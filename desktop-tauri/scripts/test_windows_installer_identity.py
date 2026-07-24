@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-EXPECTED_VERSION = "0.1.4"
+EXPECTED_VERSION = "0.1.5"
 EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 RUNTIME_PROVENANCE_NAME = "embedded_python_runtime_provenance.json"
@@ -172,7 +172,7 @@ def validate_previous_artifacts(previous_nsis: Path, previous_msi: Path, previou
 def immediate_prior_version(version: str) -> str:
     """Return the immediate prior stable patch release for a semantic version string.
 
-    For '0.1.3' this returns '0.1.2'; for a future '0.1.4' it returns '0.1.3'.
+    For '0.1.3' this returns '0.1.2'; for a future '0.1.5' it returns '0.1.3'.
     """
     match = _SEMVER_RE.match(version)
     if not match:
@@ -204,6 +204,21 @@ def _safe_env(sentinel_path: Path, sentinel_log: Path, extra: dict[str, str] | N
     env["PATH"] = str(sentinel_path)
     env["TOKENPLACE_SENTINEL_LOG"] = str(sentinel_log)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    poison = str(sentinel_path / "poison")
+    env.update({
+        "PYTHONHOME": poison,
+        "PYTHONPATH": poison,
+        "PYTHONUSERBASE": poison,
+        "VIRTUAL_ENV": poison,
+        "CONDA_PREFIX": poison,
+        "PIP_INDEX_URL": "https://example.invalid/simple",
+        "PIP_REQUIRE_VIRTUALENV": "1",
+        "CMAKE_ARGS": "-DGGML_CUDA=off",
+        "FORCE_CMAKE": "1",
+        "TOKEN_PLACE_PYTHON_IMPORT_ROOT": poison,
+        "TOKEN_PLACE_SIDECAR_PYTHON": str(sentinel_path / "python.exe"),
+        "TOKEN_PLACE_DESKTOP_PYTHON": str(sentinel_path / "python.exe"),
+    })
     if extra:
         env.update(extra)
     return env
@@ -648,22 +663,23 @@ def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expect
 
 
 def launch_for_operator_record(exe: Path, env: dict[str, str], log_path: Path | None = None) -> str:
-    result = _run([str(exe), "--operator-session-smoke"], env=env, timeout=90, check=False, log_path=log_path)
+    result = _run([str(exe), "--operator-start-preflight"], env=env, timeout=90, check=False, log_path=log_path)
     if result.returncode not in (0, 124):
-        raise InstallerIdentityError(f"operator-session smoke launch failed: {result.stdout[-1000:]}")
+        raise InstallerIdentityError(f"operator-start preflight launch failed: {result.stdout[-1000:]}")
     return result.stdout
 
 
 def assert_operator_record(text: str, expected_tier: str | None = None, launch_number: int | None = None) -> dict[str, object]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if len(lines) != 1:
-        raise InstallerIdentityError("operator-session smoke must emit exactly one machine-parseable JSON record")
+        raise InstallerIdentityError("operator-start preflight must emit exactly one machine-parseable JSON record")
     try:
         data = json.loads(lines[0])
     except json.JSONDecodeError as exc:
-        raise InstallerIdentityError("operator-session smoke did not emit JSON") from exc
+        raise InstallerIdentityError("operator-start preflight did not emit JSON") from exc
     expected = {
-        "record": "desktop.compute_node.session.layout",
+        "operator_start_preflight": "ok",
+        "resource_context_source": "tauri_app_handle",
         "launcher_source": "bundled",
         "interpreter_basename": "python.exe",
         "runtime_id": EXPECTED_RUNTIME_ID,
@@ -671,11 +687,16 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
     }
     missing = [key for key, value in expected.items() if data.get(key) != value]
     if missing:
-        raise InstallerIdentityError(f"operator-session record missing or mismatched {missing}")
+        raise InstallerIdentityError(f"operator-start preflight record missing or mismatched {missing}")
     if data.get("bridge_preflight") != "ok":
-        raise InstallerIdentityError("operator-session smoke did not run bridge-command preflight")
+        raise InstallerIdentityError("operator-start preflight did not run bridge-command preflight")
+    for key, value in {"bridge_child_spawned": True, "bridge_event_received": True}.items():
+        if data.get(key) != value:
+            raise InstallerIdentityError(f"operator-start preflight missing controlled ready field {key}")
+    if expected_tier is not None and data.get("startup_result") != "ready":
+        raise InstallerIdentityError("operator-start preflight missing controlled ready field startup_result")
     if data.get("model_artifact_inspect") != "ok":
-        raise InstallerIdentityError("operator-session smoke did not run GUI-equivalent model artifact inspection")
+        raise InstallerIdentityError("operator-start preflight did not run GUI-equivalent model artifact inspection")
     model_filename = data.get("model_artifact_filename")
     if (
         not isinstance(model_filename, str)
@@ -684,26 +705,26 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
         or "/" in model_filename
         or "\\" in model_filename
     ):
-        raise InstallerIdentityError("operator-session smoke did not report the expected safe model artifact filename")
+        raise InstallerIdentityError("operator-start preflight did not report the expected safe model artifact filename")
     if expected_tier is not None:
         expected_n_ctx = {"8k-fast": 8192, "64k-full": 65536}.get(expected_tier)
         if data.get("context_tier") != expected_tier or data.get("effective_n_ctx") != expected_n_ctx or data.get("n_ctx") != expected_n_ctx:
-            raise InstallerIdentityError(f"operator-session smoke reported mismatched context tier/n_ctx for {expected_tier}")
+            raise InstallerIdentityError(f"operator-start preflight reported mismatched context tier/n_ctx for {expected_tier}")
         if data.get("selected_model_profile") != "qwen3-8b-q4":
-            raise InstallerIdentityError("operator-session smoke did not select the Qwen3 8B Q4 profile")
+            raise InstallerIdentityError("operator-start preflight did not select the Qwen3 8B Q4 profile")
         if data.get("startup_phase") == "provisioning" or data.get("startup_deadline_ms") is None:
-            raise InstallerIdentityError("operator-session smoke did not report a bounded ready/terminal startup phase")
+            raise InstallerIdentityError("operator-start preflight did not report a bounded ready/terminal startup phase")
         if data.get("startup_result") not in ("ready", "terminal_actionable_error"):
-            raise InstallerIdentityError("operator-session smoke did not reach ready or a terminal actionable error")
+            raise InstallerIdentityError("operator-start preflight did not reach ready or a terminal actionable error")
         fallback_keys = ("fallback_reason", "backend_fallback", "model_fallback", "context_fallback")
         if data.get("fallback_reason") or any(data.get(key) is True for key in fallback_keys[1:]):
-            raise InstallerIdentityError("operator-session smoke reported a fallback")
+            raise InstallerIdentityError("operator-start preflight reported a fallback")
         if expected_tier == "64k-full":
             if data.get("api_v1_readiness_yarn_requested_context_tokens") != 65536 or data.get("api_v1_readiness_yarn_rope_supported") is not True:
                 raise InstallerIdentityError("64k-full smoke did not satisfy fail-closed YaRN/RoPE capability contract")
     assert_no_probe_attempt_counters(data)
     if launch_number == 2 and data.get("runtime_action") in {"installed_cuda_reexec", "installed_metal_reexec", "failed", "install_failed"}:
-        raise InstallerIdentityError("second operator-session smoke launch reported runtime mutation action")
+        raise InstallerIdentityError("second operator-start preflight launch reported runtime mutation action")
     return data
 
 

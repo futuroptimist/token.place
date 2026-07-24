@@ -57,9 +57,14 @@ impl PythonLauncher {
         cmd
     }
 
-    fn command_for_metadata_probe(&self) -> Command {
+    fn command_for_metadata_probe(&self, packaged: bool) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        if packaged || self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+            cmd.env("PYTHONNOUSERSITE", "1");
+            cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+        }
         cmd.arg("-c");
         cmd.arg("import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))");
         cmd
@@ -722,7 +727,7 @@ pub fn resolve_python_launcher_resource_aware(
                         ));
                     }
                 }
-                return match candidate.command_for_metadata_probe().output() {
+                return match candidate.command_for_metadata_probe(opts.packaged).output() {
                     Ok(output) => {
                         let stdout = String::from_utf8_lossy(&output.stdout);
                         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1072,24 +1077,39 @@ where
 
 const PACKAGED_MUTABLE_ENV_PREFIXES: &[&str] = &["PIP_", "CMAKE_"];
 const PACKAGED_MUTABLE_ENV_KEYS: &[&str] = &[
-    "TOKEN_PLACE_DESKTOP_PYTHON",
-    "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET",
-    "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP",
-    "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD",
-    "PYTHONHOME",
-    "PYTHONUSERBASE",
+    "CONDA_PREFIX",
     "FORCE_CMAKE",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONUSERBASE",
+    "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET",
+    "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD",
+    "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP",
+    "TOKEN_PLACE_DESKTOP_PYTHON",
+    "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
+    "TOKEN_PLACE_SIDECAR_PYTHON",
+    "VIRTUAL_ENV",
 ];
+
+const PACKAGED_PRESERVED_ENV_KEYS: &[&str] = &["SystemRoot", "ComSpec", "TEMP", "TMP"];
 
 pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C)
 where
     C: PythonEnvCommand,
 {
+    let preserved = PACKAGED_PRESERVED_ENV_KEYS
+        .iter()
+        .filter_map(|key| std::env::var_os(key).map(|value| (*key, value)))
+        .collect::<Vec<_>>();
+    command.clear_env();
+    for (key, value) in preserved {
+        command.set_env(key, value);
+    }
+    command.set_env("PYTHONNOUSERSITE", "1");
+    command.set_env("PYTHONDONTWRITEBYTECODE", "1");
     for key in PACKAGED_MUTABLE_ENV_KEYS {
         command.remove_env(std::ffi::OsStr::new(key));
     }
-    // std::process::Command cannot remove dynamic prefixes without enumerating
-    // the parent env; remove every currently inherited pip/CMake variable.
     for (key, _) in std::env::vars_os() {
         let upper = key.to_string_lossy().to_ascii_uppercase();
         if PACKAGED_MUTABLE_ENV_PREFIXES
@@ -1148,6 +1168,8 @@ where
 }
 
 pub trait PythonEnvCommand {
+    fn clear_env(&mut self);
+
     fn set_env<K, V>(&mut self, key: K, value: V)
     where
         K: AsRef<std::ffi::OsStr>,
@@ -1158,6 +1180,10 @@ pub trait PythonEnvCommand {
 }
 
 impl PythonEnvCommand for Command {
+    fn clear_env(&mut self) {
+        self.env_clear();
+    }
+
     fn set_env<K, V>(&mut self, key: K, value: V)
     where
         K: AsRef<std::ffi::OsStr>,
@@ -1175,6 +1201,10 @@ impl PythonEnvCommand for Command {
 }
 
 impl PythonEnvCommand for tokio::process::Command {
+    fn clear_env(&mut self) {
+        self.env_clear();
+    }
+
     fn set_env<K, V>(&mut self, key: K, value: V)
     where
         K: AsRef<std::ffi::OsStr>,
@@ -2081,6 +2111,77 @@ mod tests {
             assert!(command_env_value(command, "PYTHONPATH").is_some());
             assert!(command_env_removed(command, "PYTHONHOME"));
             assert!(command_env_removed(command, "PYTHONUSERBASE"));
+        }
+    }
+
+    #[test]
+    fn bundled_metadata_probe_is_sanitized_before_execution() {
+        let launcher = PythonLauncher::new(
+            if cfg!(target_os = "windows") {
+                r"C:\bundle\python-runtime\python.exe"
+            } else {
+                "/bundle/python-runtime/bin/python3"
+            },
+            vec![],
+            PythonLauncherSource::BundledRuntime,
+            bundled_runtime_id(),
+        );
+        std::env::set_var("PYTHONHOME", "/host/pythonhome");
+        std::env::set_var("PYTHONPATH", "/host/pythonpath");
+        std::env::set_var("PYTHONUSERBASE", "/host/userbase");
+        std::env::set_var("VIRTUAL_ENV", "/host/venv");
+        std::env::set_var("CONDA_PREFIX", "/host/conda");
+        std::env::set_var("PIP_INDEX_URL", "https://example.invalid/simple");
+        std::env::set_var("CMAKE_ARGS", "-DGGML_CUDA=off");
+        std::env::set_var("FORCE_CMAKE", "1");
+        std::env::set_var("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "/host/import-root");
+        std::env::set_var("TOKEN_PLACE_SIDECAR_PYTHON", "/host/python");
+
+        let command = launcher.command_for_metadata_probe(true);
+
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new(&launcher.program)
+        );
+        assert_eq!(
+            command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            command_env_value(&command, "PYTHONDONTWRITEBYTECODE").as_deref(),
+            Some("1")
+        );
+        for key in [
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONUSERBASE",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "PIP_INDEX_URL",
+            "CMAKE_ARGS",
+            "FORCE_CMAKE",
+            "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
+            "TOKEN_PLACE_SIDECAR_PYTHON",
+        ] {
+            assert!(
+                command_env_removed(&command, key),
+                "{key} leaked into metadata probe"
+            );
+        }
+
+        for key in [
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONUSERBASE",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "PIP_INDEX_URL",
+            "CMAKE_ARGS",
+            "FORCE_CMAKE",
+            "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
+            "TOKEN_PLACE_SIDECAR_PYTHON",
+        ] {
+            std::env::remove_var(key);
         }
     }
 

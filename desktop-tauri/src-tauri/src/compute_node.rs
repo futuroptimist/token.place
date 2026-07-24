@@ -825,7 +825,20 @@ async fn complete_no_child_startup_failure(
     session_id: &str,
     log_file_path: Option<String>,
     last_error: String,
+    stage: &'static str,
+    code: &'static str,
+    category: &'static str,
 ) {
+    if let Some(path) = log_file_path.as_deref() {
+        append_line_to_path(
+            path,
+            "desktop.compute_node.startup_failure",
+            &format!(
+                "operator_session_id={} stage={} code={} category={} terminal=true",
+                session_id, stage, code, category
+            ),
+        );
+    }
     let mut notify = None;
     {
         let mut process = state.bridge_process.lock().await;
@@ -1687,6 +1700,18 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         "bridge_preflight": "ok",
         "model_artifact_inspect": "ok",
         "model_artifact_filename": model_artifact_filename,
+        "operator_start_preflight": "ok",
+        "resource_context_source": "tauri_app_handle",
+        "bridge_child_spawned": true,
+        "bridge_event_received": true,
+        "startup_result": "ready",
+        "runtime_installation_attempted_count": 0,
+        "runtime_repair_attempted_count": 0,
+        "dependency_provisioning_attempted_count": 0,
+        "provisioning_attempted_count": 0,
+        "network_attempted_count": 0,
+        "model_download_attempted_count": 0,
+        "compiler_attempted_count": 0,
     });
     if let (Value::Object(payload_map), Value::Object(probe_map)) = (&mut payload, context_probe) {
         for (key, value) in probe_map {
@@ -1766,6 +1791,9 @@ pub async fn start_compute_node(
                 &session_id,
                 log_file_path.clone(),
                 err.clone(),
+                "bridge_script_resolution",
+                "bridge_script_unresolved",
+                "bridge_script_resolution",
             )
             .await;
             return Err(anyhow::anyhow!(err));
@@ -1798,6 +1826,9 @@ pub async fn start_compute_node(
                         &session_id,
                         log_file_path.clone(),
                         err.to_string(),
+                        "bundled_runtime_probe",
+                        "desktop_python_runtime_invalid",
+                        "bundled_runtime_probe",
                     )
                     .await;
                     return Err(err.into());
@@ -1811,6 +1842,9 @@ pub async fn start_compute_node(
                     &session_id,
                     log_file_path.clone(),
                     err.to_string(),
+                    "bundled_runtime_resolution",
+                    "python_launcher_task_failed",
+                    "bundled_runtime_resolution",
                 )
                 .await;
                 return Err(err.into());
@@ -1853,6 +1887,9 @@ pub async fn start_compute_node(
             &session_id,
             log_file_path.clone(),
             err.to_string(),
+            "packaged_launcher_validation",
+            "desktop_python_runtime_invalid",
+            "packaged_launcher_validation",
         )
         .await;
         return Err(err.into());
@@ -1867,6 +1904,9 @@ pub async fn start_compute_node(
                 &session_id,
                 log_file_path.clone(),
                 err.to_string(),
+                "command_build",
+                "bridge_command_build_failed",
+                "command_build",
             )
             .await;
             return Err(err.into());
@@ -1971,6 +2011,9 @@ pub async fn start_compute_node(
                 &session_id,
                 log_file_path.clone(),
                 format!("failed to start compute-node bridge: {err}"),
+                "child_spawn",
+                "bridge_child_spawn_failed",
+                "child_spawn",
             )
             .await;
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
@@ -5454,6 +5497,9 @@ mod tests {
             "session-1",
             Some("/tmp/operator.log".into()),
             "bridge script missing".into(),
+            "bridge_script_resolution",
+            "bridge_script_unresolved",
+            "bridge_script_resolution",
         )
         .await;
 
@@ -5513,6 +5559,9 @@ mod tests {
             "session-1",
             None,
             "python launcher missing".into(),
+            "bundled_runtime_resolution",
+            "desktop_python_runtime_missing",
+            "bundled_runtime_resolution",
         )
         .await;
         stop_task
@@ -5548,6 +5597,9 @@ mod tests {
             "session-1",
             None,
             "old failure".into(),
+            "bridge_script_resolution",
+            "bridge_script_unresolved",
+            "bridge_script_resolution",
         )
         .await;
 

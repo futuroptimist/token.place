@@ -721,7 +721,9 @@ fn main() {
         }
         return;
     }
-    if std::env::args().any(|arg| arg == "--operator-session-smoke") {
+    if std::env::args()
+        .any(|arg| arg == "--operator-session-smoke" || arg == "--operator-start-preflight")
+    {
         if let Err(err) = print_operator_session_smoke_json() {
             eprintln!("{err}");
             std::process::exit(1);

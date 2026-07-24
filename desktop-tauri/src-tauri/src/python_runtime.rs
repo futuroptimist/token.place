@@ -1283,6 +1283,18 @@ mod tests {
     use std::process::ExitStatus;
     use tempfile::TempDir;
 
+    fn command_env_value(command: &Command, key: &str) -> Option<String> {
+        command.get_envs().find_map(|(name, value)| {
+            (name == key).then(|| value.map(|v| v.to_string_lossy().into_owned()))?
+        })
+    }
+
+    fn command_env_removed(command: &Command, key: &str) -> bool {
+        command
+            .get_envs()
+            .any(|(name, value)| name == key && value.is_none())
+    }
+
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         std::process::Output {
             status: if success {
@@ -2019,11 +2031,18 @@ mod tests {
             .expect("compute script");
         let (model_root, model_layout) = context.describe_resource_layout(&resolved_model);
         let (compute_root, compute_layout) = context.describe_resource_layout(&resolved_compute);
-        let mut command = launcher.command_for_script_blocking(&resolved_model);
+        let mut model_command = launcher.command_for_script_blocking(&resolved_model);
         configure_python_subprocess_env_for_layout(
-            &mut command,
+            &mut model_command,
             &resource_root,
-            model_layout,
+            model_layout.clone(),
+            context.packaged(),
+        );
+        let mut compute_command = launcher.command_for_script_blocking(&resolved_compute);
+        configure_python_subprocess_env_for_layout(
+            &mut compute_command,
+            &resource_root,
+            compute_layout.clone(),
             context.packaged(),
         );
 
@@ -2034,23 +2053,35 @@ mod tests {
         assert_eq!(model_root, resource_root);
         assert_eq!(compute_root, model_root);
         assert_eq!(compute_layout, model_layout);
-        let args = command
+        let model_args = model_command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(
-            args.first().map(String::as_str),
+            model_args.first().map(String::as_str),
             Some(model_script.to_str().unwrap())
         );
+        let compute_args = compute_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         assert_eq!(
-            std_command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
-            Some("1")
+            compute_args.first().map(String::as_str),
+            Some(compute_script.to_str().unwrap())
         );
-        assert_eq!(
-            std_command_env_value(&command, "TOKEN_PLACE_PYTHON_IMPORT_ROOT").as_deref(),
-            Some(resource_root.to_str().unwrap())
-        );
-        assert!(std_command_env_value(&command, "PYTHONPATH").is_some());
+        for command in [&model_command, &compute_command] {
+            assert_eq!(
+                command_env_value(command, "PYTHONNOUSERSITE").as_deref(),
+                Some("1")
+            );
+            assert_eq!(
+                command_env_value(command, "TOKEN_PLACE_PYTHON_IMPORT_ROOT").as_deref(),
+                Some(resource_root.to_str().unwrap())
+            );
+            assert!(command_env_value(command, "PYTHONPATH").is_some());
+            assert!(command_env_removed(command, "PYTHONHOME"));
+            assert!(command_env_removed(command, "PYTHONUSERBASE"));
+        }
     }
 
     #[test]

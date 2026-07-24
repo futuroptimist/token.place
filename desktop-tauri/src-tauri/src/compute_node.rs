@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 #[cfg(unix)]
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::Path;
@@ -444,6 +444,24 @@ fn is_python_script(path: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
 }
 
+fn build_installed_context_probe_command(
+    launcher: &PythonLauncher,
+    bridge_script: &Path,
+    context: &BridgeResourceContext<'_>,
+    config: &DesktopConfig,
+) -> std::process::Command {
+    let mut command = launcher.command_for_script_blocking(bridge_script);
+    configure_runtime_pythonpath(
+        &mut command,
+        context.manifest_dir,
+        bridge_script,
+        context.exe_path,
+        context.tauri_resource_dir,
+    );
+    configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
+    command
+}
+
 fn bridge_script_candidates(
     exe_path: Option<&Path>,
     manifest_dir: &Path,
@@ -543,9 +561,12 @@ where
     import_root
 }
 
-fn configure_runtime_bootstrap_env(command: &mut Command, mode: &ComputeMode) {
+fn configure_runtime_bootstrap_env<C>(command: &mut C, mode: &ComputeMode)
+where
+    C: PythonEnvCommand,
+{
     if should_enable_runtime_bootstrap(mode) {
-        command.env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
+        command.set_env(ENABLE_RUNTIME_BOOTSTRAP_ENV, "1");
     }
 }
 
@@ -557,6 +578,22 @@ fn command_env_value(command: &Command, key: &str) -> Option<String> {
         .find_map(|(env_key, value)| (env_key == key).then_some(value))
         .flatten()
         .map(|value| value.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+fn std_command_env_value(command: &std::process::Command, key: &str) -> Option<String> {
+    command
+        .get_envs()
+        .find_map(|(env_key, value)| (env_key == key).then_some(value))
+        .flatten()
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+fn std_command_env_removed(command: &std::process::Command, key: &str) -> bool {
+    command
+        .get_envs()
+        .any(|(env_key, value)| env_key == key && value.is_none())
 }
 
 fn sanitize_relay_target(relay_url: &str) -> String {
@@ -1609,24 +1646,18 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
     let model_inspect_stdout = String::from_utf8_lossy(&model_inspect_output.stdout);
     let model_inspect_json: Value = serde_json::from_str(model_inspect_stdout.trim())?;
     let model_artifact_filename = inspect_model_artifact_filename(&model_inspect_json)?;
-    let mut bridge_command = build_bridge_command(&bridge_script, Some(launcher.clone()))?;
-    let import_root = configure_runtime_pythonpath(
-        &mut bridge_command,
-        manifest_dir,
-        Path::new(&bridge_script),
-        context.exe_path,
-        context.tauri_resource_dir,
-    );
-    configure_runtime_bootstrap_env(&mut bridge_command, &config.preferred_mode);
+    let bridge_script_path = Path::new(&bridge_script);
     let (selected_resource_root, selected_layout) =
-        context.describe_resource_layout(Path::new(&bridge_script));
+        context.describe_resource_layout(bridge_script_path);
+    let import_root = resolve_runtime_import_root(Some(bridge_script_path), context.manifest_dir);
     let identity = crate::build_identity::build_identity();
     let launcher_source = match launcher.source {
         PythonLauncherSource::BundledRuntime => "bundled",
         PythonLauncherSource::EnvironmentOverride => "environment_override",
         PythonLauncherSource::SystemDevelopmentRuntime => "system_development",
     };
-    let mut context_probe_command = launcher.command_for_script_blocking(&bridge_script);
+    let mut context_probe_command =
+        build_installed_context_probe_command(&launcher, bridge_script_path, &context, config);
     context_probe_command.arg("--installed-context-smoke");
     context_probe_command
         .arg("--context-tier")
@@ -5954,6 +5985,63 @@ mod tests {
             None
         );
         assert_eq!(safe_model_artifact_filename(""), None);
+    }
+
+    #[test]
+    fn installed_context_probe_helper_configures_executed_command_environment() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest_dir = temp
+            .path()
+            .join("repo")
+            .join("desktop-tauri")
+            .join("src-tauri");
+        let exe_dir = temp.path().join("installed").join("bin");
+        let resource_root = exe_dir.join("resources");
+        let python_dir = resource_root.join("python");
+        std::fs::create_dir_all(&python_dir).expect("create python dir");
+        std::fs::create_dir_all(resource_root.join("utils")).expect("create import utils dir");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        std::fs::create_dir_all(&exe_dir).expect("create exe dir");
+        let bridge_script = python_dir.join("compute_node_bridge.py");
+        std::fs::write(&bridge_script, "# compute bridge\n").expect("write bridge script");
+        let exe_path = exe_dir.join("token.place");
+        std::fs::write(&exe_path, "").expect("write exe");
+        let launcher = PythonLauncher {
+            program: "python3".into(),
+            args: Vec::new(),
+            source: PythonLauncherSource::BundledRuntime,
+            runtime_id: "test-runtime".into(),
+        };
+        let context = BridgeResourceContext {
+            exe_path: Some(&exe_path),
+            manifest_dir: &manifest_dir,
+            tauri_resource_dir: Some(&resource_root),
+        };
+        let config = DesktopConfig::default();
+
+        let command =
+            build_installed_context_probe_command(&launcher, &bridge_script, &context, &config);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some(bridge_script.to_str().unwrap())
+        );
+        assert!(!args.first().unwrap().is_empty());
+        assert_eq!(
+            std_command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            std_command_env_value(&command, "TOKEN_PLACE_PYTHON_IMPORT_ROOT").as_deref(),
+            Some(resource_root.to_str().unwrap())
+        );
+        assert!(std_command_env_value(&command, "PYTHONPATH").is_some());
+        assert!(std_command_env_removed(&command, "PYTHONHOME"));
+        assert!(std_command_env_removed(&command, "PYTHONUSERBASE"));
     }
 
     #[test]

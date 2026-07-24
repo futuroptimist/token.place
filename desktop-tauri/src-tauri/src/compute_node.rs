@@ -6355,11 +6355,15 @@ mod tests {
         std::fs::create_dir_all(runtime.parent().unwrap()).expect("create runtime directory");
         std::fs::write(python_dir.join("compute_node_bridge.py"), "# bridge\n")
             .expect("write bridge");
-        let machine = std::env::consts::ARCH;
+        let machine = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x86_64"
+        };
         std::fs::write(
             &runtime,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' '{{\"version\":[3,11,0],\"machine\":\"{machine}\",\"executable\":\"{}\",\"prefix\":\"{}\"}}'\n",
+                "#!/bin/sh\nprintf '%s\\n' '{{\"version\":[3,11,13],\"machine\":\"{machine}\",\"executable\":\"{}\",\"prefix\":\"{}\"}}'\n",
                 runtime.display(),
                 root.join("python-runtime").display()
             ),
@@ -6401,7 +6405,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let tauri_root = temp.path().join("tauri-resources");
         let exe_dir = temp.path().join("installed");
-        let sibling_root = exe_dir.join("resources");
+        let sibling_root = temp.path().join("Resources");
         write_coherent_test_resource_root(&tauri_root);
         write_coherent_test_resource_root(&sibling_root);
         std::fs::create_dir_all(&exe_dir).unwrap();

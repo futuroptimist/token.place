@@ -1979,7 +1979,7 @@ pub async fn start_compute_node(
                 category,
             )
             .await;
-            return Err(err);
+            return Err(err.into());
         }
     };
     let bridge_script = preparation.bridge_script;

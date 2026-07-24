@@ -161,6 +161,26 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Run Windows packaged-start preflight with poisoned host Python state
+        shell: pwsh
+        env:
+          TOKEN_PLACE_SENTINEL_PATH: C:\Windows\System32
+          PYTHONHOME: C:\token-place-poison\pythonhome
+          PYTHONPATH: C:\token-place-poison\pythonpath
+          PYTHONUSERBASE: C:\token-place-poison\userbase
+          VIRTUAL_ENV: C:\token-place-poison\venv
+          CONDA_PREFIX: C:\token-place-poison\conda
+          PIP_INDEX_URL: https://invalid.token.place.local/simple
+          CMAKE_ARGS: -DTOKEN_PLACE_SENTINEL=ON
+          FORCE_CMAKE: '1'
+          TOKEN_PLACE_SIDECAR_PYTHON: C:\token-place-poison\python.exe
+          TOKEN_PLACE_PYTHON_IMPORT_ROOT: C:\token-place-poison\import-root
+        run: |
+          $env:PATH = "$env:TOKEN_PLACE_SENTINEL_PATH;$env:PATH"
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml prepare_operator_bridge_launch_configures_preflight_command_environment
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml bundled_metadata_probe_sanitizes_poisoned_host_python_state
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml no_child_startup_failure
+
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py
 

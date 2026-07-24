@@ -53,6 +53,9 @@ impl PythonLauncher {
     fn command_for_version_check(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        if self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+        }
         cmd.arg("--version");
         cmd
     }
@@ -60,6 +63,9 @@ impl PythonLauncher {
     fn command_for_metadata_probe(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        if self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+        }
         cmd.arg("-c");
         cmd.arg("import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))");
         cmd
@@ -71,6 +77,9 @@ impl PythonLauncher {
     {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args);
+        if self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+        }
         cmd.arg(script_path);
         cmd
     }
@@ -81,6 +90,9 @@ impl PythonLauncher {
     {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        if self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+        }
         cmd.arg(script_path);
         cmd
     }
@@ -94,6 +106,7 @@ pub enum PythonLauncherCategory {
     BundledRuntimeNotPython3,
     BundledRuntimeWrongArchitecture,
     BundledRuntimeProbeFailed,
+    BundledRuntimeAmbiguous,
     OverrideMissing,
     OverrideNotPython3,
     SystemRuntimeMissing,
@@ -102,13 +115,14 @@ pub enum PythonLauncherCategory {
 }
 
 impl PythonLauncherCategory {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::BundledRuntimeMissing => "bundled_runtime_missing",
             Self::BundledRuntimeNotExecutable => "bundled_runtime_not_executable",
             Self::BundledRuntimeNotPython3 => "bundled_runtime_not_python3",
             Self::BundledRuntimeWrongArchitecture => "bundled_runtime_wrong_architecture",
             Self::BundledRuntimeProbeFailed => "bundled_runtime_probe_failed",
+            Self::BundledRuntimeAmbiguous => "bundled_runtime_ambiguous",
             Self::OverrideMissing => "override_missing",
             Self::OverrideNotPython3 => "override_not_python3",
             Self::SystemRuntimeMissing => "system_runtime_missing",
@@ -1066,18 +1080,31 @@ where
     C: PythonEnvCommand,
 {
     command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
+    command.set_env("PYTHONDONTWRITEBYTECODE", std::ffi::OsStr::new("1"));
     command.remove_env(std::ffi::OsStr::new("PYTHONHOME"));
+    command.remove_env(std::ffi::OsStr::new("PYTHONPATH"));
     command.remove_env(std::ffi::OsStr::new("PYTHONUSERBASE"));
 }
 
 const PACKAGED_MUTABLE_ENV_PREFIXES: &[&str] = &["PIP_", "CMAKE_"];
+const PACKAGED_ENV_FUNDAMENTALS: &[&str] = &["SystemRoot", "ComSpec", "TEMP", "TMP", "WINDIR"];
+
 const PACKAGED_MUTABLE_ENV_KEYS: &[&str] = &[
     "TOKEN_PLACE_DESKTOP_PYTHON",
     "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET",
+    "TOKEN_PLACE_SIDECAR_PYTHON",
+    "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
     "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP",
     "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD",
     "PYTHONHOME",
+    "PYTHONPATH",
     "PYTHONUSERBASE",
+    "PYTHONNOUSERSITE",
+    "PYTHONDONTWRITEBYTECODE",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "PYLAUNCHER_ALLOW_INSTALL",
     "FORCE_CMAKE",
 ];
 
@@ -1085,6 +1112,12 @@ pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C)
 where
     C: PythonEnvCommand,
 {
+    command.clear_env();
+    for key in PACKAGED_ENV_FUNDAMENTALS {
+        if let Some(value) = std::env::var_os(key) {
+            command.set_env(std::ffi::OsStr::new(key), value);
+        }
+    }
     for key in PACKAGED_MUTABLE_ENV_KEYS {
         command.remove_env(std::ffi::OsStr::new(key));
     }
@@ -1099,6 +1132,8 @@ where
             command.remove_env(key);
         }
     }
+    command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
+    command.set_env("PYTHONDONTWRITEBYTECODE", std::ffi::OsStr::new("1"));
 }
 
 fn import_root_is_confirmed_unbundled_development(import_root: &Path) -> bool {
@@ -1155,6 +1190,7 @@ pub trait PythonEnvCommand {
     fn remove_env<K>(&mut self, key: K)
     where
         K: AsRef<std::ffi::OsStr>;
+    fn clear_env(&mut self);
 }
 
 impl PythonEnvCommand for Command {
@@ -1172,6 +1208,10 @@ impl PythonEnvCommand for Command {
     {
         self.env_remove(key);
     }
+
+    fn clear_env(&mut self) {
+        self.env_clear();
+    }
 }
 
 impl PythonEnvCommand for tokio::process::Command {
@@ -1188,6 +1228,10 @@ impl PythonEnvCommand for tokio::process::Command {
         K: AsRef<std::ffi::OsStr>,
     {
         self.env_remove(key);
+    }
+
+    fn clear_env(&mut self) {
+        self.env_clear();
     }
 }
 
@@ -2339,5 +2383,42 @@ mod tests {
         );
         assert!(!msg.contains("xcode-select"));
         assert!(!msg.contains("No developer tools"));
+    }
+    #[test]
+    fn bundled_metadata_probe_sanitizes_poisoned_host_python_state() {
+        let launcher = PythonLauncher::new(
+            if cfg!(windows) {
+                r"C:\bundle\python-runtime\python.exe"
+            } else {
+                "/bundle/python-runtime/bin/python3"
+            },
+            vec![],
+            PythonLauncherSource::BundledRuntime,
+            bundled_runtime_id(),
+        );
+        let command = launcher.command_for_metadata_probe();
+        assert_eq!(
+            command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            command_env_value(&command, "PYTHONDONTWRITEBYTECODE").as_deref(),
+            Some("1")
+        );
+        for key in [
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONUSERBASE",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "FORCE_CMAKE",
+            "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
+            "TOKEN_PLACE_SIDECAR_PYTHON",
+        ] {
+            assert!(
+                command_env_removed(&command, key) || command_env_value(&command, key).is_none(),
+                "{key} must not be inherited by bundled probes"
+            );
+        }
     }
 }

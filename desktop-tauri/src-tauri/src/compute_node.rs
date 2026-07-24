@@ -590,13 +590,6 @@ fn std_command_env_value(command: &std::process::Command, key: &str) -> Option<S
         .map(|value| value.to_string_lossy().into_owned())
 }
 
-#[cfg(test)]
-fn std_command_env_removed(command: &std::process::Command, key: &str) -> bool {
-    command
-        .get_envs()
-        .any(|(env_key, value)| env_key == key && value.is_none())
-}
-
 fn sanitize_relay_target(relay_url: &str) -> String {
     let trimmed = relay_url.trim();
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
@@ -6242,8 +6235,56 @@ mod tests {
             Some(resource_root.to_str().unwrap())
         );
         assert!(std_command_env_value(&command, "PYTHONPATH").is_some());
-        assert!(std_command_env_removed(&command, "PYTHONHOME"));
-        assert!(std_command_env_removed(&command, "PYTHONUSERBASE"));
+
+        let mut effective = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+        configure_runtime_pythonpath(
+            &mut effective,
+            &manifest_dir,
+            &bridge_script,
+            context.exe_path,
+            context.tauri_resource_dir,
+        );
+        assert!(effective.clear_env_called);
+        for key in [
+            "PYTHONHOME",
+            "PYTHONUSERBASE",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "PIP_INDEX_URL",
+            "CMAKE_ARGS",
+            "FORCE_CMAKE",
+        ] {
+            assert_eq!(effective.value(key), None, "{key} must not reach the child");
+        }
+        assert_eq!(
+            effective.value("PYTHONNOUSERSITE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            effective.value("PYTHONDONTWRITEBYTECODE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            effective.value("TOKEN_PLACE_PYTHON_IMPORT_ROOT"),
+            Some(resource_root.as_os_str())
+        );
+        assert!(effective.value("PYTHONPATH").is_some());
+        assert!(effective.effective_env.keys().all(|key| {
+            matches!(
+                key.to_str(),
+                Some(
+                    "SystemRoot"
+                        | "ComSpec"
+                        | "TEMP"
+                        | "TMP"
+                        | "WINDIR"
+                        | "PYTHONNOUSERSITE"
+                        | "PYTHONDONTWRITEBYTECODE"
+                        | "TOKEN_PLACE_PYTHON_IMPORT_ROOT"
+                        | "PYTHONPATH"
+                )
+            )
+        }));
     }
 
     #[test]

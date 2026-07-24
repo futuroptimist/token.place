@@ -178,8 +178,11 @@ jobs:
         run: |
           $env:PATH = "$env:TOKEN_PLACE_SENTINEL_PATH;$env:PATH"
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml prepare_operator_bridge_launch_configures_preflight_command_environment
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml bundled_metadata_probe_sanitizes_poisoned_host_python_state
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml no_child_startup_failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py
@@ -187,9 +190,13 @@ jobs:
       - name: Run Windows CUDA capability handoff regressions (fakes)
         run: |
           python -m pytest tests/unit/test_desktop_runtime_setup.py -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pytest tests/unit/test_model_manager.py -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pytest tests/integration/test_desktop_qwen64k_packaged_runtime.py -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload desktop relay parity logs on failure (Windows)
         if: failure()

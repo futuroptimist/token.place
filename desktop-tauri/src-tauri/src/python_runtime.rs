@@ -1193,6 +1193,67 @@ pub trait PythonEnvCommand {
     fn clear_env(&mut self);
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PythonEnvCommandRecorder {
+    pub(crate) clear_env_called: bool,
+    pub(crate) effective_env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl PythonEnvCommandRecorder {
+    pub(crate) fn with_poisoned_env() -> Self {
+        Self {
+            clear_env_called: false,
+            effective_env: [
+                ("PYTHONHOME", "poison-python-home"),
+                ("PYTHONPATH", "poison-python-path"),
+                ("PYTHONUSERBASE", "poison-python-user-base"),
+                ("VIRTUAL_ENV", "poison-virtual-env"),
+                ("CONDA_PREFIX", "poison-conda-prefix"),
+                ("PIP_INDEX_URL", "poison-pip-index"),
+                ("CMAKE_ARGS", "poison-cmake-args"),
+                ("FORCE_CMAKE", "poison-force-cmake"),
+                ("TOKEN_PLACE_SIDECAR_PYTHON", "poison-sidecar"),
+                ("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "poison-import-root"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+        }
+    }
+
+    pub(crate) fn value(&self, key: &str) -> Option<&std::ffi::OsStr> {
+        self.effective_env
+            .get(std::ffi::OsStr::new(key))
+            .map(std::ffi::OsString::as_os_str)
+    }
+}
+
+#[cfg(test)]
+impl PythonEnvCommand for PythonEnvCommandRecorder {
+    fn set_env<K, V>(&mut self, key: K, value: V)
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        self.effective_env
+            .insert(key.as_ref().to_owned(), value.as_ref().to_owned());
+    }
+
+    fn remove_env<K>(&mut self, key: K)
+    where
+        K: AsRef<std::ffi::OsStr>,
+    {
+        self.effective_env.remove(key.as_ref());
+    }
+
+    fn clear_env(&mut self) {
+        self.clear_env_called = true;
+        self.effective_env.clear();
+    }
+}
+
 impl PythonEnvCommand for Command {
     fn set_env<K, V>(&mut self, key: K, value: V)
     where
@@ -2191,18 +2252,29 @@ mod tests {
             "{}",
         )
         .expect("write provenance");
-        let mut command = Command::new("python");
-        command.env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
+        let mut command = PythonEnvCommandRecorder::with_poisoned_env();
+        command.set_env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
 
         configure_python_subprocess_env(&mut command, &root);
 
-        let removed = command.get_envs().any(|(key, value)| {
-            key == "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD" && value.is_none()
-        });
-        assert!(
-            removed,
-            "packaged runtime must strip development repair opt-in"
+        assert!(command.clear_env_called);
+        assert_eq!(
+            command.value("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD"),
+            None
         );
+        assert_eq!(
+            command.value("PYTHONNOUSERSITE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            command.value("PYTHONDONTWRITEBYTECODE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            command.value("TOKEN_PLACE_PYTHON_IMPORT_ROOT"),
+            Some(root.as_os_str())
+        );
+        assert!(command.value("PYTHONPATH").is_some());
     }
 
     #[test]
@@ -2215,9 +2287,8 @@ mod tests {
             "# stale packaged copy",
         )
         .expect("write marker");
-        let mut command = Command::new("python");
-        command.env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
-        command.env("FORCE_CMAKE", "1");
+        let mut command = PythonEnvCommandRecorder::with_poisoned_env();
+        command.set_env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
 
         configure_python_subprocess_env_for_layout(
             &mut command,
@@ -2226,16 +2297,21 @@ mod tests {
             true,
         );
 
-        let removed_keys: std::collections::BTreeSet<_> = command
-            .get_envs()
-            .filter_map(|(key, value)| {
-                value
-                    .is_none()
-                    .then_some(key.to_string_lossy().into_owned())
-            })
-            .collect();
-        assert!(removed_keys.contains("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD"));
-        assert!(removed_keys.contains("FORCE_CMAKE"));
+        assert!(command.clear_env_called);
+        for key in [
+            "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD",
+            "FORCE_CMAKE",
+            "PYTHONHOME",
+            "PIP_INDEX_URL",
+            "CMAKE_ARGS",
+        ] {
+            assert_eq!(command.value(key), None, "{key} must not reach the child");
+        }
+        assert_eq!(
+            command.value("TOKEN_PLACE_PYTHON_IMPORT_ROOT"),
+            Some(root.as_os_str())
+        );
+        assert!(command.value("PYTHONPATH").is_some());
     }
 
     #[test]
@@ -2405,20 +2481,37 @@ mod tests {
             command_env_value(&command, "PYTHONDONTWRITEBYTECODE").as_deref(),
             Some("1")
         );
+        let mut effective = PythonEnvCommandRecorder::with_poisoned_env();
+        sanitize_packaged_python_subprocess_env(&mut effective);
+        assert!(effective.clear_env_called);
         for key in [
             "PYTHONHOME",
             "PYTHONPATH",
             "PYTHONUSERBASE",
             "VIRTUAL_ENV",
             "CONDA_PREFIX",
+            "PIP_INDEX_URL",
+            "CMAKE_ARGS",
             "FORCE_CMAKE",
             "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
             "TOKEN_PLACE_SIDECAR_PYTHON",
         ] {
-            assert!(
-                command_env_removed(&command, key) || command_env_value(&command, key).is_none(),
-                "{key} must not be inherited by bundled probes"
-            );
+            assert_eq!(effective.value(key), None, "{key} must not reach the child");
         }
+        assert_eq!(
+            effective.value("PYTHONNOUSERSITE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            effective.value("PYTHONDONTWRITEBYTECODE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert!(effective.effective_env.keys().all(|key| {
+            PACKAGED_ENV_FUNDAMENTALS.contains(&key.to_string_lossy().as_ref())
+                || matches!(
+                    key.to_str(),
+                    Some("PYTHONNOUSERSITE" | "PYTHONDONTWRITEBYTECODE")
+                )
+        }));
     }
 }

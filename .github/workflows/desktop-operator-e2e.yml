@@ -171,6 +171,26 @@ jobs:
           python -m pytest tests/integration/test_desktop_qwen64k_packaged_runtime.py -q
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml
 
+      - name: Windows packaged-start preflight with poisoned host state
+        shell: pwsh
+        env:
+          PATH: ${{ runner.temp }}\token-place-empty-path
+          PYTHONHOME: ${{ runner.temp }}\poison-pythonhome
+          PYTHONPATH: ${{ runner.temp }}\poison-pythonpath
+          PYTHONUSERBASE: ${{ runner.temp }}\poison-userbase
+          VIRTUAL_ENV: ${{ runner.temp }}\poison-venv
+          CONDA_PREFIX: ${{ runner.temp }}\poison-conda
+          PIP_INDEX_URL: https://127.0.0.1.invalid/simple
+          CMAKE_ARGS: -DPOISONED=1
+          FORCE_CMAKE: '1'
+          TOKEN_PLACE_PYTHON: ${{ runner.temp }}\sentinel-python.cmd
+          TOKEN_PLACE_SIDECAR_PYTHON: ${{ runner.temp }}\sentinel-python.cmd
+          TOKEN_PLACE_PYTHON_IMPORT_ROOT: ${{ runner.temp }}\poison-import-root
+        run: |
+          New-Item -ItemType Directory -Force $env:PATH | Out-Null
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml bundled_metadata_probe_sanitizes_poisoned_host_python_env
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml startup_failure
+
       - name: Upload desktop relay parity logs on failure (Windows)
         if: failure()
         uses: actions/upload-artifact@v4

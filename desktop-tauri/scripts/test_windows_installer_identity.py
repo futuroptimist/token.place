@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-EXPECTED_VERSION = "0.1.4"
+EXPECTED_VERSION = "0.1.5"
 EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 RUNTIME_PROVENANCE_NAME = "embedded_python_runtime_provenance.json"
@@ -203,7 +203,22 @@ def _safe_env(sentinel_path: Path, sentinel_log: Path, extra: dict[str, str] | N
             env[key] = os.environ[key]
     env["PATH"] = str(sentinel_path)
     env["TOKENPLACE_SENTINEL_LOG"] = str(sentinel_log)
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.update({
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONHOME": str(sentinel_path / "bad-pythonhome"),
+        "PYTHONPATH": str(sentinel_path / "bad-pythonpath"),
+        "PYTHONUSERBASE": str(sentinel_path / "bad-userbase"),
+        "VIRTUAL_ENV": str(sentinel_path / "bad-venv"),
+        "CONDA_PREFIX": str(sentinel_path / "bad-conda"),
+        "PIP_INDEX_URL": "https://127.0.0.1.invalid/simple",
+        "PIP_REQUIRE_VIRTUALENV": "1",
+        "CMAKE_ARGS": "-DPOISONED=1",
+        "CMAKE_GENERATOR": "POISONED",
+        "FORCE_CMAKE": "1",
+        "TOKEN_PLACE_PYTHON": str(sentinel_path / "python.cmd"),
+        "TOKEN_PLACE_SIDECAR_PYTHON": str(sentinel_path / "python.cmd"),
+        "TOKEN_PLACE_PYTHON_IMPORT_ROOT": str(sentinel_path / "bad-import-root"),
+    })
     if extra:
         env.update(extra)
     return env
@@ -648,7 +663,7 @@ def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expect
 
 
 def launch_for_operator_record(exe: Path, env: dict[str, str], log_path: Path | None = None) -> str:
-    result = _run([str(exe), "--operator-session-smoke"], env=env, timeout=90, check=False, log_path=log_path)
+    result = _run([str(exe), "--operator-start-preflight"], env=env, timeout=90, check=False, log_path=log_path)
     if result.returncode not in (0, 124):
         raise InstallerIdentityError(f"operator-session smoke launch failed: {result.stdout[-1000:]}")
     return result.stdout
@@ -663,6 +678,10 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
     except json.JSONDecodeError as exc:
         raise InstallerIdentityError("operator-session smoke did not emit JSON") from exc
     expected = {
+        "operator_start_preflight": "ok",
+        "resource_context_source": "tauri_app_handle",
+        "bridge_child_spawned": True,
+        "bridge_event_received": True,
         "record": "desktop.compute_node.session.layout",
         "launcher_source": "bundled",
         "interpreter_basename": "python.exe",
@@ -672,6 +691,12 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
     missing = [key for key, value in expected.items() if data.get(key) != value]
     if missing:
         raise InstallerIdentityError(f"operator-session record missing or mismatched {missing}")
+    if data.get("operator_start_preflight") != "ok" or data.get("resource_context_source") != "tauri_app_handle":
+        raise InstallerIdentityError("operator start preflight did not use the Tauri AppHandle resource context")
+    if data.get("bridge_child_spawned") is not True or data.get("bridge_event_received") is not True:
+        raise InstallerIdentityError("operator start preflight did not spawn and parse a controlled ready bridge event")
+    if (expected_tier is not None or "startup_result" in data) and data.get("startup_result") != "ready":
+        raise InstallerIdentityError("operator-session smoke did not reach ready or a terminal actionable error")
     if data.get("bridge_preflight") != "ok":
         raise InstallerIdentityError("operator-session smoke did not run bridge-command preflight")
     if data.get("model_artifact_inspect") != "ok":
@@ -693,8 +718,8 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
             raise InstallerIdentityError("operator-session smoke did not select the Qwen3 8B Q4 profile")
         if data.get("startup_phase") == "provisioning" or data.get("startup_deadline_ms") is None:
             raise InstallerIdentityError("operator-session smoke did not report a bounded ready/terminal startup phase")
-        if data.get("startup_result") not in ("ready", "terminal_actionable_error"):
-            raise InstallerIdentityError("operator-session smoke did not reach ready or a terminal actionable error")
+        if data.get("startup_result") != "ready":
+            raise InstallerIdentityError("operator start preflight did not reach controlled ready")
         fallback_keys = ("fallback_reason", "backend_fallback", "model_fallback", "context_fallback")
         if data.get("fallback_reason") or any(data.get(key) is True for key in fallback_keys[1:]):
             raise InstallerIdentityError("operator-session smoke reported a fallback")

@@ -2539,7 +2539,7 @@ def _load_windows_release_validator():
     return module
 
 
-def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.4') -> tuple[Path, Path]:
+def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.5') -> tuple[Path, Path]:
     validator = _load_windows_release_validator()
     manifest = json.loads(Path('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json').read_text(encoding='utf-8'))
     runtime = root / 'resources' / 'python-runtime'
@@ -2599,7 +2599,7 @@ def test_windows_validator_without_version_args_derives_package_json_version(tmp
 def test_windows_release_validator_accepts_extracted_msi_and_nsis(tmp_path):
     validator = _load_windows_release_validator()
     nsis, msi = _write_windows_runtime_fixture(tmp_path)
-    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.4']) == 0
+    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.5']) == 0
 
 
 def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_path):
@@ -2614,7 +2614,7 @@ def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_p
     data['llama_cpp_cuda_wheel']['flavor'] = 'cpu'
     provenance.write_text(json.dumps(data), encoding='utf-8')
     with pytest.raises(validator.ValidationError, match='incomplete Windows runtime provenance'):
-        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.4'])
+        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.5'])
 
 
 def _extract_workflow_job_block(text: str, job_key: str) -> str:
@@ -2653,18 +2653,18 @@ def test_release_workflow_runs_windows_validator_and_preserves_skipped_nvidia_ga
 
 def test_windows_validator_version_tag_config_and_extract_edges(tmp_path, monkeypatch):
     validator = _load_windows_release_validator()
-    assert validator.expected_version_from_tag(None, '0.1.4') == '0.1.4'
-    assert validator.expected_version_from_tag('desktop-v1.2.3', '0.1.4') == '1.2.3'
+    assert validator.expected_version_from_tag(None, '0.1.5') == '0.1.5'
+    assert validator.expected_version_from_tag('desktop-v1.2.3', '0.1.5') == '1.2.3'
     with pytest.raises(validator.ValidationError, match='desktop-vX.Y.Z'):
-        validator.expected_version_from_tag('1495/merge', '0.1.4')
+        validator.expected_version_from_tag('1495/merge', '0.1.5')
 
     package = tmp_path / 'package.json'
     lock = tmp_path / 'package-lock.json'
     tauri = tmp_path / 'tauri.conf.json'
     cargo = tmp_path / 'Cargo.toml'
     cargo_lock = tmp_path / 'Cargo.lock'
-    package.write_text(json.dumps({'version': '0.1.4'}), encoding='utf-8')
-    lock.write_text(json.dumps({'version': '0.1.4'}), encoding='utf-8')
+    package.write_text(json.dumps({'version': '0.1.5'}), encoding='utf-8')
+    lock.write_text(json.dumps({'version': '0.1.5'}), encoding='utf-8')
     tauri.write_text(json.dumps({'version': '9.9.9'}), encoding='utf-8')
     cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.3"\n', encoding='utf-8')
     cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.3"\n', encoding='utf-8')
@@ -2674,17 +2674,17 @@ def test_windows_validator_version_tag_config_and_extract_edges(tmp_path, monkey
     monkeypatch.setattr(validator, 'CARGO_MANIFEST', cargo)
     monkeypatch.setattr(validator, 'CARGO_LOCK', cargo_lock)
     with pytest.raises(validator.ValidationError, match='Windows release version mismatch'):
-        validator.validate_config_versions('0.1.4')
-    tauri.write_text(json.dumps({'version': '0.1.4'}), encoding='utf-8')
+        validator.validate_config_versions('0.1.5')
+    tauri.write_text(json.dumps({'version': '0.1.5'}), encoding='utf-8')
     cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.0"\n', encoding='utf-8')
     with pytest.raises(validator.ValidationError, match='Cargo.toml'):
-        validator.validate_config_versions('0.1.4')
-    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.4"\n', encoding='utf-8')
+        validator.validate_config_versions('0.1.5')
+    cargo.write_text('[package]\nname = "token-place-desktop-tauri"\nversion = "0.1.5"\n', encoding='utf-8')
     cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.0"\n', encoding='utf-8')
     with pytest.raises(validator.ValidationError, match='Cargo.lock'):
-        validator.validate_config_versions('0.1.4')
-    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.4"\n', encoding='utf-8')
-    validator.validate_config_versions('0.1.4')
+        validator.validate_config_versions('0.1.5')
+    cargo_lock.write_text('version = 4\n\n[[package]]\nname = "token-place-desktop-tauri"\nversion = "0.1.5"\n', encoding='utf-8')
+    validator.validate_config_versions('0.1.5')
 
     source_dir = tmp_path / 'already-extracted'
     source_dir.mkdir()
@@ -3543,18 +3543,18 @@ def _load_windows_installer_identity():
 
 def test_windows_installer_identity_requires_previous_artifacts(tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.4-x64.msi'
-    previous_nsis = tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe'
-    previous_msi = tmp_path / 'token.place-desktop-0.1.3-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.5-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.4-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
         path.write_text('artifact', encoding='utf-8')
 
-    scenarios = guard.build_scenarios(current_nsis, current_msi, previous_nsis, previous_msi, '0.1.4', '0.1.3')
+    scenarios = guard.build_scenarios(current_nsis, current_msi, previous_nsis, previous_msi, '0.1.5', '0.1.4')
 
     assert [scenario.name for scenario in scenarios] == [
-        'clean-nsis-0.1.4',
-        'clean-msi-0.1.4',
+        'clean-nsis-0.1.5',
+        'clean-msi-0.1.5',
         'upgrade-nsis-to-nsis',
         'upgrade-msi-to-msi',
         'cross-nsis-to-msi',
@@ -3568,17 +3568,17 @@ def test_windows_installer_identity_requires_previous_artifacts(tmp_path) -> Non
 
 def test_windows_installer_identity_rejects_duplicate_previous_artifact(tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    previous_nsis = tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe'
     previous_nsis.write_text('artifact', encoding='utf-8')
 
     with pytest.raises(guard.InstallerIdentityError, match='exactly one previous NSIS and one distinct previous MSI'):
-        guard.validate_previous_artifacts(previous_nsis, previous_nsis, '0.1.3')
+        guard.validate_previous_artifacts(previous_nsis, previous_nsis, '0.1.4')
 
 
 def test_immediate_prior_version_is_semver_aware() -> None:
     guard = _load_windows_installer_identity()
     assert guard.immediate_prior_version('0.1.3') == '0.1.2'
-    assert guard.immediate_prior_version('0.1.4') == '0.1.3'
+    assert guard.immediate_prior_version('0.1.5') == '0.1.4'
     assert guard.immediate_prior_version('1.0.1') == '1.0.0'
     with pytest.raises(guard.InstallerIdentityError, match='no immediate prior patch release'):
         guard.immediate_prior_version('1.0.0')
@@ -3589,8 +3589,8 @@ def test_immediate_prior_version_is_semver_aware() -> None:
 def test_windows_installer_identity_main_requires_exact_build_id(tmp_path) -> None:
     guard = _load_windows_installer_identity()
     artifacts = {
-        'current_nsis': tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe',
-        'current_msi': tmp_path / 'token.place-desktop-0.1.3-x64.msi',
+        'current_nsis': tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe',
+        'current_msi': tmp_path / 'token.place-desktop-0.1.4-x64.msi',
         'previous_nsis': tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe',
         'previous_msi': tmp_path / 'token.place-desktop-0.1.2-x64.msi',
     }
@@ -3674,7 +3674,7 @@ def _empty_snapshot(guard):
 
 def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
+    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.4-x64.msi', 'msi', '0.1.3')
     previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe', 'nsis', '0.1.2')
     scenario = guard.Scenario('cross-nsis-to-msi', current, previous)
     for path in (current.path, previous.path):
@@ -3701,8 +3701,8 @@ def test_windows_installer_identity_cross_installer_fail_closed(monkeypatch, tmp
 
 def test_windows_installer_identity_probes_scenario_current_version(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe', 'nsis', '0.1.4')
-    previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe', 'nsis', '0.1.3')
+    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe', 'nsis', '0.1.5')
+    previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe', 'nsis', '0.1.5')
     for path in (current.path, previous.path):
         path.write_text('artifact', encoding='utf-8')
     exe = tmp_path / 'token.place.exe'
@@ -3719,7 +3719,11 @@ def test_windows_installer_identity_probes_scenario_current_version(monkeypatch,
     monkeypatch.setattr(guard, 'resolve_authoritative_shortcut', lambda rejected_version=None: guard.Shortcut(tmp_path / 'app.lnk', exe))
     monkeypatch.setattr(guard, '_assert_runtime', lambda target: None)
     monkeypatch.setattr(guard, 'launch_for_operator_record', lambda target, env, log_path=None: json.dumps({
-        'record': 'desktop.compute_node.session.layout',
+        'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
+            'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
@@ -3739,12 +3743,12 @@ def test_windows_installer_identity_probes_scenario_current_version(monkeypatch,
 
     monkeypatch.setattr(guard, 'probe_identity', fake_probe)
     guard.run_scenario(guard.Scenario('upgrade-nsis-to-nsis', current, previous), 'abcdef123456')
-    assert probed_versions == ['0.1.4']
+    assert probed_versions == ['0.1.5']
 
 
 def test_windows_installer_identity_rejects_arbitrary_cross_installer_failures(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
+    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.4-x64.msi', 'msi', '0.1.3')
     previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe', 'nsis', '0.1.2')
     for path in (current.path, previous.path):
         path.write_text('artifact', encoding='utf-8')
@@ -3765,7 +3769,7 @@ def test_windows_installer_identity_rejects_arbitrary_cross_installer_failures(m
 
 def test_windows_installer_identity_requires_postconditions_for_competing_rejection(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
+    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.4-x64.msi', 'msi', '0.1.3')
     previous = guard.Installer(tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe', 'nsis', '0.1.2')
     for path in (current.path, previous.path):
         path.write_text('artifact', encoding='utf-8')
@@ -4074,7 +4078,11 @@ def test_assert_runtime_requires_valid_matching_provenance(tmp_path) -> None:
 def test_windows_installer_identity_operator_record_rejects_fabricated_or_incomplete() -> None:
     guard = _load_windows_installer_identity()
     guard.assert_operator_record(json.dumps({
-        'record': 'desktop.compute_node.session.layout',
+        'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
+            'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
@@ -4136,10 +4144,10 @@ def test_previous_release_selector_uses_camel_case_publication_fields(tmp_path, 
         {'tagName': 'desktop-v0.1.1', 'isDraft': False, 'isPrerelease': False},
         {'tagName': 'desktop-v0.1.2', 'isDraft': False, 'isPrerelease': False},
         {'tagName': 'desktop-v0.1.3', 'isDraft': False, 'isPrerelease': False},
-        {'tagName': 'desktop-v0.1.4', 'isDraft': False, 'isPrerelease': False},
+        {'tagName': 'desktop-v0.1.5', 'isDraft': False, 'isPrerelease': False},
     ]
     assert _run_previous_release_selector('0.1.3', releases, tmp_path, monkeypatch) == 'desktop-v0.1.2'
-    assert _run_previous_release_selector('0.1.4', releases, tmp_path, monkeypatch) == 'desktop-v0.1.3'
+    assert _run_previous_release_selector('0.1.5', releases, tmp_path, monkeypatch) == 'desktop-v0.1.3'
 
 
 def test_previous_release_selector_rejects_drafts_prereleases_and_malformed_records(tmp_path, monkeypatch) -> None:
@@ -4154,7 +4162,7 @@ def test_previous_release_selector_rejects_drafts_prereleases_and_malformed_reco
         {'tagName': 'desktop-vnot-semver', 'isDraft': False, 'isPrerelease': False},
         {'tagName': 'desktop-v0.0.6', 'isDraft': False, 'isPrerelease': False},
     ]
-    assert _run_previous_release_selector('0.1.4', releases, tmp_path, monkeypatch) == 'desktop-v0.0.6'
+    assert _run_previous_release_selector('0.1.5', releases, tmp_path, monkeypatch) == 'desktop-v0.0.6'
 
 
 def test_previous_release_selector_reports_documented_error_when_no_valid_predecessor(tmp_path, monkeypatch) -> None:
@@ -4208,7 +4216,11 @@ def test_publish_flow_absent_overwrite_reuse_and_existing_draft_paths() -> None:
 def test_windows_installer_identity_operator_record_requires_exact_context_tier_contract() -> None:
     guard = _load_windows_installer_identity()
     base = {
-        'record': 'desktop.compute_node.session.layout',
+        'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
+            'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
@@ -4247,7 +4259,11 @@ def test_windows_installer_identity_operator_record_requires_exact_context_tier_
 def test_windows_installer_identity_second_launch_rejects_repair_or_provisioning() -> None:
     guard = _load_windows_installer_identity()
     record = {
-        'record': 'desktop.compute_node.session.layout',
+        'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
+            'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
@@ -4285,6 +4301,10 @@ def test_windows_installer_identity_context_tier_probe_executes_twice_per_tier(m
         launched.append((tier, launch))
         n_ctx = 65536 if tier == '64k-full' else 8192
         payload = {
+            'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
             'record': 'desktop.compute_node.session.layout',
             'launcher_source': 'bundled',
             'interpreter_basename': 'python.exe',
@@ -4426,7 +4446,11 @@ def test_windows_installer_identity_manifest_detects_added_removed_modified(tmp_
 def test_windows_installer_identity_second_launch_requires_observed_zero_counters() -> None:
     guard = _load_windows_installer_identity()
     base = {
-        'record': 'desktop.compute_node.session.layout',
+        'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
+            'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
@@ -4523,10 +4547,10 @@ def test_installed_context_smoke_uses_get_llm_instance_boundary() -> None:
 
 def test_windows_installer_identity_main_non_windows_contract_success(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.4-x64.msi'
-    previous_nsis = tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe'
-    previous_msi = tmp_path / 'token.place-desktop-0.1.3-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.5-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.4-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
         path.write_text('artifact', encoding='utf-8')
     monkeypatch.setattr(guard.sys, 'platform', 'linux')
@@ -4549,7 +4573,7 @@ def test_windows_installer_identity_run_all_scenarios_uses_custom_runner_contrac
     guard = _load_windows_installer_identity()
     scenario = guard.Scenario(
         'clean/nsis',
-        guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe', 'nsis', '0.1.3'),
+        guard.Installer(tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe', 'nsis', '0.1.5'),
     )
     calls: list[tuple[object, str]] = []
 
@@ -4580,7 +4604,7 @@ def test_windows_installer_identity_probe_identity_accepts_json_and_raw_fallback
 
 def test_windows_installer_identity_run_scenario_rejects_sentinel_after_success(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe', 'nsis', '0.1.3')
+    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe', 'nsis', '0.1.5')
     current.path.write_text('installer', encoding='utf-8')
     exe = tmp_path / 'token.place.exe'
     exe.write_text('exe', encoding='utf-8')
@@ -4592,7 +4616,11 @@ def test_windows_installer_identity_run_scenario_rejects_sentinel_after_success(
     monkeypatch.setattr(guard, 'probe_identity', lambda *args, **kwargs: {})
     monkeypatch.setattr(guard, 'validate_installed_context_tiers', lambda *args, **kwargs: None)
     monkeypatch.setattr(guard, 'launch_for_operator_record', lambda *args, **kwargs: json.dumps({
-        'record': 'desktop.compute_node.session.layout',
+        'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
+            'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
@@ -4611,7 +4639,7 @@ def test_windows_installer_identity_run_scenario_rejects_sentinel_after_success(
     monkeypatch.setattr(guard, '_sentinel_dir', sentinel_dir_with_activity)
 
     with pytest.raises(guard.InstallerIdentityError, match='sentinel was invoked'):
-        guard.run_scenario(guard.Scenario('clean-nsis-0.1.4', current), 'abcdef123456')
+        guard.run_scenario(guard.Scenario('clean-nsis-0.1.5', current), 'abcdef123456')
 
 
 
@@ -4679,7 +4707,11 @@ def test_windows_installer_identity_probe_attempt_counters_fail_closed() -> None
 def test_windows_installer_identity_operator_record_accepts_64k_ready_contract() -> None:
     guard = _load_windows_installer_identity()
     record = {
-        'record': 'desktop.compute_node.session.layout',
+        'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
+            'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
@@ -4717,7 +4749,11 @@ def test_windows_installer_identity_operator_record_accepts_64k_ready_contract()
 def test_windows_installer_identity_operator_record_rejects_multiline_or_fallback() -> None:
     guard = _load_windows_installer_identity()
     valid = {
-        'record': 'desktop.compute_node.session.layout',
+        'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
+            'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
@@ -4805,17 +4841,17 @@ def test_installed_context_smoke_fails_on_wrong_constructor_n_ctx(monkeypatch) -
 
 def test_windows_installer_identity_classifies_artifacts_and_sanitizes_log_paths(tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    nsis = tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe'
-    msi = tmp_path / 'token.place-desktop-0.1.3-x64.msi'
-    unsupported = tmp_path / 'token.place-desktop-0.1.3-x64.zip'
+    nsis = tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe'
+    msi = tmp_path / 'token.place-desktop-0.1.4-x64.msi'
+    unsupported = tmp_path / 'token.place-desktop-0.1.4-x64.zip'
     wrong_version = tmp_path / 'token.place-desktop-0.1.2-x64-setup.exe'
     for path in (nsis, msi, unsupported, wrong_version):
         path.write_text('artifact', encoding='utf-8')
 
-    assert guard.classify_installer(nsis, '0.1.3').kind == 'nsis'
-    assert guard.classify_installer(msi, '0.1.3').kind == 'msi'
+    assert guard.classify_installer(nsis, '0.1.4').kind == 'nsis'
+    assert guard.classify_installer(msi, '0.1.4').kind == 'msi'
     with pytest.raises(guard.InstallerIdentityError, match='unsupported Windows installer type'):
-        guard.classify_installer(unsupported, '0.1.3')
+        guard.classify_installer(unsupported, '0.1.4')
     with pytest.raises(guard.InstallerIdentityError, match='filename must include 0.1.3'):
         guard.classify_installer(wrong_version, '0.1.3')
     with pytest.raises(guard.InstallerIdentityError, match='installer does not exist'):
@@ -4902,8 +4938,8 @@ def test_windows_installer_identity_registry_inventory_and_authority_signature(m
 
 def test_windows_installer_identity_install_and_run_log_failure_contract(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    nsis = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe', 'nsis', '0.1.3')
-    msi = guard.Installer(tmp_path / 'token.place-desktop-0.1.3-x64.msi', 'msi', '0.1.3')
+    nsis = guard.Installer(tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe', 'nsis', '0.1.5')
+    msi = guard.Installer(tmp_path / 'token.place-desktop-0.1.4-x64.msi', 'msi', '0.1.3')
     for installer in (nsis, msi):
         installer.path.write_text('installer', encoding='utf-8')
     calls = []
@@ -5069,7 +5105,11 @@ def test_windows_installer_identity_probe_and_launch_failure_edges(monkeypatch, 
 def test_windows_installer_identity_operator_record_rejects_readiness_and_runtime_mutation() -> None:
     guard = _load_windows_installer_identity()
     base = {
-        'record': 'desktop.compute_node.session.layout',
+        'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
+            'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
@@ -5141,6 +5181,10 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
         tier = json.loads((tmp_path / 'Roaming' / guard.TAURI_IDENTIFIER / guard.CONFIG_NAME).read_text(encoding='utf-8'))['context_tier']
         n_ctx = 65536 if tier == '64k-full' else 8192
         return json.dumps({
+            'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
             'record': 'desktop.compute_node.session.layout',
             'launcher_source': 'bundled',
             'interpreter_basename': 'python.exe',
@@ -5176,6 +5220,10 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
         tier = json.loads((tmp_path / 'Roaming' / guard.TAURI_IDENTIFIER / guard.CONFIG_NAME).read_text(encoding='utf-8'))['context_tier']
         n_ctx = 65536 if tier == '64k-full' else 8192
         return json.dumps({
+            'operator_start_preflight': 'ok',
+            'resource_context_source': 'tauri_app_handle',
+            'bridge_child_spawned': True,
+            'bridge_event_received': True,
             'record': 'desktop.compute_node.session.layout',
             'launcher_source': 'bundled',
             'interpreter_basename': 'python.exe',
@@ -5207,20 +5255,20 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
 
 def test_windows_installer_identity_run_all_and_main_windows_paths(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.4-x64.msi'
-    previous_nsis = tmp_path / 'token.place-desktop-0.1.3-x64-setup.exe'
-    previous_msi = tmp_path / 'token.place-desktop-0.1.3-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.5-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.4-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
         path.write_text('artifact', encoding='utf-8')
 
-    scenarios = [guard.Scenario('clean-nsis-0.1.4', guard.Installer(current_nsis, 'nsis', '0.1.4'))]
+    scenarios = [guard.Scenario('clean-nsis-0.1.5', guard.Installer(current_nsis, 'nsis', '0.1.5'))]
     artifacts_seen = []
     def fake_runner(scenario, build_id):
         artifacts_seen.append((scenario.name, build_id))
 
     guard.run_all_scenarios(scenarios, 'abcdef123456', runner=fake_runner, artifact_root=tmp_path / 'logs')
-    assert artifacts_seen == [('clean-nsis-0.1.4', 'abcdef123456')]
+    assert artifacts_seen == [('clean-nsis-0.1.5', 'abcdef123456')]
 
     old_argv = sys.argv
     monkeypatch.setattr(guard.sys, 'platform', 'win32')

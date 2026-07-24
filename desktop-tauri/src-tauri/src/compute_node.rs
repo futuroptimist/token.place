@@ -825,7 +825,19 @@ async fn complete_no_child_startup_failure(
     session_id: &str,
     log_file_path: Option<String>,
     last_error: String,
+    stage: &str,
+    code: &str,
+    category: &str,
 ) {
+    if let Some(path) = log_file_path.as_deref() {
+        let line = format!(
+            "desktop.compute_node.startup_failure stage={} code={} category={}",
+            sanitize_freeform_bridge_log_line(stage),
+            sanitize_freeform_bridge_log_line(code),
+            sanitize_freeform_bridge_log_line(category)
+        );
+        let _ = append_line_to_path(Path::new(path), &line);
+    }
     let mut notify = None;
     {
         let mut process = state.bridge_process.lock().await;
@@ -1598,6 +1610,39 @@ fn with_log_file_path(mut payload: Value, log_file_path: Option<&str>) -> Value 
     payload
 }
 
+#[derive(Debug)]
+pub(crate) struct OperatorBridgeLaunchPreparation {
+    pub bridge_script: String,
+    pub launcher: Option<PythonLauncher>,
+}
+
+pub(crate) fn prepare_operator_bridge_launch(
+    context: &BridgeResourceContext<'_>,
+) -> anyhow::Result<OperatorBridgeLaunchPreparation> {
+    let bridge_script = resolve_bridge_script_for(
+        context.exe_path,
+        context.manifest_dir,
+        context.tauri_resource_dir,
+        None,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let launcher = if is_python_script(&bridge_script) {
+        let launcher = resolve_python_launcher_resource_aware(
+            context.launcher_options("TOKEN_PLACE_SIDECAR_PYTHON"),
+        )?;
+        if !packaged_launcher_source_is_valid(context.packaged(), Some(&launcher.source)) {
+            anyhow::bail!("desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime");
+        }
+        Some(launcher)
+    } else {
+        None
+    };
+    Ok(OperatorBridgeLaunchPreparation {
+        bridge_script,
+        launcher,
+    })
+}
+
 fn packaged_launcher_source_is_valid(
     is_packaged_execution: bool,
     launcher_source: Option<&PythonLauncherSource>,
@@ -1613,20 +1658,12 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         manifest_dir,
         tauri_resource_dir: None,
     };
-    let packaged = context.packaged();
-    let launcher = resolve_python_launcher_resource_aware(
-        context.launcher_options("TOKEN_PLACE_SIDECAR_PYTHON"),
-    )?;
-    if !packaged_launcher_source_is_valid(packaged, Some(&launcher.source)) {
-        anyhow::bail!("desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime");
-    }
-    let bridge_script = resolve_bridge_script_for(
-        context.exe_path,
-        context.manifest_dir,
-        context.tauri_resource_dir,
-        Some(&launcher.program),
-    )
-    .map_err(anyhow::Error::msg)?;
+    let preparation = prepare_operator_bridge_launch(&context)?;
+    let launcher = preparation
+        .launcher
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing bundled Python launcher for operator smoke"))?;
+    let bridge_script = preparation.bridge_script.clone();
     let model_bridge_script = context
         .resolve_bridge_script_path("model_bridge.py", Some(&launcher.program))
         .map_err(anyhow::Error::msg)?;
@@ -1757,68 +1794,40 @@ pub async fn start_compute_node(
         }
     }
 
-    let bridge_script = match resolve_bridge_script(&app) {
-        Ok(bridge_script) => bridge_script,
+    let resource_dir = app.path().resource_dir().ok();
+    let current_exe = std::env::current_exe().ok();
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
+        manifest_dir,
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
+    let preparation = match prepare_operator_bridge_launch(&context) {
+        Ok(preparation) => preparation,
         Err(err) => {
+            let message = err.to_string();
+            let category = if message.contains("compute_node_bridge.py") {
+                "bridge_script_resolution"
+            } else if message.contains("packaged Windows/macOS operator") {
+                "packaged_launcher_validation"
+            } else {
+                "bundled_runtime_probe"
+            };
             complete_no_child_startup_failure(
                 &state,
                 &request,
                 &session_id,
                 log_file_path.clone(),
-                err.clone(),
+                message,
+                category,
+                "operator_bridge_preparation_failed",
+                category,
             )
             .await;
-            return Err(anyhow::anyhow!(err));
+            return Err(err);
         }
     };
-    let launcher = if is_python_script(&bridge_script) {
-        let resource_dir = app.path().resource_dir().ok();
-        let current_exe = std::env::current_exe().ok();
-        match tokio::task::spawn_blocking(move || {
-            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-            resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
-                override_var_name: "TOKEN_PLACE_SIDECAR_PYTHON",
-                tauri_resource_dir: resource_dir.as_deref(),
-                current_exe_path: current_exe.as_deref(),
-                manifest_dir,
-                packaged: crate::python_runtime::is_packaged_execution(
-                    current_exe.as_deref(),
-                    manifest_dir,
-                ),
-            })
-        })
-        .await
-        {
-            Ok(result) => match result {
-                Ok(launcher) => Some(launcher),
-                Err(err) => {
-                    complete_no_child_startup_failure(
-                        &state,
-                        &request,
-                        &session_id,
-                        log_file_path.clone(),
-                        err.to_string(),
-                    )
-                    .await;
-                    return Err(err.into());
-                }
-            },
-            Err(err) => {
-                let err = anyhow::anyhow!("python launcher resolver task failed: {err}");
-                complete_no_child_startup_failure(
-                    &state,
-                    &request,
-                    &session_id,
-                    log_file_path.clone(),
-                    err.to_string(),
-                )
-                .await;
-                return Err(err.into());
-            }
-        }
-    } else {
-        None
-    };
+    let bridge_script = preparation.bridge_script;
+    let launcher = preparation.launcher;
 
     let launcher_metadata = launcher.as_ref().map(|launcher| {
         let source = match launcher.source {
@@ -1853,6 +1862,9 @@ pub async fn start_compute_node(
             &session_id,
             log_file_path.clone(),
             err.to_string(),
+            "packaged_launcher_validation",
+            "packaged_launcher_source_invalid",
+            "packaged_launcher_validation",
         )
         .await;
         return Err(err.into());
@@ -1867,6 +1879,9 @@ pub async fn start_compute_node(
                 &session_id,
                 log_file_path.clone(),
                 err.to_string(),
+                "command_build",
+                "bridge_command_build_failed",
+                "command_build",
             )
             .await;
             return Err(err.into());
@@ -1971,6 +1986,9 @@ pub async fn start_compute_node(
                 &session_id,
                 log_file_path.clone(),
                 format!("failed to start compute-node bridge: {err}"),
+                "child_spawn",
+                "bridge_child_spawn_failed",
+                "child_spawn",
             )
             .await;
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
@@ -5454,6 +5472,9 @@ mod tests {
             "session-1",
             Some("/tmp/operator.log".into()),
             "bridge script missing".into(),
+            "bridge_script_resolution",
+            "bridge_script_unresolved",
+            "bridge_script_resolution",
         )
         .await;
 
@@ -5513,6 +5534,9 @@ mod tests {
             "session-1",
             None,
             "python launcher missing".into(),
+            "bundled_runtime_resolution",
+            "python_launcher_resolution_failed",
+            "bundled_runtime_probe",
         )
         .await;
         stop_task
@@ -5548,6 +5572,9 @@ mod tests {
             "session-1",
             None,
             "old failure".into(),
+            "bridge_script_resolution",
+            "bridge_script_unresolved",
+            "bridge_script_resolution",
         )
         .await;
 

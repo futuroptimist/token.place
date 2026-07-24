@@ -177,7 +177,7 @@ jobs:
           TOKEN_PLACE_PYTHON_IMPORT_ROOT: C:\token-place-poison\import-root
         run: |
           $env:PATH = "$env:TOKEN_PLACE_SENTINEL_PATH;$env:PATH"
-          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml prepare_operator_bridge_launch
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml prepare_operator_bridge_launch_configures_preflight_command_environment
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml bundled_metadata_probe_sanitizes_poisoned_host_python_state
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml no_child_startup_failure
 

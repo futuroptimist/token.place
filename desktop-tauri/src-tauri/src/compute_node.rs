@@ -10,7 +10,8 @@ use crate::python_runtime::{
     describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
     resolve_python_launcher_resource_aware, resolve_runtime_import_root,
     should_enable_runtime_bootstrap, BridgeResourceContext, PythonEnvCommand, PythonLauncher,
-    PythonLauncherResolutionOptions, PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    PythonLauncherCategory, PythonLauncherError, PythonLauncherResolutionOptions,
+    PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -1620,22 +1621,90 @@ pub(crate) struct OperatorBridgeLaunchPreparation {
     pub launcher: Option<PythonLauncher>,
 }
 
+#[derive(Debug)]
+pub(crate) struct OperatorBridgeLaunchPreparationError {
+    stage: &'static str,
+    code: &'static str,
+    category: &'static str,
+}
+
+impl OperatorBridgeLaunchPreparationError {
+    fn new(
+        stage: &'static str,
+        code: &'static str,
+        category: &'static str,
+        _message: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            code,
+            category,
+        }
+    }
+
+    fn from_launcher(err: PythonLauncherError) -> Self {
+        let stage = match err.category {
+            PythonLauncherCategory::BundledRuntimeProbeFailed
+            | PythonLauncherCategory::BundledRuntimeNotPython3
+            | PythonLauncherCategory::BundledRuntimeWrongArchitecture
+            | PythonLauncherCategory::BundledRuntimeNotExecutable
+            | PythonLauncherCategory::AppleDeveloperToolsStub => "bundled_runtime_probe",
+            _ => "bundled_runtime_resolution",
+        };
+        Self::new(
+            stage,
+            err.public_code,
+            err.category.as_str(),
+            err.to_string(),
+        )
+    }
+
+    fn metadata(&self) -> (&'static str, &'static str, &'static str) {
+        (self.stage, self.code, self.category)
+    }
+}
+
+impl std::fmt::Display for OperatorBridgeLaunchPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} stage={} category={}",
+            self.code, self.stage, self.category
+        )
+    }
+}
+
+impl std::error::Error for OperatorBridgeLaunchPreparationError {}
+
 pub(crate) fn prepare_operator_bridge_launch(
     context: &BridgeResourceContext<'_>,
-) -> anyhow::Result<OperatorBridgeLaunchPreparation> {
+) -> Result<OperatorBridgeLaunchPreparation, OperatorBridgeLaunchPreparationError> {
     let bridge_script = resolve_bridge_script_for(
         context.exe_path,
         context.manifest_dir,
         context.tauri_resource_dir,
         None,
     )
-    .map_err(anyhow::Error::msg)?;
+    .map_err(|err| {
+        OperatorBridgeLaunchPreparationError::new(
+            "bridge_script_resolution",
+            "bridge_script_unresolved",
+            "bridge_script_resolution",
+            err,
+        )
+    })?;
     let launcher = if is_python_script(&bridge_script) {
         let launcher = resolve_python_launcher_resource_aware(
             context.launcher_options("TOKEN_PLACE_SIDECAR_PYTHON"),
-        )?;
+        )
+        .map_err(OperatorBridgeLaunchPreparationError::from_launcher)?;
         if !packaged_launcher_source_is_valid(context.packaged(), Some(&launcher.source)) {
-            anyhow::bail!("desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime");
+            return Err(OperatorBridgeLaunchPreparationError::new(
+                "packaged_launcher_validation",
+                "packaged_launcher_source_invalid",
+                "packaged_launcher_validation",
+                "packaged operator must use bundled runtime",
+            ));
         }
         Some(launcher)
     } else {
@@ -1655,39 +1724,9 @@ fn packaged_launcher_source_is_valid(
 }
 
 fn operator_bridge_preparation_failure_metadata(
-    message: &str,
+    err: &OperatorBridgeLaunchPreparationError,
 ) -> (&'static str, &'static str, &'static str) {
-    if message.contains("compute_node_bridge.py") {
-        (
-            "bridge_script_resolution",
-            "bridge_script_unresolved",
-            "bridge_script_resolution",
-        )
-    } else if message.contains("packaged Windows/macOS operator") {
-        (
-            "packaged_launcher_validation",
-            "packaged_launcher_source_invalid",
-            "packaged_launcher_validation",
-        )
-    } else if message.contains("desktop_python_runtime_invalid") {
-        (
-            "packaged_launcher_validation",
-            "packaged_launcher_source_invalid",
-            "packaged_launcher_validation",
-        )
-    } else if message.contains("metadata") || message.contains("probe") {
-        (
-            "bundled_runtime_probe",
-            "bundled_metadata_probe_failed",
-            "bundled_runtime_probe",
-        )
-    } else {
-        (
-            "bundled_runtime_resolution",
-            "python_launcher_resolution_failed",
-            "bundled_runtime_resolution",
-        )
-    }
+    err.metadata()
 }
 
 pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::Result<Value> {
@@ -1699,6 +1738,15 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         tauri_resource_dir: None,
     };
     let preparation = prepare_operator_bridge_launch(&context)?;
+    operator_session_smoke_record_from_preparation(config, &context, &preparation)
+}
+
+fn operator_session_smoke_record_from_preparation(
+    config: &DesktopConfig,
+    context: &BridgeResourceContext<'_>,
+    preparation: &OperatorBridgeLaunchPreparation,
+) -> anyhow::Result<Value> {
+    let manifest_dir = context.manifest_dir;
     let launcher = preparation
         .launcher
         .as_ref()
@@ -1825,7 +1873,8 @@ pub(crate) fn operator_start_preflight_record(
         anyhow::bail!("operator_preflight_not_ready: controlled bridge did not report ready");
     }
 
-    let mut payload = operator_session_smoke_record(config)?;
+    let mut payload =
+        operator_session_smoke_record_from_preparation(config, &context, &preparation)?;
     if let Value::Object(map) = &mut payload {
         map.insert(
             "operator_start_preflight".into(),
@@ -1918,7 +1967,7 @@ pub async fn start_compute_node(
         Ok(preparation) => preparation,
         Err(err) => {
             let message = err.to_string();
-            let (stage, code, category) = operator_bridge_preparation_failure_metadata(&message);
+            let (stage, code, category) = operator_bridge_preparation_failure_metadata(&err);
             complete_no_child_startup_failure(
                 &state,
                 &request,
@@ -6122,7 +6171,26 @@ mod tests {
     }
 
     #[test]
-    fn installed_context_probe_helper_configures_executed_command_environment() {
+    fn operator_bridge_preparation_failure_metadata_preserves_typed_error() {
+        let err = OperatorBridgeLaunchPreparationError::new(
+            "bundled_runtime_probe",
+            "desktop_python_runtime_invalid",
+            "bundled_runtime_wrong_architecture",
+            "safe test error",
+        );
+
+        assert_eq!(
+            operator_bridge_preparation_failure_metadata(&err),
+            (
+                "bundled_runtime_probe",
+                "desktop_python_runtime_invalid",
+                "bundled_runtime_wrong_architecture",
+            )
+        );
+    }
+
+    #[test]
+    fn prepare_operator_bridge_launch_configures_preflight_command_environment() {
         let temp = TempDir::new().expect("tempdir");
         let manifest_dir = temp
             .path()

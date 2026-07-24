@@ -115,7 +115,7 @@ pub enum PythonLauncherCategory {
 }
 
 impl PythonLauncherCategory {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::BundledRuntimeMissing => "bundled_runtime_missing",
             Self::BundledRuntimeNotExecutable => "bundled_runtime_not_executable",

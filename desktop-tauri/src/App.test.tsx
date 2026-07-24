@@ -441,6 +441,78 @@ describe('desktop app start failure handling', () => {
     resolveStart?.();
   });
 
+  it('disables Start operator when the operator is already running on load', async () => {
+    mockInitialComputeStatus({
+      running: true,
+      registered: true,
+      relay_runtime_state: 'ready',
+      warm_load_state: 'ready',
+      warm_load_enabled: true,
+      model_path: '/tmp/model.gguf',
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(true));
+
+    fireEvent.click(startOperatorButton);
+    expect(invokeMock.mock.calls.some(([command]) => command === 'start_compute_node')).toBe(false);
+  });
+
+  it('disables Start operator when the model path is empty', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '',
+          relay_base_url: 'https://token.place',
+          relay_base_urls: ['https://token.place'],
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(true));
+
+    fireEvent.click(startOperatorButton);
+    expect(invokeMock.mock.calls.some(([command]) => command === 'start_compute_node')).toBe(false);
+  });
+
+  it('disables Start operator after clearing Relay URL 1 to whitespace', async () => {
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    fireEvent.change(relayInput, { target: { value: '   ' } });
+
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(true));
+    fireEvent.click(startOperatorButton);
+    expect(invokeMock.mock.calls.some(([command]) => command === 'start_compute_node')).toBe(false);
+  });
+
+  it('still enables Start operator using the default relay when legacy config omits relay_base_urls', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'load_config') {
+        return Promise.resolve({
+          model_path: '/tmp/model.gguf',
+          relay_base_url: '',
+          preferred_mode: 'auto',
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const relayInput = (await screen.findByLabelText('Relay URL 1')) as HTMLInputElement;
+    await waitFor(() => expect(relayInput.value).toBe('https://token.place'));
+
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+  });
+
   it('keeps model path blank on first launch when config has no persisted model path', async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'detect_backend') {

@@ -1598,6 +1598,19 @@ fn with_log_file_path(mut payload: Value, log_file_path: Option<&str>) -> Value 
     payload
 }
 
+fn append_startup_failure_log(
+    log_sink: &Option<OperatorLogSink>,
+    stage: &str,
+    code: &str,
+    category: &str,
+) {
+    append_operator_log_line(
+        log_sink,
+        "desktop.compute_node.startup_failure",
+        &format!("stage={stage} code={code} category={category}"),
+    );
+}
+
 fn packaged_launcher_source_is_valid(
     is_packaged_execution: bool,
     launcher_source: Option<&PythonLauncherSource>,
@@ -1760,6 +1773,12 @@ pub async fn start_compute_node(
     let bridge_script = match resolve_bridge_script(&app) {
         Ok(bridge_script) => bridge_script,
         Err(err) => {
+            append_startup_failure_log(
+                &log_sink,
+                "bridge_script_resolution",
+                "desktop_bridge_script_missing",
+                "bridge_script_resolution",
+            );
             complete_no_child_startup_failure(
                 &state,
                 &request,
@@ -1792,6 +1811,13 @@ pub async fn start_compute_node(
             Ok(result) => match result {
                 Ok(launcher) => Some(launcher),
                 Err(err) => {
+                    let category = err.category.as_str();
+                    append_startup_failure_log(
+                        &log_sink,
+                        "bundled_runtime_probe",
+                        err.public_code,
+                        category,
+                    );
                     complete_no_child_startup_failure(
                         &state,
                         &request,
@@ -1805,6 +1831,12 @@ pub async fn start_compute_node(
             },
             Err(err) => {
                 let err = anyhow::anyhow!("python launcher resolver task failed: {err}");
+                append_startup_failure_log(
+                    &log_sink,
+                    "bundled_runtime_resolution",
+                    "desktop_python_runtime_invalid",
+                    "launcher_task_failed",
+                );
                 complete_no_child_startup_failure(
                     &state,
                     &request,
@@ -1847,6 +1879,12 @@ pub async fn start_compute_node(
         let err = anyhow::anyhow!(
             "desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime"
         );
+        append_startup_failure_log(
+            &log_sink,
+            "packaged_launcher_validation",
+            "desktop_python_runtime_invalid",
+            "packaged_launcher_validation",
+        );
         complete_no_child_startup_failure(
             &state,
             &request,
@@ -1861,6 +1899,12 @@ pub async fn start_compute_node(
     let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
         Ok(command) => command,
         Err(err) => {
+            append_startup_failure_log(
+                &log_sink,
+                "command_build",
+                "desktop_bridge_command_invalid",
+                "command_build",
+            );
             complete_no_child_startup_failure(
                 &state,
                 &request,
@@ -1965,6 +2009,12 @@ pub async fn start_compute_node(
     let mut child = match spawn_result {
         Ok(child) => child,
         Err(err) => {
+            append_startup_failure_log(
+                &log_sink,
+                "child_spawn",
+                "desktop_bridge_spawn_failed",
+                "child_spawn",
+            );
             complete_no_child_startup_failure(
                 &state,
                 &request,

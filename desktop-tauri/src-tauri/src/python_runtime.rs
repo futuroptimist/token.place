@@ -53,6 +53,11 @@ impl PythonLauncher {
     fn command_for_version_check(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        if self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+        } else {
+            disable_python_user_site(&mut cmd);
+        }
         cmd.arg("--version");
         cmd
     }
@@ -60,6 +65,11 @@ impl PythonLauncher {
     fn command_for_metadata_probe(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        if self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+        } else {
+            disable_python_user_site(&mut cmd);
+        }
         cmd.arg("-c");
         cmd.arg("import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))");
         cmd
@@ -102,7 +112,7 @@ pub enum PythonLauncherCategory {
 }
 
 impl PythonLauncherCategory {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::BundledRuntimeMissing => "bundled_runtime_missing",
             Self::BundledRuntimeNotExecutable => "bundled_runtime_not_executable",
@@ -1066,18 +1076,30 @@ where
     C: PythonEnvCommand,
 {
     command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
+    command.set_env("PYTHONDONTWRITEBYTECODE", std::ffi::OsStr::new("1"));
     command.remove_env(std::ffi::OsStr::new("PYTHONHOME"));
+    command.remove_env(std::ffi::OsStr::new("PYTHONPATH"));
     command.remove_env(std::ffi::OsStr::new("PYTHONUSERBASE"));
+    command.remove_env(std::ffi::OsStr::new("PYTHONEXECUTABLE"));
 }
 
 const PACKAGED_MUTABLE_ENV_PREFIXES: &[&str] = &["PIP_", "CMAKE_"];
 const PACKAGED_MUTABLE_ENV_KEYS: &[&str] = &[
     "TOKEN_PLACE_DESKTOP_PYTHON",
+    "TOKEN_PLACE_SIDECAR_PYTHON",
+    "TOKEN_PLACE_PYTHON",
+    "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
     "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET",
     "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP",
+    "TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP",
     "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD",
     "PYTHONHOME",
+    "PYTHONPATH",
     "PYTHONUSERBASE",
+    "PYTHONEXECUTABLE",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
     "FORCE_CMAKE",
 ];
 
@@ -1085,6 +1107,8 @@ pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C)
 where
     C: PythonEnvCommand,
 {
+    command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
+    command.set_env("PYTHONDONTWRITEBYTECODE", std::ffi::OsStr::new("1"));
     for key in PACKAGED_MUTABLE_ENV_KEYS {
         command.remove_env(std::ffi::OsStr::new(key));
     }
@@ -2162,6 +2186,37 @@ mod tests {
     }
 
     #[test]
+    fn bundled_metadata_probe_sanitizes_poisoned_host_python_env() {
+        let launcher = PythonLauncher::new(
+            if cfg!(windows) {
+                "C:/runtime/python.exe"
+            } else {
+                "/runtime/bin/python3"
+            },
+            vec![],
+            PythonLauncherSource::BundledRuntime,
+            "bundled-cpython-3.11-win-x86_64-cu124",
+        );
+        let command = launcher.command_for_metadata_probe();
+        assert!(command_env_removed(&command, "PYTHONHOME"));
+        assert!(command_env_removed(&command, "PYTHONPATH"));
+        assert!(command_env_removed(&command, "PYTHONUSERBASE"));
+        assert!(command_env_removed(&command, "VIRTUAL_ENV"));
+        assert!(command_env_removed(&command, "CONDA_PREFIX"));
+        assert!(command_env_removed(
+            &command,
+            "TOKEN_PLACE_PYTHON_IMPORT_ROOT"
+        ));
+        assert_eq!(
+            command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            command_env_value(&command, "PYTHONDONTWRITEBYTECODE").as_deref(),
+            Some("1")
+        );
+    }
+
     fn configure_python_subprocess_env_for_layout_sanitizes_packaged_even_with_dev_marker() {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("Resources");

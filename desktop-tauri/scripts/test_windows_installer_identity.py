@@ -162,6 +162,14 @@ def build_scenarios(current_nsis: Path, current_msi: Path, previous_nsis: Path, 
     ]
 
 
+def build_current_package_scenario(current_nsis: Path, expected_version: str) -> Scenario:
+    """Build the single clean-NSIS scenario used by the hosted-Windows PR gate."""
+    installer = classify_installer(current_nsis, expected_version)
+    if installer.kind != "nsis":
+        raise InstallerIdentityError("current-package PR validation requires an NSIS installer")
+    return Scenario(f"pr-clean-current-nsis-{expected_version}", installer)
+
+
 def validate_previous_artifacts(previous_nsis: Path, previous_msi: Path, previous_version: str) -> None:
     nsis = classify_installer(previous_nsis, previous_version)
     msi = classify_installer(previous_msi, previous_version)
@@ -842,10 +850,16 @@ def run_all_scenarios(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--windows-nsis", type=Path, required=True)
-    parser.add_argument("--windows-msi", type=Path, required=True)
-    parser.add_argument("--previous-windows-nsis", type=Path, required=True)
-    parser.add_argument("--previous-windows-msi", type=Path, required=True)
+    parser.add_argument(
+        "--pr-current-windows-nsis",
+        type=Path,
+        default=None,
+        help="Run the hosted-Windows PR gate against exactly one current-head NSIS package.",
+    )
+    parser.add_argument("--windows-nsis", type=Path)
+    parser.add_argument("--windows-msi", type=Path)
+    parser.add_argument("--previous-windows-nsis", type=Path)
+    parser.add_argument("--previous-windows-msi", type=Path)
     parser.add_argument(
         "--previous-version",
         default=None,
@@ -857,6 +871,26 @@ def main() -> int:
     args = parser.parse_args()
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
+    if args.pr_current_windows_nsis is not None:
+        if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)):
+            raise InstallerIdentityError("--pr-current-windows-nsis cannot be combined with full release scenario arguments")
+        scenario = build_current_package_scenario(args.pr_current_windows_nsis, args.expected_version)
+        if sys.platform != "win32":
+            print("validated current-package Windows NSIS PR-gate contract; real install runs only on hosted Windows")
+            return 0
+        artifacts = ScenarioArtifactDir(args.artifact_dir) if args.artifact_dir else None
+        run_scenario(scenario, args.expected_build_id, artifacts)
+        print(f"validated current-package Windows NSIS for {args.expected_version} build {args.expected_build_id}")
+        return 0
+    required = {
+        "--windows-nsis": args.windows_nsis,
+        "--windows-msi": args.windows_msi,
+        "--previous-windows-nsis": args.previous_windows_nsis,
+        "--previous-windows-msi": args.previous_windows_msi,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise InstallerIdentityError(f"full release validation requires {', '.join(missing)}")
     previous_version = args.previous_version or immediate_prior_version(args.expected_version)
     validate_previous_artifacts(args.previous_windows_nsis, args.previous_windows_msi, previous_version)
     scenarios = build_scenarios(args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.expected_version, previous_version)

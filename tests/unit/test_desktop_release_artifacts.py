@@ -3566,6 +3566,67 @@ def test_windows_installer_identity_requires_previous_artifacts(tmp_path) -> Non
         guard.validate_previous_artifacts(previous_nsis, current_msi, '0.1.2')
 
 
+def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_scenario(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
+    current_nsis.write_text('artifact', encoding='utf-8')
+    artifact_dir = tmp_path / 'logs'
+    calls = []
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, 'run_scenario', lambda scenario, build_id, artifacts=None: calls.append((scenario, build_id, artifacts)))
+    monkeypatch.setattr(sys, 'argv', [
+        'test_windows_installer_identity.py',
+        '--pr-current-windows-nsis', str(current_nsis),
+        '--expected-version', '0.1.5',
+        '--expected-build-id', 'abcdef123456',
+        '--artifact-dir', str(artifact_dir),
+    ])
+
+    assert guard.main() == 0
+    assert len(calls) == 1
+    scenario, build_id, artifacts = calls[0]
+    assert scenario.name == 'pr-clean-current-nsis-0.1.5'
+    assert scenario.current.kind == 'nsis'
+    assert scenario.previous is None
+    assert build_id == 'abcdef123456'
+    assert artifacts.root == artifact_dir
+
+
+def test_windows_installer_identity_full_release_scenarios_remain_clean_and_upgrade(tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    paths = [
+        tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe',
+        tmp_path / 'token.place-desktop-0.1.5-x64.msi',
+        tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe',
+        tmp_path / 'token.place-desktop-0.1.4-x64.msi',
+    ]
+    for path in paths:
+        path.write_text('artifact', encoding='utf-8')
+
+    scenarios = guard.build_scenarios(*paths, '0.1.5', '0.1.4')
+
+    assert len(scenarios) == 6
+    assert [scenario.previous is None for scenario in scenarios] == [True, True, False, False, False, False]
+
+
+def test_windows_packaged_start_workflow_builds_and_validates_current_nsis() -> None:
+    workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
+
+    assert 'prepare_windows_embedded_python_runtime.py' in workflow
+    assert 'tauri build -- --target x86_64-pc-windows-msvc --bundles nsis' in workflow
+    assert '--pr-current-windows-nsis' in workflow
+    assert '--operator-start-preflight' in Path('desktop-tauri/scripts/test_windows_installer_identity.py').read_text(encoding='utf-8')
+
+
+def test_windows_packaged_start_workflow_cannot_be_only_filtered_cargo_tests() -> None:
+    workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
+    packaged_gate = workflow.split('- name: Hosted-Windows packaged-start gate for installed current package', 1)[1]
+
+    assert 'test_windows_installer_identity.py' in packaged_gate
+    assert '--pr-current-windows-nsis' in packaged_gate
+    assert 'cargo test' not in packaged_gate.split('- name:', 1)[0]
+
+
 def test_windows_installer_identity_rejects_duplicate_previous_artifact(tmp_path) -> None:
     guard = _load_windows_installer_identity()
     previous_nsis = tmp_path / 'token.place-desktop-0.1.4-x64-setup.exe'

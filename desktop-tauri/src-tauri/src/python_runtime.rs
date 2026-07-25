@@ -1163,7 +1163,16 @@ where
 }
 
 const PACKAGED_MUTABLE_ENV_PREFIXES: &[&str] = &["PIP_", "CMAKE_"];
-const PACKAGED_ENV_FUNDAMENTALS: &[&str] = &["SystemRoot", "ComSpec", "TEMP", "TMP", "WINDIR"];
+const PACKAGED_ENV_FUNDAMENTALS: &[&str] = &[
+    "SystemRoot",
+    "ComSpec",
+    "TEMP",
+    "TMP",
+    "WINDIR",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+];
 
 const PACKAGED_MUTABLE_ENV_KEYS: &[&str] = &[
     "TOKEN_PLACE_DESKTOP_PYTHON",
@@ -2587,6 +2596,51 @@ mod tests {
                     Some("PYTHONNOUSERSITE" | "PYTHONDONTWRITEBYTECODE")
                 )
         }));
+    }
+
+    #[test]
+    fn packaged_sanitizer_preserves_bounded_windows_profile_fundamentals() {
+        let _lock = RUNTIME_BOOTSTRAP_ENV_TEST_LOCK.lock().unwrap();
+        let fundamentals = [
+            ("APPDATA", r"C:\Users\operator\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\operator\AppData\Local"),
+            ("USERPROFILE", r"C:\Users\operator"),
+        ];
+        let previous = fundamentals
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        for (key, value) in fundamentals {
+            std::env::set_var(key, value);
+        }
+
+        let mut effective = PythonEnvCommandRecorder::with_poisoned_env();
+        effective.set_env("PATH", "poison-host-tools");
+        sanitize_packaged_python_subprocess_env(&mut effective);
+
+        for (key, value) in fundamentals {
+            assert_eq!(effective.value(key), Some(std::ffi::OsStr::new(value)));
+        }
+        for key in [
+            "PATH",
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "PIP_INDEX_URL",
+            "CMAKE_ARGS",
+            "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
+        ] {
+            assert_eq!(effective.value(key), None, "{key} must not reach the child");
+        }
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
     }
 
     #[test]

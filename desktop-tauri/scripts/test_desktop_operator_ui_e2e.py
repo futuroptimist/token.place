@@ -176,6 +176,24 @@ def assert_model_path_exists(path: str) -> None:
         raise AssertionError(f"model path does not exist: {path}")
 
 
+def resolve_real_e2e_model_path() -> Path:
+    raw_path = os.environ.get("TOKENPLACE_REAL_E2E_MODEL_PATH", "").strip()
+    if not raw_path:
+        raise RuntimeError(
+            "TOKENPLACE_REAL_E2E_MODEL_PATH must point to the provisioned CI tiny GGUF"
+        )
+    model_path = Path(raw_path).expanduser()
+    if not model_path.is_absolute():
+        raise RuntimeError("TOKENPLACE_REAL_E2E_MODEL_PATH must be an absolute path")
+    if not model_path.is_file():
+        raise RuntimeError(
+            "TOKENPLACE_REAL_E2E_MODEL_PATH must point to an existing regular file"
+        )
+    if model_path.stat().st_size == 0:
+        raise RuntimeError("TOKENPLACE_REAL_E2E_MODEL_PATH must point to a non-empty GGUF")
+    return model_path
+
+
 def wait_for_running_stability(
     driver: webdriver.Remote, expected: str, stable_seconds: float = 2.0
 ) -> None:
@@ -592,7 +610,7 @@ def main() -> int:
 
     driver: webdriver.Remote | None = None
     landing_driver: webdriver.Chrome | None = None
-    model_path: str | None = None
+    model_path = resolve_real_e2e_model_path()
     try:
         wait_for_http_200(f"{relay_url}/livez")
         ensure_alive(relay, "relay")
@@ -624,18 +642,16 @@ def main() -> int:
         assert initial_model_value == "", (
             f"expected first-launch model path to be blank; got {initial_model_value!r}"
         )
-        with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as model_file:
-            model_path = model_file.name
         if runtime_resolved_path:
-            # Capture for diagnostics, but keep temp path deterministic for CI.
+            # Capture for diagnostics, but keep the provisioned path authoritative.
             print(f"Runtime resolved path (not used as primary test path): {runtime_resolved_path}")
-        fill_input_by_label(driver, "Model GGUF path", model_path)
+        fill_input_by_label(driver, "Model GGUF path", str(model_path))
         model_input = driver.find_element(
             By.XPATH,
             "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]",
         )
-        assert model_input.get_attribute("value") == model_path
-        assert_model_path_exists(model_path)
+        assert model_input.get_attribute("value") == str(model_path)
+        assert_model_path_exists(str(model_path))
         fill_input_by_label(driver, "Relay URL 1", relay_url)
 
         wait_for_start_operator_enabled(driver, relay_log, driver_log)
@@ -738,9 +754,6 @@ def main() -> int:
                 landing_driver.quit()
         if driver is not None:
             driver.quit()
-        if model_path:
-            with contextlib.suppress(FileNotFoundError):
-                Path(model_path).unlink()
         terminate_process(tauri_driver)
         terminate_process(relay)
         shutil.rmtree(isolated_home, ignore_errors=True)

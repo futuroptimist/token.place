@@ -116,12 +116,26 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
+          python -m pip install "$(sed -n '/^llama_cpp_python==/p' requirements.txt)"
           pip install selenium
+
+      - name: Restore cached tiny real GGUF for desktop operator UI e2e
+        uses: actions/cache@v4
+        with:
+          path: .ci-models/stories15M-q4_0.gguf
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
+
+      - name: Provision tiny real GGUF for desktop operator UI e2e
+        env:
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+        run: bash scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
 
       - name: Run full Rust suite
         run: cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml
 
       - name: Run desktop operator UI e2e
+        env:
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
         run: xvfb-run -a python desktop-tauri/scripts/test_desktop_operator_ui_e2e.py
 
       - name: Run packaged operator bridge e2e

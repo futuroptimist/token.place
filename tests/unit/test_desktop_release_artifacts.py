@@ -4645,6 +4645,17 @@ def test_windows_installer_identity_safe_env_restricts_path_and_preserves_requir
     assert env['ComSpec'] == r'C:\Windows\System32\cmd.exe'
     assert env['APPDATA'] == r'C:\Users\runner\AppData\Roaming'
     assert env['TOKENPLACE_EXTRA'] == 'ok'
+    assert env['PYTHONHOME'] == str(sentinel / 'poison-pythonhome')
+    assert env['PYTHONPATH'] == str(sentinel / 'poison-pythonpath')
+    assert env['PYTHONUSERBASE'] == str(sentinel / 'poison-userbase')
+    assert env['VIRTUAL_ENV'] == str(sentinel / 'poison-venv')
+    assert env['CONDA_PREFIX'] == str(sentinel / 'poison-conda')
+    assert env['PIP_INDEX_URL'] == 'https://invalid.token.place.local/simple'
+    assert env['PIP_NO_INDEX'] == '1'
+    assert env['CMAKE_ARGS'] == '-DTOKEN_PLACE_SENTINEL=ON'
+    assert env['FORCE_CMAKE'] == '1'
+    assert env['TOKEN_PLACE_SIDECAR_PYTHON'] == str(sentinel / 'python.exe')
+    assert env['TOKEN_PLACE_PYTHON_IMPORT_ROOT'] == str(sentinel / 'poison-import-root')
 
 
 def test_windows_installer_identity_sentinel_dir_creates_every_host_tool_guard(tmp_path) -> None:
@@ -4712,6 +4723,47 @@ def test_windows_installer_identity_operator_record_accepts_64k_ready_contract()
     parsed = guard.assert_operator_record(json.dumps(record), expected_tier='64k-full', launch_number=2)
 
     assert parsed['effective_n_ctx'] == 65536
+
+
+@pytest.mark.parametrize(
+    ('override', 'error'),
+    [
+        ({'resource_context_source': 'manifest_dir'}, 'real Tauri AppHandle'),
+        ({'bridge_child_spawned': False}, 'spawned child and parsed bridge event'),
+        ({'bridge_event_received': False}, 'spawned child and parsed bridge event'),
+        ({'controlled_ready': False}, 'controlled ready'),
+        ({'startup_result': 'terminal_actionable_error'}, 'controlled ready'),
+        ({'network_actions': 1}, 'forbidden action counter network_actions'),
+    ],
+)
+def test_windows_installer_identity_operator_preflight_fails_closed(override, error) -> None:
+    guard = _load_windows_installer_identity()
+    record = {
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'model_artifact_inspect': 'ok',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
+        'context_tier': '8k-fast',
+        'effective_n_ctx': 8192,
+        'n_ctx': 8192,
+        'selected_model_profile': 'qwen3-8b-q4',
+        'startup_phase': 'ready',
+        'startup_deadline_ms': 15000,
+        'startup_result': 'ready',
+        'operator_start_preflight': 'ok',
+        'resource_context_source': 'tauri_app_handle',
+        'bridge_child_spawned': True,
+        'bridge_event_received': True,
+        'controlled_ready': True,
+    }
+    record.update(override)
+
+    with pytest.raises(guard.InstallerIdentityError, match=error):
+        guard.assert_operator_record(json.dumps(record), expected_tier='8k-fast')
 
 
 def test_windows_installer_identity_operator_record_rejects_multiline_or_fallback() -> None:

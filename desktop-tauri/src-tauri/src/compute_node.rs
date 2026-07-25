@@ -447,21 +447,12 @@ fn is_python_script(path: &str) -> bool {
 }
 
 fn build_installed_context_probe_command(
-    launcher: &PythonLauncher,
-    bridge_script: &Path,
-    context: &BridgeResourceContext<'_>,
+    preparation: &OperatorBridgeLaunchPreparation,
     config: &DesktopConfig,
-) -> std::process::Command {
-    let mut command = launcher.command_for_script_blocking(bridge_script);
-    configure_runtime_pythonpath(
-        &mut command,
-        context.manifest_dir,
-        bridge_script,
-        context.exe_path,
-        context.tauri_resource_dir,
-    );
+) -> anyhow::Result<std::process::Command> {
+    let mut command = preparation.blocking_command()?;
     configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
-    command
+    Ok(command)
 }
 
 fn bridge_script_candidates(
@@ -1850,19 +1841,17 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         tauri_resource_dir: None,
     };
     let preparation = prepare_operator_bridge_launch(&context)?;
-    operator_session_smoke_record_from_preparation(config, &context, &preparation)
+    operator_session_smoke_record_from_preparation(config, &preparation)
 }
 
 fn operator_session_smoke_record_from_preparation(
     config: &DesktopConfig,
-    context: &BridgeResourceContext<'_>,
     preparation: &OperatorBridgeLaunchPreparation,
 ) -> anyhow::Result<Value> {
     let launcher = preparation
         .launcher
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("missing bundled Python launcher for operator smoke"))?;
-    let bridge_script = preparation.bridge_script.clone();
     let mut model_inspect_command = preparation.model_inspect_command()?;
     model_inspect_command.arg("inspect");
     let model_inspect_output = model_inspect_command.output()?;
@@ -1872,7 +1861,6 @@ fn operator_session_smoke_record_from_preparation(
     let model_inspect_stdout = String::from_utf8_lossy(&model_inspect_output.stdout);
     let model_inspect_json: Value = serde_json::from_str(model_inspect_stdout.trim())?;
     let model_artifact_filename = inspect_model_artifact_filename(&model_inspect_json)?;
-    let bridge_script_path = Path::new(&bridge_script);
     let selected_resource_root = preparation.resource_root.clone();
     let selected_layout = preparation.layout.clone();
     let import_root = Some(preparation.import_root.clone());
@@ -1882,8 +1870,7 @@ fn operator_session_smoke_record_from_preparation(
         PythonLauncherSource::EnvironmentOverride => "environment_override",
         PythonLauncherSource::SystemDevelopmentRuntime => "system_development",
     };
-    let mut context_probe_command =
-        build_installed_context_probe_command(&launcher, bridge_script_path, &context, config);
+    let mut context_probe_command = build_installed_context_probe_command(preparation, config)?;
     context_probe_command.arg("--installed-context-smoke");
     context_probe_command
         .arg("--context-tier")
@@ -1968,8 +1955,7 @@ pub(crate) fn operator_start_preflight_record(
         anyhow::bail!("operator_preflight_not_ready: controlled bridge did not report ready");
     }
 
-    let mut payload =
-        operator_session_smoke_record_from_preparation(config, &context, &preparation)?;
+    let mut payload = operator_session_smoke_record_from_preparation(config, &preparation)?;
     if let Value::Object(map) = &mut payload {
         map.insert(
             "operator_start_preflight".into(),
@@ -6302,10 +6288,17 @@ mod tests {
             manifest_dir: &manifest_dir,
             tauri_resource_dir: Some(&resource_root),
         };
+        let preparation = OperatorBridgeLaunchPreparation {
+            bridge_script: bridge_script.to_string_lossy().into_owned(),
+            launcher: Some(launcher),
+            resource_root: resource_root.clone(),
+            import_root: resource_root.clone(),
+            layout: ResourceLayoutKind::WindowsResources,
+        };
         let config = DesktopConfig::default();
 
-        let command =
-            build_installed_context_probe_command(&launcher, &bridge_script, &context, &config);
+        let command = build_installed_context_probe_command(&preparation, &config)
+            .expect("build prepared context probe");
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -6375,6 +6368,64 @@ mod tests {
                 )
             )
         }));
+    }
+
+    #[test]
+    fn installed_context_probe_uses_prepared_import_root_under_poisoned_override() {
+        let _env_guard = crate::python_runtime::RUNTIME_BOOTSTRAP_ENV_TEST_LOCK
+            .lock()
+            .expect("runtime bootstrap env test lock");
+        let temp = TempDir::new().expect("tempdir");
+        let import_root = temp.path().join("prepared-resources");
+        let poisoned_root = temp.path().join("poisoned-resources");
+        std::fs::create_dir_all(import_root.join("python")).expect("create import root");
+        let bridge_script = import_root.join("python").join("compute_node_bridge.py");
+        std::fs::write(&bridge_script, "# compute bridge\n").expect("write bridge script");
+        let preparation = OperatorBridgeLaunchPreparation {
+            bridge_script: bridge_script.to_string_lossy().into_owned(),
+            launcher: Some(PythonLauncher {
+                program: "python3".into(),
+                args: Vec::new(),
+                source: PythonLauncherSource::BundledRuntime,
+                runtime_id: "test-runtime".into(),
+            }),
+            resource_root: import_root.clone(),
+            import_root: import_root.clone(),
+            layout: ResourceLayoutKind::WindowsResources,
+        };
+        let previous = std::env::var_os("TOKEN_PLACE_PYTHON_IMPORT_ROOT");
+        // SAFETY: The shared environment-test lock prevents concurrent mutation, and the
+        // previous value is restored before this test returns.
+        unsafe {
+            std::env::set_var("TOKEN_PLACE_PYTHON_IMPORT_ROOT", &poisoned_root);
+        }
+
+        let command =
+            build_installed_context_probe_command(&preparation, &DesktopConfig::default())
+                .expect("build prepared context probe");
+
+        // SAFETY: Restore the process environment while still holding the shared lock.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("TOKEN_PLACE_PYTHON_IMPORT_ROOT", value),
+                None => std::env::remove_var("TOKEN_PLACE_PYTHON_IMPORT_ROOT"),
+            }
+        }
+        assert_eq!(
+            std_command_env_value(&command, "TOKEN_PLACE_PYTHON_IMPORT_ROOT").as_deref(),
+            import_root.to_str()
+        );
+        let python_dir = import_root.join("python");
+        let expected_pythonpath =
+            std::env::join_paths([import_root.as_path(), python_dir.as_path()])
+                .expect("join prepared Python path");
+        assert_eq!(
+            command
+                .get_envs()
+                .find_map(|(key, value)| (key == "PYTHONPATH").then_some(value))
+                .flatten(),
+            Some(expected_pythonpath.as_os_str())
+        );
     }
 
     #[cfg(unix)]

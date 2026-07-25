@@ -5222,6 +5222,56 @@ def test_windows_installer_identity_probe_and_launch_failure_edges(monkeypatch, 
         guard.probe_identity(exe, {}, '0.1.3', 'abcdef123456')
 
 
+def test_windows_installer_identity_operator_smoke_separates_stderr(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'token.place.exe'
+    log_path = tmp_path / 'operator-smoke.log'
+    stdout = json.dumps({
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'model_artifact_inspect': 'ok',
+        'model_artifact_filename': guard.EXPECTED_MODEL_ARTIFACT_FILENAME,
+    }) + '\n'
+    stderr = 'Failed to unregister class Chrome_WidgetWin_0\n'
+
+    def fake_run(*args, **kwargs):
+        assert kwargs['stderr'] is subprocess.PIPE
+        return subprocess.CompletedProcess(args[0], 0, stdout, stderr)
+
+    monkeypatch.setattr(guard.subprocess, 'run', fake_run)
+
+    captured_stdout = guard.launch_for_operator_record(exe, {}, log_path)
+    assert guard.assert_operator_record(captured_stdout)['record'] == 'desktop.compute_node.session.layout'
+    artifact = log_path.read_text(encoding='utf-8')
+    assert f'stdout:\n{stdout}' in artifact
+    assert f'stderr:\n{stderr}' in artifact
+
+
+def test_windows_installer_identity_operator_smoke_nonzero_still_fails(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'token.place.exe'
+    monkeypatch.setattr(
+        guard,
+        '_run',
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, '{"record":"ready"}\n', 'webview diagnostic\n'),
+    )
+
+    with pytest.raises(guard.InstallerIdentityError, match='operator-session smoke launch failed'):
+        guard.launch_for_operator_record(exe, {})
+
+
+@pytest.mark.parametrize('stdout', ['', 'not json\n', '{} trailing\n', '{}\n{}\n'])
+def test_windows_installer_identity_operator_stdout_must_be_one_json_record(stdout) -> None:
+    guard = _load_windows_installer_identity()
+
+    with pytest.raises(guard.InstallerIdentityError):
+        guard.assert_operator_record(stdout)
+
+
 def test_windows_installer_identity_operator_record_rejects_readiness_and_runtime_mutation() -> None:
     guard = _load_windows_installer_identity()
     base = {

@@ -122,13 +122,29 @@ def _run(
     timeout: int = 180,
     check: bool = True,
     log_path: Path | None = None,
+    separate_stderr: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=timeout)
+    result = subprocess.run(
+        cmd,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
+        env=env,
+        timeout=timeout,
+    )
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(f"$ {cmd[0]}\nexit={result.returncode}\n{result.stdout}", encoding="utf-8")
+        if separate_stderr:
+            output = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr or ''}"
+        else:
+            output = result.stdout
+        log_path.write_text(f"$ {cmd[0]}\nexit={result.returncode}\n{output}", encoding="utf-8")
     if check and result.returncode != 0:
-        raise InstallerIdentityError(f"command failed ({cmd[0]}): exit={result.returncode}\n{result.stdout[-4000:]}")
+        diagnostic = result.stdout
+        if separate_stderr and result.stderr:
+            diagnostic = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        raise InstallerIdentityError(f"command failed ({cmd[0]}): exit={result.returncode}\n{diagnostic[-4000:]}")
     return result
 
 
@@ -669,9 +685,17 @@ def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expect
 
 
 def launch_for_operator_record(exe: Path, env: dict[str, str], log_path: Path | None = None) -> str:
-    result = _run([str(exe), "--operator-start-preflight"], env=env, timeout=90, check=False, log_path=log_path)
+    result = _run(
+        [str(exe), "--operator-start-preflight"],
+        env=env,
+        timeout=90,
+        check=False,
+        log_path=log_path,
+        separate_stderr=True,
+    )
     if result.returncode not in (0, 124):
-        raise InstallerIdentityError(f"operator-session smoke launch failed: {result.stdout[-1000:]}")
+        diagnostic = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr or ''}"
+        raise InstallerIdentityError(f"operator-session smoke launch failed: {diagnostic[-1000:]}")
     return result.stdout
 
 

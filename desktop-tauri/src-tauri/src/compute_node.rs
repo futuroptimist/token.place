@@ -1613,7 +1613,6 @@ fn with_log_file_path(mut payload: Value, log_file_path: Option<&str>) -> Value 
 pub(crate) struct OperatorBridgeLaunchPreparation {
     pub bridge_script: String,
     pub launcher: Option<PythonLauncher>,
-    model_bridge_script: std::path::PathBuf,
     resource_root: std::path::PathBuf,
     import_root: std::path::PathBuf,
     layout: ResourceLayoutKind,
@@ -1648,12 +1647,39 @@ impl OperatorBridgeLaunchPreparation {
         Ok(command)
     }
 
+    fn model_bridge_script(
+        &self,
+    ) -> Result<std::path::PathBuf, OperatorBridgeLaunchPreparationError> {
+        let canonical_root = self.resource_root.canonicalize().map_err(|_| {
+            OperatorBridgeLaunchPreparationError::new(
+                "bridge_script_resolution",
+                "model_bridge_unresolved",
+                "model_bridge_resolution",
+                "selected resource root could not be canonicalized",
+            )
+        })?;
+        Path::new(&self.bridge_script)
+            .parent()
+            .map(|parent| parent.join("model_bridge.py"))
+            .and_then(|path| path.canonicalize().ok())
+            .filter(|path| path.is_file() && path.starts_with(&canonical_root))
+            .ok_or_else(|| {
+                OperatorBridgeLaunchPreparationError::new(
+                    "bridge_script_resolution",
+                    "model_bridge_unresolved",
+                    "model_bridge_resolution",
+                    "selected resource root lacks a valid model bridge",
+                )
+            })
+    }
+
     fn model_inspect_command(&self) -> anyhow::Result<std::process::Command> {
         let launcher = self
             .launcher
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing bundled Python launcher for operator smoke"))?;
-        let mut command = launcher.command_for_script_blocking(&self.model_bridge_script);
+        let model_bridge_script = self.model_bridge_script()?;
+        let mut command = launcher.command_for_script_blocking(&model_bridge_script);
         configure_python_subprocess_env_for_layout(
             &mut command,
             &self.import_root,
@@ -1750,23 +1776,9 @@ pub(crate) fn prepare_operator_bridge_launch(
         };
         let launcher = resolve_bundled_python_launcher_at_root(&resource_root, true)
             .map_err(OperatorBridgeLaunchPreparationError::from_launcher)?;
-        let model_bridge_script = bridge_script
-            .parent()
-            .map(|parent| parent.join("model_bridge.py"))
-            .and_then(|path| path.canonicalize().ok())
-            .filter(|path| path.is_file() && path.starts_with(&resource_root))
-            .ok_or_else(|| {
-                OperatorBridgeLaunchPreparationError::new(
-                    "bridge_script_resolution",
-                    "model_bridge_unresolved",
-                    "model_bridge_resolution",
-                    "coherent packaged resource root lacks a valid model bridge",
-                )
-            })?;
         return Ok(OperatorBridgeLaunchPreparation {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(launcher),
-            model_bridge_script,
             import_root: resource_root.clone(),
             resource_root,
             layout,
@@ -1807,23 +1819,9 @@ pub(crate) fn prepare_operator_bridge_launch(
     let (resource_root, layout) = context.describe_resource_layout(bridge_path);
     let import_root = resolve_runtime_import_root(Some(bridge_path), context.manifest_dir)
         .unwrap_or_else(|| resource_root.clone());
-    let model_bridge_script = context
-        .resolve_bridge_script_path(
-            "model_bridge.py",
-            launcher.as_ref().map(|launcher| launcher.program.as_str()),
-        )
-        .map_err(|err| {
-            OperatorBridgeLaunchPreparationError::new(
-                "bridge_script_resolution",
-                "model_bridge_unresolved",
-                "model_bridge_resolution",
-                err,
-            )
-        })?;
     Ok(OperatorBridgeLaunchPreparation {
         bridge_script,
         launcher,
-        model_bridge_script,
         resource_root,
         import_root,
         layout,
@@ -6436,7 +6434,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepare_operator_bridge_launch_keeps_model_probe_under_coherent_root() {
+    fn operator_smoke_keeps_model_probe_under_coherent_root() {
         let temp = TempDir::new().expect("tempdir");
         let stale_root = temp.path().join("stale-resources");
         std::fs::create_dir_all(stale_root.join("python")).unwrap();
@@ -6455,15 +6453,14 @@ mod tests {
         };
 
         let preparation = prepare_operator_bridge_launch(&context).expect("coherent preparation");
-        assert!(preparation
-            .model_bridge_script
-            .starts_with(coherent_root.canonicalize().unwrap()));
-        assert!(!preparation.model_bridge_script.starts_with(stale_root));
+        let model_bridge_script = preparation.model_bridge_script().expect("model probe");
+        assert!(model_bridge_script.starts_with(coherent_root.canonicalize().unwrap()));
+        assert!(!model_bridge_script.starts_with(stale_root));
     }
 
     #[cfg(unix)]
     #[test]
-    fn prepare_operator_bridge_launch_rejects_missing_model_probe() {
+    fn prepare_operator_bridge_launch_allows_missing_smoke_model_probe() {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("resources");
         write_coherent_test_resource_root(&root);
@@ -6479,7 +6476,11 @@ mod tests {
             tauri_resource_dir: Some(&root),
         };
 
-        let err = prepare_operator_bridge_launch(&context).unwrap_err();
+        let preparation =
+            prepare_operator_bridge_launch(&context).expect("production launch preparation");
+        assert!(preparation.command().is_ok());
+
+        let err = preparation.model_bridge_script().unwrap_err();
         assert_eq!(
             err.metadata(),
             (

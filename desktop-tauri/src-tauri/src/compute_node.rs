@@ -47,6 +47,8 @@ pub struct ComputeNodeRequest {
 }
 
 const DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
+const OPERATOR_PREFLIGHT_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+const OPERATOR_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComputeNodeStatus {
@@ -1922,38 +1924,23 @@ pub(crate) fn operator_start_preflight_record(
         tauri_resource_dir: resource_dir.as_deref(),
     };
     let preparation = prepare_operator_bridge_launch(&context)?;
-    let mut command = preparation.blocking_command()?;
+    let mut command = preparation.command()?;
     configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
     command.arg("--operator-preflight-controlled-ready");
     command
         .arg("--context-tier")
         .arg(normalize_context_tier(&config.context_tier));
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::null());
-    let mut child = command.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("operator_preflight_stdout_unavailable"))?;
-    let mut reader = std::io::BufReader::new(stdout);
-    let mut line = String::new();
-    use std::io::BufRead;
-    let read = reader.read_line(&mut line)?;
-    let status = child.wait()?;
-    if read == 0 {
-        anyhow::bail!("operator_preflight_event_missing: controlled bridge emitted no event");
-    }
-    if !status.success() {
-        anyhow::bail!("operator_preflight_child_failed: controlled bridge exited unsuccessfully");
-    }
-    let event = parse_compute_node_event_line(line.trim())?;
-    let startup_result = event
-        .get("startup_result")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    if startup_result != "ready" {
-        anyhow::bail!("operator_preflight_not_ready: controlled bridge did not report ready");
-    }
+    let event = std::thread::spawn(move || -> anyhow::Result<Value> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_controlled_operator_preflight_child(
+                command,
+                OPERATOR_PREFLIGHT_EVENT_TIMEOUT,
+            ))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("operator_preflight_child_failed"))??;
 
     let mut payload = operator_session_smoke_record_from_preparation(config, &preparation)?;
     if let Value::Object(map) = &mut payload {
@@ -1967,13 +1954,88 @@ pub(crate) fn operator_start_preflight_record(
         );
         map.insert("bridge_child_spawned".into(), Value::Bool(true));
         map.insert("bridge_event_received".into(), Value::Bool(true));
+        for key in [
+            "controlled_preflight",
+            "startup_result",
+            "provisioning_actions",
+            "repair_actions",
+            "pip_actions",
+            "compiler_actions",
+            "network_actions",
+            "download_actions",
+        ] {
+            map.insert(key.into(), event[key].clone());
+        }
+        map.insert("bridge_event_type".into(), event["type"].clone());
         map.insert(
-            "startup_result".into(),
-            Value::String(startup_result.into()),
+            "controlled_ready".into(),
+            Value::Bool(event["controlled_preflight"] == Value::Bool(true)),
         );
-        map.insert("controlled_ready".into(), Value::Bool(true));
     }
     Ok(payload)
+}
+
+async fn cleanup_controlled_operator_preflight_child(child: &mut Child, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        terminate_bridge_process_tree(pid).await;
+    }
+    if tokio::time::timeout(OPERATOR_PREFLIGHT_REAP_TIMEOUT, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    }
+}
+
+fn validate_controlled_operator_preflight_event(event: Value) -> anyhow::Result<Value> {
+    let identity_is_valid = event.get("type").and_then(Value::as_str) == Some("status")
+        && event.get("controlled_preflight").and_then(Value::as_bool) == Some(true)
+        && event.get("startup_result").and_then(Value::as_str) == Some("ready");
+    let counters_are_zero = [
+        "provisioning_actions",
+        "repair_actions",
+        "pip_actions",
+        "compiler_actions",
+        "network_actions",
+        "download_actions",
+    ]
+    .iter()
+    .all(|key| event.get(*key).and_then(Value::as_i64) == Some(0));
+    if !identity_is_valid || !counters_are_zero {
+        anyhow::bail!("operator_preflight_invalid_event");
+    }
+    Ok(event)
+}
+
+async fn run_controlled_operator_preflight_child(
+    mut command: Command,
+    event_timeout: Duration,
+) -> anyhow::Result<Value> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    isolate_bridge_process_tree(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|_| anyhow::anyhow!("operator_preflight_child_spawn_failed"))?;
+    let pid = child.id();
+    let result = async {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("operator_preflight_stdout_unavailable"))?;
+        let mut lines = BufReader::new(stdout).lines();
+        let line = tokio::time::timeout(event_timeout, lines.next_line())
+            .await
+            .map_err(|_| anyhow::anyhow!("operator_preflight_event_timeout"))?
+            .map_err(|_| anyhow::anyhow!("operator_preflight_event_read_failed"))?
+            .ok_or_else(|| anyhow::anyhow!("operator_preflight_event_missing"))?;
+        let event = parse_compute_node_event_line(&line)
+            .map_err(|_| anyhow::anyhow!("operator_preflight_event_parse_failed"))?;
+        validate_controlled_operator_preflight_event(event)
+    }
+    .await;
+    cleanup_controlled_operator_preflight_child(&mut child, pid).await;
+    result
 }
 
 pub async fn start_compute_node(
@@ -3844,6 +3906,104 @@ mod tests {
         }
 
         assert_eq!(event_types, vec!["status".to_string(), "error".to_string()]);
+    }
+
+    const CONTROLLED_PREFLIGHT_READY_EVENT: &str = r#"{"type":"status","controlled_preflight":true,"startup_result":"ready","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
+
+    fn operator_preflight_test_command(output: Option<&str>, wedge: bool) -> Command {
+        #[cfg(unix)]
+        {
+            let script = match (output, wedge) {
+                (Some(output), true) => format!("printf '%s\\n' '{output}'; sleep 30"),
+                (Some(output), false) => format!("printf '%s\\n' '{output}'"),
+                (None, true) => "sleep 30".into(),
+                (None, false) => "exit 0".into(),
+            };
+            let mut command = Command::new("sh");
+            command.args(["-c", &script]);
+            command
+        }
+        #[cfg(windows)]
+        {
+            let script = match (output, wedge) {
+                (Some(output), true) => {
+                    format!("Write-Output '{output}'; Start-Sleep -Seconds 30")
+                }
+                (Some(output), false) => format!("Write-Output '{output}'"),
+                (None, true) => "Start-Sleep -Seconds 30".into(),
+                (None, false) => "exit 0".into(),
+            };
+            let mut command = Command::new("powershell");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            command
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_accepts_valid_controlled_readiness_event() {
+        let event = run_controlled_operator_preflight_child(
+            operator_preflight_test_command(Some(CONTROLLED_PREFLIGHT_READY_EVENT), false),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("valid controlled readiness");
+
+        assert_eq!(event["type"], "status");
+        assert_eq!(event["controlled_preflight"], true);
+        assert_eq!(event["network_actions"], 0);
+    }
+
+    #[test]
+    fn operator_preflight_rejects_noncontrolled_and_nonzero_action_events() {
+        for event in [
+            serde_json::json!({
+                "type": "status", "controlled_preflight": false, "startup_result": "ready",
+                "provisioning_actions": 0, "repair_actions": 0, "pip_actions": 0,
+                "compiler_actions": 0, "network_actions": 0, "download_actions": 0,
+            }),
+            serde_json::json!({
+                "type": "status", "controlled_preflight": true, "startup_result": "ready",
+                "provisioning_actions": 0, "repair_actions": 0, "pip_actions": 1,
+                "compiler_actions": 0, "network_actions": 0, "download_actions": 0,
+            }),
+        ] {
+            assert_eq!(
+                validate_controlled_operator_preflight_event(event)
+                    .expect_err("invalid event")
+                    .to_string(),
+                "operator_preflight_invalid_event"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_times_out_silent_wedged_child() {
+        let started = Instant::now();
+        let error = run_controlled_operator_preflight_child(
+            operator_preflight_test_command(None, true),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("silent child must time out");
+
+        assert_eq!(error.to_string(), "operator_preflight_event_timeout");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_terminates_and_reaps_child_after_ready_event() {
+        let started = Instant::now();
+        run_controlled_operator_preflight_child(
+            operator_preflight_test_command(Some(CONTROLLED_PREFLIGHT_READY_EVENT), true),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("ready event must be accepted before cleanup");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "wedged child was not terminated and boundedly reaped"
+        );
     }
 
     #[test]

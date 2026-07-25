@@ -106,6 +106,7 @@ pub enum PythonLauncherCategory {
     BundledRuntimeNotPython3,
     BundledRuntimeWrongArchitecture,
     BundledRuntimeProbeFailed,
+    BundledRuntimeProvenanceInvalid,
     BundledRuntimeAmbiguous,
     OverrideMissing,
     OverrideNotPython3,
@@ -122,6 +123,7 @@ impl PythonLauncherCategory {
             Self::BundledRuntimeNotPython3 => "bundled_runtime_not_python3",
             Self::BundledRuntimeWrongArchitecture => "bundled_runtime_wrong_architecture",
             Self::BundledRuntimeProbeFailed => "bundled_runtime_probe_failed",
+            Self::BundledRuntimeProvenanceInvalid => "bundled_runtime_provenance_invalid",
             Self::BundledRuntimeAmbiguous => "bundled_runtime_ambiguous",
             Self::OverrideMissing => "override_missing",
             Self::OverrideNotPython3 => "override_not_python3",
@@ -252,26 +254,22 @@ fn output_status_code(output: &std::process::Output) -> Option<i32> {
     output.status.code()
 }
 
-fn json_string_field<'a>(payload: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("\"{key}\"");
-    let after_key = payload.split(&needle).nth(1)?;
-    let after_colon = after_key.split_once(':')?.1.trim_start();
-    let after_quote = after_colon.strip_prefix('"')?;
-    after_quote.split('"').next()
-}
-
 fn metadata_probe_is_valid(
     stdout: &str,
     runtime_root: &Path,
     expected_machine: &str,
 ) -> Result<(), PythonLauncherCategory> {
-    let payload = stdout.trim();
-    let compact_payload = payload.replace(char::is_whitespace, "");
-    if !(compact_payload.contains("\"version\"") && compact_payload.contains("[3,11,13]")) {
+    let metadata = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .map_err(|_| PythonLauncherCategory::BundledRuntimeProbeFailed)?;
+    let version = metadata.get("version").and_then(|value| value.as_array());
+    if !version.is_some_and(|parts| {
+        parts.len() == 3
+            && parts[0].as_u64() == Some(3)
+            && parts[1].as_u64() == Some(11)
+            && parts[2].as_u64() == Some(13)
+    }) {
         return Err(PythonLauncherCategory::BundledRuntimeNotPython3);
     }
-    let metadata = serde_json::from_str::<serde_json::Value>(payload)
-        .map_err(|_| PythonLauncherCategory::BundledRuntimeProbeFailed)?;
     if metadata
         .get("pointer_bits")
         .and_then(|value| value.as_u64())
@@ -279,7 +277,9 @@ fn metadata_probe_is_valid(
     {
         return Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture);
     }
-    let machine = json_string_field(payload, "machine")
+    let machine = metadata
+        .get("machine")
+        .and_then(|value| value.as_str())
         .ok_or(PythonLauncherCategory::BundledRuntimeWrongArchitecture)?;
     let machine_is_expected = match expected_machine {
         "AMD64" | "x86_64" => matches!(machine.to_ascii_lowercase().as_str(), "amd64" | "x86_64"),
@@ -297,7 +297,9 @@ fn metadata_probe_is_valid(
         .canonicalize()
         .map_err(|_| PythonLauncherCategory::BundledRuntimeProbeFailed)?;
     for key in ["executable", "prefix"] {
-        let value = json_string_field(payload, key)
+        let value = metadata
+            .get(key)
+            .and_then(|value| value.as_str())
             .ok_or(PythonLauncherCategory::BundledRuntimeProbeFailed)?;
         let resolved = Path::new(value)
             .canonicalize()
@@ -802,7 +804,7 @@ fn validate_bundled_runtime_candidate(
             if cfg!(target_os = "windows") && !bundled_windows_provenance_is_valid(&runtime_root) {
                 return Err(launcher_error(
                     DESKTOP_PYTHON_RUNTIME_INVALID,
-                    PythonLauncherCategory::BundledRuntimeProbeFailed,
+                    PythonLauncherCategory::BundledRuntimeProvenanceInvalid,
                     Some(&candidate),
                     packaged,
                     output_status_code(&output),
@@ -2625,5 +2627,39 @@ mod tests {
                 Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture)
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundled_metadata_semantically_decodes_escaped_installed_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        // A quote forces serde_json to escape the installed path. The metadata
+        // validator must use the decoded JSON string, not raw payload slices.
+        let runtime_root = temp.path().join("installed-\"runtime");
+        std::fs::create_dir_all(&runtime_root).expect("runtime root");
+        let executable = runtime_root.join("python3");
+        std::fs::write(&executable, b"runtime").expect("runtime executable");
+        let payload = serde_json::json!({
+            "version": [3, 11, 13],
+            "machine": "x86_64",
+            "pointer_bits": 64,
+            "executable": executable,
+            "prefix": runtime_root,
+        })
+        .to_string();
+
+        assert_eq!(
+            metadata_probe_is_valid(&payload, &runtime_root, "x86_64"),
+            Ok(())
+        );
+
+        let escaped = temp.path().join("outside");
+        std::fs::create_dir_all(&escaped).expect("outside root");
+        let mut tampered: serde_json::Value = serde_json::from_str(&payload).expect("metadata");
+        tampered["prefix"] = serde_json::json!(escaped);
+        assert_eq!(
+            metadata_probe_is_valid(&tampered.to_string(), &runtime_root, "x86_64"),
+            Err(PythonLauncherCategory::BundledRuntimeProbeFailed)
+        );
     }
 }

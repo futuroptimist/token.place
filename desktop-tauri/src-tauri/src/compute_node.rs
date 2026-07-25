@@ -1707,6 +1707,7 @@ impl OperatorBridgeLaunchPreparationError {
     fn from_launcher(err: PythonLauncherError) -> Self {
         let stage = match err.category {
             PythonLauncherCategory::BundledRuntimeProbeFailed
+            | PythonLauncherCategory::BundledRuntimeProvenanceInvalid
             | PythonLauncherCategory::BundledRuntimeNotPython3
             | PythonLauncherCategory::BundledRuntimeWrongArchitecture
             | PythonLauncherCategory::BundledRuntimeNotExecutable

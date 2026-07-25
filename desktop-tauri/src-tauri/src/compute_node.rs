@@ -6607,7 +6607,7 @@ mod tests {
         std::fs::write(
             &runtime,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' '{{\"version\":[3,11,13],\"machine\":\"{machine}\",\"executable\":\"{}\",\"prefix\":\"{}\"}}'\n",
+                "#!/bin/sh\nprintf '%s\\n' '{{\"version\":[3,11,13],\"machine\":\"{machine}\",\"pointer_bits\":64,\"executable\":\"{}\",\"prefix\":\"{}\"}}'\n",
                 runtime.display(),
                 root.join("python-runtime").display()
             ),

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
 PYTHON_MODULE_DIR = Path(__file__).resolve().parents[2] / 'desktop-tauri' / 'src-tauri' / 'python'
@@ -833,6 +834,7 @@ def test_ensure_runtime_uses_custom_repo_root_for_initial_probe_and_post_repair_
 
 
 def test_probe_uses_resolved_runtime_root_for_subprocess_cwd_and_pythonpath(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'linux')
     runtime_root = tmp_path / 'bundle_root'
     (runtime_root / 'utils').mkdir(parents=True)
     monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
@@ -1373,6 +1375,7 @@ def test_install_error_summary_prefers_stderr_tail_when_command_is_long():
 
 
 def test_probe_leaves_dependency_target_env_unset_when_target_is_unresolved(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'linux')
     runtime_root = tmp_path / 'bundle_root'
     (runtime_root / 'utils').mkdir(parents=True)
     monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(runtime_root))
@@ -1404,7 +1407,7 @@ def test_probe_leaves_dependency_target_env_unset_when_target_is_unresolved(monk
     probe = desktop_runtime_setup._probe_llama_runtime()
 
     assert 'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET' not in captured['env']
-    assert './unknown' not in captured['env']['PYTHONPATH']
+    assert './unknown' not in captured['env'].get('PYTHONPATH', '')
     assert probe.dependency_target == 'unknown'
 
 
@@ -1534,6 +1537,7 @@ def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
 
 
 def test_probe_subprocess_keeps_stdlib_ahead_of_polluted_dependency_target(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'Darwin')
     runtime_root = tmp_path / 'resources'
     (runtime_root / 'utils').mkdir(parents=True)
     dependency_target = runtime_root / '.token_place_desktop_site'
@@ -1884,6 +1888,7 @@ def test_is_repo_local_llama_module_uses_case_insensitive_comparison(tmp_path):
 
 
 def test_ensure_desktop_python_dependencies_reports_requirements_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'linux')
     runtime_root = tmp_path / 'runtime'
     (runtime_root / 'utils').mkdir(parents=True)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: runtime_root)
@@ -1913,6 +1918,7 @@ def test_resolve_desktop_requirements_path_prefers_macos_resources_layout(tmp_pa
 
 
 def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'linux')
     requirements = tmp_path / 'requirements_desktop_runtime.txt'
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
@@ -1942,6 +1948,7 @@ def test_ensure_desktop_python_dependencies_reports_install_failed(monkeypatch, 
 
 
 def test_ensure_desktop_python_dependencies_lock_oserror_returns_sanitized_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'linux')
     sentinel = str(tmp_path / "secret" / "managed.lock")
     requirements = tmp_path / 'requirements_desktop_runtime.txt'
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
@@ -1975,6 +1982,7 @@ def test_ensure_desktop_python_dependencies_lock_oserror_returns_sanitized_failu
 
 
 def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'linux')
     requirements = tmp_path / 'requirements_desktop_runtime.txt'
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda **_: tmp_path)
@@ -1993,6 +2001,7 @@ def test_ensure_desktop_python_dependencies_reports_post_install_missing(monkeyp
 def test_ensure_desktop_python_dependencies_falls_back_to_home_target_when_runtime_root_unwritable(
     monkeypatch, tmp_path
 ):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'linux')
     requirements = tmp_path / 'requirements_desktop_runtime.txt'
     requirements.write_text('psutil\nrequests\npython-dotenv\ncryptography\n', encoding='utf-8')
     runtime_root = tmp_path / 'runtime'
@@ -2900,6 +2909,7 @@ def test_lock_cancel_and_exit_no_handle_paths(tmp_path):
 
 
 def test_read_only_dependency_preflight_reports_missing_without_target_creation(tmp_path, monkeypatch):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'linux')
     monkeypatch.delenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', raising=False)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_runtime_root', lambda repo_root=None: tmp_path)
     monkeypatch.setattr(desktop_runtime_setup, '_resolve_desktop_requirements_path', lambda _root: tmp_path / 'requirements.txt')
@@ -2914,6 +2924,7 @@ def test_read_only_dependency_preflight_reports_missing_without_target_creation(
 
 
 def test_dependency_preflight_post_lock_satisfied_and_unmapped(tmp_path, monkeypatch):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'linux')
     target = tmp_path / 'site'
     target.mkdir()
     requirements = tmp_path / 'requirements.txt'
@@ -3191,12 +3202,15 @@ print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({
 
 def _pid_is_alive(pid: int) -> bool:
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        process = psutil.Process(pid)
+    except psutil.NoSuchProcess:
         return False
-    except PermissionError:
+    try:
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.AccessDenied:
         return True
-    return True
 
 
 def _wait_until_gone(pid: int, *, timeout: float = 5.0) -> bool:
@@ -3311,6 +3325,7 @@ time.sleep(60)
 
 
 def test_actual_probe_snippet_with_fake_llama_cpp_package(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'Darwin')
     target = tmp_path / 'managed_site'
     package = target / 'llama_cpp'
     package.mkdir(parents=True)

@@ -67,7 +67,7 @@ impl PythonLauncher {
             sanitize_packaged_python_subprocess_env(&mut cmd);
         }
         cmd.arg("-c");
-        cmd.arg("import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))");
+        cmd.arg("import json,platform,struct,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'pointer_bits': struct.calcsize('P') * 8, 'executable': sys.executable, 'prefix': sys.prefix}))");
         cmd
     }
 
@@ -270,7 +270,27 @@ fn metadata_probe_is_valid(
     if !(compact_payload.contains("\"version\"") && compact_payload.contains("[3,11,13]")) {
         return Err(PythonLauncherCategory::BundledRuntimeNotPython3);
     }
-    if json_string_field(payload, "machine") != Some(expected_machine) {
+    let metadata = serde_json::from_str::<serde_json::Value>(payload)
+        .map_err(|_| PythonLauncherCategory::BundledRuntimeProbeFailed)?;
+    if metadata
+        .get("pointer_bits")
+        .and_then(|value| value.as_u64())
+        != Some(64)
+    {
+        return Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture);
+    }
+    let machine = json_string_field(payload, "machine")
+        .ok_or(PythonLauncherCategory::BundledRuntimeWrongArchitecture)?;
+    let machine_is_expected = match expected_machine {
+        "AMD64" | "x86_64" => matches!(machine.to_ascii_lowercase().as_str(), "amd64" | "x86_64"),
+        "arm64" => matches!(machine.to_ascii_lowercase().as_str(), "arm64" | "aarch64"),
+        expected => machine.eq_ignore_ascii_case(expected),
+    };
+    // A sanitized Windows interpreter can return no machine string after the
+    // architecture environment variables are cleared. Pointer width is owned
+    // by the interpreter; Windows x64 provenance and PE closure are attested
+    // separately before the runtime is accepted.
+    if !machine_is_expected && !(machine.is_empty() && expected_machine == "AMD64") {
         return Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture);
     }
     let runtime_root = runtime_root
@@ -1270,6 +1290,8 @@ impl PythonEnvCommandRecorder {
                 ("FORCE_CMAKE", "poison-force-cmake"),
                 ("TOKEN_PLACE_SIDECAR_PYTHON", "poison-sidecar"),
                 ("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "poison-import-root"),
+                ("PROCESSOR_ARCHITECTURE", "x86"),
+                ("PROCESSOR_ARCHITEW6432", "ARM64"),
             ]
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
@@ -2155,7 +2177,7 @@ mod tests {
         let launcher_path = runtime_bin.join("python3");
         let machine = expected_runtime_arch();
         let launcher_body = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then printf '{{\"version\":[3,11,13],\"machine\":\"{}\",\"executable\":\"{}\",\"prefix\":\"{}\"}}\\n'; exit 0; fi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then printf '{{\"version\":[3,11,13],\"machine\":\"{}\",\"pointer_bits\":64,\"executable\":\"{}\",\"prefix\":\"{}\"}}\\n'; exit 0; fi\nexit 0\n",
             machine,
             launcher_path.display(),
             resource_root.join("python-runtime").display()
@@ -2460,7 +2482,7 @@ mod tests {
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         let runtime_root = resources.join("python-runtime");
         let probe = format!(
-            r#"{{"version":[3,11,13],"machine":"{}","executable":"{}","prefix":"{}"}}"#,
+            r#"{{"version":[3,11,13],"machine":"{}","pointer_bits":64,"executable":"{}","prefix":"{}"}}"#,
             expected_runtime_arch(),
             py.display(),
             runtime_root.display()
@@ -2543,6 +2565,8 @@ mod tests {
             "FORCE_CMAKE",
             "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
             "TOKEN_PLACE_SIDECAR_PYTHON",
+            "PROCESSOR_ARCHITECTURE",
+            "PROCESSOR_ARCHITEW6432",
         ] {
             assert_eq!(effective.value(key), None, "{key} must not reach the child");
         }
@@ -2561,5 +2585,45 @@ mod tests {
                     Some("PYTHONNOUSERSITE" | "PYTHONDONTWRITEBYTECODE")
                 )
         }));
+    }
+
+    #[test]
+    fn bundled_metadata_architecture_uses_interpreter_owned_pointer_width() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime_root = temp.path().join("python-runtime");
+        std::fs::create_dir_all(&runtime_root).expect("runtime root");
+        let executable = runtime_root.join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python3"
+        });
+        std::fs::write(&executable, b"runtime").expect("runtime executable");
+        let payload = |machine: &str, pointer_bits: u64| {
+            serde_json::json!({
+                "version": [3, 11, 13],
+                "machine": machine,
+                "pointer_bits": pointer_bits,
+                "executable": executable,
+                "prefix": runtime_root,
+            })
+            .to_string()
+        };
+
+        for machine in ["AMD64", "x86_64"] {
+            assert_eq!(
+                metadata_probe_is_valid(&payload(machine, 64), &runtime_root, "AMD64"),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            metadata_probe_is_valid(&payload("", 64), &runtime_root, "AMD64"),
+            Ok(())
+        );
+        for (machine, pointer_bits) in [("AMD64", 32), ("x86", 64), ("ARM64", 64)] {
+            assert_eq!(
+                metadata_probe_is_valid(&payload(machine, pointer_bits), &runtime_root, "AMD64"),
+                Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture)
+            );
+        }
     }
 }

@@ -3592,6 +3592,49 @@ def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_sc
     assert artifacts.root == artifact_dir
 
 
+def test_windows_installer_identity_current_package_validates_contract_off_windows(monkeypatch, tmp_path, capsys) -> None:
+    guard = _load_windows_installer_identity()
+    current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
+    current_nsis.write_text('artifact', encoding='utf-8')
+    monkeypatch.setattr(guard.sys, 'platform', 'linux')
+    monkeypatch.setattr(sys, 'argv', [
+        'test_windows_installer_identity.py',
+        '--pr-current-windows-nsis', str(current_nsis),
+        '--expected-version', '0.1.5',
+        '--expected-build-id', 'abcdef123456',
+    ])
+
+    assert guard.main() == 0
+    assert 'validated current-package Windows NSIS PR-gate contract' in capsys.readouterr().out
+
+
+def test_windows_installer_identity_rejects_invalid_current_package_arguments(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.5-x64.msi'
+    for path in (current_nsis, current_msi):
+        path.write_text('artifact', encoding='utf-8')
+
+    with pytest.raises(guard.InstallerIdentityError, match='requires an NSIS installer'):
+        guard.build_current_package_scenario(current_msi, '0.1.5')
+
+    monkeypatch.setattr(sys, 'argv', [
+        'test_windows_installer_identity.py',
+        '--pr-current-windows-nsis', str(current_nsis),
+        '--windows-nsis', str(current_nsis),
+        '--expected-build-id', 'abcdef123456',
+    ])
+    with pytest.raises(guard.InstallerIdentityError, match='cannot be combined'):
+        guard.main()
+
+    monkeypatch.setattr(sys, 'argv', [
+        'test_windows_installer_identity.py',
+        '--expected-build-id', 'abcdef123456',
+    ])
+    with pytest.raises(guard.InstallerIdentityError, match='full release validation requires'):
+        guard.main()
+
+
 def test_windows_installer_identity_full_release_scenarios_remain_clean_and_upgrade(tmp_path) -> None:
     guard = _load_windows_installer_identity()
     paths = [

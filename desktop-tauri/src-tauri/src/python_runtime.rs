@@ -1448,12 +1448,6 @@ mod tests {
         })
     }
 
-    fn command_env_removed(command: &Command, key: &str) -> bool {
-        command
-            .get_envs()
-            .any(|(name, value)| name == key && value.is_none())
-    }
-
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
         std::process::Output {
             status: if success {
@@ -2238,8 +2232,8 @@ mod tests {
                 Some(resource_root.to_str().unwrap())
             );
             assert!(command_env_value(command, "PYTHONPATH").is_some());
-            assert!(command_env_removed(command, "PYTHONHOME"));
-            assert!(command_env_removed(command, "PYTHONUSERBASE"));
+            assert!(command_env_value(command, "PYTHONHOME").is_none());
+            assert!(command_env_value(command, "PYTHONUSERBASE").is_none());
         }
     }
 

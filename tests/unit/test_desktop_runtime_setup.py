@@ -2871,15 +2871,20 @@ class _KillFailProcess:
 
 def test_terminate_process_tree_falls_back_when_group_kill_fails(monkeypatch):
     calls = []
+    host_os_name = os.name
 
     def fail_killpg(_pid, _sig):
         calls.append('killpg')
         raise OSError('no group')
 
-    monkeypatch.setattr(desktop_runtime_setup.os, 'name', 'posix')
-    monkeypatch.setattr(desktop_runtime_setup.os, 'killpg', fail_killpg)
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        'os',
+        SimpleNamespace(name='posix', killpg=fail_killpg),
+    )
     desktop_runtime_setup._terminate_process_tree(_KillFailProcess())
     assert calls == ['killpg']
+    assert os.name == host_os_name
 
 
 def test_lock_cancel_and_exit_no_handle_paths(tmp_path):
@@ -2987,10 +2992,11 @@ def test_runtime_install_threads_cancellation_and_heartbeat_kwargs(monkeypatch, 
 
 def test_lock_wait_heartbeat_and_windows_branches(tmp_path, monkeypatch):
     events = []
+    host_os_name = os.name
     times = iter([0.0, 0.0, 5.1, 5.2, 6.1])
     monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times))
     monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
-    monkeypatch.setattr(desktop_runtime_setup.os, 'name', 'nt')
+    monkeypatch.setattr(desktop_runtime_setup, 'os', SimpleNamespace(name='nt'))
 
     class FakeMsvcrt:
         LK_NBLCK = 1
@@ -3021,6 +3027,7 @@ def test_lock_wait_heartbeat_and_windows_branches(tmp_path, monkeypatch):
     FakeMsvcrt.locking = classmethod(lambda cls, _fd, _mode, _size: None)
     lock.__exit__(None, None, None)
     assert lock._handle is None
+    assert os.name == host_os_name
 
 
 def test_run_pip_install_heartbeat_failure_terminates_process_tree(monkeypatch):
@@ -3068,6 +3075,7 @@ def test_run_pip_install_heartbeat_failure_terminates_process_tree(monkeypatch):
 
 
 def test_managed_site_lock_heartbeat_failure_closes_handle(tmp_path, monkeypatch):
+    host_os_name = os.name
     times = iter([0.0, 0.0, 5.1])
     monkeypatch.setattr(desktop_runtime_setup.time, 'monotonic', lambda: next(times))
     monkeypatch.setattr(desktop_runtime_setup.time, 'sleep', lambda _seconds: None)
@@ -3075,7 +3083,7 @@ def test_managed_site_lock_heartbeat_failure_closes_handle(tmp_path, monkeypatch
     def busy_flock(_fileno, _flags):
         raise OSError('busy')
 
-    monkeypatch.setattr(desktop_runtime_setup.os, 'name', 'posix')
+    monkeypatch.setattr(desktop_runtime_setup, 'os', SimpleNamespace(name='posix'))
     monkeypatch.setitem(sys.modules, 'fcntl', SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=busy_flock))
 
     def failing_heartbeat(_extra):
@@ -3086,6 +3094,7 @@ def test_managed_site_lock_heartbeat_failure_closes_handle(tmp_path, monkeypatch
         lock.__enter__()
 
     assert lock._handle is None
+    assert os.name == host_os_name
 
 
 def test_probe_llama_runtime_cancellable_path_emits_runtime_probe_heartbeat(monkeypatch, tmp_path):

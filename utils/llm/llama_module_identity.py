@@ -31,7 +31,8 @@ def canonical_llama_module_identity_input(module_path: Any) -> Optional[str]:
     except (TypeError, ValueError, OSError):
         return None
     try:
-        canonical = os.path.normcase(str(Path(path_text).resolve(strict=True)))
+        resolved = strip_windows_extended_path_prefix(str(Path(path_text).resolve(strict=True)))
+        canonical = os.path.normcase(resolved)
     except (TypeError, ValueError, OSError):
         try:
             canonical = os.path.normcase(os.path.normpath(path_text))

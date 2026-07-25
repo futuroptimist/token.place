@@ -3520,10 +3520,16 @@ def test_llama_module_identity_canonicalizes_symlink_dotdot(tmp_path):
     link_dir = tmp_path / 'link'
     link_dir.symlink_to(real.parent.parent, target_is_directory=True)
     via_link = link_dir / 'llama_cpp' / '..' / 'llama_cpp' / '__init__.py'
+    assert desktop_runtime_setup._canonical_llama_module_identity_input(
+        real
+    ) == desktop_runtime_setup._canonical_llama_module_identity_input(via_link)
     assert desktop_runtime_setup.llama_module_identity_from_path(real) == desktop_runtime_setup.llama_module_identity_from_path(via_link)
     other = tmp_path / 'other' / 'llama_cpp' / '__init__.py'
     other.parent.mkdir(parents=True)
     other.write_text('# other')
+    assert desktop_runtime_setup._canonical_llama_module_identity_input(
+        real
+    ) != desktop_runtime_setup._canonical_llama_module_identity_input(other)
     assert desktop_runtime_setup.llama_module_identity_from_path(real) != desktop_runtime_setup.llama_module_identity_from_path(other)
 
 
@@ -3654,10 +3660,13 @@ def test_packaged_identity_fallback_matches_shared_helper_in_subprocess(tmp_path
     code = (
         'import json, desktop_runtime_setup as d; '
         f'cases = {cases!r}; '
-        'print(json.dumps({k: d.llama_module_identity_from_path(v) for k, v in cases.items()} | {'
+        'print(json.dumps({'
+        '"identity": {k: d.llama_module_identity_from_path(v) for k, v in cases.items()}, '
+        '"canonical": {k: d._canonical_llama_module_identity_input(v) for k, v in cases.items()}, '
+        '"valid": {'
         '"valid_good": d._valid_llama_module_identity("sha256:" + "a" * 64), '
         '"valid_bad": d._valid_llama_module_identity("sha256:" + "g" * 64), '
-        '"valid_non_string": d._valid_llama_module_identity(123)}))'
+        '"valid_non_string": d._valid_llama_module_identity(123)}}))'
     )
     result = subprocess.run(
         [sys.executable, '-B', '-c', code],
@@ -3668,20 +3677,30 @@ def test_packaged_identity_fallback_matches_shared_helper_in_subprocess(tmp_path
         cwd=str(tmp_path),
     )
     assert result.returncode == 0, result.stderr
-    fallback = json.loads(result.stdout)
+    fallback_payload = json.loads(result.stdout)
+    fallback = fallback_payload['identity']
+    fallback_canonical = fallback_payload['canonical']
+    fallback_valid = fallback_payload['valid']
 
     from utils.llm import llama_module_identity as shared_identity
 
     shared = {k: desktop_runtime_setup.llama_module_identity_from_path(v) for k, v in cases.items()}
-    assert fallback == {
-        **shared,
+    shared_canonical = {
+        k: desktop_runtime_setup._canonical_llama_module_identity_input(v) for k, v in cases.items()
+    }
+    assert fallback == shared
+    assert fallback_valid == {
         'valid_good': 'sha256:' + 'a' * 64,
         'valid_bad': None,
         'valid_non_string': None,
     }
+    assert fallback_canonical == shared_canonical
     assert fallback['posix_real'] == fallback['posix_dotdot_symlink']
+    assert fallback_canonical['posix_real'] == fallback_canonical['posix_dotdot_symlink']
     assert fallback['windows_extended'] == fallback['windows_mixed_case']
+    assert fallback_canonical['windows_extended'] == fallback_canonical['windows_mixed_case']
     assert fallback['posix_real'] != fallback['other']
+    assert fallback_canonical['posix_real'] != fallback_canonical['other']
 
 
 def test_packaged_identity_inline_fallback_is_covered_without_utils(
@@ -3721,9 +3740,15 @@ def test_packaged_identity_inline_fallback_is_covered_without_utils(
         'LLAMA_CPP/__init__.py'
     )
 
+    assert module._canonical_llama_module_identity_input(
+        real
+    ) == module._canonical_llama_module_identity_input(via_dotdot)
     assert module.llama_module_identity_from_path(
         real
     ) == module.llama_module_identity_from_path(via_dotdot)
+    assert module._canonical_llama_module_identity_input(
+        windows_prefixed
+    ) == module._canonical_llama_module_identity_input(windows_mixed)
     assert module.llama_module_identity_from_path(
         windows_prefixed
     ) == module.llama_module_identity_from_path(windows_mixed)

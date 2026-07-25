@@ -2823,6 +2823,7 @@ def test_managed_site_lock_closes_handle_when_enter_times_out(monkeypatch, tmp_p
 
 
 def test_ensure_desktop_python_dependencies_maps_compat_timeout_to_timeout_action(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKENPLACE_DESKTOP_SIMULATED_PLATFORM', 'linux')
     requirements = tmp_path / 'requirements_desktop_runtime.txt'
     requirements.write_text('psutil==1\nrequests==1\npython-dotenv==1\ncryptography==1\n', encoding='utf-8')
     target = tmp_path / 'site'

@@ -1679,6 +1679,12 @@ def _desktop_platform() -> str:
 
 
 def _desktop_arch() -> str:
+    packaged_arch = os.environ.get("TOKEN_PLACE_PACKAGED_RUNTIME_ARCH", "").strip().lower()
+    if packaged_arch:
+        normalized = packaged_arch.replace("amd64", "x86_64")
+        if normalized not in {"x86_64", "arm64", "aarch64"}:
+            raise RuntimeError("packaged_runtime_arch_attestation_invalid")
+        return normalized
     return platform_module.machine().lower().replace("amd64", "x86_64")
 
 

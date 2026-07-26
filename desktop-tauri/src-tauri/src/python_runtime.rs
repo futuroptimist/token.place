@@ -36,6 +36,18 @@ pub struct PythonLauncher {
 }
 
 impl PythonLauncher {
+    fn bundled_runtime_root(&self) -> Option<PathBuf> {
+        (self.source == PythonLauncherSource::BundledRuntime)
+            .then(|| bundled_runtime_root_from_candidate(self))
+            .flatten()
+    }
+
+    fn sanitize_bundled_command<C: PythonEnvCommand>(&self, command: &mut C) {
+        if let Some(runtime_root) = self.bundled_runtime_root() {
+            sanitize_packaged_python_subprocess_env(command, &runtime_root);
+        }
+    }
+
     fn new(
         program: impl Into<String>,
         args: Vec<String>,
@@ -54,7 +66,7 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            self.sanitize_bundled_command(&mut cmd);
         }
         cmd.arg("--version");
         cmd
@@ -64,7 +76,7 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            self.sanitize_bundled_command(&mut cmd);
         }
         cmd.arg("-c");
         cmd.arg("import json,platform,struct,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'pointer_bits': struct.calcsize('P') * 8, 'executable': sys.executable, 'prefix': sys.prefix}))");
@@ -78,7 +90,7 @@ impl PythonLauncher {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            self.sanitize_bundled_command(&mut cmd);
         }
         cmd.arg(script_path);
         cmd
@@ -91,7 +103,7 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            self.sanitize_bundled_command(&mut cmd);
         }
         cmd.arg(script_path);
         cmd
@@ -1193,7 +1205,7 @@ const PACKAGED_MUTABLE_ENV_KEYS: &[&str] = &[
     "FORCE_CMAKE",
 ];
 
-pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C)
+pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C, runtime_root: &Path)
 where
     C: PythonEnvCommand,
 {
@@ -1219,6 +1231,33 @@ where
     }
     command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
     command.set_env("PYTHONDONTWRITEBYTECODE", std::ffi::OsStr::new("1"));
+    let runtime_root = runtime_root
+        .canonicalize()
+        .unwrap_or_else(|_| runtime_root.to_path_buf());
+    let mut trusted_path = vec![runtime_root.clone()];
+    let native_lib = runtime_root
+        .join("Lib")
+        .join("site-packages")
+        .join("llama_cpp")
+        .join("lib");
+    if native_lib.is_dir() {
+        trusted_path.push(native_lib.canonicalize().unwrap_or(native_lib));
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(system_root) = std::env::var_os("SystemRoot").map(PathBuf::from) {
+            if system_root.is_absolute() {
+                let system32 = system_root.join("System32");
+                trusted_path.push(system32.canonicalize().unwrap_or(system32));
+            }
+        }
+        // This value is an attestation from the compiled/bundled runtime contract,
+        // never a copy of the mutable host architecture environment.
+        command.set_env("PROCESSOR_ARCHITECTURE", "AMD64");
+        command.set_env("TOKEN_PLACE_PACKAGED_RUNTIME_ARCH", "x86_64");
+    }
+    if let Ok(path) = std::env::join_paths(trusted_path) {
+        command.set_env("PATH", path);
+    }
 }
 
 fn import_root_is_confirmed_unbundled_development(import_root: &Path) -> bool {
@@ -1242,7 +1281,19 @@ pub fn configure_python_subprocess_env_for_layout<C>(
 {
     disable_python_user_site(command);
     if packaged || layout != ResourceLayoutKind::DevSourceTree {
-        sanitize_packaged_python_subprocess_env(command);
+        let runtime_root = import_root
+            .ancestors()
+            .map(|root| root.join("python-runtime"))
+            .find(|root| {
+                root.join(if cfg!(target_os = "windows") {
+                    "python.exe"
+                } else {
+                    "bin/python3"
+                })
+                .is_file()
+            })
+            .unwrap_or_else(|| import_root.join("python-runtime"));
+        sanitize_packaged_python_subprocess_env(command, &runtime_root);
     }
     command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root.as_os_str());
     let python_dir = import_root.join("python");
@@ -1423,6 +1474,28 @@ pub fn resolve_runtime_import_root(
     candidates
         .into_iter()
         .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
+}
+
+/// Resolve repository Python resources inside one already-selected packaged
+/// Tauri resource tree. Packaged callers deliberately do not consult the host
+/// override accepted by the development resolver above.
+pub fn resolve_packaged_runtime_import_root(resource_root: &Path) -> Option<PathBuf> {
+    let tree = resource_root.canonicalize().ok()?;
+    let mut candidates = Vec::new();
+    let mut candidate = tree.clone();
+    for _ in 0..=3 {
+        if candidate.join("utils").is_dir() || candidate.join("config.py").is_file() {
+            let canonical = candidate.canonicalize().ok()?;
+            if canonical.starts_with(&tree) && !candidates.contains(&canonical) {
+                candidates.push(canonical);
+            }
+        }
+        candidate = candidate.join("_up_");
+    }
+    match candidates.as_slice() {
+        [root] => Some(root.clone()),
+        _ => None,
+    }
 }
 
 fn mode_requests_gpu(mode: &ComputeMode) -> bool {
@@ -2563,7 +2636,10 @@ mod tests {
             Some("1")
         );
         let mut effective = PythonEnvCommandRecorder::with_poisoned_env();
-        sanitize_packaged_python_subprocess_env(&mut effective);
+        sanitize_packaged_python_subprocess_env(
+            &mut effective,
+            Path::new("/bundle/python-runtime"),
+        );
         assert!(effective.clear_env_called);
         for key in [
             "PYTHONHOME",
@@ -2593,7 +2669,13 @@ mod tests {
             PACKAGED_ENV_FUNDAMENTALS.contains(&key.to_string_lossy().as_ref())
                 || matches!(
                     key.to_str(),
-                    Some("PYTHONNOUSERSITE" | "PYTHONDONTWRITEBYTECODE")
+                    Some(
+                        "PATH"
+                            | "PYTHONNOUSERSITE"
+                            | "PYTHONDONTWRITEBYTECODE"
+                            | "PROCESSOR_ARCHITECTURE"
+                            | "TOKEN_PLACE_PACKAGED_RUNTIME_ARCH"
+                    )
                 )
         }));
     }
@@ -2616,13 +2698,15 @@ mod tests {
 
         let mut effective = PythonEnvCommandRecorder::with_poisoned_env();
         effective.set_env("PATH", "poison-host-tools");
-        sanitize_packaged_python_subprocess_env(&mut effective);
+        sanitize_packaged_python_subprocess_env(
+            &mut effective,
+            Path::new("/bundle/python-runtime"),
+        );
 
         for (key, value) in fundamentals {
             assert_eq!(effective.value(key), Some(std::ffi::OsStr::new(value)));
         }
         for key in [
-            "PATH",
             "PYTHONHOME",
             "PYTHONPATH",
             "VIRTUAL_ENV",
@@ -2633,6 +2717,9 @@ mod tests {
         ] {
             assert_eq!(effective.value(key), None, "{key} must not reach the child");
         }
+        let path = effective.value("PATH").expect("deterministic bundled PATH");
+        assert!(path.to_string_lossy().contains("python-runtime"));
+        assert!(!path.to_string_lossy().contains("poison-host-tools"));
 
         for (key, value) in previous {
             if let Some(value) = value {

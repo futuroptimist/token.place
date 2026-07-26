@@ -3014,6 +3014,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--installed-context-smoke", action="store_true")
     parser.add_argument("--operator-preflight-controlled-ready", action="store_true")
+    parser.add_argument("--operator-native-runtime-preflight", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3049,8 +3050,38 @@ def main() -> int:
             "download_actions": 0,
         }, sort_keys=True, separators=(",", ":")), flush=True)
         return 0
+    if args.operator_native_runtime_preflight:
+        # Release acceptance reaches the real immutable native import before
+        # stopping at the first hardware/model-dependent boundary.  Unlike the
+        # legacy controlled-ready unit hook, this event is never fabricated.
+        dependency_setup = ensure_desktop_python_dependencies()
+        if dependency_setup.get("ok") != "true":
+            raise RuntimeError("operator_native_preflight_dependency_check_failed")
+        from desktop_runtime_setup import _probe_llama_runtime
+
+        probe = _probe_llama_runtime()
+        if probe.error or probe.version != "0.3.32":
+            raise RuntimeError("operator_native_preflight_llama_import_failed")
+        if not probe.constructor_signature_inspectable or probe.qwen_64k_yarn_support != "supported":
+            raise RuntimeError("operator_native_preflight_capability_metadata_incomplete")
+        print(json.dumps({
+            "type": "status",
+            "startup_result": "native_runtime_validated",
+            "context_tier": args.context_tier,
+            "controlled_preflight": False,
+            "native_runtime_imported": True,
+            "runtime_version": probe.version,
+            "hardware_boundary": "physical_device_and_model_construction",
+            "provisioning_actions": 0,
+            "repair_actions": 0,
+            "pip_actions": 0,
+            "compiler_actions": 0,
+            "network_actions": 0,
+            "download_actions": 0,
+        }, sort_keys=True, separators=(",", ":")), flush=True)
+        return 0
     if not args.model:
-        parser.error("--model is required unless --installed-context-smoke or --operator-preflight-controlled-ready is used")
+        parser.error("--model is required unless an installed-runtime preflight is used")
 
     try:
         args.mode = _normalize_compute_mode_local(args.mode)

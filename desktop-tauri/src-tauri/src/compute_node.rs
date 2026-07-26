@@ -1770,10 +1770,20 @@ pub(crate) fn prepare_operator_bridge_launch(
         };
         let launcher = resolve_bundled_python_launcher_at_root(&resource_root, true)
             .map_err(OperatorBridgeLaunchPreparationError::from_launcher)?;
+        let import_root =
+            crate::python_runtime::resolve_packaged_runtime_import_root(&resource_root)
+                .ok_or_else(|| {
+                    OperatorBridgeLaunchPreparationError::new(
+                        "import_root_resolution",
+                        "desktop_python_runtime_invalid",
+                        "packaged_import_root_invalid",
+                        "packaged import root is missing or ambiguous",
+                    )
+                })?;
         return Ok(OperatorBridgeLaunchPreparation {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(launcher),
-            import_root: resource_root.clone(),
+            import_root,
             resource_root,
             layout,
         });
@@ -1927,7 +1937,7 @@ pub(crate) fn operator_start_preflight_record(
     let preparation = prepare_operator_bridge_launch(&context)?;
     let mut command = preparation.command()?;
     configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
-    command.arg("--operator-preflight-controlled-ready");
+    command.arg("--operator-native-runtime-preflight");
     command
         .arg("--context-tier")
         .arg(normalize_context_tier(&config.context_tier));
@@ -1990,9 +2000,17 @@ async fn cleanup_controlled_operator_preflight_child(child: &mut Child, pid: Opt
 }
 
 fn validate_controlled_operator_preflight_event(event: Value) -> anyhow::Result<Value> {
-    let identity_is_valid = event.get("type").and_then(Value::as_str) == Some("status")
-        && event.get("controlled_preflight").and_then(Value::as_bool) == Some(true)
+    let legacy_unit_event = event.get("controlled_preflight").and_then(Value::as_bool)
+        == Some(true)
         && event.get("startup_result").and_then(Value::as_str) == Some("ready");
+    let native_release_event = event
+        .get("native_runtime_imported")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && event.get("runtime_version").and_then(Value::as_str) == Some("0.3.32")
+        && event.get("startup_result").and_then(Value::as_str) == Some("native_runtime_validated");
+    let identity_is_valid = event.get("type").and_then(Value::as_str) == Some("status")
+        && (legacy_unit_event || native_release_event);
     let counters_are_zero = [
         "provisioning_actions",
         "repair_actions",

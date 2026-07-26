@@ -2735,8 +2735,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(entries[0], runtime.canonicalize().unwrap());
         assert_eq!(entries[1], native.canonicalize().unwrap());
-        assert_eq!(entries.iter().filter(|entry| **entry == entries[0]).count(), 1);
-        assert!(!entries.iter().any(|entry| entry.to_string_lossy().contains("poison")));
+        assert_eq!(
+            entries.iter().filter(|entry| **entry == entries[0]).count(),
+            1
+        );
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.to_string_lossy().contains("poison")));
     }
 
     #[test]

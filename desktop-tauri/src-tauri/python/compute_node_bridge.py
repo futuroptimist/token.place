@@ -3037,11 +3037,15 @@ def main() -> int:
         if dependency.get("ok") != "true":
             raise RuntimeError("operator_preflight_dependency_check_failed")
         args.mode = _normalize_compute_mode_local(args.mode)
-        runtime = _ensure_desktop_llama_runtime_for_context(args.mode, args.context_tier)
-        if runtime.get("ok") != "true":
-            raise RuntimeError("operator_preflight_runtime_validation_failed")
         _, normalize_context_tier = _load_context_profile_helpers()
         context_tier = normalize_context_tier(args.context_tier)
+        runtime = _ensure_desktop_llama_runtime_for_context(args.mode, context_tier)
+        if (
+            not runtime.get("runtime_action")
+            or not runtime.get("selected_backend")
+            or desktop_gpu_runtime_failure_message(args.mode, runtime)
+        ):
+            raise RuntimeError("operator_preflight_runtime_validation_failed")
         print(json.dumps({
             "type": "status",
             "startup_result": "runtime_validated",

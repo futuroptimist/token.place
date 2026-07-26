@@ -3954,13 +3954,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_preflight_accepts_valid_controlled_readiness_event() {
+    async fn operator_preflight_accepts_valid_runtime_validation_event() {
         let event = run_production_operator_preflight_child(
             operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_VALIDATED_EVENT), false),
             Duration::from_secs(2),
         )
         .await
-        .expect("valid controlled readiness");
+        .expect("valid production runtime validation");
 
         assert_eq!(event["type"], "status");
         assert_eq!(event["production_runtime_preflight"], true);

@@ -2039,7 +2039,14 @@ def test_main_normalizes_mode_before_run(monkeypatch):
 def test_main_operator_preflight_validates_native_runtime_before_boundary(capsys, monkeypatch):
     calls = []
     monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: calls.append('dependencies') or {'ok': 'true'})
-    monkeypatch.setattr(compute_node_bridge, '_ensure_desktop_llama_runtime_for_context', lambda mode, tier: calls.append((mode, tier)) or {'ok': 'true'})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda mode, tier: calls.append((mode, tier)) or {
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+        },
+    )
     monkeypatch.setattr(
         sys,
         'argv',
@@ -2069,6 +2076,50 @@ def test_main_operator_preflight_validates_native_runtime_before_boundary(capsys
         'network_actions': 0,
         'download_actions': 0,
     }
+
+
+def test_main_operator_preflight_normalizes_context_before_runtime_validation(capsys, monkeypatch):
+    calls = []
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda mode, tier: calls.append((mode, tier)) or {
+            'runtime_action': 'already_supported',
+            'selected_backend': 'cuda',
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['compute_node_bridge.py', '--operator-runtime-preflight', '--context-tier', ' 64K '],
+    )
+
+    assert compute_node_bridge.main() == 0
+    assert calls == [('auto', '8k-fast')]
+    assert json.loads(capsys.readouterr().out)['context_tier'] == '8k-fast'
+
+
+def test_main_operator_preflight_rejects_failed_runtime_contract(monkeypatch):
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda _mode, _tier: {
+            'runtime_action': 'bundled_runtime_probe_failed',
+            'selected_backend': 'cpu',
+            'fallback_reason': 'native import failed',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'desktop_gpu_runtime_failure_message',
+        lambda _mode, _runtime: 'GPU provisioning failed',
+    )
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight'])
+
+    with pytest.raises(RuntimeError, match='operator_preflight_runtime_validation_failed'):
+        compute_node_bridge.main()
 
 
 def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys, monkeypatch):

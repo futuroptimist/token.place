@@ -11134,6 +11134,60 @@ def test_llama_module_identity_consumer_rejects_sentinels_and_normalizes_windows
     assert model_manager_module.llama_module_identity_from_path(base) == model_manager_module.llama_module_identity_from_path(mixed)
 
 
+def test_canonical_windows_path_for_identity_resolves_real_alias_before_lexical_fallback(tmp_path):
+    """A resolvable symlink/dot-dot alias of an existing module must canonicalize to the
+    same identity as the real path instead of falling back to lexical normalization, which
+    caused packaged Windows worker identities to mismatch the parent-computed expectation."""
+    from utils.llm import model_manager as model_manager_module
+
+    real = tmp_path / 'real' / 'llama_cpp' / '__init__.py'
+    real.parent.mkdir(parents=True)
+    real.write_text('# mock')
+    link_dir = tmp_path / 'link'
+    link_dir.symlink_to(real.parent.parent, target_is_directory=True)
+    via_link = link_dir / 'llama_cpp' / '..' / 'llama_cpp' / '__init__.py'
+
+    direct = model_manager_module._canonical_windows_path_for_identity(str(real))
+    aliased = model_manager_module._canonical_windows_path_for_identity(str(via_link))
+    assert direct == aliased
+
+    other = tmp_path / 'other' / 'llama_cpp' / '__init__.py'
+    other.parent.mkdir(parents=True)
+    other.write_text('# other')
+    assert direct != model_manager_module._canonical_windows_path_for_identity(str(other))
+
+    # Nonexistent/synthetic Windows-style paths must retain deterministic lexical fallback.
+    synthetic = r'C:\Users\Alice\Runtime\Lib\site-packages\llama_cpp\..\llama_cpp\__init__.py'
+    assert model_manager_module._canonical_windows_path_for_identity(synthetic) == (
+        r'c:/users/alice/runtime/lib/site-packages/llama_cpp/__init__.py'
+    )
+
+
+def test_llama_module_identity_from_path_matches_shared_helper_for_aliased_real_paths(tmp_path):
+    """model_manager's identity helper must agree with the shared llama_module_identity
+    implementation for a real file and its symlink/dot-dot alias, matching what the packaged
+    worker process computes for the expected/imported worker identity comparison."""
+    from utils.llm import model_manager as model_manager_module
+    from utils.llm import llama_module_identity as shared_identity
+
+    real = tmp_path / 'real' / 'llama_cpp' / '__init__.py'
+    real.parent.mkdir(parents=True)
+    real.write_text('# mock')
+    link_dir = tmp_path / 'link'
+    link_dir.symlink_to(real.parent.parent, target_is_directory=True)
+    via_link = link_dir / 'llama_cpp' / '..' / 'llama_cpp' / '__init__.py'
+
+    assert model_manager_module.llama_module_identity_from_path(
+        real
+    ) == model_manager_module.llama_module_identity_from_path(via_link)
+    assert model_manager_module.llama_module_identity_from_path(
+        real
+    ) == shared_identity.llama_module_identity_from_path(real)
+    assert model_manager_module.llama_module_identity_from_path(
+        via_link
+    ) == shared_identity.llama_module_identity_from_path(via_link)
+
+
 def test_import_llama_cpp_runtime_identity_only_probe_skips_discovery(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
 

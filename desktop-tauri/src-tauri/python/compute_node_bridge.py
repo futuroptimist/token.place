@@ -3013,7 +3013,7 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--installed-context-smoke", action="store_true")
-    parser.add_argument("--operator-preflight-controlled-ready", action="store_true")
+    parser.add_argument("--operator-runtime-preflight", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3030,16 +3030,24 @@ def main() -> int:
     if args.installed_context_smoke:
         print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))
         return 0
-    if args.operator_preflight_controlled_ready:
+    if args.operator_runtime_preflight:
+        # Release acceptance must execute the immutable runtime checks; it may
+        # not substitute a fabricated worker-ready event for native import.
+        dependency = ensure_desktop_python_dependencies()
+        if dependency.get("ok") != "true":
+            raise RuntimeError("operator_preflight_dependency_check_failed")
+        args.mode = _normalize_compute_mode_local(args.mode)
+        runtime = _ensure_desktop_llama_runtime_for_context(args.mode, args.context_tier)
+        if runtime.get("ok") != "true":
+            raise RuntimeError("operator_preflight_runtime_validation_failed")
+        _, normalize_context_tier = _load_context_profile_helpers()
+        context_tier = normalize_context_tier(args.context_tier)
         print(json.dumps({
             "type": "status",
-            "startup_result": "ready",
-            "startup_phase": "ready",
-            "relay_runtime_state": "ready",
-            "worker_state": "ready",
-            "worker_alive": True,
-            "context_tier": args.context_tier,
-            "controlled_preflight": True,
+            "startup_result": "runtime_validated",
+            "startup_phase": "hardware_model_boundary",
+            "context_tier": context_tier,
+            "production_runtime_preflight": True,
             "runtime_provisioning_state": "ready",
             "provisioning_actions": 0,
             "repair_actions": 0,
@@ -3050,7 +3058,7 @@ def main() -> int:
         }, sort_keys=True, separators=(",", ":")), flush=True)
         return 0
     if not args.model:
-        parser.error("--model is required unless --installed-context-smoke or --operator-preflight-controlled-ready is used")
+        parser.error("--model is required unless an installed preflight is used")
 
     try:
         args.mode = _normalize_compute_mode_local(args.mode)

@@ -9,10 +9,11 @@ use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, coherent_packaged_resource_roots,
     configure_python_subprocess_env_for_layout, describe_resource_layout, disable_python_user_site,
     resolve_bridge_script_path, resolve_bundled_python_launcher_at_root,
-    resolve_python_launcher_resource_aware, resolve_runtime_import_root,
-    should_enable_runtime_bootstrap, BridgeResourceContext, PythonEnvCommand, PythonLauncher,
-    PythonLauncherCategory, PythonLauncherError, PythonLauncherResolutionOptions,
-    PythonLauncherSource, ResourceLayoutKind, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    resolve_packaged_runtime_import_root, resolve_python_launcher_resource_aware,
+    resolve_runtime_import_root, should_enable_runtime_bootstrap, BridgeResourceContext,
+    PythonEnvCommand, PythonLauncher, PythonLauncherCategory, PythonLauncherError,
+    PythonLauncherResolutionOptions, PythonLauncherSource, ResourceLayoutKind,
+    ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -1770,10 +1771,19 @@ pub(crate) fn prepare_operator_bridge_launch(
         };
         let launcher = resolve_bundled_python_launcher_at_root(&resource_root, true)
             .map_err(OperatorBridgeLaunchPreparationError::from_launcher)?;
+        let import_root =
+            resolve_packaged_runtime_import_root(&resource_root).ok_or_else(|| {
+                OperatorBridgeLaunchPreparationError::new(
+                    "import_root_resolution",
+                    "packaged_import_root_invalid",
+                    "packaged_layout_invalid",
+                    "selected packaged resource tree has no unique import root",
+                )
+            })?;
         return Ok(OperatorBridgeLaunchPreparation {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(launcher),
-            import_root: resource_root.clone(),
+            import_root,
             resource_root,
             layout,
         });
@@ -1927,7 +1937,7 @@ pub(crate) fn operator_start_preflight_record(
     let preparation = prepare_operator_bridge_launch(&context)?;
     let mut command = preparation.command()?;
     configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
-    command.arg("--operator-preflight-controlled-ready");
+    command.arg("--operator-runtime-preflight");
     command
         .arg("--context-tier")
         .arg(normalize_context_tier(&config.context_tier));
@@ -1935,7 +1945,7 @@ pub(crate) fn operator_start_preflight_record(
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(run_controlled_operator_preflight_child(
+            .block_on(run_production_operator_preflight_child(
                 command,
                 OPERATOR_PREFLIGHT_EVENT_TIMEOUT,
             ))
@@ -1956,7 +1966,7 @@ pub(crate) fn operator_start_preflight_record(
         map.insert("bridge_child_spawned".into(), Value::Bool(true));
         map.insert("bridge_event_received".into(), Value::Bool(true));
         for key in [
-            "controlled_preflight",
+            "production_runtime_preflight",
             "startup_result",
             "provisioning_actions",
             "repair_actions",
@@ -1969,14 +1979,14 @@ pub(crate) fn operator_start_preflight_record(
         }
         map.insert("bridge_event_type".into(), event["type"].clone());
         map.insert(
-            "controlled_ready".into(),
-            Value::Bool(event["controlled_preflight"] == Value::Bool(true)),
+            "native_runtime_validated".into(),
+            Value::Bool(event["production_runtime_preflight"] == Value::Bool(true)),
         );
     }
     Ok(payload)
 }
 
-async fn cleanup_controlled_operator_preflight_child(child: &mut Child, pid: Option<u32>) {
+async fn cleanup_production_operator_preflight_child(child: &mut Child, pid: Option<u32>) {
     if let Some(pid) = pid {
         terminate_bridge_process_tree(pid).await;
     }
@@ -1989,10 +1999,13 @@ async fn cleanup_controlled_operator_preflight_child(child: &mut Child, pid: Opt
     }
 }
 
-fn validate_controlled_operator_preflight_event(event: Value) -> anyhow::Result<Value> {
+fn validate_production_operator_preflight_event(event: Value) -> anyhow::Result<Value> {
     let identity_is_valid = event.get("type").and_then(Value::as_str) == Some("status")
-        && event.get("controlled_preflight").and_then(Value::as_bool) == Some(true)
-        && event.get("startup_result").and_then(Value::as_str) == Some("ready");
+        && event
+            .get("production_runtime_preflight")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && event.get("startup_result").and_then(Value::as_str) == Some("runtime_validated");
     let counters_are_zero = [
         "provisioning_actions",
         "repair_actions",
@@ -2009,7 +2022,7 @@ fn validate_controlled_operator_preflight_event(event: Value) -> anyhow::Result<
     Ok(event)
 }
 
-async fn run_controlled_operator_preflight_child(
+async fn run_production_operator_preflight_child(
     mut command: Command,
     event_timeout: Duration,
 ) -> anyhow::Result<Value> {
@@ -2032,10 +2045,10 @@ async fn run_controlled_operator_preflight_child(
             .ok_or_else(|| anyhow::anyhow!("operator_preflight_event_missing"))?;
         let event = parse_compute_node_event_line(&line)
             .map_err(|_| anyhow::anyhow!("operator_preflight_event_parse_failed"))?;
-        validate_controlled_operator_preflight_event(event)
+        validate_production_operator_preflight_event(event)
     }
     .await;
-    cleanup_controlled_operator_preflight_child(&mut child, pid).await;
+    cleanup_production_operator_preflight_child(&mut child, pid).await;
     result
 }
 
@@ -3909,7 +3922,7 @@ mod tests {
         assert_eq!(event_types, vec!["status".to_string(), "error".to_string()]);
     }
 
-    const CONTROLLED_PREFLIGHT_READY_EVENT: &str = r#"{"type":"status","controlled_preflight":true,"startup_result":"ready","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
+    const PRODUCTION_PREFLIGHT_VALIDATED_EVENT: &str = r#"{"type":"status","production_runtime_preflight":true,"startup_result":"runtime_validated","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
 
     fn operator_preflight_test_command(output: Option<&str>, wedge: bool) -> Command {
         #[cfg(unix)]
@@ -3942,15 +3955,15 @@ mod tests {
 
     #[tokio::test]
     async fn operator_preflight_accepts_valid_controlled_readiness_event() {
-        let event = run_controlled_operator_preflight_child(
-            operator_preflight_test_command(Some(CONTROLLED_PREFLIGHT_READY_EVENT), false),
+        let event = run_production_operator_preflight_child(
+            operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_VALIDATED_EVENT), false),
             Duration::from_secs(2),
         )
         .await
         .expect("valid controlled readiness");
 
         assert_eq!(event["type"], "status");
-        assert_eq!(event["controlled_preflight"], true);
+        assert_eq!(event["production_runtime_preflight"], true);
         assert_eq!(event["network_actions"], 0);
     }
 
@@ -3958,18 +3971,18 @@ mod tests {
     fn operator_preflight_rejects_noncontrolled_and_nonzero_action_events() {
         for event in [
             serde_json::json!({
-                "type": "status", "controlled_preflight": false, "startup_result": "ready",
+                "type": "status", "production_runtime_preflight": false, "startup_result": "runtime_validated",
                 "provisioning_actions": 0, "repair_actions": 0, "pip_actions": 0,
                 "compiler_actions": 0, "network_actions": 0, "download_actions": 0,
             }),
             serde_json::json!({
-                "type": "status", "controlled_preflight": true, "startup_result": "ready",
+                "type": "status", "production_runtime_preflight": true, "startup_result": "runtime_validated",
                 "provisioning_actions": 0, "repair_actions": 0, "pip_actions": 1,
                 "compiler_actions": 0, "network_actions": 0, "download_actions": 0,
             }),
         ] {
             assert_eq!(
-                validate_controlled_operator_preflight_event(event)
+                validate_production_operator_preflight_event(event)
                     .expect_err("invalid event")
                     .to_string(),
                 "operator_preflight_invalid_event"
@@ -3980,7 +3993,7 @@ mod tests {
     #[tokio::test]
     async fn operator_preflight_times_out_silent_wedged_child() {
         let started = Instant::now();
-        let error = run_controlled_operator_preflight_child(
+        let error = run_production_operator_preflight_child(
             operator_preflight_test_command(None, true),
             Duration::from_millis(100),
         )
@@ -3994,8 +4007,8 @@ mod tests {
     #[tokio::test]
     async fn operator_preflight_terminates_and_reaps_child_after_ready_event() {
         let started = Instant::now();
-        run_controlled_operator_preflight_child(
-            operator_preflight_test_command(Some(CONTROLLED_PREFLIGHT_READY_EVENT), true),
+        run_production_operator_preflight_child(
+            operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_VALIDATED_EVENT), true),
             Duration::from_secs(2),
         )
         .await

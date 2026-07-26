@@ -1679,6 +1679,12 @@ def _desktop_platform() -> str:
 
 
 def _desktop_arch() -> str:
+    packaged_arch = os.environ.get("TOKEN_PLACE_PACKAGED_ARCH", "").strip().lower()
+    packaged_source = os.environ.get("TOKEN_PLACE_PACKAGED_ARCH_SOURCE", "").strip()
+    if packaged_arch or packaged_source:
+        if packaged_arch == "x86_64" and packaged_source == "attested_windows_x86_64":
+            return packaged_arch
+        raise RuntimeError("packaged_runtime_architecture_attestation_invalid")
     return platform_module.machine().lower().replace("amd64", "x86_64")
 
 

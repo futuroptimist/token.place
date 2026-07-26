@@ -2036,13 +2036,16 @@ def test_main_normalizes_mode_before_run(monkeypatch):
     assert captured['mode'] == 'auto'
 
 
-def test_main_emits_controlled_operator_preflight_ready_event(capsys, monkeypatch):
+def test_main_operator_preflight_validates_native_runtime_before_boundary(capsys, monkeypatch):
+    calls = []
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: calls.append('dependencies') or {'ok': 'true'})
+    monkeypatch.setattr(compute_node_bridge, '_ensure_desktop_llama_runtime_for_context', lambda mode, tier: calls.append((mode, tier)) or {'ok': 'true'})
     monkeypatch.setattr(
         sys,
         'argv',
         [
             'compute_node_bridge.py',
-            '--operator-preflight-controlled-ready',
+            '--operator-runtime-preflight',
             '--context-tier',
             '64k-full',
         ],
@@ -2051,15 +2054,13 @@ def test_main_emits_controlled_operator_preflight_ready_event(capsys, monkeypatc
     assert compute_node_bridge.main() == 0
 
     payload = json.loads(capsys.readouterr().out)
+    assert calls == ['dependencies', ('auto', '64k-full')]
     assert payload == {
         'type': 'status',
-        'startup_result': 'ready',
-        'startup_phase': 'ready',
-        'relay_runtime_state': 'ready',
-        'worker_state': 'ready',
-        'worker_alive': True,
+        'startup_result': 'runtime_validated',
+        'startup_phase': 'hardware_model_boundary',
         'context_tier': '64k-full',
-        'controlled_preflight': True,
+        'production_runtime_preflight': True,
         'runtime_provisioning_state': 'ready',
         'provisioning_actions': 0,
         'repair_actions': 0,

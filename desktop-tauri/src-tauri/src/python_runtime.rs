@@ -54,7 +54,10 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            sanitize_packaged_python_subprocess_env(
+                &mut cmd,
+                self.bundled_runtime_root().as_deref(),
+            );
         }
         cmd.arg("--version");
         cmd
@@ -64,7 +67,10 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            sanitize_packaged_python_subprocess_env(
+                &mut cmd,
+                self.bundled_runtime_root().as_deref(),
+            );
         }
         cmd.arg("-c");
         cmd.arg("import json,platform,struct,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'pointer_bits': struct.calcsize('P') * 8, 'executable': sys.executable, 'prefix': sys.prefix}))");
@@ -78,7 +84,10 @@ impl PythonLauncher {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            sanitize_packaged_python_subprocess_env(
+                &mut cmd,
+                self.bundled_runtime_root().as_deref(),
+            );
         }
         cmd.arg(script_path);
         cmd
@@ -91,10 +100,21 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            sanitize_packaged_python_subprocess_env(
+                &mut cmd,
+                self.bundled_runtime_root().as_deref(),
+            );
         }
         cmd.arg(script_path);
         cmd
+    }
+}
+
+impl PythonLauncher {
+    fn bundled_runtime_root(&self) -> Option<PathBuf> {
+        (self.source == PythonLauncherSource::BundledRuntime)
+            .then(|| Path::new(&self.program).parent().map(Path::to_path_buf))
+            .flatten()
     }
 }
 
@@ -1193,7 +1213,7 @@ const PACKAGED_MUTABLE_ENV_KEYS: &[&str] = &[
     "FORCE_CMAKE",
 ];
 
-pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C)
+pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C, runtime_root: Option<&Path>)
 where
     C: PythonEnvCommand,
 {
@@ -1219,6 +1239,34 @@ where
     }
     command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
     command.set_env("PYTHONDONTWRITEBYTECODE", std::ffi::OsStr::new("1"));
+    if let Some(runtime_root) = runtime_root.and_then(|path| path.canonicalize().ok()) {
+        let mut trusted = vec![runtime_root.clone()];
+        let native = runtime_root.join("Lib/site-packages/llama_cpp/lib");
+        if let Ok(native) = native.canonicalize() {
+            trusted.push(native);
+        }
+        if cfg!(target_os = "windows") {
+            if let Some(system_root) = std::env::var_os("SystemRoot")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .and_then(|path| path.canonicalize().ok())
+            {
+                if let Ok(system32) = system_root.join("System32").canonicalize() {
+                    trusted.push(system32);
+                }
+            }
+            command.set_env("PROCESSOR_ARCHITECTURE", "AMD64");
+            command.set_env("TOKEN_PLACE_PACKAGED_ARCH", "x86_64");
+            command.set_env(
+                "TOKEN_PLACE_PACKAGED_ARCH_SOURCE",
+                "attested_windows_x86_64",
+            );
+        }
+        trusted.dedup();
+        if let Ok(path) = std::env::join_paths(trusted) {
+            command.set_env("PATH", path);
+        }
+    }
 }
 
 fn import_root_is_confirmed_unbundled_development(import_root: &Path) -> bool {
@@ -1242,7 +1290,11 @@ pub fn configure_python_subprocess_env_for_layout<C>(
 {
     disable_python_user_site(command);
     if packaged || layout != ResourceLayoutKind::DevSourceTree {
-        sanitize_packaged_python_subprocess_env(command);
+        let runtime_root = import_root
+            .ancestors()
+            .map(|root| root.join("python-runtime"))
+            .find(|root| root.is_dir());
+        sanitize_packaged_python_subprocess_env(command, runtime_root.as_deref());
     }
     command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root.as_os_str());
     let python_dir = import_root.join("python");
@@ -1423,6 +1475,31 @@ pub fn resolve_runtime_import_root(
     candidates
         .into_iter()
         .find(|candidate| candidate.join("utils").is_dir() || candidate.join("config.py").is_file())
+}
+
+/// Resolve repository Python imports inside one already-selected packaged
+/// resource tree. Ambient overrides are deliberately excluded.
+pub fn resolve_packaged_runtime_import_root(resource_root: &Path) -> Option<PathBuf> {
+    let canonical_root = resource_root.canonicalize().ok()?;
+    let candidates = [
+        canonical_root.clone(),
+        canonical_root.join("_up_"),
+        canonical_root.join("_up_").join("_up_"),
+    ];
+    let mut matches = candidates
+        .into_iter()
+        .filter_map(|candidate| candidate.canonicalize().ok())
+        .filter(|candidate| candidate.starts_with(&canonical_root))
+        .filter(|candidate| {
+            candidate.join("utils").is_dir() && candidate.join("config.py").is_file()
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [root] => Some(root.clone()),
+        _ => None,
+    }
 }
 
 fn mode_requests_gpu(mode: &ComputeMode) -> bool {
@@ -2563,7 +2640,7 @@ mod tests {
             Some("1")
         );
         let mut effective = PythonEnvCommandRecorder::with_poisoned_env();
-        sanitize_packaged_python_subprocess_env(&mut effective);
+        sanitize_packaged_python_subprocess_env(&mut effective, None);
         assert!(effective.clear_env_called);
         for key in [
             "PYTHONHOME",
@@ -2616,7 +2693,7 @@ mod tests {
 
         let mut effective = PythonEnvCommandRecorder::with_poisoned_env();
         effective.set_env("PATH", "poison-host-tools");
-        sanitize_packaged_python_subprocess_env(&mut effective);
+        sanitize_packaged_python_subprocess_env(&mut effective, None);
 
         for (key, value) in fundamentals {
             assert_eq!(effective.value(key), Some(std::ffi::OsStr::new(value)));
@@ -2641,6 +2718,25 @@ mod tests {
                 std::env::remove_var(key);
             }
         }
+    }
+
+    #[test]
+    fn packaged_sanitizer_builds_path_from_runtime_not_host_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime = temp.path().join("python-runtime");
+        let native = runtime.join("Lib/site-packages/llama_cpp/lib");
+        std::fs::create_dir_all(&native).expect("native library directory");
+        let mut effective = PythonEnvCommandRecorder::with_poisoned_env();
+        effective.set_env("PATH", "poison-host-tools");
+
+        sanitize_packaged_python_subprocess_env(&mut effective, Some(&runtime));
+
+        let entries = std::env::split_paths(effective.value("PATH").expect("deterministic PATH"))
+            .collect::<Vec<_>>();
+        assert_eq!(entries[0], runtime.canonicalize().unwrap());
+        assert_eq!(entries[1], native.canonicalize().unwrap());
+        assert_eq!(entries.iter().filter(|entry| **entry == entries[0]).count(), 1);
+        assert!(!entries.iter().any(|entry| entry.to_string_lossy().contains("poison")));
     }
 
     #[test]

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-EXPECTED_VERSION = "0.1.5"
+EXPECTED_VERSION = "0.1.6"
 EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 RUNTIME_PROVENANCE_NAME = "embedded_python_runtime_provenance.json"
@@ -196,7 +196,7 @@ def validate_previous_artifacts(previous_nsis: Path, previous_msi: Path, previou
 def immediate_prior_version(version: str) -> str:
     """Return the immediate prior stable patch release for a semantic version string.
 
-    For '0.1.3' this returns '0.1.2'; for a future '0.1.5' it returns '0.1.4'.
+    For '0.1.3' this returns '0.1.2'; for a future '0.1.6' it returns '0.1.4'.
     """
     match = _SEMVER_RE.match(version)
     if not match:
@@ -743,8 +743,8 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
                 raise InstallerIdentityError("operator-start preflight did not use the real Tauri AppHandle resource context")
             if data.get("bridge_child_spawned") is not True or data.get("bridge_event_received") is not True:
                 raise InstallerIdentityError("operator-start preflight did not observe a spawned child and parsed bridge event")
-            if data.get("controlled_ready") is not True or data.get("startup_result") != "ready":
-                raise InstallerIdentityError("operator-start preflight did not observe controlled ready; terminal_actionable_error is not success")
+            if data.get("native_runtime_validated") is not True or data.get("startup_result") != "runtime_validated":
+                raise InstallerIdentityError("operator-start preflight did not validate the production native runtime; terminal_actionable_error is not success")
         elif data.get("startup_result") not in ("ready", "terminal_actionable_error"):
             raise InstallerIdentityError("operator-session smoke did not reach ready or a terminal actionable error")
         fallback_keys = ("fallback_reason", "backend_fallback", "model_fallback", "context_fallback")

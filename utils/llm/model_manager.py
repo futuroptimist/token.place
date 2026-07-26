@@ -1077,11 +1077,9 @@ def _is_stdlib_path(path_text: Any) -> bool:
         root_compare = _canonical_path_for_compare(root)
         if not root_compare:
             continue
-        try:
-            if os.path.commonpath([path_compare, root_compare]) == root_compare:
-                return True
-        except ValueError:
-            continue
+        root_prefix = root_compare.rstrip('/') + '/'
+        if path_compare == root_compare or path_compare.startswith(root_prefix):
+            return True
     return False
 
 
@@ -5077,11 +5075,12 @@ class ModelManager:
         if expected_size is not None or expected_sha256:
             try:
                 with open(tmp_path, 'rb') as check_file:
-                    if check_file.read(4) != GGUF_MAGIC:
-                        self.log_error("Download failed GGUF magic validation.")
-                        self._remove_partial_download(tmp_path)
-                        return False
+                    magic_is_valid = check_file.read(4) == GGUF_MAGIC
             except OSError:
+                self._remove_partial_download(tmp_path)
+                return False
+            if not magic_is_valid:
+                self.log_error("Download failed GGUF magic validation.")
                 self._remove_partial_download(tmp_path)
                 return False
         if expected_sha256 and digest.hexdigest().lower() != str(expected_sha256).lower():

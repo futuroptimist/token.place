@@ -2252,6 +2252,31 @@ def test_canonical_path_for_compare_handles_empty_and_fallback(monkeypatch):
     assert model_manager_module._canonical_path_for_compare('fallback/path') == expected
 
 
+def test_is_stdlib_path_accepts_windows_stdlib_and_rejects_shadow_origins(monkeypatch):
+    """Windows path spelling must not make a genuine stdlib module look shadowed."""
+    from utils.llm import model_manager as model_manager_module
+
+    stdlib_root = r'C:\hostedtoolcache\windows\Python\3.11.9\x64\Lib'
+    monkeypatch.setattr(
+        model_manager_module,
+        '_stdlib_roots_for_import_order',
+        lambda: [stdlib_root],
+    )
+
+    assert model_manager_module._is_stdlib_path(
+        r'\\?\C:\HOSTEDTOOLCACHE\windows\Python\3.11.9\x64\Lib\collections\__init__.py'
+    )
+    assert not model_manager_module._is_stdlib_path(
+        rf'{stdlib_root}\site-packages\collections\__init__.py'
+    )
+    assert not model_manager_module._is_stdlib_path(
+        r'C:\workspace\token.place\collections\__init__.py'
+    )
+    assert not model_manager_module._is_stdlib_path(
+        r'C:\hostedtoolcache\windows\Python\3.11.9\x64\LibraryShadow\collections\__init__.py'
+    )
+
+
 def test_run_llama_cpp_python_probe_handles_nonzero_and_malformed_json(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

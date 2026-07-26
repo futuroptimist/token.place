@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from pathlib import Path
 from typing import Any, Optional
 
 LLAMA_MODULE_IDENTITY_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -30,7 +31,8 @@ def canonical_llama_module_identity_input(module_path: Any) -> Optional[str]:
     except (TypeError, ValueError, OSError):
         return None
     try:
-        canonical = os.path.normcase(os.path.normpath(os.path.realpath(os.path.abspath(path_text))))
+        resolved = strip_windows_extended_path_prefix(str(Path(path_text).resolve(strict=True)))
+        canonical = os.path.normcase(resolved)
     except (TypeError, ValueError, OSError):
         try:
             canonical = os.path.normcase(os.path.normpath(path_text))

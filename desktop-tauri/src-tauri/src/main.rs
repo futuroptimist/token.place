@@ -660,6 +660,17 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .setup(|app| {
+            if std::env::args().any(|arg| arg == "--operator-start-preflight") {
+                let config = load_config_from_path(&config_path(&cli_config_dir()))
+                    .map_err(std::io::Error::other)?;
+                let payload = compute_node::operator_start_preflight_record(&config, &app.handle())
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+                println!("{}", payload);
+                std::process::exit(0);
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             detect_backend,
             load_config,

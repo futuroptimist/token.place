@@ -54,10 +54,12 @@ else:
             return None
         try:
             path_text = strip_windows_extended_path_prefix(str(module_path))
-            canonical = os.path.normcase(os.path.normpath(os.path.realpath(os.path.abspath(path_text))))
+            resolved = strip_windows_extended_path_prefix(str(Path(path_text).resolve(strict=True)))
+            canonical = os.path.normcase(resolved)
         except (TypeError, ValueError, OSError):
             try:
-                canonical = os.path.normcase(os.path.normpath(strip_windows_extended_path_prefix(str(module_path))))
+                path_text = strip_windows_extended_path_prefix(str(module_path))
+                canonical = os.path.normcase(os.path.normpath(path_text))
             except (TypeError, ValueError, OSError):
                 return None
         return canonical.replace("\\", "/")
@@ -118,6 +120,11 @@ def _canonical_windows_path_for_identity(path_text: str) -> str:
     stripped = _strip_windows_extended_path_prefix(path_text.strip())
     if stripped.startswith('\\?/'):
         stripped = stripped[3:]
+    try:
+        resolved = _strip_windows_extended_path_prefix(str(Path(stripped).resolve(strict=True)))
+        return os.path.normcase(resolved).replace("\\", "/")
+    except (TypeError, ValueError, OSError):
+        pass
     if stripped.startswith('/'):
         canonical = _shared_canonical_llama_module_identity_input(stripped)
         return canonical or os.path.normpath(stripped).replace("\\", "/")

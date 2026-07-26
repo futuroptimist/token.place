@@ -1077,11 +1077,9 @@ def _is_stdlib_path(path_text: Any) -> bool:
         root_compare = _canonical_path_for_compare(root)
         if not root_compare:
             continue
-        try:
-            if os.path.commonpath([path_compare, root_compare]) == root_compare:
-                return True
-        except ValueError:
-            continue
+        root_prefix = root_compare.rstrip('/') + '/'
+        if path_compare == root_compare or path_compare.startswith(root_prefix):
+            return True
     return False
 
 
@@ -1225,6 +1223,11 @@ def _canonical_windows_path_for_identity(path_text: str) -> str:
     stripped = _strip_windows_extended_path_prefix(path_text.strip())
     if stripped.startswith('\\?/'):
         stripped = stripped[3:]
+    try:
+        resolved = _strip_windows_extended_path_prefix(str(Path(stripped).resolve(strict=True)))
+        return os.path.normcase(resolved).replace("\\", "/")
+    except (TypeError, ValueError, OSError):
+        pass
     if stripped.startswith('/'):
         canonical = _shared_canonical_llama_module_identity_input(stripped)
         return canonical or os.path.normpath(stripped).replace("\\", "/")
@@ -5035,7 +5038,8 @@ class ModelManager:
                     bytes_downloaded = bytes_downloaded[-len(times):]
 
                     # Calculate speed and estimated time remaining
-                    speed = sum(bytes_downloaded) / sum(times) if times else 0
+                    elapsed_total = sum(times)
+                    speed = sum(bytes_downloaded) / elapsed_total if elapsed_total > 0 else 0
                     eta = (total_size_in_bytes - progress) / speed if speed else 0
 
                     downloaded_mb = progress / (1024 * 1024)
@@ -5071,11 +5075,12 @@ class ModelManager:
         if expected_size is not None or expected_sha256:
             try:
                 with open(tmp_path, 'rb') as check_file:
-                    if check_file.read(4) != GGUF_MAGIC:
-                        self.log_error("Download failed GGUF magic validation.")
-                        self._remove_partial_download(tmp_path)
-                        return False
+                    magic_is_valid = check_file.read(4) == GGUF_MAGIC
             except OSError:
+                self._remove_partial_download(tmp_path)
+                return False
+            if not magic_is_valid:
+                self.log_error("Download failed GGUF magic validation.")
                 self._remove_partial_download(tmp_path)
                 return False
         if expected_sha256 and digest.hexdigest().lower() != str(expected_sha256).lower():

@@ -53,6 +53,9 @@ impl PythonLauncher {
     fn command_for_version_check(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        if self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+        }
         cmd.arg("--version");
         cmd
     }
@@ -60,8 +63,11 @@ impl PythonLauncher {
     fn command_for_metadata_probe(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        if self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+        }
         cmd.arg("-c");
-        cmd.arg("import json,platform,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'executable': sys.executable, 'prefix': sys.prefix}))");
+        cmd.arg("import json,platform,struct,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'pointer_bits': struct.calcsize('P') * 8, 'executable': sys.executable, 'prefix': sys.prefix}))");
         cmd
     }
 
@@ -71,6 +77,9 @@ impl PythonLauncher {
     {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args);
+        if self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+        }
         cmd.arg(script_path);
         cmd
     }
@@ -81,6 +90,9 @@ impl PythonLauncher {
     {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        if self.source == PythonLauncherSource::BundledRuntime {
+            sanitize_packaged_python_subprocess_env(&mut cmd);
+        }
         cmd.arg(script_path);
         cmd
     }
@@ -94,6 +106,8 @@ pub enum PythonLauncherCategory {
     BundledRuntimeNotPython3,
     BundledRuntimeWrongArchitecture,
     BundledRuntimeProbeFailed,
+    BundledRuntimeProvenanceInvalid,
+    BundledRuntimeAmbiguous,
     OverrideMissing,
     OverrideNotPython3,
     SystemRuntimeMissing,
@@ -102,13 +116,15 @@ pub enum PythonLauncherCategory {
 }
 
 impl PythonLauncherCategory {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::BundledRuntimeMissing => "bundled_runtime_missing",
             Self::BundledRuntimeNotExecutable => "bundled_runtime_not_executable",
             Self::BundledRuntimeNotPython3 => "bundled_runtime_not_python3",
             Self::BundledRuntimeWrongArchitecture => "bundled_runtime_wrong_architecture",
             Self::BundledRuntimeProbeFailed => "bundled_runtime_probe_failed",
+            Self::BundledRuntimeProvenanceInvalid => "bundled_runtime_provenance_invalid",
+            Self::BundledRuntimeAmbiguous => "bundled_runtime_ambiguous",
             Self::OverrideMissing => "override_missing",
             Self::OverrideNotPython3 => "override_not_python3",
             Self::SystemRuntimeMissing => "system_runtime_missing",
@@ -238,32 +254,52 @@ fn output_status_code(output: &std::process::Output) -> Option<i32> {
     output.status.code()
 }
 
-fn json_string_field<'a>(payload: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("\"{key}\"");
-    let after_key = payload.split(&needle).nth(1)?;
-    let after_colon = after_key.split_once(':')?.1.trim_start();
-    let after_quote = after_colon.strip_prefix('"')?;
-    after_quote.split('"').next()
-}
-
 fn metadata_probe_is_valid(
     stdout: &str,
     runtime_root: &Path,
     expected_machine: &str,
 ) -> Result<(), PythonLauncherCategory> {
-    let payload = stdout.trim();
-    let compact_payload = payload.replace(char::is_whitespace, "");
-    if !(compact_payload.contains("\"version\"") && compact_payload.contains("[3,11,13]")) {
+    let metadata = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .map_err(|_| PythonLauncherCategory::BundledRuntimeProbeFailed)?;
+    let version = metadata.get("version").and_then(|value| value.as_array());
+    if !version.is_some_and(|parts| {
+        parts.len() == 3
+            && parts[0].as_u64() == Some(3)
+            && parts[1].as_u64() == Some(11)
+            && parts[2].as_u64() == Some(13)
+    }) {
         return Err(PythonLauncherCategory::BundledRuntimeNotPython3);
     }
-    if json_string_field(payload, "machine") != Some(expected_machine) {
+    if metadata
+        .get("pointer_bits")
+        .and_then(|value| value.as_u64())
+        != Some(64)
+    {
+        return Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture);
+    }
+    let machine = metadata
+        .get("machine")
+        .and_then(|value| value.as_str())
+        .ok_or(PythonLauncherCategory::BundledRuntimeWrongArchitecture)?;
+    let machine_is_expected = match expected_machine {
+        "AMD64" | "x86_64" => matches!(machine.to_ascii_lowercase().as_str(), "amd64" | "x86_64"),
+        "arm64" => matches!(machine.to_ascii_lowercase().as_str(), "arm64" | "aarch64"),
+        expected => machine.eq_ignore_ascii_case(expected),
+    };
+    // A sanitized Windows interpreter can return no machine string after the
+    // architecture environment variables are cleared. Pointer width is owned
+    // by the interpreter; Windows x64 provenance and PE closure are attested
+    // separately before the runtime is accepted.
+    if !machine_is_expected && !(machine.is_empty() && expected_machine == "AMD64") {
         return Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture);
     }
     let runtime_root = runtime_root
         .canonicalize()
         .map_err(|_| PythonLauncherCategory::BundledRuntimeProbeFailed)?;
     for key in ["executable", "prefix"] {
-        let value = json_string_field(payload, key)
+        let value = metadata
+            .get(key)
+            .and_then(|value| value.as_str())
             .ok_or(PythonLauncherCategory::BundledRuntimeProbeFailed)?;
         let resolved = Path::new(value)
             .canonicalize()
@@ -658,6 +694,138 @@ fn bundled_runtime_candidate(opts: &PythonLauncherResolutionOptions<'_>) -> Opti
     ))
 }
 
+pub(crate) fn coherent_packaged_resource_roots(
+    script_name: &str,
+    exe_path: Option<&Path>,
+    manifest_dir: &Path,
+    tauri_resource_dir: Option<&Path>,
+) -> Vec<(PathBuf, PathBuf, ResourceLayoutKind)> {
+    let mut coherent = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for candidate in resource_root_candidates(exe_path, manifest_dir, tauri_resource_dir) {
+        if !bundled_runtime_layout_is_eligible(&candidate.layout, true) {
+            continue;
+        }
+        let Some(bridge) =
+            bridge_script_candidates_from_candidates(script_name, std::slice::from_ref(&candidate))
+                .into_iter()
+                .find(|path| path.is_file())
+        else {
+            continue;
+        };
+        if !candidate
+            .root
+            .join(BUNDLED_RUNTIME_RELATIVE_PYTHON)
+            .is_file()
+        {
+            continue;
+        }
+        let canonical = canonical_resource_root(&candidate.root);
+        if seen.insert(canonical.clone()) {
+            coherent.push((
+                canonical,
+                bridge.canonicalize().unwrap_or(bridge),
+                candidate.layout,
+            ));
+        }
+    }
+    coherent
+}
+
+pub(crate) fn resolve_bundled_python_launcher_at_root(
+    root: &Path,
+    packaged: bool,
+) -> Result<PythonLauncher, PythonLauncherError> {
+    let candidate = PythonLauncher::new(
+        root.join(BUNDLED_RUNTIME_RELATIVE_PYTHON)
+            .to_string_lossy()
+            .to_string(),
+        vec![],
+        PythonLauncherSource::BundledRuntime,
+        bundled_runtime_id(),
+    );
+    validate_bundled_runtime_candidate(candidate, packaged)
+}
+
+fn validate_bundled_runtime_candidate(
+    candidate: PythonLauncher,
+    packaged: bool,
+) -> Result<PythonLauncher, PythonLauncherError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(&candidate.program)
+            .map(|m| m.permissions().mode() & 0o111 == 0)
+            .unwrap_or(true)
+        {
+            return Err(launcher_error(
+                DESKTOP_PYTHON_RUNTIME_INVALID,
+                PythonLauncherCategory::BundledRuntimeNotExecutable,
+                Some(&candidate),
+                packaged,
+                None,
+            ));
+        }
+    }
+    match candidate.command_for_metadata_probe().output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if looks_like_apple_developer_tools_stub(&stdout, &stderr) {
+                return Err(launcher_error(
+                    DESKTOP_PYTHON_RUNTIME_INVALID,
+                    PythonLauncherCategory::AppleDeveloperToolsStub,
+                    Some(&candidate),
+                    packaged,
+                    output_status_code(&output),
+                ));
+            }
+            let runtime_root =
+                bundled_runtime_root_from_candidate(&candidate).ok_or_else(|| {
+                    launcher_error(
+                        DESKTOP_PYTHON_RUNTIME_INVALID,
+                        PythonLauncherCategory::BundledRuntimeProbeFailed,
+                        Some(&candidate),
+                        packaged,
+                        output_status_code(&output),
+                    )
+                })?;
+            metadata_probe_is_valid(&stdout, &runtime_root, expected_runtime_arch()).map_err(
+                |category| {
+                    launcher_error(
+                        DESKTOP_PYTHON_RUNTIME_INVALID,
+                        category,
+                        Some(&candidate),
+                        packaged,
+                        output_status_code(&output),
+                    )
+                },
+            )?;
+            if cfg!(target_os = "windows") && !bundled_windows_provenance_is_valid(&runtime_root) {
+                return Err(launcher_error(
+                    DESKTOP_PYTHON_RUNTIME_INVALID,
+                    PythonLauncherCategory::BundledRuntimeProvenanceInvalid,
+                    Some(&candidate),
+                    packaged,
+                    output_status_code(&output),
+                ));
+            }
+            Ok(candidate)
+        }
+        Err(_) => Err(launcher_error(
+            if packaged {
+                DESKTOP_PYTHON_RUNTIME_INVALID
+            } else {
+                DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING
+            },
+            PythonLauncherCategory::BundledRuntimeProbeFailed,
+            Some(&candidate),
+            packaged,
+            None,
+        )),
+    }
+}
+
 fn has_confirmed_unbundled_dev_source_tree(opts: &PythonLauncherResolutionOptions<'_>) -> bool {
     if opts.packaged
         || classify_python_execution_layout(opts.current_exe_path, opts.manifest_dir)
@@ -706,85 +874,7 @@ pub fn resolve_python_launcher_resource_aware(
                     ));
                 }
             } else {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if std::fs::metadata(&candidate.program)
-                        .map(|m| m.permissions().mode() & 0o111 == 0)
-                        .unwrap_or(true)
-                    {
-                        return Err(launcher_error(
-                            DESKTOP_PYTHON_RUNTIME_INVALID,
-                            PythonLauncherCategory::BundledRuntimeNotExecutable,
-                            Some(&candidate),
-                            opts.packaged,
-                            None,
-                        ));
-                    }
-                }
-                return match candidate.command_for_metadata_probe().output() {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        if looks_like_apple_developer_tools_stub(&stdout, &stderr) {
-                            return Err(launcher_error(
-                                DESKTOP_PYTHON_RUNTIME_INVALID,
-                                PythonLauncherCategory::AppleDeveloperToolsStub,
-                                Some(&candidate),
-                                opts.packaged,
-                                output_status_code(&output),
-                            ));
-                        }
-                        let runtime_root = bundled_runtime_root_from_candidate(&candidate)
-                            .ok_or_else(|| {
-                                launcher_error(
-                                    DESKTOP_PYTHON_RUNTIME_INVALID,
-                                    PythonLauncherCategory::BundledRuntimeProbeFailed,
-                                    Some(&candidate),
-                                    opts.packaged,
-                                    output_status_code(&output),
-                                )
-                            })?;
-                        match metadata_probe_is_valid(
-                            &stdout,
-                            &runtime_root,
-                            expected_runtime_arch(),
-                        ) {
-                            Ok(()) => {
-                                if cfg!(target_os = "windows")
-                                    && !bundled_windows_provenance_is_valid(&runtime_root)
-                                {
-                                    return Err(launcher_error(
-                                        DESKTOP_PYTHON_RUNTIME_INVALID,
-                                        PythonLauncherCategory::BundledRuntimeProbeFailed,
-                                        Some(&candidate),
-                                        opts.packaged,
-                                        output_status_code(&output),
-                                    ));
-                                }
-                                Ok(candidate.clone())
-                            }
-                            Err(category) => Err(launcher_error(
-                                DESKTOP_PYTHON_RUNTIME_INVALID,
-                                category,
-                                Some(&candidate),
-                                opts.packaged,
-                                output_status_code(&output),
-                            )),
-                        }
-                    }
-                    Err(_) => Err(launcher_error(
-                        if opts.packaged {
-                            DESKTOP_PYTHON_RUNTIME_INVALID
-                        } else {
-                            DESKTOP_PYTHON_DEVELOPMENT_DEPENDENCY_MISSING
-                        },
-                        PythonLauncherCategory::BundledRuntimeProbeFailed,
-                        Some(&candidate),
-                        opts.packaged,
-                        None,
-                    )),
-                };
+                return validate_bundled_runtime_candidate(candidate, opts.packaged);
             }
         } else if opts.packaged {
             return Err(launcher_error(
@@ -1066,18 +1156,40 @@ where
     C: PythonEnvCommand,
 {
     command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
+    command.set_env("PYTHONDONTWRITEBYTECODE", std::ffi::OsStr::new("1"));
     command.remove_env(std::ffi::OsStr::new("PYTHONHOME"));
+    command.remove_env(std::ffi::OsStr::new("PYTHONPATH"));
     command.remove_env(std::ffi::OsStr::new("PYTHONUSERBASE"));
 }
 
 const PACKAGED_MUTABLE_ENV_PREFIXES: &[&str] = &["PIP_", "CMAKE_"];
+const PACKAGED_ENV_FUNDAMENTALS: &[&str] = &[
+    "SystemRoot",
+    "ComSpec",
+    "TEMP",
+    "TMP",
+    "WINDIR",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+];
+
 const PACKAGED_MUTABLE_ENV_KEYS: &[&str] = &[
     "TOKEN_PLACE_DESKTOP_PYTHON",
     "TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET",
+    "TOKEN_PLACE_SIDECAR_PYTHON",
+    "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
     "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP",
     "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD",
     "PYTHONHOME",
+    "PYTHONPATH",
     "PYTHONUSERBASE",
+    "PYTHONNOUSERSITE",
+    "PYTHONDONTWRITEBYTECODE",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "PYLAUNCHER_ALLOW_INSTALL",
     "FORCE_CMAKE",
 ];
 
@@ -1085,6 +1197,12 @@ pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C)
 where
     C: PythonEnvCommand,
 {
+    command.clear_env();
+    for key in PACKAGED_ENV_FUNDAMENTALS {
+        if let Some(value) = std::env::var_os(key) {
+            command.set_env(std::ffi::OsStr::new(key), value);
+        }
+    }
     for key in PACKAGED_MUTABLE_ENV_KEYS {
         command.remove_env(std::ffi::OsStr::new(key));
     }
@@ -1099,6 +1217,8 @@ where
             command.remove_env(key);
         }
     }
+    command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
+    command.set_env("PYTHONDONTWRITEBYTECODE", std::ffi::OsStr::new("1"));
 }
 
 fn import_root_is_confirmed_unbundled_development(import_root: &Path) -> bool {
@@ -1155,6 +1275,70 @@ pub trait PythonEnvCommand {
     fn remove_env<K>(&mut self, key: K)
     where
         K: AsRef<std::ffi::OsStr>;
+    fn clear_env(&mut self);
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PythonEnvCommandRecorder {
+    pub(crate) clear_env_called: bool,
+    pub(crate) effective_env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl PythonEnvCommandRecorder {
+    pub(crate) fn with_poisoned_env() -> Self {
+        Self {
+            clear_env_called: false,
+            effective_env: [
+                ("PYTHONHOME", "poison-python-home"),
+                ("PYTHONPATH", "poison-python-path"),
+                ("PYTHONUSERBASE", "poison-python-user-base"),
+                ("VIRTUAL_ENV", "poison-virtual-env"),
+                ("CONDA_PREFIX", "poison-conda-prefix"),
+                ("PIP_INDEX_URL", "poison-pip-index"),
+                ("CMAKE_ARGS", "poison-cmake-args"),
+                ("FORCE_CMAKE", "poison-force-cmake"),
+                ("TOKEN_PLACE_SIDECAR_PYTHON", "poison-sidecar"),
+                ("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "poison-import-root"),
+                ("PROCESSOR_ARCHITECTURE", "x86"),
+                ("PROCESSOR_ARCHITEW6432", "ARM64"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+        }
+    }
+
+    pub(crate) fn value(&self, key: &str) -> Option<&std::ffi::OsStr> {
+        self.effective_env
+            .get(std::ffi::OsStr::new(key))
+            .map(std::ffi::OsString::as_os_str)
+    }
+}
+
+#[cfg(test)]
+impl PythonEnvCommand for PythonEnvCommandRecorder {
+    fn set_env<K, V>(&mut self, key: K, value: V)
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        self.effective_env
+            .insert(key.as_ref().to_owned(), value.as_ref().to_owned());
+    }
+
+    fn remove_env<K>(&mut self, key: K)
+    where
+        K: AsRef<std::ffi::OsStr>,
+    {
+        self.effective_env.remove(key.as_ref());
+    }
+
+    fn clear_env(&mut self) {
+        self.clear_env_called = true;
+        self.effective_env.clear();
+    }
 }
 
 impl PythonEnvCommand for Command {
@@ -1172,6 +1356,10 @@ impl PythonEnvCommand for Command {
     {
         self.env_remove(key);
     }
+
+    fn clear_env(&mut self) {
+        self.env_clear();
+    }
 }
 
 impl PythonEnvCommand for tokio::process::Command {
@@ -1188,6 +1376,10 @@ impl PythonEnvCommand for tokio::process::Command {
         K: AsRef<std::ffi::OsStr>,
     {
         self.env_remove(key);
+    }
+
+    fn clear_env(&mut self) {
+        self.env_clear();
     }
 }
 
@@ -1287,12 +1479,6 @@ mod tests {
         command.get_envs().find_map(|(name, value)| {
             (name == key).then(|| value.map(|v| v.to_string_lossy().into_owned()))?
         })
-    }
-
-    fn command_env_removed(command: &Command, key: &str) -> bool {
-        command
-            .get_envs()
-            .any(|(name, value)| name == key && value.is_none())
     }
 
     fn fake_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
@@ -2002,7 +2188,7 @@ mod tests {
         let launcher_path = runtime_bin.join("python3");
         let machine = expected_runtime_arch();
         let launcher_body = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then printf '{{\"version\":[3,11,13],\"machine\":\"{}\",\"executable\":\"{}\",\"prefix\":\"{}\"}}\\n'; exit 0; fi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then printf '{{\"version\":[3,11,13],\"machine\":\"{}\",\"pointer_bits\":64,\"executable\":\"{}\",\"prefix\":\"{}\"}}\\n'; exit 0; fi\nexit 0\n",
             machine,
             launcher_path.display(),
             resource_root.join("python-runtime").display()
@@ -2079,8 +2265,8 @@ mod tests {
                 Some(resource_root.to_str().unwrap())
             );
             assert!(command_env_value(command, "PYTHONPATH").is_some());
-            assert!(command_env_removed(command, "PYTHONHOME"));
-            assert!(command_env_removed(command, "PYTHONUSERBASE"));
+            assert!(command_env_value(command, "PYTHONHOME").is_none());
+            assert!(command_env_value(command, "PYTHONUSERBASE").is_none());
         }
     }
 
@@ -2147,18 +2333,29 @@ mod tests {
             "{}",
         )
         .expect("write provenance");
-        let mut command = Command::new("python");
-        command.env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
+        let mut command = PythonEnvCommandRecorder::with_poisoned_env();
+        command.set_env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
 
         configure_python_subprocess_env(&mut command, &root);
 
-        let removed = command.get_envs().any(|(key, value)| {
-            key == "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD" && value.is_none()
-        });
-        assert!(
-            removed,
-            "packaged runtime must strip development repair opt-in"
+        assert!(command.clear_env_called);
+        assert_eq!(
+            command.value("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD"),
+            None
         );
+        assert_eq!(
+            command.value("PYTHONNOUSERSITE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            command.value("PYTHONDONTWRITEBYTECODE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            command.value("TOKEN_PLACE_PYTHON_IMPORT_ROOT"),
+            Some(root.as_os_str())
+        );
+        assert!(command.value("PYTHONPATH").is_some());
     }
 
     #[test]
@@ -2171,9 +2368,8 @@ mod tests {
             "# stale packaged copy",
         )
         .expect("write marker");
-        let mut command = Command::new("python");
-        command.env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
-        command.env("FORCE_CMAKE", "1");
+        let mut command = PythonEnvCommandRecorder::with_poisoned_env();
+        command.set_env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
 
         configure_python_subprocess_env_for_layout(
             &mut command,
@@ -2182,16 +2378,21 @@ mod tests {
             true,
         );
 
-        let removed_keys: std::collections::BTreeSet<_> = command
-            .get_envs()
-            .filter_map(|(key, value)| {
-                value
-                    .is_none()
-                    .then_some(key.to_string_lossy().into_owned())
-            })
-            .collect();
-        assert!(removed_keys.contains("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD"));
-        assert!(removed_keys.contains("FORCE_CMAKE"));
+        assert!(command.clear_env_called);
+        for key in [
+            "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD",
+            "FORCE_CMAKE",
+            "PYTHONHOME",
+            "PIP_INDEX_URL",
+            "CMAKE_ARGS",
+        ] {
+            assert_eq!(command.value(key), None, "{key} must not reach the child");
+        }
+        assert_eq!(
+            command.value("TOKEN_PLACE_PYTHON_IMPORT_ROOT"),
+            Some(root.as_os_str())
+        );
+        assert!(command.value("PYTHONPATH").is_some());
     }
 
     #[test]
@@ -2292,7 +2493,7 @@ mod tests {
         std::fs::create_dir_all(py.parent().unwrap()).unwrap();
         let runtime_root = resources.join("python-runtime");
         let probe = format!(
-            r#"{{"version":[3,11,13],"machine":"{}","executable":"{}","prefix":"{}"}}"#,
+            r#"{{"version":[3,11,13],"machine":"{}","pointer_bits":64,"executable":"{}","prefix":"{}"}}"#,
             expected_runtime_arch(),
             py.display(),
             runtime_root.display()
@@ -2339,5 +2540,180 @@ mod tests {
         );
         assert!(!msg.contains("xcode-select"));
         assert!(!msg.contains("No developer tools"));
+    }
+    #[test]
+    fn bundled_metadata_probe_sanitizes_poisoned_host_python_state() {
+        let launcher = PythonLauncher::new(
+            if cfg!(windows) {
+                r"C:\bundle\python-runtime\python.exe"
+            } else {
+                "/bundle/python-runtime/bin/python3"
+            },
+            vec![],
+            PythonLauncherSource::BundledRuntime,
+            bundled_runtime_id(),
+        );
+        let command = launcher.command_for_metadata_probe();
+        assert_eq!(
+            command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            command_env_value(&command, "PYTHONDONTWRITEBYTECODE").as_deref(),
+            Some("1")
+        );
+        let mut effective = PythonEnvCommandRecorder::with_poisoned_env();
+        sanitize_packaged_python_subprocess_env(&mut effective);
+        assert!(effective.clear_env_called);
+        for key in [
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONUSERBASE",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "PIP_INDEX_URL",
+            "CMAKE_ARGS",
+            "FORCE_CMAKE",
+            "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
+            "TOKEN_PLACE_SIDECAR_PYTHON",
+            "PROCESSOR_ARCHITECTURE",
+            "PROCESSOR_ARCHITEW6432",
+        ] {
+            assert_eq!(effective.value(key), None, "{key} must not reach the child");
+        }
+        assert_eq!(
+            effective.value("PYTHONNOUSERSITE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            effective.value("PYTHONDONTWRITEBYTECODE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert!(effective.effective_env.keys().all(|key| {
+            PACKAGED_ENV_FUNDAMENTALS.contains(&key.to_string_lossy().as_ref())
+                || matches!(
+                    key.to_str(),
+                    Some("PYTHONNOUSERSITE" | "PYTHONDONTWRITEBYTECODE")
+                )
+        }));
+    }
+
+    #[test]
+    fn packaged_sanitizer_preserves_bounded_windows_profile_fundamentals() {
+        let _lock = RUNTIME_BOOTSTRAP_ENV_TEST_LOCK.lock().unwrap();
+        let fundamentals = [
+            ("APPDATA", r"C:\Users\operator\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\operator\AppData\Local"),
+            ("USERPROFILE", r"C:\Users\operator"),
+        ];
+        let previous = fundamentals
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        for (key, value) in fundamentals {
+            std::env::set_var(key, value);
+        }
+
+        let mut effective = PythonEnvCommandRecorder::with_poisoned_env();
+        effective.set_env("PATH", "poison-host-tools");
+        sanitize_packaged_python_subprocess_env(&mut effective);
+
+        for (key, value) in fundamentals {
+            assert_eq!(effective.value(key), Some(std::ffi::OsStr::new(value)));
+        }
+        for key in [
+            "PATH",
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "PIP_INDEX_URL",
+            "CMAKE_ARGS",
+            "TOKEN_PLACE_PYTHON_IMPORT_ROOT",
+        ] {
+            assert_eq!(effective.value(key), None, "{key} must not reach the child");
+        }
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_metadata_architecture_uses_interpreter_owned_pointer_width() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime_root = temp.path().join("python-runtime");
+        std::fs::create_dir_all(&runtime_root).expect("runtime root");
+        let executable = runtime_root.join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python3"
+        });
+        std::fs::write(&executable, b"runtime").expect("runtime executable");
+        let payload = |machine: &str, pointer_bits: u64| {
+            serde_json::json!({
+                "version": [3, 11, 13],
+                "machine": machine,
+                "pointer_bits": pointer_bits,
+                "executable": executable,
+                "prefix": runtime_root,
+            })
+            .to_string()
+        };
+
+        for machine in ["AMD64", "x86_64"] {
+            assert_eq!(
+                metadata_probe_is_valid(&payload(machine, 64), &runtime_root, "AMD64"),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            metadata_probe_is_valid(&payload("", 64), &runtime_root, "AMD64"),
+            Ok(())
+        );
+        for (machine, pointer_bits) in [("AMD64", 32), ("x86", 64), ("ARM64", 64)] {
+            assert_eq!(
+                metadata_probe_is_valid(&payload(machine, pointer_bits), &runtime_root, "AMD64"),
+                Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundled_metadata_semantically_decodes_escaped_installed_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        // A quote forces serde_json to escape the installed path. The metadata
+        // validator must use the decoded JSON string, not raw payload slices.
+        let runtime_root = temp.path().join("installed-\"runtime");
+        std::fs::create_dir_all(&runtime_root).expect("runtime root");
+        let executable = runtime_root.join("python3");
+        std::fs::write(&executable, b"runtime").expect("runtime executable");
+        let payload = serde_json::json!({
+            "version": [3, 11, 13],
+            "machine": "x86_64",
+            "pointer_bits": 64,
+            "executable": executable,
+            "prefix": runtime_root,
+        })
+        .to_string();
+
+        assert_eq!(
+            metadata_probe_is_valid(&payload, &runtime_root, "x86_64"),
+            Ok(())
+        );
+
+        let escaped = temp.path().join("outside");
+        std::fs::create_dir_all(&escaped).expect("outside root");
+        let mut tampered: serde_json::Value = serde_json::from_str(&payload).expect("metadata");
+        tampered["prefix"] = serde_json::json!(escaped);
+        assert_eq!(
+            metadata_probe_is_valid(&tampered.to_string(), &runtime_root, "x86_64"),
+            Err(PythonLauncherCategory::BundledRuntimeProbeFailed)
+        );
     }
 }

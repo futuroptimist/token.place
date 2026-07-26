@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-EXPECTED_VERSION = "0.1.4"
+EXPECTED_VERSION = "0.1.5"
 EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 RUNTIME_PROVENANCE_NAME = "embedded_python_runtime_provenance.json"
@@ -122,13 +122,29 @@ def _run(
     timeout: int = 180,
     check: bool = True,
     log_path: Path | None = None,
+    separate_stderr: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=timeout)
+    result = subprocess.run(
+        cmd,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
+        env=env,
+        timeout=timeout,
+    )
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(f"$ {cmd[0]}\nexit={result.returncode}\n{result.stdout}", encoding="utf-8")
+        if separate_stderr:
+            output = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr or ''}"
+        else:
+            output = result.stdout
+        log_path.write_text(f"$ {cmd[0]}\nexit={result.returncode}\n{output}", encoding="utf-8")
     if check and result.returncode != 0:
-        raise InstallerIdentityError(f"command failed ({cmd[0]}): exit={result.returncode}\n{result.stdout[-4000:]}")
+        diagnostic = result.stdout
+        if separate_stderr and result.stderr:
+            diagnostic = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        raise InstallerIdentityError(f"command failed ({cmd[0]}): exit={result.returncode}\n{diagnostic[-4000:]}")
     return result
 
 
@@ -162,6 +178,14 @@ def build_scenarios(current_nsis: Path, current_msi: Path, previous_nsis: Path, 
     ]
 
 
+def build_current_package_scenario(current_nsis: Path, expected_version: str) -> Scenario:
+    """Build the single clean-NSIS scenario used by the hosted-Windows PR gate."""
+    installer = classify_installer(current_nsis, expected_version)
+    if installer.kind != "nsis":
+        raise InstallerIdentityError("current-package PR validation requires an NSIS installer")
+    return Scenario(f"pr-clean-current-nsis-{expected_version}", installer)
+
+
 def validate_previous_artifacts(previous_nsis: Path, previous_msi: Path, previous_version: str) -> None:
     nsis = classify_installer(previous_nsis, previous_version)
     msi = classify_installer(previous_msi, previous_version)
@@ -172,7 +196,7 @@ def validate_previous_artifacts(previous_nsis: Path, previous_msi: Path, previou
 def immediate_prior_version(version: str) -> str:
     """Return the immediate prior stable patch release for a semantic version string.
 
-    For '0.1.3' this returns '0.1.2'; for a future '0.1.4' it returns '0.1.3'.
+    For '0.1.3' this returns '0.1.2'; for a future '0.1.5' it returns '0.1.4'.
     """
     match = _SEMVER_RE.match(version)
     if not match:
@@ -197,13 +221,26 @@ def _msiexec() -> str:
 
 
 def _safe_env(sentinel_path: Path, sentinel_log: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
-    env = os.environ.copy()
+    env = {}
     for key in ("SystemRoot", "ComSpec", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "ProgramFiles", "ProgramFiles(x86)"):
         if key in os.environ:
             env[key] = os.environ[key]
     env["PATH"] = str(sentinel_path)
     env["TOKENPLACE_SENTINEL_LOG"] = str(sentinel_log)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.update({
+        "PYTHONHOME": str(sentinel_path / "poison-pythonhome"),
+        "PYTHONPATH": str(sentinel_path / "poison-pythonpath"),
+        "PYTHONUSERBASE": str(sentinel_path / "poison-userbase"),
+        "VIRTUAL_ENV": str(sentinel_path / "poison-venv"),
+        "CONDA_PREFIX": str(sentinel_path / "poison-conda"),
+        "PIP_INDEX_URL": "https://invalid.token.place.local/simple",
+        "PIP_NO_INDEX": "1",
+        "CMAKE_ARGS": "-DTOKEN_PLACE_SENTINEL=ON",
+        "FORCE_CMAKE": "1",
+        "TOKEN_PLACE_SIDECAR_PYTHON": str(sentinel_path / "python.exe"),
+        "TOKEN_PLACE_PYTHON_IMPORT_ROOT": str(sentinel_path / "poison-import-root"),
+    })
     if extra:
         env.update(extra)
     return env
@@ -648,9 +685,17 @@ def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expect
 
 
 def launch_for_operator_record(exe: Path, env: dict[str, str], log_path: Path | None = None) -> str:
-    result = _run([str(exe), "--operator-session-smoke"], env=env, timeout=90, check=False, log_path=log_path)
+    result = _run(
+        [str(exe), "--operator-start-preflight"],
+        env=env,
+        timeout=90,
+        check=False,
+        log_path=log_path,
+        separate_stderr=True,
+    )
     if result.returncode not in (0, 124):
-        raise InstallerIdentityError(f"operator-session smoke launch failed: {result.stdout[-1000:]}")
+        diagnostic = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr or ''}"
+        raise InstallerIdentityError(f"operator-session smoke launch failed: {diagnostic[-1000:]}")
     return result.stdout
 
 
@@ -693,7 +738,14 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
             raise InstallerIdentityError("operator-session smoke did not select the Qwen3 8B Q4 profile")
         if data.get("startup_phase") == "provisioning" or data.get("startup_deadline_ms") is None:
             raise InstallerIdentityError("operator-session smoke did not report a bounded ready/terminal startup phase")
-        if data.get("startup_result") not in ("ready", "terminal_actionable_error"):
+        if data.get("operator_start_preflight") == "ok":
+            if data.get("resource_context_source") != "tauri_app_handle":
+                raise InstallerIdentityError("operator-start preflight did not use the real Tauri AppHandle resource context")
+            if data.get("bridge_child_spawned") is not True or data.get("bridge_event_received") is not True:
+                raise InstallerIdentityError("operator-start preflight did not observe a spawned child and parsed bridge event")
+            if data.get("controlled_ready") is not True or data.get("startup_result") != "ready":
+                raise InstallerIdentityError("operator-start preflight did not observe controlled ready; terminal_actionable_error is not success")
+        elif data.get("startup_result") not in ("ready", "terminal_actionable_error"):
             raise InstallerIdentityError("operator-session smoke did not reach ready or a terminal actionable error")
         fallback_keys = ("fallback_reason", "backend_fallback", "model_fallback", "context_fallback")
         if data.get("fallback_reason") or any(data.get(key) is True for key in fallback_keys[1:]):
@@ -702,6 +754,16 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
             if data.get("api_v1_readiness_yarn_requested_context_tokens") != 65536 or data.get("api_v1_readiness_yarn_rope_supported") is not True:
                 raise InstallerIdentityError("64k-full smoke did not satisfy fail-closed YaRN/RoPE capability contract")
     assert_no_probe_attempt_counters(data)
+    for key in (
+        "provisioning_actions",
+        "repair_actions",
+        "pip_actions",
+        "compiler_actions",
+        "network_actions",
+        "download_actions",
+    ):
+        if data.get(key, 0) not in (0, None):
+            raise InstallerIdentityError(f"operator-start preflight reported forbidden action counter {key}")
     if launch_number == 2 and data.get("runtime_action") in {"installed_cuda_reexec", "installed_metal_reexec", "failed", "install_failed"}:
         raise InstallerIdentityError("second operator-session smoke launch reported runtime mutation action")
     return data
@@ -812,10 +874,16 @@ def run_all_scenarios(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--windows-nsis", type=Path, required=True)
-    parser.add_argument("--windows-msi", type=Path, required=True)
-    parser.add_argument("--previous-windows-nsis", type=Path, required=True)
-    parser.add_argument("--previous-windows-msi", type=Path, required=True)
+    parser.add_argument(
+        "--pr-current-windows-nsis",
+        type=Path,
+        default=None,
+        help="Run the hosted-Windows PR gate against exactly one current-head NSIS package.",
+    )
+    parser.add_argument("--windows-nsis", type=Path)
+    parser.add_argument("--windows-msi", type=Path)
+    parser.add_argument("--previous-windows-nsis", type=Path)
+    parser.add_argument("--previous-windows-msi", type=Path)
     parser.add_argument(
         "--previous-version",
         default=None,
@@ -827,6 +895,26 @@ def main() -> int:
     args = parser.parse_args()
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
+    if args.pr_current_windows_nsis is not None:
+        if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)):
+            raise InstallerIdentityError("--pr-current-windows-nsis cannot be combined with full release scenario arguments")
+        scenario = build_current_package_scenario(args.pr_current_windows_nsis, args.expected_version)
+        if sys.platform != "win32":
+            print("validated current-package Windows NSIS PR-gate contract; real install runs only on hosted Windows")
+            return 0
+        artifacts = ScenarioArtifactDir(args.artifact_dir) if args.artifact_dir else None
+        run_scenario(scenario, args.expected_build_id, artifacts)
+        print(f"validated current-package Windows NSIS for {args.expected_version} build {args.expected_build_id}")
+        return 0
+    required = {
+        "--windows-nsis": args.windows_nsis,
+        "--windows-msi": args.windows_msi,
+        "--previous-windows-nsis": args.previous_windows_nsis,
+        "--previous-windows-msi": args.previous_windows_msi,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise InstallerIdentityError(f"full release validation requires {', '.join(missing)}")
     previous_version = args.previous_version or immediate_prior_version(args.expected_version)
     validate_previous_artifacts(args.previous_windows_nsis, args.previous_windows_msi, previous_version)
     scenarios = build_scenarios(args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.expected_version, previous_version)

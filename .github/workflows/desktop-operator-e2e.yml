@@ -116,12 +116,26 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
+          python -m pip install "$(sed -n '/^llama_cpp_python==/p' requirements.txt)"
           pip install selenium
+
+      - name: Restore cached tiny real GGUF for desktop operator UI e2e
+        uses: actions/cache@v4
+        with:
+          path: .ci-models/stories15M-q4_0.gguf
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
+
+      - name: Provision tiny real GGUF for desktop operator UI e2e
+        env:
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+        run: bash scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
 
       - name: Run full Rust suite
         run: cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml
 
       - name: Run desktop operator UI e2e
+        env:
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
         run: xvfb-run -a python desktop-tauri/scripts/test_desktop_operator_ui_e2e.py
 
       - name: Run packaged operator bridge e2e
@@ -161,15 +175,91 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Run Windows packaged-start unit regressions with poisoned host Python state
+        shell: pwsh
+        env:
+          TOKEN_PLACE_SENTINEL_PATH: C:\Windows\System32
+          PYTHONHOME: C:\token-place-poison\pythonhome
+          PYTHONPATH: C:\token-place-poison\pythonpath
+          PYTHONUSERBASE: C:\token-place-poison\userbase
+          VIRTUAL_ENV: C:\token-place-poison\venv
+          CONDA_PREFIX: C:\token-place-poison\conda
+          PIP_INDEX_URL: https://invalid.token.place.local/simple
+          CMAKE_ARGS: -DTOKEN_PLACE_SENTINEL=ON
+          FORCE_CMAKE: '1'
+          TOKEN_PLACE_SIDECAR_PYTHON: C:\token-place-poison\python.exe
+          TOKEN_PLACE_PYTHON_IMPORT_ROOT: C:\token-place-poison\import-root
+        run: |
+          $env:PATH = "$env:TOKEN_PLACE_SENTINEL_PATH;$env:PATH"
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml prepare_operator_bridge_launch_configures_preflight_command_environment
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml bundled_metadata_probe_sanitizes_poisoned_host_python_state
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml no_child_startup_failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Set up Node.js for Windows package
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - name: Install desktop Node dependencies
+        working-directory: desktop-tauri
+        run: npm ci
+
+      - name: Cache embedded Windows CUDA Python runtime artifacts
+        uses: actions/cache@v4
+        with:
+          path: desktop-tauri/.cache/windows-python-runtime
+          key: windows-cuda-python-runtime-${{ runner.os }}-${{ hashFiles('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json') }}
+
+      - name: Prepare embedded Windows runtime
+        working-directory: desktop-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/prepare_windows_embedded_python_runtime.py
+          test -f src-tauri/python-runtime/python.exe
+          src-tauri/python-runtime/python.exe -m pip check
+
+      - name: Build desktop frontend assets for Windows package
+        working-directory: desktop-tauri
+        run: npm run build
+
+      - name: Build current-head Windows NSIS release package
+        working-directory: desktop-tauri
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Hosted-Windows packaged-start gate for installed current package
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem 'desktop-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis' -Filter '*-setup.exe' -File)
+          if ($installers.Count -ne 1) { throw "Expected exactly one current-head NSIS installer, found $($installers.Count)." }
+          $version = (Get-Content 'desktop-tauri/package.json' -Raw | ConvertFrom-Json).version
+          $buildId = (git rev-parse --short=12 HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python desktop-tauri/scripts/test_windows_installer_identity.py `
+            --pr-current-windows-nsis $installers[0].FullName `
+            --expected-version $version `
+            --expected-build-id $buildId `
+            --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py
 
       - name: Run Windows CUDA capability handoff regressions (fakes)
         run: |
           python -m pytest tests/unit/test_desktop_runtime_setup.py -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pytest tests/unit/test_model_manager.py -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pytest tests/integration/test_desktop_qwen64k_packaged_runtime.py -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload desktop relay parity logs on failure (Windows)
         if: failure()
@@ -178,6 +268,14 @@ jobs:
           name: desktop-relay-operator-parity-logs-windows
           path: .desktop-e2e-logs/
           include-hidden-files: true
+          if-no-files-found: warn
+
+      - name: Upload current-package validation logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-current-package-validation-windows
+          path: ${{ runner.temp }}/token-place-current-package-validation/
           if-no-files-found: warn
 
 

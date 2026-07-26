@@ -2036,6 +2036,40 @@ def test_main_normalizes_mode_before_run(monkeypatch):
     assert captured['mode'] == 'auto'
 
 
+def test_main_emits_controlled_operator_preflight_ready_event(capsys, monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'compute_node_bridge.py',
+            '--operator-preflight-controlled-ready',
+            '--context-tier',
+            '64k-full',
+        ],
+    )
+
+    assert compute_node_bridge.main() == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        'type': 'status',
+        'startup_result': 'ready',
+        'startup_phase': 'ready',
+        'relay_runtime_state': 'ready',
+        'worker_state': 'ready',
+        'worker_alive': True,
+        'context_tier': '64k-full',
+        'controlled_preflight': True,
+        'runtime_provisioning_state': 'ready',
+        'provisioning_actions': 0,
+        'repair_actions': 0,
+        'pip_actions': 0,
+        'compiler_actions': 0,
+        'network_actions': 0,
+        'download_actions': 0,
+    }
+
+
 def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys, monkeypatch):
     def fake_run(_args):
         raise RuntimeError("boom")

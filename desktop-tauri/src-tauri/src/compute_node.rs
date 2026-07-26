@@ -6,11 +6,13 @@ use crate::operator_logs::{
     sanitize_operator_path_display, OperatorLogSink,
 };
 use crate::python_runtime::{
-    bridge_script_candidates_from_resource_roots, configure_python_subprocess_env_for_layout,
-    describe_resource_layout, disable_python_user_site, resolve_bridge_script_path,
+    bridge_script_candidates_from_resource_roots, coherent_packaged_resource_roots,
+    configure_python_subprocess_env_for_layout, describe_resource_layout, disable_python_user_site,
+    resolve_bridge_script_path, resolve_bundled_python_launcher_at_root,
     resolve_python_launcher_resource_aware, resolve_runtime_import_root,
     should_enable_runtime_bootstrap, BridgeResourceContext, PythonEnvCommand, PythonLauncher,
-    PythonLauncherResolutionOptions, PythonLauncherSource, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    PythonLauncherCategory, PythonLauncherError, PythonLauncherResolutionOptions,
+    PythonLauncherSource, ResourceLayoutKind, ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,8 @@ pub struct ComputeNodeRequest {
 }
 
 const DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
+const OPERATOR_PREFLIGHT_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+const OPERATOR_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComputeNodeStatus {
@@ -445,21 +449,12 @@ fn is_python_script(path: &str) -> bool {
 }
 
 fn build_installed_context_probe_command(
-    launcher: &PythonLauncher,
-    bridge_script: &Path,
-    context: &BridgeResourceContext<'_>,
+    preparation: &OperatorBridgeLaunchPreparation,
     config: &DesktopConfig,
-) -> std::process::Command {
-    let mut command = launcher.command_for_script_blocking(bridge_script);
-    configure_runtime_pythonpath(
-        &mut command,
-        context.manifest_dir,
-        bridge_script,
-        context.exe_path,
-        context.tauri_resource_dir,
-    );
+) -> anyhow::Result<std::process::Command> {
+    let mut command = preparation.blocking_command()?;
     configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
-    command
+    Ok(command)
 }
 
 fn bridge_script_candidates(
@@ -587,13 +582,6 @@ fn std_command_env_value(command: &std::process::Command, key: &str) -> Option<S
         .find_map(|(env_key, value)| (env_key == key).then_some(value))
         .flatten()
         .map(|value| value.to_string_lossy().into_owned())
-}
-
-#[cfg(test)]
-fn std_command_env_removed(command: &std::process::Command, key: &str) -> bool {
-    command
-        .get_envs()
-        .any(|(env_key, value)| env_key == key && value.is_none())
 }
 
 fn sanitize_relay_target(relay_url: &str) -> String {
@@ -825,7 +813,23 @@ async fn complete_no_child_startup_failure(
     session_id: &str,
     log_file_path: Option<String>,
     last_error: String,
+    stage: &str,
+    code: &str,
+    category: &str,
 ) {
+    if let Some(path) = log_file_path.as_deref() {
+        let line = format!(
+            "desktop.compute_node.startup_failure stage={} code={} category={}",
+            sanitize_freeform_bridge_log_line(stage),
+            sanitize_freeform_bridge_log_line(code),
+            sanitize_freeform_bridge_log_line(category)
+        );
+        let _ = append_line_to_path(
+            Path::new(path),
+            "desktop.compute_node.startup_failure",
+            &line,
+        );
+    }
     let mut notify = None;
     {
         let mut process = state.bridge_process.lock().await;
@@ -1598,11 +1602,237 @@ fn with_log_file_path(mut payload: Value, log_file_path: Option<&str>) -> Value 
     payload
 }
 
+#[derive(Debug)]
+pub(crate) struct OperatorBridgeLaunchPreparation {
+    pub bridge_script: String,
+    pub launcher: Option<PythonLauncher>,
+    resource_root: std::path::PathBuf,
+    import_root: std::path::PathBuf,
+    layout: ResourceLayoutKind,
+}
+
+impl OperatorBridgeLaunchPreparation {
+    fn command(&self) -> anyhow::Result<Command> {
+        let mut command = build_bridge_command(&self.bridge_script, self.launcher.clone())?;
+        configure_python_subprocess_env_for_layout(
+            &mut command,
+            &self.import_root,
+            self.layout.clone(),
+            matches!(
+                self.launcher.as_ref().map(|launcher| &launcher.source),
+                Some(PythonLauncherSource::BundledRuntime)
+            ),
+        );
+        Ok(command)
+    }
+
+    fn blocking_command(&self) -> anyhow::Result<std::process::Command> {
+        let launcher = self.launcher.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("missing resolved Python launcher for compute-node bridge script")
+        })?;
+        let mut command = launcher.command_for_script_blocking(&self.bridge_script);
+        configure_python_subprocess_env_for_layout(
+            &mut command,
+            &self.import_root,
+            self.layout.clone(),
+            launcher.source == PythonLauncherSource::BundledRuntime,
+        );
+        Ok(command)
+    }
+
+    fn model_bridge_script(
+        &self,
+    ) -> Result<std::path::PathBuf, OperatorBridgeLaunchPreparationError> {
+        let canonical_root = self.resource_root.canonicalize().map_err(|_| {
+            OperatorBridgeLaunchPreparationError::new(
+                "bridge_script_resolution",
+                "model_bridge_unresolved",
+                "model_bridge_resolution",
+                "selected resource root could not be canonicalized",
+            )
+        })?;
+        Path::new(&self.bridge_script)
+            .parent()
+            .map(|parent| parent.join("model_bridge.py"))
+            .and_then(|path| path.canonicalize().ok())
+            .filter(|path| path.is_file() && path.starts_with(&canonical_root))
+            .ok_or_else(|| {
+                OperatorBridgeLaunchPreparationError::new(
+                    "bridge_script_resolution",
+                    "model_bridge_unresolved",
+                    "model_bridge_resolution",
+                    "selected resource root lacks a valid model bridge",
+                )
+            })
+    }
+
+    fn model_inspect_command(&self) -> anyhow::Result<std::process::Command> {
+        let launcher = self
+            .launcher
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing bundled Python launcher for operator smoke"))?;
+        let model_bridge_script = self.model_bridge_script()?;
+        let mut command = launcher.command_for_script_blocking(&model_bridge_script);
+        configure_python_subprocess_env_for_layout(
+            &mut command,
+            &self.import_root,
+            self.layout.clone(),
+            launcher.source == PythonLauncherSource::BundledRuntime,
+        );
+        Ok(command)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OperatorBridgeLaunchPreparationError {
+    stage: &'static str,
+    code: &'static str,
+    category: &'static str,
+}
+
+impl OperatorBridgeLaunchPreparationError {
+    fn new(
+        stage: &'static str,
+        code: &'static str,
+        category: &'static str,
+        _message: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            code,
+            category,
+        }
+    }
+
+    fn from_launcher(err: PythonLauncherError) -> Self {
+        let stage = match err.category {
+            PythonLauncherCategory::BundledRuntimeProbeFailed
+            | PythonLauncherCategory::BundledRuntimeProvenanceInvalid
+            | PythonLauncherCategory::BundledRuntimeNotPython3
+            | PythonLauncherCategory::BundledRuntimeWrongArchitecture
+            | PythonLauncherCategory::BundledRuntimeNotExecutable
+            | PythonLauncherCategory::AppleDeveloperToolsStub => "bundled_runtime_probe",
+            _ => "bundled_runtime_resolution",
+        };
+        Self::new(
+            stage,
+            err.public_code,
+            err.category.as_str(),
+            err.to_string(),
+        )
+    }
+
+    fn metadata(&self) -> (&'static str, &'static str, &'static str) {
+        (self.stage, self.code, self.category)
+    }
+}
+
+impl std::fmt::Display for OperatorBridgeLaunchPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} stage={} category={}",
+            self.code, self.stage, self.category
+        )
+    }
+}
+
+impl std::error::Error for OperatorBridgeLaunchPreparationError {}
+
+pub(crate) fn prepare_operator_bridge_launch(
+    context: &BridgeResourceContext<'_>,
+) -> Result<OperatorBridgeLaunchPreparation, OperatorBridgeLaunchPreparationError> {
+    if context.packaged() {
+        let roots = coherent_packaged_resource_roots(
+            "compute_node_bridge.py",
+            context.exe_path,
+            context.manifest_dir,
+            context.tauri_resource_dir,
+        );
+        let (resource_root, bridge_script, layout) = match roots.as_slice() {
+            [selection] => selection.clone(),
+            [] => {
+                return Err(OperatorBridgeLaunchPreparationError::new(
+                    "bundled_runtime_resolution",
+                    "desktop_python_runtime_missing",
+                    "bundled_runtime_missing",
+                    "no coherent packaged resource root",
+                ))
+            }
+            _ => {
+                return Err(OperatorBridgeLaunchPreparationError::new(
+                    "bundled_runtime_resolution",
+                    "desktop_python_runtime_invalid",
+                    "bundled_runtime_ambiguous",
+                    "multiple coherent packaged resource roots",
+                ))
+            }
+        };
+        let launcher = resolve_bundled_python_launcher_at_root(&resource_root, true)
+            .map_err(OperatorBridgeLaunchPreparationError::from_launcher)?;
+        return Ok(OperatorBridgeLaunchPreparation {
+            bridge_script: bridge_script.to_string_lossy().into_owned(),
+            launcher: Some(launcher),
+            import_root: resource_root.clone(),
+            resource_root,
+            layout,
+        });
+    }
+    let bridge_script = resolve_bridge_script_for(
+        context.exe_path,
+        context.manifest_dir,
+        context.tauri_resource_dir,
+        None,
+    )
+    .map_err(|err| {
+        OperatorBridgeLaunchPreparationError::new(
+            "bridge_script_resolution",
+            "bridge_script_unresolved",
+            "bridge_script_resolution",
+            err,
+        )
+    })?;
+    let launcher = if is_python_script(&bridge_script) {
+        let launcher = resolve_python_launcher_resource_aware(
+            context.launcher_options("TOKEN_PLACE_SIDECAR_PYTHON"),
+        )
+        .map_err(OperatorBridgeLaunchPreparationError::from_launcher)?;
+        if !packaged_launcher_source_is_valid(context.packaged(), Some(&launcher.source)) {
+            return Err(OperatorBridgeLaunchPreparationError::new(
+                "packaged_launcher_validation",
+                "packaged_launcher_source_invalid",
+                "packaged_launcher_validation",
+                "packaged operator must use bundled runtime",
+            ));
+        }
+        Some(launcher)
+    } else {
+        None
+    };
+    let bridge_path = Path::new(&bridge_script);
+    let (resource_root, layout) = context.describe_resource_layout(bridge_path);
+    let import_root = resolve_runtime_import_root(Some(bridge_path), context.manifest_dir)
+        .unwrap_or_else(|| resource_root.clone());
+    Ok(OperatorBridgeLaunchPreparation {
+        bridge_script,
+        launcher,
+        resource_root,
+        import_root,
+        layout,
+    })
+}
+
 fn packaged_launcher_source_is_valid(
     is_packaged_execution: bool,
     launcher_source: Option<&PythonLauncherSource>,
 ) -> bool {
     !is_packaged_execution || matches!(launcher_source, Some(PythonLauncherSource::BundledRuntime))
+}
+
+fn operator_bridge_preparation_failure_metadata(
+    err: &OperatorBridgeLaunchPreparationError,
+) -> (&'static str, &'static str, &'static str) {
+    err.metadata()
 }
 
 pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::Result<Value> {
@@ -1613,31 +1843,19 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         manifest_dir,
         tauri_resource_dir: None,
     };
-    let packaged = context.packaged();
-    let launcher = resolve_python_launcher_resource_aware(
-        context.launcher_options("TOKEN_PLACE_SIDECAR_PYTHON"),
-    )?;
-    if !packaged_launcher_source_is_valid(packaged, Some(&launcher.source)) {
-        anyhow::bail!("desktop_python_runtime_invalid: packaged Windows/macOS operator must use bundled runtime");
-    }
-    let bridge_script = resolve_bridge_script_for(
-        context.exe_path,
-        context.manifest_dir,
-        context.tauri_resource_dir,
-        Some(&launcher.program),
-    )
-    .map_err(anyhow::Error::msg)?;
-    let model_bridge_script = context
-        .resolve_bridge_script_path("model_bridge.py", Some(&launcher.program))
-        .map_err(anyhow::Error::msg)?;
-    let mut model_inspect_command = launcher.command_for_script_blocking(&model_bridge_script);
-    configure_runtime_pythonpath(
-        &mut model_inspect_command,
-        manifest_dir,
-        &model_bridge_script,
-        context.exe_path,
-        context.tauri_resource_dir,
-    );
+    let preparation = prepare_operator_bridge_launch(&context)?;
+    operator_session_smoke_record_from_preparation(config, &preparation)
+}
+
+fn operator_session_smoke_record_from_preparation(
+    config: &DesktopConfig,
+    preparation: &OperatorBridgeLaunchPreparation,
+) -> anyhow::Result<Value> {
+    let launcher = preparation
+        .launcher
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing bundled Python launcher for operator smoke"))?;
+    let mut model_inspect_command = preparation.model_inspect_command()?;
     model_inspect_command.arg("inspect");
     let model_inspect_output = model_inspect_command.output()?;
     if !model_inspect_output.status.success() {
@@ -1646,18 +1864,16 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
     let model_inspect_stdout = String::from_utf8_lossy(&model_inspect_output.stdout);
     let model_inspect_json: Value = serde_json::from_str(model_inspect_stdout.trim())?;
     let model_artifact_filename = inspect_model_artifact_filename(&model_inspect_json)?;
-    let bridge_script_path = Path::new(&bridge_script);
-    let (selected_resource_root, selected_layout) =
-        context.describe_resource_layout(bridge_script_path);
-    let import_root = resolve_runtime_import_root(Some(bridge_script_path), context.manifest_dir);
+    let selected_resource_root = preparation.resource_root.clone();
+    let selected_layout = preparation.layout.clone();
+    let import_root = Some(preparation.import_root.clone());
     let identity = crate::build_identity::build_identity();
     let launcher_source = match launcher.source {
         PythonLauncherSource::BundledRuntime => "bundled",
         PythonLauncherSource::EnvironmentOverride => "environment_override",
         PythonLauncherSource::SystemDevelopmentRuntime => "system_development",
     };
-    let mut context_probe_command =
-        build_installed_context_probe_command(&launcher, bridge_script_path, &context, config);
+    let mut context_probe_command = build_installed_context_probe_command(preparation, config)?;
     context_probe_command.arg("--installed-context-smoke");
     context_probe_command
         .arg("--context-tier")
@@ -1694,6 +1910,133 @@ pub(crate) fn operator_session_smoke_record(config: &DesktopConfig) -> anyhow::R
         }
     }
     Ok(payload)
+}
+
+pub(crate) fn operator_start_preflight_record(
+    config: &DesktopConfig,
+    app: &AppHandle,
+) -> anyhow::Result<Value> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let current_exe = std::env::current_exe().ok();
+    let resource_dir = app.path().resource_dir().ok();
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
+        manifest_dir,
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
+    let preparation = prepare_operator_bridge_launch(&context)?;
+    let mut command = preparation.command()?;
+    configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
+    command.arg("--operator-preflight-controlled-ready");
+    command
+        .arg("--context-tier")
+        .arg(normalize_context_tier(&config.context_tier));
+    let event = std::thread::spawn(move || -> anyhow::Result<Value> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_controlled_operator_preflight_child(
+                command,
+                OPERATOR_PREFLIGHT_EVENT_TIMEOUT,
+            ))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("operator_preflight_child_failed"))??;
+
+    let mut payload = operator_session_smoke_record_from_preparation(config, &preparation)?;
+    if let Value::Object(map) = &mut payload {
+        map.insert(
+            "operator_start_preflight".into(),
+            Value::String("ok".into()),
+        );
+        map.insert(
+            "resource_context_source".into(),
+            Value::String("tauri_app_handle".into()),
+        );
+        map.insert("bridge_child_spawned".into(), Value::Bool(true));
+        map.insert("bridge_event_received".into(), Value::Bool(true));
+        for key in [
+            "controlled_preflight",
+            "startup_result",
+            "provisioning_actions",
+            "repair_actions",
+            "pip_actions",
+            "compiler_actions",
+            "network_actions",
+            "download_actions",
+        ] {
+            map.insert(key.into(), event[key].clone());
+        }
+        map.insert("bridge_event_type".into(), event["type"].clone());
+        map.insert(
+            "controlled_ready".into(),
+            Value::Bool(event["controlled_preflight"] == Value::Bool(true)),
+        );
+    }
+    Ok(payload)
+}
+
+async fn cleanup_controlled_operator_preflight_child(child: &mut Child, pid: Option<u32>) {
+    if let Some(pid) = pid {
+        terminate_bridge_process_tree(pid).await;
+    }
+    if tokio::time::timeout(OPERATOR_PREFLIGHT_REAP_TIMEOUT, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    }
+}
+
+fn validate_controlled_operator_preflight_event(event: Value) -> anyhow::Result<Value> {
+    let identity_is_valid = event.get("type").and_then(Value::as_str) == Some("status")
+        && event.get("controlled_preflight").and_then(Value::as_bool) == Some(true)
+        && event.get("startup_result").and_then(Value::as_str) == Some("ready");
+    let counters_are_zero = [
+        "provisioning_actions",
+        "repair_actions",
+        "pip_actions",
+        "compiler_actions",
+        "network_actions",
+        "download_actions",
+    ]
+    .iter()
+    .all(|key| event.get(*key).and_then(Value::as_i64) == Some(0));
+    if !identity_is_valid || !counters_are_zero {
+        anyhow::bail!("operator_preflight_invalid_event");
+    }
+    Ok(event)
+}
+
+async fn run_controlled_operator_preflight_child(
+    mut command: Command,
+    event_timeout: Duration,
+) -> anyhow::Result<Value> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    isolate_bridge_process_tree(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|_| anyhow::anyhow!("operator_preflight_child_spawn_failed"))?;
+    let pid = child.id();
+    let result = async {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("operator_preflight_stdout_unavailable"))?;
+        let mut lines = BufReader::new(stdout).lines();
+        let line = tokio::time::timeout(event_timeout, lines.next_line())
+            .await
+            .map_err(|_| anyhow::anyhow!("operator_preflight_event_timeout"))?
+            .map_err(|_| anyhow::anyhow!("operator_preflight_event_read_failed"))?
+            .ok_or_else(|| anyhow::anyhow!("operator_preflight_event_missing"))?;
+        let event = parse_compute_node_event_line(&line)
+            .map_err(|_| anyhow::anyhow!("operator_preflight_event_parse_failed"))?;
+        validate_controlled_operator_preflight_event(event)
+    }
+    .await;
+    cleanup_controlled_operator_preflight_child(&mut child, pid).await;
+    result
 }
 
 pub async fn start_compute_node(
@@ -1757,68 +2100,54 @@ pub async fn start_compute_node(
         }
     }
 
-    let bridge_script = match resolve_bridge_script(&app) {
-        Ok(bridge_script) => bridge_script,
+    let resource_dir = app.path().resource_dir().ok();
+    let current_exe = std::env::current_exe().ok();
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
+        manifest_dir,
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
+    let preparation = match prepare_operator_bridge_launch(&context) {
+        Ok(preparation) => preparation,
+        Err(err) => {
+            let message = err.to_string();
+            let (stage, code, category) = operator_bridge_preparation_failure_metadata(&err);
+            complete_no_child_startup_failure(
+                &state,
+                &request,
+                &session_id,
+                log_file_path.clone(),
+                message,
+                stage,
+                code,
+                category,
+            )
+            .await;
+            return Err(err.into());
+        }
+    };
+    let mut bridge_command = match preparation.command() {
+        Ok(command) => command,
         Err(err) => {
             complete_no_child_startup_failure(
                 &state,
                 &request,
                 &session_id,
                 log_file_path.clone(),
-                err.clone(),
+                err.to_string(),
+                "command_build",
+                "bridge_command_build_failed",
+                "command_build",
             )
             .await;
-            return Err(anyhow::anyhow!(err));
+            return Err(err);
         }
     };
-    let launcher = if is_python_script(&bridge_script) {
-        let resource_dir = app.path().resource_dir().ok();
-        let current_exe = std::env::current_exe().ok();
-        match tokio::task::spawn_blocking(move || {
-            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-            resolve_python_launcher_resource_aware(PythonLauncherResolutionOptions {
-                override_var_name: "TOKEN_PLACE_SIDECAR_PYTHON",
-                tauri_resource_dir: resource_dir.as_deref(),
-                current_exe_path: current_exe.as_deref(),
-                manifest_dir,
-                packaged: crate::python_runtime::is_packaged_execution(
-                    current_exe.as_deref(),
-                    manifest_dir,
-                ),
-            })
-        })
-        .await
-        {
-            Ok(result) => match result {
-                Ok(launcher) => Some(launcher),
-                Err(err) => {
-                    complete_no_child_startup_failure(
-                        &state,
-                        &request,
-                        &session_id,
-                        log_file_path.clone(),
-                        err.to_string(),
-                    )
-                    .await;
-                    return Err(err.into());
-                }
-            },
-            Err(err) => {
-                let err = anyhow::anyhow!("python launcher resolver task failed: {err}");
-                complete_no_child_startup_failure(
-                    &state,
-                    &request,
-                    &session_id,
-                    log_file_path.clone(),
-                    err.to_string(),
-                )
-                .await;
-                return Err(err.into());
-            }
-        }
-    } else {
-        None
-    };
+    let selected_resource_root = preparation.resource_root.clone();
+    let selected_layout = preparation.layout.clone();
+    let import_root = Some(preparation.import_root.clone());
+    let bridge_script = preparation.bridge_script;
+    let launcher = preparation.launcher;
 
     let launcher_metadata = launcher.as_ref().map(|launcher| {
         let source = match launcher.source {
@@ -1853,40 +2182,14 @@ pub async fn start_compute_node(
             &session_id,
             log_file_path.clone(),
             err.to_string(),
+            "packaged_launcher_validation",
+            "packaged_launcher_source_invalid",
+            "packaged_launcher_validation",
         )
         .await;
         return Err(err.into());
     }
 
-    let mut bridge_command = match build_bridge_command(&bridge_script, launcher) {
-        Ok(command) => command,
-        Err(err) => {
-            complete_no_child_startup_failure(
-                &state,
-                &request,
-                &session_id,
-                log_file_path.clone(),
-                err.to_string(),
-            )
-            .await;
-            return Err(err.into());
-        }
-    };
-    let exe_path = std::env::current_exe().ok();
-    let resource_dir = app.path().resource_dir().ok();
-    let (selected_resource_root, selected_layout) = describe_resource_layout(
-        Path::new(&bridge_script),
-        exe_path.as_deref(),
-        manifest_dir,
-        resource_dir.as_deref(),
-    );
-    let import_root = configure_runtime_pythonpath(
-        &mut bridge_command,
-        manifest_dir,
-        Path::new(&bridge_script),
-        exe_path.as_deref(),
-        resource_dir.as_deref(),
-    );
     let interpreter = bridge_command
         .as_std()
         .get_program()
@@ -1971,6 +2274,9 @@ pub async fn start_compute_node(
                 &session_id,
                 log_file_path.clone(),
                 format!("failed to start compute-node bridge: {err}"),
+                "child_spawn",
+                "bridge_child_spawn_failed",
+                "child_spawn",
             )
             .await;
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
@@ -3601,6 +3907,104 @@ mod tests {
         }
 
         assert_eq!(event_types, vec!["status".to_string(), "error".to_string()]);
+    }
+
+    const CONTROLLED_PREFLIGHT_READY_EVENT: &str = r#"{"type":"status","controlled_preflight":true,"startup_result":"ready","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
+
+    fn operator_preflight_test_command(output: Option<&str>, wedge: bool) -> Command {
+        #[cfg(unix)]
+        {
+            let script = match (output, wedge) {
+                (Some(output), true) => format!("printf '%s\\n' '{output}'; sleep 30"),
+                (Some(output), false) => format!("printf '%s\\n' '{output}'"),
+                (None, true) => "sleep 30".into(),
+                (None, false) => "exit 0".into(),
+            };
+            let mut command = Command::new("sh");
+            command.args(["-c", &script]);
+            command
+        }
+        #[cfg(windows)]
+        {
+            let script = match (output, wedge) {
+                (Some(output), true) => {
+                    format!("Write-Output '{output}'; Start-Sleep -Seconds 30")
+                }
+                (Some(output), false) => format!("Write-Output '{output}'"),
+                (None, true) => "Start-Sleep -Seconds 30".into(),
+                (None, false) => "exit 0".into(),
+            };
+            let mut command = Command::new("powershell");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            command
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_accepts_valid_controlled_readiness_event() {
+        let event = run_controlled_operator_preflight_child(
+            operator_preflight_test_command(Some(CONTROLLED_PREFLIGHT_READY_EVENT), false),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("valid controlled readiness");
+
+        assert_eq!(event["type"], "status");
+        assert_eq!(event["controlled_preflight"], true);
+        assert_eq!(event["network_actions"], 0);
+    }
+
+    #[test]
+    fn operator_preflight_rejects_noncontrolled_and_nonzero_action_events() {
+        for event in [
+            serde_json::json!({
+                "type": "status", "controlled_preflight": false, "startup_result": "ready",
+                "provisioning_actions": 0, "repair_actions": 0, "pip_actions": 0,
+                "compiler_actions": 0, "network_actions": 0, "download_actions": 0,
+            }),
+            serde_json::json!({
+                "type": "status", "controlled_preflight": true, "startup_result": "ready",
+                "provisioning_actions": 0, "repair_actions": 0, "pip_actions": 1,
+                "compiler_actions": 0, "network_actions": 0, "download_actions": 0,
+            }),
+        ] {
+            assert_eq!(
+                validate_controlled_operator_preflight_event(event)
+                    .expect_err("invalid event")
+                    .to_string(),
+                "operator_preflight_invalid_event"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_times_out_silent_wedged_child() {
+        let started = Instant::now();
+        let error = run_controlled_operator_preflight_child(
+            operator_preflight_test_command(None, true),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("silent child must time out");
+
+        assert_eq!(error.to_string(), "operator_preflight_event_timeout");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_terminates_and_reaps_child_after_ready_event() {
+        let started = Instant::now();
+        run_controlled_operator_preflight_child(
+            operator_preflight_test_command(Some(CONTROLLED_PREFLIGHT_READY_EVENT), true),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("ready event must be accepted before cleanup");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "wedged child was not terminated and boundedly reaped"
+        );
     }
 
     #[test]
@@ -5454,6 +5858,9 @@ mod tests {
             "session-1",
             Some("/tmp/operator.log".into()),
             "bridge script missing".into(),
+            "bridge_script_resolution",
+            "bridge_script_unresolved",
+            "bridge_script_resolution",
         )
         .await;
 
@@ -5513,6 +5920,9 @@ mod tests {
             "session-1",
             None,
             "python launcher missing".into(),
+            "bundled_runtime_resolution",
+            "python_launcher_resolution_failed",
+            "bundled_runtime_probe",
         )
         .await;
         stop_task
@@ -5548,6 +5958,9 @@ mod tests {
             "session-1",
             None,
             "old failure".into(),
+            "bridge_script_resolution",
+            "bridge_script_unresolved",
+            "bridge_script_resolution",
         )
         .await;
 
@@ -5988,7 +6401,26 @@ mod tests {
     }
 
     #[test]
-    fn installed_context_probe_helper_configures_executed_command_environment() {
+    fn operator_bridge_preparation_failure_metadata_preserves_typed_error() {
+        let err = OperatorBridgeLaunchPreparationError::new(
+            "bundled_runtime_probe",
+            "desktop_python_runtime_invalid",
+            "bundled_runtime_wrong_architecture",
+            "safe test error",
+        );
+
+        assert_eq!(
+            operator_bridge_preparation_failure_metadata(&err),
+            (
+                "bundled_runtime_probe",
+                "desktop_python_runtime_invalid",
+                "bundled_runtime_wrong_architecture",
+            )
+        );
+    }
+
+    #[test]
+    fn prepare_operator_bridge_launch_configures_preflight_command_environment() {
         let temp = TempDir::new().expect("tempdir");
         let manifest_dir = temp
             .path()
@@ -6017,10 +6449,17 @@ mod tests {
             manifest_dir: &manifest_dir,
             tauri_resource_dir: Some(&resource_root),
         };
+        let preparation = OperatorBridgeLaunchPreparation {
+            bridge_script: bridge_script.to_string_lossy().into_owned(),
+            launcher: Some(launcher),
+            resource_root: resource_root.clone(),
+            import_root: resource_root.clone(),
+            layout: ResourceLayoutKind::WindowsResources,
+        };
         let config = DesktopConfig::default();
 
-        let command =
-            build_installed_context_probe_command(&launcher, &bridge_script, &context, &config);
+        let command = build_installed_context_probe_command(&preparation, &config)
+            .expect("build prepared context probe");
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -6040,8 +6479,260 @@ mod tests {
             Some(resource_root.to_str().unwrap())
         );
         assert!(std_command_env_value(&command, "PYTHONPATH").is_some());
-        assert!(std_command_env_removed(&command, "PYTHONHOME"));
-        assert!(std_command_env_removed(&command, "PYTHONUSERBASE"));
+
+        let mut effective = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+        configure_runtime_pythonpath(
+            &mut effective,
+            &manifest_dir,
+            &bridge_script,
+            context.exe_path,
+            context.tauri_resource_dir,
+        );
+        assert!(effective.clear_env_called);
+        for key in [
+            "PYTHONHOME",
+            "PYTHONUSERBASE",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "PIP_INDEX_URL",
+            "CMAKE_ARGS",
+            "FORCE_CMAKE",
+        ] {
+            assert_eq!(effective.value(key), None, "{key} must not reach the child");
+        }
+        assert_eq!(
+            effective.value("PYTHONNOUSERSITE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            effective.value("PYTHONDONTWRITEBYTECODE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            effective.value("TOKEN_PLACE_PYTHON_IMPORT_ROOT"),
+            Some(resource_root.as_os_str())
+        );
+        assert!(effective.value("PYTHONPATH").is_some());
+        assert!(effective.effective_env.keys().all(|key| {
+            matches!(
+                key.to_str(),
+                Some(
+                    "SystemRoot"
+                        | "ComSpec"
+                        | "TEMP"
+                        | "TMP"
+                        | "WINDIR"
+                        | "APPDATA"
+                        | "LOCALAPPDATA"
+                        | "USERPROFILE"
+                        | "PYTHONNOUSERSITE"
+                        | "PYTHONDONTWRITEBYTECODE"
+                        | "TOKEN_PLACE_PYTHON_IMPORT_ROOT"
+                        | "PYTHONPATH"
+                )
+            )
+        }));
+    }
+
+    #[test]
+    fn installed_context_probe_uses_prepared_import_root_under_poisoned_override() {
+        let _env_guard = crate::python_runtime::RUNTIME_BOOTSTRAP_ENV_TEST_LOCK
+            .lock()
+            .expect("runtime bootstrap env test lock");
+        let temp = TempDir::new().expect("tempdir");
+        let import_root = temp.path().join("prepared-resources");
+        let poisoned_root = temp.path().join("poisoned-resources");
+        std::fs::create_dir_all(import_root.join("python")).expect("create import root");
+        let bridge_script = import_root.join("python").join("compute_node_bridge.py");
+        std::fs::write(&bridge_script, "# compute bridge\n").expect("write bridge script");
+        let preparation = OperatorBridgeLaunchPreparation {
+            bridge_script: bridge_script.to_string_lossy().into_owned(),
+            launcher: Some(PythonLauncher {
+                program: "python3".into(),
+                args: Vec::new(),
+                source: PythonLauncherSource::BundledRuntime,
+                runtime_id: "test-runtime".into(),
+            }),
+            resource_root: import_root.clone(),
+            import_root: import_root.clone(),
+            layout: ResourceLayoutKind::WindowsResources,
+        };
+        let previous = std::env::var_os("TOKEN_PLACE_PYTHON_IMPORT_ROOT");
+        // SAFETY: The shared environment-test lock prevents concurrent mutation, and the
+        // previous value is restored before this test returns.
+        unsafe {
+            std::env::set_var("TOKEN_PLACE_PYTHON_IMPORT_ROOT", &poisoned_root);
+        }
+
+        let command =
+            build_installed_context_probe_command(&preparation, &DesktopConfig::default())
+                .expect("build prepared context probe");
+
+        // SAFETY: Restore the process environment while still holding the shared lock.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("TOKEN_PLACE_PYTHON_IMPORT_ROOT", value),
+                None => std::env::remove_var("TOKEN_PLACE_PYTHON_IMPORT_ROOT"),
+            }
+        }
+        assert_eq!(
+            std_command_env_value(&command, "TOKEN_PLACE_PYTHON_IMPORT_ROOT").as_deref(),
+            import_root.to_str()
+        );
+        let python_dir = import_root.join("python");
+        let expected_pythonpath =
+            std::env::join_paths([import_root.as_path(), python_dir.as_path()])
+                .expect("join prepared Python path");
+        assert_eq!(
+            command
+                .get_envs()
+                .find_map(|(key, value)| (key == "PYTHONPATH").then_some(value))
+                .flatten(),
+            Some(expected_pythonpath.as_os_str())
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_coherent_test_resource_root(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let python_dir = root.join("python");
+        let runtime = root.join(crate::python_runtime::BUNDLED_RUNTIME_RELATIVE_PYTHON);
+        std::fs::create_dir_all(&python_dir).expect("create bridge directory");
+        std::fs::create_dir_all(runtime.parent().unwrap()).expect("create runtime directory");
+        std::fs::write(python_dir.join("compute_node_bridge.py"), "# bridge\n")
+            .expect("write bridge");
+        std::fs::write(python_dir.join("model_bridge.py"), "# model bridge\n")
+            .expect("write model bridge");
+        let machine = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x86_64"
+        };
+        std::fs::write(
+            &runtime,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"version\":[3,11,13],\"machine\":\"{machine}\",\"pointer_bits\":64,\"executable\":\"{}\",\"prefix\":\"{}\"}}'\n",
+                runtime.display(),
+                root.join("python-runtime").display()
+            ),
+        )
+        .expect("write runtime");
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(runtime, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_operator_bridge_launch_selects_one_coherent_canonical_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("resources");
+        write_coherent_test_resource_root(&root);
+        let alias = temp.path().join("resource-alias");
+        std::os::unix::fs::symlink(&root, &alias).expect("resource alias");
+        let exe = temp.path().join("bin").join("token.place");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        let manifest = temp.path().join("manifest");
+        let context = BridgeResourceContext {
+            exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            tauri_resource_dir: Some(&alias),
+        };
+
+        let preparation = prepare_operator_bridge_launch(&context).expect("coherent preparation");
+        assert_eq!(preparation.resource_root, root.canonicalize().unwrap());
+        assert!(Path::new(&preparation.bridge_script).starts_with(&root));
+        assert!(Path::new(&preparation.launcher.unwrap().program).starts_with(&root));
+        assert_eq!(preparation.import_root, preparation.resource_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_smoke_keeps_model_probe_under_coherent_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let stale_root = temp.path().join("stale-resources");
+        std::fs::create_dir_all(stale_root.join("python")).unwrap();
+        std::fs::write(stale_root.join("python/model_bridge.py"), "# stale\n").unwrap();
+        let coherent_root = temp.path().join("Resources");
+        write_coherent_test_resource_root(&coherent_root);
+        let exe_dir = temp.path().join("installed");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let exe = exe_dir.join("token.place");
+        std::fs::write(&exe, "").unwrap();
+        let manifest = temp.path().join("manifest");
+        let context = BridgeResourceContext {
+            exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            tauri_resource_dir: Some(&stale_root),
+        };
+
+        let preparation = prepare_operator_bridge_launch(&context).expect("coherent preparation");
+        let model_bridge_script = preparation.model_bridge_script().expect("model probe");
+        assert!(model_bridge_script.starts_with(coherent_root.canonicalize().unwrap()));
+        assert!(!model_bridge_script.starts_with(stale_root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_operator_bridge_launch_allows_missing_smoke_model_probe() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("resources");
+        write_coherent_test_resource_root(&root);
+        std::fs::remove_file(root.join("python/model_bridge.py")).unwrap();
+        let exe_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let exe = exe_dir.join("token.place");
+        std::fs::write(&exe, "").unwrap();
+        let manifest = temp.path().join("manifest");
+        let context = BridgeResourceContext {
+            exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            tauri_resource_dir: Some(&root),
+        };
+
+        let preparation =
+            prepare_operator_bridge_launch(&context).expect("production launch preparation");
+        assert!(preparation.command().is_ok());
+
+        let err = preparation.model_bridge_script().unwrap_err();
+        assert_eq!(
+            err.metadata(),
+            (
+                "bridge_script_resolution",
+                "model_bridge_unresolved",
+                "model_bridge_resolution",
+            )
+        );
+        assert!(!err
+            .to_string()
+            .contains(temp.path().to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_runtime_ambiguous_for_distinct_coherent_packaged_roots() {
+        let temp = TempDir::new().expect("tempdir");
+        let tauri_root = temp.path().join("tauri-resources");
+        let exe_dir = temp.path().join("installed");
+        let sibling_root = temp.path().join("Resources");
+        write_coherent_test_resource_root(&tauri_root);
+        write_coherent_test_resource_root(&sibling_root);
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let exe = exe_dir.join("token.place");
+        std::fs::write(&exe, "").unwrap();
+        let manifest = temp.path().join("manifest");
+        let context = BridgeResourceContext {
+            exe_path: Some(&exe),
+            manifest_dir: &manifest,
+            tauri_resource_dir: Some(&tauri_root),
+        };
+
+        let err = prepare_operator_bridge_launch(&context).unwrap_err();
+        assert_eq!(err.metadata().2, "bundled_runtime_ambiguous");
+        assert!(!err
+            .to_string()
+            .contains(temp.path().to_string_lossy().as_ref()));
     }
 
     #[test]

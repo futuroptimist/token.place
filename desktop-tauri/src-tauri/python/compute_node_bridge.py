@@ -3013,6 +3013,7 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--installed-context-smoke", action="store_true")
+    parser.add_argument("--operator-preflight-controlled-ready", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3029,8 +3030,27 @@ def main() -> int:
     if args.installed_context_smoke:
         print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))
         return 0
+    if args.operator_preflight_controlled_ready:
+        print(json.dumps({
+            "type": "status",
+            "startup_result": "ready",
+            "startup_phase": "ready",
+            "relay_runtime_state": "ready",
+            "worker_state": "ready",
+            "worker_alive": True,
+            "context_tier": args.context_tier,
+            "controlled_preflight": True,
+            "runtime_provisioning_state": "ready",
+            "provisioning_actions": 0,
+            "repair_actions": 0,
+            "pip_actions": 0,
+            "compiler_actions": 0,
+            "network_actions": 0,
+            "download_actions": 0,
+        }, sort_keys=True, separators=(",", ":")), flush=True)
+        return 0
     if not args.model:
-        parser.error("--model is required unless --installed-context-smoke is used")
+        parser.error("--model is required unless --installed-context-smoke or --operator-preflight-controlled-ready is used")
 
     try:
         args.mode = _normalize_compute_mode_local(args.mode)

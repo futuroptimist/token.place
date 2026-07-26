@@ -7,6 +7,7 @@ use crate::operator_logs::{
 };
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, coherent_packaged_resource_roots,
+    configure_packaged_python_subprocess_env_for_layout,
     configure_python_subprocess_env_for_layout, describe_resource_layout, disable_python_user_site,
     resolve_bridge_script_path, resolve_bundled_python_launcher_at_root,
     resolve_packaged_runtime_import_root, resolve_python_launcher_resource_aware,
@@ -1608,22 +1609,47 @@ pub(crate) struct OperatorBridgeLaunchPreparation {
     pub bridge_script: String,
     pub launcher: Option<PythonLauncher>,
     resource_root: std::path::PathBuf,
+    runtime_root: Option<std::path::PathBuf>,
     import_root: std::path::PathBuf,
     layout: ResourceLayoutKind,
 }
 
 impl OperatorBridgeLaunchPreparation {
+    fn configure_command<C>(
+        &self,
+        command: &mut C,
+    ) -> Result<(), OperatorBridgeLaunchPreparationError>
+    where
+        C: PythonEnvCommand,
+    {
+        if matches!(
+            self.launcher.as_ref().map(|launcher| &launcher.source),
+            Some(PythonLauncherSource::BundledRuntime)
+        ) {
+            let runtime_root = self.runtime_root.as_deref().ok_or_else(|| {
+                OperatorBridgeLaunchPreparationError::packaged_environment_invalid()
+            })?;
+            configure_packaged_python_subprocess_env_for_layout(
+                command,
+                &self.import_root,
+                self.layout.clone(),
+                runtime_root,
+            )
+            .map_err(|_| OperatorBridgeLaunchPreparationError::packaged_environment_invalid())?;
+        } else {
+            configure_python_subprocess_env_for_layout(
+                command,
+                &self.import_root,
+                self.layout.clone(),
+                false,
+            );
+        }
+        Ok(())
+    }
+
     fn command(&self) -> anyhow::Result<Command> {
         let mut command = build_bridge_command(&self.bridge_script, self.launcher.clone())?;
-        configure_python_subprocess_env_for_layout(
-            &mut command,
-            &self.import_root,
-            self.layout.clone(),
-            matches!(
-                self.launcher.as_ref().map(|launcher| &launcher.source),
-                Some(PythonLauncherSource::BundledRuntime)
-            ),
-        );
+        self.configure_command(&mut command)?;
         Ok(command)
     }
 
@@ -1632,12 +1658,7 @@ impl OperatorBridgeLaunchPreparation {
             anyhow::anyhow!("missing resolved Python launcher for compute-node bridge script")
         })?;
         let mut command = launcher.command_for_script_blocking(&self.bridge_script);
-        configure_python_subprocess_env_for_layout(
-            &mut command,
-            &self.import_root,
-            self.layout.clone(),
-            launcher.source == PythonLauncherSource::BundledRuntime,
-        );
+        self.configure_command(&mut command)?;
         Ok(command)
     }
 
@@ -1674,12 +1695,7 @@ impl OperatorBridgeLaunchPreparation {
             .ok_or_else(|| anyhow::anyhow!("missing bundled Python launcher for operator smoke"))?;
         let model_bridge_script = self.model_bridge_script()?;
         let mut command = launcher.command_for_script_blocking(&model_bridge_script);
-        configure_python_subprocess_env_for_layout(
-            &mut command,
-            &self.import_root,
-            self.layout.clone(),
-            launcher.source == PythonLauncherSource::BundledRuntime,
-        );
+        self.configure_command(&mut command)?;
         Ok(command)
     }
 }
@@ -1692,6 +1708,14 @@ pub(crate) struct OperatorBridgeLaunchPreparationError {
 }
 
 impl OperatorBridgeLaunchPreparationError {
+    fn packaged_environment_invalid() -> Self {
+        Self::new(
+            "packaged_environment_construction",
+            crate::python_runtime::PACKAGED_PYTHON_ENVIRONMENT_INVALID,
+            crate::python_runtime::PACKAGED_PYTHON_ENVIRONMENT_INVALID,
+            "packaged Python environment could not be constructed",
+        )
+    }
     fn new(
         stage: &'static str,
         code: &'static str,
@@ -1771,6 +1795,10 @@ pub(crate) fn prepare_operator_bridge_launch(
         };
         let launcher = resolve_bundled_python_launcher_at_root(&resource_root, true)
             .map_err(OperatorBridgeLaunchPreparationError::from_launcher)?;
+        let runtime_root = crate::python_runtime::bundled_runtime_root_from_launcher(&launcher)
+            .and_then(|path| path.canonicalize().ok())
+            .filter(|path| path.is_dir() && path.starts_with(&resource_root))
+            .ok_or_else(OperatorBridgeLaunchPreparationError::packaged_environment_invalid)?;
         let import_root =
             resolve_packaged_runtime_import_root(&resource_root).ok_or_else(|| {
                 OperatorBridgeLaunchPreparationError::new(
@@ -1785,6 +1813,7 @@ pub(crate) fn prepare_operator_bridge_launch(
             launcher: Some(launcher),
             import_root,
             resource_root,
+            runtime_root: Some(runtime_root),
             layout,
         });
     }
@@ -1827,6 +1856,7 @@ pub(crate) fn prepare_operator_bridge_launch(
         bridge_script,
         launcher,
         resource_root,
+        runtime_root: None,
         import_root,
         layout,
     })
@@ -6433,6 +6463,28 @@ mod tests {
     }
 
     #[test]
+    fn prepare_operator_bridge_launch_rejects_invalid_packaged_sanitizer_before_spawn() {
+        let preparation = OperatorBridgeLaunchPreparation {
+            bridge_script: "compute_node_bridge.py".into(),
+            launcher: Some(PythonLauncher {
+                program: "python3".into(),
+                args: Vec::new(),
+                source: PythonLauncherSource::BundledRuntime,
+                runtime_id: "test-runtime".into(),
+            }),
+            resource_root: PathBuf::from("missing-resource-root"),
+            runtime_root: None,
+            import_root: PathBuf::from("missing-import-root"),
+            layout: ResourceLayoutKind::WindowsResources,
+        };
+
+        let err = preparation.command().expect_err("invalid environment");
+        assert!(err
+            .to_string()
+            .contains("packaged_python_environment_invalid"));
+    }
+
+    #[test]
     fn prepare_operator_bridge_launch_configures_preflight_command_environment() {
         let temp = TempDir::new().expect("tempdir");
         let manifest_dir = temp
@@ -6444,6 +6496,7 @@ mod tests {
         let resource_root = exe_dir.join("resources");
         let python_dir = resource_root.join("python");
         std::fs::create_dir_all(&python_dir).expect("create python dir");
+        std::fs::create_dir_all(resource_root.join("python-runtime")).expect("create runtime dir");
         std::fs::create_dir_all(resource_root.join("utils")).expect("create import utils dir");
         std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
         std::fs::create_dir_all(&exe_dir).expect("create exe dir");
@@ -6466,6 +6519,7 @@ mod tests {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(launcher),
             resource_root: resource_root.clone(),
+            runtime_root: Some(resource_root.join("python-runtime")),
             import_root: resource_root.clone(),
             layout: ResourceLayoutKind::WindowsResources,
         };
@@ -6553,11 +6607,21 @@ mod tests {
             .lock()
             .expect("runtime bootstrap env test lock");
         let temp = TempDir::new().expect("tempdir");
-        let import_root = temp.path().join("prepared-resources");
+        let resource_root = temp.path().join("prepared-resources");
+        let import_root = resource_root.join("_up_").join("_up_");
         let poisoned_root = temp.path().join("poisoned-resources");
         std::fs::create_dir_all(import_root.join("python")).expect("create import root");
+        let runtime_root = resource_root.join("python-runtime");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(import_root.join("python-runtime"))
+            .expect("create decoy runtime root");
         let bridge_script = import_root.join("python").join("compute_node_bridge.py");
         std::fs::write(&bridge_script, "# compute bridge\n").expect("write bridge script");
+        std::fs::write(
+            import_root.join("python").join("model_bridge.py"),
+            "# model bridge\n",
+        )
+        .expect("write model bridge script");
         let preparation = OperatorBridgeLaunchPreparation {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(PythonLauncher {
@@ -6566,7 +6630,8 @@ mod tests {
                 source: PythonLauncherSource::BundledRuntime,
                 runtime_id: "test-runtime".into(),
             }),
-            resource_root: import_root.clone(),
+            resource_root: resource_root.clone(),
+            runtime_root: Some(runtime_root.clone()),
             import_root: import_root.clone(),
             layout: ResourceLayoutKind::WindowsResources,
         };
@@ -6603,6 +6668,27 @@ mod tests {
                 .flatten(),
             Some(expected_pythonpath.as_os_str())
         );
+        let expected_path = std::env::join_paths([runtime_root.canonicalize().unwrap()])
+            .expect("trusted runtime path");
+        let async_command = preparation.command().expect("async bridge command");
+        assert_eq!(
+            command_env_value(&async_command, "PATH").as_deref(),
+            expected_path.to_str()
+        );
+        for command in [
+            preparation.blocking_command().expect("blocking command"),
+            preparation
+                .model_inspect_command()
+                .expect("model inspect command"),
+        ] {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find_map(|(key, value)| (key == "PATH").then_some(value))
+                    .flatten(),
+                Some(expected_path.as_os_str())
+            );
+        }
     }
 
     #[cfg(unix)]

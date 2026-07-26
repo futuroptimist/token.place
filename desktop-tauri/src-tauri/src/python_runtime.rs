@@ -36,6 +36,12 @@ pub struct PythonLauncher {
 }
 
 impl PythonLauncher {
+    fn bundled_runtime_root(&self) -> Option<PathBuf> {
+        (self.source == PythonLauncherSource::BundledRuntime)
+            .then(|| Path::new(&self.program).parent().map(Path::to_path_buf))
+            .flatten()
+    }
+
     fn new(
         program: impl Into<String>,
         args: Vec<String>,
@@ -54,7 +60,10 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            sanitize_packaged_python_subprocess_env_at_root(
+                &mut cmd,
+                self.bundled_runtime_root().as_deref(),
+            );
         }
         cmd.arg("--version");
         cmd
@@ -64,7 +73,10 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            sanitize_packaged_python_subprocess_env_at_root(
+                &mut cmd,
+                self.bundled_runtime_root().as_deref(),
+            );
         }
         cmd.arg("-c");
         cmd.arg("import json,platform,struct,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'pointer_bits': struct.calcsize('P') * 8, 'executable': sys.executable, 'prefix': sys.prefix}))");
@@ -78,7 +90,10 @@ impl PythonLauncher {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            sanitize_packaged_python_subprocess_env_at_root(
+                &mut cmd,
+                self.bundled_runtime_root().as_deref(),
+            );
         }
         cmd.arg(script_path);
         cmd
@@ -91,7 +106,10 @@ impl PythonLauncher {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            sanitize_packaged_python_subprocess_env(&mut cmd);
+            sanitize_packaged_python_subprocess_env_at_root(
+                &mut cmd,
+                self.bundled_runtime_root().as_deref(),
+            );
         }
         cmd.arg(script_path);
         cmd
@@ -1197,6 +1215,23 @@ pub fn sanitize_packaged_python_subprocess_env<C>(command: &mut C)
 where
     C: PythonEnvCommand,
 {
+    sanitize_packaged_python_subprocess_env_at_root(command, None);
+}
+
+fn canonical_existing_directory(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok().filter(|path| path.is_dir())
+}
+
+/// Build the immutable bundled-Python environment from verified paths.  In
+/// particular, PATH is never copied from the parent process: llama-cpp-python's
+/// Windows loader requires the variable to exist even though it prepends its
+/// own native-library directory.
+pub fn sanitize_packaged_python_subprocess_env_at_root<C>(
+    command: &mut C,
+    runtime_root: Option<&Path>,
+) where
+    C: PythonEnvCommand,
+{
     command.clear_env();
     for key in PACKAGED_ENV_FUNDAMENTALS {
         if let Some(value) = std::env::var_os(key) {
@@ -1219,6 +1254,45 @@ where
     }
     command.set_env("PYTHONNOUSERSITE", std::ffi::OsStr::new("1"));
     command.set_env("PYTHONDONTWRITEBYTECODE", std::ffi::OsStr::new("1"));
+
+    let mut trusted_path = Vec::new();
+    if let Some(runtime_root) = runtime_root.and_then(canonical_existing_directory) {
+        trusted_path.push(runtime_root.clone());
+        for native in [
+            runtime_root.join("Lib/site-packages/llama_cpp/lib"),
+            runtime_root.join("lib/site-packages/llama_cpp/lib"),
+        ] {
+            if let Some(native) = canonical_existing_directory(&native) {
+                if !trusted_path.contains(&native) {
+                    trusted_path.push(native);
+                }
+            }
+        }
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(system_root) = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .and_then(|path| canonical_existing_directory(&path))
+        {
+            if let Some(system32) = canonical_existing_directory(&system_root.join("System32")) {
+                if !trusted_path.contains(&system32) {
+                    trusted_path.push(system32);
+                }
+            }
+        }
+        // This value is an assertion made by the already-attested x64 bundle,
+        // not architecture evidence inherited from the host.
+        if runtime_root.is_some() && cfg!(target_arch = "x86_64") {
+            command.set_env("PROCESSOR_ARCHITECTURE", "AMD64");
+            command.set_env("TOKEN_PLACE_PACKAGED_TARGET_ARCH", "x86_64");
+        }
+    }
+    if !trusted_path.is_empty() {
+        if let Ok(path) = std::env::join_paths(&trusted_path) {
+            command.set_env("PATH", path);
+        }
+    }
 }
 
 fn import_root_is_confirmed_unbundled_development(import_root: &Path) -> bool {
@@ -1241,7 +1315,10 @@ pub fn configure_python_subprocess_env_for_layout<C>(
     C: PythonEnvCommand,
 {
     disable_python_user_site(command);
-    if packaged || layout != ResourceLayoutKind::DevSourceTree {
+    // Bundled launcher constructors have already cleared the environment with
+    // their verified runtime root.  Do not clear it a second time here and
+    // lose the deterministic native-loader PATH.
+    if !packaged && layout != ResourceLayoutKind::DevSourceTree {
         sanitize_packaged_python_subprocess_env(command);
     }
     command.set_env("TOKEN_PLACE_PYTHON_IMPORT_ROOT", import_root.as_os_str());

@@ -1770,10 +1770,18 @@ pub(crate) fn prepare_operator_bridge_launch(
         };
         let launcher = resolve_bundled_python_launcher_at_root(&resource_root, true)
             .map_err(OperatorBridgeLaunchPreparationError::from_launcher)?;
+        let import_root = resolve_packaged_import_root(&resource_root).ok_or_else(|| {
+            OperatorBridgeLaunchPreparationError::new(
+                "import_root_resolution",
+                "desktop_python_runtime_invalid",
+                "packaged_import_root_invalid",
+                "packaged import root is missing or ambiguous",
+            )
+        })?;
         return Ok(OperatorBridgeLaunchPreparation {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(launcher),
-            import_root: resource_root.clone(),
+            import_root,
             resource_root,
             layout,
         });
@@ -1820,6 +1828,29 @@ pub(crate) fn prepare_operator_bridge_launch(
         import_root,
         layout,
     })
+}
+
+fn resolve_packaged_import_root(resource_root: &Path) -> Option<PathBuf> {
+    let canonical_resource = resource_root.canonicalize().ok()?;
+    let mut matches = Vec::new();
+    for relative in ["", "_up_", "_up_/_up_"] {
+        let candidate = canonical_resource.join(relative);
+        let Ok(candidate) = candidate.canonicalize() else {
+            continue;
+        };
+        if !candidate.starts_with(&canonical_resource) {
+            continue;
+        }
+        if candidate.join("utils").is_dir() && candidate.join("config.py").is_file() {
+            if !matches.contains(&candidate) {
+                matches.push(candidate);
+            }
+        }
+    }
+    match matches.as_slice() {
+        [root] => Some(root.clone()),
+        _ => None,
+    }
 }
 
 fn packaged_launcher_source_is_valid(

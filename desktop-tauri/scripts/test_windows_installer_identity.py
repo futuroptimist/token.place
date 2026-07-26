@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-EXPECTED_VERSION = "0.1.5"
+EXPECTED_VERSION = "0.1.6"
 EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 RUNTIME_PROVENANCE_NAME = "embedded_python_runtime_provenance.json"

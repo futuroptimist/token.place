@@ -1679,7 +1679,15 @@ def _desktop_platform() -> str:
 
 
 def _desktop_arch() -> str:
-    return platform_module.machine().lower().replace("amd64", "x86_64")
+    machine = platform_module.machine().lower().replace("amd64", "x86_64")
+    if _is_exact_packaged_runtime_layout() and _desktop_platform().startswith("win"):
+        attested = os.environ.get("TOKEN_PLACE_PACKAGED_TARGET_ARCH", "").strip().lower()
+        if attested != "x86_64" or machine not in {"", "x86_64"}:
+            return "architecture_mismatch"
+        if struct.calcsize("P") * 8 != 64 or not _bundled_runtime_provenance_valid():
+            return "architecture_mismatch"
+        return "x86_64"
+    return machine
 
 
 def _runtime_bootstrap_policy() -> RuntimeBootstrapPolicy:

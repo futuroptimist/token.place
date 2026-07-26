@@ -1951,6 +1951,7 @@ def test_desktop_runtime_probe_parent_wins_wrong_sys_path_order(monkeypatch, tmp
 
 def test_desktop_runtime_probe_windows_extended_path_with_spaces_prioritized(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
+    _force_parent_signal_guard(monkeypatch, model_manager_module)
 
     site = tmp_path / 'Windows Python Runtime' / 'Lib' / 'site-packages with spaces'
     init_file = _write_fake_llama_cpp_package(site, 'windows-spaces')
@@ -1974,6 +1975,7 @@ def test_desktop_runtime_probe_windows_extended_path_with_spaces_prioritized(mon
 
 def test_desktop_runtime_probe_macos_app_resources_path_prioritized(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
+    _force_parent_signal_guard(monkeypatch, model_manager_module)
 
     resources_site = (
         tmp_path
@@ -2244,11 +2246,10 @@ def test_canonical_path_for_compare_handles_empty_and_fallback(monkeypatch):
 
     monkeypatch.setattr(model_manager_module.os.path, 'abspath', _abspath_raises)
 
-    assert model_manager_module._canonical_path_for_compare('fallback/path') == (
-        model_manager_module.os.path.normcase(
-            model_manager_module.os.path.normpath('fallback/path')
-        )
-    )
+    expected = model_manager_module.os.path.normcase(
+        model_manager_module.os.path.normpath('fallback/path')
+    ).replace('\\', '/')
+    assert model_manager_module._canonical_path_for_compare('fallback/path') == expected
 
 
 def test_run_llama_cpp_python_probe_handles_nonzero_and_malformed_json(monkeypatch):
@@ -3327,7 +3328,7 @@ def test_llama_cpp_package_parent_edge_cases(monkeypatch):
     assert model_manager_module._llama_cpp_package_parent_from_module_path(None) is None
     assert (
         model_manager_module._llama_cpp_package_parent_from_module_path('/opt/site/llama_cpp.py')
-        == '/opt/site'
+        == str(Path('/opt/site'))
     )
     assert model_manager_module._llama_cpp_package_parent_from_module_path('/opt/site/not_llama.py') is None
 

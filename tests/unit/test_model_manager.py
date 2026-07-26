@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import os
 import queue
+import signal
 import subprocess
 import threading
 import pytest
@@ -694,6 +695,23 @@ class TestModelManager:
             'https://example.com/model.gguf', stream=True, timeout=30
         )
         mock_response.iter_content.assert_called_once_with(chunk_size=1048576)
+
+    @patch('utils.llm.model_manager.time.time', return_value=100.0)
+    @patch('utils.llm.model_manager.requests.get')
+    def test_download_file_in_chunks_zero_elapsed_time(self, mock_get, _mock_time, model_manager):
+        """A clock with sub-resolution elapsed time must not divide by zero."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers.get.return_value = '1'
+        mock_response.iter_content.return_value = [b'a']
+        mock_get.return_value = mock_response
+
+        file_path = os.path.join(self._temp_dir, 'zero_elapsed.gguf')
+
+        assert model_manager.download_file_in_chunks(
+            file_path, 'https://example.com/model.gguf', 1
+        ) is True
+        assert Path(file_path).read_bytes() == b'a'
 
     @patch('utils.llm.model_manager.requests.get')
     def test_download_file_in_chunks_http_error(self, mock_get, model_manager):
@@ -1729,6 +1747,17 @@ def test_desktop_runtime_probe_mismatch_falls_back_to_imported_runtime(standalon
     assert plan['fallback_reason'] == 'llama_cpp_runtime_probe_mismatch'
 
 
+def _force_parent_signal_guard(monkeypatch, model_manager_module):
+    """Model the POSIX parent-import guard without requiring host signal APIs."""
+    monkeypatch.setattr(model_manager_module, '_signal_guard_available', lambda: True)
+    monkeypatch.setattr(model_manager_module.threading, 'current_thread', lambda: model_manager_module.threading.main_thread())
+    monkeypatch.setattr(model_manager_module.signal, 'SIGALRM', 14, raising=False)
+    monkeypatch.setattr(model_manager_module.signal, 'ITIMER_REAL', 0, raising=False)
+    monkeypatch.setattr(model_manager_module.signal, 'setitimer', lambda *_args: (0, 0), raising=False)
+    monkeypatch.setattr(model_manager_module.signal, 'getsignal', lambda *_args: None)
+    monkeypatch.setattr(model_manager_module.signal, 'signal', lambda *_args: None)
+
+
 def _write_fake_llama_cpp_package(site_dir: Path, marker: str) -> Path:
     package_dir = site_dir / 'llama_cpp'
     package_dir.mkdir(parents=True, exist_ok=True)
@@ -1751,11 +1780,7 @@ def test_desktop_runtime_probe_clears_stale_loaded_llama_cpp(monkeypatch, tmp_pa
     stale_path = tmp_path / 'old site-packages' / 'llama_cpp' / '__init__.py'
     right_site = tmp_path / 'right site-packages'
     right_init = _write_fake_llama_cpp_package(right_site, 'right')
-    monkeypatch.setattr(model_manager_module, '_signal_guard_available', lambda: True)
-    monkeypatch.setattr(model_manager_module.threading, 'current_thread', lambda: model_manager_module.threading.main_thread())
-    monkeypatch.setattr(model_manager_module.signal, 'setitimer', lambda *_args: (0, 0))
-    monkeypatch.setattr(model_manager_module.signal, 'getsignal', lambda *_args: None)
-    monkeypatch.setattr(model_manager_module.signal, 'signal', lambda *_args: None)
+    _force_parent_signal_guard(monkeypatch, model_manager_module)
     monkeypatch.setattr(sys, 'path', [str(right_site), *sys.path])
     monkeypatch.setitem(sys.modules, 'llama_cpp', SimpleNamespace(__file__=str(stale_path)))
 
@@ -1775,6 +1800,7 @@ def test_desktop_runtime_probe_clears_stale_loaded_llama_cpp(monkeypatch, tmp_pa
 
 def test_desktop_runtime_probe_clears_stale_llama_cpp_submodules(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
+    _force_parent_signal_guard(monkeypatch, model_manager_module)
 
     right_site = tmp_path / 'right site-packages'
     package_dir = right_site / 'llama_cpp'
@@ -1814,6 +1840,7 @@ def test_desktop_runtime_probe_clears_stale_llama_cpp_submodules(monkeypatch, tm
 
 def test_desktop_runtime_probe_clears_matching_top_level_with_stale_submodule(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
+    _force_parent_signal_guard(monkeypatch, model_manager_module)
 
     right_site = tmp_path / 'right site-packages'
     package_dir = right_site / 'llama_cpp'
@@ -1855,6 +1882,7 @@ def test_desktop_runtime_probe_clears_matching_top_level_with_stale_submodule(mo
 
 def test_desktop_runtime_probe_clears_orphaned_llama_cpp_submodules(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
+    _force_parent_signal_guard(monkeypatch, model_manager_module)
 
     right_site = tmp_path / 'right site-packages'
     package_dir = right_site / 'llama_cpp'
@@ -1896,6 +1924,7 @@ def test_desktop_runtime_probe_clears_orphaned_llama_cpp_submodules(monkeypatch,
 
 def test_desktop_runtime_probe_parent_wins_wrong_sys_path_order(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
+    _force_parent_signal_guard(monkeypatch, model_manager_module)
 
     wrong_site = tmp_path / 'wrong site-packages'
     right_site = tmp_path / 'right site-packages'
@@ -2256,6 +2285,7 @@ def test_run_llama_cpp_import_watchdog_handles_nonzero_and_malformed_json(monkey
 
 def test_import_llama_cpp_runtime_success_records_sanitized_parent_import(monkeypatch):
     from utils.llm import model_manager as model_manager_module
+    _force_parent_signal_guard(monkeypatch, model_manager_module)
 
     fake_runtime = SimpleNamespace(__file__='/site-packages/llama_cpp/__init__.py')
     sys.modules.pop('llama_cpp', None)
@@ -2340,6 +2370,10 @@ def test_import_llama_cpp_runtime_rejects_shim_from_parent_import(monkeypatch):
         sys.modules.pop('llama_cpp', None)
 
 
+@pytest.mark.skipif(
+    not all(hasattr(signal, name) for name in ('SIGALRM', 'ITIMER_REAL', 'setitimer')),
+    reason='POSIX parent-import timeout is unavailable; Windows uses the subprocess facade',
+)
 def test_import_llama_cpp_runtime_reports_parent_import_timeout(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -2802,6 +2836,10 @@ def test_canonical_path_for_compare_returns_none_when_stringification_fails_twic
     assert model_manager_module._canonical_path_for_compare(BrokenPath()) is None
 
 
+@pytest.mark.skipif(
+    not all(hasattr(signal, name) for name in ('SIGALRM', 'ITIMER_REAL', 'setitimer')),
+    reason='POSIX interval-timer guard is unavailable; Windows uses the subprocess facade',
+)
 def test_parent_import_signal_guard_wraps_generic_timeout_and_restores_prior_timer(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -2839,6 +2877,7 @@ def test_parent_import_signal_guard_wraps_generic_timeout_and_restores_prior_tim
 
 def test_parent_import_guard_imports_real_module_without_mocking_guard_modules(tmp_path, monkeypatch):
     from utils.llm import model_manager as model_manager_module
+    _force_parent_signal_guard(monkeypatch, model_manager_module)
 
     runtime_dir = tmp_path / 'runtime'
     runtime_dir.mkdir()

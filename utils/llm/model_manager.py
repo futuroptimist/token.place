@@ -5040,7 +5040,8 @@ class ModelManager:
                     bytes_downloaded = bytes_downloaded[-len(times):]
 
                     # Calculate speed and estimated time remaining
-                    speed = sum(bytes_downloaded) / sum(times) if times else 0
+                    elapsed_total = sum(times)
+                    speed = sum(bytes_downloaded) / elapsed_total if elapsed_total > 0 else 0
                     eta = (total_size_in_bytes - progress) / speed if speed else 0
 
                     downloaded_mb = progress / (1024 * 1024)

@@ -56,7 +56,7 @@ impl PythonLauncher {
         if self.source == PythonLauncherSource::BundledRuntime {
             sanitize_packaged_python_subprocess_env(
                 &mut cmd,
-                self.bundled_runtime_root().as_deref(),
+                bundled_runtime_root_from_candidate(self).as_deref(),
             );
         }
         cmd.arg("--version");
@@ -69,7 +69,7 @@ impl PythonLauncher {
         if self.source == PythonLauncherSource::BundledRuntime {
             sanitize_packaged_python_subprocess_env(
                 &mut cmd,
-                self.bundled_runtime_root().as_deref(),
+                bundled_runtime_root_from_candidate(self).as_deref(),
             );
         }
         cmd.arg("-c");
@@ -86,7 +86,7 @@ impl PythonLauncher {
         if self.source == PythonLauncherSource::BundledRuntime {
             sanitize_packaged_python_subprocess_env(
                 &mut cmd,
-                self.bundled_runtime_root().as_deref(),
+                bundled_runtime_root_from_candidate(self).as_deref(),
             );
         }
         cmd.arg(script_path);
@@ -102,19 +102,11 @@ impl PythonLauncher {
         if self.source == PythonLauncherSource::BundledRuntime {
             sanitize_packaged_python_subprocess_env(
                 &mut cmd,
-                self.bundled_runtime_root().as_deref(),
+                bundled_runtime_root_from_candidate(self).as_deref(),
             );
         }
         cmd.arg(script_path);
         cmd
-    }
-}
-
-impl PythonLauncher {
-    fn bundled_runtime_root(&self) -> Option<PathBuf> {
-        (self.source == PythonLauncherSource::BundledRuntime)
-            .then(|| Path::new(&self.program).parent().map(Path::to_path_buf))
-            .flatten()
     }
 }
 

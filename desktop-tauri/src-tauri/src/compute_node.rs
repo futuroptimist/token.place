@@ -6616,6 +6616,11 @@ mod tests {
             .expect("write bridge");
         std::fs::write(python_dir.join("model_bridge.py"), "# model bridge\n")
             .expect("write model bridge");
+        // resolve_packaged_runtime_import_root() requires both of these import
+        // sentinels alongside the bridge scripts; a fixture missing either one
+        // is not actually a coherent packaged layout.
+        std::fs::create_dir_all(root.join("utils")).expect("create utils directory");
+        std::fs::write(root.join("config.py"), "# config\n").expect("write config.py");
         let machine = if cfg!(target_arch = "aarch64") {
             "arm64"
         } else {

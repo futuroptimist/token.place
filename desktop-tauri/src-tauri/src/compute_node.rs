@@ -1969,6 +1969,8 @@ pub(crate) fn operator_start_preflight_record(
     configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
     command.arg("--operator-runtime-preflight");
     command
+        .arg("--mode")
+        .arg(format!("{:?}", config.preferred_mode).to_lowercase())
         .arg("--context-tier")
         .arg(normalize_context_tier(&config.context_tier));
     let event = std::thread::spawn(move || -> anyhow::Result<Value> {
@@ -1998,6 +2000,9 @@ pub(crate) fn operator_start_preflight_record(
         for key in [
             "production_runtime_preflight",
             "startup_result",
+            "requested_mode",
+            "selected_backend",
+            "runtime_action",
             "provisioning_actions",
             "repair_actions",
             "pip_actions",
@@ -2046,7 +2051,23 @@ fn validate_production_operator_preflight_event(event: Value) -> anyhow::Result<
     ]
     .iter()
     .all(|key| event.get(*key).and_then(Value::as_i64) == Some(0));
-    if !identity_is_valid || !counters_are_zero {
+    let requested_mode_is_valid = matches!(
+        event.get("requested_mode").and_then(Value::as_str),
+        Some("auto" | "gpu" | "hybrid")
+    );
+    let runtime_pair_is_valid = matches!(
+        (
+            event.get("selected_backend").and_then(Value::as_str),
+            event.get("runtime_action").and_then(Value::as_str),
+        ),
+        (Some("cuda"), Some("already_supported"))
+            | (Some("metal"), Some("metal_already_supported"))
+    );
+    if !identity_is_valid
+        || !counters_are_zero
+        || !requested_mode_is_valid
+        || !runtime_pair_is_valid
+    {
         anyhow::bail!("operator_preflight_invalid_event");
     }
     Ok(event)
@@ -3953,7 +3974,7 @@ mod tests {
         assert_eq!(event_types, vec!["status".to_string(), "error".to_string()]);
     }
 
-    const PRODUCTION_PREFLIGHT_VALIDATED_EVENT: &str = r#"{"type":"status","production_runtime_preflight":true,"startup_result":"runtime_validated","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
+    const PRODUCTION_PREFLIGHT_VALIDATED_EVENT: &str = r#"{"type":"status","production_runtime_preflight":true,"startup_result":"runtime_validated","requested_mode":"auto","selected_backend":"cuda","runtime_action":"already_supported","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
 
     fn operator_preflight_test_command(output: Option<&str>, wedge: bool) -> Command {
         #[cfg(unix)]
@@ -4019,6 +4040,37 @@ mod tests {
                 "operator_preflight_invalid_event"
             );
         }
+    }
+
+    #[test]
+    fn operator_preflight_requires_gpu_mode_and_immutable_native_runtime_pair() {
+        let valid = serde_json::from_str::<Value>(PRODUCTION_PREFLIGHT_VALIDATED_EVENT)
+            .expect("valid fixture");
+        for (key, value) in [
+            ("requested_mode", Value::Null),
+            ("requested_mode", Value::String("cpu".into())),
+            ("selected_backend", Value::String("cpu".into())),
+            ("runtime_action", Value::String("skipped".into())),
+            (
+                "runtime_action",
+                Value::String("metal_already_supported".into()),
+            ),
+        ] {
+            let mut event = valid.clone();
+            event[key] = value;
+            assert_eq!(
+                validate_production_operator_preflight_event(event)
+                    .expect_err("forged runtime attestation")
+                    .to_string(),
+                "operator_preflight_invalid_event"
+            );
+        }
+
+        let mut metal = valid;
+        metal["requested_mode"] = Value::String("gpu".into());
+        metal["selected_backend"] = Value::String("metal".into());
+        metal["runtime_action"] = Value::String("metal_already_supported".into());
+        validate_production_operator_preflight_event(metal).expect("valid Metal attestation");
     }
 
     #[tokio::test]

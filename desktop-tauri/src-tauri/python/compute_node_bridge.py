@@ -3040,17 +3040,22 @@ def main() -> int:
         _, normalize_context_tier = _load_context_profile_helpers()
         context_tier = normalize_context_tier(args.context_tier)
         runtime = _ensure_desktop_llama_runtime_for_context(args.mode, context_tier)
-        if (
-            not runtime.get("runtime_action")
-            or not runtime.get("selected_backend")
-            or desktop_gpu_runtime_failure_message(args.mode, runtime)
-        ):
+        selected_backend = runtime.get("selected_backend")
+        runtime_action = runtime.get("runtime_action")
+        native_runtime_success = (selected_backend, runtime_action) in {
+            ("cuda", "already_supported"),
+            ("metal", "metal_already_supported"),
+        }
+        if args.mode not in {"auto", "gpu", "hybrid"} or not native_runtime_success:
             raise RuntimeError("operator_preflight_runtime_validation_failed")
         print(json.dumps({
             "type": "status",
             "startup_result": "runtime_validated",
             "startup_phase": "hardware_model_boundary",
             "context_tier": context_tier,
+            "requested_mode": args.mode,
+            "selected_backend": selected_backend,
+            "runtime_action": runtime_action,
             "production_runtime_preflight": True,
             "runtime_provisioning_state": "ready",
             "provisioning_actions": 0,

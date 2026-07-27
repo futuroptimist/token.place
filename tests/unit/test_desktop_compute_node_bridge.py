@@ -2067,6 +2067,9 @@ def test_main_operator_preflight_validates_native_runtime_before_boundary(capsys
         'startup_result': 'runtime_validated',
         'startup_phase': 'hardware_model_boundary',
         'context_tier': '64k-full',
+        'requested_mode': 'auto',
+        'selected_backend': 'cuda',
+        'runtime_action': 'already_supported',
         'production_runtime_preflight': True,
         'runtime_provisioning_state': 'ready',
         'provisioning_actions': 0,
@@ -2120,6 +2123,41 @@ def test_main_operator_preflight_rejects_failed_runtime_contract(monkeypatch):
 
     with pytest.raises(RuntimeError, match='operator_preflight_runtime_validation_failed'):
         compute_node_bridge.main()
+
+
+@pytest.mark.parametrize(
+    ('mode', 'runtime'),
+    [
+        ('cpu', {'runtime_action': 'skipped', 'selected_backend': 'cpu'}),
+        ('auto', {'runtime_action': 'skipped', 'selected_backend': 'cpu'}),
+        ('gpu', {'runtime_action': 'probe_only', 'selected_backend': 'cuda'}),
+    ],
+)
+def test_main_operator_preflight_rejects_non_native_success(mode, runtime, monkeypatch):
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(compute_node_bridge, '_ensure_desktop_llama_runtime_for_context', lambda _mode, _tier: runtime)
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight', '--mode', mode])
+
+    with pytest.raises(RuntimeError, match='operator_preflight_runtime_validation_failed'):
+        compute_node_bridge.main()
+
+
+@pytest.mark.parametrize(
+    ('backend', 'action'),
+    [('cuda', 'already_supported'), ('metal', 'metal_already_supported')],
+)
+def test_main_operator_preflight_accepts_native_success_pairs(backend, action, capsys, monkeypatch):
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda _mode, _tier: {'runtime_action': action, 'selected_backend': backend},
+    )
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight', '--mode', 'gpu'])
+
+    assert compute_node_bridge.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert (payload['selected_backend'], payload['runtime_action']) == (backend, action)
 
 
 def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys, monkeypatch):

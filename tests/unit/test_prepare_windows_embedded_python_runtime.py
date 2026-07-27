@@ -81,7 +81,7 @@ def manifest(**overrides):
                 'license': 'test license',
                 'provenance': 'test provenance',
                 'archive_member_path': f'bin/{name}',
-                'destination': name,
+                'destination': f'Lib/site-packages/llama_cpp/lib/{name}',
                 'extracted_sha256': '456789abcdeffedcba98765432100123456789abcdeffedcba98765432101234',
             }
             for name, version in [
@@ -89,6 +89,7 @@ def manifest(**overrides):
                 ('cublas64_12.dll', '12.4.5.8'),
                 ('msvcp140.dll', '14.44.35211.0'),
                 ('vcomp140.dll', '14.44.35211.0'),
+                ('vcruntime140_1.dll', '14.44.35211.0'),
             ]
         ],
         'python_package_wheels': [],
@@ -229,6 +230,7 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract)
     monkeypatch.setattr(prep, 'run', fake_run)
     monkeypatch.setattr(prep, 'validate_runtime_payload', lambda runtime, data: [])
+    monkeypatch.setattr(prep, 'validate_staged_native_import', lambda runtime, data, closure: None)
     monkeypatch.setattr(prep.platform, 'machine', lambda: 'AMD64')
 
     prep.prepare(m)
@@ -743,6 +745,7 @@ def test_prepare_restores_previous_runtime_when_promotion_fails(tmp_path, monkey
     monkeypatch.setattr(prep, 'validate_wheel', lambda whl, data: None)
     monkeypatch.setattr(prep, 'validate_installed_inventory', lambda py, data: None)
     monkeypatch.setattr(prep, 'validate_runtime_payload', lambda runtime, data: [])
+    monkeypatch.setattr(prep, 'validate_staged_native_import', lambda runtime, data, closure: None)
 
     def fake_extract(_archive, dest):
         staged = dest / 'cpython'
@@ -988,6 +991,70 @@ def test_stage_native_dll_artifacts_extracts_exact_pinned_member(tmp_path, monke
     prep.stage_native_dll_artifacts(m, tmp_path / 'cache', runtime)
 
     assert (runtime / 'cudart64_12.dll').read_bytes() == dll_bytes
+
+
+def test_staged_native_import_uses_closed_packaged_environment(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    system_root = tmp_path / 'Windows'
+    native.mkdir(parents=True)
+    (system_root / 'System32').mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    monkeypatch.setenv('SystemRoot', str(system_root))
+    monkeypatch.setenv('PATH', 'POISONED-HOST-PATH')
+    monkeypatch.setenv('PYTHONPATH', 'POISONED-PYTHONPATH')
+    calls = []
+
+    def completed(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return prep.subprocess.CompletedProcess(cmd, 0, '{"native_import_valid":true}\n', '')
+
+    monkeypatch.setattr(prep.subprocess, 'run', completed)
+    prep.validate_staged_native_import(runtime, {'expected_interpreter_path': 'python.exe'}, [])
+
+    command, kwargs = calls[0]
+    assert command[:3] == [str((runtime / 'python.exe').resolve()), '-I', '-c']
+    assert kwargs['env']['PATH'].split(prep.os.pathsep) == [
+        str(runtime.resolve()), str(native.resolve()), str((system_root / 'System32').resolve())
+    ]
+    assert 'POISONED' not in repr(kwargs['env'])
+    assert set(kwargs['env']) == {'PATH', 'PYTHONNOUSERSITE', 'PYTHONDONTWRITEBYTECODE', 'SystemRoot'}
+
+
+def test_staged_native_import_failure_is_bounded_and_identifies_closure_member(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    system_root = tmp_path / 'Windows'
+    native.mkdir(parents=True)
+    (system_root / 'System32').mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    failing = native / 'ggml-base.dll'
+    failing.write_bytes(b'dll')
+    monkeypatch.setenv('SystemRoot', str(system_root))
+    secret = r'C:\Users\Secret\sentinel.dll'
+    results = iter([
+        prep.subprocess.CompletedProcess([], 1, '', secret),
+        prep.subprocess.CompletedProcess([], 1, '{"code":126}\n', secret),
+    ])
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: next(results))
+
+    with pytest.raises(prep.RuntimePrepError) as raised:
+        prep.validate_staged_native_import(
+            runtime,
+            {'expected_interpreter_path': 'python.exe'},
+            [{'name': 'ggml-base.dll', 'path': 'Lib/site-packages/llama_cpp/lib/ggml-base.dll'}],
+        )
+    assert str(raised.value) == 'staged native import failed: ggml-base.dll:winerror_126'
+    assert secret not in str(raised.value)
+
+
+def test_staged_native_import_rejects_missing_search_topology(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    (runtime / 'python.exe').write_bytes(b'python')
+    monkeypatch.setenv('SystemRoot', str(tmp_path / 'missing-windows'))
+    with pytest.raises(prep.RuntimePrepError, match='environment invalid'):
+        prep.validate_staged_native_import(runtime, {'expected_interpreter_path': 'python.exe'}, [])
 
 
 def test_manifest_rejects_non_exact_native_versions(tmp_path):

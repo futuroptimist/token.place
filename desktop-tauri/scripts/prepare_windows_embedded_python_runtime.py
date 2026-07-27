@@ -113,9 +113,12 @@ def load_manifest(path: Path=MANIFEST) -> dict:
         native_destinations.add(destination)
     if native_artifacts:
         native_names = {a["name"].lower() for a in native_artifacts if isinstance(a, dict) and "name" in a}
-        required_vendor = {"cudart64_12.dll", "cublas64_12.dll", "msvcp140.dll", "vcomp140.dll"}
+        required_vendor = {"cudart64_12.dll", "cublas64_12.dll", "msvcp140.dll", "vcomp140.dll", "vcruntime140_1.dll"}
         missing_vendor = sorted(required_vendor - native_names)
         if missing_vendor: raise RuntimePrepError(f"missing native DLL artifact pins: {missing_vendor}")
+        native_prefix = "lib/site-packages/llama_cpp/lib/"
+        if any(not destination.startswith(native_prefix) for destination in native_destinations):
+            raise RuntimePrepError("native DLL artifacts must share the bundled llama_cpp loader directory")
     _validate_sha256_pin(m.get("sha256", ""), "archive sha256")
     _validate_sha256_pin(wheel.get("sha256", ""), "llama-cpp-python wheel sha256")
     wheelhouse = m.get("python_package_wheels", [])
@@ -215,7 +218,7 @@ def extract_microsoft_burn_member(archive: Path, member: str, dest: Path) -> Non
         shutil.copyfile(extracted, dest)
 
 def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
-    """Stage pinned native redistributable DLLs beside python.exe for Windows loader visibility."""
+    """Stage pinned redistributables in llama_cpp's registered DLL directory."""
     seen: set[str] = set()
     for artifact in m.get("native_dll_artifacts", []):
         name = artifact["name"]
@@ -254,6 +257,134 @@ def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
         machine, _ = inspect_pe(dest, dest.relative_to(staged).as_posix())
         if machine != "IMAGE_FILE_MACHINE_AMD64":
             raise RuntimePrepError(f"native DLL artifact is not AMD64: {name}")
+
+
+NATIVE_IMPORT_DIAGNOSTIC_CODES = {126, 127, 193}
+
+
+def _closed_native_import_env(runtime: Path) -> tuple[dict[str, str], Path]:
+    try:
+        runtime = runtime.resolve(strict=True)
+        native = (runtime / "Lib/site-packages/llama_cpp/lib").resolve(strict=True)
+        system_root_value = os.environ.get("SystemRoot", "")
+        system_root = Path(system_root_value)
+        if not system_root.is_absolute():
+            raise OSError
+        system_root = system_root.resolve(strict=True)
+        system32 = (system_root / "System32").resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise RuntimePrepError("staged native import environment invalid") from None
+    if not system32.is_dir() or not system32.is_relative_to(system_root):
+        raise RuntimePrepError("staged native import environment invalid")
+    env = {
+        "PATH": os.pathsep.join((str(runtime), str(native), str(system32))),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "SystemRoot": str(system_root),
+    }
+    return env, native
+
+
+def _native_import_probe_script() -> str:
+    return """
+import importlib.metadata as md, json, pathlib
+import llama_cpp
+runtime = pathlib.Path(__import__('sys').executable).resolve().parent
+module = pathlib.Path(llama_cpp.__file__).resolve()
+valid = module.is_relative_to(runtime) and md.version('llama-cpp-python') == '0.3.32'
+print(json.dumps({'native_import_valid': valid}, separators=(',', ':')))
+raise SystemExit(0 if valid else 9)
+"""
+
+
+def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str], pe_closure: list[dict[str, object]]) -> tuple[str, int | None]:
+    """Return only a manifest-owned basename and bounded Windows loader code."""
+    entries = {
+        str(entry.get("name", "")).lower(): entry
+        for entry in pe_closure
+        if isinstance(entry, dict) and entry.get("name") and entry.get("path")
+    }
+    candidates = {
+        name: runtime / str(entry["path"])
+        for name, entry in entries.items()
+    }
+    ordered: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited or name in visiting:
+            return
+        visiting.add(name)
+        imports = entries[name].get("imports", [])
+        if isinstance(imports, list):
+            for dependency in sorted(str(item).lower() for item in imports):
+                if dependency in entries:
+                    visit(dependency)
+        visiting.remove(name)
+        visited.add(name)
+        ordered.append(name)
+
+    for candidate in sorted(candidates):
+        visit(candidate)
+    for name in ordered:
+        script = """
+import ctypes, json, sys
+try:
+    ctypes.WinDLL(sys.argv[1])
+except OSError as exc:
+    code = getattr(exc, 'winerror', None)
+    print(json.dumps({'code': code if code in (126, 127, 193) else None}))
+    raise SystemExit(1)
+print('{"code":null}')
+"""
+        try:
+            result = subprocess.run(
+                [str(py), "-I", "-c", script, str(candidates[name])],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return name, None
+        if result.returncode:
+            try:
+                code = json.loads(result.stdout).get("code")
+            except (json.JSONDecodeError, AttributeError):
+                code = None
+            return name, code if code in NATIVE_IMPORT_DIAGNOSTIC_CODES else None
+    return "unknown", None
+
+
+def validate_staged_native_import(runtime: Path, m: dict, pe_closure: list[dict[str, object]]) -> None:
+    """Import the pinned native module under the packaged launcher's closed environment."""
+    try:
+        py = (runtime / m["expected_interpreter_path"]).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise RuntimePrepError("staged native import failed: unknown:loader_code_unknown") from None
+    env, _native = _closed_native_import_env(runtime)
+    try:
+        result = subprocess.run(
+            [str(py), "-I", "-c", _native_import_probe_script()],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimePrepError("staged native import failed: unknown:loader_code_unknown") from None
+    try:
+        payload = json.loads(result.stdout) if result.returncode == 0 else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if result.returncode == 0 and payload == {"native_import_valid": True}:
+        return
+    basename, code = _diagnose_native_import_failure(py, runtime, env, pe_closure)
+    bounded_code = f"winerror_{code}" if code is not None else "loader_code_unknown"
+    raise RuntimePrepError(f"staged native import failed: {basename}:{bounded_code}")
 
 def safe_extract_tar(archive: Path, dest: Path) -> None:
     with tarfile.open(archive, 'r:*') as tf:
@@ -609,6 +740,7 @@ def prepare(m: dict) -> None:
         stage_native_dll_artifacts(m, cache, staged)
         prune_packaging_unused_non_x64_launchers(staged)
         pe_closure=validate_runtime_payload(staged, m)
+        validate_staged_native_import(staged, m, pe_closure)
         for notice in m.get('runtime_notices',[]): (staged/notice['path']).write_text(f"{notice['name']} redistribution notice: {notice['license']}\n", encoding='utf-8')
         write_provenance(staged, m, pe_closure)
         backup=tmp/'old-runtime'

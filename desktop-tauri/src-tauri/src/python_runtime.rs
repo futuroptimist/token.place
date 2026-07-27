@@ -2746,12 +2746,18 @@ mod tests {
     }
     #[test]
     fn bundled_metadata_probe_sanitizes_poisoned_host_python_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime = temp.path().join("python-runtime");
+        let program = if cfg!(windows) {
+            runtime.join("python.exe")
+        } else {
+            runtime.join("bin").join("python3")
+        };
+        std::fs::create_dir_all(program.parent().expect("interpreter parent"))
+            .expect("create runtime dir");
+        std::fs::write(&program, []).expect("create interpreter");
         let launcher = PythonLauncher::new(
-            if cfg!(windows) {
-                r"C:\bundle\python-runtime\python.exe"
-            } else {
-                "/bundle/python-runtime/bin/python3"
-            },
+            program.to_string_lossy(),
             vec![],
             PythonLauncherSource::BundledRuntime,
             bundled_runtime_id(),

@@ -1423,7 +1423,8 @@ def test_probe_marks_error_when_subprocess_has_empty_stdout(monkeypatch):
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
-    assert probe.error == 'probe failed'
+    assert probe.error == 'probe_process_abnormal_exit'
+    assert probe.probe_error_code == 'probe_process_abnormal_exit'
 
 
 def test_maybe_reexec_for_runtime_refresh_skips_when_guard_set(monkeypatch):
@@ -1482,7 +1483,7 @@ def test_probe_marks_error_when_subprocess_raises(monkeypatch):
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
-    assert probe.error == 'desktop_runtime_probe_start_failed:RuntimeError'
+    assert probe.error == 'probe_process_abnormal_exit'
 
 
 def test_probe_uses_return_code_when_stderr_is_empty(monkeypatch):
@@ -1497,7 +1498,8 @@ def test_probe_uses_return_code_when_stderr_is_empty(monkeypatch):
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
-    assert probe.error == 'probe subprocess failed with return code 9'
+    assert probe.error == 'probe_process_abnormal_exit'
+    assert probe.child_exit_code == 9
 
 
 def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
@@ -1585,7 +1587,7 @@ def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
-    assert probe.error == 'json parse failed'
+    assert probe.error == 'probe_process_abnormal_exit'
 
 
 def test_is_repo_local_llama_module_returns_false_for_empty_module_path():
@@ -3200,6 +3202,33 @@ print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({
     assert probe.error is None
 
 
+@pytest.mark.parametrize(
+    ('exception_type', 'error_code'),
+    [('ImportError', 'native_llama_import_failed'), ('OSError', 'native_dll_load_failed')],
+)
+def test_probe_failure_schema_distinguishes_import_and_dll_errors(exception_type, error_code):
+    payload = {
+        'probe_stage': 'native_import', 'probe_error_code': error_code,
+        'exception_type': exception_type, 'child_exit_code': None,
+        'detected_architecture': 'x86_64', 'architecture_source': 'attested_windows_x86_64',
+        'import_root_valid': True,
+    }
+    assert desktop_runtime_setup._validated_probe_diagnostic(payload) == payload
+
+
+def test_probe_abnormal_exit_never_retains_stderr_or_paths(monkeypatch, tmp_path):
+    sentinel = 'SENTINEL_PATH=/private/secret native loader detail'
+    snippet = f"import sys; sys.stderr.write({sentinel!r}); raise SystemExit(17)"
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+    payload = desktop_runtime_setup._probe_result_payload(probe)
+
+    assert payload['probe_error_code'] == 'probe_process_abnormal_exit'
+    assert payload['child_exit_code'] == 17
+    assert sentinel not in json.dumps(payload)
+
+
 def _pid_is_alive(pid: int) -> bool:
     try:
         process = psutil.Process(pid)
@@ -4097,7 +4126,7 @@ def test_exact_packaged_probe_ignores_hostile_dependency_targets(monkeypatch, tm
 
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', fake_popen)
     probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=resources)
-    assert probe.error == 'desktop_runtime_probe_start_failed:RuntimeError'
+    assert probe.error == 'probe_process_abnormal_exit'
     env = called['popen_env']
     assert env['PYTHONNOUSERSITE'] == '1'
     assert str(hostile) not in env.get('PYTHONPATH', '')

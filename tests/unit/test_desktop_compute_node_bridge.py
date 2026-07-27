@@ -2103,7 +2103,7 @@ def test_main_operator_preflight_normalizes_context_before_runtime_validation(ca
     assert json.loads(capsys.readouterr().out)['context_tier'] == '8k-fast'
 
 
-def test_main_operator_preflight_rejects_failed_runtime_contract(monkeypatch):
+def test_main_operator_preflight_emits_bounded_failed_runtime_contract(capsys, monkeypatch):
     monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
     monkeypatch.setattr(
         compute_node_bridge,
@@ -2121,8 +2121,11 @@ def test_main_operator_preflight_rejects_failed_runtime_contract(monkeypatch):
     )
     monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight'])
 
-    with pytest.raises(RuntimeError, match='operator_preflight_runtime_validation_failed'):
-        compute_node_bridge.main()
+    assert compute_node_bridge.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['startup_result'] == 'runtime_validation_failed'
+    assert payload['probe_error_code'] == 'cuda_capability_missing'
+    assert 'fallback_reason' not in payload
 
 
 @pytest.mark.parametrize(
@@ -2133,13 +2136,31 @@ def test_main_operator_preflight_rejects_failed_runtime_contract(monkeypatch):
         ('gpu', {'runtime_action': 'probe_only', 'selected_backend': 'cuda'}),
     ],
 )
-def test_main_operator_preflight_rejects_non_native_success(mode, runtime, monkeypatch):
+def test_main_operator_preflight_rejects_non_native_success(mode, runtime, capsys, monkeypatch):
     monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
     monkeypatch.setattr(compute_node_bridge, '_ensure_desktop_llama_runtime_for_context', lambda _mode, _tier: runtime)
     monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight', '--mode', mode])
 
-    with pytest.raises(RuntimeError, match='operator_preflight_runtime_validation_failed'):
-        compute_node_bridge.main()
+    assert compute_node_bridge.main() == 1
+    assert json.loads(capsys.readouterr().out)['startup_result'] == 'runtime_validation_failed'
+
+
+@pytest.mark.parametrize(
+    ('exception', 'code'),
+    [(ImportError('SENTINEL /private/import'), 'native_llama_import_failed'),
+     (OSError('SENTINEL C:\\secret\\PATH.dll'), 'native_dll_load_failed')],
+)
+def test_main_operator_preflight_classifies_exception_without_leaking_details(exception, code, capsys, monkeypatch):
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(compute_node_bridge, '_ensure_desktop_llama_runtime_for_context', lambda *_args: (_ for _ in ()).throw(exception))
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight'])
+
+    assert compute_node_bridge.main() == 1
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload['probe_error_code'] == code
+    assert payload['exception_type'] == type(exception).__name__
+    assert 'SENTINEL' not in output and 'secret' not in output and 'PATH.dll' not in output
 
 
 @pytest.mark.parametrize(

@@ -51,6 +51,7 @@ pub struct ComputeNodeRequest {
 const DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
 const OPERATOR_PREFLIGHT_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 const OPERATOR_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(3);
+const OPERATOR_PREFLIGHT_EVENT_MAX_BYTES: usize = 2048;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComputeNodeStatus {
@@ -2073,6 +2074,92 @@ fn validate_production_operator_preflight_event(event: Value) -> anyhow::Result<
     Ok(event)
 }
 
+fn validate_production_operator_preflight_failure_event(event: &Value) -> anyhow::Result<String> {
+    const KEYS: [&str; 15] = [
+        "type",
+        "startup_result",
+        "probe_stage",
+        "probe_error_code",
+        "exception_type",
+        "child_exit_code",
+        "detected_architecture",
+        "architecture_source",
+        "import_root_valid",
+        "provisioning_actions",
+        "repair_actions",
+        "pip_actions",
+        "compiler_actions",
+        "network_actions",
+        "download_actions",
+    ];
+    let object = event
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("operator_preflight_invalid_failure_event"))?;
+    if object.len() != KEYS.len() || !object.keys().all(|key| KEYS.contains(&key.as_str())) {
+        anyhow::bail!("operator_preflight_invalid_failure_event");
+    }
+    let stage = event["probe_stage"].as_str().filter(|value| {
+        matches!(
+            *value,
+            "environment_contract" | "native_import" | "runtime_validation" | "probe_process"
+        )
+    });
+    let code = event["probe_error_code"].as_str().filter(|value| {
+        matches!(
+            *value,
+            "missing_environment_contract"
+                | "native_llama_import_failed"
+                | "native_dll_load_failed"
+                | "runtime_version_or_provenance_invalid"
+                | "cuda_capability_missing"
+                | "physical_device_missing"
+                | "yarn_rope_capability_incomplete"
+                | "unsupported_platform"
+                | "probe_timeout"
+                | "probe_process_abnormal_exit"
+        )
+    });
+    let exception = event["exception_type"].as_str().filter(|value| {
+        matches!(
+            *value,
+            "none"
+                | "ImportError"
+                | "ModuleNotFoundError"
+                | "OSError"
+                | "RuntimeError"
+                | "TimeoutExpired"
+        )
+    });
+    let architecture = event["detected_architecture"]
+        .as_str()
+        .filter(|value| matches!(*value, "x86_64" | "arm64" | "aarch64" | "unknown"));
+    let source = event["architecture_source"]
+        .as_str()
+        .filter(|value| matches!(*value, "platform" | "attested_windows_x86_64" | "unknown"));
+    let child_exit_valid =
+        event["child_exit_code"].is_null() || event["child_exit_code"].as_i64().is_some();
+    let counters_zero = KEYS[9..].iter().all(|key| event[*key].as_i64() == Some(0));
+    if event["type"] != "status"
+        || event["startup_result"] != "runtime_validation_failed"
+        || stage.is_none()
+        || code.is_none()
+        || exception.is_none()
+        || architecture.is_none()
+        || source.is_none()
+        || event["import_root_valid"].as_bool().is_none()
+        || !child_exit_valid
+        || !counters_zero
+    {
+        anyhow::bail!("operator_preflight_invalid_failure_event");
+    }
+    Ok(format!(
+        "operator_preflight_runtime_validation_failed:probe_stage={};probe_error_code={};exception_type={};child_exit_code={};detected_architecture={};architecture_source={};import_root_valid={}",
+        stage.unwrap(), code.unwrap(), exception.unwrap(),
+        event["child_exit_code"].as_i64().map(|value| value.to_string()).unwrap_or_else(|| "null".into()),
+        architecture.unwrap(), source.unwrap(), event["import_root_valid"].as_bool().unwrap()
+    ))
+}
+
 async fn run_production_operator_preflight_child(
     mut command: Command,
     event_timeout: Duration,
@@ -2094,8 +2181,17 @@ async fn run_production_operator_preflight_child(
             .map_err(|_| anyhow::anyhow!("operator_preflight_event_timeout"))?
             .map_err(|_| anyhow::anyhow!("operator_preflight_event_read_failed"))?
             .ok_or_else(|| anyhow::anyhow!("operator_preflight_event_missing"))?;
+        if line.len() > OPERATOR_PREFLIGHT_EVENT_MAX_BYTES {
+            anyhow::bail!("operator_preflight_invalid_failure_event");
+        }
         let event = parse_compute_node_event_line(&line)
             .map_err(|_| anyhow::anyhow!("operator_preflight_event_parse_failed"))?;
+        if event.get("startup_result").and_then(Value::as_str) == Some("runtime_validation_failed")
+        {
+            return Err(anyhow::anyhow!(
+                validate_production_operator_preflight_failure_event(&event)?
+            ));
+        }
         validate_production_operator_preflight_event(event)
     }
     .await;
@@ -3975,6 +4071,7 @@ mod tests {
     }
 
     const PRODUCTION_PREFLIGHT_VALIDATED_EVENT: &str = r#"{"type":"status","production_runtime_preflight":true,"startup_result":"runtime_validated","requested_mode":"auto","selected_backend":"cuda","runtime_action":"already_supported","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
+    const PRODUCTION_PREFLIGHT_FAILURE_EVENT: &str = r#"{"type":"status","startup_result":"runtime_validation_failed","probe_stage":"native_import","probe_error_code":"native_dll_load_failed","exception_type":"OSError","child_exit_code":101,"detected_architecture":"x86_64","architecture_source":"attested_windows_x86_64","import_root_valid":true,"provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
 
     fn operator_preflight_test_command(output: Option<&str>, wedge: bool) -> Command {
         #[cfg(unix)]
@@ -4017,6 +4114,69 @@ mod tests {
         assert_eq!(event["type"], "status");
         assert_eq!(event["production_runtime_preflight"], true);
         assert_eq!(event["network_actions"], 0);
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_reports_valid_bounded_failure_event() {
+        let error = run_production_operator_preflight_child(
+            operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_FAILURE_EVENT), false),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("bounded failure must be transported");
+        assert_eq!(error.to_string(), "operator_preflight_runtime_validation_failed:probe_stage=native_import;probe_error_code=native_dll_load_failed;exception_type=OSError;child_exit_code=101;detected_architecture=x86_64;architecture_source=attested_windows_x86_64;import_root_valid=true");
+        assert!(!error
+            .to_string()
+            .contains("operator_preflight_event_missing"));
+    }
+
+    #[test]
+    fn operator_preflight_rejects_malformed_unknown_and_unallowlisted_failure_events() {
+        let valid: Value = serde_json::from_str(PRODUCTION_PREFLIGHT_FAILURE_EVENT).unwrap();
+        for mutation in [
+            (
+                "probe_stage",
+                Value::String("free-form detail /secret".into()),
+            ),
+            ("probe_error_code", Value::String("unknown_code".into())),
+            ("exception_type", Value::String("SecretException".into())),
+            ("import_root_valid", Value::String("true".into())),
+        ] {
+            let mut event = valid.clone();
+            event[mutation.0] = mutation.1;
+            assert_eq!(
+                validate_production_operator_preflight_failure_event(&event)
+                    .unwrap_err()
+                    .to_string(),
+                "operator_preflight_invalid_failure_event"
+            );
+        }
+        let mut unknown = valid;
+        unknown["detail"] = Value::String("SENTINEL /secret".into());
+        assert_eq!(
+            validate_production_operator_preflight_failure_event(&unknown)
+                .unwrap_err()
+                .to_string(),
+            "operator_preflight_invalid_failure_event"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_rejects_oversized_failure_event() {
+        let output = format!(
+            "{{\"startup_result\":\"runtime_validation_failed\",\"detail\":\"{}\"}}",
+            "x".repeat(OPERATOR_PREFLIGHT_EVENT_MAX_BYTES)
+        );
+        let error = run_production_operator_preflight_child(
+            operator_preflight_test_command(Some(&output), false),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "operator_preflight_invalid_failure_event"
+        );
     }
 
     #[test]

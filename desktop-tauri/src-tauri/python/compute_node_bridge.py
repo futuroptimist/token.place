@@ -3033,21 +3033,51 @@ def main() -> int:
     if args.operator_runtime_preflight:
         # Release acceptance must execute the immutable runtime checks; it may
         # not substitute a fabricated worker-ready event for native import.
-        dependency = ensure_desktop_python_dependencies()
-        if dependency.get("ok") != "true":
-            raise RuntimeError("operator_preflight_dependency_check_failed")
-        args.mode = _normalize_compute_mode_local(args.mode)
-        _, normalize_context_tier = _load_context_profile_helpers()
-        context_tier = normalize_context_tier(args.context_tier)
-        runtime = _ensure_desktop_llama_runtime_for_context(args.mode, context_tier)
-        selected_backend = runtime.get("selected_backend")
-        runtime_action = runtime.get("runtime_action")
-        native_runtime_success = (selected_backend, runtime_action) in {
-            ("cuda", "already_supported"),
-            ("metal", "metal_already_supported"),
-        }
-        if args.mode not in {"auto", "gpu", "hybrid"} or not native_runtime_success:
-            raise RuntimeError("operator_preflight_runtime_validation_failed")
+        def emit_failure(runtime: Optional[Dict[str, Any]], code: str, stage: str, exc: Optional[BaseException] = None) -> int:
+            runtime = runtime or {}
+            exception_type = type(exc).__name__ if exc is not None else str(runtime.get("exception_type", "none"))
+            if exception_type not in {"none", "ImportError", "ModuleNotFoundError", "OSError", "RuntimeError", "TimeoutExpired"}:
+                exception_type = "RuntimeError"
+            event = {
+                "type": "status", "startup_result": "runtime_validation_failed",
+                "probe_stage": stage, "probe_error_code": code,
+                "exception_type": exception_type,
+                "child_exit_code": runtime.get("child_exit_code") if isinstance(runtime.get("child_exit_code"), int) and not isinstance(runtime.get("child_exit_code"), bool) else None,
+                "detected_architecture": runtime.get("detected_architecture") if runtime.get("detected_architecture") in {"x86_64", "arm64", "aarch64", "unknown"} else "unknown",
+                "architecture_source": runtime.get("architecture_source") if runtime.get("architecture_source") in {"platform", "attested_windows_x86_64", "unknown"} else "unknown",
+                "import_root_valid": runtime.get("import_root_valid") is True,
+                "provisioning_actions": 0, "repair_actions": 0, "pip_actions": 0,
+                "compiler_actions": 0, "network_actions": 0, "download_actions": 0,
+            }
+            print(json.dumps(event, sort_keys=True, separators=(",", ":")), flush=True)
+            return 1
+
+        try:
+            dependency = ensure_desktop_python_dependencies()
+            if dependency.get("ok") != "true":
+                return emit_failure(dependency, "missing_environment_contract", "environment_contract")
+            args.mode = _normalize_compute_mode_local(args.mode)
+            _, normalize_context_tier = _load_context_profile_helpers()
+            context_tier = normalize_context_tier(args.context_tier)
+            runtime = _ensure_desktop_llama_runtime_for_context(args.mode, context_tier)
+            selected_backend = runtime.get("selected_backend")
+            runtime_action = runtime.get("runtime_action")
+            native_runtime_success = (selected_backend, runtime_action) in {
+                ("cuda", "already_supported"),
+                ("metal", "metal_already_supported"),
+            }
+            if args.mode not in {"auto", "gpu", "hybrid"} or not native_runtime_success:
+                code = runtime.get("probe_error_code")
+                if code not in {
+                    "missing_environment_contract", "native_llama_import_failed", "native_dll_load_failed",
+                    "runtime_version_or_provenance_invalid", "cuda_capability_missing", "physical_device_missing",
+                    "yarn_rope_capability_incomplete", "unsupported_platform", "probe_timeout", "probe_process_abnormal_exit",
+                }:
+                    code = "cuda_capability_missing" if selected_backend != "cuda" else "physical_device_missing"
+                return emit_failure(runtime, code, str(runtime.get("probe_stage") or "runtime_validation"))
+        except Exception as exc:
+            code = "native_dll_load_failed" if isinstance(exc, OSError) else "native_llama_import_failed"
+            return emit_failure(None, code, "native_import", exc)
         print(json.dumps({
             "type": "status",
             "startup_result": "runtime_validated",

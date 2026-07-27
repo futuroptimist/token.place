@@ -5,6 +5,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from flask import Flask, request as flask_request
 
 from api import (
@@ -252,6 +253,73 @@ def test_kubernetes_probe_cadence_cannot_exhaust_healthz_quota():
         ]
 
     assert {response.status_code for response in responses} == {200}
+
+
+@pytest.mark.parametrize("path", ["/", "/api/v1/meta", "/api/v1/version"])
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "2/hour", "API_DAILY_QUOTA": "2/day"},
+    clear=True,
+)
+def test_public_information_gets_are_exempt_without_consuming_user_quota(path):
+    """Presentation probes stay available and leave both public budgets unused."""
+    app = Flask(__name__)
+    init_app(app)
+    app.add_url_rule(path, f"public-get-{path}", lambda: {"status": "ok"})
+
+    with app.test_client() as client:
+        public_responses = [client.get(path) for _ in range(3)]
+        user_responses = [client.get("/api/v1/models") for _ in range(3)]
+
+    assert [response.status_code for response in public_responses] == [200, 200, 200]
+    assert [response.status_code for response in user_responses] == [200, 200, 429]
+    assert user_responses[-1].get_json()["error"]["code"] == "rate_limit_exceeded"
+
+
+@pytest.mark.parametrize("path", ["/", "/api/v1/meta", "/api/v1/version"])
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1/hour", "API_DAILY_QUOTA": "1/day"},
+    clear=True,
+)
+def test_public_information_heads_are_exempt(path):
+    """HEAD presentation probes remain available after ordinary quota exhaustion."""
+    app = Flask(__name__)
+    init_app(app)
+    app.add_url_rule(path, f"public-head-{path}", lambda: {"status": "ok"})
+
+    with app.test_client() as client:
+        assert client.get("/api/v1/models").status_code == 200
+        assert client.get("/api/v1/models").status_code == 429
+        responses = [client.head(path) for _ in range(3)]
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+
+
+@pytest.mark.parametrize("path", ["/", "/api/v1/meta", "/api/v1/version"])
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1/hour", "API_DAILY_QUOTA": "1/day"},
+    clear=True,
+)
+def test_public_information_non_read_methods_are_not_exempt(path):
+    """Exact public paths must not exempt current or future mutation methods."""
+    app = Flask(__name__)
+    init_app(app)
+    app.add_url_rule(
+        path,
+        f"public-post-{path}",
+        lambda: {"status": "ok"},
+        methods=["POST"],
+    )
+
+    with app.test_client() as client:
+        first_response = client.post(path)
+        limited_response = client.post(path)
+
+    assert first_response.status_code == 200
+    assert limited_response.status_code == 429
+    assert limited_response.get_json()["error"]["code"] == "rate_limit_exceeded"
 
 
 @patch.dict(

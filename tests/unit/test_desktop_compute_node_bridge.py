@@ -2167,10 +2167,62 @@ def test_main_operator_preflight_rejects_non_native_success(mode, runtime, capsy
 
 
 @pytest.mark.parametrize(
+    ('exception', 'expected'),
+    [
+        (
+            RuntimeError(
+                "Failed to load shared library 'SENTINEL_lib.dll': "
+                "[WinError 126] The specified module could not be found."
+            ),
+            True,
+        ),
+        (
+            RuntimeError(
+                "Failed to load shared library 'SENTINEL_lib.dll': "
+                "[WinError 127] The specified procedure could not be found."
+            ),
+            True,
+        ),
+        (
+            RuntimeError(
+                "Failed to load shared library 'SENTINEL_lib.dll': "
+                "[WinError 193] %1 is not a valid Win32 application."
+            ),
+            True,
+        ),
+        (RuntimeError('SENTINEL native init boom'), False),
+        (
+            RuntimeError("Failed to load shared library 'SENTINEL_lib.dll': unexpected native failure"),
+            False,
+        ),
+        (
+            RuntimeError(
+                '[WinError 126] The specified module could not be found. SENTINEL, no wrapper prefix'
+            ),
+            False,
+        ),
+        (ImportError('SENTINEL /private/import'), False),
+        (ImportError('DLL load failed while importing _llama: SENTINEL C:\\secret\\native.dll'), True),
+        (OSError('SENTINEL C:\\secret\\PATH.dll'), True),
+    ],
+)
+def test_is_windows_dll_loader_error_recognizes_pinned_runtime_error_wrapper(exception, expected):
+    assert compute_node_bridge._is_windows_dll_loader_error(exception) is expected
+
+
+@pytest.mark.parametrize(
     ('exception', 'code'),
     [(ImportError('SENTINEL /private/import'), 'native_llama_import_failed'),
      (ImportError('DLL load failed while importing _llama: SENTINEL C:\\secret\\native.dll'), 'native_dll_load_failed'),
-     (OSError('SENTINEL C:\\secret\\PATH.dll'), 'native_dll_load_failed')],
+     (OSError('SENTINEL C:\\secret\\PATH.dll'), 'native_dll_load_failed'),
+     (
+         RuntimeError(
+             "Failed to load shared library 'SENTINEL_lib.dll': "
+             "[WinError 126] The specified module could not be found."
+         ),
+         'native_dll_load_failed',
+     ),
+     (RuntimeError('SENTINEL native init boom'), 'native_llama_import_failed')],
 )
 def test_main_operator_preflight_classifies_exception_without_leaking_details(exception, code, capsys, monkeypatch):
     monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})

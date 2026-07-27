@@ -505,10 +505,19 @@ except Exception as exc:
     exception_type = type(exc).__name__
     if exception_type not in {"ImportError", "ModuleNotFoundError", "OSError", "RuntimeError"}:
         exception_type = "RuntimeError"
-    loader_markers = ("dll load failed", "dynamic link library", "specified module could not be found")
+    loader_markers = (
+        "dll load failed", "dynamic link library", "specified module could not be found",
+        "specified procedure could not be found", "not a valid win32 application",
+        "winerror 126", "winerror 127", "winerror 193",
+    )
+    exc_text_lower = str(exc).lower()
     safe_loader_failure = isinstance(exc, OSError) or (
         isinstance(exc, ImportError)
-        and any(marker in str(exc).lower() for marker in loader_markers)
+        and any(marker in exc_text_lower for marker in loader_markers)
+    ) or (
+        isinstance(exc, RuntimeError)
+        and "failed to load shared library" in exc_text_lower
+        and any(marker in exc_text_lower for marker in loader_markers)
     )
     error_code = "native_dll_load_failed" if safe_loader_failure else "native_llama_import_failed"
     payload = {

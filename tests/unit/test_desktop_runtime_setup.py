@@ -3203,6 +3203,98 @@ print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({
     assert probe.error is None
 
 
+def _extract_probe_native_import_handler():
+    """Return the exact production except-block that classifies native import failures."""
+
+    marker = 'except Exception as exc:'
+    snippet = desktop_runtime_setup._PROBE_SNIPPET
+    index = snippet.index(marker)
+    return snippet[index:]
+
+
+def _native_import_classification_snippet(exception_source):
+    handler = _extract_probe_native_import_handler()
+    return (
+        "import json\nimport os\nimport sys\n\n"
+        "def _packaged_import_root_valid():\n"
+        "    return False\n\n"
+        "dependency_target = ''\n\n"
+        "try:\n"
+        f"    raise {exception_source}\n"
+        f"{handler}"
+    )
+
+
+@pytest.mark.parametrize(
+    ('exception_source', 'expected_code', 'expected_exception_type'),
+    [
+        (
+            "RuntimeError(\"Failed to load shared library 'SENTINEL_lib.dll': "
+            "[WinError 126] The specified module could not be found.\")",
+            'native_dll_load_failed',
+            'RuntimeError',
+        ),
+        (
+            "RuntimeError(\"Failed to load shared library 'SENTINEL_lib.dll': "
+            "[WinError 127] The specified procedure could not be found.\")",
+            'native_dll_load_failed',
+            'RuntimeError',
+        ),
+        (
+            "RuntimeError(\"Failed to load shared library 'SENTINEL_lib.dll': "
+            "[WinError 193] %1 is not a valid Win32 application.\")",
+            'native_dll_load_failed',
+            'RuntimeError',
+        ),
+        (
+            "RuntimeError('SENTINEL native init boom')",
+            'native_llama_import_failed',
+            'RuntimeError',
+        ),
+        (
+            "RuntimeError(\"Failed to load shared library 'SENTINEL_lib.dll': unexpected native failure\")",
+            'native_llama_import_failed',
+            'RuntimeError',
+        ),
+        (
+            "RuntimeError('[WinError 126] The specified module could not be found. SENTINEL, no wrapper')",
+            'native_llama_import_failed',
+            'RuntimeError',
+        ),
+        ("ImportError('SENTINEL /private/import')", 'native_llama_import_failed', 'ImportError'),
+        (
+            "ImportError('DLL load failed while importing _llama: SENTINEL')",
+            'native_dll_load_failed',
+            'ImportError',
+        ),
+        ("OSError('SENTINEL C:/secret/PATH.dll')", 'native_dll_load_failed', 'OSError'),
+    ],
+)
+def test_probe_snippet_classifies_native_import_failures(
+    monkeypatch, tmp_path, exception_source, expected_code, expected_exception_type,
+):
+    """Exercise the real production classification block (verbatim) via subprocess."""
+
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_PROBE_SNIPPET',
+        _native_import_classification_snippet(exception_source),
+    )
+
+    probe = desktop_runtime_setup._probe_llama_runtime(
+        runtime_root=tmp_path,
+        cancellation_predicate=lambda: False,
+        heartbeat=lambda _extra: None,
+    )
+
+    assert probe.probe_error_code == expected_code
+    assert probe.probe_stage == 'native_import'
+    assert probe.exception_type == expected_exception_type
+    assert probe.error == expected_code
+    assert 'SENTINEL' not in probe.interpreter
+    assert 'SENTINEL' not in probe.llama_module_path
+
+
 @pytest.mark.parametrize(
     ('exception_type', 'error_code'),
     [('ImportError', 'native_llama_import_failed'), ('OSError', 'native_dll_load_failed')],

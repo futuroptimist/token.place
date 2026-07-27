@@ -26,12 +26,19 @@ def _is_windows_dll_loader_error(exc: BaseException) -> bool:
 
     if isinstance(exc, OSError):
         return True
-    if not isinstance(exc, ImportError):
-        return False
-    if getattr(exc, "winerror", None) in {126, 127, 193}:
-        return True
-    markers = ("dll load failed", "dynamic link library", "specified module could not be found")
-    return any(marker in str(exc).lower() for marker in markers)
+    markers = (
+        "dll load failed", "dynamic link library", "specified module could not be found",
+        "specified procedure could not be found", "not a valid win32 application",
+        "winerror 126", "winerror 127", "winerror 193",
+    )
+    if isinstance(exc, ImportError):
+        if getattr(exc, "winerror", None) in {126, 127, 193}:
+            return True
+        return any(marker in str(exc).lower() for marker in markers)
+    if isinstance(exc, RuntimeError):
+        text = str(exc).lower()
+        return "failed to load shared library" in text and any(marker in text for marker in markers)
+    return False
 
 if __package__ in (None, ""):
     # Use os.path here so a polluted PYTHONPATH cannot make a third-party

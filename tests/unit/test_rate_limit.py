@@ -284,6 +284,72 @@ def test_operational_routes_are_exempt_from_public_rate_limit():
 
 @patch.dict(
     os.environ,
+    {"API_RATE_LIMIT": "2/hour", "API_DAILY_QUOTA": "2/day"},
+    clear=True,
+)
+def test_public_information_reads_are_exempt_without_consuming_user_quota():
+    """Public UI and release metadata reads should leave user quota untouched."""
+    app = Flask(__name__)
+    init_app(app)
+
+    for path in ("/", "/api/v1/meta", "/api/v1/version"):
+        app.add_url_rule(
+            path,
+            endpoint=f"public-information-{path}",
+            view_func=lambda: {"status": "ok"},
+            methods=["GET", "HEAD", "POST"],
+        )
+
+    @app.get("/api/v1/models")
+    def models():
+        return {"data": []}
+
+    with app.test_client() as client:
+        for path in ("/", "/api/v1/meta", "/api/v1/version"):
+            assert [client.get(path).status_code for _ in range(3)] == [200, 200, 200]
+            assert [client.head(path).status_code for _ in range(3)] == [200, 200, 200]
+
+        assert [client.get("/api/v1/models").status_code for _ in range(3)] == [
+            200,
+            200,
+            429,
+        ]
+
+    body = client.get("/api/v1/models").get_json()
+    assert body["error"]["type"] == "rate_limit_error"
+    assert body["error"]["code"] == "rate_limit_exceeded"
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1/hour", "API_DAILY_QUOTA": "1/day"},
+    clear=True,
+)
+def test_public_information_non_read_methods_remain_rate_limited():
+    """Mutation methods on public-information paths must retain user limits."""
+    app = Flask(__name__)
+    init_app(app)
+
+    for path in ("/", "/api/v1/meta", "/api/v1/version"):
+        app.add_url_rule(
+            path,
+            endpoint=f"public-information-mutation-{path}",
+            view_func=lambda: {"status": "ok"},
+            methods=["POST"],
+        )
+
+    with app.test_client() as client:
+        for index, path in enumerate(("/", "/api/v1/meta", "/api/v1/version")):
+            request_options = {"environ_base": {"REMOTE_ADDR": f"192.0.2.{index + 1}"}}
+            first = client.post(path, **request_options)
+            limited = client.post(path, **request_options)
+            assert first.status_code == 200
+            assert limited.status_code == 429
+            assert limited.get_json()["error"]["code"] == "rate_limit_exceeded"
+
+
+@patch.dict(
+    os.environ,
     {
         "API_RATE_LIMIT": "60/hour",
         "API_DAILY_QUOTA": "1000/day",

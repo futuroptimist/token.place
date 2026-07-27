@@ -156,6 +156,16 @@ RATE_LIMIT_EXEMPT_PATHS = frozenset(
     }
 )
 
+# Public presentation and release metadata are safe read-only information and
+# must not consume the user-facing API quota used to protect inference traffic.
+PUBLIC_INFORMATION_RATE_LIMIT_EXEMPT_PATHS = frozenset(
+    {
+        "/",
+        "/api/v1/meta",
+        "/api/v1/version",
+    }
+)
+
 # API v1 relay client read/poll routes should not consume the public user quota.
 # They do not mutate relay-owned state and are used by clients while waiting for
 # an encrypted response envelope or discovering a compute node.
@@ -249,6 +259,11 @@ def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
 
     normalized_path = _normalized_path(path)
     if normalized_path in RATE_LIMIT_EXEMPT_PATHS:
+        return True
+    if (
+        request.method in {"GET", "HEAD"}
+        and normalized_path in PUBLIC_INFORMATION_RATE_LIMIT_EXEMPT_PATHS
+    ):
         return True
     if request.method == "OPTIONS" and _is_public_api_v1_cors_path(normalized_path):
         return True

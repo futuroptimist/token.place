@@ -3429,6 +3429,54 @@ def test_packaged_import_root_validation_rejects_unverified_roots(monkeypatch, t
     assert desktop_runtime_setup._packaged_import_root_valid(runtime_root=expected) is False
 
 
+def test_packaged_import_root_validation_fails_closed_on_resolution_error(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(tmp_path))
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_safe_resolve_path',
+        lambda _path: (_ for _ in ()).throw(OSError('SENTINEL private path')),
+    )
+
+    assert desktop_runtime_setup._packaged_import_root_valid(runtime_root=tmp_path) is False
+
+
+def test_probe_failure_ignores_invalid_packaged_arch_attestation(monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_PACKAGED_ARCH', 'arm64')
+    monkeypatch.setenv('TOKEN_PLACE_PACKAGED_ARCH_SOURCE', 'untrusted')
+
+    probe = desktop_runtime_setup._probe_failure(
+        error='missing_environment_contract',
+        dependency_target_text='bundled',
+        pip_version='bundled-runtime-probe',
+    )
+
+    assert probe.detected_architecture == 'unknown'
+    assert probe.architecture_source == 'unknown'
+
+
+def test_probe_diagnostic_validation_rejects_missing_and_invalid_fields():
+    assert desktop_runtime_setup._validated_probe_diagnostic({}) is None
+    assert desktop_runtime_setup._validated_probe_diagnostic({
+        'probe_stage': 'native_import',
+        'probe_error_code': 'native_llama_import_failed',
+        'exception_type': 'SENTINEL',
+        'child_exit_code': None,
+        'detected_architecture': 'unknown',
+        'architecture_source': 'unknown',
+        'import_root_valid': False,
+    }) is None
+
+
+def test_desktop_arch_accepts_only_complete_packaged_attestation(monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_PACKAGED_ARCH', 'x86_64')
+    monkeypatch.setenv('TOKEN_PLACE_PACKAGED_ARCH_SOURCE', 'attested_windows_x86_64')
+    assert desktop_runtime_setup._desktop_arch() == 'x86_64'
+
+    monkeypatch.setenv('TOKEN_PLACE_PACKAGED_ARCH_SOURCE', 'platform')
+    with pytest.raises(RuntimeError, match='packaged_runtime_architecture_attestation_invalid'):
+        desktop_runtime_setup._desktop_arch()
+
+
 def test_probe_abnormal_exit_never_retains_stderr_or_paths(monkeypatch, tmp_path):
     sentinel = 'SENTINEL_PATH=/private/secret native loader detail'
     snippet = f"import sys; sys.stderr.write({sentinel!r}); raise SystemExit(17)"

@@ -2210,6 +2210,43 @@ def test_is_windows_dll_loader_error_recognizes_pinned_runtime_error_wrapper(exc
     assert compute_node_bridge._is_windows_dll_loader_error(exception) is expected
 
 
+def test_is_windows_dll_loader_error_uses_import_error_winerror_and_rejects_other_types():
+    loader_error = ImportError('SENTINEL detail')
+    loader_error.winerror = 126
+
+    assert compute_node_bridge._is_windows_dll_loader_error(loader_error) is True
+    assert compute_node_bridge._is_windows_dll_loader_error(ValueError('SENTINEL detail')) is False
+
+
+def test_main_operator_preflight_reports_dependency_contract_failure(capsys, monkeypatch):
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda: {'ok': 'false'},
+    )
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight'])
+
+    assert compute_node_bridge.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['probe_stage'] == 'environment_contract'
+    assert payload['probe_error_code'] == 'missing_environment_contract'
+
+
+def test_main_operator_preflight_normalizes_unallowlisted_exception_type(capsys, monkeypatch):
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda: (_ for _ in ()).throw(ValueError('SENTINEL detail')),
+    )
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight'])
+
+    assert compute_node_bridge.main() == 1
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload['exception_type'] == 'RuntimeError'
+    assert 'SENTINEL' not in output
+
+
 @pytest.mark.parametrize(
     ('exception', 'code'),
     [(ImportError('SENTINEL /private/import'), 'native_llama_import_failed'),

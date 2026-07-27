@@ -174,18 +174,51 @@ impl std::fmt::Display for PythonLauncherError {
 }
 impl std::error::Error for PythonLauncherError {}
 
-fn expected_runtime_arch() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "AMD64"
-    } else if cfg!(target_os = "macos") {
-        "arm64"
-    } else if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        "arm64"
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeArchitectureDecision {
+    expected_machine: &'static str,
+    windows_attestation: Option<(&'static str, &'static str, &'static str)>,
+}
+
+fn runtime_architecture_decision(
+    target_os: &str,
+    target_arch: &str,
+) -> Result<RuntimeArchitectureDecision, PythonLauncherCategory> {
+    if target_os == "windows" {
+        if target_arch != "x86_64" {
+            return Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture);
+        }
+        Ok(RuntimeArchitectureDecision {
+            expected_machine: "AMD64",
+            windows_attestation: Some(("AMD64", "x86_64", "attested_windows_x86_64")),
+        })
+    } else if target_os == "macos" {
+        Ok(RuntimeArchitectureDecision {
+            expected_machine: "arm64",
+            windows_attestation: None,
+        })
+    } else if target_arch == "x86_64" {
+        Ok(RuntimeArchitectureDecision {
+            expected_machine: "x86_64",
+            windows_attestation: None,
+        })
+    } else if target_arch == "aarch64" {
+        Ok(RuntimeArchitectureDecision {
+            expected_machine: "arm64",
+            windows_attestation: None,
+        })
     } else {
-        "unknown"
+        Ok(RuntimeArchitectureDecision {
+            expected_machine: "unknown",
+            windows_attestation: None,
+        })
     }
+}
+
+fn expected_runtime_arch() -> &'static str {
+    runtime_architecture_decision(std::env::consts::OS, std::env::consts::ARCH)
+        .map(|decision| decision.expected_machine)
+        .unwrap_or("unsupported")
 }
 
 fn bundled_runtime_id() -> &'static str {
@@ -775,6 +808,16 @@ fn validate_bundled_runtime_candidate(
     candidate: PythonLauncher,
     packaged: bool,
 ) -> Result<PythonLauncher, PythonLauncherError> {
+    let architecture = runtime_architecture_decision(std::env::consts::OS, std::env::consts::ARCH)
+        .map_err(|category| {
+            launcher_error(
+                DESKTOP_PYTHON_RUNTIME_INVALID,
+                category,
+                Some(&candidate),
+                packaged,
+                None,
+            )
+        })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -826,8 +869,8 @@ fn validate_bundled_runtime_candidate(
                         output_status_code(&output),
                     )
                 })?;
-            metadata_probe_is_valid(&stdout, &runtime_root, expected_runtime_arch()).map_err(
-                |category| {
+            metadata_probe_is_valid(&stdout, &runtime_root, architecture.expected_machine)
+                .map_err(|category| {
                     launcher_error(
                         DESKTOP_PYTHON_RUNTIME_INVALID,
                         category,
@@ -835,8 +878,7 @@ fn validate_bundled_runtime_candidate(
                         packaged,
                         output_status_code(&output),
                     )
-                },
-            )?;
+                })?;
             if cfg!(target_os = "windows") && !bundled_windows_provenance_is_valid(&runtime_root) {
                 return Err(launcher_error(
                     DESKTOP_PYTHON_RUNTIME_INVALID,
@@ -1254,6 +1296,23 @@ pub fn sanitize_packaged_python_subprocess_env<C>(
 where
     C: PythonEnvCommand,
 {
+    sanitize_packaged_python_subprocess_env_for_target(
+        command,
+        runtime_root,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+}
+
+fn sanitize_packaged_python_subprocess_env_for_target<C>(
+    command: &mut C,
+    runtime_root: Option<&Path>,
+    target_os: &str,
+    target_arch: &str,
+) -> Result<(), PackagedPythonEnvironmentError>
+where
+    C: PythonEnvCommand,
+{
     command.clear_env();
     for key in PACKAGED_ENV_FUNDAMENTALS {
         if let Some(value) = std::env::var_os(key) {
@@ -1289,7 +1348,11 @@ where
                 .map_err(|_| PackagedPythonEnvironmentError)?,
         );
     }
-    if cfg!(target_os = "windows") {
+    let architecture = runtime_architecture_decision(target_os, target_arch)
+        .map_err(|_| PackagedPythonEnvironmentError)?;
+    if let Some((processor_architecture, packaged_arch, attestation_source)) =
+        architecture.windows_attestation
+    {
         let system_root = std::env::var_os("SystemRoot")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
@@ -1302,12 +1365,9 @@ where
             .filter(|path| path.starts_with(&system_root) && path.is_dir())
             .ok_or(PackagedPythonEnvironmentError)?;
         trusted.push(system32);
-        command.set_env("PROCESSOR_ARCHITECTURE", "AMD64");
-        command.set_env("TOKEN_PLACE_PACKAGED_ARCH", "x86_64");
-        command.set_env(
-            "TOKEN_PLACE_PACKAGED_ARCH_SOURCE",
-            "attested_windows_x86_64",
-        );
+        command.set_env("PROCESSOR_ARCHITECTURE", processor_architecture);
+        command.set_env("TOKEN_PLACE_PACKAGED_ARCH", packaged_arch);
+        command.set_env("TOKEN_PLACE_PACKAGED_ARCH_SOURCE", attestation_source);
     }
     let mut unique = Vec::with_capacity(trusted.len());
     for entry in trusted {
@@ -1694,6 +1754,55 @@ mod tests {
 
         std::fs::write(&provenance, "{not-json").expect("write corrupt provenance");
         assert!(!bundled_windows_provenance_is_valid(runtime));
+    }
+
+    #[test]
+    fn windows_packaged_arch_x86_64_uses_compiled_target_attestation() {
+        let decision = runtime_architecture_decision("windows", "x86_64")
+            .expect("Windows x86_64 is supported");
+        assert_eq!(decision.expected_machine, "AMD64");
+        assert_eq!(
+            decision.windows_attestation,
+            Some(("AMD64", "x86_64", "attested_windows_x86_64"))
+        );
+    }
+
+    #[test]
+    fn windows_packaged_arch_rejects_unsupported_compiled_targets() {
+        for target_arch in ["aarch64", "x86", "unknown"] {
+            assert_eq!(
+                runtime_architecture_decision("windows", target_arch),
+                Err(PythonLauncherCategory::BundledRuntimeWrongArchitecture),
+                "Windows {target_arch} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_packaged_arch_rejection_never_records_x86_64_attestation() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime = temp.path().join("python-runtime");
+        std::fs::create_dir_all(&runtime).expect("runtime root");
+
+        for target_arch in ["aarch64", "x86", "unknown"] {
+            let mut command = PythonEnvCommandRecorder::with_poisoned_env();
+            assert_eq!(
+                sanitize_packaged_python_subprocess_env_for_target(
+                    &mut command,
+                    Some(&runtime),
+                    "windows",
+                    target_arch,
+                ),
+                Err(PackagedPythonEnvironmentError)
+            );
+            for key in [
+                "PROCESSOR_ARCHITECTURE",
+                "TOKEN_PLACE_PACKAGED_ARCH",
+                "TOKEN_PLACE_PACKAGED_ARCH_SOURCE",
+            ] {
+                assert_eq!(command.value(key), None, "{key} for {target_arch}");
+            }
+        }
     }
 
     #[test]

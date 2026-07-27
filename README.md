@@ -103,7 +103,7 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 
 | Variable        | Default      | Description                                                        |
 |-----------------|--------------|--------------------------------------------------------------------|
-| API_RATE_LIMIT  | 60/hour      | Per-IP rate limit for user-facing API requests; API v1 compute-node control-plane routes use separate budgets |
+| API_RATE_LIMIT  | 60/hour      | Per-IP rate limit for user-facing API requests; API v1 compute-node control-plane routes use separate budgets. Public UI and release-metadata `GET`/`HEAD` requests (`/`, `/api/v1/meta`, and `/api/v1/version`) do not consume this quota |
 | API_RELAY_CONTROL_PLANE_RATE_LIMIT | route default | Shared fallback for compute-node control-plane route budgets when a route-specific override is unset |
 | API_RELAY_CONTROL_PLANE_REGISTER_RATE_LIMIT | 240/hour | Per-server-public-key budget for authenticated compute-node register/lease refresh traffic |
 | API_RELAY_CONTROL_PLANE_UNREGISTER_RATE_LIMIT | 240/hour | Per-server-public-key budget for authenticated compute-node unregister/shutdown traffic |
@@ -114,7 +114,7 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | API_STREAM_RATE_LIMIT | 30/minute   | Per-IP rate limit applied only to streaming chat completions          |
 | SERVICE_NAME    | token.place  | Service identifier returned by health endpoints (whitespace-only overrides
 |                 |              | fall back to `token.place`)                                             |
-| API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota                                        |
+| API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota; the public UI and release-metadata `GET`/`HEAD` routes listed above do not consume it |
 | USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
 | TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |
 | CONTENT_MODERATION_MODE | disabled     | Set to `block` to enable request filtering before inference           |

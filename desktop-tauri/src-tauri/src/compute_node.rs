@@ -6698,7 +6698,15 @@ mod tests {
         let resource_root = exe_dir.join("resources");
         let python_dir = resource_root.join("python");
         std::fs::create_dir_all(&python_dir).expect("create python dir");
-        std::fs::create_dir_all(resource_root.join("python-runtime")).expect("create runtime dir");
+        let runtime_root = resource_root.join("python-runtime");
+        let interpreter = if cfg!(windows) {
+            runtime_root.join("python.exe")
+        } else {
+            runtime_root.join("bin").join("python3")
+        };
+        std::fs::create_dir_all(interpreter.parent().expect("interpreter parent"))
+            .expect("create runtime dir");
+        std::fs::write(&interpreter, "").expect("write interpreter");
         std::fs::create_dir_all(resource_root.join("utils")).expect("create import utils dir");
         std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
         std::fs::create_dir_all(&exe_dir).expect("create exe dir");
@@ -6707,7 +6715,7 @@ mod tests {
         let exe_path = exe_dir.join("token.place");
         std::fs::write(&exe_path, "").expect("write exe");
         let launcher = PythonLauncher {
-            program: "python3".into(),
+            program: interpreter.to_string_lossy().into_owned(),
             args: Vec::new(),
             source: PythonLauncherSource::BundledRuntime,
             runtime_id: "test-runtime".into(),
@@ -6721,7 +6729,7 @@ mod tests {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(launcher),
             resource_root: resource_root.clone(),
-            runtime_root: Some(resource_root.join("python-runtime")),
+            runtime_root: Some(runtime_root),
             import_root: resource_root.clone(),
             layout: ResourceLayoutKind::WindowsResources,
         };

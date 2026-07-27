@@ -2124,7 +2124,7 @@ def test_main_operator_preflight_emits_bounded_failed_runtime_contract(capsys, m
     assert compute_node_bridge.main() == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload['startup_result'] == 'runtime_validation_failed'
-    assert payload['probe_error_code'] == 'cuda_capability_missing'
+    assert payload['probe_error_code'] == 'probe_process_abnormal_exit'
     assert 'fallback_reason' not in payload
 
 
@@ -2169,6 +2169,7 @@ def test_main_operator_preflight_rejects_non_native_success(mode, runtime, capsy
 @pytest.mark.parametrize(
     ('exception', 'code'),
     [(ImportError('SENTINEL /private/import'), 'native_llama_import_failed'),
+     (ImportError('DLL load failed while importing _llama: SENTINEL C:\\secret\\native.dll'), 'native_dll_load_failed'),
      (OSError('SENTINEL C:\\secret\\PATH.dll'), 'native_dll_load_failed')],
 )
 def test_main_operator_preflight_classifies_exception_without_leaking_details(exception, code, capsys, monkeypatch):
@@ -2182,6 +2183,28 @@ def test_main_operator_preflight_classifies_exception_without_leaking_details(ex
     assert payload['probe_error_code'] == code
     assert payload['exception_type'] == type(exception).__name__
     assert 'SENTINEL' not in output and 'secret' not in output and 'PATH.dll' not in output
+
+
+def test_main_operator_preflight_preserves_structured_provenance_failure(capsys, monkeypatch):
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda *_args: {
+            'runtime_action': 'bundled_runtime_probe_failed',
+            'selected_backend': 'cpu',
+            'probe_stage': 'runtime_validation',
+            'probe_error_code': 'runtime_version_or_provenance_invalid',
+            'import_root_valid': False,
+        },
+    )
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight'])
+
+    assert compute_node_bridge.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['probe_error_code'] == 'runtime_version_or_provenance_invalid'
+    assert payload['import_root_valid'] is False
+    assert payload['probe_error_code'] != 'physical_device_missing'
 
 
 @pytest.mark.parametrize(

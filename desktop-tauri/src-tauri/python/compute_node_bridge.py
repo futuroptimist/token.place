@@ -20,6 +20,19 @@ import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
+
+def _is_windows_dll_loader_error(exc: BaseException) -> bool:
+    """Recognize common Windows loader failures without retaining their detail."""
+
+    if isinstance(exc, OSError):
+        return True
+    if not isinstance(exc, ImportError):
+        return False
+    if getattr(exc, "winerror", None) in {126, 127, 193}:
+        return True
+    markers = ("dll load failed", "dynamic link library", "specified module could not be found")
+    return any(marker in str(exc).lower() for marker in markers)
+
 if __package__ in (None, ""):
     # Use os.path here so a polluted PYTHONPATH cannot make a third-party
     # pathlib backport crash before path_bootstrap repairs sys.path.
@@ -3075,10 +3088,10 @@ def main() -> int:
                     "runtime_version_or_provenance_invalid", "cuda_capability_missing", "physical_device_missing",
                     "yarn_rope_capability_incomplete", "unsupported_platform", "probe_timeout", "probe_process_abnormal_exit",
                 }:
-                    code = "cuda_capability_missing" if selected_backend != "cuda" else "physical_device_missing"
+                    code = "probe_process_abnormal_exit"
                 return emit_failure(runtime, code, str(runtime.get("probe_stage") or "runtime_validation"))
         except Exception as exc:
-            code = "native_dll_load_failed" if isinstance(exc, OSError) else "native_llama_import_failed"
+            code = "native_dll_load_failed" if _is_windows_dll_loader_error(exc) else "native_llama_import_failed"
             return emit_failure(None, code, "native_import", exc)
         print(json.dumps({
             "type": "status",

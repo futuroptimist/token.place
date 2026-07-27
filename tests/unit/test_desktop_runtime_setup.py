@@ -3216,6 +3216,60 @@ def test_probe_failure_schema_distinguishes_import_and_dll_errors(exception_type
     assert desktop_runtime_setup._validated_probe_diagnostic(payload) == payload
 
 
+@pytest.mark.parametrize(
+    ('overrides', 'expected'),
+    [
+        ({'provenance_valid': False}, 'runtime_version_or_provenance_invalid'),
+        ({'version_match': 'mismatch'}, 'runtime_version_or_provenance_invalid'),
+        ({'expected_backend': 'cuda'}, 'cuda_capability_missing'),
+        ({'expected_backend': 'cuda', 'yarn_required': True}, 'cuda_capability_missing'),
+        ({'platform_supported': False}, 'unsupported_platform'),
+    ],
+)
+def test_runtime_validation_diagnostic_maps_production_evidence(overrides, expected):
+    probe = _probe(backend='cpu', gpu=False)
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(probe, **overrides)
+    assert diagnostic['probe_error_code'] == expected
+
+
+def test_runtime_validation_diagnostic_maps_incomplete_yarn_metadata():
+    probe = _probe(backend='cuda', gpu=True, yarn=False)
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(
+        probe, expected_backend='cuda', yarn_required=True,
+    )
+    assert diagnostic['probe_error_code'] == 'yarn_rope_capability_incomplete'
+
+
+def test_packaged_import_root_validation_accepts_installed_up_up_layout(monkeypatch, tmp_path):
+    resource_root = tmp_path / 'resources'
+    import_root = resource_root / '_up_' / '_up_'
+    python_root = resource_root / 'python'
+    (import_root / 'utils').mkdir(parents=True)
+    (import_root / 'config.py').write_text('', encoding='utf-8')
+    python_root.mkdir()
+    monkeypatch.setattr(desktop_runtime_setup, '__file__', str(python_root / 'desktop_runtime_setup.py'))
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(import_root))
+
+    assert desktop_runtime_setup._packaged_import_root_valid(runtime_root=import_root) is True
+
+
+@pytest.mark.parametrize('invalid_kind', ['missing', 'outside', 'sentinel_free'])
+def test_packaged_import_root_validation_rejects_unverified_roots(monkeypatch, tmp_path, invalid_kind):
+    resource_root = tmp_path / 'resources'
+    expected = resource_root / '_up_' / '_up_'
+    configured = expected if invalid_kind != 'outside' else tmp_path / 'ambient' / '_up_' / '_up_'
+    python_root = resource_root / 'python'
+    python_root.mkdir(parents=True)
+    if invalid_kind != 'missing':
+        (configured / 'utils').mkdir(parents=True)
+        if invalid_kind != 'sentinel_free':
+            (configured / 'config.py').write_text('', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '__file__', str(python_root / 'desktop_runtime_setup.py'))
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(configured))
+
+    assert desktop_runtime_setup._packaged_import_root_valid(runtime_root=expected) is False
+
+
 def test_probe_abnormal_exit_never_retains_stderr_or_paths(monkeypatch, tmp_path):
     sentinel = 'SENTINEL_PATH=/private/secret native loader detail'
     snippet = f"import sys; sys.stderr.write({sentinel!r}); raise SystemExit(17)"

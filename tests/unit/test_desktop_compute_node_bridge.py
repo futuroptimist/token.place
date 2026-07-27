@@ -2207,6 +2207,27 @@ def test_main_operator_preflight_preserves_structured_provenance_failure(capsys,
     assert payload['probe_error_code'] != 'physical_device_missing'
 
 
+def test_main_operator_preflight_preserves_corrected_native_import_diagnostic(capsys, monkeypatch):
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda *_args: {
+            'runtime_action': 'bundled_runtime_probe_failed',
+            'selected_backend': 'cpu',
+            'probe_stage': 'native_import',
+            'probe_error_code': 'native_llama_import_failed',
+            'import_root_valid': True,
+        },
+    )
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight'])
+
+    assert compute_node_bridge.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['probe_error_code'] == 'native_llama_import_failed'
+    assert payload['probe_stage'] == 'native_import'
+
+
 @pytest.mark.parametrize(
     ('backend', 'action'),
     [('cuda', 'already_supported'), ('metal', 'metal_already_supported')],

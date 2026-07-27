@@ -266,6 +266,13 @@ PROBE_DIAGNOSTIC_CODES = frozenset({
     "runtime_version_or_provenance_invalid", "cuda_capability_missing", "physical_device_missing",
     "yarn_rope_capability_incomplete", "unsupported_platform", "probe_timeout", "probe_process_abnormal_exit",
 })
+PROBE_DIAGNOSTIC_CODE_STAGES = {
+    "missing_environment_contract": "environment_contract",
+    "native_llama_import_failed": "native_import",
+    "native_dll_load_failed": "native_import",
+    "probe_timeout": "probe_process",
+    "probe_process_abnormal_exit": "probe_process",
+}
 PROBE_EXCEPTION_TYPES = frozenset({"none", "ImportError", "ModuleNotFoundError", "OSError", "RuntimeError", "TimeoutExpired"})
 PROBE_ARCHITECTURE_SOURCES = frozenset({"platform", "attested_windows_x86_64", "unknown"})
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
@@ -802,20 +809,34 @@ def _runtime_validation_diagnostic(
 
     existing_code = getattr(probe, "probe_error_code", "none")
     code = existing_code if existing_code in PROBE_DIAGNOSTIC_CODES - {"none"} else None
+    existing_stage = getattr(probe, "probe_stage", "runtime_validation")
+    stage = (
+        existing_stage
+        if code is not None and existing_stage in PROBE_DIAGNOSTIC_STAGES
+        else PROBE_DIAGNOSTIC_CODE_STAGES.get(code, "runtime_validation")
+    )
     if not platform_supported:
         code = "unsupported_platform"
-    elif not provenance_valid or version_match != "match":
+        stage = "runtime_validation"
+    elif not provenance_valid:
         code = "runtime_version_or_provenance_invalid"
+        stage = "runtime_validation"
+    elif code is None and version_match != "match":
+        code = "runtime_version_or_provenance_invalid"
+        stage = "runtime_validation"
     elif code is None and probe.backend != "missing" and (
         not probe.gpu_offload_supported or probe.backend != expected_backend
     ):
         code = "cuda_capability_missing"
+        stage = "runtime_validation"
     elif code is None and yarn_required and not probe.yarn_rope_supported:
         code = "yarn_rope_capability_incomplete"
+        stage = "runtime_validation"
     elif code is None:
         code = "probe_process_abnormal_exit"
+        stage = "probe_process"
     return {
-        "probe_stage": "runtime_validation",
+        "probe_stage": stage,
         "probe_error_code": code,
         "exception_type": getattr(probe, "exception_type", "none") if getattr(probe, "exception_type", "none") in PROBE_EXCEPTION_TYPES else "RuntimeError",
         "child_exit_code": getattr(probe, "child_exit_code", None),

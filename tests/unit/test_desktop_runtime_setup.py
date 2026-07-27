@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3238,6 +3239,72 @@ def test_runtime_validation_diagnostic_maps_incomplete_yarn_metadata():
         probe, expected_backend='cuda', yarn_required=True,
     )
     assert diagnostic['probe_error_code'] == 'yarn_rope_capability_incomplete'
+    assert diagnostic['probe_stage'] == 'runtime_validation'
+
+
+@pytest.mark.parametrize('code', ['native_dll_load_failed', 'native_llama_import_failed'])
+def test_runtime_validation_diagnostic_preserves_native_failure_when_version_unknown(code):
+    probe = replace(
+        _probe(backend='missing'),
+        probe_stage='native_import', probe_error_code=code,
+    )
+
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(
+        probe, version_match='unknown',
+    )
+
+    assert diagnostic['probe_error_code'] == code
+    assert diagnostic['probe_stage'] == 'native_import'
+
+
+@pytest.mark.parametrize(
+    ('code', 'stage'),
+    [
+        ('missing_environment_contract', 'environment_contract'),
+        ('probe_timeout', 'probe_process'),
+        ('probe_process_abnormal_exit', 'probe_process'),
+    ],
+)
+def test_runtime_validation_diagnostic_preserves_existing_failure_stage(code, stage):
+    probe = replace(
+        _probe(backend='missing'), probe_stage=stage, probe_error_code=code,
+    )
+
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(probe)
+
+    assert diagnostic['probe_error_code'] == code
+    assert diagnostic['probe_stage'] == stage
+
+
+@pytest.mark.parametrize(
+    ('overrides', 'expected'),
+    [
+        ({'version_match': 'mismatch'}, 'runtime_version_or_provenance_invalid'),
+        ({'expected_backend': 'cuda'}, 'cuda_capability_missing'),
+        ({'platform_supported': False}, 'unsupported_platform'),
+    ],
+)
+def test_runtime_validation_diagnostic_derived_failures_use_validation_stage(overrides, expected):
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(
+        _probe(backend='cpu', gpu=False), **overrides,
+    )
+    assert diagnostic['probe_stage'] == 'runtime_validation'
+    assert diagnostic['probe_error_code'] == expected
+
+
+def test_runtime_validation_diagnostic_normalizes_invalid_stage_without_disclosure():
+    probe = replace(
+        _probe(backend='missing'),
+        probe_stage='SENTINEL C:\\private\\runtime',
+        probe_error_code='native_dll_load_failed',
+    )
+
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(
+        probe, version_match='unknown',
+    )
+
+    assert diagnostic['probe_stage'] == 'native_import'
+    assert 'SENTINEL' not in json.dumps(diagnostic)
 
 
 def test_packaged_import_root_validation_accepts_installed_up_up_layout(monkeypatch, tmp_path):

@@ -6581,6 +6581,58 @@ mod tests {
             Some(resource_root.as_os_str())
         );
         assert!(effective.value("PYTHONPATH").is_some());
+        let path_entries = std::env::split_paths(
+            effective
+                .value("PATH")
+                .expect("sanitizer must construct a deterministic PATH"),
+        )
+        .collect::<Vec<_>>();
+        let runtime_path = resource_root
+            .join("python-runtime")
+            .canonicalize()
+            .expect("canonical runtime root");
+        #[cfg(target_os = "windows")]
+        let expected_path_entries = vec![
+            runtime_path,
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+                .canonicalize()
+                .expect("canonical SystemRoot")
+                .join("System32")
+                .canonicalize()
+                .expect("canonical System32"),
+        ];
+        #[cfg(not(target_os = "windows"))]
+        let expected_path_entries = vec![runtime_path];
+        assert_eq!(path_entries, expected_path_entries);
+        assert!(!path_entries
+            .iter()
+            .any(|entry| entry.to_string_lossy().contains("poison")));
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                effective.value("PROCESSOR_ARCHITECTURE"),
+                Some(std::ffi::OsStr::new("AMD64"))
+            );
+            assert_eq!(
+                effective.value("TOKEN_PLACE_PACKAGED_ARCH"),
+                Some(std::ffi::OsStr::new("x86_64"))
+            );
+            assert_eq!(
+                effective.value("TOKEN_PLACE_PACKAGED_ARCH_SOURCE"),
+                Some(std::ffi::OsStr::new("attested_windows_x86_64"))
+            );
+            assert_eq!(effective.value("PROCESSOR_ARCHITEW6432"), None);
+        }
+        #[cfg(not(target_os = "windows"))]
+        for key in [
+            "PROCESSOR_ARCHITECTURE",
+            "PROCESSOR_ARCHITEW6432",
+            "TOKEN_PLACE_PACKAGED_ARCH",
+            "TOKEN_PLACE_PACKAGED_ARCH_SOURCE",
+        ] {
+            assert_eq!(effective.value(key), None, "{key} must not reach the child");
+        }
         assert!(effective.effective_env.keys().all(|key| {
             matches!(
                 key.to_str(),
@@ -6597,8 +6649,17 @@ mod tests {
                         | "PYTHONDONTWRITEBYTECODE"
                         | "TOKEN_PLACE_PYTHON_IMPORT_ROOT"
                         | "PYTHONPATH"
+                        | "PATH"
                 )
-            )
+            ) || (cfg!(target_os = "windows")
+                && matches!(
+                    key.to_str(),
+                    Some(
+                        "PROCESSOR_ARCHITECTURE"
+                            | "TOKEN_PLACE_PACKAGED_ARCH"
+                            | "TOKEN_PLACE_PACKAGED_ARCH_SOURCE"
+                    )
+                ))
         }));
     }
 

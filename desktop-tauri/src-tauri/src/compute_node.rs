@@ -29,7 +29,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 #[cfg(test)]
 use tokio::sync::oneshot;
@@ -2025,6 +2025,44 @@ async fn cleanup_production_operator_preflight_child(child: &mut Child, pid: Opt
     }
 }
 
+async fn read_bounded_operator_preflight_event<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<Option<String>> {
+    let mut event = Vec::with_capacity(OPERATOR_PREFLIGHT_EVENT_MAX_BYTES + 2);
+    let mut byte = [0_u8; 1];
+    loop {
+        let bytes_read = reader
+            .read(&mut byte)
+            .await
+            .map_err(|_| anyhow::anyhow!("operator_preflight_event_read_failed"))?;
+        if bytes_read == 0 {
+            if event.is_empty() {
+                return Ok(None);
+            }
+            if event.len() > OPERATOR_PREFLIGHT_EVENT_MAX_BYTES {
+                anyhow::bail!("operator_preflight_invalid_failure_event");
+            }
+            break;
+        }
+        if byte[0] == b'\n' {
+            if event.last() == Some(&b'\r') {
+                event.pop();
+            }
+            break;
+        }
+        event.push(byte[0]);
+        if event.len() > OPERATOR_PREFLIGHT_EVENT_MAX_BYTES
+            && !(event.len() == OPERATOR_PREFLIGHT_EVENT_MAX_BYTES + 1
+                && event.last() == Some(&b'\r'))
+        {
+            anyhow::bail!("operator_preflight_invalid_failure_event");
+        }
+    }
+    String::from_utf8(event)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("operator_preflight_event_read_failed"))
+}
+
 fn validate_production_operator_preflight_event(event: Value) -> anyhow::Result<Value> {
     let identity_is_valid = event.get("type").and_then(Value::as_str) == Some("status")
         && event
@@ -2165,15 +2203,14 @@ async fn run_production_operator_preflight_child(
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("operator_preflight_stdout_unavailable"))?;
-        let mut lines = BufReader::new(stdout).lines();
-        let line = tokio::time::timeout(event_timeout, lines.next_line())
-            .await
-            .map_err(|_| anyhow::anyhow!("operator_preflight_event_timeout"))?
-            .map_err(|_| anyhow::anyhow!("operator_preflight_event_read_failed"))?
-            .ok_or_else(|| anyhow::anyhow!("operator_preflight_event_missing"))?;
-        if line.len() > OPERATOR_PREFLIGHT_EVENT_MAX_BYTES {
-            anyhow::bail!("operator_preflight_invalid_failure_event");
-        }
+        let mut reader = BufReader::new(stdout);
+        let line = tokio::time::timeout(
+            event_timeout,
+            read_bounded_operator_preflight_event(&mut reader),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("operator_preflight_event_timeout"))??
+        .ok_or_else(|| anyhow::anyhow!("operator_preflight_event_missing"))?;
         let event = parse_compute_node_event_line(&line)
             .map_err(|_| anyhow::anyhow!("operator_preflight_event_parse_failed"))?;
         if event.get("startup_result").and_then(Value::as_str) == Some("runtime_validation_failed")
@@ -4092,6 +4129,26 @@ mod tests {
         }
     }
 
+    fn oversized_unterminated_operator_preflight_test_command() -> Command {
+        let byte_count = OPERATOR_PREFLIGHT_EVENT_MAX_BYTES + 2;
+        #[cfg(unix)]
+        {
+            let script = format!("head -c {byte_count} /dev/zero | tr '\\0' x; sleep 30");
+            let mut command = Command::new("sh");
+            command.args(["-c", &script]);
+            command
+        }
+        #[cfg(windows)]
+        {
+            let script = format!(
+                "$text = 'x' * {byte_count}; [Console]::Out.Write($text); [Console]::Out.Flush(); Start-Sleep -Seconds 30"
+            );
+            let mut command = Command::new("powershell");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            command
+        }
+    }
+
     #[tokio::test]
     async fn operator_preflight_accepts_valid_runtime_validation_event() {
         let event = run_production_operator_preflight_child(
@@ -4166,6 +4223,26 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "operator_preflight_invalid_failure_event"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_rejects_oversized_unterminated_event_without_waiting_for_timeout() {
+        let started = Instant::now();
+        let error = run_production_operator_preflight_child(
+            oversized_unterminated_operator_preflight_test_command(),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("oversized unterminated event must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "operator_preflight_invalid_failure_event"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "oversized event waited for the timeout or left its child running"
         );
     }
 

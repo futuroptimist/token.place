@@ -3035,6 +3035,8 @@ def main() -> int:
         # not substitute a fabricated worker-ready event for native import.
         def emit_failure(runtime: Optional[Dict[str, Any]], code: str, stage: str, exc: Optional[BaseException] = None) -> int:
             runtime = runtime or {}
+            if stage not in {"environment_contract", "native_import", "runtime_validation", "probe_process"}:
+                stage = "runtime_validation"
             exception_type = type(exc).__name__ if exc is not None else str(runtime.get("exception_type", "none"))
             if exception_type not in {"none", "ImportError", "ModuleNotFoundError", "OSError", "RuntimeError", "TimeoutExpired"}:
                 exception_type = "RuntimeError"

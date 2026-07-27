@@ -2128,6 +2128,27 @@ def test_main_operator_preflight_emits_bounded_failed_runtime_contract(capsys, m
     assert 'fallback_reason' not in payload
 
 
+def test_main_operator_preflight_normalizes_unallowlisted_failure_stage(capsys, monkeypatch):
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda _mode, _tier: {
+            'runtime_action': 'bundled_runtime_probe_failed',
+            'selected_backend': 'cpu',
+            'probe_stage': 'SENTINEL C:\\private\\runtime',
+            'probe_error_code': 'native_dll_load_failed',
+        },
+    )
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight'])
+
+    assert compute_node_bridge.main() == 1
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload['probe_stage'] == 'runtime_validation'
+    assert 'SENTINEL' not in output and 'private' not in output
+
+
 @pytest.mark.parametrize(
     ('mode', 'runtime'),
     [

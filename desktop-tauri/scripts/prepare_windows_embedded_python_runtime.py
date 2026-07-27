@@ -111,14 +111,16 @@ def load_manifest(path: Path=MANIFEST) -> dict:
         destination = artifact.get("destination", artifact["name"]).lower().replace("\\", "/")
         if destination in native_destinations: raise RuntimePrepError(f"duplicate native DLL destination: {destination}")
         native_destinations.add(destination)
+        expected_destination = _expected_native_artifact_destination(artifact["name"])
+        if destination != expected_destination:
+            raise RuntimePrepError(
+                f"native DLL artifact has invalid loader destination: {artifact['name']}"
+            )
     if native_artifacts:
         native_names = {a["name"].lower() for a in native_artifacts if isinstance(a, dict) and "name" in a}
         required_vendor = {"cudart64_12.dll", "cublas64_12.dll", "msvcp140.dll", "vcomp140.dll", "vcruntime140_1.dll"}
         missing_vendor = sorted(required_vendor - native_names)
         if missing_vendor: raise RuntimePrepError(f"missing native DLL artifact pins: {missing_vendor}")
-        native_prefix = "lib/site-packages/llama_cpp/lib/"
-        if any(not destination.startswith(native_prefix) for destination in native_destinations):
-            raise RuntimePrepError("native DLL artifacts must share the bundled llama_cpp loader directory")
     _validate_sha256_pin(m.get("sha256", ""), "archive sha256")
     _validate_sha256_pin(wheel.get("sha256", ""), "llama-cpp-python wheel sha256")
     wheelhouse = m.get("python_package_wheels", [])
@@ -218,7 +220,7 @@ def extract_microsoft_burn_member(archive: Path, member: str, dest: Path) -> Non
         shutil.copyfile(extracted, dest)
 
 def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
-    """Stage pinned redistributables in llama_cpp's registered DLL directory."""
+    """Stage pinned redistributables in their narrowly validated loader scope."""
     seen: set[str] = set()
     for artifact in m.get("native_dll_artifacts", []):
         name = artifact["name"]
@@ -235,6 +237,8 @@ def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
         dest = (staged / destination).resolve()
         if not dest.is_relative_to(staged.resolve()) or dest.name.lower() != lower:
             raise RuntimePrepError(f"native DLL destination must stay in runtime root: {name}")
+        if destination.lower().replace("\\", "/") != _expected_native_artifact_destination(name):
+            raise RuntimePrepError(f"native DLL artifact has invalid loader destination: {name}")
         dest.parent.mkdir(parents=True, exist_ok=True)
         if archive.suffix.lower() == ".zip":
             with zipfile.ZipFile(archive) as zf:
@@ -260,6 +264,15 @@ def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
 
 
 NATIVE_IMPORT_DIAGNOSTIC_CODES = {126, 127, 193}
+NATIVE_LLAMA_DIRECTORY = "Lib/site-packages/llama_cpp/lib"
+APP_LOCAL_MSVC_DLLS = {"msvcp140.dll", "vcomp140.dll", "vcruntime140_1.dll"}
+
+
+def _expected_native_artifact_destination(name: str) -> str:
+    lower = name.lower()
+    if lower in APP_LOCAL_MSVC_DLLS:
+        return lower
+    return f"{NATIVE_LLAMA_DIRECTORY}/{lower}".lower()
 
 
 def _closed_native_import_env(runtime: Path) -> tuple[dict[str, str], Path]:
@@ -297,7 +310,7 @@ raise SystemExit(0 if valid else 9)
 """
 
 
-def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str], pe_closure: list[dict[str, object]]) -> tuple[str, int | None]:
+def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str], pe_closure: list[dict[str, object]], m: dict) -> tuple[str, int | str | None]:
     """Return only a manifest-owned basename and bounded Windows loader code."""
     entries = {
         str(entry.get("name", "")).lower(): entry
@@ -308,6 +321,26 @@ def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str]
         name: runtime / str(entry["path"])
         for name, entry in entries.items()
     }
+    manifest_destinations = {
+        str(artifact["name"]).lower(): runtime / str(artifact["destination"])
+        for artifact in m.get("native_dll_artifacts", [])
+        if isinstance(artifact, dict) and artifact.get("name") and artifact.get("destination")
+    }
+
+    # A dependency imported by Python/NumPy before llama_cpp registers its private
+    # directory must be app-local beside python.exe. Report that manifest-owned
+    # dependency rather than the consumer module that happened to expose it.
+    for consumer_name, entry in sorted(entries.items()):
+        consumer = candidates[consumer_name]
+        for dependency in entry.get("imports", []):
+            dependency = str(dependency).lower()
+            destination = manifest_destinations.get(dependency)
+            if destination is None:
+                continue
+            if not destination.is_file():
+                return dependency, 126
+            if consumer.parent != (runtime / NATIVE_LLAMA_DIRECTORY) and destination.parent != runtime:
+                return dependency, "search_topology_unavailable"
     ordered: list[str] = []
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -382,8 +415,12 @@ def validate_staged_native_import(runtime: Path, m: dict, pe_closure: list[dict[
         payload = {}
     if result.returncode == 0 and payload == {"native_import_valid": True}:
         return
-    basename, code = _diagnose_native_import_failure(py, runtime, env, pe_closure)
-    bounded_code = f"winerror_{code}" if code is not None else "loader_code_unknown"
+    basename, code = _diagnose_native_import_failure(py, runtime, env, pe_closure, m)
+    bounded_code = (
+        f"winerror_{code}" if isinstance(code, int)
+        else code if isinstance(code, str)
+        else "loader_code_unknown"
+    )
     raise RuntimePrepError(f"staged native import failed: {basename}:{bounded_code}")
 
 def safe_extract_tar(archive: Path, dest: Path) -> None:

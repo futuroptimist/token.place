@@ -263,7 +263,7 @@
       "provenance": "Microsoft Visual C++ app-local runtime redistributable for Windows x64",
       "url": "https://download.visualstudio.microsoft.com/download/pr/7ebf5fdb-36dc-4145-b0a0-90d3d5990a61/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
       "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
-      "destination": "Lib/site-packages/llama_cpp/lib/msvcp140.dll",
+      "destination": "msvcp140.dll",
       "archive_member_path": "a12/msvcp140.dll_amd64",
       "extracted_sha256": "0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9"
     },
@@ -276,7 +276,7 @@
       "provenance": "Microsoft Visual C++ OpenMP app-local runtime redistributable for Windows x64",
       "url": "https://download.visualstudio.microsoft.com/download/pr/7ebf5fdb-36dc-4145-b0a0-90d3d5990a61/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
       "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
-      "destination": "Lib/site-packages/llama_cpp/lib/vcomp140.dll",
+      "destination": "vcomp140.dll",
       "archive_member_path": "a12/vcomp140.dll_amd64",
       "extracted_sha256": "55aba23cdcd6484fbb06f4155b8ca75adfce7a881f10afd0c49457165e677164"
     },
@@ -289,7 +289,7 @@
       "provenance": "Microsoft Visual C++ app-local runtime redistributable for Windows x64",
       "url": "https://download.visualstudio.microsoft.com/download/pr/7ebf5fdb-36dc-4145-b0a0-90d3d5990a61/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
       "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
-      "destination": "Lib/site-packages/llama_cpp/lib/vcruntime140_1.dll",
+      "destination": "vcruntime140_1.dll",
       "archive_member_path": "a12/vcruntime140_1.dll_amd64",
       "extracted_sha256": "1f2d41c4aa5db0bc33ebf7b66d72943a817d7ce6cbe880502a9403823633093f"
     }

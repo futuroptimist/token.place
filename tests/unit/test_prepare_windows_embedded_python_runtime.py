@@ -81,7 +81,10 @@ def manifest(**overrides):
                 'license': 'test license',
                 'provenance': 'test provenance',
                 'archive_member_path': f'bin/{name}',
-                'destination': f'Lib/site-packages/llama_cpp/lib/{name}',
+                'destination': (
+                    name if name in {'msvcp140.dll', 'vcomp140.dll', 'vcruntime140_1.dll'}
+                    else f'Lib/site-packages/llama_cpp/lib/{name}'
+                ),
                 'extracted_sha256': '456789abcdeffedcba98765432100123456789abcdeffedcba98765432101234',
             }
             for name, version in [
@@ -896,6 +899,28 @@ def test_manifest_pins_native_vendor_runtime_dll_artifacts():
     assert artifacts['cudart64_12.dll']['version'] == '12.4.127'
     assert artifacts['cublas64_12.dll']['version'] == '12.4.5.8'
     assert artifacts['cublaslt64_12.dll']['version'] == '12.4.5.8'
+    assert artifacts['cudart64_12.dll']['destination'] == 'Lib/site-packages/llama_cpp/lib/cudart64_12.dll'
+    assert artifacts['cublas64_12.dll']['destination'] == 'Lib/site-packages/llama_cpp/lib/cublas64_12.dll'
+    for name in ('msvcp140.dll', 'vcomp140.dll', 'vcruntime140_1.dll'):
+        assert artifacts[name]['destination'] == name
+
+
+@pytest.mark.parametrize(
+    ('name', 'destination'),
+    [
+        ('cudart64_12.dll', 'cudart64_12.dll'),
+        ('vcruntime140_1.dll', 'Lib/site-packages/llama_cpp/lib/vcruntime140_1.dll'),
+    ],
+)
+def test_manifest_rejects_native_artifact_in_wrong_loader_scope(tmp_path, name, destination):
+    data = manifest()
+    artifact = next(item for item in data['native_dll_artifacts'] if item['name'] == name)
+    artifact['destination'] = destination
+    path = tmp_path / 'manifest.json'
+    write_manifest(path, data)
+
+    with pytest.raises(prep.RuntimePrepError, match='invalid loader destination'):
+        prep.load_manifest(path)
 
 
 def test_manifest_pins_msvc_redist_exact_content_addressed_url():
@@ -983,14 +1008,14 @@ def test_stage_native_dll_artifacts_extracts_exact_pinned_member(tmp_path, monke
         'license': 'NVIDIA CUDA Toolkit EULA',
         'provenance': 'test pinned runtime DLL',
         'archive_member_path': member,
-        'destination': 'cudart64_12.dll',
+        'destination': 'Lib/site-packages/llama_cpp/lib/cudart64_12.dll',
         'extracted_sha256': file_digest,
     }]}
     monkeypatch.setattr(prep, 'fetch', lambda url, sha, dest: archive)
 
     prep.stage_native_dll_artifacts(m, tmp_path / 'cache', runtime)
 
-    assert (runtime / 'cudart64_12.dll').read_bytes() == dll_bytes
+    assert (runtime / 'Lib/site-packages/llama_cpp/lib/cudart64_12.dll').read_bytes() == dll_bytes
 
 
 def test_staged_native_import_uses_closed_packaged_environment(tmp_path, monkeypatch):
@@ -1041,11 +1066,52 @@ def test_staged_native_import_failure_is_bounded_and_identifies_closure_member(t
     with pytest.raises(prep.RuntimePrepError) as raised:
         prep.validate_staged_native_import(
             runtime,
-            {'expected_interpreter_path': 'python.exe'},
+            {'expected_interpreter_path': 'python.exe', 'native_dll_artifacts': []},
             [{'name': 'ggml-base.dll', 'path': 'Lib/site-packages/llama_cpp/lib/ggml-base.dll'}],
         )
     assert str(raised.value) == 'staged native import failed: ggml-base.dll:winerror_126'
     assert secret not in str(raised.value)
+
+
+def test_staged_native_import_diagnoses_manifest_owned_numpy_dependency(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    numpy = runtime / 'Lib/site-packages/numpy/_core'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    system_root = tmp_path / 'Windows'
+    numpy.mkdir(parents=True)
+    native.mkdir(parents=True)
+    (system_root / 'System32').mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    consumer = numpy / '_multiarray_umath.cp311-win_amd64.pyd'
+    write_minimal_pe(consumer, imports=['VCRUNTIME140_1.dll'])
+    monkeypatch.setenv('SystemRoot', str(system_root))
+    monkeypatch.setattr(
+        prep.subprocess,
+        'run',
+        lambda *args, **kwargs: prep.subprocess.CompletedProcess(args[0], 1, '', r'C:\secret\raw-error'),
+    )
+    manifest_data = {
+        'expected_interpreter_path': 'python.exe',
+        'native_dll_artifacts': [{
+            'name': 'vcruntime140_1.dll',
+            'destination': 'vcruntime140_1.dll',
+        }],
+    }
+
+    with pytest.raises(prep.RuntimePrepError) as raised:
+        prep.validate_staged_native_import(
+            runtime,
+            manifest_data,
+            [{
+                'name': consumer.name,
+                'path': consumer.relative_to(runtime).as_posix(),
+                'imports': ['vcruntime140_1.dll'],
+            }],
+        )
+
+    assert str(raised.value) == 'staged native import failed: vcruntime140_1.dll:winerror_126'
+    assert '_multiarray_umath' not in str(raised.value)
+    assert 'secret' not in str(raised.value).lower()
 
 
 def test_staged_native_import_rejects_missing_search_topology(tmp_path, monkeypatch):
@@ -1292,7 +1358,7 @@ def test_stage_native_dll_artifacts_fail_closed_edge_cases(tmp_path, monkeypatch
         'license': 'NVIDIA CUDA Toolkit EULA',
         'provenance': 'test pinned runtime DLL',
         'archive_member_path': 'bin/cudart64_12.dll',
-        'destination': 'cudart64_12.dll',
+        'destination': 'Lib/site-packages/llama_cpp/lib/cudart64_12.dll',
         'extracted_sha256': good_sha,
     }
 
@@ -1312,7 +1378,7 @@ def test_stage_native_dll_artifacts_fail_closed_edge_cases(tmp_path, monkeypatch
     wrong_hash = {'native_dll_artifacts': [dict(base_artifact, extracted_sha256='abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')]}
     with pytest.raises(prep.RuntimePrepError, match='file digest mismatch'):
         prep.stage_native_dll_artifacts(wrong_hash, tmp_path / 'cache', runtime)
-    assert not (runtime / 'cudart64_12.dll').exists()
+    assert not (runtime / 'Lib/site-packages/llama_cpp/lib/cudart64_12.dll').exists()
 
     arm_dll = tmp_path / 'arm.dll'
     write_minimal_pe(arm_dll, machine=0xAA64)

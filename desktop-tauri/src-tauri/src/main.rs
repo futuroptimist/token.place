@@ -203,7 +203,9 @@ fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifac
         resource_dir.as_deref(),
         Some(&launcher.program),
     )?;
-    let mut bridge_command = launcher.command_for_script_blocking(&bridge_script);
+    let mut bridge_command = launcher
+        .command_for_script_blocking(&bridge_script)
+        .map_err(|_| python_runtime::PACKAGED_PYTHON_ENVIRONMENT_INVALID.to_string())?;
     let import_root = configure_runtime_pythonpath_for(
         &mut bridge_command,
         &bridge_script,

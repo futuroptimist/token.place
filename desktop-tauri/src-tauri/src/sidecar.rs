@@ -84,7 +84,7 @@ async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(
     Ok(())
 }
 
-fn build_sidecar_command(
+pub(crate) fn build_sidecar_command(
     sidecar_path: &str,
     launcher: Option<PythonLauncher>,
 ) -> anyhow::Result<Command> {
@@ -92,7 +92,9 @@ fn build_sidecar_command(
         let launcher = launcher.ok_or_else(|| {
             anyhow::anyhow!("missing resolved Python launcher for sidecar script")
         })?;
-        return Ok(launcher.command_for_script(sidecar_path));
+        return launcher
+            .command_for_script(sidecar_path)
+            .map_err(anyhow::Error::from);
     }
 
     Ok(Command::new(sidecar_path))

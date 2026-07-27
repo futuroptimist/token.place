@@ -7,7 +7,6 @@ use crate::operator_logs::{
 };
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, coherent_packaged_resource_roots,
-    configure_packaged_python_subprocess_env_for_layout,
     configure_python_subprocess_env_for_layout, describe_resource_layout, disable_python_user_site,
     resolve_bridge_script_path, resolve_bundled_python_launcher_at_root,
     resolve_packaged_runtime_import_root, resolve_python_launcher_resource_aware,
@@ -438,7 +437,9 @@ fn build_bridge_command(
         let launcher = launcher.ok_or_else(|| {
             anyhow::anyhow!("missing resolved Python launcher for compute-node bridge script")
         })?;
-        return Ok(launcher.command_for_script(bridge_path));
+        return launcher
+            .command_for_script(bridge_path)
+            .map_err(anyhow::Error::from);
     }
 
     Ok(Command::new(bridge_path))
@@ -1623,28 +1624,12 @@ impl OperatorBridgeLaunchPreparation {
     where
         C: PythonEnvCommand,
     {
-        if matches!(
-            self.launcher.as_ref().map(|launcher| &launcher.source),
-            Some(PythonLauncherSource::BundledRuntime)
-        ) {
-            let runtime_root = self.runtime_root.as_deref().ok_or_else(|| {
-                OperatorBridgeLaunchPreparationError::packaged_environment_invalid()
-            })?;
-            configure_packaged_python_subprocess_env_for_layout(
-                command,
-                &self.import_root,
-                self.layout.clone(),
-                runtime_root,
-            )
-            .map_err(|_| OperatorBridgeLaunchPreparationError::packaged_environment_invalid())?;
-        } else {
-            configure_python_subprocess_env_for_layout(
-                command,
-                &self.import_root,
-                self.layout.clone(),
-                false,
-            );
-        }
+        configure_python_subprocess_env_for_layout(
+            command,
+            &self.import_root,
+            self.layout.clone(),
+            false,
+        );
         Ok(())
     }
 
@@ -1658,7 +1643,9 @@ impl OperatorBridgeLaunchPreparation {
         let launcher = self.launcher.as_ref().ok_or_else(|| {
             anyhow::anyhow!("missing resolved Python launcher for compute-node bridge script")
         })?;
-        let mut command = launcher.command_for_script_blocking(&self.bridge_script);
+        let mut command = launcher
+            .command_for_script_blocking(&self.bridge_script)
+            .map_err(|_| OperatorBridgeLaunchPreparationError::packaged_environment_invalid())?;
         self.configure_command(&mut command)?;
         Ok(command)
     }
@@ -1695,7 +1682,9 @@ impl OperatorBridgeLaunchPreparation {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing bundled Python launcher for operator smoke"))?;
         let model_bridge_script = self.model_bridge_script()?;
-        let mut command = launcher.command_for_script_blocking(&model_bridge_script);
+        let mut command = launcher
+            .command_for_script_blocking(&model_bridge_script)
+            .map_err(|_| OperatorBridgeLaunchPreparationError::packaged_environment_invalid())?;
         self.configure_command(&mut command)?;
         Ok(command)
     }
@@ -6876,7 +6865,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_context_probe_uses_prepared_import_root_under_poisoned_override() {
+    fn up_up_layout_keeps_launcher_runtime_root_for_model_and_sidecar() {
         let _env_guard = crate::python_runtime::RUNTIME_BOOTSTRAP_ENV_TEST_LOCK
             .lock()
             .expect("runtime bootstrap env test lock");
@@ -6896,10 +6885,17 @@ mod tests {
             "# model bridge\n",
         )
         .expect("write model bridge script");
+        let program = if cfg!(windows) {
+            runtime_root.join("python.exe")
+        } else {
+            runtime_root.join("bin/python3")
+        };
+        std::fs::create_dir_all(program.parent().unwrap()).expect("runtime binary parent");
+        std::fs::write(&program, "").expect("runtime binary");
         let preparation = OperatorBridgeLaunchPreparation {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(PythonLauncher {
-                program: "python3".into(),
+                program: program.to_string_lossy().into_owned(),
                 args: Vec::new(),
                 source: PythonLauncherSource::BundledRuntime,
                 runtime_id: "test-runtime".into(),
@@ -6954,6 +6950,15 @@ mod tests {
             preparation
                 .model_inspect_command()
                 .expect("model inspect command"),
+            crate::sidecar::build_sidecar_command(
+                import_root
+                    .join("python/inference_sidecar.py")
+                    .to_string_lossy()
+                    .as_ref(),
+                preparation.launcher.clone(),
+            )
+            .expect("sidecar command")
+            .into_std(),
         ] {
             assert_eq!(
                 command

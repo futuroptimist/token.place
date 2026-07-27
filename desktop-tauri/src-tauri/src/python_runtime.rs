@@ -62,63 +62,60 @@ impl PythonLauncher {
         }
     }
 
-    fn command_for_version_check(&self) -> Command {
+    fn prepare_blocking_command(&self) -> Result<Command, PackagedPythonEnvironmentError> {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            let _ = sanitize_packaged_python_subprocess_env(
+            sanitize_packaged_python_subprocess_env(
                 &mut cmd,
                 bundled_runtime_root_from_candidate(self).as_deref(),
-            );
+            )?;
         }
-        cmd.arg("--version");
-        cmd
+        Ok(cmd)
     }
 
-    fn command_for_metadata_probe(&self) -> Command {
-        let mut cmd = Command::new(&self.program);
-        cmd.args(&self.args);
-        if self.source == PythonLauncherSource::BundledRuntime {
-            let _ = sanitize_packaged_python_subprocess_env(
-                &mut cmd,
-                bundled_runtime_root_from_candidate(self).as_deref(),
-            );
-        }
+    fn command_for_version_check(&self) -> Result<Command, PackagedPythonEnvironmentError> {
+        let mut cmd = self.prepare_blocking_command()?;
+        cmd.arg("--version");
+        Ok(cmd)
+    }
+
+    fn command_for_metadata_probe(&self) -> Result<Command, PackagedPythonEnvironmentError> {
+        let mut cmd = self.prepare_blocking_command()?;
         cmd.arg("-c");
         cmd.arg("import json,platform,struct,sys; print(json.dumps({'version': list(sys.version_info[:3]), 'machine': platform.machine(), 'pointer_bits': struct.calcsize('P') * 8, 'executable': sys.executable, 'prefix': sys.prefix}))");
-        cmd
+        Ok(cmd)
     }
 
-    pub fn command_for_script<P>(&self, script_path: P) -> tokio::process::Command
+    pub fn command_for_script<P>(
+        &self,
+        script_path: P,
+    ) -> Result<tokio::process::Command, PackagedPythonEnvironmentError>
     where
         P: AsRef<std::ffi::OsStr>,
     {
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args);
         if self.source == PythonLauncherSource::BundledRuntime {
-            let _ = sanitize_packaged_python_subprocess_env(
+            sanitize_packaged_python_subprocess_env(
                 &mut cmd,
                 bundled_runtime_root_from_candidate(self).as_deref(),
-            );
+            )?;
         }
         cmd.arg(script_path);
-        cmd
+        Ok(cmd)
     }
 
-    pub fn command_for_script_blocking<P>(&self, script_path: P) -> Command
+    pub fn command_for_script_blocking<P>(
+        &self,
+        script_path: P,
+    ) -> Result<Command, PackagedPythonEnvironmentError>
     where
         P: AsRef<std::ffi::OsStr>,
     {
-        let mut cmd = Command::new(&self.program);
-        cmd.args(&self.args);
-        if self.source == PythonLauncherSource::BundledRuntime {
-            let _ = sanitize_packaged_python_subprocess_env(
-                &mut cmd,
-                bundled_runtime_root_from_candidate(self).as_deref(),
-            );
-        }
+        let mut cmd = self.prepare_blocking_command()?;
         cmd.arg(script_path);
-        cmd
+        Ok(cmd)
     }
 }
 
@@ -564,7 +561,10 @@ pub fn resolve_python_launcher(var_name: &str) -> anyhow::Result<PythonLauncher>
     }
     candidates.extend(default_python_candidates());
     resolve_python_launcher_with_probe(var_name, candidates, |candidate| {
-        candidate.command_for_version_check().output()
+        candidate
+            .command_for_version_check()
+            .map_err(std::io::Error::other)?
+            .output()
     })
     .map_err(anyhow::Error::from)
 }
@@ -791,7 +791,19 @@ fn validate_bundled_runtime_candidate(
             ));
         }
     }
-    match candidate.command_for_metadata_probe().output() {
+    match candidate
+        .command_for_metadata_probe()
+        .map_err(|_| {
+            launcher_error(
+                DESKTOP_PYTHON_RUNTIME_INVALID,
+                PythonLauncherCategory::BundledRuntimeProbeFailed,
+                Some(&candidate),
+                packaged,
+                None,
+            )
+        })?
+        .output()
+    {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -927,7 +939,19 @@ pub fn resolve_python_launcher_resource_aware(
     }
     if has_confirmed_unbundled_dev_source_tree(&opts) {
         if let Some(env_candidate) = env_python_candidate(opts.override_var_name) {
-            return match env_candidate.command_for_version_check().output() {
+            return match env_candidate
+                .command_for_version_check()
+                .map_err(|_| {
+                    launcher_error(
+                        DESKTOP_PYTHON_RUNTIME_INVALID,
+                        PythonLauncherCategory::BundledRuntimeProbeFailed,
+                        Some(&env_candidate),
+                        opts.packaged,
+                        None,
+                    )
+                })?
+                .output()
+            {
                 Ok(output) => validate_launcher_with_output(&env_candidate, &output, false, false)
                     .map(|_| env_candidate),
                 Err(_) => Err(launcher_error(
@@ -1349,10 +1373,7 @@ pub fn configure_python_subprocess_env_for_layout<C>(
     C: PythonEnvCommand,
 {
     disable_python_user_site(command);
-    if packaged || layout != ResourceLayoutKind::DevSourceTree {
-        let runtime_root = import_root.join("python-runtime");
-        let _ = sanitize_packaged_python_subprocess_env(command, Some(&runtime_root));
-    }
+    let _ = (layout, packaged);
     configure_python_import_env(command, import_root);
 }
 
@@ -2387,14 +2408,18 @@ mod tests {
             .expect("compute script");
         let (model_root, model_layout) = context.describe_resource_layout(&resolved_model);
         let (compute_root, compute_layout) = context.describe_resource_layout(&resolved_compute);
-        let mut model_command = launcher.command_for_script_blocking(&resolved_model);
+        let mut model_command = launcher
+            .command_for_script_blocking(&resolved_model)
+            .expect("prepare model command environment");
         configure_python_subprocess_env_for_layout(
             &mut model_command,
             &resource_root,
             model_layout.clone(),
             context.packaged(),
         );
-        let mut compute_command = launcher.command_for_script_blocking(&resolved_compute);
+        let mut compute_command = launcher
+            .command_for_script_blocking(&resolved_compute)
+            .expect("prepare compute command environment");
         configure_python_subprocess_env_for_layout(
             &mut compute_command,
             &resource_root,
@@ -2506,7 +2531,13 @@ mod tests {
         let mut command = PythonEnvCommandRecorder::with_poisoned_env();
         command.set_env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
 
-        configure_python_subprocess_env(&mut command, &root);
+        configure_packaged_python_subprocess_env_for_layout(
+            &mut command,
+            &root,
+            ResourceLayoutKind::TauriResourceDir,
+            &root.join("python-runtime"),
+        )
+        .expect("packaged environment");
 
         assert!(command.clear_env_called);
         assert_eq!(
@@ -2533,6 +2564,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("Resources");
         std::fs::create_dir_all(root.join("python")).expect("create python dir");
+        std::fs::create_dir_all(root.join("python-runtime")).expect("create runtime dir");
         std::fs::write(
             root.join("python").join("desktop_runtime_setup.py"),
             "# stale packaged copy",
@@ -2541,12 +2573,13 @@ mod tests {
         let mut command = PythonEnvCommandRecorder::with_poisoned_env();
         command.set_env("TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD", "1");
 
-        configure_python_subprocess_env_for_layout(
+        configure_packaged_python_subprocess_env_for_layout(
             &mut command,
             &root,
             ResourceLayoutKind::WindowsResources,
-            true,
-        );
+            &root.join("python-runtime"),
+        )
+        .expect("packaged environment");
 
         assert!(command.clear_env_called);
         for key in [
@@ -2723,7 +2756,9 @@ mod tests {
             PythonLauncherSource::BundledRuntime,
             bundled_runtime_id(),
         );
-        let command = launcher.command_for_metadata_probe();
+        let command = launcher
+            .command_for_metadata_probe()
+            .expect("prepare metadata probe environment");
         assert_eq!(
             command_env_value(&command, "PYTHONNOUSERSITE").as_deref(),
             Some("1")
@@ -2769,6 +2804,77 @@ mod tests {
                     Some("PYTHONNOUSERSITE" | "PYTHONDONTWRITEBYTECODE")
                 )
         }));
+    }
+
+    #[test]
+    fn bundled_command_variants_share_verified_runtime_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime = temp.path().join("python-runtime");
+        let program = if cfg!(windows) {
+            runtime.join("python.exe")
+        } else {
+            runtime.join("bin/python3")
+        };
+        std::fs::create_dir_all(program.parent().unwrap()).expect("runtime directory");
+        std::fs::write(&program, "").expect("interpreter fixture");
+        let launcher = PythonLauncher::new(
+            program.to_string_lossy(),
+            vec![],
+            PythonLauncherSource::BundledRuntime,
+            bundled_runtime_id(),
+        );
+        let expected = runtime.canonicalize().expect("canonical runtime");
+
+        let version = launcher
+            .command_for_version_check()
+            .expect("version command");
+        let metadata = launcher
+            .command_for_metadata_probe()
+            .expect("metadata command");
+        let blocking = launcher
+            .command_for_script_blocking("bridge.py")
+            .expect("blocking command");
+        let asynchronous = launcher
+            .command_for_script("bridge.py")
+            .expect("async command");
+        for command in [&version, &metadata, &blocking, asynchronous.as_std()] {
+            let path = command_env_value(command, "PATH").expect("deterministic PATH");
+            let entries = std::env::split_paths(&path).collect::<Vec<_>>();
+            assert_eq!(entries.first(), Some(&expected));
+            assert_eq!(
+                entries.iter().filter(|entry| *entry == &expected).count(),
+                1
+            );
+            assert!(!path.contains("poison"));
+        }
+    }
+
+    #[test]
+    fn packaged_environment_failure_is_returned_before_spawn() {
+        let launcher = PythonLauncher::new(
+            "missing/python-runtime/bin/python3",
+            vec![],
+            PythonLauncherSource::BundledRuntime,
+            bundled_runtime_id(),
+        );
+        assert_eq!(
+            launcher.command_for_version_check().unwrap_err(),
+            PackagedPythonEnvironmentError
+        );
+        assert_eq!(
+            launcher.command_for_metadata_probe().unwrap_err(),
+            PackagedPythonEnvironmentError
+        );
+        assert_eq!(
+            launcher.command_for_script("bridge.py").unwrap_err(),
+            PackagedPythonEnvironmentError
+        );
+        assert_eq!(
+            launcher
+                .command_for_script_blocking("bridge.py")
+                .unwrap_err(),
+            PackagedPythonEnvironmentError
+        );
     }
 
     #[test]

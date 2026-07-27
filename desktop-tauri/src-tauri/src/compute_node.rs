@@ -7,6 +7,7 @@ use crate::operator_logs::{
 };
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, coherent_packaged_resource_roots,
+    configure_packaged_python_subprocess_env_for_layout,
     configure_python_subprocess_env_for_layout, describe_resource_layout, disable_python_user_site,
     resolve_bridge_script_path, resolve_bundled_python_launcher_at_root,
     resolve_packaged_runtime_import_root, resolve_python_launcher_resource_aware,
@@ -6720,16 +6721,11 @@ mod tests {
             source: PythonLauncherSource::BundledRuntime,
             runtime_id: "test-runtime".into(),
         };
-        let context = BridgeResourceContext {
-            exe_path: Some(&exe_path),
-            manifest_dir: &manifest_dir,
-            tauri_resource_dir: Some(&resource_root),
-        };
         let preparation = OperatorBridgeLaunchPreparation {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(launcher),
             resource_root: resource_root.clone(),
-            runtime_root: Some(runtime_root),
+            runtime_root: Some(runtime_root.clone()),
             import_root: resource_root.clone(),
             layout: ResourceLayoutKind::WindowsResources,
         };
@@ -6758,13 +6754,13 @@ mod tests {
         assert!(std_command_env_value(&command, "PYTHONPATH").is_some());
 
         let mut effective = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
-        configure_runtime_pythonpath(
+        configure_packaged_python_subprocess_env_for_layout(
             &mut effective,
-            &manifest_dir,
-            &bridge_script,
-            context.exe_path,
-            context.tauri_resource_dir,
-        );
+            &resource_root,
+            ResourceLayoutKind::WindowsResources,
+            &runtime_root,
+        )
+        .expect("configure packaged Python environment");
         assert!(effective.clear_env_called);
         for key in [
             "PYTHONHOME",

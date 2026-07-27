@@ -11,6 +11,7 @@ from api import (
     _check_control_plane_limits,
     _control_plane_identity_for_request,
     _control_server_owner_identity,
+    _is_public_api_rate_limit_exempt_path,
     _load_relay_server_registration_tokens,
     init_app,
 )
@@ -46,6 +47,46 @@ def test_rate_limit_uses_openai_style_error_payload():
     assert payload["error"]["type"] == "rate_limit_error"
     assert payload["error"]["code"] == "rate_limit_exceeded"
     assert "rate limit exceeded" in payload["error"]["message"].lower()
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1/minute", "API_DAILY_QUOTA": "1/day"},
+    clear=True,
+)
+def test_public_information_reads_are_exempt_without_consuming_user_quota():
+    """Presentation and release metadata reads should leave user quota intact."""
+    app = Flask(__name__)
+    init_app(app)
+
+    @app.route("/", methods=["GET", "POST"])
+    @app.route("/api/v1/meta", methods=["GET", "POST"])
+    @app.route("/api/v1/version", methods=["GET", "POST"])
+    def public_information():
+        return {"status": "ok"}
+
+    with app.test_client() as client:
+        for method in (client.get, client.head):
+            for path in ("/", "/api/v1/meta", "/api/v1/version"):
+                assert [method(path).status_code for _ in range(3)] == [200, 200, 200]
+
+        first_user_response = client.get("/api/v1/models")
+        limited_user_response = client.get("/api/v1/models")
+
+    assert first_user_response.status_code == 200
+    assert limited_user_response.status_code == 429
+    assert limited_user_response.get_json()["error"]["type"] == "rate_limit_error"
+    assert limited_user_response.get_json()["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_public_information_exemption_does_not_cover_mutation_methods():
+    """Exact public-information paths should exempt only safe read methods."""
+    app = Flask(__name__)
+
+    for path in ("/", "/api/v1/meta", "/api/v1/version"):
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            with app.test_request_context(path, method=method):
+                assert not _is_public_api_rate_limit_exempt_path(path)
 
 
 @patch.dict(

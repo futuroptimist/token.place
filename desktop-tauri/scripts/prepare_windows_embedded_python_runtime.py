@@ -326,6 +326,7 @@ def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str]
         for artifact in m.get("native_dll_artifacts", [])
         if isinstance(artifact, dict) and artifact.get("name") and artifact.get("destination")
     }
+    candidates.update(manifest_destinations)
 
     # A dependency imported by Python/NumPy before llama_cpp registers its private
     # directory must be app-local beside python.exe. Report that manifest-owned
@@ -349,27 +350,41 @@ def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str]
         if name in visited or name in visiting:
             return
         visiting.add(name)
-        imports = entries[name].get("imports", [])
+        imports = entries.get(name, {}).get("imports", [])
         if isinstance(imports, list):
             for dependency in sorted(str(item).lower() for item in imports):
-                if dependency in entries:
+                if dependency in candidates:
                     visit(dependency)
         visiting.remove(name)
         visited.add(name)
         ordered.append(name)
 
+    for candidate in sorted(entries):
+        visit(candidate)
+    # Manifest-owned members not referenced by the recorded closure are still
+    # provenance-owned, but come after the dependency graph they cannot explain.
     for candidate in sorted(candidates):
         visit(candidate)
     for name in ordered:
         script = """
 import ctypes, json, sys
-try:
-    ctypes.WinDLL(sys.argv[1])
-except OSError as exc:
-    code = getattr(exc, 'winerror', None)
-    print(json.dumps({'code': code if code in (126, 127, 193) else None}))
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+load = kernel32.LoadLibraryExW
+load.argtypes = (ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32)
+load.restype = ctypes.c_void_p
+free = kernel32.FreeLibrary
+free.argtypes = (ctypes.c_void_p,)
+free.restype = ctypes.c_int
+ctypes.set_last_error(0)
+# Match CPython's extension-module search behavior: search the loaded DLL's
+# directory and the process default DLL directories, never the ambient cwd.
+handle = load(sys.argv[1], None, 0x00000100 | 0x00001000)
+if not handle:
+    code = ctypes.get_last_error()
+    print(json.dumps({'loaded':False,'code':code if code in (126,127,193) else None}, separators=(',',':')))
     raise SystemExit(1)
-print('{"code":null}')
+free(handle)
+print('{"loaded":true,"code":null}')
 """
         try:
             result = subprocess.run(
@@ -382,12 +397,16 @@ print('{"code":null}')
             )
         except (OSError, subprocess.TimeoutExpired):
             return name, None
-        if result.returncode:
-            try:
-                code = json.loads(result.stdout).get("code")
-            except (json.JSONDecodeError, AttributeError):
-                code = None
-            return name, code if code in NATIVE_IMPORT_DIAGNOSTIC_CODES else None
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return name, None
+        if result.returncode == 0 and payload == {"loaded": True, "code": None}:
+            continue
+        if not isinstance(payload, dict) or set(payload) != {"loaded", "code"} or payload.get("loaded") is not False:
+            return name, None
+        code = payload.get("code")
+        return name, code if code in NATIVE_IMPORT_DIAGNOSTIC_CODES else None
     return "unknown", None
 
 

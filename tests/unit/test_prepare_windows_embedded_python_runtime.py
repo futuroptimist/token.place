@@ -1059,7 +1059,7 @@ def test_staged_native_import_failure_is_bounded_and_identifies_closure_member(t
     secret = r'C:\Users\Secret\sentinel.dll'
     results = iter([
         prep.subprocess.CompletedProcess([], 1, '', secret),
-        prep.subprocess.CompletedProcess([], 1, '{"code":126}\n', secret),
+        prep.subprocess.CompletedProcess([], 1, '{"loaded":false,"code":126}\n', secret),
     ])
     monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: next(results))
 
@@ -1071,6 +1071,123 @@ def test_staged_native_import_failure_is_bounded_and_identifies_closure_member(t
         )
     assert str(raised.value) == 'staged native import failed: ggml-base.dll:winerror_126'
     assert secret not in str(raised.value)
+
+
+@pytest.mark.parametrize('code', [126, 127, 193])
+def test_native_import_diagnostic_uses_loadlibraryex_code_and_dependency_order(tmp_path, monkeypatch, code):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    native.mkdir(parents=True)
+    dependency = native / 'dependency.dll'
+    consumer = native / 'consumer.pyd'
+    dependency.write_bytes(b'dll')
+    consumer.write_bytes(b'pyd')
+    calls = []
+
+    def completed(command, **kwargs):
+        calls.append((command, kwargs))
+        return prep.subprocess.CompletedProcess(
+            command, 1, json.dumps({'loaded': False, 'code': code}), r'C:\secret\loader detail'
+        )
+
+    monkeypatch.setattr(prep.subprocess, 'run', completed)
+    result = prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {'PATH': 'closed'},
+        [
+            {'name': consumer.name, 'path': consumer.relative_to(runtime).as_posix(), 'imports': [dependency.name]},
+            {'name': dependency.name, 'path': dependency.relative_to(runtime).as_posix(), 'imports': []},
+        ],
+        {'native_dll_artifacts': []},
+    )
+
+    assert result == ('dependency.dll', code)
+    assert calls[0][0][-1] == str(dependency)
+    probe_script = calls[0][0][3]
+    assert 'LoadLibraryExW' in probe_script
+    assert 'use_last_error=True' in probe_script
+    assert 'ctypes.get_last_error()' in probe_script
+    assert '0x00000100 | 0x00001000' in probe_script
+    assert calls[0][1]['env'] == {'PATH': 'closed'}
+
+
+def test_native_import_diagnostic_reports_consumer_after_dependencies_load(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    native.mkdir(parents=True)
+    dependency = native / 'dependency.dll'
+    consumer = native / 'consumer.pyd'
+    dependency.write_bytes(b'dll')
+    consumer.write_bytes(b'pyd')
+    results = iter([
+        prep.subprocess.CompletedProcess([], 0, '{"loaded":true,"code":null}', ''),
+        prep.subprocess.CompletedProcess([], 1, '{"loaded":false,"code":193}', ''),
+    ])
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: next(results))
+
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [
+            {'name': consumer.name, 'path': consumer.relative_to(runtime).as_posix(), 'imports': [dependency.name]},
+            {'name': dependency.name, 'path': dependency.relative_to(runtime).as_posix(), 'imports': []},
+        ],
+        {'native_dll_artifacts': []},
+    ) == ('consumer.pyd', 193)
+
+
+@pytest.mark.parametrize('stdout,returncode', [('', 1), ('not-json', 1), ('{"loaded":false,"code":5}', 1)])
+def test_native_import_diagnostic_maps_malformed_or_unsupported_child_output(
+    tmp_path, monkeypatch, stdout, returncode
+):
+    runtime = tmp_path / 'python-runtime'
+    member = runtime / 'member.dll'
+    runtime.mkdir()
+    member.write_bytes(b'dll')
+    monkeypatch.setattr(
+        prep.subprocess, 'run',
+        lambda *args, **kwargs: prep.subprocess.CompletedProcess(args[0], returncode, stdout, r'C:\secret'),
+    )
+
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [{'name': member.name, 'path': member.name, 'imports': []}],
+        {'native_dll_artifacts': []},
+    ) == ('member.dll', None)
+
+
+def test_native_import_diagnostic_maps_timeout_without_disclosure(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    member = runtime / 'member.dll'
+    runtime.mkdir()
+    member.write_bytes(b'dll')
+    monkeypatch.setattr(
+        prep.subprocess, 'run',
+        lambda *args, **kwargs: (_ for _ in ()).throw(prep.subprocess.TimeoutExpired('secret-command', 15)),
+    )
+
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [{'name': member.name, 'path': member.name, 'imports': []}],
+        {'native_dll_artifacts': []},
+    ) == ('member.dll', None)
+
+
+def test_native_import_diagnostic_success_has_no_invented_failure(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    member = runtime / 'member.dll'
+    runtime.mkdir()
+    member.write_bytes(b'dll')
+    monkeypatch.setattr(
+        prep.subprocess, 'run',
+        lambda *args, **kwargs: prep.subprocess.CompletedProcess(
+            args[0], 0, '{"loaded":true,"code":null}', ''
+        ),
+    )
+
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [{'name': member.name, 'path': member.name, 'imports': []}],
+        {'native_dll_artifacts': []},
+    ) == ('unknown', None)
 
 
 def test_staged_native_import_diagnoses_manifest_owned_numpy_dependency(tmp_path, monkeypatch):

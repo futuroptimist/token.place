@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import os
@@ -399,6 +400,8 @@ def assert_relay_roundtrip(
     relay_log: Path,
     driver_log: Path,
     driver: webdriver.Remote,
+    *,
+    prompt_text: str = "say hello from mock",
 ) -> None:
     client = CryptoClient(relay_url, debug=True)
     deadline = time.time() + 45
@@ -411,7 +414,7 @@ def assert_relay_roundtrip(
             diagnostics_message("failed to fetch server public key from relay", relay_log, driver_log, driver)
         )
 
-    response = client.send_chat_message("say hello from mock", max_retries=12)
+    response = client.send_chat_message(prompt_text, max_retries=12)
     if not response:
         raise RuntimeError(
             diagnostics_message("no relay roundtrip response returned to client", relay_log, driver_log, driver)
@@ -551,7 +554,65 @@ def tauri_driver_command() -> list[str]:
     )
 
 
-def main() -> int:
+def _status_value(driver: webdriver.Remote, label: str) -> str:
+    return driver.find_element(
+        By.XPATH, f"//p[contains(.,'{label}:')]//*[self::code or self::strong][1]"
+    ).text.strip()
+
+
+def assert_packaged_windows_nvidia_status(
+    driver: webdriver.Remote, context_tier: str
+) -> None:
+    """Fail closed unless Rust-managed UI status proves a real CUDA worker."""
+    expected = {
+        "Requested mode": "gpu",
+        "Backend available": "cuda",
+        "Backend selected": "cuda",
+        "Backend used": "cuda",
+        "Context tier": context_tier,
+        "Worker state": "ready",
+        "Worker alive": "yes",
+    }
+    observed = {label: _status_value(driver, label).lower() for label in expected}
+    for label, value in expected.items():
+        if observed[label] != value:
+            raise AssertionError(f"hardware status {label}={observed[label]!r}, expected {value!r}")
+    for label in ("Runtime ID", "Launcher source", "Interpreter"):
+        value = _status_value(driver, label).lower()
+        if value in {"", "pending", "unknown"}:
+            raise AssertionError(f"hardware status {label} was not concrete")
+    if _status_value(driver, "Interpreter").lower() != "python.exe":
+        raise AssertionError("hardware gate did not use the bundled Windows interpreter")
+    operator_log_path = Path(_status_value(driver, "Operator debug log"))
+    if not operator_log_path.is_file():
+        raise AssertionError("hardware operator debug log is unavailable")
+    evidence = (driver.page_source + operator_log_path.read_text(
+        encoding="utf-8", errors="replace"
+    )).lower()
+    required = ("warm load", "offloaded_layers", "kv_cache_device", "physical_device")
+    if any(marker not in evidence for marker in required):
+        raise AssertionError("hardware readiness evidence is incomplete")
+    forbidden = (
+        "physical_device_missing",
+        "repo_shim_imported=true",
+        "llama_repo_stub_imported=true",
+        "kv_cache_device=cpu",
+        "offloaded_layers=0",
+    )
+    if any(marker in evidence for marker in forbidden):
+        raise AssertionError("hardware readiness evidence reports fallback, fake, or missing device state")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--packaged-windows-nvidia-hardware", action="store_true")
+    parser.add_argument("--app-binary", type=Path)
+    parser.add_argument("--model", type=Path)
+    parser.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
+    args = parser.parse_args(argv)
+    hardware_mode = args.packaged_windows_nvidia_hardware
+    if hardware_mode and (args.app_binary is None or args.model is None):
+        parser.error("packaged Windows NVIDIA mode requires --app-binary and --model")
     relay_port = reserve_free_port()
     relay_url = f"http://127.0.0.1:{relay_port}"
 
@@ -560,17 +621,26 @@ def main() -> int:
     driver_log = logs_dir / "tauri-driver.log"
 
     env = os.environ.copy()
-    env["USE_MOCK_LLM"] = "1"
+    if hardware_mode:
+        for key in (
+            "USE_MOCK_LLM", "TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON",
+            "PYTHONPATH", "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP",
+        ):
+            env.pop(key, None)
+    else:
+        env["USE_MOCK_LLM"] = "1"
     # This harness is a confirmed DevSourceTree launch, so provide the explicit
     # interpreter override required by the fail-closed launcher policy without
     # restoring PATH probing for packaged/runtime launches.
-    env["TOKEN_PLACE_PYTHON"] = sys.executable
-    env["TOKEN_PLACE_SIDECAR_PYTHON"] = sys.executable
+    if not hardware_mode:
+        env["TOKEN_PLACE_PYTHON"] = sys.executable
+        env["TOKEN_PLACE_SIDECAR_PYTHON"] = sys.executable
     env["TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"] = "120"
-    existing_pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = (
-        f"{REPO_ROOT}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(REPO_ROOT)
-    )
+    if not hardware_mode:
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            f"{REPO_ROOT}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(REPO_ROOT)
+        )
     isolated_home = Path(tempfile.mkdtemp(prefix="token-place-desktop-e2e-home-"))
     env["HOME"] = str(isolated_home)
     env["XDG_CONFIG_HOME"] = str(isolated_home / ".config")
@@ -588,7 +658,7 @@ def main() -> int:
             "127.0.0.1",
             "--port",
             str(relay_port),
-            "--use_mock_llm",
+            *([] if hardware_mode else ["--use_mock_llm"]),
         ],
         cwd=REPO_ROOT,
         env=env,
@@ -610,7 +680,7 @@ def main() -> int:
 
     driver: webdriver.Remote | None = None
     landing_driver: webdriver.Chrome | None = None
-    model_path = resolve_real_e2e_model_path()
+    model_path = args.model.resolve(strict=True) if hardware_mode else resolve_real_e2e_model_path()
     try:
         wait_for_http_200(f"{relay_url}/livez")
         ensure_alive(relay, "relay")
@@ -626,7 +696,9 @@ def main() -> int:
         ensure_alive(tauri_driver, "tauri-driver")
 
         suffix = ".exe" if sys.platform == "win32" else ""
-        app_binary = TAURI_ROOT / "target" / "debug" / f"token-place-desktop-tauri{suffix}"
+        app_binary = args.app_binary.resolve(strict=True) if hardware_mode else (
+            TAURI_ROOT / "target" / "debug" / f"token-place-desktop-tauri{suffix}"
+        )
         if not app_binary.exists():
             raise RuntimeError(f"missing desktop binary: {app_binary}")
 
@@ -654,6 +726,19 @@ def main() -> int:
         assert_model_path_exists(str(model_path))
         fill_input_by_label(driver, "Relay URL 1", relay_url)
 
+        if hardware_mode:
+            mode_select = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
+            driver.execute_script(
+                "arguments[0].value='gpu'; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+                mode_select,
+            )
+            tier_select = driver.find_element(By.XPATH, "//select[@aria-label='Context tier']")
+            driver.execute_script(
+                "arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+                tier_select,
+                args.context_tier,
+            )
+
         wait_for_start_operator_enabled(driver, relay_log, driver_log)
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
 
@@ -666,6 +751,8 @@ def main() -> int:
             "//strong[starts-with(normalize-space(), 'yes')]"
         )
         wait.until(lambda d: d.find_element(By.XPATH, registered_ready_xpath))
+        if hardware_mode:
+            assert_packaged_windows_nvidia_status(driver, args.context_tier)
         wait_for_relay_diagnostics_count(relay_url, 1, timeout_seconds=5.0)
         operator_log = read_tail(relay_log) + read_tail(driver_log)
         assert "lease_seconds=120" in operator_log
@@ -681,7 +768,10 @@ def main() -> int:
             By.XPATH,
             "//label[normalize-space()='Prompt']/following-sibling::textarea[1]",
         )
-        prompt.send_keys("say hello from mock")
+        inference_prompt = (
+            "Return a short hardware acceptance response." if hardware_mode else "say hello from mock"
+        )
+        prompt.send_keys(inference_prompt)
         wait.until(
             lambda d: d.find_element(By.XPATH, "//button[.='Start local inference']").is_enabled()
         )
@@ -703,7 +793,19 @@ def main() -> int:
             assert marker not in lowered_last_error, (
                 f"Last error contains forbidden marker `{marker}`: {last_error_text}"
             )
-        assert_relay_roundtrip(relay_url, relay_log, driver_log, driver)
+        assert_relay_roundtrip(
+            relay_url,
+            relay_log,
+            driver_log,
+            driver,
+            prompt_text=inference_prompt,
+        )
+        if hardware_mode:
+            combined_log = (read_tail(relay_log) + read_tail(driver_log)).lower()
+            if "use_mock_llm=1" in combined_log or "mock inference" in combined_log:
+                raise AssertionError("hardware encrypted inference used mock inference")
+            if inference_prompt.lower() in combined_log:
+                raise AssertionError("plaintext hardware prompt appeared in relay-owned logs")
 
         stop_clicked_at = time.monotonic()
         driver.find_element(By.XPATH, "//button[.='Stop operator']").click()

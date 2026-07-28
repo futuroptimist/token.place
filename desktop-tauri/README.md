@@ -218,20 +218,14 @@ It prints:
   ```
 - Real Windows 11 + NVIDIA GPU viability smoke test (same desktop Python/runtime path):
   ```powershell
-  python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode gpu --context-tier 64k-full --model "$env:APPDATA\token.place\models\Qwen3-8B-Q4_K_M.gguf"
+  python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --installer C:\path\to\token-place-setup.exe --mode gpu --context-tier 64k-full --model "$env:APPDATA\token.place\models\Qwen3-8B-Q4_K_M.gguf"
   ```
-  Pass means desktop-side diagnostics and an authoritative `compute_node_bridge.py` operational
-  `started` event both report `context_tier=64k-full`, CUDA availability/usage, positive GPU
-  offload, non-CPU KV cache, successful warm load, and `llama_repo_stub_imported=false`. The
-  helper ignores early provisioning `started` events with pending backends and sends cancel only
-  after the CUDA-ready state is validated. Safe local phase output should progress through
-  `dependency_check`, optional `dependency_install`/`lock_wait`, `runtime_probe`, optional
-  `runtime_install` or `cuda_build`, `runtime_verification`, optional `reexec`,
-  `model_preflight`, `warm_load`, and ready/registered status. Long phases emit safe heartbeats
-  at least every 5 seconds; a fast path may skip build/reexec while a repair path includes them.
-  Absolute module paths remain private in bridge/runtime status: public payloads expose only safe origin booleans/categories,
-  while the helper verifies runtime origin internally and does not require public `llama_module_path`. Fake-CUDA CI is not evidence of a successful
-  real Windows 11 NVIDIA run; use the command above for the packaged staging validation.
+  Pass means the canonical Qwen3 artifact matches its filename, size, and SHA-256; the installed
+  Tauri executable starts the Rust-managed operator through the UI; and status proves a concrete
+  NVIDIA device, bundled runtime, CUDA selection/use, positive offload, non-CPU KV cache, and warm
+  load. The gate completes a non-mock encrypted API-v1 turn, clicks Stop, observes relay count zero,
+  and requires ordered unregister success followed by a natural bridge exit. Direct bridge launch
+  or cancellation, `physical_device_missing`, CPU fallback, repo shims, and mock inference fail.
 
 ## Packaged operator debug logs
 

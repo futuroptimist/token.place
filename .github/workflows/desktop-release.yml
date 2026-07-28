@@ -674,8 +674,8 @@ jobs:
         run: |
           $setup = Get-ChildItem release-assets/windows -Filter '*-setup.exe' | Sort-Object Name | Select-Object -First 1
           if (-not $setup) { throw 'Windows NSIS setup artifact was not downloaded.' }
-          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --mode gpu --context-tier 8k-fast
-          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --mode gpu --context-tier 64k-full
+          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --model $env:TOKEN_PLACE_WINDOWS_NVIDIA_SMOKE_MODEL --mode gpu --context-tier 8k-fast
+          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --model $env:TOKEN_PLACE_WINDOWS_NVIDIA_SMOKE_MODEL --mode gpu --context-tier 64k-full
 
   publish:
     name: Publish GitHub Release

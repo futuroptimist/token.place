@@ -1102,7 +1102,7 @@ def test_native_import_diagnostic_uses_loadlibraryex_code_and_dependency_order(t
 
     assert result == ('dependency.dll', code)
     assert calls[0][0][-2] == str(dependency.resolve())
-    assert json.loads(calls[0][0][-1]) == [str(native.resolve())]
+    assert json.loads(calls[0][0][-1]) == []
     probe_script = calls[0][0][3]
     assert 'LoadLibraryExW' in probe_script
     assert "__import__('os').add_dll_directory(path)" in probe_script
@@ -1238,11 +1238,86 @@ def test_native_import_diagnostic_registers_numpy_sibling_directory_deterministi
 
     assert result == ('unknown', None)
     assert [Path(command[-2]).name for command in calls] == [dependency.name, consumer.name]
-    expected_directories = sorted(
-        [str(core.resolve()), str(numpy_libs.resolve())], key=str.casefold
-    )
-    assert all(json.loads(command[-1]) == expected_directories for command in calls)
+    # The dependency uses LoadLibraryExW's DLL_LOAD_DIR for its own directory.
+    # The consumer additionally receives only its recorded dependency directory,
+    # matching NumPy's registration of the sibling numpy.libs directory.
+    assert [json.loads(command[-1]) for command in calls] == [
+        [],
+        [str(numpy_libs.resolve())],
+    ]
     assert all('dll_directory_handles' in command[3] for command in calls)
+
+
+def test_native_import_diagnostic_uses_minimal_transitive_directory_scope(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    consumer_dir = runtime / 'Lib/site-packages/package'
+    dependency_dir = runtime / 'Lib/site-packages/package.libs'
+    unrelated_dir = runtime / 'Lib/site-packages/unrelated.libs'
+    consumer_dir.mkdir(parents=True)
+    dependency_dir.mkdir(parents=True)
+    unrelated_dir.mkdir(parents=True)
+    consumer = consumer_dir / 'consumer.pyd'
+    dependency = dependency_dir / 'dependency.dll'
+    transitive = runtime / 'vcruntime140_1.dll'
+    unrelated = unrelated_dir / 'unrelated.dll'
+    for candidate in (consumer, dependency, transitive, unrelated):
+        candidate.write_bytes(b'native')
+    calls = {}
+
+    def completed(command, **kwargs):
+        calls[Path(command[-2]).name] = json.loads(command[-1])
+        return prep.subprocess.CompletedProcess(command, 0, '{"loaded":true,"code":null}', '')
+
+    monkeypatch.setattr(prep.subprocess, 'run', completed)
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [
+            {'name': consumer.name, 'path': consumer.relative_to(runtime).as_posix(), 'imports': [dependency.name]},
+            {'name': dependency.name, 'path': dependency.relative_to(runtime).as_posix(), 'imports': [transitive.name]},
+            {'name': transitive.name, 'path': transitive.relative_to(runtime).as_posix(), 'imports': []},
+            {'name': unrelated.name, 'path': unrelated.relative_to(runtime).as_posix(), 'imports': []},
+        ],
+        {'native_dll_artifacts': []},
+    ) == ('unknown', None)
+
+    assert calls[transitive.name] == []
+    assert calls[dependency.name] == [str(runtime.resolve())]
+    assert calls[consumer.name] == sorted(
+        [str(runtime.resolve()), str(dependency_dir.resolve())], key=str.casefold
+    )
+    assert all(str(unrelated_dir.resolve()) not in directories for directories in calls.values())
+
+
+def test_native_import_diagnostic_dependency_cycle_is_bounded(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    first_dir = runtime / 'first'
+    second_dir = runtime / 'second'
+    first_dir.mkdir(parents=True)
+    second_dir.mkdir(parents=True)
+    first = first_dir / 'first.dll'
+    second = second_dir / 'second.dll'
+    first.write_bytes(b'first')
+    second.write_bytes(b'second')
+    calls = {}
+
+    def completed(command, **kwargs):
+        calls[Path(command[-2]).name] = json.loads(command[-1])
+        return prep.subprocess.CompletedProcess(command, 0, '{"loaded":true,"code":null}', '')
+
+    monkeypatch.setattr(prep.subprocess, 'run', completed)
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [
+            {'name': first.name, 'path': first.relative_to(runtime).as_posix(), 'imports': [second.name]},
+            {'name': second.name, 'path': second.relative_to(runtime).as_posix(), 'imports': [first.name]},
+        ],
+        {'native_dll_artifacts': []},
+    ) == ('unknown', None)
+
+    assert calls == {
+        first.name: [str(second_dir.resolve())],
+        second.name: [str(first_dir.resolve())],
+    }
 
 
 def test_native_import_diagnostic_rejects_candidate_outside_runtime(tmp_path, monkeypatch):

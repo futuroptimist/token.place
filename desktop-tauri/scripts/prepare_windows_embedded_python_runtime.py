@@ -376,11 +376,29 @@ def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str]
         if not candidate.is_file() or not candidate.is_relative_to(runtime):
             return name, None
         resolved_candidates[name] = candidate
-    dll_directories = sorted(
-        {candidate.parent for candidate in resolved_candidates.values()},
-        key=lambda path: str(path).casefold(),
-    )
+    def dependency_directories(name: str) -> list[Path]:
+        """Return only directories in this member's recorded dependency closure."""
+        dependencies: set[str] = set()
+
+        def collect(candidate_name: str) -> None:
+            imports = entries.get(candidate_name, {}).get("imports", [])
+            if not isinstance(imports, list):
+                return
+            for dependency in sorted(str(item).lower() for item in imports):
+                if dependency not in resolved_candidates or dependency in dependencies:
+                    continue
+                dependencies.add(dependency)
+                collect(dependency)
+
+        collect(name)
+        dependencies.discard(name)
+        return sorted(
+            {resolved_candidates[dependency].parent for dependency in dependencies},
+            key=lambda path: str(path).casefold(),
+        )
+
     for name in ordered:
+        dll_directories = dependency_directories(name)
         script = """
 import ctypes, json, sys
 directories = json.loads(sys.argv[2])

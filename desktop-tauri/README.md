@@ -123,6 +123,23 @@ Local output is a preview build only: unsigned or ad-hoc signed, not notarized, 
 CI produces without Apple Developer ID / Windows code-signing secrets configured. It's for
 validating the packaged runtime path locally, not for distribution.
 
+**Recovering from an interrupted build.** A machine losing power or restarting mid `cargo
+build`/`cargo fetch` can leave a corrupted Cargo registry cache or partially-written `.rmeta`
+build artifacts, which then fail on the next build with confusing errors like `key with no
+value, expected =` or `found invalid metadata files` / `corrupt metadata encountered` rather
+than a clean "try again". If you hit that, wipe the local build artifacts and retry:
+
+```bash
+python3 desktop-tauri/scripts/clean_local_build.py --all
+```
+
+(equivalently, `make desktop-clean`). With no flags it only removes fast-to-rebuild
+project-local output (`src-tauri/target/`, `src-tauri/gen/`, `release-artifacts/`, `dist/`);
+`--all` (or `--node-modules` / `--runtime` / `--cargo-registry` individually) also clears
+`node_modules`, the embedded Python runtime, and the **global** `~/.cargo/registry` cache
+(shared across every Rust project on the machine, not just this repo — that's why it's
+opt-in). `--dry-run` previews what would be removed.
+
 ## Privacy defaults
 
 - Prompt/response plaintext stays in-memory by default.

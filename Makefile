@@ -1,4 +1,4 @@
-.PHONY: lint test format desktop-parity-checks desktop-build docker-build k8s-deploy
+.PHONY: lint test format desktop-parity-checks desktop-build desktop-clean docker-build k8s-deploy
 
 lint:
 	pre-commit run --all-files
@@ -14,6 +14,9 @@ desktop-parity-checks:
 
 desktop-build:
 	python3 desktop-tauri/scripts/build_local.py
+
+desktop-clean:
+	python3 desktop-tauri/scripts/clean_local_build.py --all
 
 docker-build:
 	docker build -t tokenplace-relay:latest -f docker/Dockerfile.relay .

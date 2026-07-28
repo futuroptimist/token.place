@@ -91,6 +91,8 @@ Make targets surface the same workflows in shorthand:
 - `make desktop-build` → build a local desktop installer (`.app`/`.dmg` on macOS, NSIS/MSI on
   Windows) without waiting on the ~45 minute `desktop-release.yml` CI matrix; see
   [desktop-tauri/README.md](desktop-tauri/README.md#build-a-local-installer-fast-iteration-loop)
+- `make desktop-clean` → wipe local desktop build artifacts (Rust `target/`, npm deps, embedded
+  runtime, and the global Cargo registry cache) after an interrupted/corrupted build
 - `make docker-build` → build the relay Docker image used by remote nodes
 - `make k8s-deploy` → apply the current Kubernetes manifests
 

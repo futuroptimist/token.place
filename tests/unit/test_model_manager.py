@@ -2309,6 +2309,53 @@ def test_run_llama_cpp_import_watchdog_handles_nonzero_and_malformed_json(monkey
     assert model_manager_module._run_llama_cpp_import_watchdog(timeout_seconds=1) == {}
 
 
+def test_llama_cpp_path_prefixed_code_preserves_stdout_on_success():
+    from utils.llm import model_manager as model_manager_module
+
+    code = model_manager_module._llama_cpp_path_prefixed_code(
+        "print('HELLO_FROM_WRAPPED_CODE')\n", repr('[]')
+    )
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+
+    assert result.returncode == 0
+    assert result.stdout == 'HELLO_FROM_WRAPPED_CODE\n'
+    assert result.stderr == ''
+
+
+def test_llama_cpp_stdlib_guard_flushes_diagnostic_before_raising(tmp_path):
+    """Regression test: a shadowed-stdlib-module failure in the guard must
+    never be silently lost. The guard now explicitly prints and flushes a
+    diagnostic line to stderr before raising, independent of whatever
+    background reader thread the parent process uses to drain stderr, so
+    the real cause is never reported as a bare early exit with empty
+    stdout/stderr tails."""
+    from utils.llm import model_manager as model_manager_module
+
+    (tmp_path / 'json.py').write_text('# fake shim shadowing stdlib json\n')
+    guard_code = model_manager_module._llama_cpp_stdlib_guard_code()
+    full_code = f'import sys\nsys.path.insert(0, {str(tmp_path)!r})\n' + guard_code
+
+    result = subprocess.run([sys.executable, '-c', full_code], capture_output=True, text=True)
+
+    assert result.returncode == 1
+    assert 'stdlib module json shadowed by' in result.stderr
+    assert 'ImportError' in result.stderr
+
+
+def test_llama_cpp_stdlib_guard_strips_windows_extended_length_path_prefix():
+    from utils.llm import model_manager as model_manager_module
+
+    guard_code = model_manager_module._llama_cpp_stdlib_guard_code()
+    setup_code = guard_code.split('_token_place_stdlib_candidates = [', 1)[0]
+    namespace = {}
+    exec(setup_code, namespace)
+    strip = namespace['_token_place_strip_ext_prefix']
+
+    assert strip(r'\\?\C:\Users\danie\AppData\Local\Temp\x') == r'C:\Users\danie\AppData\Local\Temp\x'
+    assert strip(r'C:\Users\danie\x') == r'C:\Users\danie\x'
+    assert strip(r'\\?\UNC\server\share\x') == r'\\server\share\x'
+
+
 def test_import_llama_cpp_runtime_success_records_sanitized_parent_import(monkeypatch):
     from utils.llm import model_manager as model_manager_module
     _force_parent_signal_guard(monkeypatch, model_manager_module)

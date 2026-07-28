@@ -796,8 +796,17 @@ def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expect
 
 
 def launch_for_operator_record(exe: Path, env: dict[str, str], log_path: Path | None = None) -> str:
+    # Uses --operator-start-preflight-cpu-smoke, not --operator-start-preflight:
+    # this script runs on hosted Windows runners with no NVIDIA GPU/driver
+    # present (see module docstring), and the real preflight now performs
+    # genuine CUDA validation (see PR #1549) rather than a fabricated ready
+    # event, so it correctly requires a GPU to pass. The CPU-smoke variant
+    # validates the same packaging/launch/resource-resolution structure
+    # without claiming GPU/CUDA validation. Real GPU regression coverage is
+    # tracked in https://github.com/futuroptimist/token.place/issues/1555
+    # pending a self-hosted GPU runner.
     result = _run(
-        [str(exe), "--operator-start-preflight"],
+        [str(exe), "--operator-start-preflight-cpu-smoke"],
         env=env,
         timeout=90,
         check=False,
@@ -856,6 +865,16 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
                 raise InstallerIdentityError("operator-start preflight did not observe a spawned child and parsed bridge event")
             if data.get("native_runtime_validated") is not True or data.get("startup_result") != "runtime_validated":
                 raise InstallerIdentityError("operator-start preflight did not validate the production native runtime; terminal_actionable_error is not success")
+        elif data.get("operator_start_preflight") == "cpu_smoke_ok":
+            # Structural-only variant (see launch_for_operator_record): deliberately
+            # does not require native_runtime_validated/runtime_validated, since it
+            # never claims GPU/CUDA validation in the first place.
+            if data.get("resource_context_source") != "tauri_app_handle":
+                raise InstallerIdentityError("operator-start preflight did not use the real Tauri AppHandle resource context")
+            if data.get("bridge_child_spawned") is not True or data.get("bridge_event_received") is not True:
+                raise InstallerIdentityError("operator-start preflight did not observe a spawned child and parsed bridge event")
+            if data.get("selected_backend") != "cpu" or data.get("startup_result") != "cpu_smoke_validated":
+                raise InstallerIdentityError("operator-start cpu-smoke preflight did not report a valid CPU-only structural result")
         elif data.get("startup_result") not in ("ready", "terminal_actionable_error"):
             raise InstallerIdentityError("operator-session smoke did not reach ready or a terminal actionable error")
         fallback_keys = ("fallback_reason", "backend_fallback", "model_fallback", "context_fallback")

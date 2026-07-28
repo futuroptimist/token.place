@@ -2335,6 +2335,68 @@ def test_main_operator_preflight_accepts_native_success_pairs(backend, action, c
     assert (payload['selected_backend'], payload['runtime_action']) == (backend, action)
 
 
+def test_main_operator_preflight_cpu_smoke_accepts_cpu_skip(capsys, monkeypatch):
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda mode, _tier: {'runtime_action': 'skipped', 'selected_backend': 'cpu'} if mode == 'cpu' else {},
+    )
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight-cpu-smoke'])
+
+    assert compute_node_bridge.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['startup_result'] == 'cpu_smoke_validated'
+    assert payload['cpu_smoke_preflight'] is True
+    assert payload['requested_mode'] == 'cpu'
+    assert (payload['selected_backend'], payload['runtime_action']) == ('cpu', 'skipped')
+    assert 'production_runtime_preflight' not in payload
+
+
+def test_main_operator_preflight_cpu_smoke_rejects_non_cpu_skip_pairs(capsys, monkeypatch):
+    # Defense in depth: even a genuine GPU success must not satisfy the
+    # CPU-only structural smoke gate -- the two contracts stay disjoint.
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda _mode, _tier: {'runtime_action': 'already_supported', 'selected_backend': 'cuda'},
+    )
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight-cpu-smoke'])
+
+    assert compute_node_bridge.main() == 1
+    assert json.loads(capsys.readouterr().out)['startup_result'] == 'runtime_validation_failed'
+
+
+def test_main_operator_preflight_cpu_smoke_reports_dependency_contract_failure(capsys, monkeypatch):
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda: {'ok': 'false'},
+    )
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight-cpu-smoke'])
+
+    assert compute_node_bridge.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['probe_stage'] == 'environment_contract'
+
+
+def test_main_operator_preflight_cpu_smoke_classifies_native_import_exception(capsys, monkeypatch):
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
+
+    def _raise(_mode, _tier):
+        raise RuntimeError('boom')
+
+    monkeypatch.setattr(compute_node_bridge, '_ensure_desktop_llama_runtime_for_context', _raise)
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py', '--operator-runtime-preflight-cpu-smoke'])
+
+    assert compute_node_bridge.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['probe_stage'] == 'native_import'
+    assert payload['probe_error_code'] == 'native_llama_import_failed'
+    assert payload['exception_type'] == 'RuntimeError'
+
+
 def test_main_emits_structured_error_when_last_resort_exception_path_runs(capsys, monkeypatch):
     def fake_run(_args):
         raise RuntimeError("boom")

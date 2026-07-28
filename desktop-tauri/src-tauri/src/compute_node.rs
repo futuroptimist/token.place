@@ -2012,6 +2012,79 @@ pub(crate) fn operator_start_preflight_record(
     Ok(payload)
 }
 
+/// Structural-only smoke gate: confirms the packaged app launches, resolves
+/// its bundled resources, and passes dependency/environment preflight on a
+/// CPU-only request. It does NOT claim GPU/CUDA/Metal validation -- that
+/// remains the sole responsibility of [`operator_start_preflight_record`]
+/// and its fail-closed `validate_production_operator_preflight_event`
+/// contract, which this function must never weaken or bypass. Intended for
+/// CI runners without a GPU (see desktop-operator-e2e.yml); real hardware
+/// validation happens on operator-facing GPU hardware separately.
+pub(crate) fn operator_start_preflight_cpu_smoke_record(
+    config: &DesktopConfig,
+    app: &AppHandle,
+) -> anyhow::Result<Value> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let current_exe = std::env::current_exe().ok();
+    let resource_dir = app.path().resource_dir().ok();
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
+        manifest_dir,
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
+    let preparation = prepare_operator_bridge_launch(&context)?;
+    let mut command = preparation.command()?;
+    configure_runtime_bootstrap_env(&mut command, &ComputeMode::Cpu);
+    command
+        .arg("--operator-runtime-preflight-cpu-smoke")
+        .arg("--mode")
+        .arg("cpu")
+        .arg("--context-tier")
+        .arg(normalize_context_tier(&config.context_tier));
+    let event = std::thread::spawn(move || -> anyhow::Result<Value> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_cpu_smoke_operator_preflight_child(
+                command,
+                OPERATOR_PREFLIGHT_EVENT_TIMEOUT,
+            ))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("operator_preflight_child_failed"))??;
+
+    let mut payload = operator_session_smoke_record_from_preparation(config, &preparation)?;
+    if let Value::Object(map) = &mut payload {
+        map.insert(
+            "operator_start_preflight".into(),
+            Value::String("cpu_smoke_ok".into()),
+        );
+        map.insert(
+            "resource_context_source".into(),
+            Value::String("tauri_app_handle".into()),
+        );
+        map.insert("bridge_child_spawned".into(), Value::Bool(true));
+        map.insert("bridge_event_received".into(), Value::Bool(true));
+        for key in [
+            "cpu_smoke_preflight",
+            "startup_result",
+            "requested_mode",
+            "selected_backend",
+            "runtime_action",
+            "provisioning_actions",
+            "repair_actions",
+            "pip_actions",
+            "compiler_actions",
+            "network_actions",
+            "download_actions",
+        ] {
+            map.insert(key.into(), event[key].clone());
+        }
+        map.insert("bridge_event_type".into(), event["type"].clone());
+    }
+    Ok(payload)
+}
+
 async fn cleanup_production_operator_preflight_child(child: &mut Child, pid: Option<u32>) {
     if let Some(pid) = pid {
         terminate_bridge_process_tree(pid).await;
@@ -2091,6 +2164,44 @@ fn validate_production_operator_preflight_event(event: Value) -> anyhow::Result<
         ),
         (Some("cuda"), Some("already_supported"))
             | (Some("metal"), Some("metal_already_supported"))
+    );
+    if !identity_is_valid
+        || !counters_are_zero
+        || !requested_mode_is_valid
+        || !runtime_pair_is_valid
+    {
+        anyhow::bail!("operator_preflight_invalid_event");
+    }
+    Ok(event)
+}
+
+/// Validates a CPU-only structural smoke event. Deliberately distinct from
+/// [`validate_production_operator_preflight_event`] (different marker field,
+/// different accepted `requested_mode`/`selected_backend`/`runtime_action`
+/// values) so a CPU-smoke pass can never be mistaken for real GPU/Metal
+/// validation by any downstream consumer.
+fn validate_cpu_smoke_operator_preflight_event(event: Value) -> anyhow::Result<Value> {
+    let identity_is_valid = event.get("type").and_then(Value::as_str) == Some("status")
+        && event.get("cpu_smoke_preflight").and_then(Value::as_bool) == Some(true)
+        && event.get("startup_result").and_then(Value::as_str) == Some("cpu_smoke_validated");
+    let counters_are_zero = [
+        "provisioning_actions",
+        "repair_actions",
+        "pip_actions",
+        "compiler_actions",
+        "network_actions",
+        "download_actions",
+    ]
+    .iter()
+    .all(|key| event.get(*key).and_then(Value::as_i64) == Some(0));
+    let requested_mode_is_valid =
+        event.get("requested_mode").and_then(Value::as_str) == Some("cpu");
+    let runtime_pair_is_valid = matches!(
+        (
+            event.get("selected_backend").and_then(Value::as_str),
+            event.get("runtime_action").and_then(Value::as_str),
+        ),
+        (Some("cpu"), Some("skipped"))
     );
     if !identity_is_valid
         || !counters_are_zero
@@ -2188,9 +2299,10 @@ fn validate_production_operator_preflight_failure_event(event: &Value) -> anyhow
     ))
 }
 
-async fn run_production_operator_preflight_child(
+async fn run_operator_preflight_child(
     mut command: Command,
     event_timeout: Duration,
+    validate_success: fn(Value) -> anyhow::Result<Value>,
 ) -> anyhow::Result<Value> {
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     isolate_bridge_process_tree(&mut command);
@@ -2219,11 +2331,35 @@ async fn run_production_operator_preflight_child(
                 validate_production_operator_preflight_failure_event(&event)?
             ));
         }
-        validate_production_operator_preflight_event(event)
+        validate_success(event)
     }
     .await;
     cleanup_production_operator_preflight_child(&mut child, pid).await;
     result
+}
+
+async fn run_production_operator_preflight_child(
+    command: Command,
+    event_timeout: Duration,
+) -> anyhow::Result<Value> {
+    run_operator_preflight_child(
+        command,
+        event_timeout,
+        validate_production_operator_preflight_event,
+    )
+    .await
+}
+
+async fn run_cpu_smoke_operator_preflight_child(
+    command: Command,
+    event_timeout: Duration,
+) -> anyhow::Result<Value> {
+    run_operator_preflight_child(
+        command,
+        event_timeout,
+        validate_cpu_smoke_operator_preflight_event,
+    )
+    .await
 }
 
 pub async fn start_compute_node(
@@ -4099,6 +4235,7 @@ mod tests {
 
     const PRODUCTION_PREFLIGHT_VALIDATED_EVENT: &str = r#"{"type":"status","production_runtime_preflight":true,"startup_result":"runtime_validated","requested_mode":"auto","selected_backend":"cuda","runtime_action":"already_supported","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
     const PRODUCTION_PREFLIGHT_FAILURE_EVENT: &str = r#"{"type":"status","startup_result":"runtime_validation_failed","probe_stage":"native_import","probe_error_code":"native_dll_load_failed","exception_type":"OSError","child_exit_code":101,"detected_architecture":"x86_64","architecture_source":"attested_windows_x86_64","import_root_valid":true,"provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
+    const CPU_SMOKE_PREFLIGHT_VALIDATED_EVENT: &str = r#"{"type":"status","cpu_smoke_preflight":true,"startup_result":"cpu_smoke_validated","requested_mode":"cpu","selected_backend":"cpu","runtime_action":"skipped","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
 
     fn operator_preflight_test_command(output: Option<&str>, wedge: bool) -> Command {
         #[cfg(unix)]
@@ -4175,6 +4312,65 @@ mod tests {
         assert!(!error
             .to_string()
             .contains("operator_preflight_event_missing"));
+    }
+
+    #[tokio::test]
+    async fn cpu_smoke_operator_preflight_accepts_valid_cpu_only_event() {
+        let event = run_cpu_smoke_operator_preflight_child(
+            operator_preflight_test_command(Some(CPU_SMOKE_PREFLIGHT_VALIDATED_EVENT), false),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("valid cpu-smoke event");
+
+        assert_eq!(event["type"], "status");
+        assert_eq!(event["cpu_smoke_preflight"], true);
+        assert_eq!(event["selected_backend"], "cpu");
+        assert_eq!(event["runtime_action"], "skipped");
+    }
+
+    #[tokio::test]
+    async fn cpu_smoke_operator_preflight_reports_valid_bounded_failure_event() {
+        let error = run_cpu_smoke_operator_preflight_child(
+            operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_FAILURE_EVENT), false),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("bounded failure must be transported");
+        assert_eq!(error.to_string(), "operator_preflight_runtime_validation_failed:probe_stage=native_import;probe_error_code=native_dll_load_failed;exception_type=OSError;child_exit_code=101;detected_architecture=x86_64;architecture_source=attested_windows_x86_64;import_root_valid=true");
+    }
+
+    #[test]
+    fn cpu_smoke_operator_preflight_rejects_gpu_flavored_and_mismatched_events() {
+        let valid: Value = serde_json::from_str(CPU_SMOKE_PREFLIGHT_VALIDATED_EVENT).unwrap();
+        for (key, value) in [
+            ("cpu_smoke_preflight", Value::Bool(false)),
+            ("startup_result", Value::String("runtime_validated".into())),
+            ("requested_mode", Value::String("auto".into())),
+            ("requested_mode", Value::String("gpu".into())),
+            ("selected_backend", Value::String("cuda".into())),
+            ("runtime_action", Value::String("already_supported".into())),
+            ("network_actions", Value::from(1)),
+        ] {
+            let mut event = valid.clone();
+            event[key] = value;
+            assert_eq!(
+                validate_cpu_smoke_operator_preflight_event(event)
+                    .expect_err("forged or mismatched cpu-smoke attestation")
+                    .to_string(),
+                "operator_preflight_invalid_event"
+            );
+        }
+
+        // A genuine production (GPU-validated) event must never validate as a
+        // cpu-smoke pass either -- the two contracts are intentionally disjoint.
+        let production: Value = serde_json::from_str(PRODUCTION_PREFLIGHT_VALIDATED_EVENT).unwrap();
+        assert_eq!(
+            validate_cpu_smoke_operator_preflight_event(production)
+                .expect_err("production event must not satisfy the cpu-smoke contract")
+                .to_string(),
+            "operator_preflight_invalid_event"
+        );
     }
 
     #[test]

@@ -671,6 +671,20 @@ pub fn run() {
                 println!("{}", payload);
                 std::process::exit(0);
             }
+            if std::env::args().any(|arg| arg == "--operator-start-preflight-cpu-smoke") {
+                // Structural-only smoke gate for CI runners without a GPU: confirms
+                // the packaged app launches and resolves its bundled resources
+                // without claiming GPU/CUDA/Metal validation. Distinct from
+                // --operator-start-preflight, which remains the real,
+                // GPU-required production preflight and must not be weakened.
+                let config = load_config_from_path(&config_path(&cli_config_dir()))
+                    .map_err(std::io::Error::other)?;
+                let payload =
+                    compute_node::operator_start_preflight_cpu_smoke_record(&config, &app.handle())
+                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                println!("{}", payload);
+                std::process::exit(0);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

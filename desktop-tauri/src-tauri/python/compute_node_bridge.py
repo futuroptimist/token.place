@@ -3034,6 +3034,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--installed-context-smoke", action="store_true")
     parser.add_argument("--operator-runtime-preflight", action="store_true")
+    parser.add_argument("--operator-runtime-preflight-cpu-smoke", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3050,9 +3051,13 @@ def main() -> int:
     if args.installed_context_smoke:
         print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))
         return 0
-    if args.operator_runtime_preflight:
+    if args.operator_runtime_preflight or args.operator_runtime_preflight_cpu_smoke:
         # Release acceptance must execute the immutable runtime checks; it may
         # not substitute a fabricated worker-ready event for native import.
+        # Shared by both the real (GPU-required) preflight and the CPU-only
+        # structural smoke variant below: a failure is a failure regardless of
+        # which mode was being validated, so the failure event shape stays
+        # identical between the two.
         def emit_failure(runtime: Optional[Dict[str, Any]], code: str, stage: str, exc: Optional[BaseException] = None) -> int:
             runtime = runtime or {}
             if stage not in {"environment_contract", "native_import", "runtime_validation", "probe_process"}:
@@ -3074,6 +3079,58 @@ def main() -> int:
             print(json.dumps(event, sort_keys=True, separators=(",", ":")), flush=True)
             return 1
 
+    if args.operator_runtime_preflight_cpu_smoke:
+        # Structural-only smoke gate for CI runners without a GPU: confirms the
+        # packaged app launches, resolves its bundled resources, and passes
+        # dependency/environment preflight on an explicit CPU-only request. It
+        # does NOT claim GPU/CUDA/Metal validation -- that remains the sole
+        # responsibility of --operator-runtime-preflight above, which this
+        # branch must never weaken or bypass. See
+        # desktop-tauri/scripts/test_windows_installer_identity.py and
+        # https://github.com/futuroptimist/token.place/issues/1555 for the
+        # follow-up to restore GPU-required CI coverage once a self-hosted
+        # GPU runner exists.
+        try:
+            dependency = ensure_desktop_python_dependencies()
+            if dependency.get("ok") != "true":
+                return emit_failure(dependency, "missing_environment_contract", "environment_contract")
+            _, normalize_context_tier = _load_context_profile_helpers()
+            context_tier = normalize_context_tier(args.context_tier)
+            runtime = _ensure_desktop_llama_runtime_for_context("cpu", context_tier)
+            selected_backend = runtime.get("selected_backend")
+            runtime_action = runtime.get("runtime_action")
+            if (selected_backend, runtime_action) != ("cpu", "skipped"):
+                code = runtime.get("probe_error_code")
+                if code not in {
+                    "missing_environment_contract", "native_llama_import_failed", "native_dll_load_failed",
+                    "runtime_version_or_provenance_invalid", "cuda_capability_missing", "physical_device_missing",
+                    "yarn_rope_capability_incomplete", "unsupported_platform", "probe_timeout", "probe_process_abnormal_exit",
+                }:
+                    code = "probe_process_abnormal_exit"
+                return emit_failure(runtime, code, str(runtime.get("probe_stage") or "runtime_validation"))
+        except Exception as exc:
+            code = "native_dll_load_failed" if _is_windows_dll_loader_error(exc) else "native_llama_import_failed"
+            return emit_failure(None, code, "native_import", exc)
+        print(json.dumps({
+            "type": "status",
+            "startup_result": "cpu_smoke_validated",
+            "startup_phase": "hardware_model_boundary",
+            "context_tier": context_tier,
+            "requested_mode": "cpu",
+            "selected_backend": selected_backend,
+            "runtime_action": runtime_action,
+            "cpu_smoke_preflight": True,
+            "runtime_provisioning_state": "ready",
+            "provisioning_actions": 0,
+            "repair_actions": 0,
+            "pip_actions": 0,
+            "compiler_actions": 0,
+            "network_actions": 0,
+            "download_actions": 0,
+        }, sort_keys=True, separators=(",", ":")), flush=True)
+        return 0
+
+    if args.operator_runtime_preflight:
         try:
             dependency = ensure_desktop_python_dependencies()
             if dependency.get("ok") != "true":

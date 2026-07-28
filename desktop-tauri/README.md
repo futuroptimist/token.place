@@ -38,6 +38,11 @@ npm ci
 npm run tauri dev
 ```
 
+`tauri dev` runs the UI against your system Python/sidecar; it does **not** package the
+embedded runtime, so it cannot exercise packaging-only bugs (embedded-runtime PATH handling,
+packaged import-root resolution, bundled resources). To build a real local installer instead,
+see [Build a local installer](#build-a-local-installer-fast-iteration-loop) below.
+
 During normal startup, desktop sidecars probe the active sidecar interpreter and, in GPU-capable modes, use platform-specific runtime bootstrap/repair where supported (Windows CUDA and macOS Metal) while preserving shared bridge lifecycle behavior. They emit:
 
 - `desktop.runtime_setup ...` during sidecar start (backend selected + fallback reason)
@@ -60,6 +65,63 @@ After a successful repair, the sidecar automatically re-execs once so the active
 - **Windows 11 + NVIDIA GPU**: validate with a CUDA-enabled llama.cpp sidecar build.
 - CPU fallback mode is available in both cases, with explicit fallback details surfaced in `desktop.runtime_setup ... fallback_reason=...` and `compute_runtime ... fallback_reason=...`. Missing `llama_cpp` is a dependency failure, not silent CPU fallback.
 - `backend_available` reports runtime capability, `backend_selected` reports policy selection, and `backend_used` reports the initialized relay-processing runtime. GPU release claims depend on `backend_used`.
+
+## Build a local installer (fast iteration loop)
+
+`.github/workflows/desktop-release.yml` (the canonical release build) takes roughly 45
+minutes per push, since it builds both macOS and Windows in a matrix. To validate packaging
+changes without that round trip, build a real local installer with one command:
+
+```bash
+python3 desktop-tauri/scripts/build_local.py
+```
+
+(equivalently, `make desktop-build` from the repo root). This reproduces the same sequence
+CI runs — Rust target setup, `npm ci`, embedded Python runtime prep, `npm run build`,
+`npm run tauri build`, and artifact staging/validation — and writes the result to
+`desktop-tauri/release-artifacts/`:
+
+- **macOS**: a `.app` (ad-hoc signed unless `APPLE_SIGNING_IDENTITY` /
+  `APPLE_CERTIFICATE_P12_BASE64` / `APPLE_CERTIFICATE_PASSWORD` are already set in your
+  environment, same as CI) and a `.dmg` built via `hdiutil`.
+- **Windows 11**: both a NSIS `*-setup.exe` and a `*.msi` (Tauri's bundler downloads NSIS/WiX
+  itself on first run — no separate install needed). Requires the MSVC C++ build tools
+  (Visual Studio "Desktop development with C++" workload or the standalone Build Tools) for
+  the Rust linker; WebView2 ships with Windows 11 already.
+
+This must run on the target OS itself — there is no cross-compilation from macOS to Windows
+or vice versa.
+
+**Launch the installed app, not the raw build output.** `classify_python_execution_layout()`
+in `src-tauri/src/python_runtime.rs` treats an executable running from beneath
+`src-tauri/target/` *while the source tree's `python/desktop_runtime_setup.py` is also
+present alongside it* as unbundled development, not a packaged run — by design, since
+`cargo build` output always lands under `target/` inside the checkout. Running the `.app`
+straight out of `src-tauri/target/.../bundle/macos/` (or the NSIS/MSI output before
+installing) while still inside the git checkout silently skips the bundled-runtime
+resolution path entirely and falls back to a system Python interpreter instead — which is a
+different code path than what ships. To actually exercise the packaged runtime resolution
+locally, install/copy the built app **out of the repo** first: open the `.dmg` and drag to
+`/Applications` on macOS, or run the NSIS/MSI installer on Windows, then launch it from
+there.
+
+Useful flags:
+- `--dry-run` — print the exact command sequence without running anything.
+- `--skip-install` — skip `npm ci` (e.g. `node_modules` is already current).
+- `--skip-validate` — skip the post-build artifact validation step.
+- `--fresh-runtime` — force re-running the embedded Python runtime prep. On Windows this
+  matters: unlike the macOS prep script, the Windows one has no "already valid" short-circuit
+  and always re-downloads the pinned CUDA wheel + native DLLs, so by default the wrapper
+  skips it once `src-tauri/python-runtime/python.exe` already exists. That's what turns
+  repeat local builds into a fast recompile loop instead of paying that download every time.
+
+The desktop-release CI pins **Node 20** and **Python 3.11**, which differ from the repo
+root's `.nvmrc` (18) and `.python-version` (3.12) — make sure the right versions are active
+(e.g. `nvm use 20`) before running the build.
+
+Local output is a preview build only: unsigned or ad-hoc signed, not notarized, matching what
+CI produces without Apple Developer ID / Windows code-signing secrets configured. It's for
+validating the packaged runtime path locally, not for distribution.
 
 ## Privacy defaults
 

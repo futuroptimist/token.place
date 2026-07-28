@@ -66,4 +66,8 @@ desktop-tauri/src-tauri/python-runtime/*
 !desktop-tauri/src-tauri/python-runtime/.gitkeep
 # Desktop runtime dependency target
 desktop-tauri/src-tauri/target/
+# Tauri CLI auto-generated capability/ACL schemas (regenerated on every build)
+desktop-tauri/src-tauri/gen/
+# Local desktop installer build output (desktop-tauri/scripts/build_local.py)
+desktop-tauri/release-artifacts/
 .token_place_desktop_site/

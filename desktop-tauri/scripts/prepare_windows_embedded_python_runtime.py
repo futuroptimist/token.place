@@ -58,10 +58,10 @@ WINDOWS_SYSTEM_DLLS = {
     "ole32.dll", "oleaut32.dll", "pdh.dll", "powrprof.dll", "psapi.dll", "rpcrt4.dll",
     "sechost.dll", "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll",
     "userenv.dll", "version.dll", "ws2_32.dll",
-    # Driver-provided and intentionally external; CUDA runtime/cuBLAS/OpenSSL/MSVC
-    # payloads must be bundled and validated as part of the runtime closure.
-    "nvcuda.dll",
 }
+# This is deliberately separate from ordinary Windows system DLLs: it is supplied
+# only by the NVIDIA display driver and may be absent on a driverless builder.
+WINDOWS_EXTERNAL_DRIVER_DLLS = {"nvcuda.dll"}
 WINDOWS_API_SET_DLL_RE = re.compile(r"^(api|ext)-ms-win-[a-z0-9-]+-l[0-9]+-[0-9]+-[0-9]+\.dll$", re.I)
 FORBIDDEN_RUNTIME_PAYLOAD_RE = re.compile(r"(^|[\\/])(cmake|ninja|nvcc|cl|msbuild)(\.exe)?$|cuda[-_]?toolkit|visual studio|(^|[\\/])buildtools([\\/]|$)|\.sln$|\.vcxproj$", re.I)
 
@@ -148,6 +148,9 @@ def load_manifest(path: Path=MANIFEST) -> dict:
 def is_windows_system_dll(name: str) -> bool:
     dll = name.lower()
     return dll in WINDOWS_SYSTEM_DLLS or bool(WINDOWS_API_SET_DLL_RE.fullmatch(dll))
+
+def is_windows_external_driver_dll(name: str) -> bool:
+    return name.lower() in WINDOWS_EXTERNAL_DRIVER_DLLS
 
 def fetch(url: str, sha: str, dest: Path) -> Path:
     original = _validated_artifact_url(url)
@@ -264,6 +267,8 @@ def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
 
 
 NATIVE_IMPORT_DIAGNOSTIC_CODES = {126, 127, 193}
+STAGED_NATIVE_IMPORT_VALID = "native_import_valid"
+STAGED_NATIVE_IMPORT_EXTERNAL_DRIVER_UNAVAILABLE = "external_driver_unavailable"
 NATIVE_LLAMA_DIRECTORY = "Lib/site-packages/llama_cpp/lib"
 APP_LOCAL_MSVC_DLLS = {"msvcp140.dll", "vcomp140.dll", "vcruntime140_1.dll"}
 
@@ -451,7 +456,77 @@ print('{"loaded":true,"code":null}')
     return "unknown", None
 
 
-def validate_staged_native_import(runtime: Path, m: dict, pe_closure: list[dict[str, object]]) -> None:
+def _driverless_native_import_boundary(
+    py: Path,
+    failed_name: str,
+    loader_code: int | str | None,
+    env: dict[str, str],
+    pe_closure: list[dict[str, object]],
+    m: dict,
+) -> bool:
+    """Prove that the failed member is blocked only by the NVIDIA driver DLL."""
+    if loader_code != 126:
+        return False
+    entries = {
+        str(entry.get("name", "")).lower(): entry
+        for entry in pe_closure
+        if isinstance(entry, dict) and entry.get("name")
+    }
+    runtime_names = set(entries)
+    runtime_names.update(
+        str(artifact.get("name", "")).lower()
+        for artifact in m.get("native_dll_artifacts", [])
+        if isinstance(artifact, dict) and artifact.get("name")
+    )
+    external: set[str] = set()
+    visited: set[str] = set()
+
+    def collect(name: str) -> bool:
+        if name in visited:
+            return True
+        visited.add(name)
+        entry = entries.get(name)
+        if entry is None or not isinstance(entry.get("imports", []), list):
+            return False
+        for imported in entry.get("imports", []):
+            dependency = str(imported).lower()
+            if dependency in runtime_names:
+                if dependency in entries and not collect(dependency):
+                    return False
+            elif is_windows_system_dll(dependency):
+                continue
+            elif is_windows_external_driver_dll(dependency):
+                external.add(dependency)
+            else:
+                return False
+        return True
+
+    if not collect(failed_name.lower()) or external != WINDOWS_EXTERNAL_DRIVER_DLLS:
+        return False
+    script = """
+import ctypes, json
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+load = kernel32.LoadLibraryExW
+load.argtypes = (ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32)
+load.restype = ctypes.c_void_p
+ctypes.set_last_error(0)
+handle = load('nvcuda.dll', None, 0x00001000)
+code = None if handle else ctypes.get_last_error()
+print(json.dumps({'loaded':bool(handle),'code':code if code in (126,127,193) else None}, separators=(',',':')))
+raise SystemExit(0 if handle else 1)
+"""
+    try:
+        result = subprocess.run(
+            [str(py), "-I", "-c", script], env=env, text=True,
+            capture_output=True, timeout=15, check=False,
+        )
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError):
+        return False
+    return result.returncode == 1 and payload == {"loaded": False, "code": 126}
+
+
+def validate_staged_native_import(runtime: Path, m: dict, pe_closure: list[dict[str, object]]) -> str:
     """Import the pinned native module under the packaged launcher's closed environment."""
     try:
         py = (runtime / m["expected_interpreter_path"]).resolve(strict=True)
@@ -474,8 +549,10 @@ def validate_staged_native_import(runtime: Path, m: dict, pe_closure: list[dict[
     except json.JSONDecodeError:
         payload = {}
     if result.returncode == 0 and payload == {"native_import_valid": True}:
-        return
+        return STAGED_NATIVE_IMPORT_VALID
     basename, code = _diagnose_native_import_failure(py, runtime, env, pe_closure, m)
+    if _driverless_native_import_boundary(py, basename, code, env, pe_closure, m):
+        return STAGED_NATIVE_IMPORT_EXTERNAL_DRIVER_UNAVAILABLE
     bounded_code = (
         f"winerror_{code}" if isinstance(code, int)
         else code if isinstance(code, str)
@@ -699,7 +776,7 @@ def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
         machine, imports = inspect_pe(pe, rel)
         closure.append({'name': pe.name, 'path': rel, 'machine': machine, 'imports': sorted(imports), 'sha256': sha256_file(pe)})
         for dll in imports:
-            if is_windows_system_dll(dll):
+            if is_windows_system_dll(dll) or is_windows_external_driver_dll(dll):
                 continue
             target = _resolve_import_target(pe, dll, candidates, runtime)
             if target is None:

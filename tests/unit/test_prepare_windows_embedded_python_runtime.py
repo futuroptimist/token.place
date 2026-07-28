@@ -681,7 +681,8 @@ def test_api_set_and_netapi_imports_are_os_provided_but_app_dependencies_must_bu
 
     for dll in ('bcryptprimitives.dll', 'cabinet.dll', 'comctl32.dll', 'comdlg32.dll', 'imm32.dll', 'iphlpapi.dll', 'msi.dll', 'netapi32.dll', 'winmm.dll', 'pdh.dll', 'powrprof.dll', 'psapi.dll', 'userenv.dll'):
         assert prep.is_windows_system_dll(dll)
-    assert prep.is_windows_system_dll('nvcuda.dll')
+    assert not prep.is_windows_system_dll('nvcuda.dll')
+    assert prep.is_windows_external_driver_dll('nvcuda.dll')
     for dll in ('cudart64_12.dll', 'cublas64_12.dll', 'libssl-3-x64.dll', 'vcruntime140.dll'):
         assert not prep.is_windows_system_dll(dll)
 
@@ -1071,6 +1072,77 @@ def test_staged_native_import_failure_is_bounded_and_identifies_closure_member(t
         )
     assert str(raised.value) == 'staged native import failed: ggml-base.dll:winerror_126'
     assert secret not in str(raised.value)
+
+
+def test_staged_native_import_accepts_only_proven_driverless_boundary(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    system_root = tmp_path / 'Windows'
+    native.mkdir(parents=True)
+    (system_root / 'System32').mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    cuda = native / 'ggml-cuda.dll'
+    cuda.write_bytes(b'dll')
+    monkeypatch.setenv('SystemRoot', str(system_root))
+    results = iter([
+        prep.subprocess.CompletedProcess([], 1, '', r'C:\secret\native loader output'),
+        prep.subprocess.CompletedProcess([], 1, '{"loaded":false,"code":126}', r'C:\secret\consumer'),
+        prep.subprocess.CompletedProcess([], 1, '{"loaded":false,"code":126}', r'C:\secret\driver'),
+    ])
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: next(results))
+
+    state = prep.validate_staged_native_import(
+        runtime,
+        {'expected_interpreter_path': 'python.exe', 'native_dll_artifacts': []},
+        [{'name': cuda.name, 'path': cuda.relative_to(runtime).as_posix(), 'imports': ['nvcuda.dll']}],
+    )
+
+    assert state == prep.STAGED_NATIVE_IMPORT_EXTERNAL_DRIVER_UNAVAILABLE
+    assert state != prep.STAGED_NATIVE_IMPORT_VALID
+
+
+@pytest.mark.parametrize(
+    'imports,driver_stdout',
+    [
+        (['missing-cublas.dll', 'nvcuda.dll'], '{"loaded":false,"code":126}'),
+        (['unknown-external.dll'], '{"loaded":false,"code":126}'),
+        (['nvcuda.dll'], '{"loaded":true,"code":null}'),
+        (['nvcuda.dll'], 'malformed C:\\secret\\loader output'),
+        (['nvcuda.dll'], '{"loaded":false,"code":127}'),
+    ],
+)
+def test_staged_native_import_driver_boundary_fails_closed(
+    tmp_path, monkeypatch, imports, driver_stdout
+):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    system_root = tmp_path / 'Windows'
+    native.mkdir(parents=True)
+    (system_root / 'System32').mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    cuda = native / 'ggml-cuda.dll'
+    cuda.write_bytes(b'dll')
+    monkeypatch.setenv('SystemRoot', str(system_root))
+    results = [
+        prep.subprocess.CompletedProcess([], 1, '', r'C:\secret\native loader output'),
+        prep.subprocess.CompletedProcess([], 1, '{"loaded":false,"code":126}', ''),
+    ]
+    if imports == ['nvcuda.dll']:
+        results.append(prep.subprocess.CompletedProcess(
+            [], 0 if '"loaded":true' in driver_stdout else 1, driver_stdout, r'C:\secret\driver'
+        ))
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: results.pop(0))
+
+    with pytest.raises(prep.RuntimePrepError) as raised:
+        prep.validate_staged_native_import(
+            runtime,
+            {'expected_interpreter_path': 'python.exe', 'native_dll_artifacts': []},
+            [{'name': cuda.name, 'path': cuda.relative_to(runtime).as_posix(), 'imports': imports}],
+        )
+
+    diagnostic = str(raised.value)
+    assert diagnostic == 'staged native import failed: ggml-cuda.dll:winerror_126'
+    assert 'secret' not in diagnostic.lower()
 
 
 @pytest.mark.parametrize('code', [126, 127, 193])

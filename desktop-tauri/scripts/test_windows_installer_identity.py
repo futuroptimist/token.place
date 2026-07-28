@@ -8,6 +8,7 @@ This does not claim real CUDA/GPU validation.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from typing import Callable, Iterable
 EXPECTED_VERSION = "0.1.6"
 EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
+EXPECTED_TARGET_TRIPLE = "x86_64-pc-windows-msvc"
 RUNTIME_PROVENANCE_NAME = "embedded_python_runtime_provenance.json"
 OBSOLETE_RUNTIME_PROVENANCE_NAME = "tokenplace-runtime-" + "provenance.json"
 SENTINELS = ("py", "python", "python3", "pip", "cmake", "ninja", "msbuild", "cl.exe", "nvcc")
@@ -30,6 +32,35 @@ TAURI_IDENTIFIER = "place.token.desktop"
 APP_PROCESS_NAMES = ("token.place", "tokenplace", "token-place")
 ACCEPTABLE_UNINSTALL_EXIT_CODES = frozenset({0, 1605, 1614, 3010})
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+EXPECTED_LLAMA_CPP_VERSION = "0.3.32"
+EXPECTED_LLAMA_CPP_WHEEL = "llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
+EXPECTED_LLAMA_CPP_FLAVOR = "cu124"
+EXPECTED_LLAMA_CPP_WHEEL_SHA256 = "c2149da0ff1af565418f27a9d11e88ed66732b3e2c46023e5d5dc0e30678fdc0"
+EXPECTED_LLAMA_CPP_WHEEL_URL = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.32-cu124/llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
+EXPECTED_CONTEXT_CAPABILITIES = {
+    "8k-fast": {
+        "api_v1_readiness_yarn_requested_context_tokens": 8192,
+        "api_v1_readiness_yarn_original_context_tokens": 32768,
+        "api_v1_readiness_yarn_context_multiplier": 1.0,
+        "api_v1_readiness_yarn_rope_freq_scale": 1.0,
+        "api_v1_readiness_yarn_ext_factor_overridden": False,
+        "api_v1_readiness_yarn_rope_scaling_type_source": "not_required",
+        "api_v1_readiness_yarn_rope_supported": True,
+        "api_v1_readiness_yarn_rope_enabled": False,
+        "api_v1_readiness_yarn_configuration_valid": True,
+    },
+    "64k-full": {
+        "api_v1_readiness_yarn_requested_context_tokens": 65536,
+        "api_v1_readiness_yarn_original_context_tokens": 32768,
+        "api_v1_readiness_yarn_context_multiplier": 2.0,
+        "api_v1_readiness_yarn_rope_freq_scale": 0.5,
+        "api_v1_readiness_yarn_ext_factor_overridden": False,
+        "api_v1_readiness_yarn_rope_scaling_type_source": "top_level_enum",
+        "api_v1_readiness_yarn_rope_supported": True,
+        "api_v1_readiness_yarn_rope_enabled": True,
+        "api_v1_readiness_yarn_configuration_valid": True,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -220,12 +251,19 @@ def _msiexec() -> str:
     return str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "msiexec.exe")
 
 
-def _safe_env(sentinel_path: Path, sentinel_log: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
+def _safe_env(
+    sentinel_path: Path,
+    sentinel_log: Path,
+    extra: dict[str, str] | None = None,
+    *,
+    include_path: bool = True,
+) -> dict[str, str]:
     env = {}
     for key in ("SystemRoot", "ComSpec", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "ProgramFiles", "ProgramFiles(x86)"):
         if key in os.environ:
             env[key] = os.environ[key]
-    env["PATH"] = str(sentinel_path)
+    if include_path:
+        env["PATH"] = str(sentinel_path)
     env["TOKENPLACE_SENTINEL_LOG"] = str(sentinel_log)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.update({
@@ -240,6 +278,8 @@ def _safe_env(sentinel_path: Path, sentinel_log: Path, extra: dict[str, str] | N
         "FORCE_CMAKE": "1",
         "TOKEN_PLACE_SIDECAR_PYTHON": str(sentinel_path / "python.exe"),
         "TOKEN_PLACE_PYTHON_IMPORT_ROOT": str(sentinel_path / "poison-import-root"),
+        "PROCESSOR_ARCHITECTURE": "ARM64",
+        "PROCESSOR_ARCHITEW6432": "x86",
     })
     if extra:
         env.update(extra)
@@ -270,6 +310,14 @@ def _canonical_path(path: Path) -> str:
         return str(path.resolve()).casefold()
     except OSError:
         return str(path).casefold()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def inventory_shortcuts() -> ShortcutInventory:
@@ -665,6 +713,69 @@ def _assert_runtime(exe: Path) -> None:
     runtime_id = data.get("runtime_id") or data.get("build_profile")
     if runtime_id != EXPECTED_RUNTIME_ID:
         raise InstallerIdentityError(f"unexpected or missing runtime id in provenance: {runtime_id!r}")
+    if data.get("target_triple") != EXPECTED_TARGET_TRIPLE:
+        raise InstallerIdentityError("installed runtime provenance has unexpected target architecture")
+    wheel = data.get("llama_cpp_cuda_wheel")
+    expected_wheel = {
+        "name": EXPECTED_LLAMA_CPP_WHEEL,
+        "version": EXPECTED_LLAMA_CPP_VERSION,
+        "flavor": EXPECTED_LLAMA_CPP_FLAVOR,
+        "sha256": EXPECTED_LLAMA_CPP_WHEEL_SHA256,
+        "url": EXPECTED_LLAMA_CPP_WHEEL_URL,
+    }
+    if not isinstance(wheel, dict) or any(wheel.get(key) != value for key, value in expected_wheel.items()):
+        raise InstallerIdentityError("installed runtime has unexpected llama-cpp-python wheel identity")
+    required_packages = data.get("required_packages")
+    if not isinstance(required_packages, dict) or required_packages.get("llama-cpp-python") != EXPECTED_LLAMA_CPP_VERSION:
+        raise InstallerIdentityError("installed runtime has unexpected llama-cpp-python package version")
+    closure = data.get("pe_dll_closure")
+    if not isinstance(closure, list) or not closure:
+        raise InstallerIdentityError("installed runtime native PE closure is missing")
+    closure_names: set[str] = set()
+    for entry in closure:
+        if not isinstance(entry, dict) or set(("path", "machine", "sha256")) - set(entry):
+            raise InstallerIdentityError("installed runtime native PE closure entry is incomplete")
+        relative = Path(str(entry["path"]))
+        if relative.is_absolute() or ".." in relative.parts or entry["machine"] != "IMAGE_FILE_MACHINE_AMD64":
+            raise InstallerIdentityError("installed runtime native PE closure entry is invalid")
+        native_file = (python_exe.parent / relative).resolve()
+        closure_names.add(relative.name.casefold())
+        try:
+            native_file.relative_to(python_exe.parent.resolve())
+        except ValueError as exc:
+            raise InstallerIdentityError("installed runtime native PE closure escapes runtime") from exc
+        if not native_file.is_file():
+            raise InstallerIdentityError("installed runtime native PE closure file is missing")
+        digest = _sha256_file(native_file)
+        if not isinstance(entry["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) or digest != entry["sha256"]:
+            raise InstallerIdentityError("installed runtime native PE closure hash mismatch")
+    required_native = data.get("required_native_dlls")
+    if not isinstance(required_native, list) or not required_native or any(
+        not isinstance(name, str) or Path(name).name.casefold() not in closure_names for name in required_native
+    ):
+        raise InstallerIdentityError("installed runtime native PE closure is incomplete")
+    probe = _run(
+        [str(python_exe), "-I", "-c", "import importlib.metadata as m,importlib.util as u,json; s=u.find_spec('llama_cpp'); print(json.dumps({'version':m.version('llama-cpp-python'),'origin':s.origin if s else None}))"],
+        env={key: os.environ[key] for key in ("SystemRoot", "TEMP", "TMP") if key in os.environ},
+        timeout=30,
+        check=False,
+    )
+    try:
+        identity = json.loads(probe.stdout.strip()) if probe.returncode == 0 else None
+    except json.JSONDecodeError:
+        identity = None
+    if not isinstance(identity, dict) or identity.get("version") != EXPECTED_LLAMA_CPP_VERSION:
+        raise InstallerIdentityError("installed bundled interpreter reported unexpected llama-cpp-python version")
+    origin = identity.get("origin")
+    if not isinstance(origin, str):
+        raise InstallerIdentityError("installed bundled interpreter did not resolve llama_cpp module")
+    try:
+        origin_path = Path(origin).resolve()
+        origin_path.relative_to(python_exe.parent.resolve())
+    except ValueError as exc:
+        raise InstallerIdentityError("installed bundled interpreter resolved llama_cpp outside runtime") from exc
+    if not origin_path.is_file():
+        raise InstallerIdentityError("installed bundled interpreter llama_cpp module origin is missing")
 
 
 def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expected_build_id: str) -> dict[str, object]:
@@ -750,9 +861,6 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
         fallback_keys = ("fallback_reason", "backend_fallback", "model_fallback", "context_fallback")
         if data.get("fallback_reason") or any(data.get(key) is True for key in fallback_keys[1:]):
             raise InstallerIdentityError("operator-session smoke reported a fallback")
-        if expected_tier == "64k-full":
-            if data.get("api_v1_readiness_yarn_requested_context_tokens") != 65536 or data.get("api_v1_readiness_yarn_rope_supported") is not True:
-                raise InstallerIdentityError("64k-full smoke did not satisfy fail-closed YaRN/RoPE capability contract")
     assert_no_probe_attempt_counters(data)
     for key in (
         "provisioning_actions",
@@ -766,10 +874,23 @@ def assert_operator_record(text: str, expected_tier: str | None = None, launch_n
             raise InstallerIdentityError(f"operator-start preflight reported forbidden action counter {key}")
     if launch_number == 2 and data.get("runtime_action") in {"installed_cuda_reexec", "installed_metal_reexec", "failed", "install_failed"}:
         raise InstallerIdentityError("second operator-session smoke launch reported runtime mutation action")
+    if expected_tier is not None and launch_number is not None:
+        capability_mismatches = [
+            key for key, value in EXPECTED_CONTEXT_CAPABILITIES[expected_tier].items()
+            if key not in data or data[key] != value
+        ]
+        if capability_mismatches:
+            raise InstallerIdentityError(f"{expected_tier} smoke reported incomplete or mismatched YaRN/RoPE metadata: {capability_mismatches}")
     return data
 
 
 def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_dir: ScenarioArtifactDir | None, scenario_name: str) -> None:
+    if "PATH" not in env:
+        raise InstallerIdentityError("installed launch matrix is missing sentinel-only PATH coverage")
+    if env.get("PATH") == os.environ.get("PATH"):
+        raise InstallerIdentityError("installed launch matrix accidentally restored host PATH")
+    if env.get("PROCESSOR_ARCHITECTURE") != "ARM64" or env.get("PROCESSOR_ARCHITEW6432") != "x86":
+        raise InstallerIdentityError("installed launch matrix must poison both processor architecture variables")
     initial_manifest = capture_installed_resource_manifest(exe)
     expected_runtime_id: str | None = None
     expected_profile: str | None = None
@@ -779,6 +900,8 @@ def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_di
             before = capture_installed_resource_manifest(exe)
             assert_manifest_unchanged(initial_manifest, before, phase=f"{tier}-launch-{launch}-preflight")
             launch_env = dict(env)
+            if launch == 1:
+                launch_env.pop("PATH", None)
             launch_env["TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER"] = str(launch)
             text = launch_for_operator_record(
                 exe,
@@ -788,6 +911,8 @@ def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_di
             after = capture_installed_resource_manifest(exe)
             assert_manifest_unchanged(before, after, phase=f"{tier}-launch-{launch}")
             record = assert_operator_record(text, expected_tier=tier, launch_number=launch)
+            if record.get("target_triple") != EXPECTED_TARGET_TRIPLE:
+                raise InstallerIdentityError("installed launcher did not report compiled Windows x86_64 attestation")
             runtime_id = str(record.get("runtime_id") or "")
             profile_id = str(record.get("model_profile_identifier") or record.get("active_model_profile_id") or "")
             if record.get("interpreter_basename") != "python.exe" or record.get("launcher_source") != "bundled" or runtime_id != EXPECTED_RUNTIME_ID:

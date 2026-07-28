@@ -3827,6 +3827,7 @@ def test_windows_installer_identity_probes_scenario_current_version(monkeypatch,
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
         'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'target_triple': guard.EXPECTED_TARGET_TRIPLE,
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
         'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok',
@@ -4147,7 +4148,52 @@ def test_build_uninstall_invocation_requires_command() -> None:
         guard.build_uninstall_invocation(entry)
 
 
-def test_assert_runtime_requires_valid_matching_provenance(tmp_path) -> None:
+def _installed_runtime_provenance(guard, runtime_dir: Path) -> dict:
+    native = runtime_dir / 'llama_cpp.dll'
+    native.write_bytes(b'native closure fixture')
+    import hashlib
+    return {
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'target_triple': guard.EXPECTED_TARGET_TRIPLE,
+        'llama_cpp_cuda_wheel': {
+            'name': guard.EXPECTED_LLAMA_CPP_WHEEL,
+            'version': guard.EXPECTED_LLAMA_CPP_VERSION,
+            'flavor': guard.EXPECTED_LLAMA_CPP_FLAVOR,
+            'sha256': guard.EXPECTED_LLAMA_CPP_WHEEL_SHA256,
+            'url': guard.EXPECTED_LLAMA_CPP_WHEEL_URL,
+        },
+        'required_packages': {'llama-cpp-python': guard.EXPECTED_LLAMA_CPP_VERSION},
+        'required_native_dlls': [native.name],
+        'pe_dll_closure': [{
+            'name': native.name,
+            'path': native.name,
+            'machine': 'IMAGE_FILE_MACHINE_AMD64',
+            'imports': [],
+            'sha256': hashlib.sha256(native.read_bytes()).hexdigest(),
+        }],
+    }
+
+
+def _mock_installed_runtime_identity(guard, monkeypatch, runtime_dir: Path, **overrides) -> None:
+    origin = runtime_dir / 'Lib' / 'site-packages' / 'llama_cpp' / '__init__.py'
+    origin.parent.mkdir(parents=True, exist_ok=True)
+    origin.write_text('# installed module fixture', encoding='utf-8')
+    payload = {
+        'version': guard.EXPECTED_LLAMA_CPP_VERSION,
+        'origin': str(origin),
+        **overrides,
+    }
+    def run_identity(command, **kwargs):
+        assert command[0] == str(runtime_dir / 'python.exe')
+        assert command[1] == '-I'
+        assert 'PATH' not in kwargs['env']
+        assert 'PROCESSOR_ARCHITECTURE' not in kwargs['env']
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), '')
+
+    monkeypatch.setattr(guard, '_run', run_identity)
+
+
+def test_assert_runtime_requires_valid_matching_provenance(tmp_path, monkeypatch) -> None:
     guard = _load_windows_installer_identity()
     install_dir = tmp_path / 'token.place desktop'
     runtime_dir = install_dir / 'python-runtime'
@@ -4171,8 +4217,62 @@ def test_assert_runtime_requires_valid_matching_provenance(tmp_path) -> None:
     with pytest.raises(guard.InstallerIdentityError, match='unexpected or missing runtime id'):
         guard._assert_runtime(exe)
 
-    provenance.write_text(json.dumps({'runtime_id': guard.EXPECTED_RUNTIME_ID}), encoding='utf-8')
+    provenance.write_text(json.dumps(_installed_runtime_provenance(guard, runtime_dir)), encoding='utf-8')
+    _mock_installed_runtime_identity(guard, monkeypatch, runtime_dir)
     guard._assert_runtime(exe)
+
+
+@pytest.mark.parametrize(
+    ('mutation', 'error'),
+    [
+        (lambda data: data['required_packages'].update({'llama-cpp-python': '0.3.31'}), 'package version'),
+        (lambda data: data['llama_cpp_cuda_wheel'].update({'name': 'wrong.whl'}), 'wheel identity'),
+        (lambda data: data.pop('pe_dll_closure'), 'PE closure is missing'),
+        (lambda data: data['pe_dll_closure'][0].update({'path': '../escape.dll'}), 'closure entry is invalid'),
+        (lambda data: data['pe_dll_closure'][0].update({'sha256': '0' * 64}), 'hash mismatch'),
+        (lambda data: data.update({'required_native_dlls': ['missing.dll']}), 'closure is incomplete'),
+    ],
+)
+def test_assert_runtime_rejects_invalid_installed_provenance(tmp_path, monkeypatch, mutation, error) -> None:
+    guard = _load_windows_installer_identity()
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    data = _installed_runtime_provenance(guard, runtime)
+    mutation(data)
+    (runtime / guard.RUNTIME_PROVENANCE_NAME).write_text(json.dumps(data), encoding='utf-8')
+    _mock_installed_runtime_identity(guard, monkeypatch, runtime)
+
+    with pytest.raises(guard.InstallerIdentityError, match=error):
+        guard._assert_runtime(exe)
+
+
+@pytest.mark.parametrize(
+    ('identity', 'error'),
+    [
+        ({'version': '0.3.31'}, 'interpreter reported unexpected'),
+        ({'origin': None}, 'did not resolve'),
+        ({'origin': 'outside/llama_cpp/__init__.py'}, 'outside runtime'),
+    ],
+)
+def test_assert_runtime_rejects_invalid_bundled_interpreter_identity(tmp_path, monkeypatch, identity, error) -> None:
+    guard = _load_windows_installer_identity()
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    (runtime / guard.RUNTIME_PROVENANCE_NAME).write_text(
+        json.dumps(_installed_runtime_provenance(guard, runtime)), encoding='utf-8'
+    )
+    if identity.get('origin') == 'outside/llama_cpp/__init__.py':
+        identity['origin'] = str(tmp_path.parent / 'outside' / 'llama_cpp' / '__init__.py')
+    _mock_installed_runtime_identity(guard, monkeypatch, runtime, **identity)
+
+    with pytest.raises(guard.InstallerIdentityError, match=error):
+        guard._assert_runtime(exe)
 
 
 def test_windows_installer_identity_operator_record_rejects_fabricated_or_incomplete() -> None:
@@ -4381,19 +4481,23 @@ def test_windows_installer_identity_context_tier_probe_executes_twice_per_tier(m
     exe = tmp_path / 'token.place.exe'
     exe.write_text('exe', encoding='utf-8')
     launched: list[tuple[str, str]] = []
+    launch_environments: list[dict[str, str]] = []
     monkeypatch.setenv('APPDATA', str(tmp_path / 'Roaming'))
 
     def fake_launch(path, env, log_path=None):
         tier = json.loads((tmp_path / 'Roaming' / guard.TAURI_IDENTIFIER / guard.CONFIG_NAME).read_text(encoding='utf-8'))['context_tier']
         launch = env['TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER']
         launched.append((tier, launch))
+        launch_environments.append(dict(env))
         n_ctx = 65536 if tier == '64k-full' else 8192
         payload = {
+            **guard.EXPECTED_CONTEXT_CAPABILITIES[tier],
             'record': 'desktop.compute_node.session.layout',
             'launcher_source': 'bundled',
             'interpreter_basename': 'python.exe',
             'runtime_id': guard.EXPECTED_RUNTIME_ID,
             'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+            'target_triple': guard.EXPECTED_TARGET_TRIPLE,
             'bridge_preflight': 'ok',
             'model_artifact_inspect': 'ok',
             'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
@@ -4413,14 +4517,51 @@ def test_windows_installer_identity_context_tier_probe_executes_twice_per_tier(m
             'runtime_repair_attempted_count': 0,
             'dependency_provisioning_attempted_count': 0,
             'runtime_mutation': False,
-            'api_v1_readiness_yarn_requested_context_tokens': n_ctx,
-            'api_v1_readiness_yarn_rope_supported': True,
         }
         return json.dumps(payload)
 
     monkeypatch.setattr(guard, 'launch_for_operator_record', fake_launch)
-    guard.validate_installed_context_tiers(exe, {}, None, 'scenario')
+    guard.validate_installed_context_tiers(exe, {
+        'PATH': 'sentinel-only',
+        'PROCESSOR_ARCHITECTURE': 'ARM64',
+        'PROCESSOR_ARCHITEW6432': 'x86',
+    }, None, 'scenario')
     assert launched == [('8k-fast', '1'), ('8k-fast', '2'), ('64k-full', '1'), ('64k-full', '2')]
+    assert all('PATH' not in launch_environments[index] for index in (0, 2))
+    assert all(launch_environments[index]['PATH'] == 'sentinel-only' for index in (1, 3))
+    assert all(item['PROCESSOR_ARCHITECTURE'] == 'ARM64' for item in launch_environments)
+    assert all(item['PROCESSOR_ARCHITEW6432'] == 'x86' for item in launch_environments)
+
+
+@pytest.mark.parametrize(
+    ('env', 'error'),
+    [
+        ({'PROCESSOR_ARCHITECTURE': 'ARM64', 'PROCESSOR_ARCHITEW6432': 'x86'}, 'sentinel-only PATH coverage'),
+        ({'PATH': 'sentinel-only', 'PROCESSOR_ARCHITECTURE': 'AMD64', 'PROCESSOR_ARCHITEW6432': 'x86'}, 'poison both'),
+        ({'PATH': 'sentinel-only', 'PROCESSOR_ARCHITECTURE': 'ARM64'}, 'poison both'),
+    ],
+)
+def test_installed_context_launch_matrix_requires_path_and_architecture_poison(monkeypatch, tmp_path, env, error) -> None:
+    guard = _load_windows_installer_identity()
+    monkeypatch.setenv('APPDATA', str(tmp_path / 'Roaming'))
+    monkeypatch.setattr(guard, 'capture_installed_resource_manifest', lambda target: guard.InstalledResourceManifest(()))
+    monkeypatch.setattr(guard, 'assert_manifest_unchanged', lambda *args, **kwargs: None)
+    with pytest.raises(guard.InstallerIdentityError, match=error):
+        guard.validate_installed_context_tiers(tmp_path / 'token.place.exe', env, None, 'scenario')
+
+
+def test_installed_context_launch_matrix_rejects_restored_host_path(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    monkeypatch.setenv('APPDATA', str(tmp_path / 'Roaming'))
+    monkeypatch.setenv('PATH', 'restored-host-path')
+    monkeypatch.setattr(guard, 'capture_installed_resource_manifest', lambda target: guard.InstalledResourceManifest(()))
+    monkeypatch.setattr(guard, 'assert_manifest_unchanged', lambda *args, **kwargs: None)
+    with pytest.raises(guard.InstallerIdentityError, match='restored host PATH'):
+        guard.validate_installed_context_tiers(tmp_path / 'token.place.exe', {
+            'PATH': 'restored-host-path',
+            'PROCESSOR_ARCHITECTURE': 'ARM64',
+            'PROCESSOR_ARCHITEW6432': 'x86',
+        }, None, 'scenario')
 
 
 def test_installed_context_smoke_probe_uses_context_profile_helper() -> None:
@@ -4530,6 +4671,7 @@ def test_windows_installer_identity_manifest_detects_added_removed_modified(tmp_
 def test_windows_installer_identity_second_launch_requires_observed_zero_counters() -> None:
     guard = _load_windows_installer_identity()
     base = {
+        **guard.EXPECTED_CONTEXT_CAPABILITIES['8k-fast'],
         'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
@@ -4760,6 +4902,12 @@ def test_windows_installer_identity_safe_env_restricts_path_and_preserves_requir
     assert env['FORCE_CMAKE'] == '1'
     assert env['TOKEN_PLACE_SIDECAR_PYTHON'] == str(sentinel / 'python.exe')
     assert env['TOKEN_PLACE_PYTHON_IMPORT_ROOT'] == str(sentinel / 'poison-import-root')
+    assert env['PROCESSOR_ARCHITECTURE'] == 'ARM64'
+    assert env['PROCESSOR_ARCHITEW6432'] == 'x86'
+    absent_path = guard._safe_env(sentinel, log, include_path=False)
+    assert 'PATH' not in absent_path
+    assert absent_path['PROCESSOR_ARCHITECTURE'] == 'ARM64'
+    assert absent_path['PROCESSOR_ARCHITEW6432'] == 'x86'
 
 
 def test_windows_installer_identity_sentinel_dir_creates_every_host_tool_guard(tmp_path) -> None:
@@ -4794,6 +4942,7 @@ def test_windows_installer_identity_probe_attempt_counters_fail_closed() -> None
 def test_windows_installer_identity_operator_record_accepts_64k_ready_contract() -> None:
     guard = _load_windows_installer_identity()
     record = {
+        **guard.EXPECTED_CONTEXT_CAPABILITIES['64k-full'],
         'record': 'desktop.compute_node.session.layout',
         'launcher_source': 'bundled',
         'interpreter_basename': 'python.exe',
@@ -4827,6 +4976,44 @@ def test_windows_installer_identity_operator_record_accepts_64k_ready_contract()
     parsed = guard.assert_operator_record(json.dumps(record), expected_tier='64k-full', launch_number=2)
 
     assert parsed['effective_n_ctx'] == 65536
+
+
+@pytest.mark.parametrize('tier', ['8k-fast', '64k-full'])
+@pytest.mark.parametrize('launch', [1, 2])
+@pytest.mark.parametrize('mutation', ['missing', 'mismatched'])
+def test_windows_installer_identity_requires_complete_tier_metadata(tier, launch, mutation) -> None:
+    guard = _load_windows_installer_identity()
+    n_ctx = 8192 if tier == '8k-fast' else 65536
+    capabilities = dict(guard.EXPECTED_CONTEXT_CAPABILITIES[tier])
+    key = 'api_v1_readiness_yarn_rope_freq_scale'
+    if mutation == 'missing':
+        capabilities.pop(key)
+    else:
+        capabilities[key] = 99.0
+    record = {
+        **capabilities,
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'model_artifact_inspect': 'ok',
+        'model_artifact_filename': guard.EXPECTED_MODEL_ARTIFACT_FILENAME,
+        'selected_model_profile': 'qwen3-8b-q4',
+        'context_tier': tier,
+        'effective_n_ctx': n_ctx,
+        'n_ctx': n_ctx,
+        'startup_phase': 'ready',
+        'startup_result': 'ready',
+        'startup_deadline_ms': 15000,
+        'fallback_reason': None,
+        'backend_fallback': False,
+        'model_fallback': False,
+        'context_fallback': False,
+    }
+    with pytest.raises(guard.InstallerIdentityError, match='YaRN/RoPE metadata'):
+        guard.assert_operator_record(json.dumps(record), expected_tier=tier, launch_number=launch)
 
 
 @pytest.mark.parametrize(
@@ -5187,7 +5374,7 @@ def test_windows_installer_identity_verify_process_authority_helper(monkeypatch,
     guard._verify_no_authority_processes([target])
 
 
-def test_windows_installer_identity_runtime_recursive_lookup_and_missing_runtime(tmp_path) -> None:
+def test_windows_installer_identity_runtime_recursive_lookup_and_missing_runtime(tmp_path, monkeypatch) -> None:
     guard = _load_windows_installer_identity()
     exe_dir = tmp_path / 'extract'
     nested_runtime = exe_dir / 'deep' / 'resources' / 'python-runtime'
@@ -5195,7 +5382,10 @@ def test_windows_installer_identity_runtime_recursive_lookup_and_missing_runtime
     exe = exe_dir / 'token.place.exe'
     exe.write_text('exe', encoding='utf-8')
     (nested_runtime / 'python.exe').write_text('python', encoding='utf-8')
-    (nested_runtime / guard.RUNTIME_PROVENANCE_NAME).write_text(json.dumps({'build_profile': guard.EXPECTED_RUNTIME_ID}), encoding='utf-8')
+    (nested_runtime / guard.RUNTIME_PROVENANCE_NAME).write_text(
+        json.dumps(_installed_runtime_provenance(guard, nested_runtime)), encoding='utf-8'
+    )
+    _mock_installed_runtime_identity(guard, monkeypatch, nested_runtime)
     guard._assert_runtime(exe)
 
     (nested_runtime / 'python.exe').unlink()
@@ -5347,11 +5537,13 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
         tier = json.loads((tmp_path / 'Roaming' / guard.TAURI_IDENTIFIER / guard.CONFIG_NAME).read_text(encoding='utf-8'))['context_tier']
         n_ctx = 65536 if tier == '64k-full' else 8192
         return json.dumps({
+            **guard.EXPECTED_CONTEXT_CAPABILITIES[tier],
             'record': 'desktop.compute_node.session.layout',
             'launcher_source': 'bundled',
             'interpreter_basename': 'python.exe',
             'runtime_id': 'different-runtime' if launches == 2 else guard.EXPECTED_RUNTIME_ID,
             'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+            'target_triple': guard.EXPECTED_TARGET_TRIPLE,
             'bridge_preflight': 'ok',
             'model_artifact_inspect': 'ok',
             'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
@@ -5367,13 +5559,15 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
             'backend_fallback': False,
             'model_fallback': False,
             'context_fallback': False,
-            'api_v1_readiness_yarn_requested_context_tokens': n_ctx,
-            'api_v1_readiness_yarn_rope_supported': True,
         })
 
     monkeypatch.setattr(guard, 'launch_for_operator_record', fake_launch_runtime_drift)
     with pytest.raises(guard.InstallerIdentityError, match='runtime_id|installed bundled runtime|changed bundled runtime identity'):
-        guard.validate_installed_context_tiers(exe, {}, None, 'scenario')
+        guard.validate_installed_context_tiers(exe, {
+            'PATH': 'sentinel-only',
+            'PROCESSOR_ARCHITECTURE': 'ARM64',
+            'PROCESSOR_ARCHITEW6432': 'x86',
+        }, None, 'scenario')
 
     launches = 0
     def fake_launch_profile_drift(path, env, log_path=None):
@@ -5382,11 +5576,13 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
         tier = json.loads((tmp_path / 'Roaming' / guard.TAURI_IDENTIFIER / guard.CONFIG_NAME).read_text(encoding='utf-8'))['context_tier']
         n_ctx = 65536 if tier == '64k-full' else 8192
         return json.dumps({
+            **guard.EXPECTED_CONTEXT_CAPABILITIES[tier],
             'record': 'desktop.compute_node.session.layout',
             'launcher_source': 'bundled',
             'interpreter_basename': 'python.exe',
             'runtime_id': guard.EXPECTED_RUNTIME_ID,
             'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+            'target_triple': guard.EXPECTED_TARGET_TRIPLE,
             'bridge_preflight': 'ok',
             'model_artifact_inspect': 'ok',
             'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
@@ -5402,13 +5598,15 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
             'backend_fallback': False,
             'model_fallback': False,
             'context_fallback': False,
-            'api_v1_readiness_yarn_requested_context_tokens': n_ctx,
-            'api_v1_readiness_yarn_rope_supported': True,
         })
 
     monkeypatch.setattr(guard, 'launch_for_operator_record', fake_launch_profile_drift)
     with pytest.raises(guard.InstallerIdentityError, match='changed canonical model profile'):
-        guard.validate_installed_context_tiers(exe, {}, None, 'scenario')
+        guard.validate_installed_context_tiers(exe, {
+            'PATH': 'sentinel-only',
+            'PROCESSOR_ARCHITECTURE': 'ARM64',
+            'PROCESSOR_ARCHITEW6432': 'x86',
+        }, None, 'scenario')
 
 
 def test_windows_installer_identity_run_all_and_main_windows_paths(monkeypatch, tmp_path, capsys) -> None:

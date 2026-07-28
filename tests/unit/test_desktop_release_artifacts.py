@@ -4540,6 +4540,11 @@ def test_installed_context_smoke_probe_uses_context_profile_helper() -> None:
     assert full['effective_n_ctx'] == 65536
     assert full['api_v1_readiness_yarn_requested_context_tokens'] == 65536
     assert full['gpu_capability'] == 'mocked_hosted_windows_contract_no_real_cuda'
+    guard = _load_windows_installer_identity()
+    for key, expected_value in guard.EXPECTED_CONTEXT_CAPABILITIES['8k-fast'].items():
+        assert eight[key] == expected_value, key
+    for key, expected_value in guard.EXPECTED_CONTEXT_CAPABILITIES['64k-full'].items():
+        assert full[key] == expected_value, key
 
 
 def test_operator_session_smoke_rust_invocation_does_not_pass_launch_number_cli_arg() -> None:

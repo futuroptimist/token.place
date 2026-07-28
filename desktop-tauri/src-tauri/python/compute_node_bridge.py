@@ -3028,6 +3028,26 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
                 "llama_cpp_capability_source": yarn_diagnostics.get("capability_source") or "mocked_hosted_windows_contract_no_real_cuda",
             }
         )
+    else:
+        # Tiers below the YaRN-extension threshold never invoke RoPE scaling,
+        # so last_yarn_rope_diagnostics stays empty; report the "not needed"
+        # baseline instead of omitting these fields, since operator tooling
+        # relies on their presence for every tier (see EXPECTED_CONTEXT_CAPABILITIES
+        # in desktop-tauri/scripts/test_windows_installer_identity.py).
+        payload.update(
+            {
+                "api_v1_readiness_yarn_requested_context_tokens": constructed_n_ctx,
+                "api_v1_readiness_yarn_original_context_tokens": 32768,
+                "api_v1_readiness_yarn_context_multiplier": 1.0,
+                "api_v1_readiness_yarn_rope_freq_scale": 1.0,
+                "api_v1_readiness_yarn_ext_factor_overridden": False,
+                "api_v1_readiness_yarn_rope_scaling_type_source": "not_required",
+                "api_v1_readiness_yarn_rope_supported": True,
+                "api_v1_readiness_yarn_rope_enabled": constructor_call.get("rope_scaling_type") is not None,
+                "api_v1_readiness_yarn_configuration_valid": True,
+                "llama_cpp_capability_source": "mocked_hosted_windows_contract_no_real_cuda",
+            }
+        )
     return payload
 
 def main() -> int:

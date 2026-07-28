@@ -312,6 +312,10 @@ raise SystemExit(0 if valid else 9)
 
 def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str], pe_closure: list[dict[str, object]], m: dict) -> tuple[str, int | str | None]:
     """Return only a manifest-owned basename and bounded Windows loader code."""
+    try:
+        runtime = runtime.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return "unknown", None
     entries = {
         str(entry.get("name", "")).lower(): entry
         for entry in pe_closure
@@ -332,7 +336,6 @@ def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str]
     # directory must be app-local beside python.exe. Report that manifest-owned
     # dependency rather than the consumer module that happened to expose it.
     for consumer_name, entry in sorted(entries.items()):
-        consumer = candidates[consumer_name]
         for dependency in entry.get("imports", []):
             dependency = str(dependency).lower()
             destination = manifest_destinations.get(dependency)
@@ -340,8 +343,6 @@ def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str]
                 continue
             if not destination.is_file():
                 return dependency, 126
-            if consumer.parent != (runtime / NATIVE_LLAMA_DIRECTORY) and destination.parent != runtime:
-                return dependency, "search_topology_unavailable"
     ordered: list[str] = []
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -365,9 +366,28 @@ def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str]
     # provenance-owned, but come after the dependency graph they cannot explain.
     for candidate in sorted(candidates):
         visit(candidate)
+
+    resolved_candidates: dict[str, Path] = {}
+    for name in ordered:
+        try:
+            candidate = candidates[name].resolve(strict=True)
+        except (OSError, RuntimeError):
+            return name, None
+        if not candidate.is_file() or not candidate.is_relative_to(runtime):
+            return name, None
+        resolved_candidates[name] = candidate
+    dll_directories = sorted(
+        {candidate.parent for candidate in resolved_candidates.values()},
+        key=lambda path: str(path).casefold(),
+    )
     for name in ordered:
         script = """
 import ctypes, json, sys
+directories = json.loads(sys.argv[2])
+# Keep every handle alive until the probed member has been unloaded. This
+# matches packages such as NumPy, which retain add_dll_directory handles while
+# importing extensions from a sibling native-library directory.
+dll_directory_handles = [__import__('os').add_dll_directory(path) for path in directories]
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 load = kernel32.LoadLibraryExW
 load.argtypes = (ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32)
@@ -388,7 +408,10 @@ print('{"loaded":true,"code":null}')
 """
         try:
             result = subprocess.run(
-                [str(py), "-I", "-c", script, str(candidates[name])],
+                [
+                    str(py), "-I", "-c", script, str(resolved_candidates[name]),
+                    json.dumps([str(path) for path in dll_directories], separators=(",", ":")),
+                ],
                 env=env,
                 text=True,
                 capture_output=True,

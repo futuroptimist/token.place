@@ -1101,9 +1101,12 @@ def test_native_import_diagnostic_uses_loadlibraryex_code_and_dependency_order(t
     )
 
     assert result == ('dependency.dll', code)
-    assert calls[0][0][-1] == str(dependency)
+    assert calls[0][0][-2] == str(dependency.resolve())
+    assert json.loads(calls[0][0][-1]) == [str(native.resolve())]
     probe_script = calls[0][0][3]
     assert 'LoadLibraryExW' in probe_script
+    assert "__import__('os').add_dll_directory(path)" in probe_script
+    assert probe_script.index('dll_directory_handles =') < probe_script.index('handle = load(')
     assert 'use_last_error=True' in probe_script
     assert 'ctypes.get_last_error()' in probe_script
     assert '0x00000100 | 0x00001000' in probe_script
@@ -1134,7 +1137,14 @@ def test_native_import_diagnostic_reports_consumer_after_dependencies_load(tmp_p
     ) == ('consumer.pyd', 193)
 
 
-@pytest.mark.parametrize('stdout,returncode', [('', 1), ('not-json', 1), ('{"loaded":false,"code":5}', 1)])
+@pytest.mark.parametrize('stdout,returncode', [
+    ('', 1),
+    ('not-json', 1),
+    ('[]', 1),
+    ('null', 1),
+    ('"scalar"', 1),
+    ('{"loaded":false,"code":5}', 1),
+])
 def test_native_import_diagnostic_maps_malformed_or_unsupported_child_output(
     tmp_path, monkeypatch, stdout, returncode
 ):
@@ -1188,6 +1198,69 @@ def test_native_import_diagnostic_success_has_no_invented_failure(tmp_path, monk
         [{'name': member.name, 'path': member.name, 'imports': []}],
         {'native_dll_artifacts': []},
     ) == ('unknown', None)
+
+
+def test_native_import_diagnostic_registers_numpy_sibling_directory_deterministically(
+    tmp_path, monkeypatch
+):
+    runtime = tmp_path / 'python-runtime'
+    core = runtime / 'Lib/site-packages/numpy/_core'
+    numpy_libs = runtime / 'Lib/site-packages/numpy.libs'
+    core.mkdir(parents=True)
+    numpy_libs.mkdir(parents=True)
+    consumer = core / '_multiarray_umath.cp311-win_amd64.pyd'
+    dependency = numpy_libs / 'libscipy_openblas-test.dll'
+    consumer.write_bytes(b'pyd')
+    dependency.write_bytes(b'dll')
+    calls = []
+
+    def completed(command, **kwargs):
+        calls.append(command)
+        return prep.subprocess.CompletedProcess(command, 0, '{"loaded":true,"code":null}', '')
+
+    monkeypatch.setattr(prep.subprocess, 'run', completed)
+    result = prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [
+            {
+                'name': consumer.name,
+                'path': consumer.relative_to(runtime).as_posix(),
+                'imports': [dependency.name],
+            },
+            {
+                'name': dependency.name,
+                'path': dependency.relative_to(runtime).as_posix(),
+                'imports': [],
+            },
+        ],
+        {'native_dll_artifacts': []},
+    )
+
+    assert result == ('unknown', None)
+    assert [Path(command[-2]).name for command in calls] == [dependency.name, consumer.name]
+    expected_directories = sorted(
+        [str(core.resolve()), str(numpy_libs.resolve())], key=str.casefold
+    )
+    assert all(json.loads(command[-1]) == expected_directories for command in calls)
+    assert all('dll_directory_handles' in command[3] for command in calls)
+
+
+def test_native_import_diagnostic_rejects_candidate_outside_runtime(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    outside = tmp_path / 'outside.dll'
+    outside.write_bytes(b'sentinel')
+    monkeypatch.setattr(
+        prep.subprocess,
+        'run',
+        lambda *args, **kwargs: pytest.fail('escaped candidate must not be probed'),
+    )
+
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [{'name': outside.name, 'path': '../outside.dll', 'imports': []}],
+        {'native_dll_artifacts': []},
+    ) == ('outside.dll', None)
 
 
 def test_staged_native_import_diagnoses_manifest_owned_numpy_dependency(tmp_path, monkeypatch):

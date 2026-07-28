@@ -4100,7 +4100,9 @@ def test_assert_runtime_requires_valid_matching_provenance(tmp_path, monkeypatch
     [
         (lambda data: data['required_packages'].update({'llama-cpp-python': '0.3.31'}), 'package version'),
         (lambda data: data['llama_cpp_cuda_wheel'].update({'name': 'wrong.whl'}), 'wheel identity'),
+        (lambda data: data.update({'target_triple': 'bundled-cpython-3.11-win-arm64-cu124'}), 'unexpected target architecture'),
         (lambda data: data.pop('pe_dll_closure'), 'PE closure is missing'),
+        (lambda data: data['pe_dll_closure'][0].pop('sha256'), 'entry is incomplete'),
         (lambda data: data['pe_dll_closure'][0].update({'path': '../escape.dll'}), 'closure entry is invalid'),
         (lambda data: data['pe_dll_closure'][0].update({'sha256': '0' * 64}), 'hash mismatch'),
         (lambda data: data.update({'required_native_dlls': ['missing.dll']}), 'closure is incomplete'),
@@ -4145,6 +4147,93 @@ def test_assert_runtime_rejects_invalid_bundled_interpreter_identity(tmp_path, m
     _mock_installed_runtime_identity(guard, monkeypatch, runtime, **identity)
 
     with pytest.raises(guard.InstallerIdentityError, match=error):
+        guard._assert_runtime(exe)
+
+
+def test_assert_runtime_rejects_closure_entry_referencing_missing_file(tmp_path, monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    data = _installed_runtime_provenance(guard, runtime)
+    data['pe_dll_closure'][0]['path'] = 'ghost.dll'
+    data['required_native_dlls'] = ['ghost.dll']
+    (runtime / guard.RUNTIME_PROVENANCE_NAME).write_text(json.dumps(data), encoding='utf-8')
+    _mock_installed_runtime_identity(guard, monkeypatch, runtime)
+
+    with pytest.raises(guard.InstallerIdentityError, match='closure file is missing'):
+        guard._assert_runtime(exe)
+
+
+def test_assert_runtime_rejects_symlinked_closure_entry_escaping_runtime(tmp_path, monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    outside = tmp_path / 'outside.dll'
+    outside.write_bytes(b'outside native fixture')
+    link = runtime / 'llama_cpp.dll'
+    link.symlink_to(outside)
+    import hashlib
+    data = _installed_runtime_provenance(guard, runtime)
+    data['required_native_dlls'] = [link.name]
+    data['pe_dll_closure'] = [{
+        'name': link.name,
+        'path': link.name,
+        'machine': 'IMAGE_FILE_MACHINE_AMD64',
+        'imports': [],
+        'sha256': hashlib.sha256(outside.read_bytes()).hexdigest(),
+    }]
+    (runtime / guard.RUNTIME_PROVENANCE_NAME).write_text(json.dumps(data), encoding='utf-8')
+    _mock_installed_runtime_identity(guard, monkeypatch, runtime)
+
+    with pytest.raises(guard.InstallerIdentityError, match='escapes runtime'):
+        guard._assert_runtime(exe)
+
+
+def test_assert_runtime_rejects_non_json_bundled_interpreter_probe_output(tmp_path, monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    (runtime / guard.RUNTIME_PROVENANCE_NAME).write_text(
+        json.dumps(_installed_runtime_provenance(guard, runtime)), encoding='utf-8'
+    )
+
+    def run_not_json(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, 'not json', '')
+
+    monkeypatch.setattr(guard, '_run', run_not_json)
+
+    with pytest.raises(guard.InstallerIdentityError, match='interpreter reported unexpected'):
+        guard._assert_runtime(exe)
+
+
+def test_assert_runtime_rejects_missing_bundled_llama_cpp_module_file(tmp_path, monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    exe = tmp_path / 'token.place.exe'
+    exe.write_text('exe', encoding='utf-8')
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    (runtime / guard.RUNTIME_PROVENANCE_NAME).write_text(
+        json.dumps(_installed_runtime_provenance(guard, runtime)), encoding='utf-8'
+    )
+    ghost_origin = runtime / 'Lib' / 'site-packages' / 'llama_cpp' / '__init__.py'
+    payload = {'version': guard.EXPECTED_LLAMA_CPP_VERSION, 'origin': str(ghost_origin)}
+
+    def run_ghost_origin(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), '')
+
+    monkeypatch.setattr(guard, '_run', run_ghost_origin)
+
+    with pytest.raises(guard.InstallerIdentityError, match='module origin is missing'):
         guard._assert_runtime(exe)
 
 
@@ -4924,6 +5013,55 @@ def test_windows_installer_identity_operator_preflight_fails_closed(override, er
         'bridge_event_received': True,
         'native_runtime_validated': True,
     }
+    record.update(override)
+
+    with pytest.raises(guard.InstallerIdentityError, match=error):
+        guard.assert_operator_record(json.dumps(record), expected_tier='8k-fast')
+
+
+def _cpu_smoke_operator_record() -> dict:
+    return {
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': _load_windows_installer_identity().EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': _load_windows_installer_identity().EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'model_artifact_inspect': 'ok',
+        'model_artifact_filename': 'Qwen3-8B-Q4_K_M.gguf',
+        'context_tier': '8k-fast',
+        'effective_n_ctx': 8192,
+        'n_ctx': 8192,
+        'selected_model_profile': 'qwen3-8b-q4',
+        'startup_phase': 'ready',
+        'startup_deadline_ms': 15000,
+        'startup_result': 'cpu_smoke_validated',
+        'operator_start_preflight': 'cpu_smoke_ok',
+        'resource_context_source': 'tauri_app_handle',
+        'bridge_child_spawned': True,
+        'bridge_event_received': True,
+        'selected_backend': 'cpu',
+    }
+
+
+def test_windows_installer_identity_cpu_smoke_preflight_accepts_valid_record() -> None:
+    guard = _load_windows_installer_identity()
+    guard.assert_operator_record(json.dumps(_cpu_smoke_operator_record()), expected_tier='8k-fast')
+
+
+@pytest.mark.parametrize(
+    ('override', 'error'),
+    [
+        ({'resource_context_source': 'manifest_dir'}, 'real Tauri AppHandle'),
+        ({'bridge_child_spawned': False}, 'spawned child and parsed bridge event'),
+        ({'bridge_event_received': False}, 'spawned child and parsed bridge event'),
+        ({'selected_backend': 'gpu'}, 'valid CPU-only structural result'),
+        ({'startup_result': 'runtime_validated'}, 'valid CPU-only structural result'),
+    ],
+)
+def test_windows_installer_identity_cpu_smoke_preflight_fails_closed(override, error) -> None:
+    guard = _load_windows_installer_identity()
+    record = _cpu_smoke_operator_record()
     record.update(override)
 
     with pytest.raises(guard.InstallerIdentityError, match=error):

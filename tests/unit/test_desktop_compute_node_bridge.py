@@ -2128,6 +2128,16 @@ def test_main_operator_preflight_emits_bounded_failed_runtime_contract(capsys, m
     assert 'fallback_reason' not in payload
 
 
+def test_main_requires_model_when_no_installed_preflight_flag_is_used(capsys, monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['compute_node_bridge.py'])
+
+    with pytest.raises(SystemExit) as exc_info:
+        compute_node_bridge.main()
+
+    assert exc_info.value.code == 2
+    assert 'an installed preflight is used' in capsys.readouterr().err
+
+
 def test_main_operator_preflight_normalizes_unallowlisted_failure_stage(capsys, monkeypatch):
     monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies', lambda: {'ok': 'true'})
     monkeypatch.setattr(

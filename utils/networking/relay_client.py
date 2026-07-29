@@ -2509,6 +2509,12 @@ class RelayClient:
             )
         if local_deadline is None:
             local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload, now=time.monotonic())
+        supervision_started = time.monotonic()
+        log_info(
+            'api_v1.inference_supervision_started request_id={} initial_deadline_budget_ms={}',
+            request_id,
+            max(0, int((local_deadline - supervision_started) * 1000)),
+        )
         terminal_status: Optional[str] = None
         terminal_reason = 'unknown'
         future_result: Optional[Dict[str, Any]] = None
@@ -2705,6 +2711,13 @@ class RelayClient:
                     terminal_reason = 'inference_failure'
                     break
             if terminal_status is not None:
+                terminal_observed = time.monotonic()
+                log_info(
+                    'api_v1.inference_terminal_observed request_id={} terminal_source={} elapsed_ms={}',
+                    request_id,
+                    terminal_reason,
+                    max(0, int((terminal_observed - supervision_started) * 1000)),
+                )
                 recovery_succeeded = False
                 try:
                     recovery_succeeded = self._terminate_current_llama_worker(
@@ -2712,6 +2725,16 @@ class RelayClient:
                     )
                 except Exception:
                     log_error('api_v1.worker_termination_failed reason={}', terminal_reason)
+                process_exit_observed = time.monotonic()
+                log_info(
+                    'api_v1.inference_worker_recovery request_id={} terminal_source={} '
+                    'cancellation_to_process_exit_ms={} replacement_ready_elapsed_ms={} recovery_succeeded={}',
+                    request_id,
+                    terminal_reason,
+                    max(0, int((process_exit_observed - terminal_observed) * 1000)),
+                    max(0, int((process_exit_observed - supervision_started) * 1000)),
+                    bool(recovery_succeeded),
+                )
                 # Track inference and control quiescence separately.  Only a stuck
                 # inference thread justifies a permanent polling stop; routine control
                 # latency must not mark a healthy recreated worker as unhealthy.

@@ -1895,6 +1895,9 @@ def _read_llama_subprocess_message(
     timeout_seconds: Optional[float],
     stage: str,
 ) -> Dict[str, Any]:
+    demultiplexer = getattr(process, '_token_place_stdout_demultiplexer', None)
+    if demultiplexer is not None:
+        return demultiplexer.read_unclaimed(timeout_seconds=timeout_seconds, stage=stage)
     result_queue: queue.Queue[str] = queue.Queue(maxsize=1)
 
     def _reader() -> None:
@@ -1984,6 +1987,140 @@ def _safe_worker_error_code(value: Any) -> str:
         return text.replace('-', '_')
     return type(value).__name__ if isinstance(value, BaseException) else 'worker_error'
 
+
+class _LlamaSubprocessDemultiplexer:
+    """Single, persistent stdout drain for one runtime worker generation."""
+
+    def __init__(self, process: subprocess.Popen) -> None:
+        self._process = process
+        self._lock = Lock()
+        self._pending: Dict[str, queue.Queue[Any]] = {}
+        self._legacy_orphans: list[Dict[str, Any]] = []
+        self._unclaimed: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=8)
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._read_forever,
+            name='llama_cpp_stdout_demultiplexer',
+            daemon=True,
+        )
+        self._thread.start()
+
+    def register(self, command_id: str, *, claim_all_legacy: bool = False) -> queue.Queue[Any]:
+        result: queue.Queue[Any] = queue.Queue(maxsize=8)
+        with self._lock:
+            if self._legacy_orphans:
+                count = len(self._legacy_orphans) if claim_all_legacy else 1
+                for _ in range(min(count, result.maxsize)):
+                    result.put_nowait(self._legacy_orphans.pop(0))
+            elif self._closed:
+                raise LlamaCppWorkerEOFError('llama_cpp worker transport is closed')
+            self._pending[command_id] = result
+        return result
+
+    def discard(self, command_id: str) -> None:
+        with self._lock:
+            self._pending.pop(command_id, None)
+
+    def _fail_pending(self) -> None:
+        error = LlamaCppWorkerEOFError('llama_cpp worker transport reached unexpected EOF')
+        with self._lock:
+            self._closed = True
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for destination in pending:
+            try:
+                destination.put_nowait(error)
+            except queue.Full:
+                pass
+
+    def _read_forever(self) -> None:
+        stdout = self._process.stdout
+        if stdout is None:
+            self._fail_pending()
+            return
+        try:
+            for line in stdout:
+                if not line.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:'):
+                    tail = getattr(self._process, '_token_place_stdout_tail', None)
+                    if isinstance(tail, list):
+                        tail.append(_sanitize_child_diagnostic_text(line))
+                        del tail[:-100]
+                    continue
+                try:
+                    message = json.loads(line.split(':', 1)[1].strip())
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                command_id = message.get('command_id')
+                if not isinstance(command_id, str):
+                    # Compatibility for deterministic fixtures that predate v2.
+                    # Real workers always attach command_id; never guess when
+                    # multiple live commands exist.
+                    with self._lock:
+                        if len(self._pending) == 1:
+                            command_id = next(iter(self._pending))
+                        elif not self._pending:
+                            self._legacy_orphans.append(message)
+                            del self._legacy_orphans[:-8]
+                            continue
+                        else:
+                            continue
+                if command_id == 'unclaimed':
+                    try:
+                        self._unclaimed.put_nowait(message)
+                    except queue.Full:
+                        pass
+                    continue
+                with self._lock:
+                    destination = self._pending.get(command_id)
+                if destination is None:
+                    try:
+                        self._unclaimed.put_nowait(message)
+                    except queue.Full:
+                        try:
+                            self._unclaimed.get_nowait()
+                            self._unclaimed.put_nowait(message)
+                        except queue.Empty:
+                            pass
+                    continue
+                # Progress is deliberately lossy.  A full queue is never allowed
+                # to stall stdout and therefore can never hide the final result.
+                if message.get('type') == 'inference_progress':
+                    try:
+                        destination.put_nowait(message)
+                    except queue.Full:
+                        pass
+                    continue
+                while True:
+                    try:
+                        destination.put_nowait(message)
+                        break
+                    except queue.Full:
+                        try:
+                            destination.get_nowait()
+                        except queue.Empty:
+                            break
+        finally:
+            self._fail_pending()
+
+    def join(self, timeout: float = 0.25) -> None:
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=max(0.0, timeout))
+
+    def read_unclaimed(self, *, timeout_seconds: Optional[float], stage: str) -> Dict[str, Any]:
+        try:
+            message = self._unclaimed.get() if timeout_seconds is None else self._unclaimed.get(timeout=timeout_seconds)
+        except queue.Empty as exc:
+            raise LlamaCppRuntimeStageTimeout(stage, timeout_seconds) from exc
+        if message.get('status') == 'error' and message.get('request_error'):
+            diagnostics = message.get('diagnostics')
+            raise LlamaCppInferenceRequestError(
+                str(message.get('error') or f'{stage} failed'),
+                diagnostics=diagnostics if isinstance(diagnostics, dict) else {},
+            )
+        return message
+
 class _SubprocessLlamaProxy:
     """Minimal llama_cpp.Llama proxy for no-SIGALRM runtimes."""
 
@@ -2005,6 +2142,7 @@ class _SubprocessLlamaProxy:
         self._expected_llama_module_identity = _valid_llama_module_identity(expected_llama_module_identity)
         self._worker_capabilities_ref = worker_capabilities if isinstance(worker_capabilities, dict) else None
         self._lock = Lock()
+        self._command_sequence = 0
         self._closed = False
         self._worker_tmpfile: Optional[str] = None
         code = _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)
@@ -2025,6 +2163,15 @@ class _SubprocessLlamaProxy:
         env = _llama_cpp_runtime_worker_env()
         cwd = _llama_cpp_probe_subprocess_cwd()
         try:
+            popen_group_kwargs: Dict[str, Any] = {}
+            if os.name == 'nt':
+                popen_group_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+            else:
+                # Native inference may create helper processes.  Giving every
+                # worker its own session lets cancellation address the complete
+                # worker tree without involving the desktop bridge's process
+                # group.
+                popen_group_kwargs['start_new_session'] = True
             self._process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
@@ -2034,6 +2181,7 @@ class _SubprocessLlamaProxy:
                 env=env,
                 cwd=cwd,
                 bufsize=1,
+                **popen_group_kwargs,
             )
         except OSError:
             # Popen failed; clean up the temp file if one was created (when
@@ -2053,14 +2201,12 @@ class _SubprocessLlamaProxy:
         self._process._token_place_stderr_tail = []  # type: ignore[attr-defined]
         self._process._token_place_stderr_sequence = 0  # type: ignore[attr-defined]
         self._stderr_reader_thread: Optional[threading.Thread] = None
+        if self._process.stdout is not None:
+            self._stdout_demultiplexer = _LlamaSubprocessDemultiplexer(self._process)
+            self._process._token_place_stdout_demultiplexer = self._stdout_demultiplexer  # type: ignore[attr-defined]
         self._start_stderr_tail_reader()
         try:
-            self._send({'method': '__import__'}, check_health=False)
-            import_message = _read_llama_subprocess_message(
-                self._process,
-                timeout_seconds=self._timeout_seconds,
-                stage='llama_cpp_import',
-            )
+            import_message = self._rpc({'method': '__import__'}, stage='llama_cpp_import', check_health=False)
             imported_worker_module_path = import_message.get('module_path')
             imported_worker_identity = llama_module_identity_from_path(imported_worker_module_path)
             expected_identity = self._expected_llama_module_identity
@@ -2083,18 +2229,40 @@ class _SubprocessLlamaProxy:
                 raise RuntimeError(safe_exc) from exc
             raise
         try:
-            self._send({'method': '__init__', 'args': args, 'kwargs': kwargs}, check_health=False)
+            init_message = self._rpc(
+                {'method': '__init__', 'args': args, 'kwargs': kwargs},
+                stage='llama_cpp_model_initialization',
+                check_health=False,
+            )
         except (LlamaCppWorkerBrokenPipeError, BrokenPipeError, OSError) as exc:
             self.close()
             raise RuntimeError(
                 _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_model_initialization')
             ) from exc
-        try:
-            init_message = _read_llama_subprocess_message(
-                self._process,
-                timeout_seconds=self._timeout_seconds,
-                stage='llama_cpp_model_initialization',
+        except LlamaCppRuntimeStageTimeout:
+            self.close()
+            raise
+        except Exception as exc:
+            self._drain_stderr_reader_bounded()
+            stderr_tail = _sanitize_child_diagnostic_text(
+                _llama_subprocess_tail(self._process, '_token_place_stderr_tail')
             )
+            if isinstance(exc, LlamaCppRuntimeInitError):
+                category = _refine_init_category(
+                    exc.safe_error_category, error=exc, child_stderr=stderr_tail
+                )
+                child_exception_type = exc.child_exception_type
+            else:
+                category = _classify_runtime_context_create_error(exc, stderr_tail)
+                child_exception_type = type(exc).__name__
+            self.close()
+            raise LlamaCppRuntimeInitError(
+                'llama_cpp_model_initialization failed',
+                child_exception_type=child_exception_type,
+                safe_error_category=category,
+                child_stderr_tail=stderr_tail,
+            ) from exc
+        try:
             self.child_model_path_exists = bool(init_message.get('child_model_path_exists'))
         except LlamaCppRuntimeStageTimeout:
             self.close()
@@ -2172,11 +2340,75 @@ class _SubprocessLlamaProxy:
             self._closed = True
             raise LlamaCppWorkerBrokenPipeError('llama_cpp subprocess stdin is unavailable')
         try:
+            if hasattr(self, '_stdout_demultiplexer') and 'command_id' not in payload:
+                payload = dict(payload)
+                payload['command_id'] = 'unclaimed'
             self._process.stdin.write(json.dumps(payload) + '\n')
             self._process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             self._closed = True
             raise LlamaCppWorkerBrokenPipeError('llama_cpp subprocess transport write failed') from exc
+
+    def _rpc(
+        self,
+        payload: Dict[str, Any],
+        *,
+        stage: str,
+        check_health: bool = True,
+        timeout_seconds: Optional[float] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        if not hasattr(self, '_stdout_demultiplexer'):
+            if check_health:
+                self._send(payload)
+            else:
+                self._send(payload, check_health=False)
+            return _read_llama_subprocess_message(
+                self._process,
+                timeout_seconds=(getattr(self, '_timeout_seconds', None) if timeout_seconds is None else timeout_seconds),
+                stage=stage,
+            )
+        self._command_sequence = getattr(self, '_command_sequence', 0) + 1
+        command_id = f'c{self._command_sequence}'
+        payload = dict(payload)
+        payload['command_id'] = command_id
+        destination = self._stdout_demultiplexer.register(command_id)
+        try:
+            self._send(payload, check_health=check_health)
+            timeout = self._timeout_seconds if timeout_seconds is None else timeout_seconds
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while True:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise LlamaCppRuntimeStageTimeout(stage, timeout)
+                try:
+                    message = destination.get(timeout=remaining)
+                except queue.Empty as exc:
+                    raise LlamaCppRuntimeStageTimeout(stage, timeout) from exc
+                if isinstance(message, BaseException):
+                    raise message
+                if message.get('type') == 'inference_progress':
+                    if callable(progress_observer):
+                        try:
+                            progress_observer(dict(message))
+                        except Exception:
+                            pass
+                    continue
+                # Reuse the established typed/error conversion without creating
+                # another stdout reader.
+                if message.get('status') == 'error':
+                    raw_error = str(message.get('error') or f'{stage} failed')
+                    if stage in {'llama_cpp_inference', 'llama_cpp_prompt_render_tokenize'} and message.get('request_error'):
+                        diagnostics = message.get('diagnostics')
+                        raise LlamaCppInferenceRequestError(raw_error, diagnostics=diagnostics if isinstance(diagnostics, dict) else {})
+                    raise LlamaCppRuntimeInitError(
+                        f'{stage} failed',
+                        child_exception_type=message.get('exception_type') or 'RuntimeError',
+                        safe_error_category=_validated_init_safe_category(message.get('safe_error_category')),
+                    )
+                return message
+        finally:
+            self._stdout_demultiplexer.discard(command_id)
 
     def is_alive(self) -> bool:
         if self._closed:
@@ -2198,11 +2430,12 @@ class _SubprocessLlamaProxy:
         try:
             with self._lock:
                 stderr_cursor = self._stderr_cursor()
-                self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
-                message = _read_llama_subprocess_message(
-                    self._process,
+                progress_observer = kwargs.pop('token_place_progress_observer', None)
+                message = self._rpc(
+                    {'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs},
                     timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
                     stage='llama_cpp_inference',
+                    progress_observer=progress_observer,
                 )
         except LlamaCppInferenceRequestError as exc:
             time.sleep(0.1)
@@ -2221,11 +2454,12 @@ class _SubprocessLlamaProxy:
         try:
             with self._lock:
                 stderr_cursor = self._stderr_cursor()
-                self._send({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs})
-                message = _read_llama_subprocess_message(
-                    self._process,
+                progress_observer = kwargs.pop('token_place_progress_observer', None)
+                message = self._rpc(
+                    {'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs},
                     timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
                     stage='llama_cpp_inference',
+                    progress_observer=progress_observer,
                 )
         except LlamaCppInferenceRequestError as exc:
             time.sleep(0.1)
@@ -2241,11 +2475,9 @@ class _SubprocessLlamaProxy:
 
     def apply_chat_template(self, *args, **kwargs):
         with self._lock:
-            self._send({'method': 'apply_chat_template', 'args': args, 'kwargs': kwargs})
             try:
-                message = _read_llama_subprocess_message(
-                    self._process,
-                    timeout_seconds=self._timeout_seconds,
+                message = self._rpc(
+                    {'method': 'apply_chat_template', 'args': args, 'kwargs': kwargs},
                     stage='llama_cpp_prompt_render',
                 )
             except LlamaCppWorkerEOFError:
@@ -2255,11 +2487,9 @@ class _SubprocessLlamaProxy:
 
     def render_and_tokenize_chat(self, *args, **kwargs):
         with self._lock:
-            self._send({'method': 'render_and_tokenize_chat', 'args': args, 'kwargs': kwargs})
             try:
-                message = _read_llama_subprocess_message(
-                    self._process,
-                    timeout_seconds=self._timeout_seconds,
+                message = self._rpc(
+                    {'method': 'render_and_tokenize_chat', 'args': args, 'kwargs': kwargs},
                     stage='llama_cpp_prompt_render_tokenize',
                 )
             except LlamaCppWorkerEOFError:
@@ -2275,11 +2505,9 @@ class _SubprocessLlamaProxy:
             for arg in args
         )
         with self._lock:
-            self._send({'method': 'tokenize', 'args': serializable_args, 'kwargs': kwargs})
             try:
-                message = _read_llama_subprocess_message(
-                    self._process,
-                    timeout_seconds=self._timeout_seconds,
+                message = self._rpc(
+                    {'method': 'tokenize', 'args': serializable_args, 'kwargs': kwargs},
                     stage='llama_cpp_prompt_tokenize',
                 )
             except LlamaCppWorkerEOFError:
@@ -2289,20 +2517,49 @@ class _SubprocessLlamaProxy:
 
     def _stream_chat_completion(self, *args, **kwargs):
         with self._lock:
-            self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
-            while True:
-                try:
-                    message = _read_llama_subprocess_message(
-                        self._process,
-                        timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
-                        stage='llama_cpp_inference',
-                    )
-                except LlamaCppWorkerEOFError:
-                    self._closed = True
-                    raise
-                if message.get('done'):
-                    return
-                yield message.get('chunk')
+            if not hasattr(self, '_stdout_demultiplexer'):
+                self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
+                while True:
+                    try:
+                        message = _read_llama_subprocess_message(
+                            self._process,
+                            timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                            stage='llama_cpp_inference',
+                        )
+                    except LlamaCppWorkerEOFError:
+                        self._closed = True
+                        raise
+                    if message.get('done'):
+                        return
+                    yield message.get('chunk')
+                return
+            self._command_sequence += 1
+            command_id = f'c{self._command_sequence}'
+            destination = self._stdout_demultiplexer.register(command_id, claim_all_legacy=True)
+            try:
+                self._send({
+                    'method': 'create_chat_completion',
+                    'args': args,
+                    'kwargs': kwargs,
+                    'command_id': command_id,
+                })
+                timeout = _llama_cpp_subprocess_inference_timeout_seconds()
+                while True:
+                    message = destination.get(timeout=timeout)
+                    if isinstance(message, BaseException):
+                        raise message
+                    if message.get('status') == 'error' and message.get('request_error'):
+                        diagnostics = message.get('diagnostics')
+                        raise LlamaCppInferenceRequestError(
+                            str(message.get('error') or 'llama_cpp_inference failed'),
+                            diagnostics=diagnostics if isinstance(diagnostics, dict) else {},
+                        )
+                    if message.get('done'):
+                        return
+                    if message.get('type') != 'inference_progress':
+                        yield message.get('chunk')
+            finally:
+                self._stdout_demultiplexer.discard(command_id)
 
     def close(self) -> None:
         if self._closed:
@@ -2322,6 +2579,9 @@ class _SubprocessLlamaProxy:
                     self._process.kill()
                 except Exception:
                     pass
+        demultiplexer = getattr(self, '_stdout_demultiplexer', None)
+        if demultiplexer is not None:
+            demultiplexer.join()
         tmpfile = getattr(self, '_worker_tmpfile', None)
         if tmpfile:
             try:
@@ -2430,6 +2690,11 @@ def _jsonable(value):
     return value
 
 def _emit(payload):
+    command_id = globals().get('_active_command_id')
+    if command_id is not None and isinstance(payload, dict):
+        payload = dict(payload)
+        payload['command_id'] = command_id
+        payload['protocol_version'] = 2
     print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
 
 
@@ -3363,6 +3628,7 @@ try:
     if not init_line:
         raise RuntimeError('llama_cpp subprocess missing init payload')
     init_payload = json.loads(init_line)
+    _active_command_id = init_payload.get('command_id') if isinstance(init_payload, dict) else None
     emit_import_handshake = isinstance(init_payload, dict) and init_payload.get('method') == '__import__'
     llama_cpp = importlib.import_module('llama_cpp')
     if emit_import_handshake:
@@ -3371,6 +3637,7 @@ try:
         if not init_line:
             raise RuntimeError('llama_cpp subprocess missing init payload')
         init_payload = json.loads(init_line)
+        _active_command_id = init_payload.get('command_id') if isinstance(init_payload, dict) else None
     init_args = init_payload.get('args', [])
     init_kwargs = init_payload.get('kwargs', {})
 except Exception as exc:
@@ -3409,6 +3676,7 @@ for line in sys.stdin:
         if not isinstance(request, dict):
             _emit(_safe_request_error('malformed_request'))
             continue
+        _active_command_id = request.get('command_id')
         method = request.get('method')
         if method not in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt', 'apply_chat_template', 'tokenize', 'render_and_tokenize_chat'}:
             _emit(_safe_request_error('unsupported_method', request=request))
@@ -5946,16 +6214,22 @@ class ModelManager:
 
         process_stopped = True
         if process is not None:
-            # Subprocess-backed workers are cleaned up with process primitives before
-            # any proxy close so third-party close() cannot block cancellation or
-            # ordinary invalidation while holding up recovery.
-            for attr in ('stdin', 'stdout', 'stderr'):
-                _close_or_join_resource(getattr(process, attr, None))
+            # IMPORTANT: signal and reap before touching pipes.  TextIOWrapper.close()
+            # takes the same internal lock as a blocked reader; closing stdout first
+            # can therefore wait indefinitely for native inference to produce a
+            # frame.  Cancellation must remain independent of both that stream lock
+            # and _SubprocessLlamaProxy._lock.
             if not _dead():
                 terminate = getattr(process, 'terminate', None)
                 if callable(terminate):
                     try:
-                        terminate()
+                        if os.name != 'nt' and isinstance(getattr(process, 'pid', None), int):
+                            try:
+                                os.killpg(process.pid, signal.SIGTERM)
+                            except (OSError, ProcessLookupError):
+                                terminate()
+                        else:
+                            terminate()
                     except Exception:
                         pass
                 wait = getattr(process, 'wait', None)
@@ -5968,7 +6242,24 @@ class ModelManager:
                 kill = getattr(process, 'kill', None)
                 if callable(kill):
                     try:
-                        kill()
+                        if os.name != 'nt' and isinstance(getattr(process, 'pid', None), int):
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except (OSError, ProcessLookupError):
+                                kill()
+                        elif os.name == 'nt' and isinstance(getattr(process, 'pid', None), int):
+                            # taskkill is part of Windows and is the only reliable
+                            # way to include native-library descendants.  No shell,
+                            # PATH repair, or mutable runtime is involved.
+                            subprocess.run(
+                                ['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                                check=False,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=1.0,
+                            )
+                        else:
+                            kill()
                     except Exception:
                         pass
                 wait = getattr(process, 'wait', None)
@@ -5978,6 +6269,10 @@ class ModelManager:
                     except Exception:
                         pass
             process_stopped = _dead()
+            # Process death/EOF releases blocked readers.  Only now is it safe to
+            # dispose transport streams; each join remains explicitly bounded.
+            for attr in ('stdin', 'stdout', 'stderr'):
+                _close_or_join_resource(getattr(process, attr, None))
 
         close = getattr(llm, 'close', None)
         if callable(close) and process is None:
@@ -6060,7 +6355,7 @@ class ModelManager:
             'stdin', 'stdout', 'stderr', '_stdin', '_stdout', '_stderr',
             '_stdout_reader', '_stderr_reader', '_reader', '_queue',
             'stdout_queue', 'stderr_queue', '_stderr_reader_thread',
-            '_stdout_reader_thread', '_reader_thread',
+            '_stdout_reader_thread', '_reader_thread', '_stdout_demultiplexer',
         ):
             resource = getattr(llm, attr, None)
             _close_or_join_resource(resource)

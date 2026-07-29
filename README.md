@@ -88,6 +88,11 @@ Make targets surface the same workflows in shorthand:
 - `make lint` → run the full pre-commit suite (formatters, linters, tests)
 - `make test` → execute `./run_all_tests.sh`
 - `make desktop-parity-checks` → run the local shared desktop parity entry point
+- `make desktop-build` → build a local desktop installer (`.app`/`.dmg` on macOS, NSIS/MSI on
+  Windows) without waiting on the ~45 minute `desktop-release.yml` CI matrix; see
+  [desktop-tauri/README.md](desktop-tauri/README.md#build-a-local-installer-fast-iteration-loop)
+- `make desktop-clean` → wipe local desktop build artifacts (Rust `target/`, npm deps, embedded
+  runtime, and the global Cargo registry cache) after an interrupted/corrupted build
 - `make docker-build` → build the relay Docker image used by remote nodes
 - `make k8s-deploy` → apply the current Kubernetes manifests
 

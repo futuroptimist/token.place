@@ -58,10 +58,10 @@ WINDOWS_SYSTEM_DLLS = {
     "ole32.dll", "oleaut32.dll", "pdh.dll", "powrprof.dll", "psapi.dll", "rpcrt4.dll",
     "sechost.dll", "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll",
     "userenv.dll", "version.dll", "ws2_32.dll",
-    # Driver-provided and intentionally external; CUDA runtime/cuBLAS/OpenSSL/MSVC
-    # payloads must be bundled and validated as part of the runtime closure.
-    "nvcuda.dll",
 }
+# This is deliberately separate from ordinary Windows system DLLs: it is supplied
+# only by the NVIDIA display driver and may be absent on a driverless builder.
+WINDOWS_EXTERNAL_DRIVER_DLLS = {"nvcuda.dll"}
 WINDOWS_API_SET_DLL_RE = re.compile(r"^(api|ext)-ms-win-[a-z0-9-]+-l[0-9]+-[0-9]+-[0-9]+\.dll$", re.I)
 FORBIDDEN_RUNTIME_PAYLOAD_RE = re.compile(r"(^|[\\/])(cmake|ninja|nvcc|cl|msbuild)(\.exe)?$|cuda[-_]?toolkit|visual studio|(^|[\\/])buildtools([\\/]|$)|\.sln$|\.vcxproj$", re.I)
 
@@ -111,9 +111,14 @@ def load_manifest(path: Path=MANIFEST) -> dict:
         destination = artifact.get("destination", artifact["name"]).lower().replace("\\", "/")
         if destination in native_destinations: raise RuntimePrepError(f"duplicate native DLL destination: {destination}")
         native_destinations.add(destination)
+        expected_destination = _expected_native_artifact_destination(artifact["name"])
+        if destination != expected_destination:
+            raise RuntimePrepError(
+                f"native DLL artifact has invalid loader destination: {artifact['name']}"
+            )
     if native_artifacts:
         native_names = {a["name"].lower() for a in native_artifacts if isinstance(a, dict) and "name" in a}
-        required_vendor = {"cudart64_12.dll", "cublas64_12.dll", "msvcp140.dll", "vcomp140.dll"}
+        required_vendor = {"cudart64_12.dll", "cublas64_12.dll", "msvcp140.dll", "vcomp140.dll", "vcruntime140_1.dll"}
         missing_vendor = sorted(required_vendor - native_names)
         if missing_vendor: raise RuntimePrepError(f"missing native DLL artifact pins: {missing_vendor}")
     _validate_sha256_pin(m.get("sha256", ""), "archive sha256")
@@ -143,6 +148,9 @@ def load_manifest(path: Path=MANIFEST) -> dict:
 def is_windows_system_dll(name: str) -> bool:
     dll = name.lower()
     return dll in WINDOWS_SYSTEM_DLLS or bool(WINDOWS_API_SET_DLL_RE.fullmatch(dll))
+
+def is_windows_external_driver_dll(name: str) -> bool:
+    return name.lower() in WINDOWS_EXTERNAL_DRIVER_DLLS
 
 def fetch(url: str, sha: str, dest: Path) -> Path:
     original = _validated_artifact_url(url)
@@ -215,7 +223,7 @@ def extract_microsoft_burn_member(archive: Path, member: str, dest: Path) -> Non
         shutil.copyfile(extracted, dest)
 
 def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
-    """Stage pinned native redistributable DLLs beside python.exe for Windows loader visibility."""
+    """Stage pinned redistributables in their narrowly validated loader scope."""
     seen: set[str] = set()
     for artifact in m.get("native_dll_artifacts", []):
         name = artifact["name"]
@@ -232,6 +240,8 @@ def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
         dest = (staged / destination).resolve()
         if not dest.is_relative_to(staged.resolve()) or dest.name.lower() != lower:
             raise RuntimePrepError(f"native DLL destination must stay in runtime root: {name}")
+        if destination.lower().replace("\\", "/") != _expected_native_artifact_destination(name):
+            raise RuntimePrepError(f"native DLL artifact has invalid loader destination: {name}")
         dest.parent.mkdir(parents=True, exist_ok=True)
         if archive.suffix.lower() == ".zip":
             with zipfile.ZipFile(archive) as zf:
@@ -254,6 +264,301 @@ def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
         machine, _ = inspect_pe(dest, dest.relative_to(staged).as_posix())
         if machine != "IMAGE_FILE_MACHINE_AMD64":
             raise RuntimePrepError(f"native DLL artifact is not AMD64: {name}")
+
+
+NATIVE_IMPORT_DIAGNOSTIC_CODES = {126, 127, 193}
+STAGED_NATIVE_IMPORT_VALID = "native_import_valid"
+STAGED_NATIVE_IMPORT_EXTERNAL_DRIVER_UNAVAILABLE = "external_driver_unavailable"
+NATIVE_LLAMA_DIRECTORY = "Lib/site-packages/llama_cpp/lib"
+APP_LOCAL_MSVC_DLLS = {"msvcp140.dll", "vcomp140.dll", "vcruntime140_1.dll"}
+
+
+def _expected_native_artifact_destination(name: str) -> str:
+    lower = name.lower()
+    if lower in APP_LOCAL_MSVC_DLLS:
+        return lower
+    return f"{NATIVE_LLAMA_DIRECTORY}/{lower}".lower()
+
+
+def _closed_native_import_env(runtime: Path) -> tuple[dict[str, str], Path]:
+    try:
+        runtime = runtime.resolve(strict=True)
+        native = (runtime / "Lib/site-packages/llama_cpp/lib").resolve(strict=True)
+        system_root_value = os.environ.get("SystemRoot", "")
+        system_root = Path(system_root_value)
+        if not system_root.is_absolute():
+            raise OSError
+        system_root = system_root.resolve(strict=True)
+        system32 = (system_root / "System32").resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise RuntimePrepError("staged native import environment invalid") from None
+    if not system32.is_dir() or not system32.is_relative_to(system_root):
+        raise RuntimePrepError("staged native import environment invalid")
+    env = {
+        "PATH": os.pathsep.join((str(runtime), str(native), str(system32))),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "SystemRoot": str(system_root),
+    }
+    return env, native
+
+
+def _native_import_probe_script() -> str:
+    return """
+import importlib.metadata as md, json, pathlib
+import llama_cpp
+runtime = pathlib.Path(__import__('sys').executable).resolve().parent
+module = pathlib.Path(llama_cpp.__file__).resolve()
+valid = module.is_relative_to(runtime) and md.version('llama-cpp-python') == '0.3.32'
+print(json.dumps({'native_import_valid': valid}, separators=(',', ':')))
+raise SystemExit(0 if valid else 9)
+"""
+
+
+def _diagnose_native_import_failure(py: Path, runtime: Path, env: dict[str, str], pe_closure: list[dict[str, object]], m: dict) -> tuple[str, int | str | None]:
+    """Return only a manifest-owned basename and bounded Windows loader code."""
+    try:
+        runtime = runtime.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return "unknown", None
+    entries = {
+        str(entry.get("name", "")).lower(): entry
+        for entry in pe_closure
+        if isinstance(entry, dict) and entry.get("name") and entry.get("path")
+    }
+    candidates = {
+        name: runtime / str(entry["path"])
+        for name, entry in entries.items()
+    }
+    manifest_destinations = {
+        str(artifact["name"]).lower(): runtime / str(artifact["destination"])
+        for artifact in m.get("native_dll_artifacts", [])
+        if isinstance(artifact, dict) and artifact.get("name") and artifact.get("destination")
+    }
+    candidates.update(manifest_destinations)
+
+    # A dependency imported by Python/NumPy before llama_cpp registers its private
+    # directory must be app-local beside python.exe. Report that manifest-owned
+    # dependency rather than the consumer module that happened to expose it.
+    for consumer_name, entry in sorted(entries.items()):
+        for dependency in entry.get("imports", []):
+            dependency = str(dependency).lower()
+            destination = manifest_destinations.get(dependency)
+            if destination is None:
+                continue
+            if not destination.is_file():
+                return dependency, 126
+    ordered: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited or name in visiting:
+            return
+        visiting.add(name)
+        imports = entries.get(name, {}).get("imports", [])
+        if isinstance(imports, list):
+            for dependency in sorted(str(item).lower() for item in imports):
+                if dependency in candidates:
+                    visit(dependency)
+        visiting.remove(name)
+        visited.add(name)
+        ordered.append(name)
+
+    for candidate in sorted(entries):
+        visit(candidate)
+    # Manifest-owned members not referenced by the recorded closure are still
+    # provenance-owned, but come after the dependency graph they cannot explain.
+    for candidate in sorted(candidates):
+        visit(candidate)
+
+    resolved_candidates: dict[str, Path] = {}
+    for name in ordered:
+        try:
+            candidate = candidates[name].resolve(strict=True)
+        except (OSError, RuntimeError):
+            return name, None
+        if not candidate.is_file() or not candidate.is_relative_to(runtime):
+            return name, None
+        resolved_candidates[name] = candidate
+    def dependency_directories(name: str) -> list[Path]:
+        """Return only directories in this member's recorded dependency closure."""
+        dependencies: set[str] = set()
+
+        def collect(candidate_name: str) -> None:
+            imports = entries.get(candidate_name, {}).get("imports", [])
+            if not isinstance(imports, list):
+                return
+            for dependency in sorted(str(item).lower() for item in imports):
+                if dependency not in resolved_candidates or dependency in dependencies:
+                    continue
+                dependencies.add(dependency)
+                collect(dependency)
+
+        collect(name)
+        dependencies.discard(name)
+        return sorted(
+            {resolved_candidates[dependency].parent for dependency in dependencies},
+            key=lambda path: str(path).casefold(),
+        )
+
+    for name in ordered:
+        dll_directories = dependency_directories(name)
+        script = """
+import ctypes, json, sys
+directories = json.loads(sys.argv[2])
+# Keep every handle alive until the probed member has been unloaded. This
+# matches packages such as NumPy, which retain add_dll_directory handles while
+# importing extensions from a sibling native-library directory.
+dll_directory_handles = [__import__('os').add_dll_directory(path) for path in directories]
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+load = kernel32.LoadLibraryExW
+load.argtypes = (ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32)
+load.restype = ctypes.c_void_p
+free = kernel32.FreeLibrary
+free.argtypes = (ctypes.c_void_p,)
+free.restype = ctypes.c_int
+ctypes.set_last_error(0)
+# Match CPython's extension-module search behavior: search the loaded DLL's
+# directory and the process default DLL directories, never the ambient cwd.
+handle = load(sys.argv[1], None, 0x00000100 | 0x00001000)
+if not handle:
+    code = ctypes.get_last_error()
+    print(json.dumps({'loaded':False,'code':code if code in (126,127,193) else None}, separators=(',',':')))
+    raise SystemExit(1)
+free(handle)
+print('{"loaded":true,"code":null}')
+"""
+        try:
+            result = subprocess.run(
+                [
+                    str(py), "-I", "-c", script, str(resolved_candidates[name]),
+                    json.dumps([str(path) for path in dll_directories], separators=(",", ":")),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return name, None
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return name, None
+        if result.returncode == 0 and payload == {"loaded": True, "code": None}:
+            continue
+        if not isinstance(payload, dict) or set(payload) != {"loaded", "code"} or payload.get("loaded") is not False:
+            return name, None
+        code = payload.get("code")
+        return name, code if code in NATIVE_IMPORT_DIAGNOSTIC_CODES else None
+    return "unknown", None
+
+
+def _driverless_native_import_boundary(
+    py: Path,
+    failed_name: str,
+    loader_code: int | str | None,
+    env: dict[str, str],
+    pe_closure: list[dict[str, object]],
+    m: dict,
+) -> bool:
+    """Prove that the failed member is blocked only by the NVIDIA driver DLL."""
+    if loader_code != 126:
+        return False
+    entries = {
+        str(entry.get("name", "")).lower(): entry
+        for entry in pe_closure
+        if isinstance(entry, dict) and entry.get("name")
+    }
+    runtime_names = set(entries)
+    runtime_names.update(
+        str(artifact.get("name", "")).lower()
+        for artifact in m.get("native_dll_artifacts", [])
+        if isinstance(artifact, dict) and artifact.get("name")
+    )
+    external: set[str] = set()
+    visited: set[str] = set()
+
+    def collect(name: str) -> bool:
+        if name in visited:
+            return True
+        visited.add(name)
+        entry = entries.get(name)
+        if entry is None or not isinstance(entry.get("imports", []), list):
+            return False
+        for imported in entry.get("imports", []):
+            dependency = str(imported).lower()
+            if dependency in runtime_names:
+                if dependency in entries and not collect(dependency):
+                    return False
+            elif is_windows_system_dll(dependency):
+                continue
+            elif is_windows_external_driver_dll(dependency):
+                external.add(dependency)
+            else:
+                return False
+        return True
+
+    if not collect(failed_name.lower()) or external != WINDOWS_EXTERNAL_DRIVER_DLLS:
+        return False
+    script = """
+import ctypes, json
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+load = kernel32.LoadLibraryExW
+load.argtypes = (ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32)
+load.restype = ctypes.c_void_p
+ctypes.set_last_error(0)
+handle = load('nvcuda.dll', None, 0x00001000)
+code = None if handle else ctypes.get_last_error()
+print(json.dumps({'loaded':bool(handle),'code':code if code in (126,127,193) else None}, separators=(',',':')))
+raise SystemExit(0 if handle else 1)
+"""
+    try:
+        result = subprocess.run(
+            [str(py), "-I", "-c", script], env=env, text=True,
+            capture_output=True, timeout=15, check=False,
+        )
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError):
+        return False
+    return result.returncode == 1 and payload == {"loaded": False, "code": 126}
+
+
+def validate_staged_native_import(runtime: Path, m: dict, pe_closure: list[dict[str, object]]) -> str:
+    """Import the pinned native module under the packaged launcher's closed environment."""
+    try:
+        py = (runtime / m["expected_interpreter_path"]).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise RuntimePrepError("staged native import failed: unknown:loader_code_unknown") from None
+    env, _native = _closed_native_import_env(runtime)
+    try:
+        result = subprocess.run(
+            [str(py), "-I", "-c", _native_import_probe_script()],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimePrepError("staged native import failed: unknown:loader_code_unknown") from None
+    try:
+        payload = json.loads(result.stdout) if result.returncode == 0 else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if result.returncode == 0 and payload == {"native_import_valid": True}:
+        return STAGED_NATIVE_IMPORT_VALID
+    basename, code = _diagnose_native_import_failure(py, runtime, env, pe_closure, m)
+    if _driverless_native_import_boundary(py, basename, code, env, pe_closure, m):
+        return STAGED_NATIVE_IMPORT_EXTERNAL_DRIVER_UNAVAILABLE
+    bounded_code = (
+        f"winerror_{code}" if isinstance(code, int)
+        else code if isinstance(code, str)
+        else "loader_code_unknown"
+    )
+    raise RuntimePrepError(f"staged native import failed: {basename}:{bounded_code}")
 
 def safe_extract_tar(archive: Path, dest: Path) -> None:
     with tarfile.open(archive, 'r:*') as tf:
@@ -471,7 +776,7 @@ def validate_pe_dll_closure(runtime: Path, m: dict) -> list[dict[str, object]]:
         machine, imports = inspect_pe(pe, rel)
         closure.append({'name': pe.name, 'path': rel, 'machine': machine, 'imports': sorted(imports), 'sha256': sha256_file(pe)})
         for dll in imports:
-            if is_windows_system_dll(dll):
+            if is_windows_system_dll(dll) or is_windows_external_driver_dll(dll):
                 continue
             target = _resolve_import_target(pe, dll, candidates, runtime)
             if target is None:
@@ -609,6 +914,7 @@ def prepare(m: dict) -> None:
         stage_native_dll_artifacts(m, cache, staged)
         prune_packaging_unused_non_x64_launchers(staged)
         pe_closure=validate_runtime_payload(staged, m)
+        validate_staged_native_import(staged, m, pe_closure)
         for notice in m.get('runtime_notices',[]): (staged/notice['path']).write_text(f"{notice['name']} redistribution notice: {notice['license']}\n", encoding='utf-8')
         write_provenance(staged, m, pe_closure)
         backup=tmp/'old-runtime'

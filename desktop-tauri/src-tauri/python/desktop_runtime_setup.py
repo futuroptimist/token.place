@@ -204,6 +204,13 @@ class RuntimeProbe:
     q4_kv_cache_type_value: Optional[int] = None
     f16_kv_cache_type_value: Optional[int] = None
     capability_source: str = "desktop_runtime_setup_probe"
+    probe_stage: str = "runtime_validation"
+    probe_error_code: str = "none"
+    exception_type: str = "none"
+    child_exit_code: Optional[int] = None
+    detected_architecture: str = "unknown"
+    architecture_source: str = "platform"
+    import_root_valid: bool = False
 
 
 GPU_MODES = frozenset({"auto", "gpu", "hybrid"})
@@ -253,6 +260,21 @@ RUNTIME_PROBE_ENV = "TOKEN_PLACE_DESKTOP_RUNTIME_PROBE_JSON"
 PROBE_RESULT_PREFIX = b"TOKEN_PLACE_RUNTIME_PROBE_RESULT "
 PROBE_RESULT_MAX_BYTES = 1024 * 1024
 PROBE_EXIT_GRACE_SECONDS = 1.0
+PROBE_DIAGNOSTIC_STAGES = frozenset({"environment_contract", "native_import", "runtime_validation", "probe_process"})
+PROBE_DIAGNOSTIC_CODES = frozenset({
+    "none", "missing_environment_contract", "native_llama_import_failed", "native_dll_load_failed",
+    "runtime_version_or_provenance_invalid", "cuda_capability_missing", "physical_device_missing",
+    "yarn_rope_capability_incomplete", "unsupported_platform", "probe_timeout", "probe_process_abnormal_exit",
+})
+PROBE_DIAGNOSTIC_CODE_STAGES = {
+    "missing_environment_contract": "environment_contract",
+    "native_llama_import_failed": "native_import",
+    "native_dll_load_failed": "native_import",
+    "probe_timeout": "probe_process",
+    "probe_process_abnormal_exit": "probe_process",
+}
+PROBE_EXCEPTION_TYPES = frozenset({"none", "ImportError", "ModuleNotFoundError", "OSError", "RuntimeError", "TimeoutExpired"})
+PROBE_ARCHITECTURE_SOURCES = frozenset({"platform", "attested_windows_x86_64", "unknown"})
 SOURCE_REPAIR_COOLDOWN_SECONDS = 24 * 60 * 60
 DEVELOPMENT_SOURCE_BUILD_OPT_IN_ENV = "TOKEN_PLACE_DESKTOP_DEV_ALLOW_SOURCE_BUILD"
 _PROCESS_SYS_PATH = sys.path
@@ -301,6 +323,21 @@ def _desktop_platform():
 python_root = os.environ.get("TOKEN_PLACE_DESKTOP_PYTHON_ROOT", "").strip()
 if python_root and python_root not in sys.path:
     sys.path.insert(0, python_root)
+
+def _packaged_import_root_valid():
+    configured = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
+    if not configured or not python_root:
+        return False
+    try:
+        configured_path = Path(_safe_resolve_path_text(configured))
+        python_path = Path(_safe_resolve_path_text(python_root))
+        installed_base = configured_path.parents[1] if tuple(part.lower() for part in configured_path.parts[-2:]) == ("_up_", "_up_") else None
+        related = python_path == configured_path or python_path.is_relative_to(configured_path) or (
+            installed_base is not None and python_path.is_relative_to(installed_base)
+        )
+        return related and (configured_path / "utils").is_dir() and (configured_path / "config.py").is_file()
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 dependency_target = os.environ.get("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", "").strip()
 if dependency_target and dependency_target not in sys.path:
@@ -465,6 +502,24 @@ try:
         "error": None,
     }
 except Exception as exc:
+    exception_type = type(exc).__name__
+    if exception_type not in {"ImportError", "ModuleNotFoundError", "OSError", "RuntimeError"}:
+        exception_type = "RuntimeError"
+    loader_markers = (
+        "dll load failed", "dynamic link library", "specified module could not be found",
+        "specified procedure could not be found", "not a valid win32 application",
+        "winerror 126", "winerror 127", "winerror 193",
+    )
+    exc_text_lower = str(exc).lower()
+    safe_loader_failure = isinstance(exc, OSError) or (
+        isinstance(exc, ImportError)
+        and any(marker in exc_text_lower for marker in loader_markers)
+    ) or (
+        isinstance(exc, RuntimeError)
+        and "failed to load shared library" in exc_text_lower
+        and any(marker in exc_text_lower for marker in loader_markers)
+    )
+    error_code = "native_dll_load_failed" if safe_loader_failure else "native_llama_import_failed"
     payload = {
         "backend": "missing",
         "gpu_offload_supported": False,
@@ -492,7 +547,14 @@ except Exception as exc:
         "q4_kv_cache_type_value": None,
         "f16_kv_cache_type_value": None,
         "capability_source": "desktop_runtime_setup_probe",
-        "error": str(exc),
+        "error": error_code,
+        "probe_stage": "native_import",
+        "probe_error_code": error_code,
+        "exception_type": exception_type,
+        "child_exit_code": None,
+        "detected_architecture": "x86_64" if os.environ.get("TOKEN_PLACE_PACKAGED_ARCH") == "x86_64" else "unknown",
+        "architecture_source": os.environ.get("TOKEN_PLACE_PACKAGED_ARCH_SOURCE", "unknown") if os.environ.get("TOKEN_PLACE_PACKAGED_ARCH_SOURCE", "unknown") in {"attested_windows_x86_64", "unknown"} else "unknown",
+        "import_root_valid": _packaged_import_root_valid(),
     }
 
 print("TOKEN_PLACE_RUNTIME_PROBE_RESULT " + json.dumps(payload, separators=(",", ":")), flush=True)
@@ -679,7 +741,18 @@ def _probe_failure(
     error: str,
     dependency_target_text: str,
     pip_version: str,
+    probe_stage: str = "probe_process",
+    probe_error_code: str = "probe_process_abnormal_exit",
+    exception_type: str = "none",
+    child_exit_code: Optional[int] = None,
 ) -> RuntimeProbe:
+    detected_architecture = "unknown"
+    architecture_source = "unknown"
+    try:
+        detected_architecture = _desktop_arch()
+        architecture_source = "attested_windows_x86_64" if os.environ.get("TOKEN_PLACE_PACKAGED_ARCH_SOURCE") == "attested_windows_x86_64" else "platform"
+    except RuntimeError:
+        pass
     return RuntimeProbe(
         backend="missing",
         gpu_offload_supported=False,
@@ -692,13 +765,122 @@ def _probe_failure(
         base_prefix=getattr(sys, "base_prefix", sys.prefix),
         dependency_target=dependency_target_text,
         pip_version=pip_version,
+        probe_stage=probe_stage,
+        probe_error_code=probe_error_code,
+        exception_type=exception_type if exception_type in PROBE_EXCEPTION_TYPES else "RuntimeError",
+        child_exit_code=child_exit_code if isinstance(child_exit_code, int) and not isinstance(child_exit_code, bool) else None,
+        detected_architecture=detected_architecture,
+        architecture_source=architecture_source,
+        import_root_valid=_packaged_import_root_valid() if _is_exact_packaged_runtime_layout() else dependency_target_text != "unknown",
     )
+
+
+def _packaged_import_root_valid(*, runtime_root: Optional[Path] = None) -> bool:
+    """Verify the launcher-configured import root, rather than trusting an override."""
+
+    configured = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
+    if not configured:
+        return False
+    try:
+        import_root = _safe_resolve_path(Path(configured))
+        expected_root = _safe_resolve_path(runtime_root) if runtime_root is not None else import_root
+        python_root = _safe_resolve_path(Path(__file__).parent)
+        installed_base = (
+            import_root.parents[1]
+            if tuple(part.lower() for part in import_root.parts[-2:]) == ("_up_", "_up_")
+            else None
+        )
+        related_to_python = (
+            python_root == import_root
+            or python_root.is_relative_to(import_root)
+            or (installed_base is not None and python_root.is_relative_to(installed_base))
+        )
+        return (
+            import_root == expected_root
+            and related_to_python
+            and (import_root / "utils").is_dir()
+            and (import_root / "config.py").is_file()
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _runtime_validation_diagnostic(
+    probe: RuntimeProbe,
+    *,
+    platform_supported: bool = True,
+    provenance_valid: bool = True,
+    version_match: str = "match",
+    expected_backend: str = "cuda",
+    yarn_required: bool = False,
+) -> Dict[str, Any]:
+    """Classify a failed immutable runtime decision from bounded evidence."""
+
+    existing_code = getattr(probe, "probe_error_code", "none")
+    code = existing_code if existing_code in PROBE_DIAGNOSTIC_CODES - {"none"} else None
+    existing_stage = getattr(probe, "probe_stage", "runtime_validation")
+    stage = (
+        existing_stage
+        if code is not None and existing_stage in PROBE_DIAGNOSTIC_STAGES
+        else PROBE_DIAGNOSTIC_CODE_STAGES.get(code, "runtime_validation")
+    )
+    if not platform_supported:
+        code = "unsupported_platform"
+        stage = "runtime_validation"
+    elif not provenance_valid:
+        code = "runtime_version_or_provenance_invalid"
+        stage = "runtime_validation"
+    elif code is None and version_match != "match":
+        code = "runtime_version_or_provenance_invalid"
+        stage = "runtime_validation"
+    elif code is None and probe.backend != "missing" and (
+        not probe.gpu_offload_supported or probe.backend != expected_backend
+    ):
+        code = "cuda_capability_missing"
+        stage = "runtime_validation"
+    elif code is None and yarn_required and not probe.yarn_rope_supported:
+        code = "yarn_rope_capability_incomplete"
+        stage = "runtime_validation"
+    elif code is None:
+        code = "probe_process_abnormal_exit"
+        stage = "probe_process"
+    return {
+        "probe_stage": stage,
+        "probe_error_code": code,
+        "exception_type": getattr(probe, "exception_type", "none") if getattr(probe, "exception_type", "none") in PROBE_EXCEPTION_TYPES else "RuntimeError",
+        "child_exit_code": getattr(probe, "child_exit_code", None),
+        "detected_architecture": getattr(probe, "detected_architecture", "unknown") if getattr(probe, "detected_architecture", "unknown") in {"x86_64", "arm64", "aarch64", "unknown"} else "unknown",
+        "architecture_source": getattr(probe, "architecture_source", "unknown") if getattr(probe, "architecture_source", "unknown") in PROBE_ARCHITECTURE_SOURCES else "unknown",
+        "import_root_valid": getattr(probe, "import_root_valid", False) is True,
+    }
+
+
+def _validated_probe_diagnostic(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    keys = {
+        "probe_stage", "probe_error_code", "exception_type", "child_exit_code",
+        "detected_architecture", "architecture_source", "import_root_valid",
+    }
+    if not keys.issubset(payload):
+        return None
+    diagnostic = {key: payload[key] for key in keys}
+    if (
+        diagnostic["probe_stage"] not in PROBE_DIAGNOSTIC_STAGES
+        or diagnostic["probe_error_code"] not in PROBE_DIAGNOSTIC_CODES - {"none"}
+        or diagnostic["exception_type"] not in PROBE_EXCEPTION_TYPES
+        or diagnostic["architecture_source"] not in PROBE_ARCHITECTURE_SOURCES
+        or diagnostic["detected_architecture"] not in {"x86_64", "arm64", "aarch64", "unknown"}
+        or not isinstance(diagnostic["import_root_valid"], bool)
+        or not (diagnostic["child_exit_code"] is None or (isinstance(diagnostic["child_exit_code"], int) and not isinstance(diagnostic["child_exit_code"], bool)))
+    ):
+        return None
+    return diagnostic
 
 
 def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_predicate: Optional[Any] = None, heartbeat: Optional[Any] = None, startup_phase: str = "runtime_probe") -> RuntimeProbe:
     repo_root = _safe_resolve_path(_resolve_runtime_root(repo_root=runtime_root))
     python_root = _safe_resolve_path(__file__).parent
     exact_packaged = _is_exact_packaged_runtime_layout()
+    packaged_import_root_valid = _packaged_import_root_valid(runtime_root=repo_root) if exact_packaged else False
     unbundled_windows = _desktop_platform().startswith("win") and not exact_packaged
     if exact_packaged:
         dependency_target = _bundled_site_packages_dir()
@@ -709,6 +891,12 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
     dependency_target_env = str(dependency_target) if dependency_target is not None and not exact_packaged else ""
     dependency_target_text = "bundled" if exact_packaged else ("development-import-environment" if unbundled_windows else (dependency_target_env or "unknown"))
     pip_version = "bundled-runtime-probe" if exact_packaged else ("read-only-development-probe" if unbundled_windows else _pip_version_summary())
+    if exact_packaged and not os.environ.get("PATH"):
+        return _probe_failure(
+            error="missing_environment_contract", dependency_target_text=dependency_target_text,
+            pip_version=pip_version, probe_stage="environment_contract",
+            probe_error_code="missing_environment_contract",
+        )
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
     env = os.environ.copy()
     if exact_packaged:
@@ -758,9 +946,10 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
         process = subprocess.Popen(cmd, **popen_kwargs)
     except Exception as exc:
         return _probe_failure(
-            error=f"desktop_runtime_probe_start_failed:{type(exc).__name__}",
+            error="probe_process_abnormal_exit",
             dependency_target_text=dependency_target_text,
             pip_version=pip_version,
+            exception_type=type(exc).__name__,
         )
 
     stdout_tail = bytearray()
@@ -930,24 +1119,30 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
     for thread in threads:
         thread.join(timeout=1)
 
-    stderr = decode_tail(stderr_tail)
     if probe_error:
-        return _probe_failure(error=probe_error, dependency_target_text=dependency_target_text, pip_version=pip_version)
+        code = "probe_timeout" if "timeout" in probe_error else "probe_process_abnormal_exit"
+        return _probe_failure(error=probe_error, dependency_target_text=dependency_target_text, pip_version=pip_version, probe_error_code=code, exception_type="TimeoutExpired" if code == "probe_timeout" else "RuntimeError", child_exit_code=returncode)
     if result_frame:
         payload = result_frame
     else:
         stdout = decode_tail(stdout_tail)
         if returncode != 0 or not stdout:
             return _probe_failure(
-                error=stderr or f"probe subprocess failed with return code {returncode}",
+                error="probe_process_abnormal_exit",
                 dependency_target_text=dependency_target_text,
                 pip_version=pip_version,
+                child_exit_code=returncode,
             )
         return _probe_failure(
-            error=stderr or "probe parse failure",
+            error="probe_process_abnormal_exit",
             dependency_target_text=dependency_target_text,
             pip_version=pip_version,
+            child_exit_code=returncode,
         )
+
+    diagnostic = _validated_probe_diagnostic(payload) if payload.get("error") else None
+    if payload.get("error") and diagnostic is None:
+        return _probe_failure(error="probe_process_abnormal_exit", dependency_target_text=dependency_target_text, pip_version=pip_version, child_exit_code=returncode)
 
     return RuntimeProbe(
         backend=str(payload.get("backend", "cpu")),
@@ -983,6 +1178,13 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
         q4_kv_cache_type_value=payload.get("q4_kv_cache_type_value") if isinstance(payload.get("q4_kv_cache_type_value"), int) and not isinstance(payload.get("q4_kv_cache_type_value"), bool) else None,
         f16_kv_cache_type_value=payload.get("f16_kv_cache_type_value") if isinstance(payload.get("f16_kv_cache_type_value"), int) and not isinstance(payload.get("f16_kv_cache_type_value"), bool) else None,
         capability_source=str(payload.get("capability_source", "desktop_runtime_setup_probe")),
+        probe_stage=str((diagnostic or {}).get("probe_stage", "runtime_validation")),
+        probe_error_code=str((diagnostic or {}).get("probe_error_code", "none")),
+        exception_type=str((diagnostic or {}).get("exception_type", "none")),
+        child_exit_code=(diagnostic or {}).get("child_exit_code"),
+        detected_architecture=str((diagnostic or {}).get("detected_architecture", "unknown")),
+        architecture_source=str((diagnostic or {}).get("architecture_source", "platform")),
+        import_root_valid=(diagnostic or {}).get("import_root_valid", packaged_import_root_valid) is True,
     )
 
 
@@ -1343,7 +1545,7 @@ def _prepend_dependency_target_to_sys_path(runtime_root: Path) -> tuple[Optional
 
 
 def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
-    return {
+    payload = {
         "detected_device": probe.detected_device or "cpu",
         "interpreter": _public_runtime_identity(probe.interpreter),
         "python_version": probe.python_version,
@@ -1374,6 +1576,17 @@ def _probe_result_payload(probe: RuntimeProbe) -> Dict[str, Any]:
         "rope_freq_scale_supported": probe.rope_freq_scale_supported,
         "yarn_orig_ctx_supported": probe.yarn_orig_ctx_supported,
     }
+    if getattr(probe, "probe_error_code", "none") != "none":
+        payload.update({
+            "probe_stage": getattr(probe, "probe_stage", "probe_process"),
+            "probe_error_code": getattr(probe, "probe_error_code"),
+            "exception_type": getattr(probe, "exception_type", "none"),
+            "child_exit_code": getattr(probe, "child_exit_code", None),
+            "detected_architecture": getattr(probe, "detected_architecture", "unknown"),
+            "architecture_source": getattr(probe, "architecture_source", "unknown"),
+            "import_root_valid": getattr(probe, "import_root_valid", False),
+        })
+    return payload
 
 
 def _private_runtime_probe_payload(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -1679,6 +1892,12 @@ def _desktop_platform() -> str:
 
 
 def _desktop_arch() -> str:
+    packaged_arch = os.environ.get("TOKEN_PLACE_PACKAGED_ARCH", "").strip().lower()
+    packaged_source = os.environ.get("TOKEN_PLACE_PACKAGED_ARCH_SOURCE", "").strip()
+    if packaged_arch or packaged_source:
+        if packaged_arch == "x86_64" and packaged_source == "attested_windows_x86_64":
+            return packaged_arch
+        raise RuntimeError("packaged_runtime_architecture_attestation_invalid")
     return platform_module.machine().lower().replace("amd64", "x86_64")
 
 
@@ -1897,6 +2116,12 @@ def _ensure_desktop_llama_runtime_impl(
             "runtime_action": "windows_development_runtime_missing_read_only",
             **_probe_result_payload(before),
             **before_version_payload,
+            **_runtime_validation_diagnostic(
+                before,
+                version_match=before_version_payload.get("llama_cpp_python_version_match", "unknown"),
+                expected_backend="cuda",
+                yarn_required=qwen_64k_required,
+            ),
         }
 
     dependency_target, dependency_target_error = _prepend_dependency_target_to_sys_path(target_root)
@@ -1924,6 +2149,7 @@ def _ensure_desktop_llama_runtime_impl(
             "runtime_origin": "bundled",
             **_probe_result_payload(before),
             **before_version_payload,
+            **_runtime_validation_diagnostic(before, provenance_valid=False),
         }
 
     if before.gpu_offload_supported and before.backend in {"cuda", "metal"}:
@@ -1958,6 +2184,12 @@ def _ensure_desktop_llama_runtime_impl(
             "runtime_origin": "bundled",
             **_probe_result_payload(before),
             **before_version_payload,
+            **_runtime_validation_diagnostic(
+                before,
+                version_match=before_version_payload.get("llama_cpp_python_version_match", "unknown"),
+                expected_backend=expected_backend or "cuda",
+                yarn_required=qwen_64k_required,
+            ),
         }
 
     if before.backend == "missing" and not policy.bootstrap_supported:
@@ -1971,6 +2203,7 @@ def _ensure_desktop_llama_runtime_impl(
             "runtime_action": "failed",
             **_probe_result_payload(before),
             **before_version_payload,
+            **_runtime_validation_diagnostic(before, platform_supported=False),
         }
 
     if not policy.bootstrap_supported:
@@ -1982,6 +2215,7 @@ def _ensure_desktop_llama_runtime_impl(
             "runtime_action": "probe_only",
             **_probe_result_payload(before),
             **before_version_payload,
+            **_runtime_validation_diagnostic(before, platform_supported=False),
         }
 
     disabled_reason = _bootstrap_disabled_reason()

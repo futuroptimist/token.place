@@ -38,6 +38,7 @@
   "required_native_dlls": [
     "python311.dll",
     "vcruntime140.dll",
+    "vcruntime140_1.dll",
     "llama.dll",
     "ggml-base.dll",
     "ggml-cpu.dll",
@@ -224,7 +225,7 @@
       "url": "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip",
       "sha256": "6a1c32e68ee1a95ca17334691ff9ad1ffe7f352c24a083d55e4c96b8063b2bcb",
       "archive_member_path": "cuda_cudart-windows-x86_64-12.4.127-archive/bin/cudart64_12.dll",
-      "destination": "cudart64_12.dll",
+      "destination": "Lib/site-packages/llama_cpp/lib/cudart64_12.dll",
       "extracted_sha256": "d28e42265da7462162a54da6b7a99ea4fa2caf8139d862bb500db875d0b32dfc"
     },
     {
@@ -237,7 +238,7 @@
       "url": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip",
       "sha256": "698140f12da055a3709eee2e022fcfe7bc8edf31f30115e3f7a5c877a9491de5",
       "archive_member_path": "libcublas-windows-x86_64-12.4.5.8-archive/bin/cublas64_12.dll",
-      "destination": "cublas64_12.dll",
+      "destination": "Lib/site-packages/llama_cpp/lib/cublas64_12.dll",
       "extracted_sha256": "e40202fe4223c1cd2d2dce7beec59e1ed61c7801bd827309183be9b50e358f4c"
     },
     {
@@ -250,7 +251,7 @@
       "url": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip",
       "sha256": "698140f12da055a3709eee2e022fcfe7bc8edf31f30115e3f7a5c877a9491de5",
       "archive_member_path": "libcublas-windows-x86_64-12.4.5.8-archive/bin/cublasLt64_12.dll",
-      "destination": "cublasLt64_12.dll",
+      "destination": "Lib/site-packages/llama_cpp/lib/cublasLt64_12.dll",
       "extracted_sha256": "2a896460bef60ed57ef32b0875812f355a6984e671d638bb632f5e8c1d7a831f"
     },
     {
@@ -278,6 +279,19 @@
       "destination": "vcomp140.dll",
       "archive_member_path": "a12/vcomp140.dll_amd64",
       "extracted_sha256": "55aba23cdcd6484fbb06f4155b8ca75adfce7a881f10afd0c49457165e677164"
+    },
+    {
+      "name": "vcruntime140_1.dll",
+      "version": "14.44.35211.0",
+      "flavor": "msvc-app-local-redist",
+      "architecture": "AMD64",
+      "license": "Microsoft Visual C++ Redistributable EULA",
+      "provenance": "Microsoft Visual C++ app-local runtime redistributable for Windows x64",
+      "url": "https://download.visualstudio.microsoft.com/download/pr/7ebf5fdb-36dc-4145-b0a0-90d3d5990a61/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
+      "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b",
+      "destination": "vcruntime140_1.dll",
+      "archive_member_path": "a12/vcruntime140_1.dll_amd64",
+      "extracted_sha256": "1f2d41c4aa5db0bc33ebf7b66d72943a817d7ce6cbe880502a9403823633093f"
     }
   ]
 }

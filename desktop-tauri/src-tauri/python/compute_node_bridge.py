@@ -20,6 +20,26 @@ import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
+
+def _is_windows_dll_loader_error(exc: BaseException) -> bool:
+    """Recognize common Windows loader failures without retaining their detail."""
+
+    if isinstance(exc, OSError):
+        return True
+    markers = (
+        "dll load failed", "dynamic link library", "specified module could not be found",
+        "specified procedure could not be found", "not a valid win32 application",
+        "winerror 126", "winerror 127", "winerror 193",
+    )
+    if isinstance(exc, ImportError):
+        if getattr(exc, "winerror", None) in {126, 127, 193}:
+            return True
+        return any(marker in str(exc).lower() for marker in markers)
+    if isinstance(exc, RuntimeError):
+        text = str(exc).lower()
+        return "failed to load shared library" in text and any(marker in text for marker in markers)
+    return False
+
 if __package__ in (None, ""):
     # Use os.path here so a polluted PYTHONPATH cannot make a third-party
     # pathlib backport crash before path_bootstrap repairs sys.path.
@@ -3008,12 +3028,33 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
                 "llama_cpp_capability_source": yarn_diagnostics.get("capability_source") or "mocked_hosted_windows_contract_no_real_cuda",
             }
         )
+    else:
+        # Tiers below the YaRN-extension threshold never invoke RoPE scaling,
+        # so last_yarn_rope_diagnostics stays empty; report the "not needed"
+        # baseline instead of omitting these fields, since operator tooling
+        # relies on their presence for every tier (see EXPECTED_CONTEXT_CAPABILITIES
+        # in desktop-tauri/scripts/test_windows_installer_identity.py).
+        payload.update(
+            {
+                "api_v1_readiness_yarn_requested_context_tokens": constructed_n_ctx,
+                "api_v1_readiness_yarn_original_context_tokens": 32768,
+                "api_v1_readiness_yarn_context_multiplier": 1.0,
+                "api_v1_readiness_yarn_rope_freq_scale": 1.0,
+                "api_v1_readiness_yarn_ext_factor_overridden": False,
+                "api_v1_readiness_yarn_rope_scaling_type_source": "not_required",
+                "api_v1_readiness_yarn_rope_supported": True,
+                "api_v1_readiness_yarn_rope_enabled": constructor_call.get("rope_scaling_type") is not None,
+                "api_v1_readiness_yarn_configuration_valid": True,
+                "llama_cpp_capability_source": "mocked_hosted_windows_contract_no_real_cuda",
+            }
+        )
     return payload
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--installed-context-smoke", action="store_true")
-    parser.add_argument("--operator-preflight-controlled-ready", action="store_true")
+    parser.add_argument("--operator-runtime-preflight", action="store_true")
+    parser.add_argument("--operator-runtime-preflight-cpu-smoke", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3030,16 +3071,121 @@ def main() -> int:
     if args.installed_context_smoke:
         print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))
         return 0
-    if args.operator_preflight_controlled_ready:
+    if args.operator_runtime_preflight or args.operator_runtime_preflight_cpu_smoke:
+        # Release acceptance must execute the immutable runtime checks; it may
+        # not substitute a fabricated worker-ready event for native import.
+        # Shared by both the real (GPU-required) preflight and the CPU-only
+        # structural smoke variant below: a failure is a failure regardless of
+        # which mode was being validated, so the failure event shape stays
+        # identical between the two.
+        def emit_failure(runtime: Optional[Dict[str, Any]], code: str, stage: str, exc: Optional[BaseException] = None) -> int:
+            runtime = runtime or {}
+            if stage not in {"environment_contract", "native_import", "runtime_validation", "probe_process"}:
+                stage = "runtime_validation"
+            exception_type = type(exc).__name__ if exc is not None else str(runtime.get("exception_type", "none"))
+            if exception_type not in {"none", "ImportError", "ModuleNotFoundError", "OSError", "RuntimeError", "TimeoutExpired"}:
+                exception_type = "RuntimeError"
+            event = {
+                "type": "status", "startup_result": "runtime_validation_failed",
+                "probe_stage": stage, "probe_error_code": code,
+                "exception_type": exception_type,
+                "child_exit_code": runtime.get("child_exit_code") if isinstance(runtime.get("child_exit_code"), int) and not isinstance(runtime.get("child_exit_code"), bool) else None,
+                "detected_architecture": runtime.get("detected_architecture") if runtime.get("detected_architecture") in {"x86_64", "arm64", "aarch64", "unknown"} else "unknown",
+                "architecture_source": runtime.get("architecture_source") if runtime.get("architecture_source") in {"platform", "attested_windows_x86_64", "unknown"} else "unknown",
+                "import_root_valid": runtime.get("import_root_valid") is True,
+                "provisioning_actions": 0, "repair_actions": 0, "pip_actions": 0,
+                "compiler_actions": 0, "network_actions": 0, "download_actions": 0,
+            }
+            print(json.dumps(event, sort_keys=True, separators=(",", ":")), flush=True)
+            return 1
+
+    if args.operator_runtime_preflight_cpu_smoke:
+        # Structural-only smoke gate for CI runners without a GPU: confirms the
+        # packaged app launches, resolves its bundled resources, and passes
+        # dependency/environment preflight on an explicit CPU-only request. It
+        # does NOT claim GPU/CUDA/Metal validation -- that remains the sole
+        # responsibility of --operator-runtime-preflight above, which this
+        # branch must never weaken or bypass. See
+        # desktop-tauri/scripts/test_windows_installer_identity.py and
+        # https://github.com/futuroptimist/token.place/issues/1555 for the
+        # follow-up to restore GPU-required CI coverage once a self-hosted
+        # GPU runner exists.
+        try:
+            dependency = ensure_desktop_python_dependencies()
+            if dependency.get("ok") != "true":
+                return emit_failure(dependency, "missing_environment_contract", "environment_contract")
+            _, normalize_context_tier = _load_context_profile_helpers()
+            context_tier = normalize_context_tier(args.context_tier)
+            runtime = _ensure_desktop_llama_runtime_for_context("cpu", context_tier)
+            selected_backend = runtime.get("selected_backend")
+            runtime_action = runtime.get("runtime_action")
+            if (selected_backend, runtime_action) != ("cpu", "skipped"):
+                code = runtime.get("probe_error_code")
+                if code not in {
+                    "missing_environment_contract", "native_llama_import_failed", "native_dll_load_failed",
+                    "runtime_version_or_provenance_invalid", "cuda_capability_missing", "physical_device_missing",
+                    "yarn_rope_capability_incomplete", "unsupported_platform", "probe_timeout", "probe_process_abnormal_exit",
+                }:
+                    code = "probe_process_abnormal_exit"
+                return emit_failure(runtime, code, str(runtime.get("probe_stage") or "runtime_validation"))
+        except Exception as exc:
+            code = "native_dll_load_failed" if _is_windows_dll_loader_error(exc) else "native_llama_import_failed"
+            return emit_failure(None, code, "native_import", exc)
         print(json.dumps({
             "type": "status",
-            "startup_result": "ready",
-            "startup_phase": "ready",
-            "relay_runtime_state": "ready",
-            "worker_state": "ready",
-            "worker_alive": True,
-            "context_tier": args.context_tier,
-            "controlled_preflight": True,
+            "startup_result": "cpu_smoke_validated",
+            "startup_phase": "hardware_model_boundary",
+            "context_tier": context_tier,
+            "requested_mode": "cpu",
+            "selected_backend": selected_backend,
+            "runtime_action": runtime_action,
+            "cpu_smoke_preflight": True,
+            "runtime_provisioning_state": "ready",
+            "provisioning_actions": 0,
+            "repair_actions": 0,
+            "pip_actions": 0,
+            "compiler_actions": 0,
+            "network_actions": 0,
+            "download_actions": 0,
+        }, sort_keys=True, separators=(",", ":")), flush=True)
+        return 0
+
+    if args.operator_runtime_preflight:
+        try:
+            dependency = ensure_desktop_python_dependencies()
+            if dependency.get("ok") != "true":
+                return emit_failure(dependency, "missing_environment_contract", "environment_contract")
+            args.mode = _normalize_compute_mode_local(args.mode)
+            _, normalize_context_tier = _load_context_profile_helpers()
+            context_tier = normalize_context_tier(args.context_tier)
+            runtime = _ensure_desktop_llama_runtime_for_context(args.mode, context_tier)
+            selected_backend = runtime.get("selected_backend")
+            runtime_action = runtime.get("runtime_action")
+            native_runtime_success = (selected_backend, runtime_action) in {
+                ("cuda", "already_supported"),
+                ("metal", "metal_already_supported"),
+            }
+            if args.mode not in {"auto", "gpu", "hybrid"} or not native_runtime_success:
+                code = runtime.get("probe_error_code")
+                if code not in {
+                    "missing_environment_contract", "native_llama_import_failed", "native_dll_load_failed",
+                    "runtime_version_or_provenance_invalid", "cuda_capability_missing", "physical_device_missing",
+                    "yarn_rope_capability_incomplete", "unsupported_platform", "probe_timeout", "probe_process_abnormal_exit",
+                }:
+                    code = "probe_process_abnormal_exit"
+                return emit_failure(runtime, code, str(runtime.get("probe_stage") or "runtime_validation"))
+        except Exception as exc:
+            code = "native_dll_load_failed" if _is_windows_dll_loader_error(exc) else "native_llama_import_failed"
+            return emit_failure(None, code, "native_import", exc)
+        print(json.dumps({
+            "type": "status",
+            "startup_result": "runtime_validated",
+            "startup_phase": "hardware_model_boundary",
+            "context_tier": context_tier,
+            "requested_mode": args.mode,
+            "selected_backend": selected_backend,
+            "runtime_action": runtime_action,
+            "production_runtime_preflight": True,
             "runtime_provisioning_state": "ready",
             "provisioning_actions": 0,
             "repair_actions": 0,
@@ -3050,7 +3196,7 @@ def main() -> int:
         }, sort_keys=True, separators=(",", ":")), flush=True)
         return 0
     if not args.model:
-        parser.error("--model is required unless --installed-context-smoke or --operator-preflight-controlled-ready is used")
+        parser.error("--model is required unless an installed preflight is used")
 
     try:
         args.mode = _normalize_compute_mode_local(args.mode)

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1423,7 +1424,8 @@ def test_probe_marks_error_when_subprocess_has_empty_stdout(monkeypatch):
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
-    assert probe.error == 'probe failed'
+    assert probe.error == 'probe_process_abnormal_exit'
+    assert probe.probe_error_code == 'probe_process_abnormal_exit'
 
 
 def test_maybe_reexec_for_runtime_refresh_skips_when_guard_set(monkeypatch):
@@ -1482,7 +1484,7 @@ def test_probe_marks_error_when_subprocess_raises(monkeypatch):
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
-    assert probe.error == 'desktop_runtime_probe_start_failed:RuntimeError'
+    assert probe.error == 'probe_process_abnormal_exit'
 
 
 def test_probe_uses_return_code_when_stderr_is_empty(monkeypatch):
@@ -1497,7 +1499,8 @@ def test_probe_uses_return_code_when_stderr_is_empty(monkeypatch):
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
-    assert probe.error == 'probe subprocess failed with return code 9'
+    assert probe.error == 'probe_process_abnormal_exit'
+    assert probe.child_exit_code == 9
 
 
 def test_probe_subprocess_sanitizes_repo_root_before_llama_import(monkeypatch):
@@ -1585,7 +1588,7 @@ def test_probe_falls_back_when_payload_is_not_json(monkeypatch):
 
     probe = desktop_runtime_setup._probe_llama_runtime()
     assert probe.backend == 'missing'
-    assert probe.error == 'json parse failed'
+    assert probe.error == 'probe_process_abnormal_exit'
 
 
 def test_is_repo_local_llama_module_returns_false_for_empty_module_path():
@@ -3200,6 +3203,293 @@ print('TOKEN_PLACE_RUNTIME_PROBE_RESULT ' + json.dumps({
     assert probe.error is None
 
 
+def _extract_probe_native_import_handler():
+    """Return the exact production except-block that classifies native import failures."""
+
+    marker = 'except Exception as exc:'
+    snippet = desktop_runtime_setup._PROBE_SNIPPET
+    index = snippet.index(marker)
+    return snippet[index:]
+
+
+def _native_import_classification_snippet(exception_source):
+    handler = _extract_probe_native_import_handler()
+    return (
+        "import json\nimport os\nimport sys\n\n"
+        "def _packaged_import_root_valid():\n"
+        "    return False\n\n"
+        "dependency_target = ''\n\n"
+        "try:\n"
+        f"    raise {exception_source}\n"
+        f"{handler}"
+    )
+
+
+@pytest.mark.parametrize(
+    ('exception_source', 'expected_code', 'expected_exception_type'),
+    [
+        (
+            "RuntimeError(\"Failed to load shared library 'SENTINEL_lib.dll': "
+            "[WinError 126] The specified module could not be found.\")",
+            'native_dll_load_failed',
+            'RuntimeError',
+        ),
+        (
+            "RuntimeError(\"Failed to load shared library 'SENTINEL_lib.dll': "
+            "[WinError 127] The specified procedure could not be found.\")",
+            'native_dll_load_failed',
+            'RuntimeError',
+        ),
+        (
+            "RuntimeError(\"Failed to load shared library 'SENTINEL_lib.dll': "
+            "[WinError 193] %1 is not a valid Win32 application.\")",
+            'native_dll_load_failed',
+            'RuntimeError',
+        ),
+        (
+            "RuntimeError('SENTINEL native init boom')",
+            'native_llama_import_failed',
+            'RuntimeError',
+        ),
+        (
+            "RuntimeError(\"Failed to load shared library 'SENTINEL_lib.dll': unexpected native failure\")",
+            'native_llama_import_failed',
+            'RuntimeError',
+        ),
+        (
+            "RuntimeError('[WinError 126] The specified module could not be found. SENTINEL, no wrapper')",
+            'native_llama_import_failed',
+            'RuntimeError',
+        ),
+        ("ImportError('SENTINEL /private/import')", 'native_llama_import_failed', 'ImportError'),
+        (
+            "ImportError('DLL load failed while importing _llama: SENTINEL')",
+            'native_dll_load_failed',
+            'ImportError',
+        ),
+        ("OSError('SENTINEL C:/secret/PATH.dll')", 'native_dll_load_failed', 'OSError'),
+    ],
+)
+def test_probe_snippet_classifies_native_import_failures(
+    monkeypatch, tmp_path, exception_source, expected_code, expected_exception_type,
+):
+    """Exercise the real production classification block (verbatim) via subprocess."""
+
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_PROBE_SNIPPET',
+        _native_import_classification_snippet(exception_source),
+    )
+
+    probe = desktop_runtime_setup._probe_llama_runtime(
+        runtime_root=tmp_path,
+        cancellation_predicate=lambda: False,
+        heartbeat=lambda _extra: None,
+    )
+
+    assert probe.probe_error_code == expected_code
+    assert probe.probe_stage == 'native_import'
+    assert probe.exception_type == expected_exception_type
+    assert probe.error == expected_code
+    assert 'SENTINEL' not in probe.interpreter
+    assert 'SENTINEL' not in probe.llama_module_path
+
+
+@pytest.mark.parametrize(
+    ('exception_type', 'error_code'),
+    [('ImportError', 'native_llama_import_failed'), ('OSError', 'native_dll_load_failed')],
+)
+def test_probe_failure_schema_distinguishes_import_and_dll_errors(exception_type, error_code):
+    payload = {
+        'probe_stage': 'native_import', 'probe_error_code': error_code,
+        'exception_type': exception_type, 'child_exit_code': None,
+        'detected_architecture': 'x86_64', 'architecture_source': 'attested_windows_x86_64',
+        'import_root_valid': True,
+    }
+    assert desktop_runtime_setup._validated_probe_diagnostic(payload) == payload
+
+
+@pytest.mark.parametrize(
+    ('overrides', 'expected'),
+    [
+        ({'provenance_valid': False}, 'runtime_version_or_provenance_invalid'),
+        ({'version_match': 'mismatch'}, 'runtime_version_or_provenance_invalid'),
+        ({'expected_backend': 'cuda'}, 'cuda_capability_missing'),
+        ({'expected_backend': 'cuda', 'yarn_required': True}, 'cuda_capability_missing'),
+        ({'platform_supported': False}, 'unsupported_platform'),
+    ],
+)
+def test_runtime_validation_diagnostic_maps_production_evidence(overrides, expected):
+    probe = _probe(backend='cpu', gpu=False)
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(probe, **overrides)
+    assert diagnostic['probe_error_code'] == expected
+
+
+def test_runtime_validation_diagnostic_maps_incomplete_yarn_metadata():
+    probe = _probe(backend='cuda', gpu=True, yarn=False)
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(
+        probe, expected_backend='cuda', yarn_required=True,
+    )
+    assert diagnostic['probe_error_code'] == 'yarn_rope_capability_incomplete'
+    assert diagnostic['probe_stage'] == 'runtime_validation'
+
+
+@pytest.mark.parametrize('code', ['native_dll_load_failed', 'native_llama_import_failed'])
+def test_runtime_validation_diagnostic_preserves_native_failure_when_version_unknown(code):
+    probe = replace(
+        _probe(backend='missing'),
+        probe_stage='native_import', probe_error_code=code,
+    )
+
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(
+        probe, version_match='unknown',
+    )
+
+    assert diagnostic['probe_error_code'] == code
+    assert diagnostic['probe_stage'] == 'native_import'
+
+
+@pytest.mark.parametrize(
+    ('code', 'stage'),
+    [
+        ('missing_environment_contract', 'environment_contract'),
+        ('probe_timeout', 'probe_process'),
+        ('probe_process_abnormal_exit', 'probe_process'),
+    ],
+)
+def test_runtime_validation_diagnostic_preserves_existing_failure_stage(code, stage):
+    probe = replace(
+        _probe(backend='missing'), probe_stage=stage, probe_error_code=code,
+    )
+
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(probe)
+
+    assert diagnostic['probe_error_code'] == code
+    assert diagnostic['probe_stage'] == stage
+
+
+@pytest.mark.parametrize(
+    ('overrides', 'expected'),
+    [
+        ({'version_match': 'mismatch'}, 'runtime_version_or_provenance_invalid'),
+        ({'expected_backend': 'cuda'}, 'cuda_capability_missing'),
+        ({'platform_supported': False}, 'unsupported_platform'),
+    ],
+)
+def test_runtime_validation_diagnostic_derived_failures_use_validation_stage(overrides, expected):
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(
+        _probe(backend='cpu', gpu=False), **overrides,
+    )
+    assert diagnostic['probe_stage'] == 'runtime_validation'
+    assert diagnostic['probe_error_code'] == expected
+
+
+def test_runtime_validation_diagnostic_normalizes_invalid_stage_without_disclosure():
+    probe = replace(
+        _probe(backend='missing'),
+        probe_stage='SENTINEL C:\\private\\runtime',
+        probe_error_code='native_dll_load_failed',
+    )
+
+    diagnostic = desktop_runtime_setup._runtime_validation_diagnostic(
+        probe, version_match='unknown',
+    )
+
+    assert diagnostic['probe_stage'] == 'native_import'
+    assert 'SENTINEL' not in json.dumps(diagnostic)
+
+
+def test_packaged_import_root_validation_accepts_installed_up_up_layout(monkeypatch, tmp_path):
+    resource_root = tmp_path / 'resources'
+    import_root = resource_root / '_up_' / '_up_'
+    python_root = resource_root / 'python'
+    (import_root / 'utils').mkdir(parents=True)
+    (import_root / 'config.py').write_text('', encoding='utf-8')
+    python_root.mkdir()
+    monkeypatch.setattr(desktop_runtime_setup, '__file__', str(python_root / 'desktop_runtime_setup.py'))
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(import_root))
+
+    assert desktop_runtime_setup._packaged_import_root_valid(runtime_root=import_root) is True
+
+
+@pytest.mark.parametrize('invalid_kind', ['missing', 'outside', 'sentinel_free'])
+def test_packaged_import_root_validation_rejects_unverified_roots(monkeypatch, tmp_path, invalid_kind):
+    resource_root = tmp_path / 'resources'
+    expected = resource_root / '_up_' / '_up_'
+    configured = expected if invalid_kind != 'outside' else tmp_path / 'ambient' / '_up_' / '_up_'
+    python_root = resource_root / 'python'
+    python_root.mkdir(parents=True)
+    if invalid_kind != 'missing':
+        (configured / 'utils').mkdir(parents=True)
+        if invalid_kind != 'sentinel_free':
+            (configured / 'config.py').write_text('', encoding='utf-8')
+    monkeypatch.setattr(desktop_runtime_setup, '__file__', str(python_root / 'desktop_runtime_setup.py'))
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(configured))
+
+    assert desktop_runtime_setup._packaged_import_root_valid(runtime_root=expected) is False
+
+
+def test_packaged_import_root_validation_fails_closed_on_resolution_error(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKEN_PLACE_PYTHON_IMPORT_ROOT', str(tmp_path))
+    monkeypatch.setattr(
+        desktop_runtime_setup,
+        '_safe_resolve_path',
+        lambda _path: (_ for _ in ()).throw(OSError('SENTINEL private path')),
+    )
+
+    assert desktop_runtime_setup._packaged_import_root_valid(runtime_root=tmp_path) is False
+
+
+def test_probe_failure_ignores_invalid_packaged_arch_attestation(monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_PACKAGED_ARCH', 'arm64')
+    monkeypatch.setenv('TOKEN_PLACE_PACKAGED_ARCH_SOURCE', 'untrusted')
+
+    probe = desktop_runtime_setup._probe_failure(
+        error='missing_environment_contract',
+        dependency_target_text='bundled',
+        pip_version='bundled-runtime-probe',
+    )
+
+    assert probe.detected_architecture == 'unknown'
+    assert probe.architecture_source == 'unknown'
+
+
+def test_probe_diagnostic_validation_rejects_missing_and_invalid_fields():
+    assert desktop_runtime_setup._validated_probe_diagnostic({}) is None
+    assert desktop_runtime_setup._validated_probe_diagnostic({
+        'probe_stage': 'native_import',
+        'probe_error_code': 'native_llama_import_failed',
+        'exception_type': 'SENTINEL',
+        'child_exit_code': None,
+        'detected_architecture': 'unknown',
+        'architecture_source': 'unknown',
+        'import_root_valid': False,
+    }) is None
+
+
+def test_desktop_arch_accepts_only_complete_packaged_attestation(monkeypatch):
+    monkeypatch.setenv('TOKEN_PLACE_PACKAGED_ARCH', 'x86_64')
+    monkeypatch.setenv('TOKEN_PLACE_PACKAGED_ARCH_SOURCE', 'attested_windows_x86_64')
+    assert desktop_runtime_setup._desktop_arch() == 'x86_64'
+
+    monkeypatch.setenv('TOKEN_PLACE_PACKAGED_ARCH_SOURCE', 'platform')
+    with pytest.raises(RuntimeError, match='packaged_runtime_architecture_attestation_invalid'):
+        desktop_runtime_setup._desktop_arch()
+
+
+def test_probe_abnormal_exit_never_retains_stderr_or_paths(monkeypatch, tmp_path):
+    sentinel = 'SENTINEL_PATH=/private/secret native loader detail'
+    snippet = f"import sys; sys.stderr.write({sentinel!r}); raise SystemExit(17)"
+    monkeypatch.setattr(desktop_runtime_setup, '_PROBE_SNIPPET', snippet)
+
+    probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=tmp_path)
+    payload = desktop_runtime_setup._probe_result_payload(probe)
+
+    assert payload['probe_error_code'] == 'probe_process_abnormal_exit'
+    assert payload['child_exit_code'] == 17
+    assert sentinel not in json.dumps(payload)
+
+
 def _pid_is_alive(pid: int) -> bool:
     try:
         process = psutil.Process(pid)
@@ -4097,7 +4387,7 @@ def test_exact_packaged_probe_ignores_hostile_dependency_targets(monkeypatch, tm
 
     monkeypatch.setattr(desktop_runtime_setup.subprocess, 'Popen', fake_popen)
     probe = desktop_runtime_setup._probe_llama_runtime(runtime_root=resources)
-    assert probe.error == 'desktop_runtime_probe_start_failed:RuntimeError'
+    assert probe.error == 'probe_process_abnormal_exit'
     env = called['popen_env']
     assert env['PYTHONNOUSERSITE'] == '1'
     assert str(hostile) not in env.get('PYTHONPATH', '')

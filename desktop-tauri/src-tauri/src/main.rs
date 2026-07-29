@@ -203,7 +203,9 @@ fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifac
         resource_dir.as_deref(),
         Some(&launcher.program),
     )?;
-    let mut bridge_command = launcher.command_for_script_blocking(&bridge_script);
+    let mut bridge_command = launcher
+        .command_for_script_blocking(&bridge_script)
+        .map_err(|_| python_runtime::PACKAGED_PYTHON_ENVIRONMENT_INVALID.to_string())?;
     let import_root = configure_runtime_pythonpath_for(
         &mut bridge_command,
         &bridge_script,
@@ -666,6 +668,20 @@ pub fn run() {
                     .map_err(std::io::Error::other)?;
                 let payload = compute_node::operator_start_preflight_record(&config, &app.handle())
                     .map_err(|err| std::io::Error::other(err.to_string()))?;
+                println!("{}", payload);
+                std::process::exit(0);
+            }
+            if std::env::args().any(|arg| arg == "--operator-start-preflight-cpu-smoke") {
+                // Structural-only smoke gate for CI runners without a GPU: confirms
+                // the packaged app launches and resolves its bundled resources
+                // without claiming GPU/CUDA/Metal validation. Distinct from
+                // --operator-start-preflight, which remains the real,
+                // GPU-required production preflight and must not be weakened.
+                let config = load_config_from_path(&config_path(&cli_config_dir()))
+                    .map_err(std::io::Error::other)?;
+                let payload =
+                    compute_node::operator_start_preflight_cpu_smoke_record(&config, &app.handle())
+                        .map_err(|err| std::io::Error::other(err.to_string()))?;
                 println!("{}", payload);
                 std::process::exit(0);
             }

@@ -81,7 +81,10 @@ def manifest(**overrides):
                 'license': 'test license',
                 'provenance': 'test provenance',
                 'archive_member_path': f'bin/{name}',
-                'destination': name,
+                'destination': (
+                    name if name in {'msvcp140.dll', 'vcomp140.dll', 'vcruntime140_1.dll'}
+                    else f'Lib/site-packages/llama_cpp/lib/{name}'
+                ),
                 'extracted_sha256': '456789abcdeffedcba98765432100123456789abcdeffedcba98765432101234',
             }
             for name, version in [
@@ -89,6 +92,7 @@ def manifest(**overrides):
                 ('cublas64_12.dll', '12.4.5.8'),
                 ('msvcp140.dll', '14.44.35211.0'),
                 ('vcomp140.dll', '14.44.35211.0'),
+                ('vcruntime140_1.dll', '14.44.35211.0'),
             ]
         ],
         'python_package_wheels': [],
@@ -229,6 +233,7 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract)
     monkeypatch.setattr(prep, 'run', fake_run)
     monkeypatch.setattr(prep, 'validate_runtime_payload', lambda runtime, data: [])
+    monkeypatch.setattr(prep, 'validate_staged_native_import', lambda runtime, data, closure: None)
     monkeypatch.setattr(prep.platform, 'machine', lambda: 'AMD64')
 
     prep.prepare(m)
@@ -676,7 +681,8 @@ def test_api_set_and_netapi_imports_are_os_provided_but_app_dependencies_must_bu
 
     for dll in ('bcryptprimitives.dll', 'cabinet.dll', 'comctl32.dll', 'comdlg32.dll', 'imm32.dll', 'iphlpapi.dll', 'msi.dll', 'netapi32.dll', 'winmm.dll', 'pdh.dll', 'powrprof.dll', 'psapi.dll', 'userenv.dll'):
         assert prep.is_windows_system_dll(dll)
-    assert prep.is_windows_system_dll('nvcuda.dll')
+    assert not prep.is_windows_system_dll('nvcuda.dll')
+    assert prep.is_windows_external_driver_dll('nvcuda.dll')
     for dll in ('cudart64_12.dll', 'cublas64_12.dll', 'libssl-3-x64.dll', 'vcruntime140.dll'):
         assert not prep.is_windows_system_dll(dll)
 
@@ -743,6 +749,7 @@ def test_prepare_restores_previous_runtime_when_promotion_fails(tmp_path, monkey
     monkeypatch.setattr(prep, 'validate_wheel', lambda whl, data: None)
     monkeypatch.setattr(prep, 'validate_installed_inventory', lambda py, data: None)
     monkeypatch.setattr(prep, 'validate_runtime_payload', lambda runtime, data: [])
+    monkeypatch.setattr(prep, 'validate_staged_native_import', lambda runtime, data, closure: None)
 
     def fake_extract(_archive, dest):
         staged = dest / 'cpython'
@@ -893,6 +900,28 @@ def test_manifest_pins_native_vendor_runtime_dll_artifacts():
     assert artifacts['cudart64_12.dll']['version'] == '12.4.127'
     assert artifacts['cublas64_12.dll']['version'] == '12.4.5.8'
     assert artifacts['cublaslt64_12.dll']['version'] == '12.4.5.8'
+    assert artifacts['cudart64_12.dll']['destination'] == 'Lib/site-packages/llama_cpp/lib/cudart64_12.dll'
+    assert artifacts['cublas64_12.dll']['destination'] == 'Lib/site-packages/llama_cpp/lib/cublas64_12.dll'
+    for name in ('msvcp140.dll', 'vcomp140.dll', 'vcruntime140_1.dll'):
+        assert artifacts[name]['destination'] == name
+
+
+@pytest.mark.parametrize(
+    ('name', 'destination'),
+    [
+        ('cudart64_12.dll', 'cudart64_12.dll'),
+        ('vcruntime140_1.dll', 'Lib/site-packages/llama_cpp/lib/vcruntime140_1.dll'),
+    ],
+)
+def test_manifest_rejects_native_artifact_in_wrong_loader_scope(tmp_path, name, destination):
+    data = manifest()
+    artifact = next(item for item in data['native_dll_artifacts'] if item['name'] == name)
+    artifact['destination'] = destination
+    path = tmp_path / 'manifest.json'
+    write_manifest(path, data)
+
+    with pytest.raises(prep.RuntimePrepError, match='invalid loader destination'):
+        prep.load_manifest(path)
 
 
 def test_manifest_pins_msvc_redist_exact_content_addressed_url():
@@ -980,14 +1009,455 @@ def test_stage_native_dll_artifacts_extracts_exact_pinned_member(tmp_path, monke
         'license': 'NVIDIA CUDA Toolkit EULA',
         'provenance': 'test pinned runtime DLL',
         'archive_member_path': member,
-        'destination': 'cudart64_12.dll',
+        'destination': 'Lib/site-packages/llama_cpp/lib/cudart64_12.dll',
         'extracted_sha256': file_digest,
     }]}
     monkeypatch.setattr(prep, 'fetch', lambda url, sha, dest: archive)
 
     prep.stage_native_dll_artifacts(m, tmp_path / 'cache', runtime)
 
-    assert (runtime / 'cudart64_12.dll').read_bytes() == dll_bytes
+    assert (runtime / 'Lib/site-packages/llama_cpp/lib/cudart64_12.dll').read_bytes() == dll_bytes
+
+
+def test_staged_native_import_uses_closed_packaged_environment(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    system_root = tmp_path / 'Windows'
+    native.mkdir(parents=True)
+    (system_root / 'System32').mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    monkeypatch.setenv('SystemRoot', str(system_root))
+    monkeypatch.setenv('PATH', 'POISONED-HOST-PATH')
+    monkeypatch.setenv('PYTHONPATH', 'POISONED-PYTHONPATH')
+    calls = []
+
+    def completed(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return prep.subprocess.CompletedProcess(cmd, 0, '{"native_import_valid":true}\n', '')
+
+    monkeypatch.setattr(prep.subprocess, 'run', completed)
+    prep.validate_staged_native_import(runtime, {'expected_interpreter_path': 'python.exe'}, [])
+
+    command, kwargs = calls[0]
+    assert command[:3] == [str((runtime / 'python.exe').resolve()), '-I', '-c']
+    assert kwargs['env']['PATH'].split(prep.os.pathsep) == [
+        str(runtime.resolve()), str(native.resolve()), str((system_root / 'System32').resolve())
+    ]
+    assert 'POISONED' not in repr(kwargs['env'])
+    assert set(kwargs['env']) == {'PATH', 'PYTHONNOUSERSITE', 'PYTHONDONTWRITEBYTECODE', 'SystemRoot'}
+
+
+def test_staged_native_import_failure_is_bounded_and_identifies_closure_member(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    system_root = tmp_path / 'Windows'
+    native.mkdir(parents=True)
+    (system_root / 'System32').mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    failing = native / 'ggml-base.dll'
+    failing.write_bytes(b'dll')
+    monkeypatch.setenv('SystemRoot', str(system_root))
+    secret = r'C:\Users\Secret\sentinel.dll'
+    results = iter([
+        prep.subprocess.CompletedProcess([], 1, '', secret),
+        prep.subprocess.CompletedProcess([], 1, '{"loaded":false,"code":126}\n', secret),
+    ])
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: next(results))
+
+    with pytest.raises(prep.RuntimePrepError) as raised:
+        prep.validate_staged_native_import(
+            runtime,
+            {'expected_interpreter_path': 'python.exe', 'native_dll_artifacts': []},
+            [{'name': 'ggml-base.dll', 'path': 'Lib/site-packages/llama_cpp/lib/ggml-base.dll'}],
+        )
+    assert str(raised.value) == 'staged native import failed: ggml-base.dll:winerror_126'
+    assert secret not in str(raised.value)
+
+
+def test_staged_native_import_accepts_only_proven_driverless_boundary(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    system_root = tmp_path / 'Windows'
+    native.mkdir(parents=True)
+    (system_root / 'System32').mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    cuda = native / 'ggml-cuda.dll'
+    cuda.write_bytes(b'dll')
+    monkeypatch.setenv('SystemRoot', str(system_root))
+    results = iter([
+        prep.subprocess.CompletedProcess([], 1, '', r'C:\secret\native loader output'),
+        prep.subprocess.CompletedProcess([], 1, '{"loaded":false,"code":126}', r'C:\secret\consumer'),
+        prep.subprocess.CompletedProcess([], 1, '{"loaded":false,"code":126}', r'C:\secret\driver'),
+    ])
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: next(results))
+
+    state = prep.validate_staged_native_import(
+        runtime,
+        {'expected_interpreter_path': 'python.exe', 'native_dll_artifacts': []},
+        [{'name': cuda.name, 'path': cuda.relative_to(runtime).as_posix(), 'imports': ['nvcuda.dll']}],
+    )
+
+    assert state == prep.STAGED_NATIVE_IMPORT_EXTERNAL_DRIVER_UNAVAILABLE
+    assert state != prep.STAGED_NATIVE_IMPORT_VALID
+
+
+@pytest.mark.parametrize(
+    'imports,driver_stdout',
+    [
+        (['missing-cublas.dll', 'nvcuda.dll'], '{"loaded":false,"code":126}'),
+        (['unknown-external.dll'], '{"loaded":false,"code":126}'),
+        (['nvcuda.dll'], '{"loaded":true,"code":null}'),
+        (['nvcuda.dll'], 'malformed C:\\secret\\loader output'),
+        (['nvcuda.dll'], '{"loaded":false,"code":127}'),
+    ],
+)
+def test_staged_native_import_driver_boundary_fails_closed(
+    tmp_path, monkeypatch, imports, driver_stdout
+):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    system_root = tmp_path / 'Windows'
+    native.mkdir(parents=True)
+    (system_root / 'System32').mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    cuda = native / 'ggml-cuda.dll'
+    cuda.write_bytes(b'dll')
+    monkeypatch.setenv('SystemRoot', str(system_root))
+    results = [
+        prep.subprocess.CompletedProcess([], 1, '', r'C:\secret\native loader output'),
+        prep.subprocess.CompletedProcess([], 1, '{"loaded":false,"code":126}', ''),
+    ]
+    if imports == ['nvcuda.dll']:
+        results.append(prep.subprocess.CompletedProcess(
+            [], 0 if '"loaded":true' in driver_stdout else 1, driver_stdout, r'C:\secret\driver'
+        ))
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: results.pop(0))
+
+    with pytest.raises(prep.RuntimePrepError) as raised:
+        prep.validate_staged_native_import(
+            runtime,
+            {'expected_interpreter_path': 'python.exe', 'native_dll_artifacts': []},
+            [{'name': cuda.name, 'path': cuda.relative_to(runtime).as_posix(), 'imports': imports}],
+        )
+
+    diagnostic = str(raised.value)
+    assert diagnostic == 'staged native import failed: ggml-cuda.dll:winerror_126'
+    assert 'secret' not in diagnostic.lower()
+
+
+@pytest.mark.parametrize('code', [126, 127, 193])
+def test_native_import_diagnostic_uses_loadlibraryex_code_and_dependency_order(tmp_path, monkeypatch, code):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    native.mkdir(parents=True)
+    dependency = native / 'dependency.dll'
+    consumer = native / 'consumer.pyd'
+    dependency.write_bytes(b'dll')
+    consumer.write_bytes(b'pyd')
+    calls = []
+
+    def completed(command, **kwargs):
+        calls.append((command, kwargs))
+        return prep.subprocess.CompletedProcess(
+            command, 1, json.dumps({'loaded': False, 'code': code}), r'C:\secret\loader detail'
+        )
+
+    monkeypatch.setattr(prep.subprocess, 'run', completed)
+    result = prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {'PATH': 'closed'},
+        [
+            {'name': consumer.name, 'path': consumer.relative_to(runtime).as_posix(), 'imports': [dependency.name]},
+            {'name': dependency.name, 'path': dependency.relative_to(runtime).as_posix(), 'imports': []},
+        ],
+        {'native_dll_artifacts': []},
+    )
+
+    assert result == ('dependency.dll', code)
+    assert calls[0][0][-2] == str(dependency.resolve())
+    assert json.loads(calls[0][0][-1]) == []
+    probe_script = calls[0][0][3]
+    assert 'LoadLibraryExW' in probe_script
+    assert "__import__('os').add_dll_directory(path)" in probe_script
+    assert probe_script.index('dll_directory_handles =') < probe_script.index('handle = load(')
+    assert 'use_last_error=True' in probe_script
+    assert 'ctypes.get_last_error()' in probe_script
+    assert '0x00000100 | 0x00001000' in probe_script
+    assert calls[0][1]['env'] == {'PATH': 'closed'}
+
+
+def test_native_import_diagnostic_reports_consumer_after_dependencies_load(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    native.mkdir(parents=True)
+    dependency = native / 'dependency.dll'
+    consumer = native / 'consumer.pyd'
+    dependency.write_bytes(b'dll')
+    consumer.write_bytes(b'pyd')
+    results = iter([
+        prep.subprocess.CompletedProcess([], 0, '{"loaded":true,"code":null}', ''),
+        prep.subprocess.CompletedProcess([], 1, '{"loaded":false,"code":193}', ''),
+    ])
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: next(results))
+
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [
+            {'name': consumer.name, 'path': consumer.relative_to(runtime).as_posix(), 'imports': [dependency.name]},
+            {'name': dependency.name, 'path': dependency.relative_to(runtime).as_posix(), 'imports': []},
+        ],
+        {'native_dll_artifacts': []},
+    ) == ('consumer.pyd', 193)
+
+
+@pytest.mark.parametrize('stdout,returncode', [
+    ('', 1),
+    ('not-json', 1),
+    ('[]', 1),
+    ('null', 1),
+    ('"scalar"', 1),
+    ('{"loaded":false,"code":5}', 1),
+])
+def test_native_import_diagnostic_maps_malformed_or_unsupported_child_output(
+    tmp_path, monkeypatch, stdout, returncode
+):
+    runtime = tmp_path / 'python-runtime'
+    member = runtime / 'member.dll'
+    runtime.mkdir()
+    member.write_bytes(b'dll')
+    monkeypatch.setattr(
+        prep.subprocess, 'run',
+        lambda *args, **kwargs: prep.subprocess.CompletedProcess(args[0], returncode, stdout, r'C:\secret'),
+    )
+
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [{'name': member.name, 'path': member.name, 'imports': []}],
+        {'native_dll_artifacts': []},
+    ) == ('member.dll', None)
+
+
+def test_native_import_diagnostic_maps_timeout_without_disclosure(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    member = runtime / 'member.dll'
+    runtime.mkdir()
+    member.write_bytes(b'dll')
+    monkeypatch.setattr(
+        prep.subprocess, 'run',
+        lambda *args, **kwargs: (_ for _ in ()).throw(prep.subprocess.TimeoutExpired('secret-command', 15)),
+    )
+
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [{'name': member.name, 'path': member.name, 'imports': []}],
+        {'native_dll_artifacts': []},
+    ) == ('member.dll', None)
+
+
+def test_native_import_diagnostic_success_has_no_invented_failure(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    member = runtime / 'member.dll'
+    runtime.mkdir()
+    member.write_bytes(b'dll')
+    monkeypatch.setattr(
+        prep.subprocess, 'run',
+        lambda *args, **kwargs: prep.subprocess.CompletedProcess(
+            args[0], 0, '{"loaded":true,"code":null}', ''
+        ),
+    )
+
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [{'name': member.name, 'path': member.name, 'imports': []}],
+        {'native_dll_artifacts': []},
+    ) == ('unknown', None)
+
+
+def test_native_import_diagnostic_registers_numpy_sibling_directory_deterministically(
+    tmp_path, monkeypatch
+):
+    runtime = tmp_path / 'python-runtime'
+    core = runtime / 'Lib/site-packages/numpy/_core'
+    numpy_libs = runtime / 'Lib/site-packages/numpy.libs'
+    core.mkdir(parents=True)
+    numpy_libs.mkdir(parents=True)
+    consumer = core / '_multiarray_umath.cp311-win_amd64.pyd'
+    dependency = numpy_libs / 'libscipy_openblas-test.dll'
+    consumer.write_bytes(b'pyd')
+    dependency.write_bytes(b'dll')
+    calls = []
+
+    def completed(command, **kwargs):
+        calls.append(command)
+        return prep.subprocess.CompletedProcess(command, 0, '{"loaded":true,"code":null}', '')
+
+    monkeypatch.setattr(prep.subprocess, 'run', completed)
+    result = prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [
+            {
+                'name': consumer.name,
+                'path': consumer.relative_to(runtime).as_posix(),
+                'imports': [dependency.name],
+            },
+            {
+                'name': dependency.name,
+                'path': dependency.relative_to(runtime).as_posix(),
+                'imports': [],
+            },
+        ],
+        {'native_dll_artifacts': []},
+    )
+
+    assert result == ('unknown', None)
+    assert [Path(command[-2]).name for command in calls] == [dependency.name, consumer.name]
+    # The dependency uses LoadLibraryExW's DLL_LOAD_DIR for its own directory.
+    # The consumer additionally receives only its recorded dependency directory,
+    # matching NumPy's registration of the sibling numpy.libs directory.
+    assert [json.loads(command[-1]) for command in calls] == [
+        [],
+        [str(numpy_libs.resolve())],
+    ]
+    assert all('dll_directory_handles' in command[3] for command in calls)
+
+
+def test_native_import_diagnostic_uses_minimal_transitive_directory_scope(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    consumer_dir = runtime / 'Lib/site-packages/package'
+    dependency_dir = runtime / 'Lib/site-packages/package.libs'
+    unrelated_dir = runtime / 'Lib/site-packages/unrelated.libs'
+    consumer_dir.mkdir(parents=True)
+    dependency_dir.mkdir(parents=True)
+    unrelated_dir.mkdir(parents=True)
+    consumer = consumer_dir / 'consumer.pyd'
+    dependency = dependency_dir / 'dependency.dll'
+    transitive = runtime / 'vcruntime140_1.dll'
+    unrelated = unrelated_dir / 'unrelated.dll'
+    for candidate in (consumer, dependency, transitive, unrelated):
+        candidate.write_bytes(b'native')
+    calls = {}
+
+    def completed(command, **kwargs):
+        calls[Path(command[-2]).name] = json.loads(command[-1])
+        return prep.subprocess.CompletedProcess(command, 0, '{"loaded":true,"code":null}', '')
+
+    monkeypatch.setattr(prep.subprocess, 'run', completed)
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [
+            {'name': consumer.name, 'path': consumer.relative_to(runtime).as_posix(), 'imports': [dependency.name]},
+            {'name': dependency.name, 'path': dependency.relative_to(runtime).as_posix(), 'imports': [transitive.name]},
+            {'name': transitive.name, 'path': transitive.relative_to(runtime).as_posix(), 'imports': []},
+            {'name': unrelated.name, 'path': unrelated.relative_to(runtime).as_posix(), 'imports': []},
+        ],
+        {'native_dll_artifacts': []},
+    ) == ('unknown', None)
+
+    assert calls[transitive.name] == []
+    assert calls[dependency.name] == [str(runtime.resolve())]
+    assert calls[consumer.name] == sorted(
+        [str(runtime.resolve()), str(dependency_dir.resolve())], key=str.casefold
+    )
+    assert all(str(unrelated_dir.resolve()) not in directories for directories in calls.values())
+
+
+def test_native_import_diagnostic_dependency_cycle_is_bounded(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    first_dir = runtime / 'first'
+    second_dir = runtime / 'second'
+    first_dir.mkdir(parents=True)
+    second_dir.mkdir(parents=True)
+    first = first_dir / 'first.dll'
+    second = second_dir / 'second.dll'
+    first.write_bytes(b'first')
+    second.write_bytes(b'second')
+    calls = {}
+
+    def completed(command, **kwargs):
+        calls[Path(command[-2]).name] = json.loads(command[-1])
+        return prep.subprocess.CompletedProcess(command, 0, '{"loaded":true,"code":null}', '')
+
+    monkeypatch.setattr(prep.subprocess, 'run', completed)
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [
+            {'name': first.name, 'path': first.relative_to(runtime).as_posix(), 'imports': [second.name]},
+            {'name': second.name, 'path': second.relative_to(runtime).as_posix(), 'imports': [first.name]},
+        ],
+        {'native_dll_artifacts': []},
+    ) == ('unknown', None)
+
+    assert calls == {
+        first.name: [str(second_dir.resolve())],
+        second.name: [str(first_dir.resolve())],
+    }
+
+
+def test_native_import_diagnostic_rejects_candidate_outside_runtime(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    outside = tmp_path / 'outside.dll'
+    outside.write_bytes(b'sentinel')
+    monkeypatch.setattr(
+        prep.subprocess,
+        'run',
+        lambda *args, **kwargs: pytest.fail('escaped candidate must not be probed'),
+    )
+
+    assert prep._diagnose_native_import_failure(
+        runtime / 'python.exe', runtime, {},
+        [{'name': outside.name, 'path': '../outside.dll', 'imports': []}],
+        {'native_dll_artifacts': []},
+    ) == ('outside.dll', None)
+
+
+def test_staged_native_import_diagnoses_manifest_owned_numpy_dependency(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    numpy = runtime / 'Lib/site-packages/numpy/_core'
+    native = runtime / 'Lib/site-packages/llama_cpp/lib'
+    system_root = tmp_path / 'Windows'
+    numpy.mkdir(parents=True)
+    native.mkdir(parents=True)
+    (system_root / 'System32').mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    consumer = numpy / '_multiarray_umath.cp311-win_amd64.pyd'
+    write_minimal_pe(consumer, imports=['VCRUNTIME140_1.dll'])
+    monkeypatch.setenv('SystemRoot', str(system_root))
+    monkeypatch.setattr(
+        prep.subprocess,
+        'run',
+        lambda *args, **kwargs: prep.subprocess.CompletedProcess(args[0], 1, '', r'C:\secret\raw-error'),
+    )
+    manifest_data = {
+        'expected_interpreter_path': 'python.exe',
+        'native_dll_artifacts': [{
+            'name': 'vcruntime140_1.dll',
+            'destination': 'vcruntime140_1.dll',
+        }],
+    }
+
+    with pytest.raises(prep.RuntimePrepError) as raised:
+        prep.validate_staged_native_import(
+            runtime,
+            manifest_data,
+            [{
+                'name': consumer.name,
+                'path': consumer.relative_to(runtime).as_posix(),
+                'imports': ['vcruntime140_1.dll'],
+            }],
+        )
+
+    assert str(raised.value) == 'staged native import failed: vcruntime140_1.dll:winerror_126'
+    assert '_multiarray_umath' not in str(raised.value)
+    assert 'secret' not in str(raised.value).lower()
+
+
+def test_staged_native_import_rejects_missing_search_topology(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    runtime.mkdir()
+    (runtime / 'python.exe').write_bytes(b'python')
+    monkeypatch.setenv('SystemRoot', str(tmp_path / 'missing-windows'))
+    with pytest.raises(prep.RuntimePrepError, match='environment invalid'):
+        prep.validate_staged_native_import(runtime, {'expected_interpreter_path': 'python.exe'}, [])
 
 
 def test_manifest_rejects_non_exact_native_versions(tmp_path):
@@ -1225,7 +1695,7 @@ def test_stage_native_dll_artifacts_fail_closed_edge_cases(tmp_path, monkeypatch
         'license': 'NVIDIA CUDA Toolkit EULA',
         'provenance': 'test pinned runtime DLL',
         'archive_member_path': 'bin/cudart64_12.dll',
-        'destination': 'cudart64_12.dll',
+        'destination': 'Lib/site-packages/llama_cpp/lib/cudart64_12.dll',
         'extracted_sha256': good_sha,
     }
 
@@ -1245,7 +1715,7 @@ def test_stage_native_dll_artifacts_fail_closed_edge_cases(tmp_path, monkeypatch
     wrong_hash = {'native_dll_artifacts': [dict(base_artifact, extracted_sha256='abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')]}
     with pytest.raises(prep.RuntimePrepError, match='file digest mismatch'):
         prep.stage_native_dll_artifacts(wrong_hash, tmp_path / 'cache', runtime)
-    assert not (runtime / 'cudart64_12.dll').exists()
+    assert not (runtime / 'Lib/site-packages/llama_cpp/lib/cudart64_12.dll').exists()
 
     arm_dll = tmp_path / 'arm.dll'
     write_minimal_pe(arm_dll, machine=0xAA64)

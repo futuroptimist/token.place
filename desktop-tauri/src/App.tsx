@@ -54,6 +54,8 @@ interface RelayStatus {
 type ReadinessDiagnostics = Record<string, string | number | boolean | null>;
 
 const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
+  'offloaded_layers',
+  'kv_cache_device',
   'api_v1_readiness_result',
   'api_v1_readiness_error_code',
   'api_v1_readiness_error_reason',
@@ -1411,6 +1413,8 @@ export function App() {
         <p style={{ marginBottom: 0 }}>Fallback reason: <code>{computeStatus.fallback_reason || 'none'}</code></p>
         <p style={{ marginBottom: 0 }}>Readiness diagnostics: <code>{formatReadinessDiagnostics(computeStatus.readiness_diagnostics)}</code></p>
         <p style={{ marginBottom: 0 }}>Model path: <code>{computeStatus.model_path || config.model_path || 'not set'}</code></p>
+        <p style={{ marginBottom: 0 }}>Operator session ID: <code>{computeStatus.operator_session_id || 'pending'}</code></p>
+        <p style={{ marginBottom: 0 }}>Sequence: <code>{computeStatus.sequence ?? 'pending'}</code></p>
         <p style={{ marginBottom: 0 }}>Operator debug log: <code>{computeStatus.log_file_path || 'not created yet'}</code></p>
         <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
           <button type="button" disabled={!computeStatus.log_file_path} onClick={refreshOperatorLog}>

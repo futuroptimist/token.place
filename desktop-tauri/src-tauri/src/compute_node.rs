@@ -7,12 +7,14 @@ use crate::operator_logs::{
 };
 use crate::python_runtime::{
     bridge_script_candidates_from_resource_roots, coherent_packaged_resource_roots,
+    configure_packaged_python_subprocess_env_for_layout,
     configure_python_subprocess_env_for_layout, describe_resource_layout, disable_python_user_site,
     resolve_bridge_script_path, resolve_bundled_python_launcher_at_root,
-    resolve_python_launcher_resource_aware, resolve_runtime_import_root,
-    should_enable_runtime_bootstrap, BridgeResourceContext, PythonEnvCommand, PythonLauncher,
-    PythonLauncherCategory, PythonLauncherError, PythonLauncherResolutionOptions,
-    PythonLauncherSource, ResourceLayoutKind, ENABLE_RUNTIME_BOOTSTRAP_ENV,
+    resolve_packaged_runtime_import_root, resolve_python_launcher_resource_aware,
+    resolve_runtime_import_root, should_enable_runtime_bootstrap, BridgeResourceContext,
+    PythonEnvCommand, PythonLauncher, PythonLauncherCategory, PythonLauncherError,
+    PythonLauncherResolutionOptions, PythonLauncherSource, ResourceLayoutKind,
+    ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
@@ -27,7 +29,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 #[cfg(test)]
 use tokio::sync::oneshot;
@@ -49,6 +51,7 @@ pub struct ComputeNodeRequest {
 const DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
 const OPERATOR_PREFLIGHT_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 const OPERATOR_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(3);
+const OPERATOR_PREFLIGHT_EVENT_MAX_BYTES: usize = 2048;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComputeNodeStatus {
@@ -435,7 +438,9 @@ fn build_bridge_command(
         let launcher = launcher.ok_or_else(|| {
             anyhow::anyhow!("missing resolved Python launcher for compute-node bridge script")
         })?;
-        return Ok(launcher.command_for_script(bridge_path));
+        return launcher
+            .command_for_script(bridge_path)
+            .map_err(anyhow::Error::from);
     }
 
     Ok(Command::new(bridge_path))
@@ -630,6 +635,8 @@ fn event_session_id(payload: &Value) -> Option<&str> {
 }
 
 const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
+    "offloaded_layers",
+    "kv_cache_device",
     "api_v1_readiness_result",
     "api_v1_readiness_error_code",
     "api_v1_readiness_error_reason",
@@ -1607,22 +1614,31 @@ pub(crate) struct OperatorBridgeLaunchPreparation {
     pub bridge_script: String,
     pub launcher: Option<PythonLauncher>,
     resource_root: std::path::PathBuf,
+    runtime_root: Option<std::path::PathBuf>,
     import_root: std::path::PathBuf,
     layout: ResourceLayoutKind,
 }
 
 impl OperatorBridgeLaunchPreparation {
-    fn command(&self) -> anyhow::Result<Command> {
-        let mut command = build_bridge_command(&self.bridge_script, self.launcher.clone())?;
+    fn configure_command<C>(
+        &self,
+        command: &mut C,
+    ) -> Result<(), OperatorBridgeLaunchPreparationError>
+    where
+        C: PythonEnvCommand,
+    {
         configure_python_subprocess_env_for_layout(
-            &mut command,
+            command,
             &self.import_root,
             self.layout.clone(),
-            matches!(
-                self.launcher.as_ref().map(|launcher| &launcher.source),
-                Some(PythonLauncherSource::BundledRuntime)
-            ),
+            false,
         );
+        Ok(())
+    }
+
+    fn command(&self) -> anyhow::Result<Command> {
+        let mut command = build_bridge_command(&self.bridge_script, self.launcher.clone())?;
+        self.configure_command(&mut command)?;
         Ok(command)
     }
 
@@ -1630,13 +1646,10 @@ impl OperatorBridgeLaunchPreparation {
         let launcher = self.launcher.as_ref().ok_or_else(|| {
             anyhow::anyhow!("missing resolved Python launcher for compute-node bridge script")
         })?;
-        let mut command = launcher.command_for_script_blocking(&self.bridge_script);
-        configure_python_subprocess_env_for_layout(
-            &mut command,
-            &self.import_root,
-            self.layout.clone(),
-            launcher.source == PythonLauncherSource::BundledRuntime,
-        );
+        let mut command = launcher
+            .command_for_script_blocking(&self.bridge_script)
+            .map_err(|_| OperatorBridgeLaunchPreparationError::packaged_environment_invalid())?;
+        self.configure_command(&mut command)?;
         Ok(command)
     }
 
@@ -1672,13 +1685,10 @@ impl OperatorBridgeLaunchPreparation {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing bundled Python launcher for operator smoke"))?;
         let model_bridge_script = self.model_bridge_script()?;
-        let mut command = launcher.command_for_script_blocking(&model_bridge_script);
-        configure_python_subprocess_env_for_layout(
-            &mut command,
-            &self.import_root,
-            self.layout.clone(),
-            launcher.source == PythonLauncherSource::BundledRuntime,
-        );
+        let mut command = launcher
+            .command_for_script_blocking(&model_bridge_script)
+            .map_err(|_| OperatorBridgeLaunchPreparationError::packaged_environment_invalid())?;
+        self.configure_command(&mut command)?;
         Ok(command)
     }
 }
@@ -1691,6 +1701,14 @@ pub(crate) struct OperatorBridgeLaunchPreparationError {
 }
 
 impl OperatorBridgeLaunchPreparationError {
+    fn packaged_environment_invalid() -> Self {
+        Self::new(
+            "packaged_environment_construction",
+            crate::python_runtime::PACKAGED_PYTHON_ENVIRONMENT_INVALID,
+            crate::python_runtime::PACKAGED_PYTHON_ENVIRONMENT_INVALID,
+            "packaged Python environment could not be constructed",
+        )
+    }
     fn new(
         stage: &'static str,
         code: &'static str,
@@ -1770,11 +1788,25 @@ pub(crate) fn prepare_operator_bridge_launch(
         };
         let launcher = resolve_bundled_python_launcher_at_root(&resource_root, true)
             .map_err(OperatorBridgeLaunchPreparationError::from_launcher)?;
+        let runtime_root = crate::python_runtime::bundled_runtime_root_from_launcher(&launcher)
+            .and_then(|path| path.canonicalize().ok())
+            .filter(|path| path.is_dir() && path.starts_with(&resource_root))
+            .ok_or_else(OperatorBridgeLaunchPreparationError::packaged_environment_invalid)?;
+        let import_root =
+            resolve_packaged_runtime_import_root(&resource_root).ok_or_else(|| {
+                OperatorBridgeLaunchPreparationError::new(
+                    "import_root_resolution",
+                    "packaged_import_root_invalid",
+                    "packaged_layout_invalid",
+                    "selected packaged resource tree has no unique import root",
+                )
+            })?;
         return Ok(OperatorBridgeLaunchPreparation {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(launcher),
-            import_root: resource_root.clone(),
+            import_root,
             resource_root,
+            runtime_root: Some(runtime_root),
             layout,
         });
     }
@@ -1817,6 +1849,7 @@ pub(crate) fn prepare_operator_bridge_launch(
         bridge_script,
         launcher,
         resource_root,
+        runtime_root: None,
         import_root,
         layout,
     })
@@ -1927,15 +1960,17 @@ pub(crate) fn operator_start_preflight_record(
     let preparation = prepare_operator_bridge_launch(&context)?;
     let mut command = preparation.command()?;
     configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
-    command.arg("--operator-preflight-controlled-ready");
+    command.arg("--operator-runtime-preflight");
     command
+        .arg("--mode")
+        .arg(format!("{:?}", config.preferred_mode).to_lowercase())
         .arg("--context-tier")
         .arg(normalize_context_tier(&config.context_tier));
     let event = std::thread::spawn(move || -> anyhow::Result<Value> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(run_controlled_operator_preflight_child(
+            .block_on(run_production_operator_preflight_child(
                 command,
                 OPERATOR_PREFLIGHT_EVENT_TIMEOUT,
             ))
@@ -1956,8 +1991,11 @@ pub(crate) fn operator_start_preflight_record(
         map.insert("bridge_child_spawned".into(), Value::Bool(true));
         map.insert("bridge_event_received".into(), Value::Bool(true));
         for key in [
-            "controlled_preflight",
+            "production_runtime_preflight",
             "startup_result",
+            "requested_mode",
+            "selected_backend",
+            "runtime_action",
             "provisioning_actions",
             "repair_actions",
             "pip_actions",
@@ -1969,14 +2007,87 @@ pub(crate) fn operator_start_preflight_record(
         }
         map.insert("bridge_event_type".into(), event["type"].clone());
         map.insert(
-            "controlled_ready".into(),
-            Value::Bool(event["controlled_preflight"] == Value::Bool(true)),
+            "native_runtime_validated".into(),
+            Value::Bool(event["production_runtime_preflight"] == Value::Bool(true)),
         );
     }
     Ok(payload)
 }
 
-async fn cleanup_controlled_operator_preflight_child(child: &mut Child, pid: Option<u32>) {
+/// Structural-only smoke gate: confirms the packaged app launches, resolves
+/// its bundled resources, and passes dependency/environment preflight on a
+/// CPU-only request. It does NOT claim GPU/CUDA/Metal validation -- that
+/// remains the sole responsibility of [`operator_start_preflight_record`]
+/// and its fail-closed `validate_production_operator_preflight_event`
+/// contract, which this function must never weaken or bypass. Intended for
+/// CI runners without a GPU (see desktop-operator-e2e.yml); real hardware
+/// validation happens on operator-facing GPU hardware separately.
+pub(crate) fn operator_start_preflight_cpu_smoke_record(
+    config: &DesktopConfig,
+    app: &AppHandle,
+) -> anyhow::Result<Value> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let current_exe = std::env::current_exe().ok();
+    let resource_dir = app.path().resource_dir().ok();
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
+        manifest_dir,
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
+    let preparation = prepare_operator_bridge_launch(&context)?;
+    let mut command = preparation.command()?;
+    configure_runtime_bootstrap_env(&mut command, &ComputeMode::Cpu);
+    command
+        .arg("--operator-runtime-preflight-cpu-smoke")
+        .arg("--mode")
+        .arg("cpu")
+        .arg("--context-tier")
+        .arg(normalize_context_tier(&config.context_tier));
+    let event = std::thread::spawn(move || -> anyhow::Result<Value> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_cpu_smoke_operator_preflight_child(
+                command,
+                OPERATOR_PREFLIGHT_EVENT_TIMEOUT,
+            ))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("operator_preflight_child_failed"))??;
+
+    let mut payload = operator_session_smoke_record_from_preparation(config, &preparation)?;
+    if let Value::Object(map) = &mut payload {
+        map.insert(
+            "operator_start_preflight".into(),
+            Value::String("cpu_smoke_ok".into()),
+        );
+        map.insert(
+            "resource_context_source".into(),
+            Value::String("tauri_app_handle".into()),
+        );
+        map.insert("bridge_child_spawned".into(), Value::Bool(true));
+        map.insert("bridge_event_received".into(), Value::Bool(true));
+        for key in [
+            "cpu_smoke_preflight",
+            "startup_result",
+            "requested_mode",
+            "selected_backend",
+            "runtime_action",
+            "provisioning_actions",
+            "repair_actions",
+            "pip_actions",
+            "compiler_actions",
+            "network_actions",
+            "download_actions",
+        ] {
+            map.insert(key.into(), event[key].clone());
+        }
+        map.insert("bridge_event_type".into(), event["type"].clone());
+    }
+    Ok(payload)
+}
+
+async fn cleanup_production_operator_preflight_child(child: &mut Child, pid: Option<u32>) {
     if let Some(pid) = pid {
         terminate_bridge_process_tree(pid).await;
     }
@@ -1989,10 +2100,51 @@ async fn cleanup_controlled_operator_preflight_child(child: &mut Child, pid: Opt
     }
 }
 
-fn validate_controlled_operator_preflight_event(event: Value) -> anyhow::Result<Value> {
+async fn read_bounded_operator_preflight_event<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<Option<String>> {
+    let mut event = Vec::with_capacity(OPERATOR_PREFLIGHT_EVENT_MAX_BYTES + 2);
+    let mut byte = [0_u8; 1];
+    loop {
+        let bytes_read = reader
+            .read(&mut byte)
+            .await
+            .map_err(|_| anyhow::anyhow!("operator_preflight_event_read_failed"))?;
+        if bytes_read == 0 {
+            if event.is_empty() {
+                return Ok(None);
+            }
+            if event.len() > OPERATOR_PREFLIGHT_EVENT_MAX_BYTES {
+                anyhow::bail!("operator_preflight_invalid_failure_event");
+            }
+            break;
+        }
+        if byte[0] == b'\n' {
+            if event.last() == Some(&b'\r') {
+                event.pop();
+            }
+            break;
+        }
+        event.push(byte[0]);
+        if event.len() > OPERATOR_PREFLIGHT_EVENT_MAX_BYTES
+            && !(event.len() == OPERATOR_PREFLIGHT_EVENT_MAX_BYTES + 1
+                && event.last() == Some(&b'\r'))
+        {
+            anyhow::bail!("operator_preflight_invalid_failure_event");
+        }
+    }
+    String::from_utf8(event)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("operator_preflight_event_read_failed"))
+}
+
+fn validate_production_operator_preflight_event(event: Value) -> anyhow::Result<Value> {
     let identity_is_valid = event.get("type").and_then(Value::as_str) == Some("status")
-        && event.get("controlled_preflight").and_then(Value::as_bool) == Some(true)
-        && event.get("startup_result").and_then(Value::as_str) == Some("ready");
+        && event
+            .get("production_runtime_preflight")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && event.get("startup_result").and_then(Value::as_str) == Some("runtime_validated");
     let counters_are_zero = [
         "provisioning_actions",
         "repair_actions",
@@ -2003,15 +2155,156 @@ fn validate_controlled_operator_preflight_event(event: Value) -> anyhow::Result<
     ]
     .iter()
     .all(|key| event.get(*key).and_then(Value::as_i64) == Some(0));
-    if !identity_is_valid || !counters_are_zero {
+    let requested_mode_is_valid = matches!(
+        event.get("requested_mode").and_then(Value::as_str),
+        Some("auto" | "gpu" | "hybrid")
+    );
+    let runtime_pair_is_valid = matches!(
+        (
+            event.get("selected_backend").and_then(Value::as_str),
+            event.get("runtime_action").and_then(Value::as_str),
+        ),
+        (Some("cuda"), Some("already_supported"))
+            | (Some("metal"), Some("metal_already_supported"))
+    );
+    if !identity_is_valid
+        || !counters_are_zero
+        || !requested_mode_is_valid
+        || !runtime_pair_is_valid
+    {
         anyhow::bail!("operator_preflight_invalid_event");
     }
     Ok(event)
 }
 
-async fn run_controlled_operator_preflight_child(
+/// Validates a CPU-only structural smoke event. Deliberately distinct from
+/// [`validate_production_operator_preflight_event`] (different marker field,
+/// different accepted `requested_mode`/`selected_backend`/`runtime_action`
+/// values) so a CPU-smoke pass can never be mistaken for real GPU/Metal
+/// validation by any downstream consumer.
+fn validate_cpu_smoke_operator_preflight_event(event: Value) -> anyhow::Result<Value> {
+    let identity_is_valid = event.get("type").and_then(Value::as_str) == Some("status")
+        && event.get("cpu_smoke_preflight").and_then(Value::as_bool) == Some(true)
+        && event.get("startup_result").and_then(Value::as_str) == Some("cpu_smoke_validated");
+    let counters_are_zero = [
+        "provisioning_actions",
+        "repair_actions",
+        "pip_actions",
+        "compiler_actions",
+        "network_actions",
+        "download_actions",
+    ]
+    .iter()
+    .all(|key| event.get(*key).and_then(Value::as_i64) == Some(0));
+    let requested_mode_is_valid =
+        event.get("requested_mode").and_then(Value::as_str) == Some("cpu");
+    let runtime_pair_is_valid = matches!(
+        (
+            event.get("selected_backend").and_then(Value::as_str),
+            event.get("runtime_action").and_then(Value::as_str),
+        ),
+        (Some("cpu"), Some("skipped"))
+    );
+    if !identity_is_valid
+        || !counters_are_zero
+        || !requested_mode_is_valid
+        || !runtime_pair_is_valid
+    {
+        anyhow::bail!("operator_preflight_invalid_event");
+    }
+    Ok(event)
+}
+
+fn validate_production_operator_preflight_failure_event(event: &Value) -> anyhow::Result<String> {
+    const KEYS: [&str; 15] = [
+        "type",
+        "startup_result",
+        "probe_stage",
+        "probe_error_code",
+        "exception_type",
+        "child_exit_code",
+        "detected_architecture",
+        "architecture_source",
+        "import_root_valid",
+        "provisioning_actions",
+        "repair_actions",
+        "pip_actions",
+        "compiler_actions",
+        "network_actions",
+        "download_actions",
+    ];
+    let object = event
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("operator_preflight_invalid_failure_event"))?;
+    if object.len() != KEYS.len() || !object.keys().all(|key| KEYS.contains(&key.as_str())) {
+        anyhow::bail!("operator_preflight_invalid_failure_event");
+    }
+    let stage = event["probe_stage"].as_str().filter(|value| {
+        matches!(
+            *value,
+            "environment_contract" | "native_import" | "runtime_validation" | "probe_process"
+        )
+    });
+    let code = event["probe_error_code"].as_str().filter(|value| {
+        matches!(
+            *value,
+            "missing_environment_contract"
+                | "native_llama_import_failed"
+                | "native_dll_load_failed"
+                | "runtime_version_or_provenance_invalid"
+                | "cuda_capability_missing"
+                | "physical_device_missing"
+                | "yarn_rope_capability_incomplete"
+                | "unsupported_platform"
+                | "probe_timeout"
+                | "probe_process_abnormal_exit"
+        )
+    });
+    let exception = event["exception_type"].as_str().filter(|value| {
+        matches!(
+            *value,
+            "none"
+                | "ImportError"
+                | "ModuleNotFoundError"
+                | "OSError"
+                | "RuntimeError"
+                | "TimeoutExpired"
+        )
+    });
+    let architecture = event["detected_architecture"]
+        .as_str()
+        .filter(|value| matches!(*value, "x86_64" | "arm64" | "aarch64" | "unknown"));
+    let source = event["architecture_source"]
+        .as_str()
+        .filter(|value| matches!(*value, "platform" | "attested_windows_x86_64" | "unknown"));
+    let child_exit_valid =
+        event["child_exit_code"].is_null() || event["child_exit_code"].as_i64().is_some();
+    let counters_zero = KEYS[9..].iter().all(|key| event[*key].as_i64() == Some(0));
+    if event["type"] != "status"
+        || event["startup_result"] != "runtime_validation_failed"
+        || stage.is_none()
+        || code.is_none()
+        || exception.is_none()
+        || architecture.is_none()
+        || source.is_none()
+        || event["import_root_valid"].as_bool().is_none()
+        || !child_exit_valid
+        || !counters_zero
+    {
+        anyhow::bail!("operator_preflight_invalid_failure_event");
+    }
+    Ok(format!(
+        "operator_preflight_runtime_validation_failed:probe_stage={};probe_error_code={};exception_type={};child_exit_code={};detected_architecture={};architecture_source={};import_root_valid={}",
+        stage.unwrap(), code.unwrap(), exception.unwrap(),
+        event["child_exit_code"].as_i64().map(|value| value.to_string()).unwrap_or_else(|| "null".into()),
+        architecture.unwrap(), source.unwrap(), event["import_root_valid"].as_bool().unwrap()
+    ))
+}
+
+async fn run_operator_preflight_child(
     mut command: Command,
     event_timeout: Duration,
+    validate_success: fn(Value) -> anyhow::Result<Value>,
 ) -> anyhow::Result<Value> {
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     isolate_bridge_process_tree(&mut command);
@@ -2024,19 +2317,51 @@ async fn run_controlled_operator_preflight_child(
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("operator_preflight_stdout_unavailable"))?;
-        let mut lines = BufReader::new(stdout).lines();
-        let line = tokio::time::timeout(event_timeout, lines.next_line())
-            .await
-            .map_err(|_| anyhow::anyhow!("operator_preflight_event_timeout"))?
-            .map_err(|_| anyhow::anyhow!("operator_preflight_event_read_failed"))?
-            .ok_or_else(|| anyhow::anyhow!("operator_preflight_event_missing"))?;
+        let mut reader = BufReader::new(stdout);
+        let line = tokio::time::timeout(
+            event_timeout,
+            read_bounded_operator_preflight_event(&mut reader),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("operator_preflight_event_timeout"))??
+        .ok_or_else(|| anyhow::anyhow!("operator_preflight_event_missing"))?;
         let event = parse_compute_node_event_line(&line)
             .map_err(|_| anyhow::anyhow!("operator_preflight_event_parse_failed"))?;
-        validate_controlled_operator_preflight_event(event)
+        if event.get("startup_result").and_then(Value::as_str) == Some("runtime_validation_failed")
+        {
+            return Err(anyhow::anyhow!(
+                validate_production_operator_preflight_failure_event(&event)?
+            ));
+        }
+        validate_success(event)
     }
     .await;
-    cleanup_controlled_operator_preflight_child(&mut child, pid).await;
+    cleanup_production_operator_preflight_child(&mut child, pid).await;
     result
+}
+
+async fn run_production_operator_preflight_child(
+    command: Command,
+    event_timeout: Duration,
+) -> anyhow::Result<Value> {
+    run_operator_preflight_child(
+        command,
+        event_timeout,
+        validate_production_operator_preflight_event,
+    )
+    .await
+}
+
+async fn run_cpu_smoke_operator_preflight_child(
+    command: Command,
+    event_timeout: Duration,
+) -> anyhow::Result<Value> {
+    run_operator_preflight_child(
+        command,
+        event_timeout,
+        validate_cpu_smoke_operator_preflight_event,
+    )
+    .await
 }
 
 pub async fn start_compute_node(
@@ -3140,6 +3465,7 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::process::Command as StdCommand;
     use std::process::ExitStatus;
     use tempfile::TempDir;
@@ -3909,7 +4235,9 @@ mod tests {
         assert_eq!(event_types, vec!["status".to_string(), "error".to_string()]);
     }
 
-    const CONTROLLED_PREFLIGHT_READY_EVENT: &str = r#"{"type":"status","controlled_preflight":true,"startup_result":"ready","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
+    const PRODUCTION_PREFLIGHT_VALIDATED_EVENT: &str = r#"{"type":"status","production_runtime_preflight":true,"startup_result":"runtime_validated","requested_mode":"auto","selected_backend":"cuda","runtime_action":"already_supported","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
+    const PRODUCTION_PREFLIGHT_FAILURE_EVENT: &str = r#"{"type":"status","startup_result":"runtime_validation_failed","probe_stage":"native_import","probe_error_code":"native_dll_load_failed","exception_type":"OSError","child_exit_code":101,"detected_architecture":"x86_64","architecture_source":"attested_windows_x86_64","import_root_valid":true,"provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
+    const CPU_SMOKE_PREFLIGHT_VALIDATED_EVENT: &str = r#"{"type":"status","cpu_smoke_preflight":true,"startup_result":"cpu_smoke_validated","requested_mode":"cpu","selected_backend":"cpu","runtime_action":"skipped","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
 
     fn operator_preflight_test_command(output: Option<&str>, wedge: bool) -> Command {
         #[cfg(unix)]
@@ -3940,36 +4268,198 @@ mod tests {
         }
     }
 
+    fn oversized_unterminated_operator_preflight_test_command() -> Command {
+        let byte_count = OPERATOR_PREFLIGHT_EVENT_MAX_BYTES + 2;
+        #[cfg(unix)]
+        {
+            let script = format!("head -c {byte_count} /dev/zero | tr '\\0' x; sleep 30");
+            let mut command = Command::new("sh");
+            command.args(["-c", &script]);
+            command
+        }
+        #[cfg(windows)]
+        {
+            let script = format!(
+                "$text = 'x' * {byte_count}; [Console]::Out.Write($text); [Console]::Out.Flush(); Start-Sleep -Seconds 30"
+            );
+            let mut command = Command::new("powershell");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            command
+        }
+    }
+
     #[tokio::test]
-    async fn operator_preflight_accepts_valid_controlled_readiness_event() {
-        let event = run_controlled_operator_preflight_child(
-            operator_preflight_test_command(Some(CONTROLLED_PREFLIGHT_READY_EVENT), false),
+    async fn operator_preflight_accepts_valid_runtime_validation_event() {
+        let event = run_production_operator_preflight_child(
+            operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_VALIDATED_EVENT), false),
             Duration::from_secs(2),
         )
         .await
-        .expect("valid controlled readiness");
+        .expect("valid production runtime validation");
 
         assert_eq!(event["type"], "status");
-        assert_eq!(event["controlled_preflight"], true);
+        assert_eq!(event["production_runtime_preflight"], true);
         assert_eq!(event["network_actions"], 0);
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_reports_valid_bounded_failure_event() {
+        let error = run_production_operator_preflight_child(
+            operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_FAILURE_EVENT), false),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("bounded failure must be transported");
+        assert_eq!(error.to_string(), "operator_preflight_runtime_validation_failed:probe_stage=native_import;probe_error_code=native_dll_load_failed;exception_type=OSError;child_exit_code=101;detected_architecture=x86_64;architecture_source=attested_windows_x86_64;import_root_valid=true");
+        assert!(!error
+            .to_string()
+            .contains("operator_preflight_event_missing"));
+    }
+
+    #[tokio::test]
+    async fn cpu_smoke_operator_preflight_accepts_valid_cpu_only_event() {
+        let event = run_cpu_smoke_operator_preflight_child(
+            operator_preflight_test_command(Some(CPU_SMOKE_PREFLIGHT_VALIDATED_EVENT), false),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("valid cpu-smoke event");
+
+        assert_eq!(event["type"], "status");
+        assert_eq!(event["cpu_smoke_preflight"], true);
+        assert_eq!(event["selected_backend"], "cpu");
+        assert_eq!(event["runtime_action"], "skipped");
+    }
+
+    #[tokio::test]
+    async fn cpu_smoke_operator_preflight_reports_valid_bounded_failure_event() {
+        let error = run_cpu_smoke_operator_preflight_child(
+            operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_FAILURE_EVENT), false),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("bounded failure must be transported");
+        assert_eq!(error.to_string(), "operator_preflight_runtime_validation_failed:probe_stage=native_import;probe_error_code=native_dll_load_failed;exception_type=OSError;child_exit_code=101;detected_architecture=x86_64;architecture_source=attested_windows_x86_64;import_root_valid=true");
+    }
+
+    #[test]
+    fn cpu_smoke_operator_preflight_rejects_gpu_flavored_and_mismatched_events() {
+        let valid: Value = serde_json::from_str(CPU_SMOKE_PREFLIGHT_VALIDATED_EVENT).unwrap();
+        for (key, value) in [
+            ("cpu_smoke_preflight", Value::Bool(false)),
+            ("startup_result", Value::String("runtime_validated".into())),
+            ("requested_mode", Value::String("auto".into())),
+            ("requested_mode", Value::String("gpu".into())),
+            ("selected_backend", Value::String("cuda".into())),
+            ("runtime_action", Value::String("already_supported".into())),
+            ("network_actions", Value::from(1)),
+        ] {
+            let mut event = valid.clone();
+            event[key] = value;
+            assert_eq!(
+                validate_cpu_smoke_operator_preflight_event(event)
+                    .expect_err("forged or mismatched cpu-smoke attestation")
+                    .to_string(),
+                "operator_preflight_invalid_event"
+            );
+        }
+
+        // A genuine production (GPU-validated) event must never validate as a
+        // cpu-smoke pass either -- the two contracts are intentionally disjoint.
+        let production: Value = serde_json::from_str(PRODUCTION_PREFLIGHT_VALIDATED_EVENT).unwrap();
+        assert_eq!(
+            validate_cpu_smoke_operator_preflight_event(production)
+                .expect_err("production event must not satisfy the cpu-smoke contract")
+                .to_string(),
+            "operator_preflight_invalid_event"
+        );
+    }
+
+    #[test]
+    fn operator_preflight_rejects_malformed_unknown_and_unallowlisted_failure_events() {
+        let valid: Value = serde_json::from_str(PRODUCTION_PREFLIGHT_FAILURE_EVENT).unwrap();
+        for mutation in [
+            (
+                "probe_stage",
+                Value::String("free-form detail /secret".into()),
+            ),
+            ("probe_error_code", Value::String("unknown_code".into())),
+            ("exception_type", Value::String("SecretException".into())),
+            ("import_root_valid", Value::String("true".into())),
+        ] {
+            let mut event = valid.clone();
+            event[mutation.0] = mutation.1;
+            assert_eq!(
+                validate_production_operator_preflight_failure_event(&event)
+                    .unwrap_err()
+                    .to_string(),
+                "operator_preflight_invalid_failure_event"
+            );
+        }
+        let mut unknown = valid;
+        unknown["detail"] = Value::String("SENTINEL /secret".into());
+        assert_eq!(
+            validate_production_operator_preflight_failure_event(&unknown)
+                .unwrap_err()
+                .to_string(),
+            "operator_preflight_invalid_failure_event"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_rejects_oversized_failure_event() {
+        let output = format!(
+            "{{\"startup_result\":\"runtime_validation_failed\",\"detail\":\"{}\"}}",
+            "x".repeat(OPERATOR_PREFLIGHT_EVENT_MAX_BYTES)
+        );
+        let error = run_production_operator_preflight_child(
+            operator_preflight_test_command(Some(&output), false),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "operator_preflight_invalid_failure_event"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_rejects_oversized_unterminated_event_without_waiting_for_timeout() {
+        let started = Instant::now();
+        let error = run_production_operator_preflight_child(
+            oversized_unterminated_operator_preflight_test_command(),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("oversized unterminated event must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "operator_preflight_invalid_failure_event"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "oversized event waited for the timeout or left its child running"
+        );
     }
 
     #[test]
     fn operator_preflight_rejects_noncontrolled_and_nonzero_action_events() {
         for event in [
             serde_json::json!({
-                "type": "status", "controlled_preflight": false, "startup_result": "ready",
+                "type": "status", "production_runtime_preflight": false, "startup_result": "runtime_validated",
                 "provisioning_actions": 0, "repair_actions": 0, "pip_actions": 0,
                 "compiler_actions": 0, "network_actions": 0, "download_actions": 0,
             }),
             serde_json::json!({
-                "type": "status", "controlled_preflight": true, "startup_result": "ready",
+                "type": "status", "production_runtime_preflight": true, "startup_result": "runtime_validated",
                 "provisioning_actions": 0, "repair_actions": 0, "pip_actions": 1,
                 "compiler_actions": 0, "network_actions": 0, "download_actions": 0,
             }),
         ] {
             assert_eq!(
-                validate_controlled_operator_preflight_event(event)
+                validate_production_operator_preflight_event(event)
                     .expect_err("invalid event")
                     .to_string(),
                 "operator_preflight_invalid_event"
@@ -3977,10 +4467,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn operator_preflight_requires_gpu_mode_and_immutable_native_runtime_pair() {
+        let valid = serde_json::from_str::<Value>(PRODUCTION_PREFLIGHT_VALIDATED_EVENT)
+            .expect("valid fixture");
+        for (key, value) in [
+            ("requested_mode", Value::Null),
+            ("requested_mode", Value::String("cpu".into())),
+            ("selected_backend", Value::String("cpu".into())),
+            ("runtime_action", Value::String("skipped".into())),
+            (
+                "runtime_action",
+                Value::String("metal_already_supported".into()),
+            ),
+        ] {
+            let mut event = valid.clone();
+            event[key] = value;
+            assert_eq!(
+                validate_production_operator_preflight_event(event)
+                    .expect_err("forged runtime attestation")
+                    .to_string(),
+                "operator_preflight_invalid_event"
+            );
+        }
+
+        let mut metal = valid;
+        metal["requested_mode"] = Value::String("gpu".into());
+        metal["selected_backend"] = Value::String("metal".into());
+        metal["runtime_action"] = Value::String("metal_already_supported".into());
+        validate_production_operator_preflight_event(metal).expect("valid Metal attestation");
+    }
+
     #[tokio::test]
     async fn operator_preflight_times_out_silent_wedged_child() {
         let started = Instant::now();
-        let error = run_controlled_operator_preflight_child(
+        let error = run_production_operator_preflight_child(
             operator_preflight_test_command(None, true),
             Duration::from_millis(100),
         )
@@ -3994,8 +4515,8 @@ mod tests {
     #[tokio::test]
     async fn operator_preflight_terminates_and_reaps_child_after_ready_event() {
         let started = Instant::now();
-        run_controlled_operator_preflight_child(
-            operator_preflight_test_command(Some(CONTROLLED_PREFLIGHT_READY_EVENT), true),
+        run_production_operator_preflight_child(
+            operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_VALIDATED_EVENT), true),
             Duration::from_secs(2),
         )
         .await
@@ -6420,6 +6941,28 @@ mod tests {
     }
 
     #[test]
+    fn prepare_operator_bridge_launch_rejects_invalid_packaged_sanitizer_before_spawn() {
+        let preparation = OperatorBridgeLaunchPreparation {
+            bridge_script: "compute_node_bridge.py".into(),
+            launcher: Some(PythonLauncher {
+                program: "python3".into(),
+                args: Vec::new(),
+                source: PythonLauncherSource::BundledRuntime,
+                runtime_id: "test-runtime".into(),
+            }),
+            resource_root: PathBuf::from("missing-resource-root"),
+            runtime_root: None,
+            import_root: PathBuf::from("missing-import-root"),
+            layout: ResourceLayoutKind::WindowsResources,
+        };
+
+        let err = preparation.command().expect_err("invalid environment");
+        assert!(err
+            .to_string()
+            .contains("packaged_python_environment_invalid"));
+    }
+
+    #[test]
     fn prepare_operator_bridge_launch_configures_preflight_command_environment() {
         let temp = TempDir::new().expect("tempdir");
         let manifest_dir = temp
@@ -6431,6 +6974,15 @@ mod tests {
         let resource_root = exe_dir.join("resources");
         let python_dir = resource_root.join("python");
         std::fs::create_dir_all(&python_dir).expect("create python dir");
+        let runtime_root = resource_root.join("python-runtime");
+        let interpreter = if cfg!(windows) {
+            runtime_root.join("python.exe")
+        } else {
+            runtime_root.join("bin").join("python3")
+        };
+        std::fs::create_dir_all(interpreter.parent().expect("interpreter parent"))
+            .expect("create runtime dir");
+        std::fs::write(&interpreter, "").expect("write interpreter");
         std::fs::create_dir_all(resource_root.join("utils")).expect("create import utils dir");
         std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
         std::fs::create_dir_all(&exe_dir).expect("create exe dir");
@@ -6439,20 +6991,16 @@ mod tests {
         let exe_path = exe_dir.join("token.place");
         std::fs::write(&exe_path, "").expect("write exe");
         let launcher = PythonLauncher {
-            program: "python3".into(),
+            program: interpreter.to_string_lossy().into_owned(),
             args: Vec::new(),
             source: PythonLauncherSource::BundledRuntime,
             runtime_id: "test-runtime".into(),
-        };
-        let context = BridgeResourceContext {
-            exe_path: Some(&exe_path),
-            manifest_dir: &manifest_dir,
-            tauri_resource_dir: Some(&resource_root),
         };
         let preparation = OperatorBridgeLaunchPreparation {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(launcher),
             resource_root: resource_root.clone(),
+            runtime_root: Some(runtime_root.clone()),
             import_root: resource_root.clone(),
             layout: ResourceLayoutKind::WindowsResources,
         };
@@ -6481,13 +7029,13 @@ mod tests {
         assert!(std_command_env_value(&command, "PYTHONPATH").is_some());
 
         let mut effective = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
-        configure_runtime_pythonpath(
+        configure_packaged_python_subprocess_env_for_layout(
             &mut effective,
-            &manifest_dir,
-            &bridge_script,
-            context.exe_path,
-            context.tauri_resource_dir,
-        );
+            &resource_root,
+            ResourceLayoutKind::WindowsResources,
+            &runtime_root,
+        )
+        .expect("configure packaged Python environment");
         assert!(effective.clear_env_called);
         for key in [
             "PYTHONHOME",
@@ -6513,6 +7061,58 @@ mod tests {
             Some(resource_root.as_os_str())
         );
         assert!(effective.value("PYTHONPATH").is_some());
+        let path_entries = std::env::split_paths(
+            effective
+                .value("PATH")
+                .expect("sanitizer must construct a deterministic PATH"),
+        )
+        .collect::<Vec<_>>();
+        let runtime_path = resource_root
+            .join("python-runtime")
+            .canonicalize()
+            .expect("canonical runtime root");
+        #[cfg(target_os = "windows")]
+        let expected_path_entries = vec![
+            runtime_path,
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+                .canonicalize()
+                .expect("canonical SystemRoot")
+                .join("System32")
+                .canonicalize()
+                .expect("canonical System32"),
+        ];
+        #[cfg(not(target_os = "windows"))]
+        let expected_path_entries = vec![runtime_path];
+        assert_eq!(path_entries, expected_path_entries);
+        assert!(!path_entries
+            .iter()
+            .any(|entry| entry.to_string_lossy().contains("poison")));
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                effective.value("PROCESSOR_ARCHITECTURE"),
+                Some(std::ffi::OsStr::new("AMD64"))
+            );
+            assert_eq!(
+                effective.value("TOKEN_PLACE_PACKAGED_ARCH"),
+                Some(std::ffi::OsStr::new("x86_64"))
+            );
+            assert_eq!(
+                effective.value("TOKEN_PLACE_PACKAGED_ARCH_SOURCE"),
+                Some(std::ffi::OsStr::new("attested_windows_x86_64"))
+            );
+            assert_eq!(effective.value("PROCESSOR_ARCHITEW6432"), None);
+        }
+        #[cfg(not(target_os = "windows"))]
+        for key in [
+            "PROCESSOR_ARCHITECTURE",
+            "PROCESSOR_ARCHITEW6432",
+            "TOKEN_PLACE_PACKAGED_ARCH",
+            "TOKEN_PLACE_PACKAGED_ARCH_SOURCE",
+        ] {
+            assert_eq!(effective.value(key), None, "{key} must not reach the child");
+        }
         assert!(effective.effective_env.keys().all(|key| {
             matches!(
                 key.to_str(),
@@ -6529,31 +7129,58 @@ mod tests {
                         | "PYTHONDONTWRITEBYTECODE"
                         | "TOKEN_PLACE_PYTHON_IMPORT_ROOT"
                         | "PYTHONPATH"
+                        | "PATH"
                 )
-            )
+            ) || (cfg!(target_os = "windows")
+                && matches!(
+                    key.to_str(),
+                    Some(
+                        "PROCESSOR_ARCHITECTURE"
+                            | "TOKEN_PLACE_PACKAGED_ARCH"
+                            | "TOKEN_PLACE_PACKAGED_ARCH_SOURCE"
+                    )
+                ))
         }));
     }
 
     #[test]
-    fn installed_context_probe_uses_prepared_import_root_under_poisoned_override() {
+    fn up_up_layout_keeps_launcher_runtime_root_for_model_and_sidecar() {
         let _env_guard = crate::python_runtime::RUNTIME_BOOTSTRAP_ENV_TEST_LOCK
             .lock()
             .expect("runtime bootstrap env test lock");
         let temp = TempDir::new().expect("tempdir");
-        let import_root = temp.path().join("prepared-resources");
+        let resource_root = temp.path().join("prepared-resources");
+        let import_root = resource_root.join("_up_").join("_up_");
         let poisoned_root = temp.path().join("poisoned-resources");
         std::fs::create_dir_all(import_root.join("python")).expect("create import root");
+        let runtime_root = resource_root.join("python-runtime");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(import_root.join("python-runtime"))
+            .expect("create decoy runtime root");
         let bridge_script = import_root.join("python").join("compute_node_bridge.py");
         std::fs::write(&bridge_script, "# compute bridge\n").expect("write bridge script");
+        std::fs::write(
+            import_root.join("python").join("model_bridge.py"),
+            "# model bridge\n",
+        )
+        .expect("write model bridge script");
+        let program = if cfg!(windows) {
+            runtime_root.join("python.exe")
+        } else {
+            runtime_root.join("bin/python3")
+        };
+        std::fs::create_dir_all(program.parent().unwrap()).expect("runtime binary parent");
+        std::fs::write(&program, "").expect("runtime binary");
         let preparation = OperatorBridgeLaunchPreparation {
             bridge_script: bridge_script.to_string_lossy().into_owned(),
             launcher: Some(PythonLauncher {
-                program: "python3".into(),
+                program: program.to_string_lossy().into_owned(),
                 args: Vec::new(),
                 source: PythonLauncherSource::BundledRuntime,
                 runtime_id: "test-runtime".into(),
             }),
-            resource_root: import_root.clone(),
+            resource_root: resource_root.clone(),
+            runtime_root: Some(runtime_root.clone()),
             import_root: import_root.clone(),
             layout: ResourceLayoutKind::WindowsResources,
         };
@@ -6590,6 +7217,52 @@ mod tests {
                 .flatten(),
             Some(expected_pythonpath.as_os_str())
         );
+        let mut expected_trusted = vec![runtime_root.canonicalize().unwrap()];
+        if cfg!(windows) {
+            // The packaged sanitizer attests architecture on Windows and appends a
+            // validated SystemRoot\System32 entry; mirror that here instead of only
+            // asserting the runtime root, which is what a non-Windows compile target
+            // would trust in isolation.
+            let system_root = std::env::var_os("SystemRoot")
+                .map(std::path::PathBuf::from)
+                .expect("SystemRoot is set on Windows test runners")
+                .canonicalize()
+                .expect("SystemRoot canonicalizes");
+            let system32 = system_root
+                .join("System32")
+                .canonicalize()
+                .expect("System32 exists under SystemRoot");
+            expected_trusted.push(system32);
+        }
+        let expected_path = std::env::join_paths(expected_trusted).expect("trusted runtime path");
+        let async_command = preparation.command().expect("async bridge command");
+        assert_eq!(
+            command_env_value(&async_command, "PATH").as_deref(),
+            expected_path.to_str()
+        );
+        for command in [
+            preparation.blocking_command().expect("blocking command"),
+            preparation
+                .model_inspect_command()
+                .expect("model inspect command"),
+            crate::sidecar::build_sidecar_command(
+                import_root
+                    .join("python/inference_sidecar.py")
+                    .to_string_lossy()
+                    .as_ref(),
+                preparation.launcher.clone(),
+            )
+            .expect("sidecar command")
+            .into_std(),
+        ] {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find_map(|(key, value)| (key == "PATH").then_some(value))
+                    .flatten(),
+                Some(expected_path.as_os_str())
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -6603,6 +7276,11 @@ mod tests {
             .expect("write bridge");
         std::fs::write(python_dir.join("model_bridge.py"), "# model bridge\n")
             .expect("write model bridge");
+        // resolve_packaged_runtime_import_root() requires both of these import
+        // sentinels alongside the bridge scripts; a fixture missing either one
+        // is not actually a coherent packaged layout.
+        std::fs::create_dir_all(root.join("utils")).expect("create utils directory");
+        std::fs::write(root.join("config.py"), "# config\n").expect("write config.py");
         let machine = if cfg!(target_arch = "aarch64") {
             "arm64"
         } else {
@@ -6641,9 +7319,13 @@ mod tests {
         };
 
         let preparation = prepare_operator_bridge_launch(&context).expect("coherent preparation");
-        assert_eq!(preparation.resource_root, root.canonicalize().unwrap());
-        assert!(Path::new(&preparation.bridge_script).starts_with(&root));
-        assert!(Path::new(&preparation.launcher.unwrap().program).starts_with(&root));
+        // Compare against the canonicalized root, not the raw TempDir path: on macOS
+        // `/var` is itself a symlink to `/private/var`, so a TempDir path and its
+        // canonicalized equivalent are textually different prefixes for the same file.
+        let canonical_root = root.canonicalize().unwrap();
+        assert_eq!(preparation.resource_root, canonical_root);
+        assert!(Path::new(&preparation.bridge_script).starts_with(&canonical_root));
+        assert!(Path::new(&preparation.launcher.unwrap().program).starts_with(&canonical_root));
         assert_eq!(preparation.import_root, preparation.resource_root);
     }
 

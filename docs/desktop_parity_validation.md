@@ -107,18 +107,17 @@ gh workflow run desktop-macos-smoke.yml
 ```powershell
 # Windows PowerShell on real Windows 11 NVIDIA hardware.
 python desktop-tauri/scripts/verify_desktop_runtime.py --mode auto --model C:\path\to\model.gguf
-python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --mode gpu --context-tier 64k-full --model "$env:APPDATA\token.place\models\Qwen3-8B-Q4_K_M.gguf"
+python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --installer C:\path\to\token-place-setup.exe --mode gpu --context-tier 64k-full --model "$env:APPDATA\token.place\models\Qwen3-8B-Q4_K_M.gguf"
 ```
 
-The smoke helper must observe the safe local phase sequence: `dependency_check`,
-optional `dependency_install`/`lock_wait`, `runtime_probe`, optional
-`runtime_install` or `cuda_build`, `runtime_verification`, optional `reexec`,
-`model_preflight`, `warm_load`, then ready/registered. Long phases should produce
-5-second heartbeats. A fast path may skip build/reexec phases; a repair path should
-include them. Public bridge/status payloads keep absolute module paths private and
-use safe origin indicators such as `llama_repo_stub_imported=false`; the helper
-performs runtime-origin validation internally. Fake-CUDA CI validates contracts only
-and is not evidence of a successful real Windows 11 NVIDIA packaged run.
+The RTX gate verifies the canonical model identity, installs the NSIS artifact once,
+and drives its Tauri executable through the UI. Rust-managed status must prove the
+bundled runtime, a concrete physical NVIDIA device, CUDA selection/use, positive
+offload, non-CPU KV cache, and warm load. Pass also requires a non-empty decrypted,
+non-mock API-v1 response followed by UI Stop, relay diagnostics at zero, ordered
+unregister success, and a natural bridge exit. `physical_device_missing`, fake or
+pending fields, CPU fallback, repo shims, direct bridge cancellation, or incomplete
+cleanup fail the hardware gate.
 
 ```bash
 # macOS shell on Metal-capable hardware.

@@ -662,6 +662,33 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r config/requirements_codex_verification.txt
+          pip install selenium
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tauri-driver
+        run: cargo install tauri-driver
+
+      - name: Verify native WebDriver prerequisites
+        shell: pwsh
+        run: |
+          $tauriDriver = Get-Command tauri-driver -ErrorAction SilentlyContinue
+          if (-not $tauriDriver) { throw 'tauri-driver was not found on PATH after installation.' }
+          $edgeDriver = Get-Command msedgedriver -ErrorAction SilentlyContinue
+          if (-not $edgeDriver) { throw "msedgedriver was not found on PATH; install the Microsoft Edge WebDriver matching this runner's WebView2 Runtime version." }
+          & $edgeDriver.Source --version
+
       - name: Download Windows release artifacts
         uses: actions/download-artifact@v5
         with:
@@ -674,8 +701,8 @@ jobs:
         run: |
           $setup = Get-ChildItem release-assets/windows -Filter '*-setup.exe' | Sort-Object Name | Select-Object -First 1
           if (-not $setup) { throw 'Windows NSIS setup artifact was not downloaded.' }
-          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --mode gpu --context-tier 8k-fast
-          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --mode gpu --context-tier 64k-full
+          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --model $env:TOKEN_PLACE_WINDOWS_NVIDIA_SMOKE_MODEL --mode gpu --context-tier 8k-fast
+          python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --artifact-root release-assets/windows --installer $setup.FullName --model $env:TOKEN_PLACE_WINDOWS_NVIDIA_SMOKE_MODEL --mode gpu --context-tier 64k-full
 
   publish:
     name: Publish GitHub Release

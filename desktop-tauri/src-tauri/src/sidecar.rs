@@ -84,7 +84,7 @@ async fn drain_sidecar_stderr<R: tokio::io::AsyncRead + Unpin>(
     Ok(())
 }
 
-fn build_sidecar_command(
+pub(crate) fn build_sidecar_command(
     sidecar_path: &str,
     launcher: Option<PythonLauncher>,
 ) -> anyhow::Result<Command> {
@@ -92,7 +92,9 @@ fn build_sidecar_command(
         let launcher = launcher.ok_or_else(|| {
             anyhow::anyhow!("missing resolved Python launcher for sidecar script")
         })?;
-        return Ok(launcher.command_for_script(sidecar_path));
+        return launcher
+            .command_for_script(sidecar_path)
+            .map_err(anyhow::Error::from);
     }
 
     Ok(Command::new(sidecar_path))
@@ -398,7 +400,12 @@ mod runtime_bootstrap_tests {
         let mut command = Command::new("python");
         configure_runtime_bootstrap_env(&mut command, &ComputeMode::Auto);
 
-        let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        // Mirrors should_enable_runtime_bootstrap_for in python_runtime.rs: bootstrap
+        // is enabled for GPU-requesting modes on Windows x86_64 (CUDA) and on macOS,
+        // any arch (Metal) -- not just Windows, which this expectation omitted.
+        let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64"))
+            || cfg!(target_os = "macos")
+        {
             Some("1")
         } else {
             None

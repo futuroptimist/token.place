@@ -1291,6 +1291,35 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain('contains spaces');
   });
 
+  it('renders operator session ID, sequence, and GPU offload/KV-cache readiness diagnostics', async () => {
+    render(<App />);
+    await screen.findByText('Start operator');
+
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('pending');
+    expect(screen.getByText(/Sequence:/).textContent).toContain('pending');
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        relay_runtime_state: 'ready',
+        offloaded_layers: 40,
+        kv_cache_device: 'cuda',
+        operator_session_id: 'session-current',
+        sequence: 3,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText(/Operator session ID:/).textContent).toContain('session-current')
+    );
+    expect(screen.getByText(/Sequence:/).textContent).toContain('3');
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain('offloaded_layers=40');
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain('kv_cache_device=cuda');
+  });
+
   it('clears readiness diagnostics on diagnostic-free status and error events', async () => {
     render(<App />);
     await screen.findByText('Start operator');

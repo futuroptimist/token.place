@@ -7317,9 +7317,13 @@ mod tests {
         };
 
         let preparation = prepare_operator_bridge_launch(&context).expect("coherent preparation");
-        assert_eq!(preparation.resource_root, root.canonicalize().unwrap());
-        assert!(Path::new(&preparation.bridge_script).starts_with(&root));
-        assert!(Path::new(&preparation.launcher.unwrap().program).starts_with(&root));
+        // Compare against the canonicalized root, not the raw TempDir path: on macOS
+        // `/var` is itself a symlink to `/private/var`, so a TempDir path and its
+        // canonicalized equivalent are textually different prefixes for the same file.
+        let canonical_root = root.canonicalize().unwrap();
+        assert_eq!(preparation.resource_root, canonical_root);
+        assert!(Path::new(&preparation.bridge_script).starts_with(&canonical_root));
+        assert!(Path::new(&preparation.launcher.unwrap().program).starts_with(&canonical_root));
         assert_eq!(preparation.import_root, preparation.resource_root);
     }
 

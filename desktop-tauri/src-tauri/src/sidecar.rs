@@ -400,7 +400,12 @@ mod runtime_bootstrap_tests {
         let mut command = Command::new("python");
         configure_runtime_bootstrap_env(&mut command, &ComputeMode::Auto);
 
-        let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        // Mirrors should_enable_runtime_bootstrap_for in python_runtime.rs: bootstrap
+        // is enabled for GPU-requesting modes on Windows x86_64 (CUDA) and on macOS,
+        // any arch (Metal) -- not just Windows, which this expectation omitted.
+        let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64"))
+            || cfg!(target_os = "macos")
+        {
             Some("1")
         } else {
             None

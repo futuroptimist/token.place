@@ -3345,6 +3345,345 @@ def test_subprocess_llama_proxy_streams_chunks_without_json_serializing_iterator
     assert created[0].stdin.writes[2]['kwargs']['stream'] is True
 
 
+class _SynchronousFakeThread:
+    """threading.Thread stand-in that runs its target immediately, in-line.
+
+    Lets tests drive `_start_stdout_demultiplexer`'s reader loop
+    deterministically against a crafted, finite stdout iterator instead of
+    racing a real background thread.
+    """
+
+    def __init__(self, target=None, name=None, daemon=None):
+        self._target = target
+
+    def start(self):
+        if self._target is not None:
+            self._target()
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        return None
+
+
+def _bare_subprocess_proxy(stdout_lines):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._legacy_frames = queue.Queue(maxsize=32)
+    proxy._unclaimed_frames = queue.Queue(maxsize=32)
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._progress_sequence = 0
+    proxy._closed = False
+    proxy._process = SimpleNamespace(stdout=iter(stdout_lines), _token_place_stdout_tail=[])
+    proxy._stdout_reader_thread = None
+    return proxy
+
+
+def test_demux_reader_stdout_none_fails_all_pending(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    proxy = _bare_subprocess_proxy([])
+    proxy._process = SimpleNamespace(stdout=None)
+    pending_queue = queue.Queue()
+    proxy._pending = {'c1': pending_queue}
+
+    proxy._start_stdout_demultiplexer()
+
+    message = pending_queue.get_nowait()
+    assert isinstance(message, model_manager_module.LlamaCppWorkerEOFError)
+
+
+def test_demux_reader_routes_and_recovers_from_malformed_frames(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    observer_events = []
+
+    def _observer(event):
+        observer_events.append(event)
+
+    stdout_lines = [
+        'plain non-prefixed line\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:not-json\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps([1, 2, 3]) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'legacy': True}) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'protocol_version': 2, 'command_id': 123}) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'unknown-cmd', 'status': 'ok'}
+        ) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({
+            'protocol_version': 2, 'command_id': 'c1', 'type': 'inference_progress',
+            'phase': 'prefill', 'total_prompt_tokens': 10, 'cached_prompt_tokens': 0,
+            'processed_prompt_tokens': 5, 'generated_tokens': 0, 'elapsed_ms': 12,
+        }) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n',
+        # Duplicate terminal frame for an already-completed command_id is dropped.
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n',
+    ]
+
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    target_queue = queue.Queue()
+    proxy._pending = {'c1': target_queue}
+    proxy._progress_observer = _observer
+    proxy._progress_request_id = 'req-1'
+    proxy._progress_worker_generation = 3
+
+    proxy._start_stdout_demultiplexer()
+
+    assert proxy._process._token_place_stdout_tail == ['plain non-prefixed line\n']
+    assert proxy._legacy_frames.get_nowait() == {'status': 'ok', 'legacy': True}
+    assert proxy._unclaimed_frames.get_nowait()['command_id'] == 123
+    assert proxy._unclaimed_frames.get_nowait()['command_id'] == 'unknown-cmd'
+
+    assert len(observer_events) == 1
+    event = observer_events[0]
+    assert event['phase'] == 'prefill'
+    assert event['request_id'] == 'req-1'
+    assert event['worker_generation'] == 3
+    assert event['sequence'] == 1
+
+    delivered = target_queue.get_nowait()
+    assert delivered['done'] is True
+    assert target_queue.empty()
+
+    # One legacy frame was left undrained above, so the EOF handler must
+    # preserve pending state rather than closing the worker out from under it.
+    assert proxy._closed is False
+
+
+def test_demux_reader_progress_observer_exception_is_swallowed(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    def _raising_observer(_event):
+        raise RuntimeError('observer boom')
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({
+            'protocol_version': 2, 'command_id': 'c1', 'type': 'inference_progress',
+            'phase': 'prefill',
+        }) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    proxy._pending = {'c1': queue.Queue()}
+    proxy._progress_observer = _raising_observer
+
+    # Must not raise, even though the observer itself blows up.
+    proxy._start_stdout_demultiplexer()
+
+
+def test_demux_reader_drops_legacy_frame_when_queue_full(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'seq': 1}) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'seq': 2}) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    proxy._legacy_frames = queue.Queue(maxsize=1)
+
+    proxy._start_stdout_demultiplexer()
+
+    assert proxy._legacy_frames.get_nowait() == {'status': 'ok', 'seq': 1}
+    assert proxy._legacy_frames.empty()
+
+
+def test_demux_reader_drops_non_str_command_id_frame_when_unclaimed_full(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'protocol_version': 2, 'command_id': 1}) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'protocol_version': 2, 'command_id': 2}) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    proxy._unclaimed_frames = queue.Queue(maxsize=1)
+
+    proxy._start_stdout_demultiplexer()
+
+    assert proxy._unclaimed_frames.get_nowait()['command_id'] == 1
+    assert proxy._unclaimed_frames.empty()
+
+
+def test_demux_reader_drops_unregistered_command_frame_when_unclaimed_full(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'unregistered-a'}
+        ) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'unregistered-b'}
+        ) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    proxy._unclaimed_frames = queue.Queue(maxsize=1)
+
+    proxy._start_stdout_demultiplexer()
+
+    assert proxy._unclaimed_frames.get_nowait()['command_id'] == 'unregistered-a'
+    assert proxy._unclaimed_frames.empty()
+
+
+def test_demux_reader_drops_target_frame_when_pending_queue_full(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'chunk': 1, 'done': False}
+        ) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'chunk': 2, 'done': False}
+        ) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    target_queue = queue.Queue(maxsize=1)
+    proxy._pending = {'c1': target_queue}
+
+    proxy._start_stdout_demultiplexer()
+
+    assert target_queue.get_nowait()['chunk'] == 1
+    assert target_queue.empty()
+
+
+def test_fail_pending_swallows_queue_full():
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._pending_lock = model_manager_module.Lock()
+    full_queue = queue.Queue(maxsize=1)
+    full_queue.put_nowait('already occupied')
+    proxy._pending = {'c1': full_queue}
+
+    # Must not raise even though the only pending queue is already full.
+    proxy._fail_pending(model_manager_module.LlamaCppWorkerEOFError('eof'))
+
+    assert full_queue.get_nowait() == 'already occupied'
+
+
+def test_set_progress_observer_and_context_store_values():
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+
+    def _observer(_event):
+        return None
+
+    proxy.set_progress_observer(_observer)
+    assert proxy._progress_observer is _observer
+
+    proxy.set_progress_context(request_id='abc', worker_generation=5)
+    assert proxy._progress_request_id == 'abc'
+    assert proxy._progress_worker_generation == 5
+    assert proxy._progress_sequence == 0
+
+
+def test_read_llama_subprocess_message_demux_aware_timeout():
+    from utils.llm import model_manager as model_manager_module
+
+    process = SimpleNamespace(
+        _token_place_unclaimed_frames=queue.Queue(),
+        _token_place_legacy_frames=queue.Queue(),
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        model_manager_module._read_llama_subprocess_message(
+            process, timeout_seconds=0.01, stage='llama_cpp_test'
+        )
+
+
+def test_subprocess_proxy_uses_windows_process_group_creationflags(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeStdin:
+        def write(self, _data):
+            return None
+
+        def flush(self):
+            return None
+
+    class FakeStdout:
+        def __init__(self):
+            self._lines = iter([
+                'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+                    {'status': 'ok', 'module_path': '/runtime/llama_cpp/__init__.py'}
+                ) + '\n',
+                'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+                    {'status': 'ok', 'module_path': '/runtime/llama_cpp/__init__.py', 'child_model_path_exists': True}
+                ) + '\n',
+            ])
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._lines)
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = None
+
+        def poll(self):
+            return None
+
+    captured_kwargs = {}
+
+    def _fake_popen(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return FakeProcess(*args, **kwargs)
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
+    monkeypatch.setattr(model_manager_module.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200, raising=False)
+
+    class _WindowsNameOS:
+        """Delegates to the real `os` module except for `.name`.
+
+        Swapping model_manager's own `os` reference (rather than the global
+        `os.name`) means pathlib's internal WindowsPath/PosixPath dispatch —
+        which imports `os` itself — is unaffected, so Path.cwd() calls
+        elsewhere in the constructor (sys.path probing) still work normally
+        on this POSIX test runner.
+        """
+
+        def __getattr__(self, item):
+            return getattr(os, item)
+
+        @property
+        def name(self):
+            return 'nt'
+
+    monkeypatch.setattr(model_manager_module, 'os', _WindowsNameOS())
+
+    model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
+
+    assert captured_kwargs.get('creationflags') == 0x00000200
+    assert 'start_new_session' not in captured_kwargs
+
+
 def test_subprocess_llama_proxy_inference_does_not_use_runtime_stage_timeout(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -3826,6 +4165,66 @@ def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monk
     assert 'buffer allocation failed' in exc_info.value.child_stderr_tail
     assert created[0].wait_timeouts and 0 <= created[0].wait_timeouts[0] <= 0.5
     assert FakeThread.joins and 0 <= FakeThread.joins[-1] <= 0.5
+
+
+def test_proxy_swallows_wait_failure_while_refining_generic_context_create_error(monkeypatch, tmp_path):
+    from io import StringIO
+
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeStdin:
+        def write(self, _data):
+            return None
+
+        def flush(self):
+            return None
+
+    class FakeThread:
+        def __init__(self, target=None, name=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = StringIO(
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","module_path":"/runtime/llama_cpp/__init__.py"}\n'
+                'TOKEN_PLACE_LLAMA_CPP_JSON:'
+                '{"status":"error","error":"Failed to create llama_context",'
+                '"exception_type":"RuntimeError","safe_error_category":"runtime_context_create_failed"}\n'
+            )
+            self.stderr = StringIO('')
+            self.returncode = 1
+            self._token_place_stderr_tail = []
+
+        def wait(self, timeout=None):
+            # Some platforms raise here (e.g. the process already reaped);
+            # this must not prevent the generic-error refinement from
+            # completing and surfacing the underlying init error.
+            raise OSError('wait unavailable')
+
+        def poll(self):
+            return self.returncode
+
+    def fake_popen(*args, **kwargs):
+        return FakeProcess(*args, **kwargs)
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', FakeThread)
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeInitError) as exc_info:
+        model_manager_module._SubprocessLlamaProxy(model_path=str(tmp_path / 'secret-model.gguf'), timeout_seconds=1)
+
+    assert exc_info.value.safe_error_category == 'runtime_context_create_failed'
 
 
 def test_bounded_stderr_drain_joins_reader_when_process_wait_raises():
@@ -8619,6 +9018,43 @@ def test_subprocess_proxy_demux_stream_eof_cleans_pending(monkeypatch):
     assert proxy._closed is True
     assert proxy._pending == {}
     assert proxy._completed_commands == set()
+
+
+def test_subprocess_proxy_stream_starts_demux_reader_when_not_already_running(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'status': 'ok', 'chunk': {'content': 'hi'}, 'done': False}
+        ) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'done': True}) + '\n',
+    ]
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue(maxsize=32)
+    proxy._unclaimed_frames = queue.Queue(maxsize=32)
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._progress_sequence = 0
+    proxy._process = SimpleNamespace(stdout=iter(stdout_lines), _token_place_stdout_tail=[])
+    # The reader is not started yet: this is the first command on this proxy.
+    proxy._stdout_reader_thread = None
+    proxy._send = MagicMock()
+
+    chunks = list(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert chunks == [{'content': 'hi'}]
+    assert proxy._stdout_reader_thread is not None
+    assert proxy._pending == {}
 
 
 def test_subprocess_proxy_ignores_unlink_failure_when_popen_fails(monkeypatch):

@@ -7215,8 +7215,24 @@ mod tests {
                 .flatten(),
             Some(expected_pythonpath.as_os_str())
         );
-        let expected_path = std::env::join_paths([runtime_root.canonicalize().unwrap()])
-            .expect("trusted runtime path");
+        let mut expected_trusted = vec![runtime_root.canonicalize().unwrap()];
+        if cfg!(windows) {
+            // The packaged sanitizer attests architecture on Windows and appends a
+            // validated SystemRoot\System32 entry; mirror that here instead of only
+            // asserting the runtime root, which is what a non-Windows compile target
+            // would trust in isolation.
+            let system_root = std::env::var_os("SystemRoot")
+                .map(std::path::PathBuf::from)
+                .expect("SystemRoot is set on Windows test runners")
+                .canonicalize()
+                .expect("SystemRoot canonicalizes");
+            let system32 = system_root
+                .join("System32")
+                .canonicalize()
+                .expect("System32 exists under SystemRoot");
+            expected_trusted.push(system32);
+        }
+        let expected_path = std::env::join_paths(expected_trusted).expect("trusted runtime path");
         let async_command = preparation.command().expect("async bridge command");
         assert_eq!(
             command_env_value(&async_command, "PATH").as_deref(),

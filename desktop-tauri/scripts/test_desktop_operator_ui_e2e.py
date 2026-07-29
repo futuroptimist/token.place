@@ -597,25 +597,47 @@ def assert_packaged_windows_nvidia_status(
         "Worker state": "ready",
         "Worker alive": "yes",
         "Fallback reason": "none",
+        # Launcher source's real value is "bundled" (PythonLauncherSource::BundledRuntime
+        # in compute_node.rs); this proves the active launcher is the installed
+        # package's own runtime, not an environment override or dev interpreter.
+        "Launcher source": "bundled",
     }
     observed = {label: _status_value(driver, label).lower() for label in expected}
     for label, value in expected.items():
         if observed[label] != value:
             raise AssertionError(f"hardware status {label}={observed[label]!r}, expected {value!r}")
-    for label in ("Runtime ID", "Launcher source", "Interpreter"):
-        value = _status_value(driver, label).lower()
-        if value in {"", "pending", "unknown"}:
-            raise AssertionError(f"hardware status {label} was not concrete")
     if _status_value(driver, "Interpreter").lower() != "python.exe":
         raise AssertionError("hardware gate did not use the bundled Windows interpreter")
+    # Registered only becomes "yes..." once the relay round-trip actually succeeds,
+    # which requires relay_runtime_state to have reached ready/processing; there is
+    # no separate "Relay runtime state" UI field to read directly.
+    registered = _status_value(driver, "Registered").lower()
+    if not registered.startswith("yes"):
+        raise AssertionError(f"hardware status relay registration was not ready: {registered!r}")
+
+    runtime_id = _status_value(driver, "Runtime ID")
+    bundled_runtime_id = _status_value(driver, "Bundled runtime ID")
+    if not bundled_runtime_id or bundled_runtime_id.lower() in {"", "pending", "unknown"}:
+        raise AssertionError("hardware status bundled runtime ID was not concrete")
+    if runtime_id != bundled_runtime_id:
+        raise AssertionError(
+            f"hardware status active runtime {runtime_id!r} does not match "
+            f"the installed bundled runtime {bundled_runtime_id!r}"
+        )
 
     diagnostics = _readiness_diagnostics_map(driver)
     offloaded_layers = diagnostics.get("offloaded_layers", "")
-    if not offloaded_layers.lstrip("-").isdigit() or int(offloaded_layers) <= 0:
-        raise AssertionError(f"hardware status reports non-positive GPU offload: {offloaded_layers!r}")
+    # Explicit GPU mode requests n_gpu_layers=-1 (ModelManager._resolve_compute_plan),
+    # which ModelManager surfaces as the literal sentinel "all_supported_layers" rather
+    # than a layer count; a real positive count is also accepted for hybrid-style
+    # partial offload. Zero, negative, unknown, and arbitrary strings are rejected.
+    is_full_offload_sentinel = offloaded_layers == "all_supported_layers"
+    is_positive_layer_count = offloaded_layers.lstrip("-").isdigit() and int(offloaded_layers) > 0
+    if not (is_full_offload_sentinel or is_positive_layer_count):
+        raise AssertionError(f"hardware status reports non-positive or unrecognized GPU offload: {offloaded_layers!r}")
     kv_cache_device = diagnostics.get("kv_cache_device", "")
-    if kv_cache_device in ("", "cpu", "unknown", "none"):
-        raise AssertionError(f"hardware status reports KV cache is not offloaded to GPU: {kv_cache_device!r}")
+    if kv_cache_device != "cuda":
+        raise AssertionError(f"hardware status reports KV cache device is not CUDA: {kv_cache_device!r}")
 
 
 def main(argv: list[str] | None = None) -> int:

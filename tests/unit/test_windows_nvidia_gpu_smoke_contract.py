@@ -332,8 +332,9 @@ def test_ui_hardware_mode_is_fail_closed_and_uses_rust_lifecycle():
         "CryptoClient",
         "Operator session ID",
         "did not advance for this operator start",
-        "non-positive GPU offload",
-        "not offloaded to GPU",
+        "all_supported_layers",
+        "non-positive or unrecognized GPU offload",
+        "KV cache device is not CUDA",
         "wait_for_operator_log_stop_markers",
         "desktop.compute_node_bridge.unregister.succeeded",
         "desktop.compute_node.bridge_process_exited",
@@ -372,8 +373,15 @@ def _valid_status_driver(
     session_id="session-current",
     sequence="3",
     fallback_reason="none",
-    offloaded_layers="40",
+    # Explicit GPU mode requests n_gpu_layers=-1, which ModelManager surfaces as this
+    # exact sentinel (utils/llm/model_manager.py::_resolve_compute_plan), not a layer
+    # count -- this is what production actually emits, not invented numeric evidence.
+    offloaded_layers="all_supported_layers",
     kv_cache_device="cuda",
+    runtime_id="bundled-cpython-3.11-win-x86_64-cu124",
+    bundled_runtime_id="bundled-cpython-3.11-win-x86_64-cu124",
+    launcher_source="bundled",
+    registered="yes",
 ):
     return _Driver(
         {
@@ -385,9 +393,11 @@ def _valid_status_driver(
             "Worker state": "ready",
             "Worker alive": "yes",
             "Fallback reason": fallback_reason,
-            "Runtime ID": "bundled-cpython-3.11-win-x86_64-cu124",
-            "Launcher source": "bundled_runtime",
+            "Runtime ID": runtime_id,
+            "Bundled runtime ID": bundled_runtime_id,
+            "Launcher source": launcher_source,
             "Interpreter": "python.exe",
+            "Registered": registered,
             "Operator session ID": session_id,
             "Sequence": sequence,
             "Readiness diagnostics": f"offloaded_layers={offloaded_layers} kv_cache_device={kv_cache_device}",
@@ -435,18 +445,65 @@ def test_hardware_status_rejects_fallback():
         validator(_valid_status_driver(fallback_reason="cpu"), "8k-fast", "session-previous")
 
 
-def test_hardware_status_rejects_non_positive_or_missing_gpu_offload():
+def test_hardware_status_accepts_full_offload_sentinel():
+    # This is what production actually emits for explicit GPU mode
+    # (n_gpu_layers=-1 -> "all_supported_layers"), not a layer count.
     validator = _load_assert_packaged_windows_nvidia_status()
-    for bad_offload in ("0", "-1", "unknown", ""):
-        with pytest.raises(AssertionError, match="non-positive GPU offload"):
+    validator(_valid_status_driver(offloaded_layers="all_supported_layers"), "8k-fast", "session-previous")
+
+
+def test_hardware_status_accepts_positive_numeric_gpu_offload():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    validator(_valid_status_driver(offloaded_layers="32"), "8k-fast", "session-previous")
+
+
+def test_hardware_status_rejects_non_positive_or_unrecognized_gpu_offload():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    for bad_offload in ("0", "-1", "unknown", "", "some_layers", "All_Supported_Layers"):
+        with pytest.raises(AssertionError, match="non-positive or unrecognized GPU offload"):
             validator(_valid_status_driver(offloaded_layers=bad_offload), "8k-fast", "session-previous")
 
 
-def test_hardware_status_rejects_cpu_or_unknown_kv_cache_device():
+def test_hardware_status_rejects_non_cuda_kv_cache_device():
     validator = _load_assert_packaged_windows_nvidia_status()
-    for bad_device in ("cpu", "unknown", "none", ""):
-        with pytest.raises(AssertionError, match="not offloaded to GPU"):
+    for bad_device in ("cpu", "unknown", "none", "", "partial"):
+        with pytest.raises(AssertionError, match="KV cache device is not CUDA"):
             validator(_valid_status_driver(kv_cache_device=bad_device), "8k-fast", "session-previous")
+
+
+def test_hardware_status_rejects_mismatched_or_placeholder_runtime_id():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    with pytest.raises(AssertionError, match="does not match"):
+        validator(
+            _valid_status_driver(runtime_id="bundled-cpython-3.11-win-x86_64-cu999"),
+            "8k-fast",
+            "session-previous",
+        )
+    for placeholder in ("", "pending", "unknown"):
+        with pytest.raises(AssertionError, match="bundled runtime ID was not concrete"):
+            validator(_valid_status_driver(bundled_runtime_id=placeholder), "8k-fast", "session-previous")
+
+
+def test_hardware_status_rejects_non_bundled_launcher_source():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    for bad_source in ("environment_override", "system_development", "bundled_runtime", ""):
+        with pytest.raises(AssertionError, match="Launcher source"):
+            validator(_valid_status_driver(launcher_source=bad_source), "8k-fast", "session-previous")
+
+
+def test_hardware_status_rejects_wrong_interpreter():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    driver = _valid_status_driver()
+    driver.values["Interpreter"] = "python3.exe"
+    with pytest.raises(AssertionError, match="bundled Windows interpreter"):
+        validator(driver, "8k-fast", "session-previous")
+
+
+def test_hardware_status_rejects_non_ready_relay_registration():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    for bad_registered in ("no", "pending", ""):
+        with pytest.raises(AssertionError, match="relay registration was not ready"):
+            validator(_valid_status_driver(registered=bad_registered), "8k-fast", "session-previous")
 
 
 def test_workflow_runs_both_installed_hardware_tiers_without_enabling_runner():

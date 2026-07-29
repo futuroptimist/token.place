@@ -560,10 +560,34 @@ def _status_value(driver: webdriver.Remote, label: str) -> str:
     ).text.strip()
 
 
+def _readiness_diagnostics_map(driver: webdriver.Remote) -> dict[str, str]:
+    text = _status_value(driver, "Readiness diagnostics")
+    return dict(item.split("=", 1) for item in text.split() if "=" in item)
+
+
 def assert_packaged_windows_nvidia_status(
-    driver: webdriver.Remote, context_tier: str
+    driver: webdriver.Remote, context_tier: str, pre_start_session_id: str
 ) -> None:
-    """Fail closed unless Rust-managed UI status proves a real CUDA worker."""
+    """Fail closed unless Rust-managed UI status proves the current session's real CUDA worker.
+
+    Every value comes from structured fields the Rust backend populates from the
+    real runtime/model-load diagnostics boundary (compute_node.rs's
+    ComputeNodeStatus and its readiness_diagnostics allowlist) -- never from
+    unscoped page-source or log-file substring matching, which cannot
+    distinguish current-session evidence from stale or fabricated text.
+    """
+    session_id = _status_value(driver, "Operator session ID")
+    if not session_id or session_id.lower() in {"pending", "unknown", "none"}:
+        raise AssertionError("hardware status is missing a concrete operator session ID")
+    if session_id == pre_start_session_id:
+        raise AssertionError(
+            "hardware status operator session ID did not advance for this operator start; "
+            "evidence may be from a prior session"
+        )
+    sequence_text = _status_value(driver, "Sequence")
+    if not sequence_text.isdigit() or int(sequence_text) < 1:
+        raise AssertionError(f"hardware status sequence is not a positive current-session value: {sequence_text!r}")
+
     expected = {
         "Requested mode": "gpu",
         "Backend available": "cuda",
@@ -572,6 +596,7 @@ def assert_packaged_windows_nvidia_status(
         "Context tier": context_tier,
         "Worker state": "ready",
         "Worker alive": "yes",
+        "Fallback reason": "none",
     }
     observed = {label: _status_value(driver, label).lower() for label in expected}
     for label, value in expected.items():
@@ -583,24 +608,14 @@ def assert_packaged_windows_nvidia_status(
             raise AssertionError(f"hardware status {label} was not concrete")
     if _status_value(driver, "Interpreter").lower() != "python.exe":
         raise AssertionError("hardware gate did not use the bundled Windows interpreter")
-    operator_log_path = Path(_status_value(driver, "Operator debug log"))
-    if not operator_log_path.is_file():
-        raise AssertionError("hardware operator debug log is unavailable")
-    evidence = (driver.page_source + operator_log_path.read_text(
-        encoding="utf-8", errors="replace"
-    )).lower()
-    required = ("warm load", "offloaded_layers", "kv_cache_device", "physical_device")
-    if any(marker not in evidence for marker in required):
-        raise AssertionError("hardware readiness evidence is incomplete")
-    forbidden = (
-        "physical_device_missing",
-        "repo_shim_imported=true",
-        "llama_repo_stub_imported=true",
-        "kv_cache_device=cpu",
-        "offloaded_layers=0",
-    )
-    if any(marker in evidence for marker in forbidden):
-        raise AssertionError("hardware readiness evidence reports fallback, fake, or missing device state")
+
+    diagnostics = _readiness_diagnostics_map(driver)
+    offloaded_layers = diagnostics.get("offloaded_layers", "")
+    if not offloaded_layers.lstrip("-").isdigit() or int(offloaded_layers) <= 0:
+        raise AssertionError(f"hardware status reports non-positive GPU offload: {offloaded_layers!r}")
+    kv_cache_device = diagnostics.get("kv_cache_device", "")
+    if kv_cache_device in ("", "cpu", "unknown", "none"):
+        raise AssertionError(f"hardware status reports KV cache is not offloaded to GPU: {kv_cache_device!r}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -740,6 +755,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         wait_for_start_operator_enabled(driver, relay_log, driver_log)
+        pre_start_session_id = _status_value(driver, "Operator session ID") if hardware_mode else ""
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
 
         wait_for_running_stability(driver, "yes", stable_seconds=3.0)
@@ -752,7 +768,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         wait.until(lambda d: d.find_element(By.XPATH, registered_ready_xpath))
         if hardware_mode:
-            assert_packaged_windows_nvidia_status(driver, args.context_tier)
+            assert_packaged_windows_nvidia_status(driver, args.context_tier, pre_start_session_id)
         wait_for_relay_diagnostics_count(relay_url, 1, timeout_seconds=5.0)
         operator_log = read_tail(relay_log) + read_tail(driver_log)
         assert "lease_seconds=120" in operator_log
@@ -851,13 +867,18 @@ def main(argv: list[str] | None = None) -> int:
             diagnostics_message(f"desktop UI e2e webdriver failure: {exc}", relay_log, driver_log, driver)
         ) from exc
     finally:
+        # A cleanup failure here must never replace/mask a primary test
+        # failure already propagating out of the try block above.
         if landing_driver is not None:
             with contextlib.suppress(Exception):
                 landing_driver.quit()
         if driver is not None:
-            driver.quit()
-        terminate_process(tauri_driver)
-        terminate_process(relay)
+            with contextlib.suppress(Exception):
+                driver.quit()
+        with contextlib.suppress(Exception):
+            terminate_process(tauri_driver)
+        with contextlib.suppress(Exception):
+            terminate_process(relay)
         shutil.rmtree(isolated_home, ignore_errors=True)
 
     return 0

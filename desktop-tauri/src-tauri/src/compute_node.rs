@@ -635,6 +635,8 @@ fn event_session_id(payload: &Value) -> Option<&str> {
 }
 
 const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
+    "offloaded_layers",
+    "kv_cache_device",
     "api_v1_readiness_result",
     "api_v1_readiness_error_code",
     "api_v1_readiness_error_reason",

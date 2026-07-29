@@ -175,6 +175,107 @@ def test_run_installed_hardware_gate_runs_uninstaller_when_present(monkeypatch, 
     assert calls[1] == [str((captured_root["root"] / "unins000.exe")), "/S"]
 
 
+def test_run_installed_hardware_gate_recognizes_uninstall_exe_naming(monkeypatch, tmp_path):
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"nsis")
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"model")
+    calls: list[list[str]] = []
+    captured_root: dict[str, Path] = {}
+
+    def fake_materialize(_installer, root):
+        captured_root["root"] = root
+        # Real NSIS packages commonly emit this exact name, not only unins*.exe.
+        (root / "uninstall.exe").write_bytes(b"uninstall")
+        return root / "token-place.exe"
+
+    monkeypatch.setattr(smoke, "validate_canonical_model", lambda path: path.resolve())
+    monkeypatch.setattr(smoke, "materialize_nsis", fake_materialize)
+    monkeypatch.setattr(
+        smoke.subprocess, "run", lambda command, **kwargs: calls.append([str(v) for v in command])
+    )
+
+    smoke.run_installed_hardware_gate(installer, model, "8k-fast")
+
+    assert len(calls) == 2
+    assert calls[1] == [str((captured_root["root"] / "uninstall.exe")), "/S"]
+
+
+def test_run_installed_hardware_gate_uninstalls_exactly_once_on_harness_failure(monkeypatch, tmp_path):
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"nsis")
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"model")
+    calls: list[list[str]] = []
+    captured_root: dict[str, Path] = {}
+
+    def fake_materialize(_installer, root):
+        captured_root["root"] = root
+        (root / "unins000.exe").write_bytes(b"uninstall")
+        return root / "token-place.exe"
+
+    def fake_run(command, **kwargs):
+        calls.append([str(v) for v in command])
+        if "test_desktop_operator_ui_e2e.py" in " ".join(str(v) for v in command):
+            raise smoke.subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(smoke, "validate_canonical_model", lambda path: path.resolve())
+    monkeypatch.setattr(smoke, "materialize_nsis", fake_materialize)
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+
+    with pytest.raises(smoke.subprocess.CalledProcessError):
+        smoke.run_installed_hardware_gate(installer, model, "8k-fast")
+
+    assert len(calls) == 2
+    assert calls[1] == [str((captured_root["root"] / "unins000.exe")), "/S"]
+
+
+def test_run_installed_hardware_gate_preserves_primary_exception_when_cleanup_also_fails(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"nsis")
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"model")
+
+    def fake_materialize(_installer, root):
+        (root / "unins000.exe").write_bytes(b"uninstall")
+        return root / "token-place.exe"
+
+    def fake_run(command, **kwargs):
+        joined = " ".join(str(v) for v in command)
+        if "test_desktop_operator_ui_e2e.py" in joined:
+            raise smoke.subprocess.CalledProcessError(1, command, output="hardware harness failed")
+        raise smoke.subprocess.CalledProcessError(1, command, output="uninstall also failed")
+
+    monkeypatch.setattr(smoke, "validate_canonical_model", lambda path: path.resolve())
+    monkeypatch.setattr(smoke, "materialize_nsis", fake_materialize)
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+
+    with pytest.raises(smoke.subprocess.CalledProcessError) as raised:
+        smoke.run_installed_hardware_gate(installer, model, "8k-fast")
+
+    assert raised.value.output == "hardware harness failed"
+
+
+def test_run_installed_hardware_gate_no_uninstaller_present_is_a_noop(monkeypatch, tmp_path):
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"nsis")
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"model")
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(smoke, "validate_canonical_model", lambda path: path.resolve())
+    monkeypatch.setattr(smoke, "materialize_nsis", lambda _installer, root: root / "token-place.exe")
+    monkeypatch.setattr(
+        smoke.subprocess, "run", lambda command, **kwargs: calls.append([str(v) for v in command])
+    )
+
+    smoke.run_installed_hardware_gate(installer, model, "8k-fast")
+
+    assert len(calls) == 1
+
+
 def test_main_success_prints_passed_json(monkeypatch, tmp_path, capsys):
     installer = tmp_path / "setup.exe"
     installer.write_bytes(b"nsis")
@@ -229,9 +330,10 @@ def test_ui_hardware_mode_is_fail_closed_and_uses_rust_lifecycle():
         "Start operator",
         "Stop operator",
         "CryptoClient",
-        "physical_device_missing",
-        "offloaded_layers=0",
-        "kv_cache_device=cpu",
+        "Operator session ID",
+        "did not advance for this operator start",
+        "non-positive GPU offload",
+        "not offloaded to GPU",
         "wait_for_operator_log_stop_markers",
         "desktop.compute_node_bridge.unregister.succeeded",
         "desktop.compute_node.bridge_process_exited",
@@ -242,29 +344,37 @@ def test_ui_hardware_mode_is_fail_closed_and_uses_rust_lifecycle():
     assert 'env["USE_MOCK_LLM"] = "1"' not in hardware_branch.split("else:", 1)[0]
 
 
+def test_ui_e2e_cleanup_cannot_mask_primary_test_failure():
+    source = UI_PATH.read_text(encoding="utf-8")
+    finally_block = source.split("\n    finally:", 1)[1].split("\n\n    return 0", 1)[0]
+    assert finally_block.count("contextlib.suppress(Exception)") >= 3
+    assert "driver.quit()" in finally_block
+    assert "terminate_process(tauri_driver)" in finally_block
+    assert "terminate_process(relay)" in finally_block
+
+
 class _Element:
     def __init__(self, text: str):
         self.text = text
 
 
 class _Driver:
-    def __init__(self, values: dict[str, str], page: str):
+    def __init__(self, values: dict[str, str]):
         self.values = values
-        self.page_source = page
 
     def find_element(self, _by, xpath):
         label = next(label for label in self.values if f"'{label}:'" in xpath)
         return _Element(self.values[label])
 
 
-def _valid_status_driver():
-    import tempfile
-
-    operator_log = Path(tempfile.gettempdir()) / "token-place-hardware-contract.log"
-    operator_log.write_text(
-        "warm load offloaded_layers=40 kv_cache_device=cuda physical_device=rtx4090",
-        encoding="utf-8",
-    )
+def _valid_status_driver(
+    *,
+    session_id="session-current",
+    sequence="3",
+    fallback_reason="none",
+    offloaded_layers="40",
+    kv_cache_device="cuda",
+):
     return _Driver(
         {
             "Requested mode": "gpu",
@@ -274,19 +384,18 @@ def _valid_status_driver():
             "Context tier": "8k-fast",
             "Worker state": "ready",
             "Worker alive": "yes",
+            "Fallback reason": fallback_reason,
             "Runtime ID": "bundled-cpython-3.11-win-x86_64-cu124",
             "Launcher source": "bundled_runtime",
             "Interpreter": "python.exe",
-            "Operator debug log": str(operator_log),
-        },
-        "installed UI status",
+            "Operator session ID": session_id,
+            "Sequence": sequence,
+            "Readiness diagnostics": f"offloaded_layers={offloaded_layers} kv_cache_device={kv_cache_device}",
+        }
     )
 
 
-def test_hardware_status_rejects_missing_device_cpu_and_fake_fields():
-    spec = importlib.util.spec_from_file_location("desktop_ui_e2e_contract", UI_PATH)
-    assert spec and spec.loader
-    # Avoid importing selenium in this focused unit test; execute just the helper source.
+def _load_assert_packaged_windows_nvidia_status():
     source = UI_PATH.read_text(encoding="utf-8")
     start = source.index("def _status_value")
     end = source.index("\ndef main(", start)
@@ -296,20 +405,71 @@ def test_hardware_status_rejects_missing_device_cpu_and_fake_fields():
         "Path": Path,
     }
     exec(source[start:end], namespace)  # noqa: S102 - isolated repository helper
-    validator = namespace["assert_packaged_windows_nvidia_status"]
-    validator(_valid_status_driver(), "8k-fast")
-    for marker in ("physical_device_missing", "offloaded_layers=0", "kv_cache_device=cpu"):
-        driver = _valid_status_driver()
-        driver.page_source += " warm load offloaded_layers=40 kv_cache_device=cuda physical_device=rtx " + marker
-        with pytest.raises(AssertionError):
-            validator(driver, "8k-fast")
+    return namespace["assert_packaged_windows_nvidia_status"]
+
+
+def test_hardware_status_accepts_current_session_structured_evidence():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    validator(_valid_status_driver(), "8k-fast", "session-previous")
+
+
+def test_hardware_status_rejects_stale_or_unbound_session_evidence():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    with pytest.raises(AssertionError, match="did not advance"):
+        validator(_valid_status_driver(session_id="session-previous"), "8k-fast", "session-previous")
+    for missing in ("", "pending", "unknown", "none"):
+        with pytest.raises(AssertionError, match="concrete operator session"):
+            validator(_valid_status_driver(session_id=missing), "8k-fast", "session-previous")
+
+
+def test_hardware_status_rejects_non_positive_sequence():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    for bad_sequence in ("0", "-1", "unknown", ""):
+        with pytest.raises(AssertionError, match="positive current-session"):
+            validator(_valid_status_driver(sequence=bad_sequence), "8k-fast", "session-previous")
+
+
+def test_hardware_status_rejects_fallback():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    with pytest.raises(AssertionError):
+        validator(_valid_status_driver(fallback_reason="cpu"), "8k-fast", "session-previous")
+
+
+def test_hardware_status_rejects_non_positive_or_missing_gpu_offload():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    for bad_offload in ("0", "-1", "unknown", ""):
+        with pytest.raises(AssertionError, match="non-positive GPU offload"):
+            validator(_valid_status_driver(offloaded_layers=bad_offload), "8k-fast", "session-previous")
+
+
+def test_hardware_status_rejects_cpu_or_unknown_kv_cache_device():
+    validator = _load_assert_packaged_windows_nvidia_status()
+    for bad_device in ("cpu", "unknown", "none", ""):
+        with pytest.raises(AssertionError, match="not offloaded to GPU"):
+            validator(_valid_status_driver(kv_cache_device=bad_device), "8k-fast", "session-previous")
 
 
 def test_workflow_runs_both_installed_hardware_tiers_without_enabling_runner():
     workflow = (ROOT / ".github/workflows/desktop-release.yml").read_text(encoding="utf-8")
     job = workflow.split("windows-nvidia-release-gate:", 1)[1].split("\n  publish:", 1)[0]
     assert "if: ${{ false }}" in job
+    assert "runs-on: [self-hosted, Windows, X64, NVIDIA, RTX]" in job
     assert job.count("windows_nvidia_gpu_smoke_test.py") == 2
     assert "--context-tier 8k-fast" in job
     assert "--context-tier 64k-full" in job
     assert "--installer $setup.FullName" in job
+
+
+def test_workflow_has_ordered_execution_prerequisites_before_smoke_test():
+    workflow = (ROOT / ".github/workflows/desktop-release.yml").read_text(encoding="utf-8")
+    job = workflow.split("windows-nvidia-release-gate:", 1)[1].split("\n  publish:", 1)[0]
+    steps = ("Checkout", "Set up Python", "Install Python dependencies", "Set up Rust",
+              "Install tauri-driver", "Verify native WebDriver prerequisites",
+              "Download Windows release artifacts", "Run artifact-backed Windows NVIDIA smoke test")
+    positions = [job.index(f"name: {step}") for step in steps]
+    assert positions == sorted(positions)
+    assert "actions/setup-python@v5" in job
+    assert "pip install selenium" in job
+    assert "dtolnay/rust-toolchain@stable" in job
+    assert "cargo install tauri-driver" in job
+    assert "msedgedriver" in job

@@ -68,6 +68,37 @@ def materialize_nsis(installer: Path, install_root: Path) -> Path:
     return candidates[0].resolve(strict=True)
 
 
+def _find_uninstaller(install_root: Path) -> Path | None:
+    """Locate the NSIS-generated uninstaller, top-level only.
+
+    NSIS installers commonly emit either `uninstall.exe` or an `unins*.exe`
+    variant depending on template; accept both. Constrained to the
+    installation root (not rglob) so a nested `python-runtime` dependency
+    cannot be mistaken for the package uninstaller.
+    """
+    candidates = sorted(
+        path
+        for pattern in ("unins*.exe", "uninstall*.exe")
+        for path in install_root.glob(pattern)
+    )
+    return candidates[0] if candidates else None
+
+
+def _uninstall_installed_package(install_root: Path, primary_exc: BaseException | None) -> None:
+    uninstaller = _find_uninstaller(install_root)
+    if uninstaller is None:
+        return
+    try:
+        subprocess.run([str(uninstaller), "/S"], check=True)
+    except Exception as cleanup_exc:
+        if primary_exc is not None:
+            # The harness failure is the reportable result; note cleanup
+            # also failed without masking it.
+            print(f"warning: uninstall cleanup also failed: {cleanup_exc}", file=sys.stderr)
+            return
+        raise
+
+
 def run_installed_hardware_gate(
     installer: Path, model: Path, context_tier: str
 ) -> None:
@@ -86,10 +117,15 @@ def run_installed_hardware_gate(
             "--context-tier",
             context_tier,
         ]
-        subprocess.run(command, cwd=_repo_root(), check=True)
-        uninstallers = sorted(install_root.glob("unins*.exe"))
-        if uninstallers:
-            subprocess.run([str(uninstallers[0]), "/S"], check=True)
+        primary_exc: BaseException | None = None
+        try:
+            subprocess.run(command, cwd=_repo_root(), check=True)
+        except BaseException as exc:
+            primary_exc = exc
+        finally:
+            _uninstall_installed_package(install_root, primary_exc)
+        if primary_exc is not None:
+            raise primary_exc
 
 
 def main() -> int:

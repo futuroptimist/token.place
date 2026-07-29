@@ -3840,15 +3840,41 @@ _progress = None
 _original_eval = getattr(llama, 'eval', None)
 if callable(_original_eval):
     def _progress_eval(tokens):
-        result = _original_eval(tokens)
         state = _progress
-        if isinstance(state, dict):
-            state['processed'] = min(state['total'], state['processed'] + len(tokens))
+        if not isinstance(state, dict) or state['generating']:
+            return _original_eval(tokens)
+
+        # Llama.eval owns batching.  Observe its decode boundary rather than
+        # duplicating that implementation so progress advances only after an
+        # actual batch has completed successfully.
+        context = getattr(llama, '_ctx', None)
+        original_decode = getattr(context, 'decode', None)
+        if not callable(original_decode):
+            return _original_eval(tokens)
+        completed = 0
+
+        def _progress_decode(batch):
+            nonlocal completed
+            result = original_decode(batch)
+            batch_size = min(
+                max(0, len(tokens) - completed),
+                max(1, int(getattr(llama, 'n_batch', len(tokens)) or len(tokens) or 1)),
+            )
+            completed += batch_size
+            state['processed'] = min(state['total'], state['processed'] + batch_size)
             now = time.monotonic()
-            if state['processed'] == state['total'] or now - state['last_emit'] >= 0.25:
+            final = state['processed'] == state['total'] and not state['prefill_complete']
+            if final or now - state['last_emit'] >= 0.25:
+                state['prefill_complete'] = state['prefill_complete'] or final
                 state['last_emit'] = now
                 _emit_progress(state, 'prefill')
-        return result
+            return result
+
+        context.decode = _progress_decode
+        try:
+            return _original_eval(tokens)
+        finally:
+            context.decode = original_decode
     llama.eval = _progress_eval
 
 _original_sample = getattr(llama, 'sample', None)
@@ -3857,6 +3883,11 @@ if callable(_original_sample):
         result = _original_sample(*args, **kwargs)
         state = _progress
         if isinstance(state, dict):
+            if not state['prefill_complete']:
+                state['processed'] = state['total']
+                state['prefill_complete'] = True
+                state['last_emit'] = time.monotonic()
+                _emit_progress(state, 'prefill')
             state['generated'] += 1
             now = time.monotonic()
             if not state['generating'] or now - state['last_emit'] >= 0.25:
@@ -3880,7 +3911,7 @@ def _emit_progress(state, phase):
 def _start_progress(request):
     global _progress
     started = time.monotonic()
-    _progress = {'started': started, 'last_emit': started, 'total': 0, 'cached': 0, 'processed': 0, 'generated': 0, 'generating': False}
+    _progress = {'started': started, 'last_emit': started, 'total': 0, 'cached': 0, 'processed': 0, 'generated': 0, 'generating': False, 'prefill_complete': False}
     _emit_progress(_progress, 'preparing')
     try:
         kwargs = request.get('kwargs', {})
@@ -3905,7 +3936,9 @@ def _start_progress(request):
         existing_count = max(0, int(getattr(llama, 'n_tokens', 0) or 0))
         existing = list(getattr(llama, '_input_ids', [])[:existing_count])
         cached = 0
-        for previous, current in zip(existing, tokens):
+        # Pinned Llama.generate deliberately re-evaluates the final prompt
+        # token so its logits are current; only the preceding prefix is reused.
+        for previous, current in zip(existing, tokens[:-1]):
             if int(previous) != int(current):
                 break
             cached += 1

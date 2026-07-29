@@ -7540,6 +7540,104 @@ def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_forma
     return json.loads(response.split(':', 1)[1])
 
 
+def test_llama_worker_progress_eval_batches_cached_prefix_and_phase_are_exact(tmp_path):
+    """Exercise the worker adapter while its second real decode is blocked."""
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    (package_dir / '__init__.py').write_text(r'''
+import time
+
+_ticks = iter(i * 0.3 for i in range(100))
+time.monotonic = lambda: next(_ticks)
+
+class Context:
+    def __init__(self):
+        self.calls = 0
+    def decode(self, batch):
+        self.calls += 1
+        if self.calls == 2:
+            open('second-batch-blocked', 'w').close()
+            while not __import__('os').path.exists('release-second-batch'):
+                time.sleep(0.01)
+
+class Llama:
+    def __init__(self, *args, **kwargs):
+        self.n_batch = 2
+        self.n_tokens = 3
+        self._input_ids = [11, 12, 99]
+        self._ctx = Context()
+    def apply_chat_template(self, messages, **kwargs):
+        return 'rendered'
+    def tokenize(self, prompt, add_bos=False):
+        return [11, 12, 13, 14, 15]
+    def eval(self, tokens):
+        for offset in range(0, len(tokens), self.n_batch):
+            batch = tokens[offset:offset + self.n_batch]
+            self._ctx.decode(batch)
+            self.n_tokens += len(batch)
+    def sample(self):
+        return 42
+    def create_chat_completion(self, *args, **kwargs):
+        # Match pinned generate reuse: the two-token common prefix is retained.
+        self.n_tokens = 2
+        self.eval([13, 14, 15])
+        self.sample()
+        # Decode-token evaluation must not regress the emitted phase.
+        self.eval([42])
+        return {'choices': [{'message': {'content': 'ok'}}]}
+''')
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
+    process = subprocess.Popen(
+        [sys.executable, '-c', 'from utils.llm.model_manager import _LLAMA_CPP_RUNTIME_WORKER_CODE; exec(_LLAMA_CPP_RUNTIME_WORKER_CODE)'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, cwd=tmp_path,
+    )
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+        process.stdin.flush()
+        assert json.loads(process.stdout.readline().split(':', 1)[1])['status'] == 'ok'
+        process.stdin.write(json.dumps({
+            'method': 'create_chat_completion',
+            'args': [[{'role': 'user', 'content': 'private prompt'}]],
+            'kwargs': {},
+        }) + '\n')
+        process.stdin.flush()
+
+        frames = []
+        while len(frames) < 3:
+            frames.append(json.loads(process.stdout.readline().split(':', 1)[1]))
+        assert (tmp_path / 'second-batch-blocked').exists()
+        assert [frame['phase'] for frame in frames] == ['preparing', 'prefill', 'prefill']
+        first_batch = frames[-1]
+        assert (first_batch['cached_prompt_tokens'], first_batch['processed_prompt_tokens']) == (2, 4)
+
+        (tmp_path / 'release-second-batch').touch()
+        while True:
+            frame = json.loads(process.stdout.readline().split(':', 1)[1])
+            frames.append(frame)
+            if frame.get('status') == 'ok' and 'result' in frame:
+                break
+
+        progress = [frame for frame in frames if frame.get('type') == 'inference_progress']
+        phases = [frame['phase'] for frame in progress]
+        assert phases.count('prefill') == 3  # start, one batch, and exactly one final
+        assert phases[-1] == 'generating'
+        assert progress[-2]['processed_prompt_tokens'] == progress[-2]['total_prompt_tokens'] == 5
+        assert progress[-1]['generated_tokens'] == 1
+        assert all(set(frame) == {
+            'type', 'phase', 'total_prompt_tokens', 'cached_prompt_tokens',
+            'processed_prompt_tokens', 'generated_tokens', 'elapsed_ms',
+        } for frame in progress)
+        assert 'private prompt' not in json.dumps(progress)
+        assert all(0 <= frame['cached_prompt_tokens'] <= frame['processed_prompt_tokens'] <= 5 for frame in progress)
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
 def test_llama_worker_render_and_tokenize_chat_returns_only_token_count(tmp_path):
     response = _run_llama_worker_request(
         tmp_path,

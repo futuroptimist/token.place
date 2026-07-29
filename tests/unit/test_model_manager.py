@@ -4999,9 +4999,11 @@ def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_pat
     terminate_fails_process.terminate.assert_called_once_with()
     terminate_fails_process.kill.assert_called_once_with()
     assert terminate_fails_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
-    terminate_fails_process.stdin.close.assert_called_once_with()
-    terminate_fails_process.stdout.close.assert_called_once_with()
-    terminate_fails_process.stderr.close.assert_called_once_with()
+    # Death was never observable (poll always returned None), so pipe cleanup is
+    # deliberately skipped rather than risking a stream-lock deadlock.
+    terminate_fails_process.stdin.close.assert_not_called()
+    terminate_fails_process.stdout.close.assert_not_called()
+    terminate_fails_process.stderr.close.assert_not_called()
 
     stubborn_process = SimpleNamespace(
         poll=MagicMock(return_value=None),
@@ -5212,6 +5214,39 @@ def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, 
     process.terminate.assert_called_once_with()
     process.kill.assert_called_once_with()
     assert process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
+
+
+def test_close_llm_proxy_signals_before_closing_blocked_stdout(tmp_path, monkeypatch):
+    """Regression: a live stdout reader must not delay the terminate signal."""
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    calls = []
+    exited = threading.Event()
+
+    class BlockingStdout:
+        def close(self):
+            calls.append("stdout.close")
+            assert exited.is_set(), "stdout was closed while its reader could still hold the stream lock"
+
+    def terminate():
+        calls.append("terminate")
+        exited.set()
+
+    process = SimpleNamespace(
+        poll=lambda: 0 if exited.is_set() else None,
+        terminate=terminate,
+        wait=lambda timeout: 0,
+        kill=lambda: calls.append("kill"),
+        stdin=SimpleNamespace(close=lambda: calls.append("stdin.close")),
+        stdout=BlockingStdout(),
+        stderr=SimpleNamespace(close=lambda: calls.append("stderr.close")),
+    )
+
+    started = time.monotonic()
+    assert manager._close_llm_proxy(SimpleNamespace(_process=process), terminate_process=True)
+    elapsed = time.monotonic() - started
+
+    assert calls == ["terminate", "stdin.close", "stdout.close", "stderr.close"]
+    assert elapsed < 0.25
 
 
 def test_close_llm_proxy_processless_terminate_close_exception_returns_failure(tmp_path, monkeypatch):

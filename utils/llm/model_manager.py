@@ -2025,6 +2025,13 @@ class _SubprocessLlamaProxy:
         env = _llama_cpp_runtime_worker_env()
         cwd = _llama_cpp_probe_subprocess_cwd()
         try:
+            process_group_kwargs: Dict[str, Any]
+            if os.name == 'nt':
+                process_group_kwargs = {
+                    'creationflags': getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0),
+                }
+            else:
+                process_group_kwargs = {'start_new_session': True}
             self._process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
@@ -2034,6 +2041,7 @@ class _SubprocessLlamaProxy:
                 env=env,
                 cwd=cwd,
                 bufsize=1,
+                **process_group_kwargs,
             )
         except OSError:
             # Popen failed; clean up the temp file if one was created (when
@@ -5946,18 +5954,34 @@ class ModelManager:
 
         process_stopped = True
         if process is not None:
-            # Subprocess-backed workers are cleaned up with process primitives before
-            # any proxy close so third-party close() cannot block cancellation or
-            # ordinary invalidation while holding up recovery.
-            for attr in ('stdin', 'stdout', 'stderr'):
-                _close_or_join_resource(getattr(process, attr, None))
-            if not _dead():
-                terminate = getattr(process, 'terminate', None)
-                if callable(terminate):
+            # Do not close a pipe before the child exits.  In particular,
+            # TextIOWrapper.close() takes the same stream lock as a reader blocked in
+            # readline(); taking that lock here used to prevent cancellation from
+            # ever reaching terminate() while native prefill was silent.
+            #
+            # Runtime workers are launched in their own process group/session.  On
+            # POSIX, signal the group so a native/backend descendant cannot outlive
+            # its worker.  Windows' CREATE_NEW_PROCESS_GROUP still gives the child
+            # an isolated lifecycle; Popen.terminate/kill are the reliable,
+            # non-interactive primitives there.
+            def _signal_process(*, hard: bool) -> None:
+                if os.name != 'nt':
+                    pid = getattr(process, 'pid', None)
+                    if isinstance(pid, int) and pid > 0:
+                        try:
+                            os.killpg(pid, signal.SIGKILL if hard else signal.SIGTERM)
+                            return
+                        except (OSError, ProcessLookupError):
+                            pass
+                method = getattr(process, 'kill' if hard else 'terminate', None)
+                if callable(method):
                     try:
-                        terminate()
+                        method()
                     except Exception:
                         pass
+
+            if not _dead():
+                _signal_process(hard=False)
                 wait = getattr(process, 'wait', None)
                 if callable(wait):
                     try:
@@ -5965,12 +5989,7 @@ class ModelManager:
                     except Exception:
                         pass
             if not _dead():
-                kill = getattr(process, 'kill', None)
-                if callable(kill):
-                    try:
-                        kill()
-                    except Exception:
-                        pass
+                _signal_process(hard=True)
                 wait = getattr(process, 'wait', None)
                 if callable(wait):
                     try:
@@ -5978,6 +5997,14 @@ class ModelManager:
                     except Exception:
                         pass
             process_stopped = _dead()
+
+            # Process death/EOF releases reader-side stream locks.  Only now is it
+            # safe to dispose pipes and boundedly join the persistent/tail readers.
+            # If death could not be verified, leave streams alone: blocking cleanup
+            # is worse than reporting failed teardown and refusing replacement.
+            if process_stopped:
+                for attr in ('stdin', 'stdout', 'stderr'):
+                    _close_or_join_resource(getattr(process, attr, None))
 
         close = getattr(llm, 'close', None)
         if callable(close) and process is None:

@@ -2050,13 +2050,10 @@ class _SubprocessLlamaProxy:
         self._command_sequence = 0
         self._legacy_frames: queue.Queue = queue.Queue(maxsize=32)
         self._unclaimed_frames: queue.Queue = queue.Queue(maxsize=32)
-        # Pending progress identity/observer: staged by set_progress_context /
-        # set_progress_observer, then snapshotted per-command_id at command
-        # creation so a later call for a *different* request can never mutate
-        # the identity or sequence already bound to an in-flight command.
-        self._progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None
-        self._progress_request_id: Optional[str] = None
-        self._progress_worker_generation = 0
+        # Per-command progress identity/observer, bound atomically at command
+        # creation time from the caller's own explicit arguments (never from
+        # mutable proxy-global state), so two concurrent callers on the same
+        # proxy can never interleave and mislabel each other's command.
         self._command_progress: Dict[str, Dict[str, Any]] = {}
         # Coalesced latest-progress-per-command, populated by the stdout
         # reader and drained/dispatched by each command's own waiting caller
@@ -2329,7 +2326,15 @@ class _SubprocessLlamaProxy:
         Runs on the *caller's* thread (the one waiting on this command's
         result), never on the stdout reader thread, so a slow or raising
         observer cannot delay stdout drainage or another command's frames.
+        Once this proxy is closed (detached, cancelled, replaced), any
+        progress still queued for it is stale by definition and must be
+        discarded rather than delivered under what would look like a live
+        generation to the observer.
         """
+        if self._closed:
+            with self._pending_lock:
+                self._latest_progress.pop(command_id, None)
+            return
         with self._pending_lock:
             event = self._latest_progress.pop(command_id, None)
             context = self._command_progress.get(command_id)
@@ -2368,31 +2373,29 @@ class _SubprocessLlamaProxy:
             except queue.Empty:
                 continue
 
-    def set_progress_observer(self, observer: Optional[Callable[[Dict[str, Any]], None]]) -> None:
-        """Stage the observer for the *next* command this proxy issues.
+    def _register_command_progress_context(
+        self,
+        command_id: str,
+        *,
+        observer: Optional[Callable[[Dict[str, Any]], None]],
+        request_id: Optional[str],
+        worker_generation: int,
+    ) -> None:
+        """Atomically bind one command's progress identity at creation time.
 
-        Snapshotted into per-command state when that command is created, so
-        it can never be reassigned out from under an already in-flight
-        command by a later, unrelated caller.
+        Identity is supplied directly by the immediate caller for this one
+        command_id - never read back from mutable proxy-global state - and
+        must be called only from within the same `_pending_lock`-protected
+        block that creates `command_id`. This is the entire binding
+        operation: there is no separate "stage now, consume later" step, so
+        two concurrent callers on the same proxy can never interleave and
+        mislabel each other's command, and a later, unbound internal command
+        can never inherit a previous request's identity or observer.
         """
-        self._progress_observer = observer
-
-    def set_progress_context(self, *, request_id: str, worker_generation: int) -> None:
-        """Stage the identity for the *next* command this proxy issues.
-
-        See `set_progress_observer`: this is a staging area, snapshotted
-        per-command_id at creation time, not live proxy-global state that
-        progress events read at delivery time.
-        """
-        self._progress_request_id = str(request_id)
-        self._progress_worker_generation = max(0, int(worker_generation))
-
-    def _register_command_progress_context(self, command_id: str) -> None:
-        """Snapshot the currently staged progress identity for one command."""
         self._command_progress[command_id] = {
-            'observer': self._progress_observer,
-            'request_id': self._progress_request_id,
-            'worker_generation': self._progress_worker_generation,
+            'observer': observer,
+            'request_id': request_id,
+            'worker_generation': max(0, int(worker_generation)),
             'sequence': 0,
         }
 
@@ -2400,7 +2403,17 @@ class _SubprocessLlamaProxy:
         self._command_progress.pop(command_id, None)
         self._latest_progress.pop(command_id, None)
 
-    def _rpc(self, payload: Dict[str, Any], *, timeout_seconds: Optional[float], stage: str, check_health: bool = True) -> Dict[str, Any]:
+    def _rpc(
+        self,
+        payload: Dict[str, Any],
+        *,
+        timeout_seconds: Optional[float],
+        stage: str,
+        check_health: bool = True,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+    ) -> Dict[str, Any]:
         if not hasattr(self, '_pending_lock') or self._process.stdout is None:
             if check_health:
                 self._send(payload)
@@ -2414,7 +2427,12 @@ class _SubprocessLlamaProxy:
             # silently dropped under backpressure.
             result_queue: queue.Queue = queue.Queue()
             self._pending[command_id] = result_queue
-            self._register_command_progress_context(command_id)
+            self._register_command_progress_context(
+                command_id,
+                observer=progress_observer,
+                request_id=progress_request_id,
+                worker_generation=progress_worker_generation,
+            )
         outbound = dict(payload)
         outbound['protocol_version'] = 2
         outbound['command_id'] = command_id
@@ -2502,15 +2520,39 @@ class _SubprocessLlamaProxy:
                 _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_liveness')
             )
 
-    def create_chat_completion(self, *args, **kwargs):
+    def create_chat_completion(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+        **kwargs,
+    ):
+        """`progress_request_id`/`progress_observer`/`progress_worker_generation`
+        are internal, keyword-only, and bind local progress telemetry to
+        exactly this one call - never forwarded into `kwargs`, so they can
+        never reach the child worker's generation payload."""
         stream = bool(kwargs.get('stream', False))
         if stream:
-            return self._stream_chat_completion(*args, **kwargs)
+            return self._stream_chat_completion(
+                *args,
+                progress_request_id=progress_request_id,
+                progress_observer=progress_observer,
+                progress_worker_generation=progress_worker_generation,
+                **kwargs,
+            )
         stderr_cursor = 0
         try:
             with self._lock:
                 stderr_cursor = self._stderr_cursor()
-                message = self._rpc({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs}, timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(), stage='llama_cpp_inference')
+                message = self._rpc(
+                    {'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs},
+                    timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                    stage='llama_cpp_inference',
+                    progress_request_id=progress_request_id,
+                    progress_observer=progress_observer,
+                    progress_worker_generation=progress_worker_generation,
+                )
         except LlamaCppInferenceRequestError as exc:
             time.sleep(0.1)
             metal_diag = _classify_safe_metal_backend_failure(self._stderr_since(stderr_cursor))
@@ -2574,7 +2616,14 @@ class _SubprocessLlamaProxy:
                 raise
         return message.get('result')
 
-    def _stream_chat_completion(self, *args, **kwargs):
+    def _stream_chat_completion(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+        **kwargs,
+    ):
         with self._lock:
             if not hasattr(self, '_pending_lock'):
                 self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
@@ -2595,7 +2644,12 @@ class _SubprocessLlamaProxy:
                 # authoritative and must never be silently dropped under backpressure.
                 frames: queue.Queue = queue.Queue()
                 self._pending[command_id] = frames
-                self._register_command_progress_context(command_id)
+                self._register_command_progress_context(
+                    command_id,
+                    observer=progress_observer,
+                    request_id=progress_request_id,
+                    worker_generation=progress_worker_generation,
+                )
             if self._stdout_reader_thread is None:
                 self._start_stdout_demultiplexer()
             self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs, 'protocol_version': 2, 'command_id': command_id})
@@ -6643,27 +6697,37 @@ class ModelManager:
         return self._ensure_replacement_llm(observed_generation)
 
     @staticmethod
-    def _bind_llm_progress_context(
-        llm_instance: Any,
+    def _progress_call_kwargs(
+        create_chat_completion: Callable[..., Any],
         *,
         request_id: Optional[str],
         observer: Optional[Callable[[Dict[str, Any]], None]],
         worker_generation: int,
-    ) -> None:
-        """Bind per-request progress identity onto `llm_instance`, if it supports it.
+    ) -> Dict[str, Any]:
+        """Build this call's one-shot progress-identity kwargs, if supported.
 
-        A no-op unless the caller supplied a real `request_id`, and safe for
-        runtimes (e.g. a direct in-process Llama, or a test double) that
-        don't expose `set_progress_observer`/`set_progress_context`.
+        Identity is passed as dedicated call arguments to
+        `create_chat_completion` itself - atomically bound to that single
+        invocation, never staged on mutable shared state - so it's returned
+        empty unless the caller supplied a real `request_id` AND the target
+        callable actually declares these parameters (checked by signature,
+        not a fixed type, so both the subprocess proxy and a compatible test
+        double work; a direct in-process Llama's real signature does not
+        declare them and is safely never passed anything extra).
         """
         if request_id is None:
-            return
-        set_observer = getattr(llm_instance, 'set_progress_observer', None)
-        if callable(set_observer):
-            set_observer(observer)
-        set_context = getattr(llm_instance, 'set_progress_context', None)
-        if callable(set_context):
-            set_context(request_id=request_id, worker_generation=worker_generation)
+            return {}
+        try:
+            params = inspect.signature(create_chat_completion).parameters
+        except (TypeError, ValueError):
+            return {}
+        if 'progress_request_id' not in params:
+            return {}
+        return {
+            'progress_request_id': request_id,
+            'progress_observer': observer,
+            'progress_worker_generation': worker_generation,
+        }
 
     def create_chat_completion_with_recovery(
         self,
@@ -6709,14 +6773,14 @@ class ModelManager:
         create_chat_completion = getattr(llm_instance, 'create_chat_completion', None)
         if not callable(create_chat_completion):
             raise RuntimeError('LLM runtime missing create_chat_completion')
-        self._bind_llm_progress_context(
-            llm_instance,
+        progress_kwargs = self._progress_call_kwargs(
+            create_chat_completion,
             request_id=progress_request_id,
             observer=progress_observer,
             worker_generation=observed_generation,
         )
         try:
-            return create_chat_completion(*args, **kwargs)
+            return create_chat_completion(*args, **kwargs, **progress_kwargs)
         except LlamaCppInferenceRequestError as exc:
             safe_error_code = _safe_worker_error_code(exc)
             diagnostics = getattr(exc, 'diagnostics', {}) or {}
@@ -6760,14 +6824,14 @@ class ModelManager:
         # Rebind against the replacement's own generation: a caller must never
         # receive progress that appears to come from the stale, pre-recovery
         # worker generation it started with.
-        self._bind_llm_progress_context(
-            replacement,
+        replacement_progress_kwargs = self._progress_call_kwargs(
+            replacement_create,
             request_id=progress_request_id,
             observer=progress_observer,
             worker_generation=replacement_generation,
         )
         try:
-            result = replacement_create(*args, **kwargs)
+            result = replacement_create(*args, **kwargs, **replacement_progress_kwargs)
             with self.llm_lock:
                 self.worker_state = 'ready'
                 self.last_worker_error_code = None

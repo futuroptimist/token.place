@@ -3381,11 +3381,9 @@ def _bare_subprocess_proxy(stdout_lines):
     proxy._pending_lock = model_manager_module.Lock()
     proxy._pending = {}
     proxy._completed_commands = set()
+    proxy._command_sequence = 0
     proxy._legacy_frames = queue.Queue(maxsize=32)
     proxy._unclaimed_frames = queue.Queue(maxsize=32)
-    proxy._progress_observer = None
-    proxy._progress_request_id = None
-    proxy._progress_worker_generation = 0
     proxy._command_progress = {}
     proxy._latest_progress = {}
     # Default to real production EOF semantics (always closes); tests that
@@ -3489,6 +3487,7 @@ def test_demux_reader_dispatches_coalesced_progress_on_caller_thread():
         observer_events.append(event)
 
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
     proxy._pending_lock = model_manager_module.Lock()
     proxy._command_progress = {
         'c1': {'observer': _observer, 'request_id': 'req-1', 'worker_generation': 3, 'sequence': 2},
@@ -3501,6 +3500,31 @@ def test_demux_reader_dispatches_coalesced_progress_on_caller_thread():
     # Coalesced: consumed exactly once, not redelivered on the next dispatch.
     proxy._dispatch_pending_progress('c1')
     assert observer_events == [{'phase': 'prefill', 'sequence': 2}]
+
+
+def test_demux_reader_discards_stale_progress_after_proxy_closed():
+    """Once this proxy is closed (detached/cancelled/invalidated), any
+    progress still queued for it must be discarded, not delivered under
+    what would look like a still-live generation."""
+    from utils.llm import model_manager as model_manager_module
+
+    observer_events = []
+
+    def _observer(event):
+        observer_events.append(event)
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = True
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._command_progress = {
+        'c1': {'observer': _observer, 'request_id': 'req-1', 'worker_generation': 3, 'sequence': 2},
+    }
+    proxy._latest_progress = {'c1': {'phase': 'prefill', 'sequence': 2}}
+
+    proxy._dispatch_pending_progress('c1')
+
+    assert observer_events == []
+    assert 'c1' not in proxy._latest_progress
 
 
 def test_demux_reader_eof_preserves_legacy_fixture_when_explicitly_opted_in():
@@ -3594,11 +3618,12 @@ def test_demux_reader_isolates_progress_sequence_across_two_successive_requests(
     monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
 
     proxy = _bare_subprocess_proxy([])
-    proxy.set_progress_observer(lambda _event: None)
-    proxy.set_progress_context(request_id='request-a', worker_generation=1)
-    proxy._register_command_progress_context('c1')
-    proxy.set_progress_context(request_id='request-b', worker_generation=2)
-    proxy._register_command_progress_context('c2')
+    proxy._register_command_progress_context(
+        'c1', observer=lambda _event: None, request_id='request-a', worker_generation=1,
+    )
+    proxy._register_command_progress_context(
+        'c2', observer=lambda _event: None, request_id='request-b', worker_generation=2,
+    )
 
     for _ in range(3):
         proxy._latest_progress['c1'] = {'phase': 'prefill'}
@@ -3853,7 +3878,10 @@ def test_fail_pending_skips_completed_and_survives_a_broken_target():
     assert isinstance(still_pending_queue.get_nowait(), model_manager_module.LlamaCppWorkerEOFError)
 
 
-def test_set_progress_observer_and_context_stage_values_for_next_command():
+def test_register_command_progress_context_binds_atomically_with_no_inheritance():
+    """Progress identity is bound as one atomic, per-command operation with
+    explicit arguments - there is deliberately no shared staged proxy state
+    for a later, unbound command to inherit from."""
     from utils.llm import model_manager as model_manager_module
 
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
@@ -3862,26 +3890,197 @@ def test_set_progress_observer_and_context_stage_values_for_next_command():
     def _observer(_event):
         return None
 
-    proxy.set_progress_observer(_observer)
-    assert proxy._progress_observer is _observer
-
-    proxy.set_progress_context(request_id='abc', worker_generation=5)
-    assert proxy._progress_request_id == 'abc'
-    assert proxy._progress_worker_generation == 5
-
-    # Snapshotting into a command_id captures these staged values without
-    # mutating them, so a later set_progress_context/observer call for a
-    # different request can't reach back and change an in-flight command.
-    proxy._register_command_progress_context('c1')
+    proxy._register_command_progress_context(
+        'c1', observer=_observer, request_id='abc', worker_generation=5,
+    )
     assert proxy._command_progress['c1'] == {
         'observer': _observer,
         'request_id': 'abc',
         'worker_generation': 5,
         'sequence': 0,
     }
-    proxy.set_progress_context(request_id='xyz', worker_generation=9)
+
+    # An unbound internal command (no request_id/observer supplied) gets
+    # exactly that - never the previous command's identity or observer.
+    proxy._register_command_progress_context(
+        'c2', observer=None, request_id=None, worker_generation=0,
+    )
+    assert proxy._command_progress['c2'] == {
+        'observer': None,
+        'request_id': None,
+        'worker_generation': 0,
+        'sequence': 0,
+    }
+    # 'c1' is completely unaffected by 'c2's registration.
     assert proxy._command_progress['c1']['request_id'] == 'abc'
-    assert proxy._command_progress['c1']['worker_generation'] == 5
+    assert proxy._command_progress['c1']['observer'] is _observer
+
+
+def test_two_interleaved_command_registrations_cannot_swap_identities():
+    """Simulates two concurrent callers on the same proxy interleaving their
+    binding calls; each command_id must end up with exactly its own caller's
+    identity, never the other's - proving there's no shared mutable window
+    for a race to swap them, unlike the old stage-then-snapshot design."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._command_progress = {}
+
+    def _observer_a(_event):
+        return None
+
+    def _observer_b(_event):
+        return None
+
+    # Interleaved as two concurrent callers might race: A stages, B stages,
+    # A registers, B registers - each call is now self-contained, so
+    # interleaving order can't matter.
+    proxy._register_command_progress_context(
+        'from-a', observer=_observer_a, request_id='request-a', worker_generation=1,
+    )
+    proxy._register_command_progress_context(
+        'from-b', observer=_observer_b, request_id='request-b', worker_generation=2,
+    )
+
+    assert proxy._command_progress['from-a'] == {
+        'observer': _observer_a, 'request_id': 'request-a', 'worker_generation': 1, 'sequence': 0,
+    }
+    assert proxy._command_progress['from-b'] == {
+        'observer': _observer_b, 'request_id': 'request-b', 'worker_generation': 2, 'sequence': 0,
+    }
+
+
+def test_concurrent_rpc_calls_never_swap_progress_identity_under_real_threads():
+    """Barrier-synchronized real-thread regression for the exact race the
+    old stage-then-snapshot design was vulnerable to: two concurrent callers
+    issuing commands on the same proxy at the same instant must each end up
+    bound to their own identity, never the other caller's."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue(maxsize=32)
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    proxy._stdout_reader_thread = SimpleNamespace()  # already "running"
+    proxy._process = SimpleNamespace(stdout=object())
+
+    barrier = threading.Barrier(2)
+    captured = {}
+
+    def _send(outbound, *, check_health=True):
+        command_id = outbound['command_id']
+        barrier.wait(timeout=5)  # force both threads to be mid-registration together
+        with proxy._pending_lock:
+            captured[command_id] = dict(proxy._command_progress[command_id])
+        proxy._pending[command_id].put_nowait({'status': 'ok', 'result': command_id, 'done': True})
+
+    proxy._send = _send
+
+    def _observer_a(_event):
+        return None
+
+    def _observer_b(_event):
+        return None
+
+    errors = []
+
+    def _worker(request_id, observer, generation):
+        try:
+            proxy._rpc(
+                {'method': 'create_chat_completion', 'args': (), 'kwargs': {}},
+                timeout_seconds=5.0, stage='llama_cpp_inference',
+                progress_request_id=request_id, progress_observer=observer,
+                progress_worker_generation=generation,
+            )
+        except Exception as exc:  # pragma: no cover - surfaced via errors list
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=_worker, args=('request-a', _observer_a, 1))
+    thread_b = threading.Thread(target=_worker, args=('request-b', _observer_b, 2))
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=5)
+    thread_b.join(timeout=5)
+
+    assert not errors
+    assert len(captured) == 2
+    by_request_id = {snapshot['request_id']: snapshot for snapshot in captured.values()}
+    assert by_request_id['request-a']['observer'] is _observer_a
+    assert by_request_id['request-a']['worker_generation'] == 1
+    assert by_request_id['request-b']['observer'] is _observer_b
+    assert by_request_id['request-b']['worker_generation'] == 2
+
+
+def test_progress_arguments_never_appear_in_child_generation_kwargs(monkeypatch):
+    """Internal progress-binding arguments must never leak into the payload
+    sent to the child worker process."""
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    sent_payloads = []
+    proxy._send = lambda payload, **_kw: sent_payloads.append(payload)
+    proxy._stdout_reader_thread = SimpleNamespace()  # avoid starting a real reader
+
+    def _observer(_event):
+        return None
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        # Our fake _send never actually delivers a response; we only care
+        # what was sent before the (short) timeout fires.
+        proxy._rpc(
+            {'method': 'create_chat_completion', 'args': (), 'kwargs': {'messages': [{'role': 'user', 'content': 'hi'}]}},
+            timeout_seconds=0.01, stage='llama_cpp_inference',
+            progress_request_id='req-1', progress_observer=_observer, progress_worker_generation=4,
+        )
+
+    assert sent_payloads
+    outbound = sent_payloads[0]
+    assert 'progress_request_id' not in outbound
+    assert 'progress_observer' not in outbound
+    assert 'progress_worker_generation' not in outbound
+    assert 'progress_request_id' not in outbound['kwargs']
+    assert 'progress_observer' not in outbound['kwargs']
+    assert 'progress_worker_generation' not in outbound['kwargs']
+
+
+def test_rpc_clears_progress_binding_when_send_itself_fails():
+    """Binding must be cleared even when _send raises before anything is
+    ever written to the transport."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = _bare_subprocess_proxy([])
+
+    def _failing_send(_payload, **_kw):
+        raise model_manager_module.LlamaCppWorkerBrokenPipeError('pipe gone')
+
+    proxy._send = _failing_send
+    proxy._stdout_reader_thread = SimpleNamespace()
+
+    def _observer(_event):
+        return None
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerBrokenPipeError):
+        proxy._rpc(
+            {'method': 'create_chat_completion', 'args': (), 'kwargs': {}},
+            timeout_seconds=1.0, stage='llama_cpp_inference',
+            progress_request_id='req-1', progress_observer=_observer, progress_worker_generation=2,
+        )
+
+    assert proxy._command_progress == {}
+    assert proxy._latest_progress == {}
+    assert proxy._pending == {}
 
 
 def test_read_llama_subprocess_message_demux_aware_timeout():
@@ -5223,13 +5422,16 @@ class _RestartableFakeWorker:
     def close(self):
         self.closed = True
 
-    def set_progress_observer(self, observer):
-        self.progress_observer_calls.append(observer)
-
-    def set_progress_context(self, *, request_id, worker_generation):
-        self.progress_context_calls.append((request_id, worker_generation))
-
-    def create_chat_completion(self, **_kwargs):
+    def create_chat_completion(
+        self, *, progress_request_id=None, progress_observer=None, progress_worker_generation=0, **_kwargs
+    ):
+        # Declaring these as explicit parameters (not swept into **_kwargs)
+        # mirrors _SubprocessLlamaProxy.create_chat_completion's real
+        # signature closely enough for ModelManager._progress_call_kwargs's
+        # signature-introspection check to recognize this fake as supporting
+        # progress binding, the same way it recognizes the real proxy.
+        self.progress_observer_calls.append(progress_observer)
+        self.progress_context_calls.append((progress_request_id, progress_worker_generation))
         self.calls += 1
         from utils.llm import model_manager as model_manager_module
         if self.fail == 'dead':
@@ -5330,11 +5532,32 @@ def test_create_chat_completion_with_recovery_omits_binding_without_a_request_id
     manager, _created = _restart_manager(tmp_path, monkeypatch, [worker])
 
     # No progress_request_id supplied (e.g. an internal/non-API-v1 caller):
-    # must not touch the worker's progress state at all.
+    # no real identity/observer must be bound - the call still reaches the
+    # worker (recorded as None/default), it's just never bound to anything.
     manager.create_chat_completion_with_recovery(messages=[])
 
-    assert worker.progress_observer_calls == []
-    assert worker.progress_context_calls == []
+    assert worker.progress_observer_calls == [None]
+    assert worker.progress_context_calls == [(None, 0)]
+
+
+def test_unbound_internal_call_after_api_request_does_not_inherit_prior_identity(tmp_path, monkeypatch):
+    """An API v1 request followed by a later, unbound internal call on the
+    same worker must never let the internal call inherit the previous
+    request's identity or observer - there is no shared staged state left
+    for it to leak through."""
+    worker = _RestartableFakeWorker('only')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [worker])
+
+    def _api_observer(_event):
+        return None
+
+    manager.create_chat_completion_with_recovery(
+        messages=[], progress_request_id='req-external-1', progress_observer=_api_observer,
+    )
+    manager.create_chat_completion_with_recovery(messages=[])
+
+    assert worker.progress_observer_calls == [_api_observer, None]
+    assert worker.progress_context_calls == [('req-external-1', 0), (None, 0)]
 
 
 def test_create_chat_completion_with_recovery_rebinds_progress_context_for_replacement_generation(

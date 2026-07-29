@@ -1,4 +1,5 @@
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -102,3 +103,24 @@ def test_cli_no_flags_disables_optional_cleanup(monkeypatch):
 def test_clean_missing_dirs_are_noop(tmp_path: Path):
     empty = tmp_path / 'nonexistent-desktop-tauri'
     clean_local_build.clean(empty, node_modules=True, runtime=True, cargo_registry=False)
+
+
+def test_clean_runtime_flag_removes_stray_files_alongside_gitkeep(desktop_tauri_dir: Path):
+    runtime = desktop_tauri_dir / 'src-tauri' / 'python-runtime'
+    (runtime / 'VERSION').write_text('3.11.13')
+
+    clean_local_build.clean(desktop_tauri_dir, runtime=True)
+
+    assert not (runtime / 'VERSION').exists()
+    assert (runtime / '.gitkeep').exists()
+
+
+def test_main_guard_runs_as_script(tmp_path: Path):
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), '--dry-run'],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0

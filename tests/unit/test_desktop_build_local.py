@@ -135,6 +135,70 @@ def test_stage_windows_artifacts_missing_nsis_raises(desktop_tauri_dir: Path):
         build_local.stage_windows_artifacts(desktop_tauri_dir, skip_validate=True)
 
 
+def test_stage_windows_artifacts_missing_msi_raises(desktop_tauri_dir: Path):
+    bundle_root = desktop_tauri_dir / 'src-tauri' / 'target' / 'x86_64-pc-windows-msvc' / 'release' / 'bundle'
+    (bundle_root / 'nsis').mkdir(parents=True)
+    (bundle_root / 'nsis' / 'token.place-desktop_0.1.6_x64-setup.exe').write_text('stub')
+    (bundle_root / 'msi').mkdir(parents=True)
+    with pytest.raises(build_local.BuildLocalError, match='No MSI'):
+        build_local.stage_windows_artifacts(desktop_tauri_dir, skip_validate=True)
+
+
+def test_stage_windows_artifacts_runs_validation_and_raises_on_failure(desktop_tauri_dir: Path, monkeypatch):
+    bundle_root = desktop_tauri_dir / 'src-tauri' / 'target' / 'x86_64-pc-windows-msvc' / 'release' / 'bundle'
+    (bundle_root / 'nsis').mkdir(parents=True)
+    (bundle_root / 'nsis' / 'token.place-desktop_0.1.6_x64-setup.exe').write_text('stub')
+    (bundle_root / 'msi').mkdir(parents=True)
+    (bundle_root / 'msi' / 'token.place-desktop_0.1.6_x64_en-US.msi').write_text('stub')
+
+    calls = []
+
+    class FakeResult:
+        returncode = 1
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return FakeResult()
+
+    monkeypatch.setattr(build_local, 'find_python', lambda system: '/usr/bin/python3')
+    monkeypatch.setattr(build_local.subprocess, 'run', fake_run)
+
+    with pytest.raises(build_local.BuildLocalError, match='validation failed'):
+        build_local.stage_windows_artifacts(desktop_tauri_dir, skip_validate=False)
+
+    assert calls
+    assert 'validate_windows_desktop_release_artifacts.py' in calls[0][1]
+    assert '--expected-version' in calls[0]
+    assert '0.1.6' in calls[0]
+
+
+def test_stage_windows_artifacts_runs_validation_success(desktop_tauri_dir: Path, monkeypatch):
+    bundle_root = desktop_tauri_dir / 'src-tauri' / 'target' / 'x86_64-pc-windows-msvc' / 'release' / 'bundle'
+    (bundle_root / 'nsis').mkdir(parents=True)
+    (bundle_root / 'nsis' / 'token.place-desktop_0.1.6_x64-setup.exe').write_text('stub')
+    (bundle_root / 'msi').mkdir(parents=True)
+    (bundle_root / 'msi' / 'token.place-desktop_0.1.6_x64_en-US.msi').write_text('stub')
+
+    class FakeResult:
+        returncode = 0
+
+    monkeypatch.setattr(build_local, 'find_python', lambda system: '/usr/bin/python3')
+    monkeypatch.setattr(build_local.subprocess, 'run', lambda cmd, **kwargs: FakeResult())
+
+    staged = build_local.stage_windows_artifacts(desktop_tauri_dir, skip_validate=False)
+    assert len(staged) == 2
+
+
+def test_run_steps_prints_elapsed_time_on_success(monkeypatch, desktop_tauri_dir: Path, capsys):
+    class FakeResult:
+        returncode = 0
+
+    monkeypatch.setattr(build_local.subprocess, 'run', lambda *a, **k: FakeResult())
+    steps = [build_local.Step('do a thing', ['echo', 'hi'], desktop_tauri_dir)]
+    build_local.run_steps(steps, dry_run=False)
+    assert 'done in' in capsys.readouterr().out
+
+
 def test_stage_windows_artifacts_copies_and_skips_validate(desktop_tauri_dir: Path):
     bundle_root = desktop_tauri_dir / 'src-tauri' / 'target' / 'x86_64-pc-windows-msvc' / 'release' / 'bundle'
     (bundle_root / 'nsis').mkdir(parents=True)
@@ -168,6 +232,69 @@ def test_cli_unsupported_platform_returns_1(monkeypatch):
     assert build_local.main(['--dry-run']) == 1
 
 
+def test_cli_windows_dry_run_plans_windows_steps(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(build_local, 'DESKTOP_TAURI_DIR', tmp_path)
+    monkeypatch.setattr(build_local.platform, 'system', lambda: 'Windows')
+    calls = []
+    monkeypatch.setattr(build_local, 'plan_windows_steps', lambda **kw: calls.append(kw) or [])
+
+    rc = build_local.main(['--dry-run'])
+
+    assert rc == 0
+    assert calls == [{'skip_install': False, 'fresh_runtime': False}]
+
+
+def test_cli_windows_stages_artifacts_after_steps(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(build_local, 'DESKTOP_TAURI_DIR', tmp_path)
+    monkeypatch.setattr(build_local.platform, 'system', lambda: 'Windows')
+    monkeypatch.setattr(build_local, 'check_prerequisites', lambda system: [])
+    monkeypatch.setattr(build_local, 'plan_windows_steps', lambda **kw: [])
+    stage_calls = []
+    monkeypatch.setattr(
+        build_local,
+        'stage_windows_artifacts',
+        lambda **kw: stage_calls.append(kw) or [],
+    )
+
+    rc = build_local.main([])
+
+    assert rc == 0
+    assert stage_calls == [{'skip_validate': False, 'dry_run': False}]
+
+
+def test_cli_reports_build_local_error_and_returns_1(monkeypatch, tmp_path: Path, capsys):
+    monkeypatch.setattr(build_local, 'DESKTOP_TAURI_DIR', tmp_path)
+    monkeypatch.setattr(build_local.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(build_local, 'check_prerequisites', lambda system: [])
+    monkeypatch.setattr(build_local, 'plan_macos_steps', lambda **kw: [])
+
+    def raise_error(steps, dry_run):
+        raise build_local.BuildLocalError('step failed (1.0s): boom')
+
+    monkeypatch.setattr(build_local, 'run_steps', raise_error)
+
+    rc = build_local.main([])
+
+    assert rc == 1
+    assert 'error: step failed' in capsys.readouterr().err
+
+
+def test_main_guard_runs_as_script():
+    # Exercises the `if __name__ == "__main__":` entry point directly, which
+    # importlib.util.spec_from_file_location loading (used by every other test
+    # in this file) never touches. Exit code is host-platform-dependent
+    # (Darwin/Windows dry-run plan cleanly; anything else reports "unsupported
+    # platform"), so only assert the process starts and terminates cleanly --
+    # the platform-specific branches are already covered via main() directly.
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), '--dry-run'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode in (0, 1)
+
+
 def test_run_steps_missing_executable_raises_clean_error(monkeypatch, desktop_tauri_dir: Path):
     def fake_run(*a, **k):
         raise FileNotFoundError(2, 'No such file or directory', 'rustup')
@@ -182,6 +309,58 @@ def test_check_prerequisites_reports_missing_tools(monkeypatch):
     monkeypatch.setattr(build_local.shutil, 'which', lambda name: None)
     assert build_local.check_prerequisites('Darwin') == ['rustup', 'npm', 'python3']
     assert build_local.check_prerequisites('Windows') == ['rustup', 'npm', 'python']
+
+
+def test_python_version_returns_none_on_launch_failure(monkeypatch):
+    def fake_run(*a, **k):
+        raise FileNotFoundError(2, 'No such file or directory', 'python3.11')
+
+    monkeypatch.setattr(build_local.subprocess, 'run', fake_run)
+    assert build_local._python_version('python3.11') is None
+
+
+def test_python_version_returns_none_on_timeout(monkeypatch):
+    def fake_run(*a, **k):
+        raise subprocess.TimeoutExpired('python3.11', 10)
+
+    monkeypatch.setattr(build_local.subprocess, 'run', fake_run)
+    assert build_local._python_version('python3.11') is None
+
+
+def test_python_version_returns_none_on_nonzero_exit(monkeypatch):
+    class FakeResult:
+        returncode = 1
+        stdout = ''
+
+    monkeypatch.setattr(build_local.subprocess, 'run', lambda *a, **k: FakeResult())
+    assert build_local._python_version('python3.11') is None
+
+
+def test_python_version_returns_none_on_unparseable_stdout(monkeypatch):
+    class FakeResult:
+        returncode = 0
+        stdout = 'not a version'
+
+    monkeypatch.setattr(build_local.subprocess, 'run', lambda *a, **k: FakeResult())
+    assert build_local._python_version('python3.11') is None
+
+
+def test_git_short_sha_returns_trimmed_stdout(monkeypatch, desktop_tauri_dir: Path):
+    class FakeResult:
+        stdout = 'abc1234\n'
+
+    monkeypatch.setattr(build_local.subprocess, 'run', lambda *a, **k: FakeResult())
+    assert build_local.git_short_sha(desktop_tauri_dir) == 'abc1234'
+
+
+def test_plan_macos_steps_falls_back_to_local_when_git_sha_unavailable(desktop_tauri_dir: Path, monkeypatch):
+    def raise_error(cwd=None):
+        raise subprocess.CalledProcessError(1, 'git')
+
+    monkeypatch.setattr(build_local, 'git_short_sha', raise_error)
+    steps = build_local.plan_macos_steps(desktop_tauri_dir)
+    stage_step = next(s for s in steps if 'Stage .app' in s.description)
+    assert 'token.place-desktop-local-0.1.6-local-apple-silicon.dmg' in stage_step.argv[2]
 
 
 def test_check_prerequisites_empty_when_all_present(monkeypatch):

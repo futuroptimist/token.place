@@ -68,6 +68,161 @@ def test_gate_materializes_once_and_runs_installed_ui_harness(monkeypatch, tmp_p
     assert "os.environ.copy" not in source
 
 
+def test_canonical_model_contract_raises_when_profile_missing(monkeypatch):
+    import utils.llm.model_profiles as model_profiles
+
+    monkeypatch.setattr(model_profiles, "get_model_profile", lambda _profile_id: None)
+    with pytest.raises(RuntimeError, match="canonical Qwen3 model profile is missing"):
+        smoke._canonical_model_contract()
+
+
+def test_canonical_model_contract_returns_repository_profile():
+    profile = smoke._canonical_model_contract()
+    assert profile["filename"].endswith(".gguf")
+    assert isinstance(profile["artifact_size_bytes"], int)
+    assert isinstance(profile["artifact_sha256"], str)
+
+
+def test_materialize_nsis_requires_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr(smoke.sys, "platform", "darwin")
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"nsis")
+    with pytest.raises(RuntimeError, match="requires Windows"):
+        smoke.materialize_nsis(installer, tmp_path / "install")
+
+
+def test_materialize_nsis_requires_exe_installer(monkeypatch, tmp_path):
+    monkeypatch.setattr(smoke.sys, "platform", "win32")
+    bad_suffix = tmp_path / "setup.msi"
+    bad_suffix.write_bytes(b"nsis")
+    with pytest.raises(RuntimeError, match="must be the built NSIS setup executable"):
+        smoke.materialize_nsis(bad_suffix, tmp_path / "install")
+
+    missing = tmp_path / "missing.exe"
+    with pytest.raises(RuntimeError, match="must be the built NSIS setup executable"):
+        smoke.materialize_nsis(missing, tmp_path / "install")
+
+
+def test_materialize_nsis_runs_installer_and_returns_single_exe(monkeypatch, tmp_path):
+    monkeypatch.setattr(smoke.sys, "platform", "win32")
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"nsis")
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    calls = []
+    monkeypatch.setattr(
+        smoke.subprocess, "run", lambda command, **kwargs: calls.append(command) or None
+    )
+
+    def _create_install_tree():
+        (install_root / "token-place.exe").write_bytes(b"app")
+        (install_root / "Uninstall token.place.exe").write_bytes(b"uninstall")
+        runtime_dir = install_root / "python-runtime"
+        runtime_dir.mkdir()
+        (runtime_dir / "python.exe").write_bytes(b"python")
+
+    _create_install_tree()
+
+    result = smoke.materialize_nsis(installer, install_root)
+
+    assert result == (install_root / "token-place.exe").resolve()
+    assert len(calls) == 1
+    assert calls[0][0] == str(installer.resolve())
+    assert "/S" in calls[0]
+    assert any(str(arg).startswith("/D=") for arg in calls[0])
+
+
+def test_materialize_nsis_rejects_ambiguous_exe_count(monkeypatch, tmp_path):
+    monkeypatch.setattr(smoke.sys, "platform", "win32")
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"nsis")
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    monkeypatch.setattr(smoke.subprocess, "run", lambda command, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="exactly one Tauri executable"):
+        smoke.materialize_nsis(installer, install_root)
+
+    (install_root / "token-place.exe").write_bytes(b"app")
+    (install_root / "second.exe").write_bytes(b"app2")
+    with pytest.raises(RuntimeError, match="exactly one Tauri executable"):
+        smoke.materialize_nsis(installer, install_root)
+
+
+def test_run_installed_hardware_gate_runs_uninstaller_when_present(monkeypatch, tmp_path):
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"nsis")
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"model")
+    calls: list[list[str]] = []
+    captured_root: dict[str, Path] = {}
+
+    def fake_materialize(_installer, root):
+        captured_root["root"] = root
+        (root / "unins000.exe").write_bytes(b"uninstall")
+        return root / "token-place.exe"
+
+    monkeypatch.setattr(smoke, "validate_canonical_model", lambda path: path.resolve())
+    monkeypatch.setattr(smoke, "materialize_nsis", fake_materialize)
+    monkeypatch.setattr(
+        smoke.subprocess, "run", lambda command, **kwargs: calls.append([str(v) for v in command])
+    )
+
+    smoke.run_installed_hardware_gate(installer, model, "8k-fast")
+
+    assert len(calls) == 2
+    assert "test_desktop_operator_ui_e2e.py" in " ".join(calls[0])
+    assert calls[1] == [str((captured_root["root"] / "unins000.exe")), "/S"]
+
+
+def test_main_success_prints_passed_json(monkeypatch, tmp_path, capsys):
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"nsis")
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"model")
+    monkeypatch.setattr(smoke, "run_installed_hardware_gate", lambda *a, **k: None)
+    monkeypatch.setattr(
+        smoke.sys,
+        "argv",
+        [
+            "windows_nvidia_gpu_smoke_test.py",
+            "--installer", str(installer),
+            "--model", str(model),
+            "--context-tier", "8k-fast",
+        ],
+    )
+
+    assert smoke.main() == 0
+    payload = smoke.json.loads(capsys.readouterr().out)
+    assert payload == {"result": "passed", "context_tier": "8k-fast"}
+
+
+def test_main_failure_prints_failed_json_to_stderr(monkeypatch, tmp_path, capsys):
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"nsis")
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"model")
+
+    def raise_error(*_a, **_k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(smoke, "run_installed_hardware_gate", raise_error)
+    monkeypatch.setattr(
+        smoke.sys,
+        "argv",
+        [
+            "windows_nvidia_gpu_smoke_test.py",
+            "--installer", str(installer),
+            "--model", str(model),
+            "--context-tier", "64k-full",
+        ],
+    )
+
+    assert smoke.main() == 1
+    payload = smoke.json.loads(capsys.readouterr().err)
+    assert payload == {"result": "failed", "error": "boom"}
+
+
 def test_ui_hardware_mode_is_fail_closed_and_uses_rust_lifecycle():
     source = UI_PATH.read_text(encoding="utf-8")
     for required in (

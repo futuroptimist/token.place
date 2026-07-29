@@ -2025,6 +2025,17 @@ class _SubprocessLlamaProxy:
         env = _llama_cpp_runtime_worker_env()
         cwd = _llama_cpp_probe_subprocess_cwd()
         try:
+            popen_kwargs: Dict[str, Any] = {}
+            if os.name == 'nt':
+                # Give the bundled worker its own process group.  This keeps
+                # cancellation independent from the desktop process and lets a
+                # future worker that launches native helpers be torn down as one
+                # unit on Windows.
+                popen_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+            else:
+                # A separate session permits killpg() below to include native
+                # descendants without ever signalling the desktop process.
+                popen_kwargs['start_new_session'] = True
             self._process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
@@ -2034,6 +2045,7 @@ class _SubprocessLlamaProxy:
                 env=env,
                 cwd=cwd,
                 bufsize=1,
+                **popen_kwargs,
             )
         except OSError:
             # Popen failed; clean up the temp file if one was created (when
@@ -5946,16 +5958,23 @@ class ModelManager:
 
         process_stopped = True
         if process is not None:
-            # Subprocess-backed workers are cleaned up with process primitives before
-            # any proxy close so third-party close() cannot block cancellation or
-            # ordinary invalidation while holding up recovery.
-            for attr in ('stdin', 'stdout', 'stderr'):
-                _close_or_join_resource(getattr(process, attr, None))
+            # IMPORTANT: signal and reap before touching pipes.  TextIOWrapper.close()
+            # takes the same internal lock as a thread blocked in iteration; closing
+            # stdout first can therefore wait indefinitely for native inference to
+            # produce output.  Process primitives do not use the proxy request lock
+            # or the pipe locks, so cancellation remains preemptive while inference
+            # and its reader are silent.
             if not _dead():
                 terminate = getattr(process, 'terminate', None)
                 if callable(terminate):
                     try:
-                        terminate()
+                        if os.name != 'nt' and getattr(process, 'pid', None):
+                            try:
+                                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                            except (OSError, ProcessLookupError):
+                                terminate()
+                        else:
+                            terminate()
                     except Exception:
                         pass
                 wait = getattr(process, 'wait', None)
@@ -5968,7 +5987,13 @@ class ModelManager:
                 kill = getattr(process, 'kill', None)
                 if callable(kill):
                     try:
-                        kill()
+                        if os.name != 'nt' and getattr(process, 'pid', None):
+                            try:
+                                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                            except (OSError, ProcessLookupError):
+                                kill()
+                        else:
+                            kill()
                     except Exception:
                         pass
                 wait = getattr(process, 'wait', None)
@@ -5978,6 +6003,12 @@ class ModelManager:
                     except Exception:
                         pass
             process_stopped = _dead()
+            # A dead process has closed its write ends, so readers can observe EOF.
+            # Joining is bounded and pipe disposal can no longer wait for live
+            # llama.cpp work.  Never dispose live-process pipes on this path.
+            if process_stopped:
+                for attr in ('stdin', 'stdout', 'stderr'):
+                    _close_or_join_resource(getattr(process, attr, None))
 
         close = getattr(llm, 'close', None)
         if callable(close) and process is None:

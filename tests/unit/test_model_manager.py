@@ -4987,7 +4987,7 @@ def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_pat
     already_dead._process.kill.assert_not_called()
 
     terminate_fails_process = SimpleNamespace(
-        poll=MagicMock(return_value=None),
+        poll=MagicMock(side_effect=[None, None, 0]),
         terminate=MagicMock(side_effect=RuntimeError("terminate failed")),
         wait=MagicMock(return_value=0),
         kill=MagicMock(),
@@ -5024,6 +5024,52 @@ def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_pat
     broken_poll_process.terminate.assert_called_once_with()
     assert broken_poll_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
     broken_poll_process.kill.assert_called_once_with()
+
+
+def test_close_llm_proxy_signals_silent_process_before_closing_stdout(tmp_path, monkeypatch):
+    """A blocked stdout iterator must not delay cancellation signalling.
+
+    This is a real subprocess regression for the packaged-macOS failure: closing
+    ``TextIOWrapper`` while its iterator owns the read lock can block until the
+    child writes or exits.  The child deliberately never writes a result.
+    """
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    popen_kwargs = {'start_new_session': True} if os.name != 'nt' else {
+        'creationflags': getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0),
+    }
+    process = subprocess.Popen(
+        [sys.executable, '-u', '-c', 'import time; time.sleep(60)'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **popen_kwargs,
+    )
+    reader_started = threading.Event()
+
+    def blocked_reader():
+        reader_started.set()
+        for _line in process.stdout:
+            pass
+
+    reader = threading.Thread(target=blocked_reader, daemon=True)
+    reader.start()
+    assert reader_started.wait(timeout=1.0)
+    started = time.monotonic()
+    try:
+        assert manager._close_llm_proxy(
+            SimpleNamespace(_process=process, _stdout_reader_thread=reader),
+            terminate_process=True,
+        ) is True
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.5, f'silent-worker cancellation took {elapsed:.3f}s'
+        assert process.poll() is not None
+        reader.join(timeout=0.5)
+        assert not reader.is_alive()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=1.0)
 
 
 def test_model_manager_cancellation_without_active_worker_recreate_false_and_failure(monkeypatch):

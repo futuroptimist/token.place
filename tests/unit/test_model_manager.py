@@ -8472,6 +8472,155 @@ def test_subprocess_proxy_stream_marks_closed_on_eof(monkeypatch):
     assert sent_payloads[0]["method"] == "create_chat_completion"
 
 
+def test_subprocess_proxy_demux_stream_timeout_kills_worker_and_cleans_pending(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS', '0.01')
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue()
+    # Non-None sentinel: demux reader is treated as already running so the
+    # test doesn't need a real stdout pipe.
+    proxy._stdout_reader_thread = SimpleNamespace()
+    proxy._send = MagicMock()
+
+    terminate_calls = []
+    wait_calls = []
+    kill_calls = []
+
+    class FakeProcess:
+        def terminate(self):
+            terminate_calls.append(True)
+
+        def wait(self, timeout=None):
+            wait_calls.append(timeout)
+
+        def kill(self):
+            kill_calls.append(True)
+
+    proxy._process = FakeProcess()
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        next(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert terminate_calls == [True]
+    assert wait_calls == [1]
+    assert kill_calls == []
+    assert proxy._closed is True
+    assert proxy._pending == {}
+    assert proxy._completed_commands == set()
+
+
+def test_subprocess_proxy_demux_stream_timeout_falls_back_to_kill_when_terminate_fails(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS', '0.01')
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue()
+    proxy._stdout_reader_thread = SimpleNamespace()
+    proxy._send = MagicMock()
+
+    kill_calls = []
+
+    class FakeProcess:
+        def terminate(self):
+            raise OSError('already gone')
+
+        def wait(self, timeout=None):
+            raise AssertionError('wait should not be reached when terminate fails')
+
+        def kill(self):
+            kill_calls.append(True)
+
+    proxy._process = FakeProcess()
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        next(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert kill_calls == [True]
+    assert proxy._closed is True
+    assert proxy._pending == {}
+
+
+def test_subprocess_proxy_demux_stream_timeout_survives_kill_also_failing(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS', '0.01')
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue()
+    proxy._stdout_reader_thread = SimpleNamespace()
+    proxy._send = MagicMock()
+
+    class FakeProcess:
+        def terminate(self):
+            raise OSError('already gone')
+
+        def wait(self, timeout=None):
+            raise AssertionError('wait should not be reached when terminate fails')
+
+        def kill(self):
+            raise OSError('kill also unavailable')
+
+    proxy._process = FakeProcess()
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        next(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert proxy._closed is True
+    assert proxy._pending == {}
+
+
+def test_subprocess_proxy_demux_stream_eof_cleans_pending(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue()
+    proxy._stdout_reader_thread = SimpleNamespace()
+
+    def _fake_send(payload, *, check_health=True):
+        # Simulate the demultiplexer routing a worker-transport EOF error to
+        # this command's pending queue after the request was sent.
+        proxy._pending[payload['command_id']].put_nowait(
+            model_manager_module.LlamaCppWorkerEOFError('worker eof')
+        )
+
+    proxy._send = _fake_send
+    proxy._process = SimpleNamespace()
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
+        next(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert proxy._closed is True
+    assert proxy._pending == {}
+    assert proxy._completed_commands == set()
+
+
 def test_subprocess_proxy_ignores_unlink_failure_when_popen_fails(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 

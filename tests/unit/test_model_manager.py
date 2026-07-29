@@ -4083,6 +4083,108 @@ def test_rpc_clears_progress_binding_when_send_itself_fails():
     assert proxy._pending == {}
 
 
+def test_repeated_command_cycles_leave_no_resource_accumulation(monkeypatch):
+    """P3 regression-matrix gap (resource-accumulation check): across many
+    sequential success and timeout cycles on the same long-lived proxy,
+    _pending/_command_progress/_latest_progress/_completed_commands must
+    all return to empty every time - no leak accumulates over the worker's
+    lifetime."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue(maxsize=32)
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    proxy._stdout_reader_thread = SimpleNamespace()  # already "running"
+    proxy._process = SimpleNamespace(stdout=object())
+
+    modes = []
+
+    def _send(outbound, *, check_health=True):
+        command_id = outbound['command_id']
+        if modes.pop(0) == 'success':
+            proxy._pending[command_id].put_nowait({'status': 'ok', 'result': {'ok': True}})
+        # else 'timeout': deliver nothing, let the deadline fire.
+
+    proxy._send = _send
+
+    for _ in range(25):
+        modes.append('success')
+        result = proxy._rpc(
+            {'method': 'create_chat_completion', 'args': (), 'kwargs': {}},
+            timeout_seconds=None, stage='llama_cpp_inference',
+        )
+        assert result == {'status': 'ok', 'result': {'ok': True}}
+        assert proxy._pending == {}
+        assert proxy._command_progress == {}
+        assert proxy._latest_progress == {}
+        assert proxy._completed_commands == set()
+
+    for _ in range(25):
+        modes.append('timeout')
+        with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+            proxy._rpc(
+                {'method': 'create_chat_completion', 'args': (), 'kwargs': {}},
+                timeout_seconds=0.01, stage='llama_cpp_inference',
+            )
+        assert proxy._pending == {}
+        assert proxy._command_progress == {}
+        assert proxy._latest_progress == {}
+        assert proxy._completed_commands == set()
+
+
+def test_close_signals_stdin_eof_before_terminating_the_process():
+    """P3 regression-matrix gap (terminate-before-close ordering): stdin is
+    closed - signalling EOF to the child - before the process is
+    terminated/killed. This is the ordering the whole PR is built around
+    (never close stdout/stderr while a reader may hold their lock; here we
+    lock in the stdin/terminate/wait ordering deterministically via a
+    recorded call order, not timing)."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._worker_tmpfile = None
+
+    call_order = []
+
+    class FakeStdin:
+        def close(self):
+            call_order.append('stdin_close')
+
+    class FakeProcess:
+        stdin = FakeStdin()
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            call_order.append('terminate')
+
+        def wait(self, timeout=None):
+            call_order.append('wait')
+            return None
+
+        def kill(self):
+            call_order.append('kill')
+
+    proxy._process = FakeProcess()
+
+    # FakeProcess deliberately has no stdout/stderr attributes at all: if
+    # close() ever touched them, this call would raise AttributeError
+    # instead of completing normally, proving they're never closed here -
+    # the reader thread alone owns them until it observes EOF on its own.
+    proxy.close()
+
+    assert call_order == ['stdin_close', 'terminate', 'wait']
+
+
 def test_signal_worker_process_tree_posix_sends_group_signal(monkeypatch):
     from utils.llm import model_manager as model_manager_module
 
@@ -5664,15 +5766,24 @@ def test_create_chat_completion_with_recovery_binds_progress_context_before_call
     worker = _RestartableFakeWorker('only')
     manager, _created = _restart_manager(tmp_path, monkeypatch, [worker])
 
-    def _observer(_event):
-        return None
+    received = []
+
+    def _observer(event):
+        received.append(event)
 
     manager.create_chat_completion_with_recovery(
         messages=[], progress_request_id='req-external-1', progress_observer=_observer,
     )
 
-    assert worker.progress_observer_calls == [_observer]
     assert worker.progress_context_calls == [('req-external-1', manager._llm_generation)]
+    assert len(worker.progress_observer_calls) == 1
+    guarded_observer = worker.progress_observer_calls[0]
+    # Wrapped for stale-generation guarding, not the raw observer function.
+    assert guarded_observer is not _observer
+    # The worker/generation is still the manager's current one: delivery
+    # passes through to the real observer unchanged.
+    guarded_observer({'phase': 'prefill'})
+    assert received == [{'phase': 'prefill'}]
 
 
 def test_create_chat_completion_with_recovery_omits_binding_without_a_request_id(tmp_path, monkeypatch):
@@ -5696,15 +5807,22 @@ def test_unbound_internal_call_after_api_request_does_not_inherit_prior_identity
     worker = _RestartableFakeWorker('only')
     manager, _created = _restart_manager(tmp_path, monkeypatch, [worker])
 
-    def _api_observer(_event):
-        return None
+    received = []
+
+    def _api_observer(event):
+        received.append(event)
 
     manager.create_chat_completion_with_recovery(
         messages=[], progress_request_id='req-external-1', progress_observer=_api_observer,
     )
     manager.create_chat_completion_with_recovery(messages=[])
 
-    assert worker.progress_observer_calls == [_api_observer, None]
+    assert len(worker.progress_observer_calls) == 2
+    first_guarded, second = worker.progress_observer_calls
+    assert first_guarded is not _api_observer
+    first_guarded({'phase': 'prefill'})
+    assert received == [{'phase': 'prefill'}]
+    assert second is None
     assert worker.progress_context_calls == [('req-external-1', 0), (None, 0)]
 
 
@@ -5717,8 +5835,10 @@ def test_create_chat_completion_with_recovery_rebinds_progress_context_for_repla
     second = _RestartableFakeWorker('second')
     manager, _created = _restart_manager(tmp_path, monkeypatch, [first, second])
 
-    def _observer(_event):
-        return None
+    received = []
+
+    def _observer(event):
+        received.append(event)
 
     initial_generation = manager._llm_generation
     first_result = manager.create_chat_completion_with_recovery(
@@ -5737,6 +5857,144 @@ def test_create_chat_completion_with_recovery_rebinds_progress_context_for_repla
     # the caller observed before recovery replaced the dead worker.
     assert second.progress_context_calls == [('req-b', manager._llm_generation)]
     assert manager._llm_generation != initial_generation
+
+    # Replacement-generation progress is delivered normally: the manager's
+    # current worker/generation still match what the replacement call bound.
+    replacement_guarded_observer = second.progress_observer_calls[0]
+    replacement_guarded_observer({'phase': 'generating'})
+    assert received == [{'phase': 'generating'}]
+
+
+def test_progress_suppressed_immediately_on_cancellation_while_close_llm_proxy_blocked():
+    """The core contract this task fixes: terminate_active_worker_for_cancellation
+    detaches the worker (self.llm = None, generation advanced) *before*
+    calling _close_llm_proxy - not after it returns. Progress already
+    queued for the old worker must be suppressed the moment detachment
+    happens, proven here by deliberately blocking _close_llm_proxy (via a
+    real Event, no sleep) and dispatching from inside that blocked window.
+    """
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.worker_state = 'ready'
+    manager._llm_generation = 5
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 0
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.log_warning = MagicMock()
+    manager.get_llm_instance = lambda: manager.llm
+
+    worker = _RestartableFakeWorker('active')
+    manager.llm = worker
+
+    received = []
+
+    def _observer(event):
+        received.append(event)
+
+    manager.create_chat_completion_with_recovery(
+        messages=[], progress_request_id='req-1', progress_observer=_observer,
+    )
+    assert len(worker.progress_observer_calls) == 1
+    guarded_observer = worker.progress_observer_calls[0]
+
+    close_entered = threading.Event()
+    release_close = threading.Event()
+
+    def _blocked_close_llm_proxy(_llm, terminate_process=False, fatal_callback=None):
+        close_entered.set()
+        assert release_close.wait(timeout=5), 'test setup error: never released'
+        return True
+
+    manager._close_llm_proxy = _blocked_close_llm_proxy
+
+    cancel_thread = threading.Thread(
+        target=manager.terminate_active_worker_for_cancellation,
+        kwargs={'reason': 'cancelled'},
+    )
+    cancel_thread.start()
+    try:
+        assert close_entered.wait(timeout=5), 'terminate_active_worker_for_cancellation never reached _close_llm_proxy'
+
+        # Detachment has already happened (self.llm is None, generation
+        # advanced) even though _close_llm_proxy is deliberately still
+        # blocked and has not returned.
+        assert manager.llm is None
+        assert manager._llm_generation == 6
+
+        guarded_observer({'phase': 'prefill'})
+        assert received == []
+    finally:
+        release_close.set()
+        cancel_thread.join(timeout=5)
+    assert not cancel_thread.is_alive()
+
+
+def test_progress_suppressed_immediately_on_ordinary_invalidation_while_close_llm_proxy_blocked():
+    """Same contract as the cancellation test above, but for the ordinary
+    invalidation path (_invalidate_llm_if_current), triggered the way
+    production code triggers it: a LlamaCppRestartableWorkerError raised
+    from create_chat_completion_with_recovery's own call."""
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.worker_state = 'ready'
+    manager._llm_generation = 9
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 0
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.log_warning = MagicMock()
+
+    dying_worker = _RestartableFakeWorker('dying', fail='dead')
+    manager.llm = dying_worker
+    manager.get_llm_instance = lambda: manager.llm
+
+    received = []
+
+    def _observer(event):
+        received.append(event)
+
+    close_entered = threading.Event()
+    release_close = threading.Event()
+
+    def _blocked_close_llm_proxy(_llm, terminate_process=False, fatal_callback=None):
+        close_entered.set()
+        assert release_close.wait(timeout=5), 'test setup error: never released'
+        return True
+
+    manager._close_llm_proxy = _blocked_close_llm_proxy
+
+    def _run() -> None:
+        try:
+            manager.create_chat_completion_with_recovery(
+                messages=[], progress_request_id='req-1', progress_observer=_observer,
+            )
+        except Exception:
+            # We only care about the state during the blocked detachment
+            # window below, not the eventual replacement outcome (there is
+            # no replacement worker in this test).
+            pass
+
+    call_thread = threading.Thread(target=_run)
+    call_thread.start()
+    try:
+        assert close_entered.wait(timeout=5), '_invalidate_llm_if_current never reached _close_llm_proxy'
+
+        assert manager.llm is None
+        assert manager._llm_generation == 10
+
+        # The guarded observer was captured on the *dying* worker's own
+        # create_chat_completion call before it raised.
+        assert len(dying_worker.progress_observer_calls) == 1
+        guarded_observer = dying_worker.progress_observer_calls[0]
+        guarded_observer({'phase': 'prefill'})
+        assert received == []
+    finally:
+        release_close.set()
+        call_thread.join(timeout=5)
+    assert not call_thread.is_alive()
 
 
 def test_model_manager_request_scoped_inference_error_not_retried(tmp_path, monkeypatch):

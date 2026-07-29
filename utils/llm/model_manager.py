@@ -6738,6 +6738,39 @@ class ModelManager:
             observed_generation = self._llm_generation
         return self._ensure_replacement_llm(observed_generation)
 
+    def _guard_progress_observer(
+        self,
+        observer: Optional[Callable[[Dict[str, Any]], None]],
+        *,
+        llm_instance: Any,
+        worker_generation: int,
+    ) -> Optional[Callable[[Dict[str, Any]], None]]:
+        """Wrap `observer` so delivery is suppressed once this exact worker
+        instance/generation is no longer the manager's current one.
+
+        Cancellation (`terminate_active_worker_for_cancellation`) and
+        ordinary invalidation (`_invalidate_llm_if_current`) both detach the
+        serving worker (`self.llm = None`, `_llm_generation` incremented)
+        and release `llm_lock` *before* `_close_llm_proxy` actually
+        terminates the process - the proxy's own `_closed` flag only
+        becomes true much later, once the process has actually exited.
+        Progress already coalesced on the reader thread for an in-flight
+        command can still be dispatched by the caller's own polling loop
+        during that window, so staleness must be checked here, fresh,
+        against current manager state at delivery time - not inferred from
+        the proxy being closed, and not deferred until process EOF.
+        """
+        if observer is None:
+            return None
+
+        def _guarded(event: Dict[str, Any]) -> None:
+            with self.llm_lock:
+                if self.llm is not llm_instance or self._llm_generation != worker_generation:
+                    return
+            observer(event)
+
+        return _guarded
+
     @staticmethod
     def _progress_call_kwargs(
         create_chat_completion: Callable[..., Any],
@@ -6818,7 +6851,9 @@ class ModelManager:
         progress_kwargs = self._progress_call_kwargs(
             create_chat_completion,
             request_id=progress_request_id,
-            observer=progress_observer,
+            observer=self._guard_progress_observer(
+                progress_observer, llm_instance=llm_instance, worker_generation=observed_generation,
+            ),
             worker_generation=observed_generation,
         )
         try:
@@ -6869,7 +6904,9 @@ class ModelManager:
         replacement_progress_kwargs = self._progress_call_kwargs(
             replacement_create,
             request_id=progress_request_id,
-            observer=progress_observer,
+            observer=self._guard_progress_observer(
+                progress_observer, llm_instance=replacement, worker_generation=replacement_generation,
+            ),
             worker_generation=replacement_generation,
         )
         try:

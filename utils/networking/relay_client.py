@@ -2726,12 +2726,14 @@ class RelayClient:
                     recovery_succeeded = self._terminate_current_llama_worker(
                         terminal_reason, recreate=terminal_status != 'operator_stop'
                     )
-                    process_exit_at = time.monotonic()
+                    # `_terminate_current_llama_worker` may recreate a replacement
+                    # worker (recreate=True), so this timestamp reflects full
+                    # recovery completion, not just OS process exit.
+                    recovery_completed_at = time.monotonic()
                     log_info(
-                        'api_v1.worker_process_exit elapsed_ms={} cancellation_to_process_exit_ms={} replacement_ready_elapsed_ms={}',
-                        max(0, int((process_exit_at - supervisor_started_at) * 1000)),
-                        max(0, int((process_exit_at - terminal_observed_at) * 1000)),
-                        max(0, int((process_exit_at - supervisor_started_at) * 1000)),
+                        'api_v1.worker_recovery_complete elapsed_ms={} cancellation_to_recovery_complete_ms={}',
+                        max(0, int((recovery_completed_at - supervisor_started_at) * 1000)),
+                        max(0, int((recovery_completed_at - terminal_observed_at) * 1000)),
                     )
                 except Exception:
                     log_error('api_v1.worker_termination_failed reason={}', terminal_reason)

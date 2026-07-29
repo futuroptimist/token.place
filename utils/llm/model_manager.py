@@ -2306,13 +2306,18 @@ class _SubprocessLlamaProxy:
                     message = self._legacy_frames.get_nowait()
                     break
                 except queue.Empty:
+                    if deadline is None:
+                        wait_seconds = 0.05
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise LlamaCppRuntimeStageTimeout(stage, timeout_seconds)
+                        wait_seconds = min(remaining, 0.05)
                     try:
-                        message = result_queue.get_nowait()
+                        message = result_queue.get(timeout=wait_seconds)
                         break
                     except queue.Empty:
-                        if deadline is not None and time.monotonic() >= deadline:
-                            raise LlamaCppRuntimeStageTimeout(stage, timeout_seconds)
-                        time.sleep(0.001)
+                        continue
             if isinstance(message, BaseException):
                 raise message
             return _validate_llama_subprocess_message(message, process=self._process, stage=stage)
@@ -2462,29 +2467,46 @@ class _SubprocessLlamaProxy:
             with self._pending_lock:
                 self._command_sequence += 1
                 command_id = f'c{self._command_sequence}'
-                frames: queue.Queue = queue.Queue(maxsize=32)
+                # Unbounded: stream chunks and the terminal `done` frame are
+                # authoritative and must never be silently dropped under backpressure.
+                frames: queue.Queue = queue.Queue()
                 self._pending[command_id] = frames
             if self._stdout_reader_thread is None:
                 self._start_stdout_demultiplexer()
             self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs, 'protocol_version': 2, 'command_id': command_id})
-            while True:
-                try:
+            try:
+                while True:
                     try:
-                        message = self._legacy_frames.get_nowait()
+                        try:
+                            message = self._legacy_frames.get_nowait()
+                        except queue.Empty:
+                            message = frames.get(timeout=_llama_cpp_subprocess_inference_timeout_seconds())
+                        if isinstance(message, BaseException):
+                            raise message
+                        message = _validate_llama_subprocess_message(message, process=self._process, stage='llama_cpp_inference')
                     except queue.Empty:
-                        message = frames.get(timeout=_llama_cpp_subprocess_inference_timeout_seconds())
-                    if isinstance(message, BaseException):
-                        raise message
-                    message = _validate_llama_subprocess_message(message, process=self._process, stage='llama_cpp_inference')
-                except LlamaCppWorkerEOFError:
-                    self._closed = True
-                    raise
-                if message.get('done'):
-                    with self._pending_lock:
-                        self._pending.pop(command_id, None)
-                        self._completed_commands.discard(command_id)
-                    return
-                yield message.get('chunk')
+                        try:
+                            self._process.terminate()
+                            self._process.wait(timeout=1)
+                        except Exception:
+                            try:
+                                self._process.kill()
+                            except Exception:
+                                pass
+                        self._closed = True
+                        raise LlamaCppRuntimeStageTimeout(
+                            'llama_cpp_inference', _llama_cpp_subprocess_inference_timeout_seconds()
+                        ) from None
+                    except LlamaCppWorkerEOFError:
+                        self._closed = True
+                        raise
+                    if message.get('done'):
+                        return
+                    yield message.get('chunk')
+            finally:
+                with self._pending_lock:
+                    self._pending.pop(command_id, None)
+                    self._completed_commands.discard(command_id)
 
     def close(self) -> None:
         if self._closed:
@@ -3642,7 +3664,23 @@ def _start_progress(request):
     _progress = {'started': started, 'last_emit': started, 'total': 0, 'cached': 0, 'processed': 0, 'generated': 0, 'generating': False}
     _emit_progress(_progress, 'preparing')
     try:
-        rendered, _ = _render_chat_with_runtime_template(llama, request.get('args', []), request.get('kwargs', {}))
+        kwargs = request.get('kwargs', {})
+        if not isinstance(kwargs, dict):
+            kwargs = {}
+        # Mirror the render-only kwargs assembled by the real
+        # create_chat_completion_from_rendered_prompt path (below): passing
+        # generation-only options (max_tokens, temperature, stream, ...) into
+        # apply_chat_template can make runtimes reject the call and leave
+        # progress totals at zero.
+        render_kwargs = {
+            'tokenize': False,
+            'add_generation_prompt': True,
+            'enable_thinking': kwargs.get('enable_thinking'),
+            'token_place_provider': kwargs.get('token_place_provider'),
+            'token_place_template_policy': kwargs.get('token_place_template_policy'),
+        }
+        render_kwargs = {key: value for key, value in render_kwargs.items() if value is not None}
+        rendered, _ = _render_chat_with_runtime_template(llama, request.get('args', []), render_kwargs)
         tokens = llama.tokenize(rendered.encode('utf-8'), add_bos=False)
         total = len(tokens)
         existing_count = max(0, int(getattr(llama, 'n_tokens', 0) or 0))

@@ -2495,6 +2495,7 @@ class RelayClient:
             log_info('api_v1.control_ack_failed request_id={}', request_id)
 
     def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any], *, local_deadline: Optional[float] = None) -> _ApiV1SupervisorOutcome:
+        supervisor_started_at = time.monotonic()
         request_id = api_v1_request_payload['request_id']
         relay_url = self._api_v1_response_relay_url()
         control_available = relay_url in getattr(self, '_api_v1_registered_relays', set())
@@ -2509,6 +2510,10 @@ class RelayClient:
             )
         if local_deadline is None:
             local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload, now=time.monotonic())
+        log_info(
+            'api_v1.inference_supervision_started initial_deadline_budget_ms={}',
+            max(0, int((local_deadline - supervisor_started_at) * 1000)),
+        )
         terminal_status: Optional[str] = None
         terminal_reason = 'unknown'
         future_result: Optional[Dict[str, Any]] = None
@@ -2705,10 +2710,28 @@ class RelayClient:
                     terminal_reason = 'inference_failure'
                     break
             if terminal_status is not None:
+                terminal_observed_at = time.monotonic()
+                log_info(
+                    'api_v1.inference_terminal_observed terminal_source={} elapsed_ms={}',
+                    terminal_reason,
+                    max(0, int((terminal_observed_at - supervisor_started_at) * 1000)),
+                )
                 recovery_succeeded = False
                 try:
+                    terminate_started_at = time.monotonic()
+                    log_info(
+                        'api_v1.worker_terminate_signal elapsed_ms={}',
+                        max(0, int((terminate_started_at - supervisor_started_at) * 1000)),
+                    )
                     recovery_succeeded = self._terminate_current_llama_worker(
                         terminal_reason, recreate=terminal_status != 'operator_stop'
+                    )
+                    process_exit_at = time.monotonic()
+                    log_info(
+                        'api_v1.worker_process_exit elapsed_ms={} cancellation_to_process_exit_ms={} replacement_ready_elapsed_ms={}',
+                        max(0, int((process_exit_at - supervisor_started_at) * 1000)),
+                        max(0, int((process_exit_at - terminal_observed_at) * 1000)),
+                        max(0, int((process_exit_at - supervisor_started_at) * 1000)),
                     )
                 except Exception:
                     log_error('api_v1.worker_termination_failed reason={}', terminal_reason)

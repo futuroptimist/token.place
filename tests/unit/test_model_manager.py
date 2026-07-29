@@ -4999,9 +4999,12 @@ def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_pat
     terminate_fails_process.terminate.assert_called_once_with()
     terminate_fails_process.kill.assert_called_once_with()
     assert terminate_fails_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
-    terminate_fails_process.stdin.close.assert_called_once_with()
-    terminate_fails_process.stdout.close.assert_called_once_with()
-    terminate_fails_process.stderr.close.assert_called_once_with()
+    # A wait() return is not authoritative when poll() still reports alive.
+    # Pipe close must remain deferred rather than risk blocking on the reader's
+    # stream lock before process death is verified.
+    terminate_fails_process.stdin.close.assert_not_called()
+    terminate_fails_process.stdout.close.assert_not_called()
+    terminate_fails_process.stderr.close.assert_not_called()
 
     stubborn_process = SimpleNamespace(
         poll=MagicMock(return_value=None),

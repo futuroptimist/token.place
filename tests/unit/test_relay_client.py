@@ -5497,6 +5497,38 @@ def test_api_v1_context_admission_uses_recovered_runtime_before_rejecting():
     assert manager.runtime.calls == []
 
 
+def test_api_v1_generation_binds_real_request_id_and_local_progress_observer():
+    """The real external request_id and a local, privacy-safe progress
+    observer must reach ModelManager.create_chat_completion_with_recovery -
+    the production wiring this PR adds, not just the plumbing underneath it."""
+    manager = _AdmissionManager(window=64, default_max_tokens=4)
+    manager.create_chat_completion_with_recovery = MagicMock(
+        return_value={"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    )
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "hello", options={"max_tokens": 4})
+
+    assert "error" not in envelope["api_v1_response"]
+    manager.create_chat_completion_with_recovery.assert_called_once()
+    call_kwargs = manager.create_chat_completion_with_recovery.call_args.kwargs
+    assert call_kwargs["progress_request_id"] == "req-admission"
+    assert call_kwargs["progress_observer"] == client._api_v1_local_progress_observer
+
+
+def test_api_v1_local_progress_observer_logs_without_raising():
+    client = _api_v1_validation_client(_AdmissionManager())
+
+    # Must not raise even with a malformed/incomplete event, and must never
+    # forward anything to the relay - it's a local log line only.
+    client._api_v1_local_progress_observer({})
+    client._api_v1_local_progress_observer({
+        "request_id": "req-1", "worker_generation": 2, "sequence": 3,
+        "phase": "prefill", "total_prompt_tokens": 10, "cached_prompt_tokens": 0,
+        "processed_prompt_tokens": 5, "generated_tokens": 0, "elapsed_ms": 12,
+    })
+
+
 def test_api_v1_context_admission_rejects_when_runtime_count_unavailable():
     manager = _AdmissionManager(window=32)
     manager.runtime.apply_chat_template = lambda *args, **kwargs: None

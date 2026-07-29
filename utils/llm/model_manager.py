@@ -2011,6 +2011,17 @@ def _safe_worker_error_code(value: Any) -> str:
 class _SubprocessLlamaProxy:
     """Minimal llama_cpp.Llama proxy for no-SIGALRM runtimes."""
 
+    # Class-level default (not set per-instance in __init__): a genuinely
+    # explicit, race-free opt-out for deterministic test fixtures with a
+    # finite stdout iterator that simulates a still-alive worker. Overriding
+    # it at the class level (e.g. via monkeypatch, before constructing an
+    # instance) takes effect immediately, closing the window a same-thread
+    # background reader could otherwise race through before an instance
+    # attribute assignment made after construction would apply. Real
+    # versioned production workers must never override this: stdout EOF
+    # always means the process is gone.
+    _legacy_fixture_transport = False
+
     def __init__(
         self,
         *args,
@@ -2039,10 +2050,19 @@ class _SubprocessLlamaProxy:
         self._command_sequence = 0
         self._legacy_frames: queue.Queue = queue.Queue(maxsize=32)
         self._unclaimed_frames: queue.Queue = queue.Queue(maxsize=32)
+        # Pending progress identity/observer: staged by set_progress_context /
+        # set_progress_observer, then snapshotted per-command_id at command
+        # creation so a later call for a *different* request can never mutate
+        # the identity or sequence already bound to an in-flight command.
         self._progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None
         self._progress_request_id: Optional[str] = None
         self._progress_worker_generation = 0
-        self._progress_sequence = 0
+        self._command_progress: Dict[str, Dict[str, Any]] = {}
+        # Coalesced latest-progress-per-command, populated by the stdout
+        # reader and drained/dispatched by each command's own waiting caller
+        # thread so a slow or raising observer can never delay stdout
+        # drainage or another command's authoritative frames.
+        self._latest_progress: Dict[str, Dict[str, Any]] = {}
         self._closed = False
         self._worker_tmpfile: Optional[str] = None
         code = _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)
@@ -2186,10 +2206,12 @@ class _SubprocessLlamaProxy:
             try:
                 for line in stdout:
                     if not line.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:'):
-                        tail = getattr(self._process, '_token_place_stdout_tail', None)
-                        if isinstance(tail, list):
-                            tail.append(line)
-                            del tail[:-100]
+                        sanitized_line = _sanitize_child_diagnostic_line(line)
+                        if sanitized_line:
+                            tail = getattr(self._process, '_token_place_stdout_tail', None)
+                            if isinstance(tail, list):
+                                tail.append(sanitized_line)
+                                del tail[:-100]
                         continue
                     try:
                         frame = json.loads(line.split(':', 1)[1].strip())
@@ -2219,10 +2241,15 @@ class _SubprocessLlamaProxy:
                             pass
                         continue
                     if frame.get('type') == 'inference_progress':
-                        observer = self._progress_observer
-                        if callable(observer):
-                            try:
-                                self._progress_sequence += 1
+                        # Progress is coalesced (latest value wins) and never
+                        # dispatched from this thread: a slow or raising
+                        # observer must never delay stdout drainage or another
+                        # command's authoritative frames. The command's own
+                        # waiting caller thread dispatches it.
+                        with self._pending_lock:
+                            context = self._command_progress.get(command_id)
+                            if context is not None:
+                                context['sequence'] += 1
                                 event = {
                                     key: frame[key] for key in (
                                         'type', 'phase', 'total_prompt_tokens',
@@ -2231,30 +2258,43 @@ class _SubprocessLlamaProxy:
                                     ) if key in frame
                                 }
                                 event.update({
-                                    'request_id': self._progress_request_id or 'local',
-                                    'worker_generation': self._progress_worker_generation,
-                                    'sequence': self._progress_sequence,
+                                    'request_id': context['request_id'] or 'local',
+                                    'worker_generation': context['worker_generation'],
+                                    'sequence': context['sequence'],
                                 })
-                                observer(event)
-                            except Exception:
-                                pass
-                        # Progress is deliberately lossy and never occupies the
-                        # authoritative one-slot result queue.
+                                self._latest_progress[command_id] = event
                         continue
                     with self._pending_lock:
                         if command_id in self._completed_commands:
                             continue
-                        if frame.get('done') is not False:
-                            self._completed_commands.add(command_id)
+                    # Per-command queues are unbounded, so this cannot raise
+                    # queue.Full under normal operation. If delivery still
+                    # fails for any reason, the transport can no longer be
+                    # trusted: fail every pending command with a typed
+                    # transport error and stop reading, rather than silently
+                    # dropping the frame and leaving a waiter hanging forever.
+                    # Deliberately marked completed only *after* a successful
+                    # put: a failed delivery must never be mistaken for one
+                    # that succeeded, or _fail_pending would wrongly skip it.
                     try:
                         target.put_nowait(frame)
-                    except queue.Full:
-                        pass
+                    except Exception:
+                        self._closed = True
+                        self._fail_pending(
+                            LlamaCppWorkerEOFError('llama_cpp worker transport frame delivery failed')
+                        )
+                        return
+                    if frame.get('done') is not False:
+                        with self._pending_lock:
+                            self._completed_commands.add(command_id)
             finally:
-                # Legacy deterministic fixtures provide a finite iterator while
-                # keeping a fake process alive.  Versioned production workers
-                # never do this; preserve queued compatibility frames there.
-                if self._legacy_frames.empty():
+                # Real versioned production workers only ever reach EOF when
+                # the process has actually died, so this must always close
+                # the transport and fail every still-pending command. The
+                # sole exception is a deterministic test fixture that opts in
+                # explicitly via _legacy_fixture_transport (never inferred
+                # from queue contents).
+                if not getattr(self, '_legacy_fixture_transport', False):
                     self._closed = True
                     self._fail_pending(LlamaCppWorkerEOFError('llama_cpp worker transport reached unexpected EOF'))
 
@@ -2265,21 +2305,100 @@ class _SubprocessLlamaProxy:
 
     def _fail_pending(self, error: BaseException) -> None:
         with self._pending_lock:
-            targets = list(self._pending.values())
+            # Commands whose terminal frame was already delivered don't need
+            # (and shouldn't receive) a spurious failure behind it.
+            targets = [
+                target
+                for command_id, target in self._pending.items()
+                if command_id not in self._completed_commands
+            ]
         for target in targets:
+            # Unbounded per-command queues: this must never be silently
+            # dropped under normal operation (deliberately no `except
+            # queue.Full`). The broad except here exists only so one
+            # unexpectedly broken queue can't prevent this fatal failure from
+            # reaching every *other* still-pending command.
             try:
                 target.put_nowait(error)
-            except queue.Full:
+            except Exception:
+                continue
+
+    def _dispatch_pending_progress(self, command_id: str) -> None:
+        """Fire the observer for the latest coalesced progress, if any.
+
+        Runs on the *caller's* thread (the one waiting on this command's
+        result), never on the stdout reader thread, so a slow or raising
+        observer cannot delay stdout drainage or another command's frames.
+        """
+        with self._pending_lock:
+            event = self._latest_progress.pop(command_id, None)
+            context = self._command_progress.get(command_id)
+        if event is None or context is None:
+            return
+        observer = context.get('observer')
+        if callable(observer):
+            try:
+                observer(event)
+            except Exception:
                 pass
 
+    def _wait_with_progress(
+        self, command_id: str, target: queue.Queue, timeout_seconds: Optional[float]
+    ) -> Any:
+        """Block for the next frame on `target` in short slices.
+
+        Dispatches coalesced progress for `command_id` between slices so a
+        long wait (e.g. prefill on a large prompt) still surfaces progress
+        promptly instead of only once the awaited frame finally arrives.
+        Raises `queue.Empty` once `timeout_seconds` elapses with nothing
+        delivered, matching a plain bounded `target.get(timeout=...)`.
+        """
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        while True:
+            self._dispatch_pending_progress(command_id)
+            if deadline is None:
+                wait_seconds = 0.05
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty()
+                wait_seconds = min(remaining, 0.05)
+            try:
+                return target.get(timeout=wait_seconds)
+            except queue.Empty:
+                continue
+
     def set_progress_observer(self, observer: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+        """Stage the observer for the *next* command this proxy issues.
+
+        Snapshotted into per-command state when that command is created, so
+        it can never be reassigned out from under an already in-flight
+        command by a later, unrelated caller.
+        """
         self._progress_observer = observer
 
     def set_progress_context(self, *, request_id: str, worker_generation: int) -> None:
-        """Bind private child progress to an opaque local request generation."""
+        """Stage the identity for the *next* command this proxy issues.
+
+        See `set_progress_observer`: this is a staging area, snapshotted
+        per-command_id at creation time, not live proxy-global state that
+        progress events read at delivery time.
+        """
         self._progress_request_id = str(request_id)
         self._progress_worker_generation = max(0, int(worker_generation))
-        self._progress_sequence = 0
+
+    def _register_command_progress_context(self, command_id: str) -> None:
+        """Snapshot the currently staged progress identity for one command."""
+        self._command_progress[command_id] = {
+            'observer': self._progress_observer,
+            'request_id': self._progress_request_id,
+            'worker_generation': self._progress_worker_generation,
+            'sequence': 0,
+        }
+
+    def _forget_command_progress_context(self, command_id: str) -> None:
+        self._command_progress.pop(command_id, None)
+        self._latest_progress.pop(command_id, None)
 
     def _rpc(self, payload: Dict[str, Any], *, timeout_seconds: Optional[float], stage: str, check_health: bool = True) -> Dict[str, Any]:
         if not hasattr(self, '_pending_lock') or self._process.stdout is None:
@@ -2291,8 +2410,11 @@ class _SubprocessLlamaProxy:
         with self._pending_lock:
             self._command_sequence += 1
             command_id = f'c{self._command_sequence}'
-            result_queue: queue.Queue = queue.Queue(maxsize=32)
+            # Unbounded: an authoritative result/error frame must never be
+            # silently dropped under backpressure.
+            result_queue: queue.Queue = queue.Queue()
             self._pending[command_id] = result_queue
+            self._register_command_progress_context(command_id)
         outbound = dict(payload)
         outbound['protocol_version'] = 2
         outbound['command_id'] = command_id
@@ -2302,6 +2424,7 @@ class _SubprocessLlamaProxy:
             self._send(outbound, check_health=check_health)
             deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
             while True:
+                self._dispatch_pending_progress(command_id)
                 try:
                     message = self._legacy_frames.get_nowait()
                     break
@@ -2325,6 +2448,7 @@ class _SubprocessLlamaProxy:
             with self._pending_lock:
                 self._pending.pop(command_id, None)
                 self._completed_commands.discard(command_id)
+                self._forget_command_progress_context(command_id)
 
     def _drain_stderr_reader_bounded(self) -> None:
         deadline = time.monotonic() + 0.5
@@ -2471,16 +2595,20 @@ class _SubprocessLlamaProxy:
                 # authoritative and must never be silently dropped under backpressure.
                 frames: queue.Queue = queue.Queue()
                 self._pending[command_id] = frames
+                self._register_command_progress_context(command_id)
             if self._stdout_reader_thread is None:
                 self._start_stdout_demultiplexer()
             self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs, 'protocol_version': 2, 'command_id': command_id})
             try:
                 while True:
+                    self._dispatch_pending_progress(command_id)
                     try:
                         try:
                             message = self._legacy_frames.get_nowait()
                         except queue.Empty:
-                            message = frames.get(timeout=_llama_cpp_subprocess_inference_timeout_seconds())
+                            message = self._wait_with_progress(
+                                command_id, frames, _llama_cpp_subprocess_inference_timeout_seconds()
+                            )
                         if isinstance(message, BaseException):
                             raise message
                         message = _validate_llama_subprocess_message(message, process=self._process, stage='llama_cpp_inference')
@@ -2507,6 +2635,7 @@ class _SubprocessLlamaProxy:
                 with self._pending_lock:
                     self._pending.pop(command_id, None)
                     self._completed_commands.discard(command_id)
+                    self._forget_command_progress_context(command_id)
 
     def close(self) -> None:
         if self._closed:
@@ -6513,13 +6642,50 @@ class ModelManager:
             observed_generation = self._llm_generation
         return self._ensure_replacement_llm(observed_generation)
 
-    def create_chat_completion_with_recovery(self, *args, **kwargs):
+    @staticmethod
+    def _bind_llm_progress_context(
+        llm_instance: Any,
+        *,
+        request_id: Optional[str],
+        observer: Optional[Callable[[Dict[str, Any]], None]],
+        worker_generation: int,
+    ) -> None:
+        """Bind per-request progress identity onto `llm_instance`, if it supports it.
+
+        A no-op unless the caller supplied a real `request_id`, and safe for
+        runtimes (e.g. a direct in-process Llama, or a test double) that
+        don't expose `set_progress_observer`/`set_progress_context`.
+        """
+        if request_id is None:
+            return
+        set_observer = getattr(llm_instance, 'set_progress_observer', None)
+        if callable(set_observer):
+            set_observer(observer)
+        set_context = getattr(llm_instance, 'set_progress_context', None)
+        if callable(set_context):
+            set_context(request_id=request_id, worker_generation=worker_generation)
+
+    def create_chat_completion_with_recovery(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        **kwargs,
+    ):
         """Create a completion, replacing a dead subprocess worker at most once.
 
         Recovery is only supported for non-streaming completions. Passing
         ``stream=True`` returns a generator before transport IO can raise
         restartable worker errors, so callers that need recovery must use
         ``stream=False``.
+
+        ``progress_request_id``/``progress_observer`` are internal, keyword-only:
+        when supplied, they bind this call's local progress telemetry to the
+        caller's real external request_id and the worker generation actually
+        used to serve it (including the post-recovery generation, if a
+        replacement worker is used), so recovery can never deliver progress
+        for a stale generation to the wrong request. Neither is part of the
+        public API v1 request/response schema.
         """
         if kwargs.get('stream', False):
             raise ValueError(
@@ -6543,6 +6709,12 @@ class ModelManager:
         create_chat_completion = getattr(llm_instance, 'create_chat_completion', None)
         if not callable(create_chat_completion):
             raise RuntimeError('LLM runtime missing create_chat_completion')
+        self._bind_llm_progress_context(
+            llm_instance,
+            request_id=progress_request_id,
+            observer=progress_observer,
+            worker_generation=observed_generation,
+        )
         try:
             return create_chat_completion(*args, **kwargs)
         except LlamaCppInferenceRequestError as exc:
@@ -6584,6 +6756,16 @@ class ModelManager:
                 self._llm_generation != observed_generation and observed_cancel_event.is_set()
             ):
                 raise RuntimeError('LLM inference request cancelled before worker retry')
+            replacement_generation = self._llm_generation
+        # Rebind against the replacement's own generation: a caller must never
+        # receive progress that appears to come from the stale, pre-recovery
+        # worker generation it started with.
+        self._bind_llm_progress_context(
+            replacement,
+            request_id=progress_request_id,
+            observer=progress_observer,
+            worker_generation=replacement_generation,
+        )
         try:
             result = replacement_create(*args, **kwargs)
             with self.llm_lock:

@@ -3337,6 +3337,13 @@ def test_subprocess_llama_proxy_streams_chunks_without_json_serializing_iterator
         return process
 
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
+    # This fixture's FakeStdout is a finite, pre-scripted iterator covering
+    # the whole exchange (handshake + stream), not a real blocking pipe, so
+    # its real background reader thread can race ahead and hit EOF before
+    # this test even finishes constructing the proxy. Opt out of the
+    # always-fatal EOF semantics explicitly, at the class level so it takes
+    # effect before that race window opens.
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_legacy_fixture_transport', True)
 
     proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
     chunks = list(proxy.create_chat_completion(messages=[], stream=True))
@@ -3379,7 +3386,11 @@ def _bare_subprocess_proxy(stdout_lines):
     proxy._progress_observer = None
     proxy._progress_request_id = None
     proxy._progress_worker_generation = 0
-    proxy._progress_sequence = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    # Default to real production EOF semantics (always closes); tests that
+    # specifically exercise the deterministic-fixture opt-out set this True.
+    proxy._legacy_fixture_transport = False
     proxy._closed = False
     proxy._process = SimpleNamespace(stdout=iter(stdout_lines), _token_place_stdout_tail=[])
     proxy._stdout_reader_thread = None
@@ -3407,13 +3418,8 @@ def test_demux_reader_routes_and_recovers_from_malformed_frames(monkeypatch):
 
     monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
 
-    observer_events = []
-
-    def _observer(event):
-        observer_events.append(event)
-
     stdout_lines = [
-        'plain non-prefixed line\n',
+        'a plain, non-diagnostic non-prefixed line\n',
         'TOKEN_PLACE_LLAMA_CPP_JSON:not-json\n',
         'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps([1, 2, 3]) + '\n',
         'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'legacy': True}) + '\n',
@@ -3438,31 +3444,221 @@ def test_demux_reader_routes_and_recovers_from_malformed_frames(monkeypatch):
     proxy = _bare_subprocess_proxy(stdout_lines)
     target_queue = queue.Queue()
     proxy._pending = {'c1': target_queue}
-    proxy._progress_observer = _observer
-    proxy._progress_request_id = 'req-1'
-    proxy._progress_worker_generation = 3
+    proxy._command_progress['c1'] = {
+        'observer': None,
+        'request_id': 'req-1',
+        'worker_generation': 3,
+        'sequence': 0,
+    }
 
     proxy._start_stdout_demultiplexer()
 
-    assert proxy._process._token_place_stdout_tail == ['plain non-prefixed line\n']
+    # Non-diagnostic stdout content (no llama/ggml/memory keywords) is
+    # dropped entirely rather than retained; see the dedicated sanitization
+    # test below for retention + redaction of genuine diagnostic content.
+    assert proxy._process._token_place_stdout_tail == []
     assert proxy._legacy_frames.get_nowait() == {'status': 'ok', 'legacy': True}
     assert proxy._unclaimed_frames.get_nowait()['command_id'] == 123
     assert proxy._unclaimed_frames.get_nowait()['command_id'] == 'unknown-cmd'
 
-    assert len(observer_events) == 1
-    event = observer_events[0]
-    assert event['phase'] == 'prefill'
-    assert event['request_id'] == 'req-1'
-    assert event['worker_generation'] == 3
-    assert event['sequence'] == 1
+    # Progress is coalesced into per-command state, not dispatched from the
+    # reader thread; the command's own caller dispatches it (see the
+    # dedicated dispatch test below).
+    assert proxy._latest_progress['c1']['phase'] == 'prefill'
+    context = proxy._command_progress.get('c1')
+    assert context is not None and context['sequence'] == 1
 
     delivered = target_queue.get_nowait()
     assert delivered['done'] is True
     assert target_queue.empty()
 
-    # One legacy frame was left undrained above, so the EOF handler must
-    # preserve pending state rather than closing the worker out from under it.
+    # Real versioned-protocol EOF always closes the transport, even though a
+    # legacy frame was left undrained above.
+    assert proxy._closed is True
+    # The terminal frame for 'c1' was already delivered, so _fail_pending
+    # must not also push a spurious error behind it.
+    assert target_queue.empty()
+
+
+def test_demux_reader_dispatches_coalesced_progress_on_caller_thread():
+    from utils.llm import model_manager as model_manager_module
+
+    observer_events = []
+
+    def _observer(event):
+        observer_events.append(event)
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._command_progress = {
+        'c1': {'observer': _observer, 'request_id': 'req-1', 'worker_generation': 3, 'sequence': 2},
+    }
+    proxy._latest_progress = {'c1': {'phase': 'prefill', 'sequence': 2}}
+
+    proxy._dispatch_pending_progress('c1')
+
+    assert observer_events == [{'phase': 'prefill', 'sequence': 2}]
+    # Coalesced: consumed exactly once, not redelivered on the next dispatch.
+    proxy._dispatch_pending_progress('c1')
+    assert observer_events == [{'phase': 'prefill', 'sequence': 2}]
+
+
+def test_demux_reader_eof_preserves_legacy_fixture_when_explicitly_opted_in():
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = _bare_subprocess_proxy([
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'legacy': True}) + '\n',
+    ])
+    # Explicit, test-only opt-out: a deterministic fixture with a finite
+    # iterator, simulating a still-alive worker. Never inferred from queue
+    # contents.
+    proxy._legacy_fixture_transport = True
+
+    with patch.object(model_manager_module.threading, 'Thread', _SynchronousFakeThread):
+        proxy._start_stdout_demultiplexer()
+
+    assert proxy._legacy_frames.get_nowait() == {'status': 'ok', 'legacy': True}
     assert proxy._closed is False
+
+
+def test_demux_reader_eof_always_closes_by_default_even_with_queued_legacy_data(monkeypatch):
+    """The corrected-behavior counterpart to the opt-in test above.
+
+    Without the explicit fixture opt-out, real versioned-protocol EOF must
+    always close the transport and fail pending commands, even when there
+    happens to be unconsumed legacy data still sitting in the queue -
+    never inferred from queue contents.
+    """
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    proxy = _bare_subprocess_proxy([
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'legacy': True}) + '\n',
+    ])
+    pending_queue = queue.Queue()
+    proxy._pending = {'c1': pending_queue}
+    assert proxy._legacy_fixture_transport is False
+
+    proxy._start_stdout_demultiplexer()
+
+    # The legacy frame is still sitting there, undrained...
+    assert not proxy._legacy_frames.empty()
+    # ...but the transport still closed and failed the pending command.
+    assert proxy._closed is True
+    assert isinstance(pending_queue.get_nowait(), model_manager_module.LlamaCppWorkerEOFError)
+
+
+def test_demux_reader_slow_observer_never_blocks_the_reader_thread(monkeypatch):
+    """The reader must never invoke the observer at all, slow or not.
+
+    An observer that would block forever is registered; if the reader ever
+    called it directly, this test would hang instead of completing.
+    """
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    def _observer_that_blocks_forever(_event):
+        threading.Event().wait()  # never set: would hang if ever called here
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({
+            'protocol_version': 2, 'command_id': 'c1', 'type': 'inference_progress',
+            'phase': 'prefill',
+        }) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    target_queue = queue.Queue()
+    proxy._pending = {'c1': target_queue}
+    proxy._command_progress['c1'] = {
+        'observer': _observer_that_blocks_forever,
+        'request_id': 'req-1',
+        'worker_generation': 1,
+        'sequence': 0,
+    }
+
+    proxy._start_stdout_demultiplexer()  # must return promptly, not hang
+
+    assert target_queue.get_nowait()['done'] is True
+
+
+def test_demux_reader_isolates_progress_sequence_across_two_successive_requests(monkeypatch):
+    """Two successive requests/generations on the same proxy must not leak
+    identity, sequence numbers, or events into each other."""
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    proxy = _bare_subprocess_proxy([])
+    proxy.set_progress_observer(lambda _event: None)
+    proxy.set_progress_context(request_id='request-a', worker_generation=1)
+    proxy._register_command_progress_context('c1')
+    proxy.set_progress_context(request_id='request-b', worker_generation=2)
+    proxy._register_command_progress_context('c2')
+
+    for _ in range(3):
+        proxy._latest_progress['c1'] = {'phase': 'prefill'}
+        with proxy._pending_lock:
+            context = proxy._command_progress['c1']
+            context['sequence'] += 1
+            proxy._latest_progress['c1']['sequence'] = context['sequence']
+
+    proxy._latest_progress['c2'] = {'phase': 'prefill'}
+    with proxy._pending_lock:
+        context = proxy._command_progress['c2']
+        context['sequence'] += 1
+        proxy._latest_progress['c2']['sequence'] = context['sequence']
+
+    assert proxy._command_progress['c1']['request_id'] == 'request-a'
+    assert proxy._command_progress['c1']['worker_generation'] == 1
+    assert proxy._command_progress['c1']['sequence'] == 3
+    assert proxy._command_progress['c2']['request_id'] == 'request-b'
+    assert proxy._command_progress['c2']['worker_generation'] == 2
+    # A later command's own sequence starts fresh at 1, unaffected by the
+    # earlier command's count.
+    assert proxy._latest_progress['c2']['sequence'] == 1
+
+    proxy._forget_command_progress_context('c1')
+    proxy._forget_command_progress_context('c2')
+    assert proxy._command_progress == {}
+    assert proxy._latest_progress == {}
+
+
+def test_sanitize_stdout_diagnostic_tail_redacts_sentinel_secrets(monkeypatch):
+    """Non-protocol stdout must be sanitized before retention: sentinel
+    prompt/output/token/credential material must never survive into the
+    bounded diagnostic tail."""
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        # Matches the diagnostic allowlist (mentions ggml/memory) but also
+        # carries sentinel secret-shaped material that must be redacted.
+        'ggml_metal: buffer allocation failed prompt="SENTINEL_SECRET_PROMPT" '
+        'token=SENTINEL_SECRET_TOKEN api_key=SENTINEL_SECRET_APIKEY\n',
+        # Does not match the allowlist at all: dropped entirely, regardless
+        # of any secret-shaped content it might also carry.
+        'plain output line mentioning SENTINEL_SECRET_OUTPUT with no keyword\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+
+    proxy._start_stdout_demultiplexer()
+
+    tail_text = '\n'.join(proxy._process._token_place_stdout_tail)
+    for sentinel in (
+        'SENTINEL_SECRET_PROMPT',
+        'SENTINEL_SECRET_TOKEN',
+        'SENTINEL_SECRET_APIKEY',
+        'SENTINEL_SECRET_OUTPUT',
+    ):
+        assert sentinel not in tail_text
+    assert 'ggml_metal' in tail_text
+    assert '<redacted>' in tail_text
 
 
 def test_demux_reader_progress_observer_exception_is_swallowed(monkeypatch):
@@ -3481,10 +3677,21 @@ def test_demux_reader_progress_observer_exception_is_swallowed(monkeypatch):
     ]
     proxy = _bare_subprocess_proxy(stdout_lines)
     proxy._pending = {'c1': queue.Queue()}
-    proxy._progress_observer = _raising_observer
+    proxy._command_progress['c1'] = {
+        'observer': _raising_observer,
+        'request_id': 'req-1',
+        'worker_generation': 1,
+        'sequence': 0,
+    }
 
-    # Must not raise, even though the observer itself blows up.
+    # The reader thread itself must never see the observer at all.
     proxy._start_stdout_demultiplexer()
+    assert 'c1' in proxy._latest_progress
+
+    # Dispatch happens on the caller's own thread and must not raise, even
+    # though the observer itself blows up.
+    proxy._dispatch_pending_progress('c1')
+    assert 'c1' not in proxy._latest_progress
 
 
 def test_demux_reader_drops_legacy_frame_when_queue_full(monkeypatch):
@@ -3545,48 +3752,112 @@ def test_demux_reader_drops_unregistered_command_frame_when_unclaimed_full(monke
     assert proxy._unclaimed_frames.empty()
 
 
-def test_demux_reader_drops_target_frame_when_pending_queue_full(monkeypatch):
+def test_demux_reader_delivers_every_authoritative_frame_under_burst(monkeypatch):
+    """Contract: the waiter must receive every authoritative frame it's owed.
+
+    Replaces the old test asserting that a bounded per-command queue could
+    silently drop chunks under backpressure. Per-command queues are now
+    unbounded, so a burst of chunks (far more than the old maxsize=32) must
+    all be observable, in order, ending with the terminal frame.
+    """
     from utils.llm import model_manager as model_manager_module
 
     monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
 
+    chunk_count = 200
     stdout_lines = [
         'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
-            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'chunk': 1, 'done': False}
-        ) + '\n',
-        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
-            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'chunk': 2, 'done': False}
-        ) + '\n',
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'chunk': i, 'done': False}
+        ) + '\n'
+        for i in range(chunk_count)
     ]
+    stdout_lines.append(
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n'
+    )
+
     proxy = _bare_subprocess_proxy(stdout_lines)
-    target_queue = queue.Queue(maxsize=1)
+    target_queue = queue.Queue()
     proxy._pending = {'c1': target_queue}
 
     proxy._start_stdout_demultiplexer()
 
-    assert target_queue.get_nowait()['chunk'] == 1
+    delivered = [target_queue.get_nowait() for _ in range(chunk_count)]
+    assert [frame['chunk'] for frame in delivered] == list(range(chunk_count))
+    terminal = target_queue.get_nowait()
+    assert terminal['done'] is True
     assert target_queue.empty()
 
 
-def test_fail_pending_swallows_queue_full():
+def test_demux_reader_escalates_to_typed_failure_when_delivery_itself_fails(monkeypatch):
+    """Contract: if delivery is ever impossible, fail the transport, don't drop.
+
+    Uses a queue-like double whose `put_nowait` always raises, simulating an
+    unbounded queue somehow still failing to accept an item, to prove the
+    reader treats that as fatal instead of silently continuing.
+    """
     from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    class _AlwaysFullQueue:
+        def put_nowait(self, _item):
+            raise queue.Full('simulated unrecoverable delivery failure')
+
+        def get_nowait(self):
+            raise queue.Empty()
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    broken_target = _AlwaysFullQueue()
+    other_target = queue.Queue()
+    proxy._pending = {'c1': broken_target, 'c2': other_target}
+
+    proxy._start_stdout_demultiplexer()
+
+    # The command whose delivery failed AND every other still-pending
+    # command receive a typed transport failure; nothing hangs silently.
+    other_message = other_target.get_nowait()
+    assert isinstance(other_message, model_manager_module.LlamaCppWorkerEOFError)
+    assert proxy._closed is True
+
+
+def test_fail_pending_skips_completed_and_survives_a_broken_target():
+    from utils.llm import model_manager as model_manager_module
+
+    class _BrokenQueue:
+        def put_nowait(self, _item):
+            raise RuntimeError('this queue never accepts anything')
 
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
     proxy._pending_lock = model_manager_module.Lock()
-    full_queue = queue.Queue(maxsize=1)
-    full_queue.put_nowait('already occupied')
-    proxy._pending = {'c1': full_queue}
+    completed_queue = queue.Queue()
+    still_pending_queue = queue.Queue()
+    proxy._pending = {
+        'completed': completed_queue,
+        'broken': _BrokenQueue(),
+        'still-pending': still_pending_queue,
+    }
+    proxy._completed_commands = {'completed'}
 
-    # Must not raise even though the only pending queue is already full.
+    # Must not raise, and must still reach every other still-pending target
+    # even though one queue is broken and one command already finished.
     proxy._fail_pending(model_manager_module.LlamaCppWorkerEOFError('eof'))
 
-    assert full_queue.get_nowait() == 'already occupied'
+    assert completed_queue.empty()
+    assert isinstance(still_pending_queue.get_nowait(), model_manager_module.LlamaCppWorkerEOFError)
 
 
-def test_set_progress_observer_and_context_store_values():
+def test_set_progress_observer_and_context_stage_values_for_next_command():
     from utils.llm import model_manager as model_manager_module
 
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._command_progress = {}
 
     def _observer(_event):
         return None
@@ -3597,7 +3868,20 @@ def test_set_progress_observer_and_context_store_values():
     proxy.set_progress_context(request_id='abc', worker_generation=5)
     assert proxy._progress_request_id == 'abc'
     assert proxy._progress_worker_generation == 5
-    assert proxy._progress_sequence == 0
+
+    # Snapshotting into a command_id captures these staged values without
+    # mutating them, so a later set_progress_context/observer call for a
+    # different request can't reach back and change an in-flight command.
+    proxy._register_command_progress_context('c1')
+    assert proxy._command_progress['c1'] == {
+        'observer': _observer,
+        'request_id': 'abc',
+        'worker_generation': 5,
+        'sequence': 0,
+    }
+    proxy.set_progress_context(request_id='xyz', worker_generation=9)
+    assert proxy._command_progress['c1']['request_id'] == 'abc'
+    assert proxy._command_progress['c1']['worker_generation'] == 5
 
 
 def test_read_llama_subprocess_message_demux_aware_timeout():
@@ -4930,12 +5214,20 @@ class _RestartableFakeWorker:
         self.closed = False
         self.calls = 0
         self.pid = id(self)
+        self.progress_observer_calls = []
+        self.progress_context_calls = []
 
     def is_alive(self):
         return not self.closed and self.fail != 'dead'
 
     def close(self):
         self.closed = True
+
+    def set_progress_observer(self, observer):
+        self.progress_observer_calls.append(observer)
+
+    def set_progress_context(self, *, request_id, worker_generation):
+        self.progress_context_calls.append((request_id, worker_generation))
 
     def create_chat_completion(self, **_kwargs):
         self.calls += 1
@@ -5016,6 +5308,64 @@ def test_model_manager_restart_broken_pipe_or_eof_once(tmp_path, monkeypatch):
     assert fourth_result['choices'][0]['message']['content'] == 'fourth'
     assert eof.closed is True
     assert created == [eof, fourth]
+
+
+def test_create_chat_completion_with_recovery_binds_progress_context_before_call(tmp_path, monkeypatch):
+    worker = _RestartableFakeWorker('only')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [worker])
+
+    def _observer(_event):
+        return None
+
+    manager.create_chat_completion_with_recovery(
+        messages=[], progress_request_id='req-external-1', progress_observer=_observer,
+    )
+
+    assert worker.progress_observer_calls == [_observer]
+    assert worker.progress_context_calls == [('req-external-1', manager._llm_generation)]
+
+
+def test_create_chat_completion_with_recovery_omits_binding_without_a_request_id(tmp_path, monkeypatch):
+    worker = _RestartableFakeWorker('only')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [worker])
+
+    # No progress_request_id supplied (e.g. an internal/non-API-v1 caller):
+    # must not touch the worker's progress state at all.
+    manager.create_chat_completion_with_recovery(messages=[])
+
+    assert worker.progress_observer_calls == []
+    assert worker.progress_context_calls == []
+
+
+def test_create_chat_completion_with_recovery_rebinds_progress_context_for_replacement_generation(
+    tmp_path, monkeypatch
+):
+    """Recovery must never let progress appear to come from the stale,
+    pre-recovery worker generation the caller originally started with."""
+    first = _RestartableFakeWorker('first')
+    second = _RestartableFakeWorker('second')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [first, second])
+
+    def _observer(_event):
+        return None
+
+    initial_generation = manager._llm_generation
+    first_result = manager.create_chat_completion_with_recovery(
+        messages=[], progress_request_id='req-a', progress_observer=_observer,
+    )
+    assert first_result['choices'][0]['message']['content'] == 'first'
+    assert first.progress_context_calls == [('req-a', initial_generation)]
+
+    first.fail = 'dead'
+    second_result = manager.create_chat_completion_with_recovery(
+        messages=[], progress_request_id='req-b', progress_observer=_observer,
+    )
+    assert second_result['choices'][0]['message']['content'] == 'second'
+
+    # The replacement worker is bound to the *new* generation, not the one
+    # the caller observed before recovery replaced the dead worker.
+    assert second.progress_context_calls == [('req-b', manager._llm_generation)]
+    assert manager._llm_generation != initial_generation
 
 
 def test_model_manager_request_scoped_inference_error_not_retried(tmp_path, monkeypatch):
@@ -8884,6 +9234,11 @@ def test_subprocess_proxy_demux_stream_timeout_kills_worker_and_cleans_pending(m
     proxy._completed_commands = set()
     proxy._command_sequence = 0
     proxy._legacy_frames = queue.Queue()
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
     # Non-None sentinel: demux reader is treated as already running so the
     # test doesn't need a real stdout pipe.
     proxy._stdout_reader_thread = SimpleNamespace()
@@ -8929,6 +9284,11 @@ def test_subprocess_proxy_demux_stream_timeout_falls_back_to_kill_when_terminate
     proxy._completed_commands = set()
     proxy._command_sequence = 0
     proxy._legacy_frames = queue.Queue()
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
     proxy._stdout_reader_thread = SimpleNamespace()
     proxy._send = MagicMock()
 
@@ -8967,6 +9327,11 @@ def test_subprocess_proxy_demux_stream_timeout_survives_kill_also_failing(monkey
     proxy._completed_commands = set()
     proxy._command_sequence = 0
     proxy._legacy_frames = queue.Queue()
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
     proxy._stdout_reader_thread = SimpleNamespace()
     proxy._send = MagicMock()
 
@@ -9000,6 +9365,11 @@ def test_subprocess_proxy_demux_stream_eof_cleans_pending(monkeypatch):
     proxy._completed_commands = set()
     proxy._command_sequence = 0
     proxy._legacy_frames = queue.Queue()
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
     proxy._stdout_reader_thread = SimpleNamespace()
 
     def _fake_send(payload, *, check_health=True):
@@ -9044,7 +9414,8 @@ def test_subprocess_proxy_stream_starts_demux_reader_when_not_already_running(mo
     proxy._progress_observer = None
     proxy._progress_request_id = None
     proxy._progress_worker_generation = 0
-    proxy._progress_sequence = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
     proxy._process = SimpleNamespace(stdout=iter(stdout_lines), _token_place_stdout_tail=[])
     # The reader is not started yet: this is the first command on this proxy.
     proxy._stdout_reader_thread = None

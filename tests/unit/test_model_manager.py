@@ -4083,6 +4083,154 @@ def test_rpc_clears_progress_binding_when_send_itself_fails():
     assert proxy._pending == {}
 
 
+def test_signal_worker_process_tree_posix_sends_group_signal(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.os, 'name', 'posix')
+    killpg_calls = []
+    monkeypatch.setattr(model_manager_module.os, 'getpgid', lambda pid: pid + 1000)
+    monkeypatch.setattr(
+        model_manager_module.os, 'killpg', lambda pgid, sig: killpg_calls.append((pgid, sig))
+    )
+
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=42), hard=False)
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=42), hard=True)
+
+    assert killpg_calls == [
+        (1042, model_manager_module.signal.SIGTERM),
+        (1042, model_manager_module.signal.SIGKILL),
+    ]
+
+
+def test_signal_worker_process_tree_windows_uses_taskkill(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.os, 'name', 'nt')
+    run_calls = []
+    monkeypatch.setattr(
+        model_manager_module.subprocess, 'run',
+        lambda *args, **kwargs: run_calls.append((args, kwargs)),
+    )
+
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=99), hard=False)
+
+    assert len(run_calls) == 1
+    (command,), kwargs = run_calls[0]
+    assert command == ['taskkill', '/F', '/T', '/PID', '99']
+    assert kwargs.get('timeout') == 5
+
+
+def test_signal_worker_process_tree_swallows_all_errors(monkeypatch):
+    """Never worse than the pre-existing single-process signal: any failure
+    here (missing pid, dead process, permission error, missing taskkill)
+    must be silently absorbed."""
+    from utils.llm import model_manager as model_manager_module
+
+    # No pid attribute at all.
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(), hard=False)
+
+    # POSIX: getpgid/killpg both raise.
+    monkeypatch.setattr(model_manager_module.os, 'name', 'posix')
+
+    def _raise_lookup(*_args, **_kwargs):
+        raise ProcessLookupError('already gone')
+
+    monkeypatch.setattr(model_manager_module.os, 'getpgid', _raise_lookup)
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=1), hard=True)
+
+    # Windows: subprocess.run raises (e.g. taskkill missing).
+    monkeypatch.setattr(model_manager_module.os, 'name', 'nt')
+
+    def _raise_oserror(*_args, **_kwargs):
+        raise OSError('taskkill not found')
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'run', _raise_oserror)
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=1), hard=False)
+
+
+def test_close_signals_process_tree_before_terminate_and_before_hard_kill(monkeypatch):
+    """close() must reach for the whole process/session group at both the
+    soft (terminate) and hard (kill-fallback) stages, not just the direct
+    process."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._worker_tmpfile = None
+    signal_calls = []
+    monkeypatch.setattr(
+        model_manager_module, '_signal_worker_process_tree',
+        lambda process, *, hard: signal_calls.append(hard),
+    )
+
+    class FakeProcess:
+        pid = 123
+        stdin = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise TimeoutError('still running')
+
+        def kill(self):
+            return None
+
+    proxy._process = FakeProcess()
+
+    proxy.close()
+
+    assert signal_calls == [False, True]
+
+
+def test_close_llm_proxy_signals_process_tree_before_terminate_and_before_hard_kill(monkeypatch, tmp_path):
+    """_close_llm_proxy (the cancellation/recovery cleanup path) must also
+    reach for the whole process/session group, not just the direct
+    process."""
+    from utils.llm import model_manager as model_manager_module
+
+    manager = model_manager_module.ModelManager.__new__(model_manager_module.ModelManager)
+    manager.log_info = lambda *_a, **_k: None
+    manager.log_warning = lambda *_a, **_k: None
+    manager.log_error = lambda *_a, **_k: None
+
+    signal_calls = []
+    monkeypatch.setattr(
+        model_manager_module, '_signal_worker_process_tree',
+        lambda process, *, hard: signal_calls.append(hard),
+    )
+
+    class FakeProcess:
+        pid = 456
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def __init__(self):
+            self._polls = iter([None, None, 1])
+
+        def poll(self):
+            return next(self._polls, 1)
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise TimeoutError('still running')
+
+        def kill(self):
+            return None
+
+    llm = SimpleNamespace(_process=FakeProcess())
+
+    manager._close_llm_proxy(llm)
+
+    assert signal_calls == [False, True]
+
+
 def test_read_llama_subprocess_message_demux_aware_timeout():
     from utils.llm import model_manager as model_manager_module
 

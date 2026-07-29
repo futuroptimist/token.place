@@ -2008,6 +2008,40 @@ def _safe_worker_error_code(value: Any) -> str:
         return text.replace('-', '_')
     return type(value).__name__ if isinstance(value, BaseException) else 'worker_error'
 
+
+def _signal_worker_process_tree(process: Any, *, hard: bool) -> None:
+    """Best-effort signal to a worker's whole process/session group.
+
+    The llama.cpp worker subprocess is started in its own session/process
+    group (`start_new_session=True` on POSIX, `CREATE_NEW_PROCESS_GROUP` on
+    Windows) specifically so any helper processes the pinned backend spawns
+    into that same group can be reached here too - the direct-process-only
+    `terminate()`/`kill()` calls the caller already performs cannot reach
+    them. This is always a supplement to, never a replacement for, that
+    direct signal: any failure here (permission, platform quirk, the
+    process already gone) is silently ignored, leaving behavior no worse
+    than before this existed.
+    """
+    pid = getattr(process, 'pid', None)
+    if pid is None:
+        return
+    if os.name == 'nt':
+        try:
+            subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(pid)],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+        return
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGKILL if hard else signal.SIGTERM)
+    except Exception:
+        pass
+
+
 class _SubprocessLlamaProxy:
     """Minimal llama_cpp.Llama proxy for no-SIGALRM runtimes."""
 
@@ -2701,10 +2735,12 @@ class _SubprocessLlamaProxy:
         except Exception:
             pass
         if self._process.poll() is None:
+            _signal_worker_process_tree(self._process, hard=False)
             self._process.terminate()
             try:
                 self._process.wait(timeout=1)
             except Exception:
+                _signal_worker_process_tree(self._process, hard=True)
                 try:
                     self._process.kill()
                 except Exception:
@@ -6433,6 +6469,11 @@ class ModelManager:
             # any proxy close so third-party close() cannot block cancellation or
             # ordinary invalidation while holding up recovery.
             if not _dead():
+                # Supplement the direct-process signal by also reaching the
+                # worker's whole process/session group, since a llama.cpp
+                # backend could spawn helper processes the direct-process
+                # terminate()/kill() below can never reach.
+                _signal_worker_process_tree(process, hard=False)
                 terminate = getattr(process, 'terminate', None)
                 if callable(terminate):
                     try:
@@ -6450,6 +6491,7 @@ class ModelManager:
                     except Exception:
                         pass
             if not _dead():
+                _signal_worker_process_tree(process, hard=True)
                 kill = getattr(process, 'kill', None)
                 if callable(kill):
                     try:

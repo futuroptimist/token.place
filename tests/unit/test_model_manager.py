@@ -4251,6 +4251,50 @@ def test_signal_worker_process_tree_posix_sends_group_signal(monkeypatch):
     assert killpg_calls == [(1042, 15), (1042, 9)]
 
 
+def test_signal_worker_process_tree_rejects_non_positive_or_non_int_pids(monkeypatch):
+    """A fake/unconfigured `.pid` must never reach getpgid/killpg/taskkill.
+
+    `int(MagicMock())` silently coerces to `1`: an unconfigured test double
+    passed here without an explicit `.pid` (e.g. `MagicMock()`) would
+    otherwise resolve to PID 1 (init) and send it SIGTERM/SIGKILL. In at
+    least one sandboxed CI environment this actually succeeded and took
+    down the entire runner, rather than merely raising PermissionError as
+    it does on an ordinary unprivileged POSIX machine - this is a real,
+    not merely theoretical, danger.
+    """
+    from utils.llm import model_manager as model_manager_module
+
+    getpgid_calls = []
+    killpg_calls = []
+    run_calls = []
+    monkeypatch.setattr(
+        model_manager_module,
+        'os',
+        _FakeNamedOS(
+            'posix',
+            getpgid=lambda pid: getpgid_calls.append(pid) or pid,
+            killpg=lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        ),
+    )
+    monkeypatch.setattr(
+        model_manager_module.subprocess, 'run',
+        lambda *args, **kwargs: run_calls.append((args, kwargs)),
+    )
+
+    for bad_pid in (1, 0, -1, MagicMock()):
+        model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=bad_pid), hard=False)
+        model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=bad_pid), hard=True)
+
+    assert getpgid_calls == []
+    assert killpg_calls == []
+    assert run_calls == []
+
+    # A genuine positive int PID > 1 still works normally (sanity check the
+    # guard isn't overbroad).
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=2), hard=False)
+    assert getpgid_calls == [2]
+
+
 def test_signal_worker_process_tree_windows_soft_uses_ctrl_break_event(monkeypatch):
     """Windows graceful phase: CTRL_BREAK_EVENT to the process group, never
     taskkill /F (that's forceful, hard-phase only)."""
@@ -4320,7 +4364,7 @@ def test_signal_worker_process_tree_swallows_all_errors(monkeypatch):
         raise ProcessLookupError('already gone')
 
     monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix', getpgid=_raise_lookup))
-    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=1), hard=True)
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=2), hard=True)
 
     # Windows: subprocess.run raises (e.g. taskkill missing).
     monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
@@ -4329,7 +4373,7 @@ def test_signal_worker_process_tree_swallows_all_errors(monkeypatch):
         raise OSError('taskkill not found')
 
     monkeypatch.setattr(model_manager_module.subprocess, 'run', _raise_oserror)
-    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=1), hard=False)
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=2), hard=False)
 
 
 @pytest.mark.skipif(

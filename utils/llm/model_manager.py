@@ -2041,7 +2041,15 @@ def _signal_worker_process_tree(
       never independently block longer than the shutdown lifecycle allows.
     """
     pid = getattr(process, 'pid', None)
-    if pid is None:
+    # Must be a genuine positive PID greater than 1: a non-int (e.g. a test
+    # double's auto-generated Mock attribute) or a bare truthy-but-fake value
+    # must never reach getpgid/killpg/taskkill below. In particular, `int()`
+    # coercion of an unconfigured MagicMock's `.pid` silently yields `1` -
+    # sending SIGTERM/SIGKILL to process group 1 (init) has, in at least one
+    # sandboxed CI environment, taken down the entire runner rather than
+    # merely failing with a permission error, since PID 1 is not always
+    # unreachable to the caller there.
+    if not isinstance(pid, int) or pid <= 1:
         return
     if os.name == 'nt':
         if not hard:

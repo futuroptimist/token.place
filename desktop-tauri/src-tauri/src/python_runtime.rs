@@ -627,6 +627,25 @@ fn path_is_beneath(path: &Path, ancestor: &Path) -> bool {
     path.starts_with(ancestor)
 }
 
+/// True when `exe_path` sits at `<Anything>.app/Contents/MacOS/<exe>`, the
+/// fixed executable location inside a macOS app bundle. A locally built
+/// `.app` run straight out of its `target/.../bundle/macos/` build output
+/// (i.e. before being moved to /Applications) still has this shape, and must
+/// be treated as packaged even though it is nested under the manifest dir's
+/// `target/` tree.
+fn exe_path_is_inside_macos_app_bundle(exe_path: &Path) -> bool {
+    let Some(macos_dir) = exe_path.parent() else {
+        return false;
+    };
+    if macos_dir.file_name().and_then(|name| name.to_str()) != Some("MacOS") {
+        return false;
+    }
+    let Some(contents_dir) = macos_dir.parent() else {
+        return false;
+    };
+    contents_dir.file_name().and_then(|name| name.to_str()) == Some("Contents")
+}
+
 pub fn classify_python_execution_layout(
     current_exe_path: Option<&Path>,
     manifest_dir: &Path,
@@ -634,6 +653,9 @@ pub fn classify_python_execution_layout(
     let Some(exe_path) = current_exe_path else {
         return PythonExecutionLayout::Packaged;
     };
+    if exe_path_is_inside_macos_app_bundle(exe_path) {
+        return PythonExecutionLayout::Packaged;
+    }
     let source_marker = manifest_dir.join("python").join("desktop_runtime_setup.py");
     if source_marker.is_file() && path_is_beneath(exe_path, &manifest_dir.join("target")) {
         PythonExecutionLayout::UnbundledDevelopment
@@ -2351,6 +2373,32 @@ mod tests {
             PythonExecutionLayout::UnbundledDevelopment
         );
         assert!(!is_packaged_execution(Some(&exe), &manifest));
+    }
+
+    #[test]
+    fn macos_app_bundle_executable_under_target_is_still_packaged() {
+        // Reproduces a real local-build-validation failure: running the freshly
+        // built .app straight out of its `target/.../bundle/macos/` build output
+        // (before moving it to /Applications) was misclassified as an unbundled
+        // dev binary purely because it is nested under `target/`, even though its
+        // executable sits at the canonical `<App>.app/Contents/MacOS/<exe>`
+        // location that only ever exists inside a real app bundle.
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = temp.path().join("desktop-tauri/src-tauri");
+        let marker = manifest.join("python").join("desktop_runtime_setup.py");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "# marker\n").unwrap();
+        let exe = manifest
+            .join("target/aarch64-apple-darwin/release/bundle/macos")
+            .join("token.place desktop.app/Contents/MacOS/token-place-desktop-tauri");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+
+        assert_eq!(
+            classify_python_execution_layout(Some(&exe), &manifest),
+            PythonExecutionLayout::Packaged
+        );
+        assert!(is_packaged_execution(Some(&exe), &manifest));
     }
 
     #[test]

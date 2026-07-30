@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import importlib
 import ipaddress
 import json
@@ -2495,6 +2496,7 @@ class RelayClient:
             log_info('api_v1.control_ack_failed request_id={}', request_id)
 
     def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any], *, local_deadline: Optional[float] = None) -> _ApiV1SupervisorOutcome:
+        supervisor_started_at = time.monotonic()
         request_id = api_v1_request_payload['request_id']
         relay_url = self._api_v1_response_relay_url()
         control_available = relay_url in getattr(self, '_api_v1_registered_relays', set())
@@ -2509,6 +2511,10 @@ class RelayClient:
             )
         if local_deadline is None:
             local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload, now=time.monotonic())
+        log_info(
+            'api_v1.inference_supervision_started initial_deadline_budget_ms={}',
+            max(0, int((local_deadline - supervisor_started_at) * 1000)),
+        )
         terminal_status: Optional[str] = None
         terminal_reason = 'unknown'
         future_result: Optional[Dict[str, Any]] = None
@@ -2705,10 +2711,30 @@ class RelayClient:
                     terminal_reason = 'inference_failure'
                     break
             if terminal_status is not None:
+                terminal_observed_at = time.monotonic()
+                log_info(
+                    'api_v1.inference_terminal_observed terminal_source={} elapsed_ms={}',
+                    terminal_reason,
+                    max(0, int((terminal_observed_at - supervisor_started_at) * 1000)),
+                )
                 recovery_succeeded = False
                 try:
+                    terminate_started_at = time.monotonic()
+                    log_info(
+                        'api_v1.worker_terminate_signal elapsed_ms={}',
+                        max(0, int((terminate_started_at - supervisor_started_at) * 1000)),
+                    )
                     recovery_succeeded = self._terminate_current_llama_worker(
                         terminal_reason, recreate=terminal_status != 'operator_stop'
+                    )
+                    # `_terminate_current_llama_worker` may recreate a replacement
+                    # worker (recreate=True), so this timestamp reflects full
+                    # recovery completion, not just OS process exit.
+                    recovery_completed_at = time.monotonic()
+                    log_info(
+                        'api_v1.worker_recovery_complete elapsed_ms={} cancellation_to_recovery_complete_ms={}',
+                        max(0, int((recovery_completed_at - supervisor_started_at) * 1000)),
+                        max(0, int((recovery_completed_at - terminal_observed_at) * 1000)),
                     )
                 except Exception:
                     log_error('api_v1.worker_termination_failed reason={}', terminal_reason)
@@ -4542,6 +4568,32 @@ class RelayClient:
                         shape["text_type"] = type(choice.get("text")).__name__
         return shape
 
+    def _api_v1_local_progress_observer(self, event: Dict[str, Any]) -> None:
+        """Log local-only preparing/prefill/generating progress, privacy-safe.
+
+        `event` is bound to a real request_id and worker generation by
+        ModelManager.create_chat_completion_with_recovery. Never forwarded to
+        the relay: this is a local log line only, matching the relay-blind
+        E2EE guardrail (relay sees ciphertext + safe metadata only).
+        """
+        try:
+            log_info(
+                "api_v1.local_progress request_id={} worker_generation={} sequence={} phase={} "
+                "total_prompt_tokens={} cached_prompt_tokens={} processed_prompt_tokens={} "
+                "generated_tokens={} elapsed_ms={}",
+                event.get("request_id", "local"),
+                event.get("worker_generation", 0),
+                event.get("sequence", 0),
+                event.get("phase", "unknown"),
+                event.get("total_prompt_tokens", 0),
+                event.get("cached_prompt_tokens", 0),
+                event.get("processed_prompt_tokens", 0),
+                event.get("generated_tokens", 0),
+                event.get("elapsed_ms", 0),
+            )
+        except Exception:
+            pass
+
     def _generate_api_v1_response_with_runtime_model(
         self,
         *,
@@ -4742,6 +4794,21 @@ class RelayClient:
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and llm_instance is not None:
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
+            elif callable(create_chat_completion):
+                # Bind this call's real external request_id + a local,
+                # privacy-safe progress observer. create_chat_completion_with_recovery
+                # accepts these as internal keyword-only arguments and rebinds
+                # them against whichever worker generation actually serves the
+                # request (including a post-recovery replacement), so recovery
+                # can never deliver progress for a stale generation to the
+                # wrong request. Not part of the public API v1 schema, and
+                # invisible to the runtime-completion-kwargs filtering below
+                # since they're bound here rather than passed through it.
+                create_chat_completion = functools.partial(
+                    create_chat_completion,
+                    progress_request_id=request_id,
+                    progress_observer=self._api_v1_local_progress_observer,
+                )
 
             if self._api_v1_qwen_non_thinking_required(model_profile) and not callable(qwen_render_complete):
                 return self._api_v1_response_envelope(

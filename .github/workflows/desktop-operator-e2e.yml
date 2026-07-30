@@ -145,7 +145,23 @@ jobs:
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py --skip-packaged
 
       - name: Run packaged cancellation and integration regressions
-        run: python -m pytest tests/integration/test_desktop_qwen64k_packaged_runtime.py -q
+        # This step has hung silently to the job's own timeout-minutes ceiling
+        # more than once (the whole file normally finishes in ~2s locally with
+        # 21 passing tests). A job-level timeout hard-kills the entire job and
+        # skips every remaining step - including `if: always()` upload steps -
+        # so no diagnostic evidence survives that path. Wrapping the command in
+        # a shell-level `timeout` here instead lets *this step* fail cleanly and
+        # quickly (well under the job ceiling) with its already-streamed output
+        # intact, so the actual hang can be diagnosed from the log instead of
+        # disappearing into an unretrievable job-level cancellation.
+        run: |
+          timeout --signal=TERM --kill-after=15s 180s \
+            python -m pytest tests/integration/test_desktop_qwen64k_packaged_runtime.py -q --durations=25
+          status=$?
+          if [ "$status" -eq 124 ]; then
+            echo "::error::integration regressions step hung past its 180s diagnostic timeout"
+          fi
+          exit "$status"
 
       - name: Upload desktop e2e logs on failure
         if: failure()

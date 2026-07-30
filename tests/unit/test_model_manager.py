@@ -4204,7 +4204,30 @@ def test_signal_worker_process_tree_posix_sends_group_signal(monkeypatch):
     ]
 
 
-def test_signal_worker_process_tree_windows_uses_taskkill(monkeypatch):
+def test_signal_worker_process_tree_windows_soft_uses_ctrl_break_event(monkeypatch):
+    """Windows graceful phase: CTRL_BREAK_EVENT to the process group, never
+    taskkill /F (that's forceful, hard-phase only)."""
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.os, 'name', 'nt')
+    run_calls = []
+    monkeypatch.setattr(
+        model_manager_module.subprocess, 'run',
+        lambda *args, **kwargs: run_calls.append((args, kwargs)),
+    )
+    signal_calls = []
+    process = SimpleNamespace(pid=99, send_signal=lambda sig: signal_calls.append(sig))
+
+    model_manager_module._signal_worker_process_tree(process, hard=False)
+
+    assert signal_calls == [getattr(model_manager_module.signal, 'CTRL_BREAK_EVENT', 1)]
+    assert run_calls == []
+
+
+def test_signal_worker_process_tree_windows_hard_uses_taskkill_bounded_by_remaining_budget(monkeypatch):
+    """Windows hard phase: taskkill /F /T, bounded by whatever remains of
+    the caller's own cleanup budget - not an independent five-second
+    timeout stacked on top of it."""
     from utils.llm import model_manager as model_manager_module
 
     monkeypatch.setattr(model_manager_module.os, 'name', 'nt')
@@ -4214,12 +4237,26 @@ def test_signal_worker_process_tree_windows_uses_taskkill(monkeypatch):
         lambda *args, **kwargs: run_calls.append((args, kwargs)),
     )
 
-    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=99), hard=False)
-
+    # No cleanup_started_at supplied: falls back to the full budget.
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=99), hard=True)
     assert len(run_calls) == 1
     (command,), kwargs = run_calls[0]
     assert command == ['taskkill', '/F', '/T', '/PID', '99']
-    assert kwargs.get('timeout') == 5
+    assert kwargs.get('timeout') == pytest.approx(
+        model_manager_module._WORKER_TREE_CLEANUP_BUDGET_SECONDS, abs=0.01
+    )
+
+    # With cleanup_started_at supplied, the remaining budget shrinks by
+    # however much of it has already elapsed.
+    run_calls.clear()
+    started_at = time.monotonic() - 3.0
+    model_manager_module._signal_worker_process_tree(
+        SimpleNamespace(pid=99), hard=True, cleanup_started_at=started_at,
+    )
+    assert len(run_calls) == 1
+    (_command,), kwargs = run_calls[0]
+    remaining = kwargs.get('timeout')
+    assert 0.05 <= remaining <= model_manager_module._WORKER_TREE_CLEANUP_BUDGET_SECONDS - 2.9
 
 
 def test_signal_worker_process_tree_swallows_all_errors(monkeypatch):
@@ -4250,6 +4287,132 @@ def test_signal_worker_process_tree_swallows_all_errors(monkeypatch):
     model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=1), hard=False)
 
 
+@pytest.mark.skipif(
+    os.name != 'posix',
+    reason='real process-tree survival test targets the POSIX session/group path; '
+    'Windows CTRL_BREAK_EVENT/taskkill behavior is covered separately via mocks above',
+)
+def test_real_process_tree_survives_soft_signal_but_dies_on_hard_escalation(tmp_path):
+    """Bounded, real-subprocess regression using the production
+    start_new_session=True setup (see _SubprocessLlamaProxy.__init__):
+    spawn a worker with a heartbeat-producing descendant that ignores the
+    graceful signal, prove the whole tree survives the soft phase, then
+    verify hard escalation kills every process and heartbeats stop.
+    Strict deadlines and a `finally` cleanup ensure a test failure can
+    never orphan real processes on the machine running this suite."""
+    from utils.llm import model_manager as model_manager_module
+
+    heartbeat_path = tmp_path / 'heartbeat.txt'
+    # The descendant is spawned by the "worker" (parent) without its own
+    # start_new_session, so it inherits the parent's process group - the
+    # same relationship a real llama.cpp backend's helper processes would
+    # have to the worker this whole mechanism is built to reach.
+    descendant_script = (
+        "import sys, time\n"
+        "path = sys.argv[1]\n"
+        "while True:\n"
+        "    with open(path, 'a') as fh:\n"
+        "        fh.write(str(time.time()) + chr(10))\n"
+        "    time.sleep(0.05)\n"
+    )
+    parent_script = (
+        "import signal, subprocess, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]])\n"
+        "while True:\n"
+        "    time.sleep(0.05)\n"
+    )
+
+    process = subprocess.Popen(
+        [sys.executable, '-c', parent_script, str(heartbeat_path), descendant_script],
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while not heartbeat_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert heartbeat_path.exists(), 'descendant never started heartbeating'
+
+        def _heartbeat_line_count() -> int:
+            return len(heartbeat_path.read_text().splitlines())
+
+        deadline = time.monotonic() + 5.0
+        before_soft = _heartbeat_line_count()
+        while _heartbeat_line_count() <= before_soft and time.monotonic() < deadline:
+            time.sleep(0.02)
+        before_soft = _heartbeat_line_count()
+
+        # Graceful phase: the descendant's parent ignores SIGTERM, so the
+        # whole tree must survive it.
+        model_manager_module._signal_worker_process_tree(process, hard=False)
+        time.sleep(0.3)
+        assert process.poll() is None, 'parent must survive the graceful (soft) signal'
+        assert _heartbeat_line_count() > before_soft, 'descendant must keep heartbeating past the soft signal'
+
+        # Hard phase: SIGKILL to the whole group must kill both the parent
+        # and the descendant within a bounded deadline.
+        model_manager_module._signal_worker_process_tree(process, hard=True)
+        deadline = time.monotonic() + 5.0
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert process.poll() is not None, 'parent must not survive hard tree-kill'
+
+        stopped_count = _heartbeat_line_count()
+        time.sleep(0.3)
+        assert _heartbeat_line_count() == stopped_count, 'descendant must not survive hard tree-kill'
+    finally:
+        try:
+            if process.poll() is None:
+                pgid = os.getpgid(process.pid)
+                os.killpg(pgid, signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def test_close_graceful_exit_never_reaches_hard_tree_kill(monkeypatch):
+    """A worker that exits cleanly during the graceful wait must never
+    reach the hard (taskkill /F / SIGKILL) phase at all."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._worker_tmpfile = None
+    signal_calls = []
+    monkeypatch.setattr(
+        model_manager_module, '_signal_worker_process_tree',
+        lambda process, *, hard, cleanup_started_at=None: signal_calls.append(hard),
+    )
+
+    class FakeProcess:
+        pid = 123
+        stdin = None
+
+        def __init__(self):
+            self._polls = iter([None, 0])
+
+        def poll(self):
+            return next(self._polls, 0)
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0  # exits cleanly, no exception
+
+        def kill(self):
+            raise AssertionError('kill() must never be reached on a graceful exit')
+
+    proxy._process = FakeProcess()
+
+    proxy.close()
+
+    assert signal_calls == [False]
+
+
 def test_close_signals_process_tree_before_terminate_and_before_hard_kill(monkeypatch):
     """close() must reach for the whole process/session group at both the
     soft (terminate) and hard (kill-fallback) stages, not just the direct
@@ -4262,7 +4425,7 @@ def test_close_signals_process_tree_before_terminate_and_before_hard_kill(monkey
     signal_calls = []
     monkeypatch.setattr(
         model_manager_module, '_signal_worker_process_tree',
-        lambda process, *, hard: signal_calls.append(hard),
+        lambda process, *, hard, cleanup_started_at=None: signal_calls.append(hard),
     )
 
     class FakeProcess:
@@ -4302,7 +4465,7 @@ def test_close_llm_proxy_signals_process_tree_before_terminate_and_before_hard_k
     signal_calls = []
     monkeypatch.setattr(
         model_manager_module, '_signal_worker_process_tree',
-        lambda process, *, hard: signal_calls.append(hard),
+        lambda process, *, hard, cleanup_started_at=None: signal_calls.append(hard),
     )
 
     class FakeProcess:

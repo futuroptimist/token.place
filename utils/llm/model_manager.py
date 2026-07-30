@@ -2009,28 +2009,59 @@ def _safe_worker_error_code(value: Any) -> str:
     return type(value).__name__ if isinstance(value, BaseException) else 'worker_error'
 
 
-def _signal_worker_process_tree(process: Any, *, hard: bool) -> None:
+# Total budget for the hard (tree-kill) phase's external `taskkill`
+# invocation on Windows, shared across a single cleanup cycle rather than
+# an independent timeout stacked on top of the caller's own waits.
+_WORKER_TREE_CLEANUP_BUDGET_SECONDS = 5.0
+
+
+def _signal_worker_process_tree(
+    process: Any, *, hard: bool, cleanup_started_at: Optional[float] = None
+) -> None:
     """Best-effort signal to a worker's whole process/session group.
 
     The llama.cpp worker subprocess is started in its own session/process
     group (`start_new_session=True` on POSIX, `CREATE_NEW_PROCESS_GROUP` on
     Windows) specifically so any helper processes the pinned backend spawns
     into that same group can be reached here too - the direct-process-only
-    `terminate()`/`kill()` calls the caller already performs cannot reach
-    them. This is always a supplement to, never a replacement for, that
-    direct signal: any failure here (permission, platform quirk, the
-    process already gone) is silently ignored, leaving behavior no worse
-    than before this existed.
+    `terminate()`/`kill()` calls the caller performs cannot reach them.
+    This is always a supplement to, never a replacement for, that direct
+    signal: any failure here (permission, platform quirk, the process
+    already gone) is silently ignored, leaving behavior no worse than
+    before this existed.
+
+    Windows has a genuine graceful/hard distinction, unlike a bare
+    `terminate()`/`taskkill /F`, which are both forceful there:
+    - Graceful (`hard=False`): `CTRL_BREAK_EVENT` to the process group
+      (requires `CREATE_NEW_PROCESS_GROUP`, which the worker always uses).
+      Never `taskkill /F` or `Popen.terminate()` here - both kill
+      immediately on Windows and would defeat the graceful attempt.
+    - Hard (`hard=True`): `taskkill /F /T` to kill the whole tree, bounded
+      by whatever remains of `cleanup_started_at`'s budget so this can
+      never independently block longer than the shutdown lifecycle allows.
     """
     pid = getattr(process, 'pid', None)
     if pid is None:
         return
     if os.name == 'nt':
+        if not hard:
+            send_signal = getattr(process, 'send_signal', None)
+            if callable(send_signal):
+                try:
+                    send_signal(getattr(signal, 'CTRL_BREAK_EVENT', 1))
+                except Exception:
+                    pass
+            return
+        if cleanup_started_at is None:
+            remaining = _WORKER_TREE_CLEANUP_BUDGET_SECONDS
+        else:
+            elapsed = time.monotonic() - cleanup_started_at
+            remaining = max(0.05, _WORKER_TREE_CLEANUP_BUDGET_SECONDS - elapsed)
         try:
             subprocess.run(
                 ['taskkill', '/F', '/T', '/PID', str(pid)],
                 capture_output=True,
-                timeout=5,
+                timeout=remaining,
             )
         except Exception:
             pass
@@ -2735,12 +2766,19 @@ class _SubprocessLlamaProxy:
         except Exception:
             pass
         if self._process.poll() is None:
+            cleanup_started_at = time.monotonic()
             _signal_worker_process_tree(self._process, hard=False)
-            self._process.terminate()
+            # On Windows, terminate() is TerminateProcess(): already
+            # forceful, single-process, and would defeat the graceful
+            # CTRL_BREAK_EVENT just sent above. POSIX terminate() (SIGTERM)
+            # is a harmless, redundant echo of the group SIGTERM already
+            # sent to the whole process/session group.
+            if os.name != 'nt':
+                self._process.terminate()
             try:
                 self._process.wait(timeout=1)
             except Exception:
-                _signal_worker_process_tree(self._process, hard=True)
+                _signal_worker_process_tree(self._process, hard=True, cleanup_started_at=cleanup_started_at)
                 try:
                     self._process.kill()
                 except Exception:
@@ -6512,18 +6550,22 @@ class ModelManager:
                 # Supplement the direct-process signal by also reaching the
                 # worker's whole process/session group, since a llama.cpp
                 # backend could spawn helper processes the direct-process
-                # terminate()/kill() below can never reach.
+                # terminate()/kill() below can never reach. On Windows this
+                # is a genuine graceful signal (CTRL_BREAK_EVENT); calling
+                # terminate() (TerminateProcess - already forceful there)
+                # afterward would defeat that, so it's POSIX-only here.
                 _signal_worker_process_tree(process, hard=False)
-                terminate = getattr(process, 'terminate', None)
-                if callable(terminate):
-                    try:
-                        terminate()
-                        self.log_info(
-                            "desktop.llama_cpp_worker.terminate_signal elapsed_ms=%s"
-                            % max(0, int((time.monotonic() - cleanup_started_at) * 1000))
-                        )
-                    except Exception:
-                        pass
+                if os.name != 'nt':
+                    terminate = getattr(process, 'terminate', None)
+                    if callable(terminate):
+                        try:
+                            terminate()
+                            self.log_info(
+                                "desktop.llama_cpp_worker.terminate_signal elapsed_ms=%s"
+                                % max(0, int((time.monotonic() - cleanup_started_at) * 1000))
+                            )
+                        except Exception:
+                            pass
                 wait = getattr(process, 'wait', None)
                 if callable(wait):
                     try:
@@ -6531,7 +6573,7 @@ class ModelManager:
                     except Exception:
                         pass
             if not _dead():
-                _signal_worker_process_tree(process, hard=True)
+                _signal_worker_process_tree(process, hard=True, cleanup_started_at=cleanup_started_at)
                 kill = getattr(process, 'kill', None)
                 if callable(kill):
                     try:

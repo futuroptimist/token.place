@@ -2081,6 +2081,125 @@ def _signal_worker_process_tree(
         pass
 
 
+def _safe_call(fn: Optional[Callable], *args: Any, **kwargs: Any) -> Any:
+    """Call `fn` if callable, swallowing any exception it raises."""
+    if not callable(fn):
+        return None
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _teardown_worker_process(
+    process: Any,
+    *,
+    cleanup_started_at: float,
+    log_info: Optional[Callable[[str], None]] = None,
+    recheck_before_hard: bool = True,
+    wait_after_kill: bool = True,
+    wait_timeout: float = 1.0,
+) -> bool:
+    """Shared soft-signal -> terminate() -> wait() -> hard-signal -> kill()
+    sequence used by both `_SubprocessLlamaProxy.close()` and
+    `ModelManager._close_llm_proxy()`. The caller owns the entry gate
+    (whether the process is worth tearing down at all) and everything after
+    this returns (stream/tmpfile cleanup, etc).
+
+    `close()` and `_close_llm_proxy()` differ in exactly the ways controlled
+    by these keyword-only parameters:
+
+    - `recheck_before_hard`: `close()` passes False - it escalates to the
+      hard phase only if the soft `wait()` call itself raised.
+      `_close_llm_proxy()` passes True - it re-checks `poll()` immediately
+      before the hard phase regardless of whether `wait()` raised (a
+      `wait()` that returns cleanly while `poll()` still reports the
+      process alive must still escalate).
+    - `wait_after_kill`: whether a second, best-effort `wait()` follows
+      `kill()`. `close()` passes False (no second wait); `_close_llm_proxy()`
+      passes True.
+    - `log_info`: only `_close_llm_proxy()` supplies a logger (via
+      `self.log_info`); `close()` has none available and passes `None`, in
+      which case nothing is logged.
+
+    Returns True if the process is confirmed dead (via `poll()`) once the
+    sequence completes.
+    """
+
+    def _poll_dead() -> bool:
+        poll = getattr(process, 'poll', None)
+        if not callable(poll):
+            return False
+        try:
+            return poll() is not None
+        except Exception:
+            return False
+
+    # Supplement the direct-process signal by also reaching the worker's
+    # whole process/session group, since a llama.cpp backend could spawn
+    # helper processes the direct-process terminate()/kill() below can
+    # never reach.
+    _signal_worker_process_tree(process, hard=False)
+
+    # On Windows, terminate() is TerminateProcess(): already forceful,
+    # single-process, and would defeat the graceful CTRL_BREAK_EVENT just
+    # sent above. POSIX terminate() (SIGTERM) is a harmless, redundant echo
+    # of the group SIGTERM already sent to the whole process/session group.
+    if os.name != 'nt':
+        terminate = getattr(process, 'terminate', None)
+        if callable(terminate):
+            # Not _safe_call: the log line must fire only when terminate()
+            # did NOT raise, and a successful terminate() legitimately
+            # returns None - indistinguishable from _safe_call's failure
+            # return via return value alone.
+            try:
+                terminate()
+            except Exception:
+                pass
+            else:
+                if log_info is not None:
+                    log_info(
+                        "desktop.llama_cpp_worker.terminate_signal elapsed_ms=%s"
+                        % max(0, int((time.monotonic() - cleanup_started_at) * 1000))
+                    )
+
+    # Not _safe_call: close()'s escalation decision (recheck_before_hard
+    # False) depends on whether THIS call raised, which _safe_call's return
+    # value cannot distinguish from a legitimate None result.
+    wait_raised = False
+    wait = getattr(process, 'wait', None)
+    if callable(wait):
+        try:
+            wait(timeout=wait_timeout)
+        except Exception:
+            wait_raised = True
+
+    escalate = (not _poll_dead()) if recheck_before_hard else wait_raised
+
+    if escalate:
+        _signal_worker_process_tree(process, hard=True, cleanup_started_at=cleanup_started_at)
+        kill = getattr(process, 'kill', None)
+        if callable(kill):
+            # Same reasoning as terminate() above: success-gated logging.
+            try:
+                kill()
+            except Exception:
+                pass
+            else:
+                if log_info is not None:
+                    log_info(
+                        "desktop.llama_cpp_worker.hard_kill_signal elapsed_ms=%s"
+                        % max(0, int((time.monotonic() - cleanup_started_at) * 1000))
+                    )
+        if wait_after_kill:
+            # Fire-and-forget: close() never reaches here (wait_after_kill
+            # always False for it); _close_llm_proxy() recomputes
+            # _poll_dead() below instead of trusting this wait()'s result.
+            _safe_call(getattr(process, 'wait', None), timeout=wait_timeout)
+
+    return _poll_dead()
+
+
 class _SubprocessLlamaProxy:
     """Minimal llama_cpp.Llama proxy for no-SIGALRM runtimes."""
 
@@ -2774,23 +2893,12 @@ class _SubprocessLlamaProxy:
         except Exception:
             pass
         if self._process.poll() is None:
-            cleanup_started_at = time.monotonic()
-            _signal_worker_process_tree(self._process, hard=False)
-            # On Windows, terminate() is TerminateProcess(): already
-            # forceful, single-process, and would defeat the graceful
-            # CTRL_BREAK_EVENT just sent above. POSIX terminate() (SIGTERM)
-            # is a harmless, redundant echo of the group SIGTERM already
-            # sent to the whole process/session group.
-            if os.name != 'nt':
-                self._process.terminate()
-            try:
-                self._process.wait(timeout=1)
-            except Exception:
-                _signal_worker_process_tree(self._process, hard=True, cleanup_started_at=cleanup_started_at)
-                try:
-                    self._process.kill()
-                except Exception:
-                    pass
+            _teardown_worker_process(
+                self._process,
+                cleanup_started_at=time.monotonic(),
+                recheck_before_hard=False,
+                wait_after_kill=False,
+            )
         tmpfile = getattr(self, '_worker_tmpfile', None)
         if tmpfile:
             try:
@@ -6525,18 +6633,8 @@ class ModelManager:
         process = getattr(llm, '_process', None)
 
         def _close_or_join_resource(resource: Any) -> None:
-            closer = getattr(resource, 'close', None)
-            if callable(closer):
-                try:
-                    closer()
-                except Exception:
-                    pass
-            join = getattr(resource, 'join', None)
-            if callable(join):
-                try:
-                    join(timeout=0.25)
-                except Exception:
-                    pass
+            _safe_call(getattr(resource, 'close', None))
+            _safe_call(getattr(resource, 'join', None), timeout=0.25)
 
         def _dead() -> bool:
             if process is None:
@@ -6555,50 +6653,15 @@ class ModelManager:
             # any proxy close so third-party close() cannot block cancellation or
             # ordinary invalidation while holding up recovery.
             if not _dead():
-                # Supplement the direct-process signal by also reaching the
-                # worker's whole process/session group, since a llama.cpp
-                # backend could spawn helper processes the direct-process
-                # terminate()/kill() below can never reach. On Windows this
-                # is a genuine graceful signal (CTRL_BREAK_EVENT); calling
-                # terminate() (TerminateProcess - already forceful there)
-                # afterward would defeat that, so it's POSIX-only here.
-                _signal_worker_process_tree(process, hard=False)
-                if os.name != 'nt':
-                    terminate = getattr(process, 'terminate', None)
-                    if callable(terminate):
-                        try:
-                            terminate()
-                            self.log_info(
-                                "desktop.llama_cpp_worker.terminate_signal elapsed_ms=%s"
-                                % max(0, int((time.monotonic() - cleanup_started_at) * 1000))
-                            )
-                        except Exception:
-                            pass
-                wait = getattr(process, 'wait', None)
-                if callable(wait):
-                    try:
-                        wait(timeout=1.0)
-                    except Exception:
-                        pass
-            if not _dead():
-                _signal_worker_process_tree(process, hard=True, cleanup_started_at=cleanup_started_at)
-                kill = getattr(process, 'kill', None)
-                if callable(kill):
-                    try:
-                        kill()
-                        self.log_info(
-                            "desktop.llama_cpp_worker.hard_kill_signal elapsed_ms=%s"
-                            % max(0, int((time.monotonic() - cleanup_started_at) * 1000))
-                        )
-                    except Exception:
-                        pass
-                wait = getattr(process, 'wait', None)
-                if callable(wait):
-                    try:
-                        wait(timeout=1.0)
-                    except Exception:
-                        pass
-            process_stopped = _dead()
+                process_stopped = _teardown_worker_process(
+                    process,
+                    cleanup_started_at=cleanup_started_at,
+                    log_info=self.log_info,
+                    recheck_before_hard=True,
+                    wait_after_kill=True,
+                )
+            else:
+                process_stopped = True
             # A live stdout iterator can own TextIOWrapper's internal lock.
             # Streams are therefore disposed only after verified process death,
             # when EOF has released the persistent reader.

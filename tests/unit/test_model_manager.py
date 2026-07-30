@@ -7540,6 +7540,17 @@ def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_forma
     return json.loads(response.split(':', 1)[1])
 
 
+def _start_bounded_frame_reader(stream):
+    frames = queue.Queue()
+
+    def _read():
+        for line in stream:
+            frames.put(json.loads(line.split(':', 1)[1]))
+
+    threading.Thread(target=_read, daemon=True).start()
+    return lambda timeout=2: frames.get(timeout=timeout)
+
+
 def test_llama_worker_progress_eval_batches_cached_prefix_and_phase_are_exact(tmp_path):
     """Exercise the worker adapter while its second real decode is blocked."""
     package_dir = tmp_path / 'llama_cpp'
@@ -7596,9 +7607,10 @@ class Llama:
     try:
         assert process.stdin is not None
         assert process.stdout is not None
+        read_frame = _start_bounded_frame_reader(process.stdout)
         process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
         process.stdin.flush()
-        assert json.loads(process.stdout.readline().split(':', 1)[1])['status'] == 'ok'
+        assert read_frame()['status'] == 'ok'
         process.stdin.write(json.dumps({
             'method': 'create_chat_completion',
             'args': [[{'role': 'user', 'content': 'private prompt'}]],
@@ -7607,23 +7619,23 @@ class Llama:
         process.stdin.flush()
 
         frames = []
-        while len(frames) < 3:
-            frames.append(json.loads(process.stdout.readline().split(':', 1)[1]))
+        while len(frames) < 2:
+            frames.append(read_frame())
         assert (tmp_path / 'second-batch-blocked').exists()
-        assert [frame['phase'] for frame in frames] == ['preparing', 'prefill', 'prefill']
+        assert [frame['phase'] for frame in frames] == ['preparing', 'prefill']
         first_batch = frames[-1]
         assert (first_batch['cached_prompt_tokens'], first_batch['processed_prompt_tokens']) == (2, 4)
 
         (tmp_path / 'release-second-batch').touch()
         while True:
-            frame = json.loads(process.stdout.readline().split(':', 1)[1])
+            frame = read_frame()
             frames.append(frame)
             if frame.get('status') == 'ok' and 'result' in frame:
                 break
 
         progress = [frame for frame in frames if frame.get('type') == 'inference_progress']
         phases = [frame['phase'] for frame in progress]
-        assert phases.count('prefill') == 3  # start, one batch, and exactly one final
+        assert phases.count('prefill') == 2  # one batch and exactly one final
         assert phases[-1] == 'generating'
         assert progress[-2]['processed_prompt_tokens'] == progress[-2]['total_prompt_tokens'] == 5
         assert progress[-1]['generated_tokens'] == 1
@@ -7633,6 +7645,94 @@ class Llama:
         } for frame in progress)
         assert 'private prompt' not in json.dumps(progress)
         assert all(0 <= frame['cached_prompt_tokens'] <= frame['processed_prompt_tokens'] <= 5 for frame in progress)
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ('branch', 'cached'),
+    [('exact', 5), ('replay', 4), ('partial', 2), ('reset', 0)],
+)
+def test_llama_worker_progress_cached_count_uses_generator_decision(tmp_path, branch, cached):
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    (package_dir / '__init__.py').write_text(f'''
+class Context:
+    def decode(self, batch):
+        pass
+    def kv_cache_seq_rm(self, *args):
+        return False
+
+class Llama:
+    def __init__(self, *args, **kwargs):
+        self.n_batch = 2
+        self.n_tokens = 5
+        self._ctx = Context()
+    def apply_chat_template(self, messages, **kwargs):
+        return 'rendered'
+    def tokenize(self, prompt, add_bos=False):
+        return [11, 12, 13, 14, 15]
+    def eval(self, tokens):
+        for offset in range(0, len(tokens), self.n_batch):
+            batch = tokens[offset:offset + self.n_batch]
+            self._ctx.decode(batch)
+            self.n_tokens += len(batch)
+    def sample(self):
+        return 42
+    def create_chat_completion(self, *args, **kwargs):
+        branch = {branch!r}
+        if branch == 'exact':
+            self.n_tokens = 5
+            self.eval([])
+        elif branch == 'replay':
+            self.n_tokens = 4
+            self.eval([15])
+        elif branch == 'partial':
+            self.n_tokens = 2
+            self.eval([13, 14, 15])
+        else:
+            assert self._ctx.kv_cache_seq_rm(0, 0, -1) is False
+            self.n_tokens = 0
+            self.eval([11, 12, 13, 14, 15])
+        self.sample()
+        self.eval([42])
+        return {{'choices': [{{'message': {{'content': 'ok'}}}}]}}
+''')
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
+    process = subprocess.Popen(
+        [sys.executable, '-c', 'from utils.llm.model_manager import _LLAMA_CPP_RUNTIME_WORKER_CODE; exec(_LLAMA_CPP_RUNTIME_WORKER_CODE)'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, cwd=tmp_path,
+    )
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        read_frame = _start_bounded_frame_reader(process.stdout)
+        process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+        process.stdin.flush()
+        assert read_frame()['status'] == 'ok'
+        process.stdin.write(json.dumps({
+            'method': 'create_chat_completion', 'args': [[]], 'kwargs': {},
+        }) + '\n')
+        process.stdin.flush()
+        frames = []
+        while True:
+            frame = read_frame()
+            frames.append(frame)
+            if frame.get('status') == 'ok' and 'result' in frame:
+                break
+        progress = [frame for frame in frames if frame.get('type') == 'inference_progress']
+        prefill = [frame for frame in progress if frame['phase'] == 'prefill']
+        assert prefill
+        assert all(frame['cached_prompt_tokens'] == cached for frame in prefill)
+        assert [frame['processed_prompt_tokens'] for frame in prefill] == sorted(
+            frame['processed_prompt_tokens'] for frame in prefill
+        )
+        assert prefill[-1]['processed_prompt_tokens'] == prefill[-1]['total_prompt_tokens'] == 5
+        assert progress[-1]['phase'] == 'generating'
+        generating_index = next(i for i, frame in enumerate(progress) if frame['phase'] == 'generating')
+        assert all(frame['phase'] != 'prefill' for frame in progress[generating_index:])
     finally:
         process.kill()
         process.wait(timeout=5)

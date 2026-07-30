@@ -3844,6 +3844,23 @@ if callable(_original_eval):
         if not isinstance(state, dict) or state['generating']:
             return _original_eval(tokens)
 
+        # generate() has now completed its cache reuse/reset decision.  Its
+        # current token count is therefore authoritative (unlike a common
+        # prefix computed before generate() runs).
+        if not state['cached_recorded']:
+            retained = min(state['total'], max(0, int(getattr(llama, 'n_tokens', 0) or 0)))
+            state['cached'] = retained
+            state['processed'] = retained
+            state['cached_recorded'] = True
+        if not tokens:
+            result = _original_eval(tokens)
+            if not state['prefill_complete']:
+                state['processed'] = state['total']
+                state['prefill_complete'] = True
+                state['last_emit'] = time.monotonic()
+                _emit_progress(state, 'prefill')
+            return result
+
         # Llama.eval owns batching.  Observe its decode boundary rather than
         # duplicating that implementation so progress advances only after an
         # actual batch has completed successfully.
@@ -3911,7 +3928,7 @@ def _emit_progress(state, phase):
 def _start_progress(request):
     global _progress
     started = time.monotonic()
-    _progress = {'started': started, 'last_emit': started, 'total': 0, 'cached': 0, 'processed': 0, 'generated': 0, 'generating': False, 'prefill_complete': False}
+    _progress = {'started': started, 'last_emit': started, 'total': 0, 'cached': 0, 'processed': 0, 'generated': 0, 'generating': False, 'prefill_complete': False, 'cached_recorded': False}
     _emit_progress(_progress, 'preparing')
     try:
         kwargs = request.get('kwargs', {})
@@ -3933,21 +3950,11 @@ def _start_progress(request):
         rendered, _ = _render_chat_with_runtime_template(llama, request.get('args', []), render_kwargs)
         tokens = llama.tokenize(rendered.encode('utf-8'), add_bos=False)
         total = len(tokens)
-        existing_count = max(0, int(getattr(llama, 'n_tokens', 0) or 0))
-        existing = list(getattr(llama, '_input_ids', [])[:existing_count])
-        cached = 0
-        # Pinned Llama.generate deliberately re-evaluates the final prompt
-        # token so its logits are current; only the preceding prefix is reused.
-        for previous, current in zip(existing, tokens[:-1]):
-            if int(previous) != int(current):
-                break
-            cached += 1
-        _progress.update({'total': total, 'cached': cached, 'processed': cached})
+        _progress['total'] = total
     except Exception:
         # Inference remains authoritative.  If preparation cannot be inspected,
         # retain privacy-safe zero counters rather than estimating progress.
         pass
-    _emit_progress(_progress, 'prefill')
 
 for line in sys.stdin:
     request = None

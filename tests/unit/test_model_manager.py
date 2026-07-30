@@ -7876,7 +7876,17 @@ class Llama:
         frames = []
         while len(frames) < 2:
             frames.append(read_frame())
-        assert (tmp_path / 'second-batch-blocked').exists()
+        # The marker file is created by the *subprocess* immediately after it
+        # emits this frame, not by the *parent* observing it - these are two
+        # separate processes, so there is no happens-before guarantee that
+        # the file already exists the instant this side finishes reading the
+        # frame off the pipe. Poll briefly for it instead of asserting
+        # instantaneous availability (this raced on a CI runner where
+        # scheduling margins differ from a local dev machine).
+        deadline = time.monotonic() + 2.0
+        while not (tmp_path / 'second-batch-blocked').exists():
+            assert time.monotonic() < deadline, "second batch's decode() never started"
+            time.sleep(0.01)
         assert [frame['phase'] for frame in frames] == ['preparing', 'prefill']
         first_batch = frames[-1]
         assert (first_batch['cached_prompt_tokens'], first_batch['processed_prompt_tokens']) == (2, 4)

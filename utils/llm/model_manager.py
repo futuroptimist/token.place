@@ -2151,16 +2151,20 @@ def _teardown_worker_process(
             # Not _safe_call: the log line must fire only when terminate()
             # did NOT raise, and a successful terminate() legitimately
             # returns None - indistinguishable from _safe_call's failure
-            # return via return value alone.
+            # return via return value alone. The log call itself still goes
+            # through _safe_call so a raising logger can't abort teardown
+            # (matches the pre-extraction behavior, where terminate() and
+            # the log call shared one try/except).
             try:
                 terminate()
             except Exception:
                 pass
             else:
                 if log_info is not None:
-                    log_info(
+                    _safe_call(
+                        log_info,
                         "desktop.llama_cpp_worker.terminate_signal elapsed_ms=%s"
-                        % max(0, int((time.monotonic() - cleanup_started_at) * 1000))
+                        % max(0, int((time.monotonic() - cleanup_started_at) * 1000)),
                     )
 
     # Not _safe_call: close()'s escalation decision (recheck_before_hard
@@ -2180,16 +2184,18 @@ def _teardown_worker_process(
         _signal_worker_process_tree(process, hard=True, cleanup_started_at=cleanup_started_at)
         kill = getattr(process, 'kill', None)
         if callable(kill):
-            # Same reasoning as terminate() above: success-gated logging.
+            # Same reasoning as terminate() above: success-gated logging via
+            # _safe_call so a raising logger can't abort teardown.
             try:
                 kill()
             except Exception:
                 pass
             else:
                 if log_info is not None:
-                    log_info(
+                    _safe_call(
+                        log_info,
                         "desktop.llama_cpp_worker.hard_kill_signal elapsed_ms=%s"
-                        % max(0, int((time.monotonic() - cleanup_started_at) * 1000))
+                        % max(0, int((time.monotonic() - cleanup_started_at) * 1000)),
                     )
         if wait_after_kill:
             # Fire-and-forget: close() never reaches here (wait_after_kill

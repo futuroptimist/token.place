@@ -26,6 +26,35 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from utils.llm.model_manager import ModelManager
 
 
+class _FakeNamedOS:
+    """Delegates to the real `os` module except for `.name` and any
+    explicitly overridden attributes.
+
+    Swapping model_manager's own `os` reference (via
+    ``monkeypatch.setattr(model_manager_module, 'os', ...)``) rather than
+    mutating the real global `os` module means pathlib's internal
+    WindowsPath/PosixPath dispatch - which imports `os` itself - is
+    unaffected. Mutating the real `os.name` directly is dangerous: if the
+    simulated platform doesn't match the CI runner's actual platform,
+    pytest's own failure-reporting machinery can crash trying to build a
+    `Path` while the patch is still live (e.g. `NotImplementedError: cannot
+    instantiate 'PosixPath'/'WindowsPath' on your system`).
+    """
+
+    def __init__(self, name: str, **overrides):
+        self._name = name
+        self._overrides = overrides
+
+    def __getattr__(self, item):
+        if item in self._overrides:
+            return self._overrides[item]
+        return getattr(os, item)
+
+    @property
+    def name(self):
+        return self._name
+
+
 class _ToDictOnly:
     """Helper class that provides a working to_dict implementation."""
 
@@ -3211,6 +3240,12 @@ def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
         return process
 
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
+    # Force the POSIX close() branch deterministically: FakeProcess has no
+    # `pid`/`send_signal`, so it doesn't simulate a real Windows process, and
+    # on a real Windows CI runner close()'s soft phase skips terminate()
+    # entirely (forceful there) - this test is about the terminate-before-kill
+    # ordering, which is POSIX-specific given FakeProcess's shape.
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix'))
 
     with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
         model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
@@ -4139,15 +4174,20 @@ def test_repeated_command_cycles_leave_no_resource_accumulation(monkeypatch):
         assert proxy._completed_commands == set()
 
 
-def test_close_signals_stdin_eof_before_terminating_the_process():
+def test_close_signals_stdin_eof_before_terminating_the_process(monkeypatch):
     """P3 regression-matrix gap (terminate-before-close ordering): stdin is
     closed - signalling EOF to the child - before the process is
     terminated/killed. This is the ordering the whole PR is built around
     (never close stdout/stderr while a reader may hold their lock; here we
     lock in the stdin/terminate/wait ordering deterministically via a
-    recorded call order, not timing)."""
+    recorded call order, not timing).
+
+    Forces the POSIX branch: on Windows, close()'s soft phase intentionally
+    skips terminate() (forceful there), so this ordering is POSIX-specific.
+    """
     from utils.llm import model_manager as model_manager_module
 
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix'))
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
     proxy._closed = False
     proxy._worker_tmpfile = None
@@ -4186,22 +4226,29 @@ def test_close_signals_stdin_eof_before_terminating_the_process():
 
 
 def test_signal_worker_process_tree_posix_sends_group_signal(monkeypatch):
+    """Forces the POSIX branch via a delegating `os` proxy (not the real
+    `os` module) so this is safe to simulate on a real Windows CI runner.
+    Real Windows also lacks `signal.SIGKILL` entirely, so that constant is
+    patched too rather than read from the (possibly Windows) real module."""
     from utils.llm import model_manager as model_manager_module
 
-    monkeypatch.setattr(model_manager_module.os, 'name', 'posix')
     killpg_calls = []
-    monkeypatch.setattr(model_manager_module.os, 'getpgid', lambda pid: pid + 1000)
     monkeypatch.setattr(
-        model_manager_module.os, 'killpg', lambda pgid, sig: killpg_calls.append((pgid, sig))
+        model_manager_module,
+        'os',
+        _FakeNamedOS(
+            'posix',
+            getpgid=lambda pid: pid + 1000,
+            killpg=lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        ),
     )
+    monkeypatch.setattr(model_manager_module.signal, 'SIGTERM', 15, raising=False)
+    monkeypatch.setattr(model_manager_module.signal, 'SIGKILL', 9, raising=False)
 
     model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=42), hard=False)
     model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=42), hard=True)
 
-    assert killpg_calls == [
-        (1042, model_manager_module.signal.SIGTERM),
-        (1042, model_manager_module.signal.SIGKILL),
-    ]
+    assert killpg_calls == [(1042, 15), (1042, 9)]
 
 
 def test_signal_worker_process_tree_windows_soft_uses_ctrl_break_event(monkeypatch):
@@ -4209,7 +4256,7 @@ def test_signal_worker_process_tree_windows_soft_uses_ctrl_break_event(monkeypat
     taskkill /F (that's forceful, hard-phase only)."""
     from utils.llm import model_manager as model_manager_module
 
-    monkeypatch.setattr(model_manager_module.os, 'name', 'nt')
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
     run_calls = []
     monkeypatch.setattr(
         model_manager_module.subprocess, 'run',
@@ -4230,7 +4277,7 @@ def test_signal_worker_process_tree_windows_hard_uses_taskkill_bounded_by_remain
     timeout stacked on top of it."""
     from utils.llm import model_manager as model_manager_module
 
-    monkeypatch.setattr(model_manager_module.os, 'name', 'nt')
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
     run_calls = []
     monkeypatch.setattr(
         model_manager_module.subprocess, 'run',
@@ -4269,16 +4316,14 @@ def test_signal_worker_process_tree_swallows_all_errors(monkeypatch):
     model_manager_module._signal_worker_process_tree(SimpleNamespace(), hard=False)
 
     # POSIX: getpgid/killpg both raise.
-    monkeypatch.setattr(model_manager_module.os, 'name', 'posix')
-
     def _raise_lookup(*_args, **_kwargs):
         raise ProcessLookupError('already gone')
 
-    monkeypatch.setattr(model_manager_module.os, 'getpgid', _raise_lookup)
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix', getpgid=_raise_lookup))
     model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=1), hard=True)
 
     # Windows: subprocess.run raises (e.g. taskkill missing).
-    monkeypatch.setattr(model_manager_module.os, 'name', 'nt')
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
 
     def _raise_oserror(*_args, **_kwargs):
         raise OSError('taskkill not found')
@@ -4555,24 +4600,7 @@ def test_subprocess_proxy_uses_windows_process_group_creationflags(monkeypatch):
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
     monkeypatch.setattr(model_manager_module.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200, raising=False)
 
-    class _WindowsNameOS:
-        """Delegates to the real `os` module except for `.name`.
-
-        Swapping model_manager's own `os` reference (rather than the global
-        `os.name`) means pathlib's internal WindowsPath/PosixPath dispatch —
-        which imports `os` itself — is unaffected, so Path.cwd() calls
-        elsewhere in the constructor (sys.path probing) still work normally
-        on this POSIX test runner.
-        """
-
-        def __getattr__(self, item):
-            return getattr(os, item)
-
-        @property
-        def name(self):
-            return 'nt'
-
-    monkeypatch.setattr(model_manager_module, 'os', _WindowsNameOS())
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
 
     model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
 

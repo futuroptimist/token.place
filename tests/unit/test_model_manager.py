@@ -6387,8 +6387,15 @@ def test_llama_subprocess_transport_error_omits_unsafely_unallowlisted_secret():
     assert 'SECRET_TOKEN' not in error
     assert 'authorization' not in error
 
-def test_subprocess_llama_proxy_liveness_and_close_edge_cases():
+def test_subprocess_llama_proxy_liveness_and_close_edge_cases(monkeypatch):
     from utils.llm import model_manager as model_manager_module
+
+    # Forces the POSIX close() branch: the fake process below has no `pid`
+    # (so _signal_worker_process_tree is a no-op) and this test asserts
+    # terminate() is unconditionally called, which is POSIX-only behavior -
+    # on real Windows, close()'s soft phase intentionally skips terminate()
+    # (forceful there).
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix'))
 
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
     proxy._closed = False
@@ -6545,6 +6552,11 @@ def test_model_manager_cancellation_recreates_outside_non_reentrant_lock(monkeyp
 
 def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_path, monkeypatch):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    # Forces the POSIX close() branch: these fake processes have no `pid`
+    # (so _signal_worker_process_tree is a no-op) and assert terminate() is
+    # unconditionally called, which is POSIX-only - on real Windows,
+    # _close_llm_proxy's soft phase intentionally skips terminate() (forceful there).
+    monkeypatch.setattr('utils.llm.model_manager.os', _FakeNamedOS('posix'))
 
     already_dead = SimpleNamespace(
         close=MagicMock(),
@@ -6635,6 +6647,8 @@ def test_model_manager_cancellation_without_active_worker_recreate_false_and_fai
 
 def test_close_llm_proxy_wait_failure_after_kill_is_bounded(tmp_path, monkeypatch):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    # Forces the POSIX close() branch (see test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases).
+    monkeypatch.setattr('utils.llm.model_manager.os', _FakeNamedOS('posix'))
     process = SimpleNamespace(
         poll=MagicMock(return_value=None),
         terminate=MagicMock(side_effect=RuntimeError("terminate failed")),
@@ -6742,6 +6756,8 @@ def test_model_manager_cancellation_active_worker_skip_recreation_and_close_with
 
 def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    # Forces the POSIX close() branch (see test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases).
+    monkeypatch.setattr('utils.llm.model_manager.os', _FakeNamedOS('posix'))
     close_fails = SimpleNamespace(close=MagicMock(side_effect=RuntimeError("close failed")))
 
     manager._close_llm_proxy(close_fails, terminate_process=False)
@@ -6764,6 +6780,8 @@ def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch):
 
 def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, monkeypatch):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    # Forces the POSIX close() branch (see test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases).
+    monkeypatch.setattr('utils.llm.model_manager.os', _FakeNamedOS('posix'))
     close_entered = threading.Event()
     close_release = threading.Event()
     poll_values = iter([None, None, 0])
@@ -6896,6 +6914,8 @@ sys.exit(0)
 
 def test_invalidate_llm_detaches_before_bounded_subprocess_cleanup(tmp_path, monkeypatch):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
+    # Forces the POSIX close() branch (see test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases).
+    monkeypatch.setattr('utils.llm.model_manager.os', _FakeNamedOS('posix'))
     poll_values = iter([None, None, None, 0])
     process = SimpleNamespace(
         poll=MagicMock(side_effect=lambda: next(poll_values, 0)),
@@ -10074,6 +10094,12 @@ def test_subprocess_proxy_reports_actual_child_model_path_exists_with_relative_s
 
 def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
     from utils.llm import model_manager as model_manager_module
+
+    # Forces the POSIX close() branch: FakeProcess below has no `pid` (so
+    # _signal_worker_process_tree is a no-op) and this test asserts
+    # terminate() is unconditionally called, which is POSIX-only - on real
+    # Windows, close()'s soft phase intentionally skips terminate() (forceful there).
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix'))
 
     popen_calls = []
 

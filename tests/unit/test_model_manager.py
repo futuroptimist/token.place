@@ -55,6 +55,21 @@ class _FakeNamedOS:
         return self._name
 
 
+@pytest.fixture
+def posix_os(monkeypatch):
+    """Forces the POSIX branch of model_manager's own `os` reference (see
+    _FakeNamedOS above for why the real os module is never mutated)."""
+    from utils.llm import model_manager as model_manager_module
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix'))
+
+
+@pytest.fixture
+def windows_os(monkeypatch):
+    """Forces the Windows branch - see posix_os / _FakeNamedOS above."""
+    from utils.llm import model_manager as model_manager_module
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
+
+
 class _ToDictOnly:
     """Helper class that provides a working to_dict implementation."""
 
@@ -3193,7 +3208,7 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
     assert created
 
 
-def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
+def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch, posix_os):
     from utils.llm import model_manager as model_manager_module
 
     stop_stdout = threading.Event()
@@ -3240,12 +3255,6 @@ def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
         return process
 
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
-    # Force the POSIX close() branch deterministically: FakeProcess has no
-    # `pid`/`send_signal`, so it doesn't simulate a real Windows process, and
-    # on a real Windows CI runner close()'s soft phase skips terminate()
-    # entirely (forceful there) - this test is about the terminate-before-kill
-    # ordering, which is POSIX-specific given FakeProcess's shape.
-    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix'))
 
     with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout) as exc_info:
         model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
@@ -4174,20 +4183,16 @@ def test_repeated_command_cycles_leave_no_resource_accumulation(monkeypatch):
         assert proxy._completed_commands == set()
 
 
-def test_close_signals_stdin_eof_before_terminating_the_process(monkeypatch):
+def test_close_signals_stdin_eof_before_terminating_the_process(posix_os):
     """P3 regression-matrix gap (terminate-before-close ordering): stdin is
     closed - signalling EOF to the child - before the process is
     terminated/killed. This is the ordering the whole PR is built around
     (never close stdout/stderr while a reader may hold their lock; here we
     lock in the stdin/terminate/wait ordering deterministically via a
     recorded call order, not timing).
-
-    Forces the POSIX branch: on Windows, close()'s soft phase intentionally
-    skips terminate() (forceful there), so this ordering is POSIX-specific.
     """
     from utils.llm import model_manager as model_manager_module
 
-    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix'))
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
     proxy._closed = False
     proxy._worker_tmpfile = None
@@ -4295,12 +4300,11 @@ def test_signal_worker_process_tree_rejects_non_positive_or_non_int_pids(monkeyp
     assert getpgid_calls == [2]
 
 
-def test_signal_worker_process_tree_windows_soft_uses_ctrl_break_event(monkeypatch):
+def test_signal_worker_process_tree_windows_soft_uses_ctrl_break_event(monkeypatch, windows_os):
     """Windows graceful phase: CTRL_BREAK_EVENT to the process group, never
     taskkill /F (that's forceful, hard-phase only)."""
     from utils.llm import model_manager as model_manager_module
 
-    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
     run_calls = []
     monkeypatch.setattr(
         model_manager_module.subprocess, 'run',
@@ -4315,13 +4319,12 @@ def test_signal_worker_process_tree_windows_soft_uses_ctrl_break_event(monkeypat
     assert run_calls == []
 
 
-def test_signal_worker_process_tree_windows_hard_uses_taskkill_bounded_by_remaining_budget(monkeypatch):
+def test_signal_worker_process_tree_windows_hard_uses_taskkill_bounded_by_remaining_budget(monkeypatch, windows_os):
     """Windows hard phase: taskkill /F /T, bounded by whatever remains of
     the caller's own cleanup budget - not an independent five-second
     timeout stacked on top of it."""
     from utils.llm import model_manager as model_manager_module
 
-    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
     run_calls = []
     monkeypatch.setattr(
         model_manager_module.subprocess, 'run',
@@ -4599,7 +4602,7 @@ def test_read_llama_subprocess_message_demux_aware_timeout():
         )
 
 
-def test_subprocess_proxy_uses_windows_process_group_creationflags(monkeypatch):
+def test_subprocess_proxy_uses_windows_process_group_creationflags(monkeypatch, windows_os):
     from utils.llm import model_manager as model_manager_module
 
     class FakeStdin:
@@ -4643,8 +4646,6 @@ def test_subprocess_proxy_uses_windows_process_group_creationflags(monkeypatch):
 
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
     monkeypatch.setattr(model_manager_module.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200, raising=False)
-
-    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
 
     model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
 
@@ -6431,15 +6432,8 @@ def test_llama_subprocess_transport_error_omits_unsafely_unallowlisted_secret():
     assert 'SECRET_TOKEN' not in error
     assert 'authorization' not in error
 
-def test_subprocess_llama_proxy_liveness_and_close_edge_cases(monkeypatch):
+def test_subprocess_llama_proxy_liveness_and_close_edge_cases(monkeypatch, posix_os):
     from utils.llm import model_manager as model_manager_module
-
-    # Forces the POSIX close() branch: the fake process below has no `pid`
-    # (so _signal_worker_process_tree is a no-op) and this test asserts
-    # terminate() is unconditionally called, which is POSIX-only behavior -
-    # on real Windows, close()'s soft phase intentionally skips terminate()
-    # (forceful there).
-    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix'))
 
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
     proxy._closed = False
@@ -6594,13 +6588,8 @@ def test_model_manager_cancellation_recreates_outside_non_reentrant_lock(monkeyp
     manager.log_warning.assert_not_called()
 
 
-def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_path, monkeypatch):
+def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_path, monkeypatch, posix_os):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
-    # Forces the POSIX close() branch: these fake processes have no `pid`
-    # (so _signal_worker_process_tree is a no-op) and assert terminate() is
-    # unconditionally called, which is POSIX-only - on real Windows,
-    # _close_llm_proxy's soft phase intentionally skips terminate() (forceful there).
-    monkeypatch.setattr('utils.llm.model_manager.os', _FakeNamedOS('posix'))
 
     already_dead = SimpleNamespace(
         close=MagicMock(),
@@ -6689,10 +6678,8 @@ def test_model_manager_cancellation_without_active_worker_recreate_false_and_fai
     assert manager.last_worker_error_code == "expired"
 
 
-def test_close_llm_proxy_wait_failure_after_kill_is_bounded(tmp_path, monkeypatch):
+def test_close_llm_proxy_wait_failure_after_kill_is_bounded(tmp_path, monkeypatch, posix_os):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
-    # Forces the POSIX close() branch (see test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases).
-    monkeypatch.setattr('utils.llm.model_manager.os', _FakeNamedOS('posix'))
     process = SimpleNamespace(
         poll=MagicMock(return_value=None),
         terminate=MagicMock(side_effect=RuntimeError("terminate failed")),
@@ -6798,10 +6785,8 @@ def test_model_manager_cancellation_active_worker_skip_recreation_and_close_with
     processless_worker.close.assert_called_once_with()
 
 
-def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch):
+def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch, posix_os):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
-    # Forces the POSIX close() branch (see test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases).
-    monkeypatch.setattr('utils.llm.model_manager.os', _FakeNamedOS('posix'))
     close_fails = SimpleNamespace(close=MagicMock(side_effect=RuntimeError("close failed")))
 
     manager._close_llm_proxy(close_fails, terminate_process=False)
@@ -6822,10 +6807,8 @@ def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch):
     assert kill_fails_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
 
 
-def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, monkeypatch):
+def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, monkeypatch, posix_os):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
-    # Forces the POSIX close() branch (see test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases).
-    monkeypatch.setattr('utils.llm.model_manager.os', _FakeNamedOS('posix'))
     close_entered = threading.Event()
     close_release = threading.Event()
     poll_values = iter([None, None, 0])
@@ -6956,10 +6939,8 @@ sys.exit(0)
 
 
 
-def test_invalidate_llm_detaches_before_bounded_subprocess_cleanup(tmp_path, monkeypatch):
+def test_invalidate_llm_detaches_before_bounded_subprocess_cleanup(tmp_path, monkeypatch, posix_os):
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
-    # Forces the POSIX close() branch (see test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases).
-    monkeypatch.setattr('utils.llm.model_manager.os', _FakeNamedOS('posix'))
     poll_values = iter([None, None, None, 0])
     process = SimpleNamespace(
         poll=MagicMock(side_effect=lambda: next(poll_values, 0)),
@@ -10146,14 +10127,8 @@ def test_subprocess_proxy_reports_actual_child_model_path_exists_with_relative_s
         proxy.close()
 
 
-def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
+def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch, posix_os):
     from utils.llm import model_manager as model_manager_module
-
-    # Forces the POSIX close() branch: FakeProcess below has no `pid` (so
-    # _signal_worker_process_tree is a no-op) and this test asserts
-    # terminate() is unconditionally called, which is POSIX-only - on real
-    # Windows, close()'s soft phase intentionally skips terminate() (forceful there).
-    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix'))
 
     popen_calls = []
 

@@ -3,14 +3,52 @@ from urllib.parse import urlparse
 
 from api.v1 import compute_provider
 from api.v1.compute_provider import (
+    CompletionResult,
     ComputeProviderError,
     DistributedApiV1ComputeProvider,
     FallbackApiV1ComputeProvider,
     LocalApiV1ComputeProvider,
+    coerce_completion_result,
     get_api_v1_compute_provider_for_mode,
     get_api_v1_resolved_provider_path,
 )
 from relay import app
+
+
+def test_completion_result_message_compatibility_contract():
+    message = {"role": "assistant", "content": "hello"}
+    result = CompletionResult(
+        message=message,
+        finish_reason="length",
+        usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        output_budget={"effective_output_tokens": 1},
+    )
+
+    assert result.get("content") == "hello"
+    assert result.get("missing", "fallback") == "fallback"
+    assert result == message
+    assert result == CompletionResult(
+        message=message,
+        finish_reason="length",
+        usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        output_budget={"effective_output_tokens": 1},
+    )
+    assert result != CompletionResult(message=message)
+    assert result != "hello"
+
+
+def test_coerce_completion_result_compatibility_contract():
+    result = CompletionResult(message={"role": "assistant", "content": "current"})
+    assert coerce_completion_result(result) is result
+
+    legacy_message = {"role": "assistant", "content": "legacy"}
+    assert coerce_completion_result(legacy_message) == CompletionResult(message=legacy_message)
+
+    try:
+        coerce_completion_result("not a message")
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert str(exc) == "assistant response must be a message object"
 
 
 def _clear_distributed_target_env(monkeypatch):

@@ -4135,6 +4135,113 @@ def test_rendered_prompt_progress_context_is_registered_but_not_serialized():
     } & set(outbound_kwargs)
 
 
+def test_rendered_prompt_rpc_delivers_bound_privacy_safe_progress(monkeypatch):
+    """Rendered-prompt calls deliver worker progress through their real RPC binding."""
+    from utils.llm import model_manager as model_manager_module
+
+    private_prompt = "SENTINEL_PRIVATE_PROMPT"
+    private_output = "SENTINEL_PRIVATE_OUTPUT"
+    private_token = "SENTINEL_PRIVATE_TOKEN"
+    request_id = "opaque-request-7"
+    worker_generation = 12
+    delivered = []
+    serialized_outbound = []
+
+    class _DeferredThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            return None
+
+        def run(self):
+            self._target()
+
+    monkeypatch.setattr(model_manager_module.threading, "Thread", _DeferredThread)
+    proxy = _bare_subprocess_proxy([])
+    proxy._lock = model_manager_module.Lock()
+    proxy._legacy_fixture_transport = True
+
+    frames = []
+    for phase, processed, generated in [
+        ("preparing", 0, 0), ("prefill", 2, 0),
+        ("prefill", 4, 0), ("generating", 4, 1),
+    ]:
+        frames.append(
+            {
+                "protocol_version": 2,
+                "command_id": "c1",
+                "type": "inference_progress",
+                "phase": phase,
+                "total_prompt_tokens": 4,
+                "cached_prompt_tokens": 0,
+                "processed_prompt_tokens": processed,
+                "generated_tokens": generated,
+                "elapsed_ms": len(frames) * 10,
+            }
+        )
+    frames.append(
+        {
+            "protocol_version": 2,
+            "command_id": "c1",
+            "status": "ok",
+            "result": {"choices": [{"text": private_output}]},
+            "done": True,
+        }
+    )
+
+    def _stdout_lines():
+        for frame in frames:
+            yield "TOKEN_PLACE_LLAMA_CPP_JSON:" + json.dumps(frame) + "\n"
+            # Resume only after the real demultiplexer has processed the
+            # yielded frame, then let the real caller-thread dispatcher run.
+            proxy._dispatch_pending_progress("c1")
+
+    proxy._process.stdout = _stdout_lines()
+
+    def _send(outbound, *, check_health=True):
+        serialized_outbound.append(json.loads(json.dumps(outbound)))
+        proxy._stdout_reader_thread.run()
+
+    proxy._send = _send
+    result = proxy.create_chat_completion_from_rendered_prompt(
+        [{"role": "user", "content": private_prompt}],
+        max_tokens=3,
+        progress_request_id=request_id,
+        progress_observer=delivered.append,
+        progress_worker_generation=worker_generation,
+    )
+
+    assert result == {"choices": [{"text": private_output}]}
+    assert [event["phase"] for event in delivered] == [
+        "preparing", "prefill", "prefill", "generating",
+    ]
+    assert [event["sequence"] for event in delivered] == [1, 2, 3, 4]
+    expected_keys = {
+        "type", "phase", "total_prompt_tokens", "cached_prompt_tokens",
+        "processed_prompt_tokens", "generated_tokens", "elapsed_ms",
+        "request_id", "worker_generation", "sequence",
+    }
+    assert all(set(event) == expected_keys for event in delivered)
+    assert all(event["request_id"] == request_id for event in delivered)
+    assert all(event["worker_generation"] == worker_generation for event in delivered)
+    assert [event["processed_prompt_tokens"] for event in delivered] == [0, 2, 4, 4]
+    assert [event["generated_tokens"] for event in delivered] == [0, 0, 0, 1]
+    assert all(
+        0 <= event["cached_prompt_tokens"] <= event["processed_prompt_tokens"]
+        <= event["total_prompt_tokens"]
+        for event in delivered
+    )
+
+    assert len(serialized_outbound) == 1
+    worker_kwargs = serialized_outbound[0]["kwargs"]
+    assert worker_kwargs == {"max_tokens": 3}
+    privacy_surface = json.dumps({"events": delivered, "worker_kwargs": worker_kwargs})
+    for private_value in (private_prompt, private_output, private_token):
+        assert private_value not in privacy_surface
+    assert "progress_observer" not in privacy_surface
+
+
 def test_rendered_prompt_progress_guard_drops_replaced_worker_events():
     """A rendered-path callback from an old generation cannot reach a new request."""
     from utils.llm import model_manager as model_manager_module

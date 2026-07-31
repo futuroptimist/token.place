@@ -4832,6 +4832,22 @@ class RelayClient:
                     not in getattr(llm_instance, "__dict__", {})
                 ):
                     qwen_render_complete = None
+                elif callable(qwen_render_complete):
+                    progress_call_kwargs = getattr(
+                        self.model_manager,
+                        "local_progress_call_kwargs_for_runtime",
+                        None,
+                    )
+                    if callable(progress_call_kwargs):
+                        qwen_render_complete = functools.partial(
+                            qwen_render_complete,
+                            **progress_call_kwargs(
+                                qwen_render_complete,
+                                llm_instance=llm_instance,
+                                request_id=request_id,
+                                observer=self._api_v1_local_progress_observer,
+                            ),
+                        )
 
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and llm_instance is not None:

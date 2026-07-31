@@ -4099,6 +4099,79 @@ def test_progress_arguments_never_appear_in_child_generation_kwargs(monkeypatch)
     assert 'progress_worker_generation' not in outbound['kwargs']
 
 
+def test_rendered_prompt_progress_context_is_registered_but_not_serialized():
+    """The rendered-prompt proxy must bind progress exactly like chat completion."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = _bare_subprocess_proxy([])
+    proxy._lock = model_manager_module.Lock()
+    captured = {}
+
+    def _observer(_event):
+        return None
+
+    def _rpc(payload, **context):
+        captured["payload"] = payload
+        captured["context"] = context
+        return {"result": {"choices": []}}
+
+    proxy._rpc = _rpc
+    result = proxy.create_chat_completion_from_rendered_prompt(
+        [{"role": "user", "content": "private"}],
+        max_tokens=3,
+        progress_request_id="req-rendered",
+        progress_observer=_observer,
+        progress_worker_generation=9,
+    )
+
+    assert result == {"choices": []}
+    assert captured["context"]["progress_request_id"] == "req-rendered"
+    assert captured["context"]["progress_observer"] is _observer
+    assert captured["context"]["progress_worker_generation"] == 9
+    outbound_kwargs = captured["payload"]["kwargs"]
+    assert outbound_kwargs == {"max_tokens": 3}
+    assert not {
+        "progress_request_id", "progress_observer", "progress_worker_generation"
+    } & set(outbound_kwargs)
+
+
+def test_rendered_prompt_progress_guard_drops_replaced_worker_events():
+    """A rendered-path callback from an old generation cannot reach a new request."""
+    from utils.llm import model_manager as model_manager_module
+
+    manager = object.__new__(model_manager_module.ModelManager)
+    manager.llm_lock = model_manager_module.Lock()
+    old_runtime = object()
+    manager.llm = old_runtime
+    manager._llm_generation = 4
+    observed = []
+
+    def _rendered(
+        _messages,
+        *,
+        progress_request_id=None,
+        progress_observer=None,
+        progress_worker_generation=0,
+    ):
+        return None
+
+    progress_kwargs = manager.local_progress_call_kwargs_for_runtime(
+        _rendered,
+        llm_instance=old_runtime,
+        request_id="req-old",
+        observer=observed.append,
+    )
+    assert progress_kwargs["progress_request_id"] == "req-old"
+    assert progress_kwargs["progress_worker_generation"] == 4
+
+    progress_kwargs["progress_observer"]({"phase": "preparing"})
+    manager.llm = object()
+    manager._llm_generation = 5
+    progress_kwargs["progress_observer"]({"phase": "generating"})
+
+    assert observed == [{"phase": "preparing"}]
+
+
 def test_rpc_clears_progress_binding_when_send_itself_fails():
     """Binding must be cleared even when _send raises before anything is
     ever written to the transport."""
@@ -7787,7 +7860,11 @@ def _start_bounded_frame_reader(stream):
     return lambda timeout=2: frames.get(timeout=timeout)
 
 
-def test_llama_worker_progress_eval_batches_cached_prefix_and_phase_are_exact(tmp_path):
+@pytest.mark.parametrize(
+    "method",
+    ["create_chat_completion", "create_chat_completion_from_rendered_prompt"],
+)
+def test_llama_worker_progress_eval_batches_cached_prefix_and_phase_are_exact(tmp_path, method):
     """Exercise the worker adapter while its second real decode is blocked."""
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()
@@ -7824,7 +7901,7 @@ class Llama:
             self.n_tokens += len(batch)
     def sample(self):
         return 42
-    def create_chat_completion(self, *args, **kwargs):
+    def _complete(self):
         # Match pinned generate reuse: the two-token common prefix is retained.
         self.n_tokens = 2
         self.eval([13, 14, 15])
@@ -7832,6 +7909,10 @@ class Llama:
         # Decode-token evaluation must not regress the emitted phase.
         self.eval([42])
         return {'choices': [{'message': {'content': 'ok'}}]}
+    def create_chat_completion(self, *args, **kwargs):
+        return self._complete()
+    def create_completion(self, *args, **kwargs):
+        return self._complete()
 ''')
     env = os.environ.copy()
     env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
@@ -7848,7 +7929,7 @@ class Llama:
         process.stdin.flush()
         assert read_frame()['status'] == 'ok'
         process.stdin.write(json.dumps({
-            'method': 'create_chat_completion',
+            'method': method,
             'args': [[{'role': 'user', 'content': 'private prompt'}]],
             'kwargs': {},
         }) + '\n')

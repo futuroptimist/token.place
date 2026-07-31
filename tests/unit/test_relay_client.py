@@ -4698,6 +4698,10 @@ class _ApiV1RuntimeManager:
     def get_llm_instance(self):
         return self.runtime
 
+    def bind_completion_progress_context(self, completion, **context):
+        self.progress_binding = context
+        return completion
+
 
 
 def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
@@ -4722,6 +4726,10 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
 
     assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "ok"}
     manager.runtime.create_chat_completion.assert_not_called()
+    progress_binding = manager.progress_binding
+    assert progress_binding["llm_instance"] is manager.runtime
+    assert progress_binding["request_id"] == "req-qwen-render-complete"
+    assert progress_binding["observer"] == client._api_v1_local_progress_observer
     kwargs = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.kwargs
     assert kwargs == {
         "max_tokens": 64,

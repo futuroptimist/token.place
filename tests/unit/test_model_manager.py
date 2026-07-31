@@ -4099,6 +4099,142 @@ def test_progress_arguments_never_appear_in_child_generation_kwargs(monkeypatch)
     assert 'progress_worker_generation' not in outbound['kwargs']
 
 
+def test_rendered_prompt_progress_context_reaches_rpc_not_worker_kwargs():
+    """The Qwen bridge binds telemetry in the parent without serializing it."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._lock = model_manager_module.Lock()
+    proxy._stderr_cursor = lambda: 0
+    captured = {}
+
+    def _rpc(payload, **context):
+        captured["payload"] = payload
+        captured["context"] = context
+        return {"result": {"choices": [{"text": "ok"}]}}
+
+    proxy._rpc = _rpc
+
+    events = []
+    observer = events.append
+    result = proxy.create_chat_completion_from_rendered_prompt(
+        [{"role": "user", "content": "private"}],
+        max_tokens=4,
+        progress_request_id="opaque-request",
+        progress_observer=observer,
+        progress_worker_generation=7,
+    )
+
+    assert result == {"choices": [{"text": "ok"}]}
+    assert captured["context"]["progress_request_id"] == "opaque-request"
+    assert captured["context"]["progress_observer"] is observer
+    assert captured["context"]["progress_worker_generation"] == 7
+    assert captured["payload"]["kwargs"] == {"max_tokens": 4}
+    assert not any(key.startswith("progress_") for key in captured["payload"])
+
+
+def test_rendered_prompt_dispatches_worker_progress_with_bound_identity():
+    """Rendered-prompt worker frames retain genuine phases and safe counters."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue()
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    proxy._stdout_reader_thread = SimpleNamespace()
+    proxy._process = SimpleNamespace(stdout=object())
+    proxy._stderr_cursor = lambda: 0
+    observed = []
+
+    progress_frames = [
+        {"phase": "preparing", "total_prompt_tokens": 12, "processed_prompt_tokens": 0},
+        {"phase": "prefill", "total_prompt_tokens": 12, "processed_prompt_tokens": 6},
+        {"phase": "prefill", "total_prompt_tokens": 12, "processed_prompt_tokens": 12},
+        {"phase": "generating", "total_prompt_tokens": 12, "generated_tokens": 1},
+    ]
+
+    def _send(payload, **_kwargs):
+        command_id = payload["command_id"]
+        for sequence, frame in enumerate(progress_frames, 1):
+            context = proxy._command_progress[command_id]
+            proxy._latest_progress[command_id] = {
+                "type": "inference_progress",
+                "request_id": context["request_id"],
+                "worker_generation": context["worker_generation"],
+                "sequence": sequence,
+                "cached_prompt_tokens": 0,
+                "elapsed_ms": sequence,
+                **frame,
+            }
+            proxy._dispatch_pending_progress(command_id)
+        proxy._pending[command_id].put_nowait(
+            {"status": "ok", "result": {"choices": [{"text": "ok"}]}, "done": True}
+        )
+
+    proxy._send = _send
+    proxy.create_chat_completion_from_rendered_prompt(
+        [{"role": "user", "content": "private"}],
+        max_tokens=1,
+        progress_request_id="opaque-request",
+        progress_observer=observed.append,
+        progress_worker_generation=9,
+    )
+
+    assert [event["phase"] for event in observed] == [
+        "preparing", "prefill", "prefill", "generating"
+    ]
+    assert [event["processed_prompt_tokens"] for event in observed[1:3]] == [6, 12]
+    assert all(event["request_id"] == "opaque-request" for event in observed)
+    assert all(event["worker_generation"] == 9 for event in observed)
+    assert all("content" not in event for event in observed)
+
+
+def test_rendered_prompt_bound_observer_drops_replaced_worker_progress():
+    """A rendered-path observer cannot relabel progress after replacement."""
+    from utils.llm import model_manager as model_manager_module
+
+    manager = object.__new__(model_manager_module.ModelManager)
+    manager.llm_lock = model_manager_module.Lock()
+    worker = object()
+    manager.llm = worker
+    manager._llm_generation = 4
+    calls = []
+
+    def _rendered(
+        messages,
+        *,
+        progress_request_id=None,
+        progress_observer=None,
+        progress_worker_generation=0,
+        **kwargs,
+    ):
+        calls.append((progress_request_id, progress_worker_generation, kwargs))
+        progress_observer({"phase": "prefill"})
+
+    observed = []
+    bound = manager.bind_completion_progress_context(
+        _rendered,
+        llm_instance=worker,
+        request_id="request-old",
+        observer=observed.append,
+    )
+    bound([], max_tokens=1)
+    manager._llm_generation = 5
+    bound([], max_tokens=1)
+
+    assert calls == [
+        ("request-old", 4, {"max_tokens": 1}),
+        ("request-old", 4, {"max_tokens": 1}),
+    ]
+    assert observed == [{"phase": "prefill"}]
+
+
 def test_rpc_clears_progress_binding_when_send_itself_fails():
     """Binding must be cleared even when _send raises before anything is
     ever written to the transport."""

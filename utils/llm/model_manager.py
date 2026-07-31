@@ -20,6 +20,7 @@ import sys
 import importlib
 import importlib.metadata
 import inspect
+import functools
 import subprocess
 import tempfile
 import queue
@@ -2763,12 +2764,37 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
 
-    def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
+    def create_chat_completion_from_rendered_prompt(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+        **kwargs,
+    ):
+        """Complete a rendered prompt with call-local progress telemetry.
+
+        The progress arguments are parent-process bookkeeping and are passed
+        only to ``_rpc``.  Keeping them out of ``kwargs`` ensures that neither
+        the callable observer nor its request identity can enter the worker
+        command or llama.cpp generation arguments.
+        """
         stderr_cursor = 0
         try:
             with self._lock:
                 stderr_cursor = self._stderr_cursor()
-                message = self._rpc({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs}, timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(), stage='llama_cpp_inference')
+                message = self._rpc(
+                    {
+                        'method': 'create_chat_completion_from_rendered_prompt',
+                        'args': args,
+                        'kwargs': kwargs,
+                    },
+                    timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                    stage='llama_cpp_inference',
+                    progress_request_id=progress_request_id,
+                    progress_observer=progress_observer,
+                    progress_worker_generation=progress_worker_generation,
+                )
         except LlamaCppInferenceRequestError as exc:
             time.sleep(0.1)
             metal_diag = _classify_safe_metal_backend_failure(self._stderr_since(stderr_cursor))
@@ -6985,6 +7011,31 @@ class ModelManager:
             'progress_observer': observer,
             'progress_worker_generation': worker_generation,
         }
+
+    def bind_completion_progress_context(
+        self,
+        create_completion: Callable[..., Any],
+        *,
+        llm_instance: Any,
+        request_id: Optional[str],
+        observer: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> Callable[..., Any]:
+        """Bind one runtime call to its current worker's local progress identity."""
+        with self.llm_lock:
+            worker_generation = self._llm_generation
+        progress_kwargs = self._progress_call_kwargs(
+            create_completion,
+            request_id=request_id,
+            observer=self._guard_progress_observer(
+                observer,
+                llm_instance=llm_instance,
+                worker_generation=worker_generation,
+            ),
+            worker_generation=worker_generation,
+        )
+        if not progress_kwargs:
+            return create_completion
+        return functools.partial(create_completion, **progress_kwargs)
 
     def create_chat_completion_with_recovery(
         self,

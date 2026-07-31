@@ -4736,10 +4736,10 @@ def test_installed_context_smoke_uses_get_llm_instance_boundary() -> None:
 
 def test_windows_installer_identity_main_non_windows_contract_success(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.6-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.6-x64.msi'
-    previous_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
-    previous_msi = tmp_path / 'token.place-desktop-0.1.5-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.7-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.7-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.6-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.6-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
         path.write_text('artifact', encoding='utf-8')
     monkeypatch.setattr(guard.sys, 'platform', 'linux')
@@ -5627,20 +5627,20 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
 
 def test_windows_installer_identity_run_all_and_main_windows_paths(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.6-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.6-x64.msi'
-    previous_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
-    previous_msi = tmp_path / 'token.place-desktop-0.1.5-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.7-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.7-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.6-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.6-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
         path.write_text('artifact', encoding='utf-8')
 
-    scenarios = [guard.Scenario('clean-nsis-0.1.6', guard.Installer(current_nsis, 'nsis', '0.1.6'))]
+    scenarios = [guard.Scenario('clean-nsis-0.1.7', guard.Installer(current_nsis, 'nsis', '0.1.7'))]
     artifacts_seen = []
     def fake_runner(scenario, build_id):
         artifacts_seen.append((scenario.name, build_id))
 
     guard.run_all_scenarios(scenarios, 'abcdef123456', runner=fake_runner, artifact_root=tmp_path / 'logs')
-    assert artifacts_seen == [('clean-nsis-0.1.6', 'abcdef123456')]
+    assert artifacts_seen == [('clean-nsis-0.1.7', 'abcdef123456')]
 
     old_argv = sys.argv
     monkeypatch.setattr(guard.sys, 'platform', 'win32')

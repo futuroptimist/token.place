@@ -4099,6 +4099,73 @@ def test_progress_arguments_never_appear_in_child_generation_kwargs(monkeypatch)
     assert 'progress_worker_generation' not in outbound['kwargs']
 
 
+def test_rendered_prompt_completion_registers_parent_only_progress_context():
+    """The Qwen bridge must bind progress to _rpc, not child kwargs."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._lock = model_manager_module.Lock()
+    proxy._stderr_cursor = lambda: 0
+    captured = {}
+
+    def _rpc(payload, **context):
+        captured["payload"] = payload
+        captured["context"] = context
+        return {"result": {"choices": []}}
+
+    proxy._rpc = _rpc
+
+    def _observer(_event):
+        return None
+
+    result = proxy.create_chat_completion_from_rendered_prompt(
+        [{"role": "user", "content": "private"}],
+        max_tokens=2,
+        progress_request_id="opaque-request",
+        progress_observer=_observer,
+        progress_worker_generation=7,
+    )
+
+    assert result == {"choices": []}
+    assert captured["context"]["progress_request_id"] == "opaque-request"
+    assert captured["context"]["progress_observer"] is _observer
+    assert captured["context"]["progress_worker_generation"] == 7
+    assert captured["payload"]["kwargs"] == {"max_tokens": 2}
+    assert not any(key.startswith("progress_") for key in captured["payload"]["kwargs"])
+
+
+def test_rendered_prompt_progress_binding_suppresses_replaced_worker_events():
+    """A rendered-path observer cannot outlive its worker generation."""
+    from utils.llm import model_manager as model_manager_module
+
+    manager = object.__new__(model_manager_module.ModelManager)
+    manager.llm_lock = model_manager_module.Lock()
+    runtime = object()
+    manager.llm = runtime
+    manager._llm_generation = 3
+    observed = []
+
+    def _completion(
+        *, progress_request_id=None, progress_observer=None,
+        progress_worker_generation=0, **_kwargs
+    ):
+        progress_observer({"phase": "preparing"})
+        manager._llm_generation = 4
+        manager.llm = object()
+        progress_observer({"phase": "prefill"})
+        return progress_request_id, progress_worker_generation
+
+    bound = manager.bind_progress_context_for_runtime_completion(
+        _completion,
+        llm_instance=runtime,
+        progress_request_id="opaque-request",
+        progress_observer=observed.append,
+    )
+
+    assert bound() == ("opaque-request", 3)
+    assert observed == [{"phase": "preparing"}]
+
+
 def test_rpc_clears_progress_binding_when_send_itself_fails():
     """Binding must be cleared even when _send raises before anything is
     ever written to the transport."""

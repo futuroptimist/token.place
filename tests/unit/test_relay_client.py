@@ -3,6 +3,7 @@ Unit tests for the relay client module.
 """
 import base64
 import builtins
+import functools
 import json
 import math
 import pytest
@@ -4694,9 +4695,23 @@ class _ApiV1RuntimeManager:
         self.use_mock_llm = True
         self.worker_health = "healthy"
         self.recovery_count = 0
+        self.render_progress_bindings = []
 
     def get_llm_instance(self):
         return self.runtime
+
+    def bind_progress_context_for_runtime_completion(
+        self, completion, *, llm_instance, progress_request_id, progress_observer
+    ):
+        self.render_progress_bindings.append(
+            (llm_instance, progress_request_id, progress_observer)
+        )
+        return functools.partial(
+            completion,
+            progress_request_id=progress_request_id,
+            progress_observer=progress_observer,
+            progress_worker_generation=11,
+        )
 
 
 
@@ -4727,7 +4742,17 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
         "max_tokens": 64,
         "token_place_provider": "qwen",
         "enable_thinking": False,
+        "progress_request_id": "req-qwen-render-complete",
+        "progress_observer": client._api_v1_local_progress_observer,
+        "progress_worker_generation": 11,
     }
+    assert manager.render_progress_bindings == [
+        (
+            manager.runtime,
+            "req-qwen-render-complete",
+            client._api_v1_local_progress_observer,
+        )
+    ]
     messages = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.args[0]
     assert messages[-1]["content"] == "hi"
 

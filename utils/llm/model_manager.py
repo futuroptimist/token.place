@@ -20,6 +20,7 @@ import sys
 import importlib
 import importlib.metadata
 import inspect
+import functools
 import subprocess
 import tempfile
 import queue
@@ -2763,12 +2764,32 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
 
-    def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
+    def create_chat_completion_from_rendered_prompt(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+        **kwargs,
+    ):
+        """Run the rendered-prompt bridge with parent-only progress context.
+
+        The progress arguments are deliberately explicit keyword-only
+        parameters, so they are registered on the parent RPC command and can
+        never enter the child worker's llama.cpp generation kwargs.
+        """
         stderr_cursor = 0
         try:
             with self._lock:
                 stderr_cursor = self._stderr_cursor()
-                message = self._rpc({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs}, timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(), stage='llama_cpp_inference')
+                message = self._rpc(
+                    {'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs},
+                    timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                    stage='llama_cpp_inference',
+                    progress_request_id=progress_request_id,
+                    progress_observer=progress_observer,
+                    progress_worker_generation=progress_worker_generation,
+                )
         except LlamaCppInferenceRequestError as exc:
             time.sleep(0.1)
             metal_diag = _classify_safe_metal_backend_failure(self._stderr_since(stderr_cursor))
@@ -6985,6 +7006,39 @@ class ModelManager:
             'progress_observer': observer,
             'progress_worker_generation': worker_generation,
         }
+
+    def bind_progress_context_for_runtime_completion(
+        self,
+        completion: Callable[..., Any],
+        *,
+        llm_instance: Any,
+        progress_request_id: Optional[str],
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> Callable[..., Any]:
+        """Bind one current runtime call to its local progress identity.
+
+        This is used by specialized completion entry points which intentionally
+        bypass the ordinary recovery method, such as Qwen's render-then-plain
+        bridge.  Snapshotting the current worker generation and guarding the
+        observer here preserves the same cancellation/replacement isolation as
+        the ordinary completion path without changing that bridge's recovery
+        behavior.
+        """
+        with self.llm_lock:
+            worker_generation = self._llm_generation
+        progress_kwargs = self._progress_call_kwargs(
+            completion,
+            request_id=progress_request_id,
+            observer=self._guard_progress_observer(
+                progress_observer,
+                llm_instance=llm_instance,
+                worker_generation=worker_generation,
+            ),
+            worker_generation=worker_generation,
+        )
+        if not progress_kwargs:
+            return completion
+        return functools.partial(completion, **progress_kwargs)
 
     def create_chat_completion_with_recovery(
         self,

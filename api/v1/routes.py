@@ -747,6 +747,31 @@ def _handle_text_completion_request(data):
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
 
+        finish_reason = completion_result.finish_reason or "stop"
+        authoritative_usage = completion_result.usage
+        if authoritative_usage and all(
+            isinstance(authoritative_usage.get(key), int)
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        ):
+            usage = {
+                "prompt_tokens": authoritative_usage["prompt_tokens"],
+                "completion_tokens": authoritative_usage["completion_tokens"],
+                "total_tokens": authoritative_usage["total_tokens"],
+            }
+        else:
+            # Compatibility estimator for legacy message-only providers.
+            prompt_tokens = _estimate_token_length(
+                _extract_message_content_for_usage(messages[0])
+            )
+            completion_tokens = _estimate_token_length(
+                _extract_message_content_for_usage(assistant_message)
+            )
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+
         response_data = {
             "id": f"cmpl-{uuid.uuid4().hex[:12]}",
             "object": "text_completion",
@@ -756,14 +781,10 @@ def _handle_text_completion_request(data):
                 {
                     "index": 0,
                     "text": assistant_message.get("content", ""),
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
+            "usage": usage,
         }
 
         if is_encrypted_request and client_public_key:

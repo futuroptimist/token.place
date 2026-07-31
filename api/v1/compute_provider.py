@@ -213,7 +213,7 @@ class LocalApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> CompletionResult:
         updated_messages = _active_generate_response()(model_id, messages, **(options or {}))
         if not updated_messages:
             raise ComputeProviderError("model returned an empty message list")
@@ -250,7 +250,7 @@ class DistributedApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> CompletionResult:
         _last_backend_path.set("distributed_relay_e2ee_pending")
         crypto_manager = self._build_request_crypto_manager()
         relay_timeout = max(float(self.timeout_seconds), 1.0)
@@ -563,7 +563,7 @@ class FallbackApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> CompletionResult:
         try:
             message = self.primary.complete_chat(
                 model_id=model_id,

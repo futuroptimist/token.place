@@ -2124,6 +2124,37 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             }
             """
         )
+        page.evaluate(
+            """
+            () => {
+                const appEl = document.querySelector('#app');
+                const vm = appEl && appEl.__vue__;
+                const originalEncrypt = vm.encrypt.bind(vm);
+                window.__landingRequestedMaxTokens = null;
+                vm.encrypt = async (plaintext, publicKeyPem) => {
+                    let envelope;
+                    try {
+                        envelope = JSON.parse(plaintext);
+                    } catch (_error) {
+                        return originalEncrypt(plaintext, publicKeyPem);
+                    }
+                    if (
+                        envelope &&
+                        envelope.protocol === 'tokenplace_api_v1_relay_e2ee' &&
+                        envelope.version === 1 &&
+                        envelope.api_v1_request &&
+                        envelope.api_v1_request.options
+                    ) {
+                        window.__landingRequestedMaxTokens =
+                            envelope.api_v1_request.options.max_tokens;
+                        envelope.api_v1_request.options.max_tokens = 8;
+                        return originalEncrypt(JSON.stringify(envelope), publicKeyPem);
+                    }
+                    return originalEncrypt(plaintext, publicKeyPem);
+                };
+            }
+            """
+        )
 
         prompt_text = (
             "Reply with a short sentence confirming you received this message. "
@@ -2217,6 +2248,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert assistant_text != "Sorry, the relay returned an invalid response. Please try again."
         assert assistant_text not in transient_bridge_errors
         assert "Unknown streaming error" not in assistant_text
+        assert page.evaluate("window.__landingRequestedMaxTokens") == 8192
 
         assert len(relay_requests) >= 1
         assert chat_completion_requests == []
@@ -2239,6 +2271,19 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 const vm = appEl && appEl.__vue__;
                 const history = vm && Array.isArray(vm.chatHistory) ? vm.chatHistory : [];
                 const assistant = [...history].reverse().find((message) => message && message.role === 'assistant') || null;
+                const assistantNodes = document.querySelectorAll('.assistant-message');
+                const latestAssistant = assistantNodes.length
+                    ? assistantNodes[assistantNodes.length - 1]
+                    : null;
+                const assistantContentNode = latestAssistant
+                    ? latestAssistant.querySelector(':scope > span')
+                    : null;
+                const outputLimitNotices = latestAssistant
+                    ? latestAssistant.querySelectorAll(':scope > .output-limit-notice')
+                    : [];
+                const outputLimitNotice = outputLimitNotices.length
+                    ? outputLimitNotices[0]
+                    : null;
 
                 return {
                     snapshots,
@@ -2252,14 +2297,17 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                     ),
                     assistantIsTyping: Boolean(assistant && assistant.isTyping),
                     assistantContent: assistant && typeof assistant.content === 'string' ? assistant.content : '',
-                    domAssistantText: (() => {
-                        const nodes = document.querySelectorAll('.assistant-message');
-                        if (!nodes.length) {
-                            return '';
-                        }
-                        const latest = nodes[nodes.length - 1];
-                        return (latest.textContent || '').trim();
-                    })(),
+                    assistantFinishReason: assistant ? assistant.finishReason : null,
+                    domAssistantContentText: assistantContentNode
+                        ? (assistantContentNode.textContent || '').trim()
+                        : '',
+                    outputLimitNoticeCount: outputLimitNotices.length,
+                    outputLimitNoticeText: outputLimitNotice
+                        ? (outputLimitNotice.textContent || '').trim()
+                        : '',
+                    outputLimitNoticeRole: outputLimitNotice
+                        ? outputLimitNotice.getAttribute('role')
+                        : null,
                 };
             }
             """
@@ -2272,18 +2320,28 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             f"snapshots={non_streaming_state['snapshots']}"
         )
         assistant_content = non_streaming_state["assistantContent"].strip()
-        dom_assistant_text = non_streaming_state["domAssistantText"].strip()
+        dom_assistant_content_text = non_streaming_state["domAssistantContentText"].strip()
+        output_limit_notice_text = "Response stopped at the output-token limit."
+        assert output_limit_notice_text not in assistant_content
 
         # DOM rendering can add/remove whitespace around punctuation and wrapped lines.
         # Compare lexical token sequences so punctuation-preserving whitespace differences pass,
         # while real word-boundary/content regressions still fail.
         token_pattern = r"\w+|[^\w\s]"
         assistant_content_tokens = re.findall(token_pattern, assistant_content, flags=re.UNICODE)
-        dom_assistant_text_tokens = re.findall(token_pattern, dom_assistant_text, flags=re.UNICODE)
-        assert assistant_content_tokens == dom_assistant_text_tokens, (
+        dom_assistant_content_tokens = re.findall(
+            token_pattern, dom_assistant_content_text, flags=re.UNICODE
+        )
+        assert assistant_content_tokens == dom_assistant_content_tokens, (
             "final assistant Vue state content must match rendered DOM text token-for-token "
             "(allowing formatting-only whitespace differences) to prove final non-streaming rendering path"
         )
+        if non_streaming_state["assistantFinishReason"] == "length":
+            assert non_streaming_state["outputLimitNoticeCount"] == 1
+            assert non_streaming_state["outputLimitNoticeText"] == output_limit_notice_text
+            assert non_streaming_state["outputLimitNoticeRole"] == "status"
+        else:
+            assert non_streaming_state["outputLimitNoticeCount"] == 0
 
         encrypted_request = relay_requests[0].post_data_json
         assert encrypted_request.get("protocol") == "tokenplace_api_v1_relay_e2ee"

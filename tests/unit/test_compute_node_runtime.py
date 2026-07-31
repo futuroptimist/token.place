@@ -29,7 +29,17 @@ from utils.compute_node_runtime import (
 
 def _ready_relay_client():
     return SimpleNamespace(
-        _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 3)
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (
+            True,
+            None,
+            {
+                "prompt_tokens": 3,
+                "active_context_tokens": 8192,
+                "requested_output_tokens": 1,
+                "available_output_tokens": 8189,
+                "effective_output_tokens": 1,
+            },
+        )
     )
 
 
@@ -560,6 +570,13 @@ def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():
     )
     assert runtime.ensure_api_v1_runtime_ready() is True
     assert model_manager.last_compute_diagnostics["api_v1_readiness_result"] == "passed"
+    assert model_manager.last_compute_diagnostics["api_v1_readiness_prompt_tokens"] == 3
+    assert (
+        model_manager.last_compute_diagnostics[
+            "api_v1_readiness_tokenizer_render_bridge_available"
+        ]
+        is True
+    )
 
 
 def test_compute_node_runtime_readiness_admission_exception_is_generic_not_bridge_missing():

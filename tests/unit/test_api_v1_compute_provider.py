@@ -3,14 +3,52 @@ from urllib.parse import urlparse
 
 from api.v1 import compute_provider
 from api.v1.compute_provider import (
+    CompletionResult,
     ComputeProviderError,
     DistributedApiV1ComputeProvider,
     FallbackApiV1ComputeProvider,
     LocalApiV1ComputeProvider,
+    coerce_completion_result,
     get_api_v1_compute_provider_for_mode,
     get_api_v1_resolved_provider_path,
 )
 from relay import app
+
+
+def test_completion_result_message_compatibility_contract():
+    message = {"role": "assistant", "content": "hello"}
+    result = CompletionResult(
+        message=message,
+        finish_reason="length",
+        usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        output_budget={"effective_output_tokens": 1},
+    )
+
+    assert result.get("content") == "hello"
+    assert result.get("missing", "fallback") == "fallback"
+    assert result == message
+    assert result == CompletionResult(
+        message=message,
+        finish_reason="length",
+        usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        output_budget={"effective_output_tokens": 1},
+    )
+    assert result != CompletionResult(message=message)
+    assert result != "hello"
+
+
+def test_coerce_completion_result_compatibility_contract():
+    result = CompletionResult(message={"role": "assistant", "content": "current"})
+    assert coerce_completion_result(result) is result
+
+    legacy_message = {"role": "assistant", "content": "legacy"}
+    assert coerce_completion_result(legacy_message) == CompletionResult(message=legacy_message)
+
+    try:
+        coerce_completion_result("not a message")
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert str(exc) == "assistant response must be a message object"
 
 
 def _clear_distributed_target_env(monkeypatch):
@@ -146,6 +184,9 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
                 "request_id": fake_crypto._encrypted["cipher-1"]["request_id"],
                 "api_v1_response": {
                     "message": {"role": "assistant", "content": "Distributed secure response"},
+                    "finish_reason": "length",
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                    "output_budget": {"requested_tokens": 8, "available_tokens": 3, "effective_tokens": 3},
                 },
             }
             encrypted_response = fake_crypto.encrypt_message(response_envelope, fake_crypto.public_key_b64)
@@ -167,6 +208,9 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         options={"temperature": 0.2},
     )
     assert response["content"] == "Distributed secure response"
+    assert response.finish_reason == "length"
+    assert response.usage == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    assert response.output_budget["effective_tokens"] == 3
     relay_request_id = fake_crypto._encrypted["cipher-1"]["request_id"]
     expected_retrieve_payload = {
         "client_public_key": fake_crypto.public_key_b64,

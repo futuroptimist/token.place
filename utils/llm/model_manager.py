@@ -3367,7 +3367,30 @@ def _normalize_plain_completion_result(result):
         cleaned = cleaned[:-len('<|im_end|>')].rstrip()
     if not cleaned:
         return None, 'empty_completion_output'
-    return {'choices': [{'message': {'role': 'assistant', 'content': cleaned}}]}, None
+    choice_result = {'message': {'role': 'assistant', 'content': cleaned}}
+    if isinstance(result, dict):
+        choices = result.get('choices')
+        choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+        finish_reason = choice.get('finish_reason')
+        if isinstance(finish_reason, str) and finish_reason:
+            choice_result['finish_reason'] = finish_reason
+        usage = result.get('usage')
+        if isinstance(usage, dict):
+            # This result crosses the subprocess JSON boundary unchanged. Keep
+            # authoritative backend accounting beside, never inside, the message.
+            normalized_usage = {
+                key: usage[key]
+                for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+                if isinstance(usage.get(key), int) and usage[key] >= 0
+            }
+        else:
+            normalized_usage = {}
+    else:
+        normalized_usage = {}
+    normalized = {'choices': [choice_result]}
+    if normalized_usage:
+        normalized['usage'] = normalized_usage
+    return normalized, None
 
 
 class _RuntimeTemplateRenderError(RuntimeError):

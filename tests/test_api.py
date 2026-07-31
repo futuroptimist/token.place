@@ -642,6 +642,56 @@ def test_api_v1_chat_completion_distributed_with_fallback_allows_model_absent_fr
     assert response.get_json()['choices'][0]['message']['content'] == 'distributed ok'
 
 
+def test_api_v1_chat_completion_preserves_finish_reason_and_authoritative_usage(client, monkeypatch):
+    from api.v1.compute_provider import CompletionResult
+
+    class MetadataProvider:
+        def complete_chat(self, **_kwargs):
+            return CompletionResult(
+                message={'role': 'assistant', 'content': 'partial answer'},
+                finish_reason='length',
+                usage={'prompt_tokens': 17, 'completion_tokens': 5, 'total_tokens': 22},
+            )
+
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: MetadataProvider())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'distributed')
+    response = client.post('/api/v1/chat/completions', json={
+        'model': 'qwen3-8b-instruct',
+        'messages': [{'role': 'user', 'content': 'hello'}],
+    })
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body['choices'][0]['finish_reason'] == 'length'
+    assert body['choices'][0]['message']['content'] == 'partial answer'
+    assert body['usage'] == {'prompt_tokens': 17, 'completion_tokens': 5, 'total_tokens': 22}
+
+
+def test_api_v1_text_completion_preserves_finish_reason_and_authoritative_usage(client, monkeypatch):
+    from api.v1.compute_provider import CompletionResult
+
+    class MetadataProvider:
+        def complete_chat(self, **_kwargs):
+            return CompletionResult(
+                message={'role': 'assistant', 'content': 'partial answer'},
+                finish_reason='length',
+                usage={'prompt_tokens': 17, 'completion_tokens': 5, 'total_tokens': 22},
+            )
+
+    monkeypatch.setattr('api.v1.routes.get_api_v1_compute_provider', lambda: MetadataProvider())
+    monkeypatch.setattr('api.v1.routes.get_api_v1_resolved_provider_path', lambda _provider: 'distributed')
+    response = client.post('/api/v1/completions', json={
+        'model': 'qwen3-8b-instruct',
+        'prompt': 'hello',
+    })
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body['choices'][0]['finish_reason'] == 'length'
+    assert body['choices'][0]['text'] == 'partial answer'
+    assert body['usage'] == {'prompt_tokens': 17, 'completion_tokens': 5, 'total_tokens': 22}
+
+
 
 
 def test_api_v1_completions_distributed_with_fallback_allows_model_absent_from_local_catalogue(client, monkeypatch):

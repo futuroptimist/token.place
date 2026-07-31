@@ -2124,6 +2124,37 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             }
             """
         )
+        page.evaluate(
+            """
+            () => {
+                const appEl = document.querySelector('#app');
+                const vm = appEl && appEl.__vue__;
+                const originalEncrypt = vm.encrypt.bind(vm);
+                window.__landingRequestedMaxTokens = null;
+                vm.encrypt = async (plaintext, publicKeyPem) => {
+                    let envelope;
+                    try {
+                        envelope = JSON.parse(plaintext);
+                    } catch (_error) {
+                        return originalEncrypt(plaintext, publicKeyPem);
+                    }
+                    if (
+                        envelope &&
+                        envelope.protocol === 'tokenplace_api_v1_relay_e2ee' &&
+                        envelope.version === 1 &&
+                        envelope.api_v1_request &&
+                        envelope.api_v1_request.options
+                    ) {
+                        window.__landingRequestedMaxTokens =
+                            envelope.api_v1_request.options.max_tokens;
+                        envelope.api_v1_request.options.max_tokens = 8;
+                        return originalEncrypt(JSON.stringify(envelope), publicKeyPem);
+                    }
+                    return originalEncrypt(plaintext, publicKeyPem);
+                };
+            }
+            """
+        )
 
         prompt_text = (
             "Reply with a short sentence confirming you received this message. "
@@ -2217,6 +2248,7 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert assistant_text != "Sorry, the relay returned an invalid response. Please try again."
         assert assistant_text not in transient_bridge_errors
         assert "Unknown streaming error" not in assistant_text
+        assert page.evaluate("window.__landingRequestedMaxTokens") == 8192
 
         assert len(relay_requests) >= 1
         assert chat_completion_requests == []

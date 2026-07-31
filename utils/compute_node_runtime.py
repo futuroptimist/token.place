@@ -1038,7 +1038,7 @@ class ComputeNodeRuntime:
                     {"role": "system", "content": "You are a concise assistant."},
                     {"role": "user", "content": "Reply with exactly: ok"},
                 ]
-                admitted, admission_error, prompt_tokens = (
+                admitted, admission_error, output_budget = (
                     self.relay_client._api_v1_authoritative_context_admission(
                         llm_instance=llm_runtime,
                         messages=RelayClient._api_v1_prepare_qwen_non_thinking_messages(
@@ -1051,10 +1051,26 @@ class ComputeNodeRuntime:
             except Exception as exc:
                 admitted = False
                 admission_error = {"code": "compute_node_context_admission_unavailable"}
-                prompt_tokens = None
+                output_budget = None
                 diagnostics["api_v1_readiness_exception_type"] = type(exc).__name__
 
-            prompt_tokens_available = isinstance(prompt_tokens, int) and prompt_tokens > 0
+            prompt_tokens = None
+            if isinstance(output_budget, dict):
+                budget_prompt_tokens = output_budget.get("prompt_tokens")
+                if (
+                    isinstance(budget_prompt_tokens, int)
+                    and not isinstance(budget_prompt_tokens, bool)
+                    and budget_prompt_tokens > 0
+                ):
+                    prompt_tokens = budget_prompt_tokens
+            elif (
+                isinstance(output_budget, int)
+                and not isinstance(output_budget, bool)
+                and output_budget > 0
+            ):
+                # Compatibility for older relay clients and focused test doubles.
+                prompt_tokens = output_budget
+            prompt_tokens_available = prompt_tokens is not None
             diagnostics.update({
                 "api_v1_runtime_ready": bool(admitted),
                 "api_v1_readiness_result": "passed" if admitted else "failed",

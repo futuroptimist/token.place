@@ -8,6 +8,9 @@ const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
 const DEFAULT_CONTEXT_TIER = 'auto';
 const AUTO_CONTEXT_TIER = 'auto';
 const AUTO_OUTPUT_RESERVATION_TOKENS = 1024;
+// Public API v1 maximum. Tier selection's 1024-token estimate is deliberately
+// separate; the compute node clamps this request to its authoritative context.
+const LANDING_CHAT_MAX_OUTPUT_TOKENS = 8192;
 const AUTO_CONTEXT_SAFETY_MARGIN_TOKENS = 1024;
 const AUTO_MESSAGE_OVERHEAD_TOKENS = 8;
 const CONTEXT_TIER_ORDER = {
@@ -1049,7 +1052,7 @@ new Vue({
                 api_v1_request: {
                     model: this.selectedModelId,
                     messages: apiV1Messages,
-                    options: {},
+                    options: { max_tokens: LANDING_CHAT_MAX_OUTPUT_TOKENS },
                     routing: {
                         context_tier: tierResolution.requestedContextTier
                     }
@@ -1429,7 +1432,9 @@ new Vue({
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
                             throw new Error('invalid_assistant_response_content');
                         }
-                        this.appendAssistantMessage(assistantMessage);
+                        this.appendAssistantMessage(Object.assign({}, assistantMessage, {
+                            finishReason: response.finish_reason
+                        }));
                     }
                     // OpenAI-compatible API v1 choices envelope.
                     else if (response.choices && response.choices.length > 0) {
@@ -1437,7 +1442,9 @@ new Vue({
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
                             throw new Error('invalid_assistant_response_content');
                         }
-                        this.appendAssistantMessage(assistantMessage);
+                        this.appendAssistantMessage(Object.assign({}, assistantMessage, {
+                            finishReason: response.choices[0].finish_reason
+                        }));
                     }
                     else {
                         throw new Error('Unexpected response format');

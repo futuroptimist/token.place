@@ -3367,7 +3367,24 @@ def _normalize_plain_completion_result(result):
         cleaned = cleaned[:-len('<|im_end|>')].rstrip()
     if not cleaned:
         return None, 'empty_completion_output'
-    return {'choices': [{'message': {'role': 'assistant', 'content': cleaned}}]}, None
+    normalized = {'choices': [{'message': {'role': 'assistant', 'content': cleaned}}]}
+    # Completion metadata is part of the result, not the assistant message.  Keep
+    # llama.cpp's authoritative reason and token counts across the worker IPC
+    # boundary while continuing to discard every unknown backend field.
+    if isinstance(result, dict):
+        choice = (result.get('choices') or [{}])[0]
+        if isinstance(choice, dict) and isinstance(choice.get('finish_reason'), str):
+            normalized['choices'][0]['finish_reason'] = choice['finish_reason']
+        usage = result.get('usage')
+        if isinstance(usage, dict) and all(
+            isinstance(usage.get(key), int) and not isinstance(usage.get(key), bool)
+            for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+        ):
+            normalized['usage'] = {
+                key: usage[key]
+                for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+            }
+    return normalized, None
 
 
 class _RuntimeTemplateRenderError(RuntimeError):

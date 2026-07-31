@@ -1038,7 +1038,7 @@ class ComputeNodeRuntime:
                     {"role": "system", "content": "You are a concise assistant."},
                     {"role": "user", "content": "Reply with exactly: ok"},
                 ]
-                admitted, admission_error, prompt_tokens = (
+                admitted, admission_error, prompt_budget = (
                     self.relay_client._api_v1_authoritative_context_admission(
                         llm_instance=llm_runtime,
                         messages=RelayClient._api_v1_prepare_qwen_non_thinking_messages(
@@ -1048,6 +1048,7 @@ class ComputeNodeRuntime:
                         requested_context_tier=str(context_tier),
                     )
                 )
+                prompt_tokens = getattr(prompt_budget, "prompt_tokens", prompt_budget)
             except Exception as exc:
                 admitted = False
                 admission_error = {"code": "compute_node_context_admission_unavailable"}

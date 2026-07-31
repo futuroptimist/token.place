@@ -155,7 +155,7 @@ class ApiV1ComputeProvider(Protocol):
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Return an assistant message payload compatible with OpenAI chat responses."""
+        """Return an assistant message, or the richer internal completion result."""
 
 
 @dataclass(frozen=True)
@@ -487,6 +487,15 @@ class DistributedApiV1ComputeProvider:
                 )
 
             _last_backend_path.set("distributed_relay_e2ee")
+            # New compute nodes return metadata beside (never inside) the
+            # assistant message.  Message-only envelopes remain readable for
+            # rolling upgrades through the isolated fallback below.
+            if any(key in api_v1_response for key in ("finish_reason", "usage", "output_budget")):
+                return {
+                    key: api_v1_response[key]
+                    for key in ("message", "finish_reason", "usage", "output_budget")
+                    if key in api_v1_response
+                }
             return assistant_message
 
         timeout_error = _error_from_code(

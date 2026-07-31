@@ -519,7 +519,7 @@ def _handle_chat_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = _call_provider_complete_chat(
+        completion_result = _call_provider_complete_chat(
             provider,
             model_id=model_id,
             messages=messages,
@@ -527,6 +527,21 @@ def _handle_chat_completion_request(data):
         )
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
+
+        if (
+            isinstance(completion_result, dict)
+            and isinstance(completion_result.get("message"), dict)
+            and any(key in completion_result for key in ("finish_reason", "usage", "output_budget"))
+        ):
+            assistant_message = completion_result["message"]
+            backend_finish_reason = completion_result.get("finish_reason")
+            authoritative_usage = completion_result.get("usage")
+        else:
+            # Explicit compatibility path for local/test providers and older
+            # encrypted message-only compute-node responses.
+            assistant_message = completion_result
+            backend_finish_reason = None
+            authoritative_usage = None
 
         tool_calls = assistant_message.get("tool_calls")
 
@@ -538,7 +553,7 @@ def _handle_chat_completion_request(data):
         if tool_calls:
             message_payload["tool_calls"] = tool_calls
 
-        finish_reason = "tool_calls" if tool_calls else "stop"
+        finish_reason = backend_finish_reason if isinstance(backend_finish_reason, str) else ("tool_calls" if tool_calls else "stop")
 
         completion_segments = [_extract_message_content_for_usage(assistant_message)]
         if tool_calls:
@@ -547,6 +562,11 @@ def _handle_chat_completion_request(data):
         prompt_tokens = sum(_estimate_token_length(text) for text in prompt_contents_for_usage)
         completion_tokens = _estimate_token_length("\n".join(filter(None, completion_segments)))
 
+        usage_payload = authoritative_usage if isinstance(authoritative_usage, dict) else {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
         response_data = {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
@@ -559,11 +579,7 @@ def _handle_chat_completion_request(data):
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+            "usage": usage_payload,
         }
 
         if isinstance(request_metadata, dict) and request_metadata:

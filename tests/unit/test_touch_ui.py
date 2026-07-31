@@ -192,7 +192,7 @@ def test_landing_chat_js_rejects_raw_array_chat_responses():
     assert "const assistantMessage = response.message;" in chat_js
     assert "else if (response.choices && response.choices.length > 0)" in chat_js
     assert "const assistantMessage = response.choices[0].message;" in chat_js
-    assert "this.appendAssistantMessage(assistantMessage);" in chat_js
+    assert "this.appendAssistantMessage(Object.assign({}, assistantMessage" in chat_js
     assert "throw new Error('Unexpected response format');" in chat_js
 
 
@@ -248,3 +248,20 @@ def test_api_v1_structured_error_logs_safe_diagnostic_fields():
     ):
         assert field in chat_js
     assert "{ code: normalizedError.code }" not in chat_js
+
+
+def test_landing_chat_requests_public_maximum_and_surfaces_length_limit():
+    chat_js = Path("static/chat.js").read_text()
+    index_html = Path("static/index.html").read_text()
+    assert "LANDING_CHAT_MAX_OUTPUT_TOKENS = 8192" in chat_js
+    assert "options: { max_tokens: LANDING_CHAT_MAX_OUTPUT_TOKENS }" in chat_js
+    assert "finishReason: response.finish_reason" in chat_js
+    assert "message.finishReason === 'length'" in index_html
+    assert "role=\"status\"" in index_html
+    assert "Response stopped at the output-token limit." in index_html
+
+
+def test_landing_chat_does_not_send_ui_only_completion_metadata():
+    chat_js = Path("static/chat.js").read_text()
+    history_projection = chat_js[chat_js.index("createApiV1Messages(messageContent)"):chat_js.index("generateClientKeys()")]
+    assert "finishReason" not in history_projection

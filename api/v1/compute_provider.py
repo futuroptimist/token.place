@@ -58,6 +58,17 @@ class DistributedTargetSelection:
     relay_only: bool = False
 
 
+@dataclass(frozen=True)
+class CompletionResult:
+    """Internal completion metadata kept separate from the assistant message."""
+
+    message: dict[str, Any]
+    finish_reason: str | None = None
+    usage: dict[str, int] | None = None
+    output_budget: dict[str, int] | None = None
+    legacy_message_only: bool = False
+
+
 class ComputeProviderError(Exception):
     """Raised when a compute provider cannot satisfy a request."""
 
@@ -154,8 +165,8 @@ class ApiV1ComputeProvider(Protocol):
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Return an assistant message payload compatible with OpenAI chat responses."""
+    ) -> CompletionResult:
+        """Return the assistant message and completion metadata."""
 
 
 @dataclass(frozen=True)
@@ -168,7 +179,7 @@ class LocalApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> CompletionResult:
         updated_messages = _active_generate_response()(model_id, messages, **(options or {}))
         if not updated_messages:
             raise ComputeProviderError("model returned an empty message list")
@@ -176,7 +187,9 @@ class LocalApiV1ComputeProvider:
         if not isinstance(assistant_message, dict):
             raise ComputeProviderError("assistant response must be a message object")
         _last_backend_path.set("local_in_process")
-        return assistant_message
+        # In-process generators predate the richer result contract. Keep this
+        # fallback isolated until local llama execution supplies metadata.
+        return CompletionResult(message=assistant_message, legacy_message_only=True)
 
 
 @dataclass(frozen=True)
@@ -205,7 +218,7 @@ class DistributedApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> CompletionResult:
         _last_backend_path.set("distributed_relay_e2ee_pending")
         crypto_manager = self._build_request_crypto_manager()
         relay_timeout = max(float(self.timeout_seconds), 1.0)
@@ -487,7 +500,16 @@ class DistributedApiV1ComputeProvider:
                 )
 
             _last_backend_path.set("distributed_relay_e2ee")
-            return assistant_message
+            finish_reason = api_v1_response.get("finish_reason")
+            usage = api_v1_response.get("usage")
+            output_budget = api_v1_response.get("output_budget")
+            return CompletionResult(
+                message=assistant_message,
+                finish_reason=finish_reason if isinstance(finish_reason, str) else None,
+                usage=usage if isinstance(usage, dict) else None,
+                output_budget=output_budget if isinstance(output_budget, dict) else None,
+                legacy_message_only="finish_reason" not in api_v1_response,
+            )
 
         timeout_error = _error_from_code(
             "compute_node_timeout",
@@ -510,23 +532,23 @@ class FallbackApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> CompletionResult:
         try:
-            message = self.primary.complete_chat(
+            result = self.primary.complete_chat(
                 model_id=model_id,
                 messages=messages,
                 options=options,
             )
-            return message
+            return result
         except ComputeProviderError as exc:
             logger.warning("distributed compute fallback triggered: %s", exc)
-            message = self.fallback.complete_chat(
+            result = self.fallback.complete_chat(
                 model_id=model_id,
                 messages=messages,
                 options=options,
             )
             _last_backend_path.set("fallback_local_in_process")
-            return message
+            return result
 
 
 def _normalise_target_url(value: str | None) -> str:

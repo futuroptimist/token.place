@@ -38,6 +38,7 @@ from api.v1.models import (
     get_model_instance as _get_model_instance,
 )
 from api.v1.compute_provider import (
+    CompletionResult,
     DistributedTargetSelection,
     get_api_v1_compute_provider,
     get_api_v1_compute_provider_for_mode,
@@ -519,7 +520,7 @@ def _handle_chat_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = _call_provider_complete_chat(
+        completion_result = _call_provider_complete_chat(
             provider,
             model_id=model_id,
             messages=messages,
@@ -527,6 +528,16 @@ def _handle_chat_completion_request(data):
         )
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
+
+        if isinstance(completion_result, CompletionResult):
+            assistant_message = completion_result.message
+        else:
+            # Explicit compatibility for test/third-party providers that still
+            # implement the historical message-only contract.
+            assistant_message = completion_result
+            completion_result = CompletionResult(
+                message=assistant_message, legacy_message_only=True
+            )
 
         tool_calls = assistant_message.get("tool_calls")
 
@@ -538,7 +549,9 @@ def _handle_chat_completion_request(data):
         if tool_calls:
             message_payload["tool_calls"] = tool_calls
 
-        finish_reason = "tool_calls" if tool_calls else "stop"
+        finish_reason = completion_result.finish_reason
+        if finish_reason is None:
+            finish_reason = "tool_calls" if tool_calls else "stop"
 
         completion_segments = [_extract_message_content_for_usage(assistant_message)]
         if tool_calls:
@@ -547,6 +560,7 @@ def _handle_chat_completion_request(data):
         prompt_tokens = sum(_estimate_token_length(text) for text in prompt_contents_for_usage)
         completion_tokens = _estimate_token_length("\n".join(filter(None, completion_segments)))
 
+        authoritative_usage = completion_result.usage
         response_data = {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
@@ -559,7 +573,7 @@ def _handle_chat_completion_request(data):
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
+            "usage": authoritative_usage or {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
@@ -722,7 +736,7 @@ def _handle_text_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = _call_provider_complete_chat(
+        completion_result = _call_provider_complete_chat(
             provider,
             model_id=model_id,
             messages=messages,
@@ -730,6 +744,12 @@ def _handle_text_completion_request(data):
         )
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
+
+        if isinstance(completion_result, CompletionResult):
+            assistant_message = completion_result.message
+        else:
+            assistant_message = completion_result
+            completion_result = CompletionResult(message=assistant_message, legacy_message_only=True)
 
         response_data = {
             "id": f"cmpl-{uuid.uuid4().hex[:12]}",
@@ -740,10 +760,10 @@ def _handle_text_completion_request(data):
                 {
                     "index": 0,
                     "text": assistant_message.get("content", ""),
-                    "finish_reason": "stop",
+                    "finish_reason": completion_result.finish_reason or "stop",
                 }
             ],
-            "usage": {
+            "usage": completion_result.usage or {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,

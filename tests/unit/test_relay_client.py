@@ -2255,21 +2255,13 @@ class TestRelayClient:
         assert mock_model_manager.runtime.create_chat_completion.call_args.kwargs[
             "messages"
         ] == [{"role": "user", "content": "Hello"}]
-        mock_crypto_manager.encrypt_message.assert_called_with(
-            {
-                "protocol": "tokenplace_api_v1_relay_e2ee",
-                "version": 1,
-                "request_id": "req-123",
-                "client_public_key": request_data["client_public_key"],
-                "api_v1_response": {
-                    "message": {
-                        "role": "assistant",
-                        "content": "The capital of France is Paris.",
-                    },
-                },
-            },
-            base64.b64decode(request_data["client_public_key"], validate=True),
-        )
+        encrypted_plaintext = mock_crypto_manager.encrypt_message.call_args.args[0]
+        assert encrypted_plaintext["api_v1_response"]["message"] == {
+            "role": "assistant",
+            "content": "The capital of France is Paris.",
+        }
+        assert encrypted_plaintext["api_v1_response"]["finish_reason"] == "stop"
+        assert encrypted_plaintext["api_v1_response"]["output_budget"]["effective_tokens"] == 1
         mock_post.assert_called_once_with(
             'http://localhost:5000/api/v1/relay/responses',
             json={
@@ -5411,17 +5403,15 @@ def test_api_v1_large_qwen_prompt_reaches_8k_admission_before_context_rejection(
     assert manager.runtime.calls == []
 
 
-def test_api_v1_large_qwen_prompt_exact_64k_overflow_uses_context_error():
+def test_api_v1_large_qwen_prompt_exact_64k_overflow_clamps_output_budget():
     payload = _large_natural_language_payload()
     manager = _QwenLikeAdmissionManager(tier="64k-full", window=65536, prompt_tokens=65025)
 
     envelope = _qwen_large_payload_envelope(manager, payload)
 
     assert manager.runtime.render_and_tokenize_calls
-    error = envelope["api_v1_response"]["error"]
-    assert error["code"] == "compute_node_context_window_exceeded"
-    assert error["required_total_tokens"] == 65537
-    assert manager.runtime.calls == []
+    assert "error" not in envelope["api_v1_response"]
+    assert manager.runtime.calls[-1]["max_tokens"] == 511
 
 
 def test_api_v1_context_admission_includes_template_overhead_and_explicit_budget():
@@ -5429,15 +5419,39 @@ def test_api_v1_context_admission_includes_template_overhead_and_explicit_budget
     client = _api_v1_validation_client(manager)
     # Rendered prompt is len("<s><user>" + content + "<assistant>") = 20 + content.
     accepted = _admission_envelope(client, manager, "x" * 7, options={"max_tokens": 5})
-    rejected = _admission_envelope(client, manager, "x" * 8, options={"max_tokens": 5})
-
     assert "error" not in accepted["api_v1_response"]
     assert manager.runtime.calls[-1]["max_tokens"] == 5
-    error = rejected["api_v1_response"]["error"]
-    assert error["code"] == "compute_node_context_window_exceeded"
-    assert error["prompt_tokens"] == 28
-    assert error["requested_output_tokens"] == 5
-    assert error["required_total_tokens"] == 33
+    clamped = _admission_envelope(client, manager, "x" * 8, options={"max_tokens": 5})
+
+    assert "error" not in clamped["api_v1_response"]
+    assert manager.runtime.calls[-1]["max_tokens"] == 4
+    assert clamped["api_v1_response"]["output_budget"] == {
+        "requested_tokens": 5, "available_tokens": 4, "effective_tokens": 4
+    }
+
+
+def test_api_v1_context_budget_exact_full_rejects_without_inference():
+    manager = _AdmissionManager(window=32)
+    client = _api_v1_validation_client(manager)
+
+    envelope = _admission_envelope(client, manager, "x" * 12, options={"max_tokens": 5})
+
+    assert envelope["api_v1_response"]["error"]["code"] == "compute_node_context_window_exceeded"
+    assert manager.runtime.calls == []
+
+
+def test_api_v1_context_budget_one_token_and_small_remainder_are_clamped():
+    manager = _AdmissionManager(window=32)
+    client = _api_v1_validation_client(manager)
+    one = _admission_envelope(client, manager, "x" * 11, options={"max_tokens": 1000})
+    assert one["api_v1_response"]["output_budget"]["effective_tokens"] == 1
+    assert manager.runtime.calls[-1]["max_tokens"] == 1
+
+    manager = _AdmissionManager(window=121)
+    client = _api_v1_validation_client(manager)
+    remainder = _admission_envelope(client, manager, "x", options={"max_tokens": 1000})
+    assert remainder["api_v1_response"]["output_budget"]["effective_tokens"] == 100
+    assert manager.runtime.calls[-1]["max_tokens"] == 100
 
 
 def test_api_v1_large_structurally_valid_message_uses_exact_tier_admission():
@@ -5472,12 +5486,11 @@ def test_api_v1_context_admission_uses_default_output_budget_for_omitted_max_tok
     client = _api_v1_validation_client(manager)
 
     accepted = _admission_envelope(client, manager, "x" * 8)
-    rejected = _admission_envelope(client, manager, "x" * 9)
+    clamped = _admission_envelope(client, manager, "x" * 9)
 
     assert "error" not in accepted["api_v1_response"]
-    error = rejected["api_v1_response"]["error"]
-    assert error["requested_output_tokens"] == 4
-    assert error["prompt_tokens"] == 29
+    assert "error" not in clamped["api_v1_response"]
+    assert manager.runtime.calls[-1]["max_tokens"] == 3
 
 
 def test_api_v1_context_admission_uses_recovered_runtime_before_rejecting():
@@ -5665,14 +5678,13 @@ def test_api_v1_64k_request_on_8k_runtime_reports_exact_admission_counts():
     )
 
     error = envelope["api_v1_response"]["error"]
-    assert error["code"] == "compute_node_context_window_exceeded"
+    assert error["code"] == "compute_node_context_tier_unsupported"
     assert error["active_context_tier"] == "8k-fast"
     assert error["configured_context_tokens"] == 8192
     assert error["prompt_tokens"] == 8190
     assert error["requested_output_tokens"] == 3
     assert error["required_total_tokens"] == 8193
-    assert error["recommended_context_tier"] == "64k-full"
-    assert error["retryable"] is True
+    assert error["retryable"] is False
     assert manager.runtime.calls == []
 
 

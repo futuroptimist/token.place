@@ -9,6 +9,9 @@ const DEFAULT_CONTEXT_TIER = 'auto';
 const AUTO_CONTEXT_TIER = 'auto';
 const AUTO_OUTPUT_RESERVATION_TOKENS = 1024;
 const AUTO_CONTEXT_SAFETY_MARGIN_TOKENS = 1024;
+// API v1's advertised request ceiling. This is deliberately independent from
+// the smaller reservation used only to select an automatic context tier.
+const LANDING_CHAT_MAX_OUTPUT_TOKENS = 8192;
 const AUTO_MESSAGE_OVERHEAD_TOKENS = 8;
 const CONTEXT_TIER_ORDER = {
     '8k-fast': 8192,
@@ -1049,7 +1052,7 @@ new Vue({
                 api_v1_request: {
                     model: this.selectedModelId,
                     messages: apiV1Messages,
-                    options: {},
+                    options: { max_tokens: LANDING_CHAT_MAX_OUTPUT_TOKENS },
                     routing: {
                         context_tier: tierResolution.requestedContextTier
                     }
@@ -1267,7 +1270,7 @@ new Vue({
             return Math.min(6, Math.ceil(length / 48));
         },
 
-        appendAssistantMessage(message) {
+        appendAssistantMessage(message, finishReason = null) {
             if (!message || typeof message !== 'object') {
                 return;
             }
@@ -1279,7 +1282,10 @@ new Vue({
                 console.warn('relayApiV1NonStreaming is disabled; forcing atomic render fallback.');
             }
 
-            const entry = Object.assign({}, message, { isTyping: false });
+            const entry = Object.assign({}, message, {
+                isTyping: false,
+                finishReason: typeof finishReason === 'string' ? finishReason : null
+            });
             this.chatHistory.push(entry);
         },
 
@@ -1429,7 +1435,7 @@ new Vue({
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
                             throw new Error('invalid_assistant_response_content');
                         }
-                        this.appendAssistantMessage(assistantMessage);
+                        this.appendAssistantMessage(assistantMessage, response.finish_reason);
                     }
                     // OpenAI-compatible API v1 choices envelope.
                     else if (response.choices && response.choices.length > 0) {
@@ -1437,7 +1443,7 @@ new Vue({
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
                             throw new Error('invalid_assistant_response_content');
                         }
-                        this.appendAssistantMessage(assistantMessage);
+                        this.appendAssistantMessage(assistantMessage, response.choices[0].finish_reason);
                     }
                     else {
                         throw new Error('Unexpected response format');

@@ -10,6 +10,9 @@ const AUTO_CONTEXT_TIER = 'auto';
 const AUTO_OUTPUT_RESERVATION_TOKENS = 1024;
 const AUTO_CONTEXT_SAFETY_MARGIN_TOKENS = 1024;
 const AUTO_MESSAGE_OVERHEAD_TOKENS = 8;
+// Match the advertised API v1 maximum. Compute nodes remain authoritative and
+// clamp this deliberate request to the active context's actual remaining room.
+const API_V1_MAX_OUTPUT_TOKENS = 8192;
 const CONTEXT_TIER_ORDER = {
     '8k-fast': 8192,
     '64k-full': 65536
@@ -1049,7 +1052,7 @@ new Vue({
                 api_v1_request: {
                     model: this.selectedModelId,
                     messages: apiV1Messages,
-                    options: {},
+                    options: { max_tokens: API_V1_MAX_OUTPUT_TOKENS },
                     routing: {
                         context_tier: tierResolution.requestedContextTier
                     }
@@ -1425,7 +1428,10 @@ new Vue({
                     }
                     // API v1 response.message envelope.
                     else if (response.message && typeof response.message === 'object') {
-                        const assistantMessage = response.message;
+                        const assistantMessage = {
+                            ...response.message,
+                            finishReason: typeof response.finish_reason === 'string' ? response.finish_reason : null
+                        };
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
                             throw new Error('invalid_assistant_response_content');
                         }
@@ -1433,7 +1439,12 @@ new Vue({
                     }
                     // OpenAI-compatible API v1 choices envelope.
                     else if (response.choices && response.choices.length > 0) {
-                        const assistantMessage = response.choices[0].message;
+                        const assistantMessage = {
+                            ...response.choices[0].message,
+                            finishReason: typeof response.choices[0].finish_reason === 'string'
+                                ? response.choices[0].finish_reason
+                                : null
+                        };
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
                             throw new Error('invalid_assistant_response_content');
                         }

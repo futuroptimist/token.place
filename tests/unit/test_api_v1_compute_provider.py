@@ -146,6 +146,9 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
                 "request_id": fake_crypto._encrypted["cipher-1"]["request_id"],
                 "api_v1_response": {
                     "message": {"role": "assistant", "content": "Distributed secure response"},
+                    "finish_reason": "length",
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 9, "total_tokens": 14},
+                    "output_budget": {"requested_tokens": 8192, "available_tokens": 9, "effective_tokens": 9},
                 },
             }
             encrypted_response = fake_crypto.encrypt_message(response_envelope, fake_crypto.public_key_b64)
@@ -166,7 +169,10 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         messages=[{"role": "user", "content": "hi"}],
         options={"temperature": 0.2},
     )
-    assert response["content"] == "Distributed secure response"
+    assert response.message["content"] == "Distributed secure response"
+    assert response.finish_reason == "length"
+    assert response.usage["completion_tokens"] == 9
+    assert response.output_budget["effective_tokens"] == 9
     relay_request_id = fake_crypto._encrypted["cipher-1"]["request_id"]
     expected_retrieve_payload = {
         "client_public_key": fake_crypto.public_key_b64,

@@ -1115,8 +1115,9 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
             captured["options"] = options
             return {
                 "choices": [
-                    {"message": {"role": "assistant", "content": "bonjour"}},
-                ]
+                    {"message": {"role": "assistant", "content": "bonjour"}, "finish_reason": "length"},
+                ],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 42, "total_tokens": 49},
             }
 
     class _RuntimeModelManager:
@@ -1163,6 +1164,8 @@ def test_relay_client_api_v1_envelope_uses_model_and_posts_ciphertext_only(monke
     encrypted_payload = crypto_stub.last_encrypted_payload
     assert encrypted_payload["request_id"] == "req-1"
     assert encrypted_payload["api_v1_response"]["message"]["content"] == "bonjour"
+    assert encrypted_payload["api_v1_response"]["finish_reason"] == "length"
+    assert encrypted_payload["api_v1_response"]["usage"]["completion_tokens"] == 42
     assert captured["model"] == "llama-3-8b-instruct:alignment"
 
 

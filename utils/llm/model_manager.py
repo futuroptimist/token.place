@@ -3367,7 +3367,15 @@ def _normalize_plain_completion_result(result):
         cleaned = cleaned[:-len('<|im_end|>')].rstrip()
     if not cleaned:
         return None, 'empty_completion_output'
-    return {'choices': [{'message': {'role': 'assistant', 'content': cleaned}}]}, None
+    normalized_choice = {'message': {'role': 'assistant', 'content': cleaned}}
+    if isinstance(result, dict):
+        choice = (result.get('choices') or [{}])[0]
+        if isinstance(choice, dict) and isinstance(choice.get('finish_reason'), str):
+            normalized_choice['finish_reason'] = choice['finish_reason']
+    normalized = {'choices': [normalized_choice]}
+    if isinstance(result, dict) and isinstance(result.get('usage'), dict):
+        normalized['usage'] = dict(result['usage'])
+    return normalized, None
 
 
 class _RuntimeTemplateRenderError(RuntimeError):

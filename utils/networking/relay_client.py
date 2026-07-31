@@ -77,6 +77,23 @@ class _ApiV1SupervisorOutcome(NamedTuple):
     submission_allowed: bool = True
 
 
+class _ApiV1OutputBudget(NamedTuple):
+    """Authoritative output capacity after runtime-template tokenization."""
+
+    prompt_tokens: int
+    active_context_tokens: int
+    requested_output_tokens: int
+    available_output_tokens: int
+    effective_output_tokens: int
+
+    def as_encrypted_payload(self) -> Dict[str, int]:
+        return {
+            "requested_tokens": self.requested_output_tokens,
+            "available_tokens": self.available_output_tokens,
+            "effective_tokens": self.effective_output_tokens,
+        }
+
+
 class _PostApiV1Outcome(NamedTuple):
     """Typed result from _post_api_v1_response().
 
@@ -2834,6 +2851,9 @@ class RelayClient:
         request_id: str,
         *,
         message: Optional[Dict[str, Any]] = None,
+        finish_reason: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None,
+        output_budget: Optional[Dict[str, int]] = None,
         error: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build an encrypted API v1 relay response envelope body."""
@@ -2843,6 +2863,12 @@ class RelayClient:
             api_v1_response = {"error": error}
         else:
             api_v1_response = {"message": message}
+            if finish_reason is not None:
+                api_v1_response["finish_reason"] = finish_reason
+            if usage is not None:
+                api_v1_response["usage"] = usage
+            if output_budget is not None:
+                api_v1_response["output_budget"] = output_budget
         return {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -4038,7 +4064,7 @@ class RelayClient:
         messages: List[Dict[str, Any]],
         requested_output_tokens: int,
         requested_context_tier: str,
-    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[int]]:
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[_ApiV1OutputBudget]]:
         active_context_tier = normalize_context_tier(
             getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)
         )
@@ -4148,13 +4174,21 @@ class RelayClient:
                 ),
                 None,
             )
-        required_total = prompt_tokens + requested_output_tokens
+        available_output_tokens = max(configured_context_tokens - prompt_tokens, 0)
+        effective_output_tokens = min(requested_output_tokens, available_output_tokens)
+        budget = _ApiV1OutputBudget(
+            prompt_tokens=prompt_tokens,
+            active_context_tokens=configured_context_tokens,
+            requested_output_tokens=requested_output_tokens,
+            available_output_tokens=available_output_tokens,
+            effective_output_tokens=effective_output_tokens,
+        )
         tier_supported = self._active_context_tier_can_satisfy(requested_context_tier)
-        admitted = tier_supported and required_total <= configured_context_tokens
+        admitted = tier_supported and effective_output_tokens > 0
         if admitted:
             safe_error_code = "none"
             admission_error = None
-        elif not tier_supported and required_total <= configured_context_tokens:
+        elif not tier_supported and effective_output_tokens > 0:
             safe_error_code = "compute_node_context_tier_unsupported"
             admission_error = self._api_v1_context_tier_unsupported_error(
                 active_context_tier=active_context_tier,
@@ -4173,16 +4207,18 @@ class RelayClient:
                 requested_context_tier=requested_context_tier,
             )
         log_info(
-            "api_v1.context_admission active_tier={} prompt_tokens={} output_reservation={} result={} duration_ms=0 safe_error_code={}",
+            "api_v1.context_admission active_tier={} prompt_tokens={} requested_output_tokens={} available_output_tokens={} effective_output_tokens={} result={} duration_ms=0 safe_error_code={}",
             active_context_tier,
             prompt_tokens,
             requested_output_tokens,
+            available_output_tokens,
+            effective_output_tokens,
             "admitted" if admitted else "rejected",
             safe_error_code,
         )
         if admitted:
-            return True, None, prompt_tokens
-        return False, admission_error, prompt_tokens
+            return True, None, budget
+        return False, admission_error, budget
 
     def _api_v1_runtime_completion_kwargs(
         self, safe_options: Dict[str, Any]
@@ -4756,12 +4792,28 @@ class RelayClient:
 
             completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
             requested_output_tokens = int(completion_kwargs["max_tokens"])
-            admitted, admission_error, prompt_tokens = self._api_v1_authoritative_context_admission(
+            admitted, admission_error, budget_result = self._api_v1_authoritative_context_admission(
                 llm_instance=llm_instance,
                 messages=runtime_messages,
                 requested_output_tokens=requested_output_tokens,
                 requested_context_tier=requested_context_tier,
             )
+            # Integer results are accepted only for old test/runtime adapters.
+            # Newly built compute nodes always return the structured budget.
+            if isinstance(budget_result, _ApiV1OutputBudget):
+                output_budget = budget_result
+                prompt_tokens = output_budget.prompt_tokens
+            else:
+                prompt_tokens = budget_result if isinstance(budget_result, int) else None
+                configured_context = int(getattr(self.model_manager, "context_window_tokens", 0) or 0)
+                available = max(configured_context - (prompt_tokens or 0), 0)
+                output_budget = _ApiV1OutputBudget(
+                    prompt_tokens=prompt_tokens or 0,
+                    active_context_tokens=configured_context,
+                    requested_output_tokens=requested_output_tokens,
+                    available_output_tokens=available,
+                    effective_output_tokens=min(requested_output_tokens, available) if configured_context else requested_output_tokens,
+                )
             if not admitted:
                 return self._api_v1_response_envelope(
                     request_id,
@@ -4776,6 +4828,10 @@ class RelayClient:
                         requested_output_tokens=requested_output_tokens,
                     ),
                 )
+
+            # Never allow zero to reach llama.cpp (where it can mean unlimited).
+            # Admission guarantees this is positive for native structured results.
+            safe_options = {**safe_options, "max_tokens": output_budget.effective_output_tokens}
 
             qwen_render_complete = None
             if self._api_v1_qwen_non_thinking_required(model_profile) and llm_instance is not None:
@@ -4930,7 +4986,29 @@ class RelayClient:
                     ),
                 )
 
-            return self._api_v1_response_envelope(request_id, message=assistant_message)
+            finish_reason = None
+            usage = None
+            if isinstance(completion, dict):
+                choices = completion.get("choices")
+                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                    reason = choices[0].get("finish_reason")
+                    if isinstance(reason, str) and reason:
+                        finish_reason = reason
+                if isinstance(completion.get("usage"), dict):
+                    usage = dict(completion["usage"])
+            if finish_reason is None and isinstance(usage, dict):
+                generated = usage.get("completion_tokens")
+                if isinstance(generated, int) and generated >= output_budget.effective_output_tokens:
+                    finish_reason = "length"
+            if finish_reason is None:
+                finish_reason = "tool_calls" if assistant_message.get("tool_calls") else "stop"
+            return self._api_v1_response_envelope(
+                request_id,
+                message=assistant_message,
+                finish_reason=finish_reason,
+                usage=usage,
+                output_budget=output_budget.as_encrypted_payload(),
+            )
         except Exception as exc:
             if _is_llama_cpp_inference_request_error(exc):
                 diagnostics = getattr(exc, "diagnostics", {})

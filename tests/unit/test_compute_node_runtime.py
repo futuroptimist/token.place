@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import call, MagicMock
 
 import pytest
+from utils.networking.relay_client import RelayClient
 
 from utils.compute_node_runtime import (
     ApiV1RelayRequestAdapter,
@@ -837,6 +838,26 @@ def test_compute_node_runtime_qwen_8k_readiness_ignores_missing_yarn_rope_suppor
     diagnostics = model_manager.last_compute_diagnostics
     assert diagnostics["api_v1_readiness_context_tier"] == "8k-fast"
     assert diagnostics["api_v1_runtime_ready"] is True
+
+@pytest.mark.parametrize("prompt_tokens,requested,admitted,effective", [
+    (8192, 1000, False, 0), (8191, 1000, True, 1),
+    (8092, 1000, True, 100), (100, 42, True, 42),
+])
+def test_authoritative_output_budget_clamps_to_active_context(
+    monkeypatch, prompt_tokens, requested, admitted, effective
+):
+    client = RelayClient.__new__(RelayClient)
+    client.model_manager = SimpleNamespace(context_tier="8k-fast", context_window_tokens=8192, model_profile={})
+    monkeypatch.setattr(client, "_api_v1_render_and_tokenize_chat_prompt", lambda *_a, **_k: prompt_tokens)
+    monkeypatch.setattr(client, "_active_context_tier_can_satisfy", lambda _tier: True)
+    result, error, budget = client._api_v1_authoritative_context_admission(
+        llm_instance=object(), messages=[{"role": "user", "content": "redacted"}],
+        requested_output_tokens=requested, requested_context_tier="8k-fast",
+    )
+    assert result is admitted
+    assert budget.effective_output_tokens == effective
+    assert (error is None) is admitted
+
 
 def test_compute_node_runtime_readiness_smoke_completion_passes(monkeypatch):
     class SmokeRuntime:

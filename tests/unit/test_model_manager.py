@@ -9710,6 +9710,13 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
     normalized, invalid_reason = normalize({'choices': [{'text': ' ok <|im_end|>'}]})
     assert invalid_reason is None
     assert normalized == {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+    normalized, invalid_reason = normalize({
+        'choices': [{'text': 'partial', 'finish_reason': 'length'}],
+        'usage': {'prompt_tokens': 3, 'completion_tokens': 4, 'total_tokens': 7},
+    })
+    assert invalid_reason is None
+    assert normalized['choices'][0]['finish_reason'] == 'length'
+    assert normalized['usage']['completion_tokens'] == 4
     normalized, invalid_reason = normalize({'choices': [{'message': {'content': 'message ok'}}]})
     assert invalid_reason is None
     assert normalized['choices'][0]['message']['content'] == 'message ok'

@@ -159,6 +159,16 @@ class ApiV1ComputeProvider(Protocol):
 
 
 @dataclass(frozen=True)
+class ApiV1CompletionResult:
+    """Internal completion metadata kept separate from the assistant message."""
+
+    message: dict[str, Any]
+    finish_reason: str | None = None
+    usage: dict[str, Any] | None = None
+    output_budget: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class LocalApiV1ComputeProvider:
     """Default provider that executes inference in-process via llama.cpp."""
 
@@ -487,7 +497,12 @@ class DistributedApiV1ComputeProvider:
                 )
 
             _last_backend_path.set("distributed_relay_e2ee")
-            return assistant_message
+            return ApiV1CompletionResult(
+                message=assistant_message,
+                finish_reason=(api_v1_response.get("finish_reason") if isinstance(api_v1_response.get("finish_reason"), str) else None),
+                usage=(dict(api_v1_response["usage"]) if isinstance(api_v1_response.get("usage"), dict) else None),
+                output_budget=(dict(api_v1_response["output_budget"]) if isinstance(api_v1_response.get("output_budget"), dict) else None),
+            )
 
         timeout_error = _error_from_code(
             "compute_node_timeout",

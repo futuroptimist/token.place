@@ -189,11 +189,22 @@ def test_landing_chat_js_rejects_raw_array_chat_responses():
     assert forbidden_history_comment not in chat_js
     assert forbidden_compat_comment not in chat_js.lower()
     assert "else if (response.message && typeof response.message === 'object')" in chat_js
-    assert "const assistantMessage = response.message;" in chat_js
+    assert "...response.message" in chat_js
     assert "else if (response.choices && response.choices.length > 0)" in chat_js
-    assert "const assistantMessage = response.choices[0].message;" in chat_js
+    assert "...response.choices[0].message" in chat_js
     assert "this.appendAssistantMessage(assistantMessage);" in chat_js
     assert "throw new Error('Unexpected response format');" in chat_js
+
+
+def test_landing_chat_requests_api_max_and_renders_only_length_notice():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    assert "API_V1_MAX_OUTPUT_TOKENS = 8192" in chat_js
+    assert "options: { max_tokens: API_V1_MAX_OUTPUT_TOKENS }" in chat_js
+    assert "finishReason" in chat_js
+    assert "message.finishReason === 'length'" in index_html
+    assert 'role="status"' in index_html
+    assert "Response stopped at the output-token limit." in index_html
 
 
 def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():

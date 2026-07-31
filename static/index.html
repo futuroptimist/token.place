@@ -547,6 +547,11 @@
                     class="message"
                 >
                     <span v-html="renderMarkdown(getDisplayContent(message))"></span>
+                    <div
+                        v-if="message.role === 'assistant' && message.finishReason === 'length'"
+                        class="output-limit-notice"
+                        role="status"
+                    >Response stopped at the output-token limit.</div>
                 </div>
             </template>
             <div class="input-container">

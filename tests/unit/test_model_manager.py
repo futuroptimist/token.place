@@ -4277,6 +4277,12 @@ def test_rendered_prompt_progress_guard_drops_replaced_worker_events():
     progress_kwargs["progress_observer"]({"phase": "generating"})
 
     assert observed == [{"phase": "preparing"}]
+    assert manager.local_progress_call_kwargs_for_runtime(
+        _rendered,
+        llm_instance=old_runtime,
+        request_id="req-stale",
+        observer=observed.append,
+    ) == {}
 
 
 def test_rpc_clears_progress_binding_when_send_itself_fails():

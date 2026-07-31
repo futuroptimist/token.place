@@ -4099,6 +4099,38 @@ def test_progress_arguments_never_appear_in_child_generation_kwargs(monkeypatch)
     assert 'progress_worker_generation' not in outbound['kwargs']
 
 
+def test_rendered_prompt_completion_registers_parent_only_progress_context():
+    """The Qwen bridge binds progress to _rpc without serializing its context."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._lock = model_manager_module.Lock()
+    proxy._stderr_cursor = lambda: 0
+    captured = {}
+
+    def _rpc(payload, **context):
+        captured.update(payload=payload, context=context)
+        return {"result": {"choices": []}}
+
+    proxy._rpc = _rpc
+    observer = MagicMock()
+
+    result = proxy.create_chat_completion_from_rendered_prompt(
+        [{"role": "user", "content": "private"}],
+        max_tokens=7,
+        progress_request_id="opaque-request",
+        progress_observer=observer,
+        progress_worker_generation=9,
+    )
+
+    assert result == {"choices": []}
+    assert captured["context"]["progress_request_id"] == "opaque-request"
+    assert captured["context"]["progress_observer"] is observer
+    assert captured["context"]["progress_worker_generation"] == 9
+    assert captured["payload"]["kwargs"] == {"max_tokens": 7}
+    assert not any(key.startswith("progress_") for key in captured["payload"])
+
+
 def test_rpc_clears_progress_binding_when_send_itself_fails():
     """Binding must be cleared even when _send raises before anything is
     ever written to the transport."""

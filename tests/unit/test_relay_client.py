@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # Import the module to test
 from utils.networking import relay_client as relay_client_module
 from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA, _PostApiV1Outcome
+from utils.llm.model_manager import ModelManager
 
 
 def test_api_v1_models_module_import_failure_does_not_capture_worker_diagnostics(monkeypatch):
@@ -4694,6 +4695,12 @@ class _ApiV1RuntimeManager:
         self.use_mock_llm = True
         self.worker_health = "healthy"
         self.recovery_count = 0
+        self.llm = self.runtime
+        self.llm_lock = threading.Lock()
+        self._llm_generation = 3
+
+    _progress_call_kwargs = staticmethod(ModelManager._progress_call_kwargs)
+    _guard_progress_observer = ModelManager._guard_progress_observer
 
     def get_llm_instance(self):
         return self.runtime
@@ -4706,9 +4713,24 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
     manager.context_tier = "64k-full"
     manager.context_window_tokens = 65536
     manager.runtime.create_chat_completion.side_effect = AssertionError("chat path must not be used for qwen")
-    render_complete = MagicMock(return_value={
-        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
-    })
+    render_calls = []
+
+    def render_complete(
+        messages,
+        *,
+        progress_request_id=None,
+        progress_observer=None,
+        progress_worker_generation=0,
+        **kwargs,
+    ):
+        render_calls.append((messages, {
+            **kwargs,
+            "progress_request_id": progress_request_id,
+            "progress_observer": progress_observer,
+            "progress_worker_generation": progress_worker_generation,
+        }))
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
     manager.runtime.create_chat_completion_from_rendered_prompt = render_complete
     client = _api_v1_validation_client(manager)
 
@@ -4722,13 +4744,15 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
 
     assert envelope["api_v1_response"]["message"] == {"role": "assistant", "content": "ok"}
     manager.runtime.create_chat_completion.assert_not_called()
-    kwargs = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.kwargs
-    assert kwargs == {
+    messages, kwargs = render_calls[0]
+    assert {key: value for key, value in kwargs.items() if not key.startswith("progress_")} == {
         "max_tokens": 64,
         "token_place_provider": "qwen",
         "enable_thinking": False,
     }
-    messages = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.args[0]
+    assert kwargs["progress_request_id"] == "req-qwen-render-complete"
+    assert kwargs["progress_worker_generation"] == 3
+    assert callable(kwargs["progress_observer"])
     assert messages[-1]["content"] == "hi"
 
 

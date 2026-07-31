@@ -4592,7 +4592,7 @@ class RelayClient:
         """Log local-only preparing/prefill/generating progress, privacy-safe.
 
         `event` is bound to a real request_id and worker generation by
-        ModelManager.create_chat_completion_with_recovery. Never forwarded to
+        ModelManager's command-local completion bindings. Never forwarded to
         the relay: this is a local log line only, matching the relay-blind
         E2EE guardrail (relay sees ciphertext + safe metadata only).
         """
@@ -4832,6 +4832,38 @@ class RelayClient:
                     not in getattr(llm_instance, "__dict__", {})
                 ):
                     qwen_render_complete = None
+
+                progress_kwargs_builder = getattr(
+                    self.model_manager, "_progress_call_kwargs", None
+                )
+                progress_observer_guard = getattr(
+                    self.model_manager, "_guard_progress_observer", None
+                )
+                if (
+                    callable(qwen_render_complete)
+                    and callable(progress_kwargs_builder)
+                    and callable(progress_observer_guard)
+                    and hasattr(self.model_manager, "llm_lock")
+                ):
+                    # The Qwen path bypasses create_chat_completion_with_recovery,
+                    # so bind its command-local telemetry directly to the current
+                    # worker generation. The guarded observer drops anything from
+                    # a cancelled or replaced worker.
+                    with self.model_manager.llm_lock:
+                        qwen_worker_generation = self.model_manager._llm_generation
+                    qwen_progress_kwargs = progress_kwargs_builder(
+                        qwen_render_complete,
+                        request_id=request_id,
+                        observer=progress_observer_guard(
+                            self._api_v1_local_progress_observer,
+                            llm_instance=llm_instance,
+                            worker_generation=qwen_worker_generation,
+                        ),
+                        worker_generation=qwen_worker_generation,
+                    )
+                    qwen_render_complete = functools.partial(
+                        qwen_render_complete, **qwen_progress_kwargs
+                    )
 
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and llm_instance is not None:

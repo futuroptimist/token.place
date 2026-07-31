@@ -2763,12 +2763,31 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
 
-    def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
+    def create_chat_completion_from_rendered_prompt(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+        **kwargs,
+    ):
+        """Complete a rendered prompt with command-local progress telemetry.
+
+        The progress arguments are parent-only bookkeeping and are deliberately
+        excluded from the worker payload's llama.cpp kwargs.
+        """
         stderr_cursor = 0
         try:
             with self._lock:
                 stderr_cursor = self._stderr_cursor()
-                message = self._rpc({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs}, timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(), stage='llama_cpp_inference')
+                message = self._rpc(
+                    {'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs},
+                    timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                    stage='llama_cpp_inference',
+                    progress_request_id=progress_request_id,
+                    progress_observer=progress_observer,
+                    progress_worker_generation=progress_worker_generation,
+                )
         except LlamaCppInferenceRequestError as exc:
             time.sleep(0.1)
             metal_diag = _classify_safe_metal_backend_failure(self._stderr_since(stderr_cursor))

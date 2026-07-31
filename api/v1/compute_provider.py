@@ -77,6 +77,51 @@ class ComputeProviderError(Exception):
         self.status_code = status_code
 
 
+@dataclass(frozen=True)
+class CompletionResult:
+    """Internal completion contract; metadata is never mixed into the message."""
+
+    message: dict[str, Any]
+    finish_reason: str | None = None
+    usage: dict[str, int] | None = None
+    output_budget: dict[str, int] | None = None
+
+    # Transitional message access keeps direct provider callers source-compatible
+    # while the route boundary consumes the richer contract.
+    def __getitem__(self, key: str) -> Any:
+        return self.message[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.message.get(key, default)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, dict):
+            return self.message == other
+        if isinstance(other, CompletionResult):
+            return (
+                self.message,
+                self.finish_reason,
+                self.usage,
+                self.output_budget,
+            ) == (
+                other.message,
+                other.finish_reason,
+                other.usage,
+                other.output_budget,
+            )
+        return NotImplemented
+
+
+def coerce_completion_result(value: Any) -> CompletionResult:
+    """Isolated compatibility path for legacy/test providers returning a message."""
+
+    if isinstance(value, CompletionResult):
+        return value
+    if isinstance(value, dict):
+        return CompletionResult(message=value)
+    raise ComputeProviderError("assistant response must be a message object")
+
+
 _RELAY_ERROR_MAP: dict[str, dict[str, Any]] = {
     "no_registered_compute_nodes": {
         "error_type": "service_unavailable_error",
@@ -154,8 +199,8 @@ class ApiV1ComputeProvider(Protocol):
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Return an assistant message payload compatible with OpenAI chat responses."""
+    ) -> CompletionResult:
+        """Return an assistant message and completion metadata."""
 
 
 @dataclass(frozen=True)
@@ -176,7 +221,7 @@ class LocalApiV1ComputeProvider:
         if not isinstance(assistant_message, dict):
             raise ComputeProviderError("assistant response must be a message object")
         _last_backend_path.set("local_in_process")
-        return assistant_message
+        return CompletionResult(message=assistant_message)
 
 
 @dataclass(frozen=True)
@@ -486,8 +531,16 @@ class DistributedApiV1ComputeProvider:
                     message="compute node response missing assistant message",
                 )
 
+            usage = api_v1_response.get("usage")
+            output_budget = api_v1_response.get("output_budget")
+            finish_reason = api_v1_response.get("finish_reason")
             _last_backend_path.set("distributed_relay_e2ee")
-            return assistant_message
+            return CompletionResult(
+                message=assistant_message,
+                finish_reason=finish_reason if isinstance(finish_reason, str) else None,
+                usage=usage if isinstance(usage, dict) else None,
+                output_budget=output_budget if isinstance(output_budget, dict) else None,
+            )
 
         timeout_error = _error_from_code(
             "compute_node_timeout",
@@ -517,7 +570,7 @@ class FallbackApiV1ComputeProvider:
                 messages=messages,
                 options=options,
             )
-            return message
+            return coerce_completion_result(message)
         except ComputeProviderError as exc:
             logger.warning("distributed compute fallback triggered: %s", exc)
             message = self.fallback.complete_chat(
@@ -526,7 +579,7 @@ class FallbackApiV1ComputeProvider:
                 options=options,
             )
             _last_backend_path.set("fallback_local_in_process")
-            return message
+            return coerce_completion_result(message)
 
 
 def _normalise_target_url(value: str | None) -> str:

@@ -7470,7 +7470,12 @@ def test_api_v1_deadline_metadata_uses_smaller_and_never_extends(monkeypatch):
     assert shortened == 1003.0
     extended = client._api_v1_deadline_after_response(shortened, {'request_deadline_remaining_seconds': 300})
     assert extended == shortened
-    assert client._api_v1_initial_deadline_from_metadata({'request_ttl_seconds': True}) == 1480.0
+    assert client._api_v1_initial_deadline_from_metadata({'request_ttl_seconds': 480}) == 1480.0
+    invalid_metadata = (None, True, False, 0, -1, float('nan'), float('inf'), 'bad')
+    for value in invalid_metadata:
+        assert client._api_v1_initial_deadline_from_metadata(
+            {'request_ttl_seconds': value}
+        ) == 1300.0
 
 
 @pytest.mark.parametrize('raw,expected', [(0, 1.0), (0.25, 1.0), (11, 10.0), ('bad', 1.0), (3, 3.0)])

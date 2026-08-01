@@ -10,14 +10,14 @@ from utils.inference_timeout import (
 from utils.networking import relay_client
 
 
-def test_production_inference_deadlines_are_consistent_without_300_second_bottleneck():
+def test_upgraded_inference_deadlines_preserve_legacy_300_second_boundary():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
 
     assert DEFAULT_INFERENCE_TIMEOUT_SECONDS == 480.0
     assert INFERENCE_RESPONSE_GRACE_SECONDS == 5.0
     assert DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS == 485.0
     assert relay.DEFAULT_API_V1_REQUEST_DEADLINE_SECONDS == 480.0
-    assert relay_client._API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS == 480.0
+    assert relay_client._API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS == 300.0
     assert DistributedApiV1ComputeProvider("https://relay.example").timeout_seconds == 485.0
     assert "RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000" in chat_js
     assert "RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000" not in chat_js

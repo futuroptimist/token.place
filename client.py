@@ -33,7 +33,7 @@ API_FALLBACK_URLS = [
 ]
 # Or use "http://localhost:5070" if targeting relay endpoints directly
 
-REQUEST_TIMEOUT = DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
+SHORT_OPERATIONAL_TIMEOUT_SECONDS = 10.0
 UNKNOWN_REQUEST_ID = object()
 
 CLIENT_KEYS_DIR = "client_keys"
@@ -92,7 +92,7 @@ def get_server_public_key():
     for base_url in _iter_api_base_urls():
         try:
             response = requests.get(
-                f"{base_url}/public-key", timeout=REQUEST_TIMEOUT
+                f"{base_url}/public-key", timeout=SHORT_OPERATIONAL_TIMEOUT_SECONDS
             )
             response.raise_for_status()  # Raise an exception for bad status codes
             data = response.json()
@@ -153,7 +153,12 @@ def call_chat_completions_encrypted(server_pub_key_b64, client_priv_key, client_
     for base_url in _iter_api_base_urls():
         try:
             response = requests.post(
-                f"{base_url}/chat/completions", json=payload, timeout=REQUEST_TIMEOUT
+                f"{base_url}/chat/completions",
+                json=payload,
+                timeout=(
+                    SHORT_OPERATIONAL_TIMEOUT_SECONDS,
+                    DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS,
+                ),
             )
             response.raise_for_status()
             encrypted_response_data = response.json()
@@ -222,7 +227,8 @@ class ChatClient:
         """Fetch the server's public key from the relay."""
         try:
             response = requests.get(
-                f'{self.base_url}:{self.relay_port}/api/v1/relay/servers/next', timeout=REQUEST_TIMEOUT
+                f'{self.base_url}:{self.relay_port}/api/v1/relay/servers/next',
+                timeout=SHORT_OPERATIONAL_TIMEOUT_SECONDS,
             )
             if response.status_code == 200:
                 data = response.json()
@@ -263,7 +269,9 @@ class ChatClient:
             if request_id:
                 data["request_id"] = request_id
             response = requests.post(
-                f'{self.base_url}:{self.relay_port}/api/v1/relay/requests', json=data, timeout=REQUEST_TIMEOUT
+                f'{self.base_url}:{self.relay_port}/api/v1/relay/requests',
+                json=data,
+                timeout=SHORT_OPERATIONAL_TIMEOUT_SECONDS,
             )
             return response
         except requests.exceptions.RequestException as e:
@@ -281,6 +289,10 @@ class ChatClient:
     ):
         start_time = time.time()
         while True:
+            remaining = timeout - (time.time() - start_time)
+            if remaining <= 0:
+                logger.warning("Timeout while waiting for response.")
+                return None
             try:
                 response = requests.post(
                     f'{self.base_url}:{self.relay_port}/api/v1/relay/responses/retrieve',
@@ -292,7 +304,7 @@ class ChatClient:
                         }.items()
                         if value is not None
                     },
-                    timeout=REQUEST_TIMEOUT,
+                    timeout=min(SHORT_OPERATIONAL_TIMEOUT_SECONDS, remaining),
                 )
                 if response.status_code == 202:
                     logger.debug(
@@ -362,12 +374,11 @@ class ChatClient:
                     e.__class__.__name__,
                 )
 
-            elapsed_time = time.time() - start_time
-            if elapsed_time > timeout:
+            remaining = timeout - (time.time() - start_time)
+            if remaining <= 0:
                 logger.warning("Timeout while waiting for response.")
                 return None
-
-            time.sleep(2)  # Wait for a short interval before trying again
+            time.sleep(min(2, remaining))
 
     def send_message(self, message):
         self.chat_history.append({"role": "user", "content": message})
@@ -404,23 +415,15 @@ class ChatClient:
                 request_id=request_id,
             )
             if response_request and response_request.status_code == 200:
-                start_time = time.time()
-                timeout = DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
-                while True:
-                    response = self.retrieve_response(request_id=request_id, chat_history=self.chat_history)
-                    if response is UNKNOWN_REQUEST_ID:
-                        logger.warning("Stopping polling for unknown request_id %s.", request_id)
-                        break
-                    if response:
-                        self.chat_history = response
-                        return response
-
-                    elapsed_time = time.time() - start_time
-                    if elapsed_time > timeout:
-                        logger.warning("Timeout while waiting for response.")
-                        break
-
-                    time.sleep(2)  # Adjust the polling interval as needed
+                response = self.retrieve_response(
+                    request_id=request_id,
+                    chat_history=self.chat_history,
+                )
+                if response is UNKNOWN_REQUEST_ID:
+                    logger.warning("Stopping polling for unknown request_id %s.", request_id)
+                elif response:
+                    self.chat_history = response
+                    return response
 
         return None
 

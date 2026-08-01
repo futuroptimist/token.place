@@ -24,12 +24,12 @@ from urllib.parse import urlparse, urlunparse
 from utils.networking.http_requests_compat import requests
 from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile, normalize_context_tier
 from utils.llm.model_profiles import build_model_aliases
-from utils.inference_timeout import DEFAULT_INFERENCE_TIMEOUT_SECONDS
 
 # Configure logging
 logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
-_API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS = DEFAULT_INFERENCE_TIMEOUT_SECONDS
+# Only legacy relays that omit valid deadline metadata use this compatibility cap.
+_API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS = 300.0
 _API_V1_CONTROL_MIN_POLL_SECONDS = 1.0
 _API_V1_CONTROL_MAX_POLL_SECONDS = 10.0
 _API_V1_CONTROL_ACK_TIMEOUT_SECONDS = 2.0
@@ -2393,7 +2393,7 @@ class RelayClient:
             return None
         if not math.isfinite(seconds):
             return None
-        return max(0.0, seconds)
+        return seconds if seconds > 0 else None
 
     @classmethod
     def _api_v1_initial_deadline_from_metadata(cls, request_payload: Dict[str, Any], *, now: Optional[float] = None) -> float:
@@ -2402,8 +2402,7 @@ class RelayClient:
             cls._api_v1_initial_relative_seconds(request_payload.get('request_ttl_seconds')),
         ]
         valid = [value for value in candidates if value is not None]
-        # Legacy relays may omit deadline metadata; cap such requests at the
-        # canonical inference deadline rather than running forever.
+        # Legacy relays may omit deadline metadata and expire work after 300s.
         remaining = min(valid) if valid else _API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS
         return (time.monotonic() if now is None else now) + remaining
 

@@ -2763,12 +2763,36 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
 
-    def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
+    def create_chat_completion_from_rendered_prompt(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+        **kwargs,
+    ):
+        """Complete a rendered prompt with command-local progress telemetry.
+
+        The progress arguments are parent-only context.  Keeping them as
+        explicit keyword-only parameters ensures they are registered with the
+        RPC command but never included in the child worker's generation kwargs.
+        """
         stderr_cursor = 0
         try:
             with self._lock:
                 stderr_cursor = self._stderr_cursor()
-                message = self._rpc({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs}, timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(), stage='llama_cpp_inference')
+                message = self._rpc(
+                    {
+                        'method': 'create_chat_completion_from_rendered_prompt',
+                        'args': args,
+                        'kwargs': kwargs,
+                    },
+                    timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
+                    stage='llama_cpp_inference',
+                    progress_request_id=progress_request_id,
+                    progress_observer=progress_observer,
+                    progress_worker_generation=progress_worker_generation,
+                )
         except LlamaCppInferenceRequestError as exc:
             time.sleep(0.1)
             metal_diag = _classify_safe_metal_backend_failure(self._stderr_since(stderr_cursor))
@@ -6985,6 +7009,36 @@ class ModelManager:
             'progress_observer': observer,
             'progress_worker_generation': worker_generation,
         }
+
+    def local_progress_call_kwargs_for_runtime(
+        self,
+        runtime_callable: Callable[..., Any],
+        *,
+        llm_instance: Any,
+        request_id: Optional[str],
+        observer: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> Dict[str, Any]:
+        """Bind local telemetry to the current runtime instance/generation.
+
+        This is used by direct runtime paths, such as Qwen's rendered-prompt
+        completion, which intentionally do not pass through completion
+        recovery.  The guarded observer drops events as soon as cancellation
+        or replacement makes this worker generation stale.
+        """
+        with self.llm_lock:
+            if self.llm is not llm_instance:
+                return {}
+            worker_generation = self._llm_generation
+        return self._progress_call_kwargs(
+            runtime_callable,
+            request_id=request_id,
+            observer=self._guard_progress_observer(
+                observer,
+                llm_instance=llm_instance,
+                worker_generation=worker_generation,
+            ),
+            worker_generation=worker_generation,
+        )
 
     def create_chat_completion_with_recovery(
         self,

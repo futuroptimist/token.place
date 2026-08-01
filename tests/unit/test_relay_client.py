@@ -4711,6 +4711,13 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
     })
     manager.runtime.create_chat_completion_from_rendered_prompt = render_complete
     client = _api_v1_validation_client(manager)
+    manager.local_progress_call_kwargs_for_runtime = MagicMock(
+        return_value={
+            "progress_request_id": "req-qwen-render-complete",
+            "progress_observer": client._api_v1_local_progress_observer,
+            "progress_worker_generation": 7,
+        }
+    )
 
     envelope = client._generate_api_v1_response_with_runtime_model(
         request_id="req-qwen-render-complete",
@@ -4727,7 +4734,16 @@ def test_api_v1_qwen_generation_uses_render_then_complete_not_chat_completion():
         "max_tokens": 64,
         "token_place_provider": "qwen",
         "enable_thinking": False,
+        "progress_request_id": "req-qwen-render-complete",
+        "progress_observer": client._api_v1_local_progress_observer,
+        "progress_worker_generation": 7,
     }
+    manager.local_progress_call_kwargs_for_runtime.assert_called_once_with(
+        render_complete,
+        llm_instance=manager.runtime,
+        request_id="req-qwen-render-complete",
+        observer=client._api_v1_local_progress_observer,
+    )
     messages = manager.runtime.create_chat_completion_from_rendered_prompt.call_args.args[0]
     assert messages[-1]["content"] == "hi"
 

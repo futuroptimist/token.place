@@ -4261,6 +4261,26 @@ def test_api_v1_request_deadline_seconds_rejects_non_finite_and_hard_clamps(monk
     assert relay_module._api_v1_request_deadline_seconds() == relay_module.HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS
 
 
+def test_api_v1_default_inference_budget_allows_work_past_five_minutes(monkeypatch):
+    for name in (
+        relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV,
+        relay_module.API_V1_REQUEST_DEADLINE_MIN_SECONDS_ENV,
+        relay_module.API_V1_REQUEST_DEADLINE_MAX_SECONDS_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert relay_module._api_v1_request_deadline_seconds() == 480.0
+    started = 1_000.0
+    entry = {
+        'queued_at': 1_000.0,
+        'request_deadline_monotonic': started + relay_module._api_v1_request_deadline_seconds(),
+    }
+    monkeypatch.setattr(relay_module.time, 'monotonic', lambda: started + 301.0)
+    assert relay_module._pending_request_entry_is_expired(entry) is False
+    monkeypatch.setattr(relay_module.time, 'monotonic', lambda: started + 481.0)
+    assert relay_module._pending_request_entry_is_expired(entry) is True
+
+
 def test_api_v1_poll_drops_expired_queue_head_and_dispatches_next(client):
     known_servers[DUMMY_SERVER_PUB_KEY] = {
         'public_key': DUMMY_SERVER_PUB_KEY,

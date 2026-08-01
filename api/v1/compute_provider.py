@@ -229,7 +229,8 @@ class DistributedApiV1ComputeProvider:
     """Provider that dispatches API v1 requests via relay-blind E2EE envelopes."""
 
     base_url: str
-    timeout_seconds: float = 120.0
+    # Outer transport budget: authoritative 480s inference + 10s delivery grace.
+    timeout_seconds: float = 490.0
 
     def _relay_url(self, path: str) -> str:
         base_url = self.base_url.rstrip("/")
@@ -759,11 +760,13 @@ def _build_api_v1_compute_provider(
         return local_provider
 
     selected_target = distributed_url.rstrip("/")
-    timeout_raw = os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "120")
+    # The relay owns the 480-second inference deadline. This outer HTTP wait has
+    # ten seconds of response-delivery grace and remains configurable.
+    timeout_raw = os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "490")
     try:
         timeout_seconds = max(float(timeout_raw), 1.0)
     except (TypeError, ValueError):
-        timeout_seconds = 120.0
+        timeout_seconds = 490.0
     distributed_provider = DistributedApiV1ComputeProvider(
         base_url=selected_target,
         timeout_seconds=timeout_seconds,

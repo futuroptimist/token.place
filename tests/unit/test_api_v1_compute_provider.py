@@ -1055,6 +1055,11 @@ def test_get_provider_uses_configured_distributed_timeout(monkeypatch):
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
 
+
+def test_distributed_provider_default_has_response_delivery_grace():
+    provider = compute_provider.DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+    assert provider.timeout_seconds == 490.0
+
 def test_get_provider_defaults_invalid_distributed_timeout(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")
     monkeypatch.setenv("TOKENPLACE_DISTRIBUTED_COMPUTE_URL", "https://node-a.example")
@@ -1065,7 +1070,7 @@ def test_get_provider_defaults_invalid_distributed_timeout(monkeypatch):
     try:
         provider = compute_provider.get_api_v1_compute_provider()
         assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
-        assert provider.timeout_seconds == 120.0
+        assert provider.timeout_seconds == 490.0
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
 

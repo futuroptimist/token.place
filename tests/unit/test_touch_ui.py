@@ -211,7 +211,8 @@ def test_landing_chat_requests_full_api_budget_and_renders_length_notice():
 
 def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
-    assert "RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000" in chat_js
+    assert "RELAY_RESPONSE_POLL_TIMEOUT_MS = 490000" in chat_js
+    assert "480-second inference deadline" in chat_js
     assert "cancelRelayRequest" in chat_js
     assert "/api/v1/relay/requests/cancel" in chat_js
     assert "cancel_token: cancelToken" in chat_js

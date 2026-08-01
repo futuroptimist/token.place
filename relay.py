@@ -883,7 +883,7 @@ api_v1_terminal_transition_lock = threading.RLock()
 client_terminal_outcomes: dict[str, dict[str, float]] = {}
 client_terminal_outcomes_lock = threading.Lock()
 TERMINAL_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_TERMINAL_REQUEST_TTL_SECONDS", "300"))
-PENDING_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_PENDING_REQUEST_TTL_SECONDS", "300"))
+PENDING_REQUEST_TTL_SECONDS = float(os.getenv("TOKENPLACE_PENDING_REQUEST_TTL_SECONDS", "480"))
 client_inference_requests_lock = threading.Lock()
 client_inference_requests_changed = threading.Condition(client_inference_requests_lock)
 api_v1_in_flight_requests_lock = threading.Lock()
@@ -902,7 +902,10 @@ API_V1_IN_FLIGHT_TTL_SECONDS_ENV = "TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS"
 API_V1_REQUEST_DEADLINE_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_SECONDS"
 API_V1_REQUEST_DEADLINE_MIN_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_MIN_SECONDS"
 API_V1_REQUEST_DEADLINE_MAX_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_MAX_SECONDS"
-DEFAULT_API_V1_REQUEST_DEADLINE_SECONDS = 300.0
+# Canonical inference-completion budget. Relay deadline metadata propagates this
+# authoritative budget to compute nodes; transport callers add only explicit
+# response-delivery grace outside it.
+DEFAULT_API_V1_REQUEST_DEADLINE_SECONDS = 480.0
 DEFAULT_API_V1_REQUEST_DEADLINE_MIN_SECONDS = 1.0
 DEFAULT_API_V1_REQUEST_DEADLINE_MAX_SECONDS = 3600.0
 HARD_MIN_API_V1_REQUEST_DEADLINE_SECONDS = 1.0

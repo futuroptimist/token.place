@@ -1,5 +1,13 @@
 # token.place desktop Tauri MVP
 
+## Version bumps
+
+Functional changes included in a newly built desktop installer normally require a patch bump; major
+and minor bumps remain maintainer-directed. Update all synchronized manifests and fixtures, then run
+`python ../scripts/validate_windows_desktop_release_artifacts.py --windows-nsis <setup.exe> --windows-msi <installer.msi>` (the validator derives the
+current version from `desktop-tauri/package.json` when no release tag is supplied). A version bump does
+not create a tag or publish a release; see the canonical policy in [`AGENTS.md`](../AGENTS.md#desktop-versioning-policy).
+
 This folder contains the forward-looking Tauri desktop MVP for token.place.
 
 ## Scope of this MVP

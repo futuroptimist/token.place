@@ -50,6 +50,9 @@ pub struct ComputeNodeRequest {
 
 const DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
 const OPERATOR_PREFLIGHT_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+// The CPU-smoke runtime probe has its own 30-second deadline; allow five
+// additional seconds for its bounded event to reach the parent process.
+const OPERATOR_PREFLIGHT_CPU_SMOKE_EVENT_TIMEOUT: Duration = Duration::from_secs(35);
 const OPERATOR_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 const OPERATOR_PREFLIGHT_EVENT_MAX_BYTES: usize = 2048;
 
@@ -2047,10 +2050,7 @@ pub(crate) fn operator_start_preflight_cpu_smoke_record(
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(run_cpu_smoke_operator_preflight_child(
-                command,
-                OPERATOR_PREFLIGHT_EVENT_TIMEOUT,
-            ))
+            .block_on(run_cpu_smoke_operator_preflight_child(command))
     })
     .join()
     .map_err(|_| anyhow::anyhow!("operator_preflight_child_failed"))??;
@@ -2352,13 +2352,10 @@ async fn run_production_operator_preflight_child(
     .await
 }
 
-async fn run_cpu_smoke_operator_preflight_child(
-    command: Command,
-    event_timeout: Duration,
-) -> anyhow::Result<Value> {
+async fn run_cpu_smoke_operator_preflight_child(command: Command) -> anyhow::Result<Value> {
     run_operator_preflight_child(
         command,
-        event_timeout,
+        OPERATOR_PREFLIGHT_CPU_SMOKE_EVENT_TIMEOUT,
         validate_cpu_smoke_operator_preflight_event,
     )
     .await
@@ -4318,10 +4315,10 @@ mod tests {
 
     #[tokio::test]
     async fn cpu_smoke_operator_preflight_accepts_valid_cpu_only_event() {
-        let event = run_cpu_smoke_operator_preflight_child(
-            operator_preflight_test_command(Some(CPU_SMOKE_PREFLIGHT_VALIDATED_EVENT), false),
-            Duration::from_secs(2),
-        )
+        let event = run_cpu_smoke_operator_preflight_child(operator_preflight_test_command(
+            Some(CPU_SMOKE_PREFLIGHT_VALIDATED_EVENT),
+            false,
+        ))
         .await
         .expect("valid cpu-smoke event");
 
@@ -4333,13 +4330,25 @@ mod tests {
 
     #[tokio::test]
     async fn cpu_smoke_operator_preflight_reports_valid_bounded_failure_event() {
-        let error = run_cpu_smoke_operator_preflight_child(
-            operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_FAILURE_EVENT), false),
-            Duration::from_secs(2),
-        )
+        let error = run_cpu_smoke_operator_preflight_child(operator_preflight_test_command(
+            Some(PRODUCTION_PREFLIGHT_FAILURE_EVENT),
+            false,
+        ))
         .await
         .expect_err("bounded failure must be transported");
         assert_eq!(error.to_string(), "operator_preflight_runtime_validation_failed:probe_stage=native_import;probe_error_code=native_dll_load_failed;exception_type=OSError;child_exit_code=101;detected_architecture=x86_64;architecture_source=attested_windows_x86_64;import_root_valid=true");
+    }
+
+    #[test]
+    fn operator_preflight_timeout_budgets_remain_distinct() {
+        const CPU_SMOKE_PYTHON_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+        assert_eq!(OPERATOR_PREFLIGHT_EVENT_TIMEOUT, Duration::from_secs(10));
+        assert!(OPERATOR_PREFLIGHT_CPU_SMOKE_EVENT_TIMEOUT > CPU_SMOKE_PYTHON_PROBE_TIMEOUT);
+        assert_eq!(
+            OPERATOR_PREFLIGHT_CPU_SMOKE_EVENT_TIMEOUT,
+            Duration::from_secs(35)
+        );
     }
 
     #[test]

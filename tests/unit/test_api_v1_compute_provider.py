@@ -15,6 +15,12 @@ from api.v1.compute_provider import (
 from relay import app
 
 
+def test_admitted_ttl_rejects_boolean_metadata():
+    assert compute_provider._coerce_admitted_ttl(True) == 0.0
+    assert compute_provider._coerce_admitted_ttl(False) == 0.0
+    assert compute_provider._coerce_admitted_ttl("30") == 30.0
+
+
 def test_completion_result_message_compatibility_contract():
     message = {"role": "assistant", "content": "hello"}
     result = CompletionResult(
@@ -954,6 +960,60 @@ def test_distributed_compute_provider_timeout_after_enqueue_posts_single_cancel(
     }
     assert cancel_posts[0][2] == 1.0
 
+
+def test_distributed_compute_provider_accepts_result_after_301_seconds_with_480_ttl(
+    monkeypatch,
+):
+    fake_crypto = _FakeCryptoManager()
+    clock = {"now": 100.0}
+    response_envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": None,
+        "client_public_key": fake_crypto.public_key_b64,
+        "api_v1_response": {
+            "message": {"role": "assistant", "content": "completed late"},
+        },
+    }
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(compute_provider.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda url, timeout, params=None: _FakeResponse(
+            200, {"server_public_key": "server-public-key"}
+        ),
+    )
+
+    def fake_post(url, json, timeout):
+        if url.endswith("/api/v1/relay/requests"):
+            response_envelope["request_id"] = json["request_id"]
+            return _FakeResponse(200, {"request_ttl_seconds": 480})
+        if url.endswith("/api/v1/relay/responses/retrieve"):
+            clock["now"] = 401.0
+            encrypted = fake_crypto.encrypt_message(response_envelope, b"unused")
+            return _FakeResponse(200, encrypted)
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(compute_provider.requests, "post", fake_post)
+    provider = DistributedApiV1ComputeProvider(
+        base_url="https://node-a.example",
+        timeout_seconds=485,
+    )
+
+    result = provider.complete_chat(
+        model_id="llama-3.1-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert clock["now"] == 401.0
+    assert result.message == {"role": "assistant", "content": "completed late"}
+
 def test_distributed_compute_provider_cancel_failure_does_not_mask_timeout(monkeypatch):
     fake_crypto = _FakeCryptoManager()
     posted = []
@@ -1065,7 +1125,7 @@ def test_get_provider_defaults_invalid_distributed_timeout(monkeypatch):
     try:
         provider = compute_provider.get_api_v1_compute_provider()
         assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
-        assert provider.timeout_seconds == 120.0
+        assert provider.timeout_seconds == 485.0
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
 

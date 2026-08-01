@@ -1011,6 +1011,64 @@ def wait_for_landing_send_enabled(page: Page):
     return send_button
 
 
+def assert_cancel_payload_is_routing_metadata_only(payload: dict):
+    assert set(payload) == {
+        "client_public_key", "request_id", "cancel_token", "status", "reason"
+    }
+    assert payload["client_public_key"]
+    assert payload["request_id"]
+    assert payload["cancel_token"]
+    assert payload["status"] == "cancelled"
+    forbidden = {"messages", "prompt", "response", "chat_history", "ciphertext", "cipherkey", "iv"}
+    assert forbidden.isdisjoint(payload)
+
+
+@pytest.mark.e2e
+def test_landing_chat_timeout_cancels_relay_request_once(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page, retrieve_statuses=[202])
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+
+    page.locator("textarea").first.fill("wait beyond the deadline")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(486_000)
+    page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest.cancelled")
+
+    assert len(state["cancel_requests"]) == 1
+    payload = state["cancel_requests"][0]
+    assert_cancel_payload_is_routing_metadata_only(payload)
+    assert payload["reason"] == "client_timeout"
+    assert payload["request_id"] == state["relay_requests"][0]["request_id"]
+    assert payload["cancel_token"] == state["relay_requests"][0]["cancel_token"]
+
+
+@pytest.mark.e2e
+def test_landing_chat_abort_cancels_relay_request_once(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page, retrieve_statuses=[202])
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+
+    page.locator("textarea").first.fill("cancel when leaving")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.evaluate("() => { window.dispatchEvent(new Event('pagehide')); window.dispatchEvent(new Event('pagehide')); }")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest.cancelled")
+
+    assert len(state["cancel_requests"]) == 1
+    payload = state["cancel_requests"][0]
+    assert_cancel_payload_is_routing_metadata_only(payload)
+    assert payload["reason"] == "requester_cancelled"
+
+
 def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
     """The chat UI should render markdown formatting returned by the assistant."""
 

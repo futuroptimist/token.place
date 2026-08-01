@@ -20,6 +20,10 @@ import requests
 
 from api.v1.models import CANONICAL_LAUNCH_MODEL_ID, generate_response
 from utils.crypto.crypto_manager import CryptoManager
+from utils.inference_timeout import (
+    DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS,
+    INFERENCE_RESPONSE_GRACE_SECONDS,
+)
 
 logger = logging.getLogger("api.v1.compute_provider")
 _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -47,6 +51,16 @@ _RELAY_PUBLIC_URL_ENVS = (
     "TOKEN_PLACE_RELAY_PUBLIC_URL",
     "RELAY_PUBLIC_URL",
 )
+
+
+def _coerce_admitted_ttl(value: object) -> float:
+    """Return a numeric relay TTL, rejecting booleans as invalid metadata."""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @dataclass(frozen=True)
@@ -229,7 +243,7 @@ class DistributedApiV1ComputeProvider:
     """Provider that dispatches API v1 requests via relay-blind E2EE envelopes."""
 
     base_url: str
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
 
     def _relay_url(self, path: str) -> str:
         base_url = self.base_url.rstrip("/")
@@ -421,6 +435,23 @@ class DistributedApiV1ComputeProvider:
             )
 
         relay_request_enqueued = True
+        # Admission is where the relay-owned inference clock starts. Reset the
+        # outer transport clock from its returned relative TTL so server
+        # selection and enqueue latency cannot consume response grace. Explicit
+        # shorter provider overrides remain an upper bound.
+        try:
+            admission_payload = faucet_response.json()
+        except ValueError:
+            admission_payload = None
+        if isinstance(admission_payload, dict):
+            admitted_ttl = _coerce_admitted_ttl(
+                admission_payload.get("request_ttl_seconds")
+            )
+            if admitted_ttl > 0:
+                deadline = time.time() + min(
+                    relay_timeout,
+                    admitted_ttl + INFERENCE_RESPONSE_GRACE_SECONDS,
+                )
         poll_interval = self._poll_interval_seconds()
         while time.time() < deadline:
             try:
@@ -759,11 +790,14 @@ def _build_api_v1_compute_provider(
         return local_provider
 
     selected_target = distributed_url.rstrip("/")
-    timeout_raw = os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "120")
+    timeout_raw = os.environ.get(
+        "TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS",
+        str(DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS),
+    )
     try:
         timeout_seconds = max(float(timeout_raw), 1.0)
     except (TypeError, ValueError):
-        timeout_seconds = 120.0
+        timeout_seconds = DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
     distributed_provider = DistributedApiV1ComputeProvider(
         base_url=selected_target,
         timeout_seconds=timeout_seconds,

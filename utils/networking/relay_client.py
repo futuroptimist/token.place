@@ -28,6 +28,7 @@ from utils.llm.model_profiles import build_model_aliases
 # Configure logging
 logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
+# Only legacy relays that omit valid deadline metadata use this compatibility cap.
 _API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS = 300.0
 _API_V1_CONTROL_MIN_POLL_SECONDS = 1.0
 _API_V1_CONTROL_MAX_POLL_SECONDS = 10.0
@@ -2392,7 +2393,7 @@ class RelayClient:
             return None
         if not math.isfinite(seconds):
             return None
-        return max(0.0, seconds)
+        return seconds if seconds > 0 else None
 
     @classmethod
     def _api_v1_initial_deadline_from_metadata(cls, request_payload: Dict[str, Any], *, now: Optional[float] = None) -> float:
@@ -2401,8 +2402,7 @@ class RelayClient:
             cls._api_v1_initial_relative_seconds(request_payload.get('request_ttl_seconds')),
         ]
         valid = [value for value in candidates if value is not None]
-        # Legacy relays may omit deadline metadata; cap such requests at the
-        # documented 300-second compatibility deadline rather than running forever.
+        # Legacy relays may omit deadline metadata and expire work after 300s.
         remaining = min(valid) if valid else _API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS
         return (time.monotonic() if now is None else now) + remaining
 

@@ -2,7 +2,9 @@ const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue genera
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
 const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1000;
-const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
+// Five seconds beyond the relay-owned 480-second inference deadline lets a
+// completed ciphertext response propagate before the browser aborts.
+const RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
 const DEFAULT_CONTEXT_TIER = 'auto';
@@ -49,7 +51,8 @@ new Vue({
         computeNodeCountQueuedRefreshResolve: null,
         computeNodeCountQueuedRefreshActive: false,
         computeNodeCountFetchController: null,
-        computeNodeCountDestroyed: false
+        computeNodeCountDestroyed: false,
+        activeRelayRequest: null
     },
     mounted() {
         this.detectTouchInput();
@@ -59,6 +62,9 @@ new Vue({
         this.refreshComputeNodeCount();
         if (typeof document !== 'undefined') {
             document.addEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
+        }
+        if (typeof window !== 'undefined') {
+            window.addEventListener('pagehide', this.handleRelayPageHide);
         }
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
@@ -907,10 +913,12 @@ new Vue({
             return ASSISTANT_GENERIC_FALLBACK_MESSAGE;
         },
 
-        async cancelRelayRequest(clientPublicKeyB64, requestId, cancelToken) {
-            if (!clientPublicKeyB64 || !requestId || !cancelToken) {
+        async cancelRelayRequest(reason = 'requester_cancelled') {
+            const activeRequest = this.activeRelayRequest;
+            if (!activeRequest || activeRequest.cancelled) {
                 return;
             }
+            activeRequest.cancelled = true;
             try {
                 await fetch('/api/v1/relay/requests/cancel', {
                     method: 'POST',
@@ -918,15 +926,26 @@ new Vue({
                         'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({
-                        client_public_key: clientPublicKeyB64,
-                        request_id: requestId,
-                        cancel_token: cancelToken,
+                        client_public_key: activeRequest.clientPublicKey,
+                        request_id: activeRequest.requestId,
+                        cancel_token: activeRequest.cancelToken,
                         status: 'cancelled',
-                        reason: 'client_timeout'
-                    })
+                        reason
+                    }),
+                    keepalive: true
                 });
             } catch (error) {
-                console.warn('Unable to cancel timed-out API v1 relay request:', error);
+                console.warn('Unable to cancel API v1 relay request:', error);
+            }
+        },
+
+        handleRelayPageHide() {
+            this.cancelRelayRequest('requester_cancelled');
+        },
+
+        clearActiveRelayRequest(requestId) {
+            if (this.activeRelayRequest && this.activeRelayRequest.requestId === requestId) {
+                this.activeRelayRequest = null;
             }
         },
 
@@ -961,16 +980,22 @@ new Vue({
             const deadline = Date.now() + timeoutMs;
 
             while (Date.now() < deadline) {
-                const response = await fetch('/api/v1/relay/responses/retrieve', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        client_public_key: clientPublicKeyB64,
-                        request_id: requestId
-                    })
-                });
+                let response;
+                try {
+                    response = await fetch('/api/v1/relay/responses/retrieve', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            client_public_key: clientPublicKeyB64,
+                            request_id: requestId
+                        })
+                    });
+                } catch (error) {
+                    await this.cancelRelayRequest('requester_cancelled');
+                    throw error;
+                }
 
                 if (response.status === 202) {
                     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
@@ -985,6 +1010,7 @@ new Vue({
                         errorData = null;
                     }
                     const userMessage = this.getUserFacingRelayRetrieveError(response.status);
+                    this.clearActiveRelayRequest(requestId);
                     return {
                         error: {
                             userMessage,
@@ -993,10 +1019,12 @@ new Vue({
                     };
                 }
 
-                return response.json();
+                const result = await response.json();
+                this.clearActiveRelayRequest(requestId);
+                return result;
             }
 
-            await this.cancelRelayRequest(clientPublicKeyB64, requestId, cancelToken);
+            await this.cancelRelayRequest('client_timeout');
             return {
                 error: {
                     userMessage: 'The LLM server took too long to respond. Please try again.'
@@ -1105,6 +1133,13 @@ new Vue({
                         }
                     };
                 }
+
+                this.activeRelayRequest = {
+                    clientPublicKey: clientPublicKeyB64,
+                    requestId,
+                    cancelToken,
+                    cancelled: false
+                };
 
                 const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken);
                 if (encryptedResponse && encryptedResponse.error) {
@@ -1482,6 +1517,10 @@ new Vue({
         if (typeof document !== 'undefined') {
             document.removeEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
         }
+        if (typeof window !== 'undefined') {
+            window.removeEventListener('pagehide', this.handleRelayPageHide);
+        }
+        this.cancelRelayRequest('requester_cancelled');
         if (!Array.isArray(this.chatHistory)) {
             return;
         }

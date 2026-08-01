@@ -193,6 +193,13 @@ plaintext prompts, responses, private keys, decrypted payloads, or full public k
 
 ## Cutting a desktop release
 
+Functional changes included in a rebuilt desktop installer normally require a patch-version bump;
+major and minor bumps remain maintainer-directed. Update all synchronized package, Tauri, Cargo,
+lockfile, installer-identity, and fixture versions, then validate with
+`python -m pytest -q tests/unit/test_desktop_release_artifacts.py`.
+A version bump alone does not create or authorize a tag or release. See the canonical policy in
+[`AGENTS.md`](../AGENTS.md).
+
 Desktop binaries released as GitHub Release assets are published only by the canonical GitHub Actions workflow
 `Desktop Tauri Release` (`.github/workflows/desktop-release.yml`).
 

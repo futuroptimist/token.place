@@ -33,6 +33,21 @@ with the repo. A plain-text mirror lives in [llms.txt](llms.txt).
   sidecar launch, include regression coverage that asserts GPU mode does not
   silently fall back to CPU when GPU runtime support is expected.
 
+## Desktop versioning policy (mandatory)
+- Major and minor desktop version changes require explicit maintainer instructions.
+- A PR that functionally changes shipped desktop behavior, packaging, installation or upgrade
+  behavior, native code, UI, embedded sidecars, bundled dependencies, or shared runtime code
+  included in the desktop app should default to a patch bump. If applicability is ambiguous,
+  bump when users need a rebuilt installer to receive or validate the change.
+- A coordinated multi-PR release train may defer the bump to one release-preparation PR only
+  when the task or PR record explicitly says so; never silently assume another PR will bump it.
+- Relay-only, web-only, documentation-only, test-only, CI-only, and behavior-preserving refactors
+  need no bump unless they change the desktop artifact or require a rebuilt installer.
+- Patch bumps must update every synchronized version surface and version-dependent fixture.
+  They do not authorize tagging, publishing, or creating a release.
+- The commit/build ID identifies an exact build; the semantic version identifies an intentionally
+  packaged desktop release.
+
 ## Relay-blind E2EE invariant (must-follow)
 - Distributed relay inference must be relay-blind E2EE (ciphertext only + routing metadata).
 - Never queue, forward, log, diagnose, or expose plaintext model payload content in relay-owned state.

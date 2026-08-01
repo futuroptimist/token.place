@@ -3772,7 +3772,7 @@ def test_api_v1_control_expiry_response_race_both_orderings(client, monkeypatch)
     assert client.post('/api/v1/relay/requests', json=_api_v1_request_payload(terminal_request_id)).status_code == 200
     assert client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY}).status_code == 200
     original_monotonic = time.monotonic
-    monkeypatch.setattr(relay_module.time, 'monotonic', lambda: original_monotonic() + 400.0)
+    monkeypatch.setattr(relay_module.time, 'monotonic', lambda: original_monotonic() + 500.0)
     second_barrier = threading.Barrier(2)
     terminal_done = threading.Event()
     second_errors = []

@@ -18,6 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
+from inference_timeout import DEFAULT_API_V1_INFERENCE_TIMEOUT_SECONDS
 from utils.processing_result import RelayProcessingResult
 from urllib.parse import urlparse, urlunparse
 
@@ -28,7 +29,7 @@ from utils.llm.model_profiles import build_model_aliases
 # Configure logging
 logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
-_API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS = 300.0
+_API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS = DEFAULT_API_V1_INFERENCE_TIMEOUT_SECONDS
 _API_V1_CONTROL_MIN_POLL_SECONDS = 1.0
 _API_V1_CONTROL_MAX_POLL_SECONDS = 10.0
 _API_V1_CONTROL_ACK_TIMEOUT_SECONDS = 2.0

@@ -45,7 +45,7 @@ The response may include `request_ttl_seconds` and `request_deadline_remaining_s
 
 ## Deadline and lease behavior
 
-The relay establishes one authoritative request deadline when a request is admitted to `/api/v1/relay/requests`. The default is compatible with the browser's existing roughly 300-second cancellation behavior and is configurable via relay environment variables while remaining bounded. The deadline is stored with queued and in-flight request state, returned in admission metadata, and dispatched with the encrypted request envelope as relative TTL metadata.
+The relay establishes one authoritative request deadline when a request is admitted to `/api/v1/relay/requests`. The production default is 480 seconds and remains configurable via relay environment variables while bounded. Outer browser and distributed-provider waits add only five seconds of response-propagation grace so the relay can classify expiry and propagate cancellation before a transport caller gives up. The deadline is stored with queued and in-flight request state, returned in admission metadata, and dispatched with the encrypted request envelope as relative TTL metadata.
 
 A valid active control poll may renew only the in-flight accounting lease for the owning compute node. It never extends the absolute request deadline. Late result/error submissions after cancellation or deadline expiry remain rejected.
 

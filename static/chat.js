@@ -2,7 +2,9 @@ const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue genera
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
 const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1000;
-const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
+// The relay's 480-second deadline is authoritative. Five seconds lets its
+// classified timeout/cancellation response reach the browser first.
+const RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
 const DEFAULT_CONTEXT_TIER = 'auto';
@@ -955,8 +957,11 @@ new Vue({
             return 1;
         },
 
-        async retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken) {
-            const timeoutMs = RELAY_RESPONSE_POLL_TIMEOUT_MS;
+        async retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken, admittedTtlSeconds) {
+            const admittedTimeoutMs = Number(admittedTtlSeconds) * 1000;
+            const timeoutMs = Number.isFinite(admittedTimeoutMs) && admittedTimeoutMs > 0
+                ? admittedTimeoutMs + 5000
+                : RELAY_RESPONSE_POLL_TIMEOUT_MS;
             const pollIntervalMs = 500;
             const deadline = Date.now() + timeoutMs;
 
@@ -1106,7 +1111,13 @@ new Vue({
                     };
                 }
 
-                const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken);
+                const dispatchMetadata = await dispatchResponse.json();
+                const encryptedResponse = await this.retrieveRelayResponse(
+                    clientPublicKeyB64,
+                    requestId,
+                    cancelToken,
+                    dispatchMetadata.request_ttl_seconds
+                );
                 if (encryptedResponse && encryptedResponse.error) {
                     return encryptedResponse;
                 }

@@ -193,6 +193,13 @@ plaintext prompts, responses, private keys, decrypted payloads, or full public k
 
 ## Cutting a desktop release
 
+Functional changes shipped in the desktop installer normally require a synchronized patch-version
+bump; major and minor bumps remain maintainer-directed. Update `package.json`, its lockfile,
+`src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, its lockfile, and version-dependent fixtures, then
+validate with `python scripts/validate_windows_desktop_release_artifacts.py --expected-version X.Y.Z`
+(artifact arguments are additionally required when validating built Windows installers). A version
+bump alone does not create a tag or publish a release; see the canonical policy in `../AGENTS.md`.
+
 Desktop binaries released as GitHub Release assets are published only by the canonical GitHub Actions workflow
 `Desktop Tauri Release` (`.github/workflows/desktop-release.yml`).
 

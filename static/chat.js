@@ -2,7 +2,9 @@ const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue genera
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
 const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1000;
-const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
+// Five seconds beyond the relay-owned 480-second inference deadline lets the
+// classified timeout and downstream cancellation propagate back to the UI.
+const RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000;
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
 const DEFAULT_CONTEXT_TIER = 'auto';

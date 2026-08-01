@@ -68,6 +68,12 @@ After a successful repair, the sidecar automatically re-execs once so the active
 
 ## Build a local installer (fast iteration loop)
 
+Functional changes that ship in the desktop installer normally require a patch-version bump;
+major and minor changes remain maintainer-directed. Update all synchronized package, Tauri,
+Cargo, lockfile, installer, and fixture versions, then validate them with
+`pytest -q tests/unit/test_desktop_release_artifacts.py` from the repository root. A version
+bump does not create a tag or publish a release; see the canonical policy in `../AGENTS.md`.
+
 `.github/workflows/desktop-release.yml` (the canonical release build) takes roughly 45
 minutes per push, since it builds both macOS and Windows in a matrix. To validate packaging
 changes without that round trip, build a real local installer with one command:

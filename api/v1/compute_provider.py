@@ -20,6 +20,7 @@ import requests
 
 from api.v1.models import CANONICAL_LAUNCH_MODEL_ID, generate_response
 from utils.crypto.crypto_manager import CryptoManager
+from utils.inference_timeout import API_V1_OUTER_REQUEST_TIMEOUT_SECONDS
 
 logger = logging.getLogger("api.v1.compute_provider")
 _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -229,7 +230,7 @@ class DistributedApiV1ComputeProvider:
     """Provider that dispatches API v1 requests via relay-blind E2EE envelopes."""
 
     base_url: str
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = API_V1_OUTER_REQUEST_TIMEOUT_SECONDS
 
     def _relay_url(self, path: str) -> str:
         base_url = self.base_url.rstrip("/")
@@ -759,11 +760,14 @@ def _build_api_v1_compute_provider(
         return local_provider
 
     selected_target = distributed_url.rstrip("/")
-    timeout_raw = os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "120")
+    timeout_raw = os.environ.get(
+        "TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS",
+        str(API_V1_OUTER_REQUEST_TIMEOUT_SECONDS),
+    )
     try:
         timeout_seconds = max(float(timeout_raw), 1.0)
     except (TypeError, ValueError):
-        timeout_seconds = 120.0
+        timeout_seconds = API_V1_OUTER_REQUEST_TIMEOUT_SECONDS
     distributed_provider = DistributedApiV1ComputeProvider(
         base_url=selected_target,
         timeout_seconds=timeout_seconds,

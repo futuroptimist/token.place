@@ -10,6 +10,13 @@ Secure proxy providing OpenAI-compatible APIs with end-to-end encryption. Python
 
 ## Coding
 - New JS should use TypeScript, React hooks, and Tailwind CSS.
+- Desktop major/minor bumps require explicit maintainer direction. Functional changes shipped
+  in a rebuilt desktop installer default to a patch bump across every synchronized version
+  surface and fixture; ambiguous changes bias toward bumping. Explicitly recorded release trains
+  may defer to one release-preparation PR, but agents must not assume deferral. Relay/web/docs/
+  tests/CI-only and behavior-preserving changes need no bump unless the artifact changes. A bump
+  never authorizes tagging or publishing; semantic versions identify packaged releases while
+  commit/build IDs identify exact builds. See AGENTS.md for the canonical policy.
 
 ## Agents
 - Code Linter Agent: PR linting via ESLint/Flake8

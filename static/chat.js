@@ -2,7 +2,11 @@ const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue genera
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
 const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1000;
-const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
+const INFERENCE_COMPLETION_TIMEOUT_MS = 480000;
+// The relay owns the inference deadline. Keep a small outer grace window for
+// its terminal response/cancellation to cross the final HTTP polling round.
+const RELAY_RESPONSE_PROPAGATION_GRACE_MS = 5000;
+const RELAY_RESPONSE_POLL_TIMEOUT_MS = INFERENCE_COMPLETION_TIMEOUT_MS + RELAY_RESPONSE_PROPAGATION_GRACE_MS;
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
 const DEFAULT_CONTEXT_TIER = 'auto';

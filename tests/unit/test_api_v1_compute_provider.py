@@ -1065,9 +1065,31 @@ def test_get_provider_defaults_invalid_distributed_timeout(monkeypatch):
     try:
         provider = compute_provider.get_api_v1_compute_provider()
         assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
-        assert provider.timeout_seconds == 120.0
+        assert provider.timeout_seconds == 485.0
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_production_inference_and_outer_transport_budgets_are_consistent():
+    from pathlib import Path
+
+    from utils.inference_timeout import (
+        API_V1_INFERENCE_COMPLETION_TIMEOUT_SECONDS,
+        API_V1_OUTER_REQUEST_TIMEOUT_SECONDS,
+        API_V1_RESPONSE_PROPAGATION_GRACE_SECONDS,
+    )
+
+    chat_js = Path('static/chat.js').read_text(encoding='utf-8')
+    assert API_V1_INFERENCE_COMPLETION_TIMEOUT_SECONDS == 480.0
+    assert API_V1_RESPONSE_PROPAGATION_GRACE_SECONDS == 5.0
+    assert API_V1_OUTER_REQUEST_TIMEOUT_SECONDS == 485.0
+    assert 'INFERENCE_COMPLETION_TIMEOUT_MS = 480000' in chat_js
+    assert 'RELAY_RESPONSE_PROPAGATION_GRACE_MS = 5000' in chat_js
+    # Operational control polling and acknowledgement remain deliberately short.
+    provider = compute_provider.DistributedApiV1ComputeProvider(
+        base_url='https://relay.example', timeout_seconds=485
+    )
+    assert provider._poll_interval_seconds() <= 0.5
 
 def test_get_provider_floors_distributed_timeout_to_one_second(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")

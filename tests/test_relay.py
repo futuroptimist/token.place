@@ -4261,6 +4261,15 @@ def test_api_v1_request_deadline_seconds_rejects_non_finite_and_hard_clamps(monk
     assert relay_module._api_v1_request_deadline_seconds() == relay_module.HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS
 
 
+def test_api_v1_production_request_deadline_default_is_eight_minutes(monkeypatch):
+    monkeypatch.delenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, raising=False)
+    monkeypatch.delenv(relay_module.API_V1_REQUEST_DEADLINE_MIN_SECONDS_ENV, raising=False)
+    monkeypatch.delenv(relay_module.API_V1_REQUEST_DEADLINE_MAX_SECONDS_ENV, raising=False)
+
+    assert relay_module.DEFAULT_API_V1_REQUEST_DEADLINE_SECONDS == 480.0
+    assert relay_module._api_v1_request_deadline_seconds() == 480.0
+
+
 def test_api_v1_poll_drops_expired_queue_head_and_dispatches_next(client):
     known_servers[DUMMY_SERVER_PUB_KEY] = {
         'public_key': DUMMY_SERVER_PUB_KEY,

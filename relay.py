@@ -17,6 +17,7 @@ from typing import Any, Dict
 from urllib.parse import urlparse
 
 from release_metadata import get_release_metadata, resolve_asset_version, resolve_deploy_ref
+from utils.inference_timeout import API_V1_INFERENCE_COMPLETION_TIMEOUT_SECONDS
 from utils.llm.model_profiles import build_model_aliases
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
@@ -902,7 +903,10 @@ API_V1_IN_FLIGHT_TTL_SECONDS_ENV = "TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS"
 API_V1_REQUEST_DEADLINE_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_SECONDS"
 API_V1_REQUEST_DEADLINE_MIN_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_MIN_SECONDS"
 API_V1_REQUEST_DEADLINE_MAX_SECONDS_ENV = "TOKEN_PLACE_API_V1_REQUEST_DEADLINE_MAX_SECONDS"
-DEFAULT_API_V1_REQUEST_DEADLINE_SECONDS = 300.0
+# Authoritative end-to-end inference-completion budget. Relay deadline metadata
+# propagates this budget to compute nodes; outer clients may add only response
+# propagation grace and must never shorten it.
+DEFAULT_API_V1_REQUEST_DEADLINE_SECONDS = API_V1_INFERENCE_COMPLETION_TIMEOUT_SECONDS
 DEFAULT_API_V1_REQUEST_DEADLINE_MIN_SECONDS = 1.0
 DEFAULT_API_V1_REQUEST_DEADLINE_MAX_SECONDS = 3600.0
 HARD_MIN_API_V1_REQUEST_DEADLINE_SECONDS = 1.0

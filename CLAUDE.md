@@ -10,6 +10,7 @@ It complements [AGENTS.md](AGENTS.md) and [llms.txt](llms.txt) by focusing on gu
 - Validate model output before acting on it.
 
 For broader assistant behavior, see [docs/AGENTS.md](docs/AGENTS.md).
+The mandatory desktop patch-bump default is canonical in [AGENTS.md](AGENTS.md#desktop-semantic-versioning-mandatory).
 
 
 ## token.place API v1 relay guardrails

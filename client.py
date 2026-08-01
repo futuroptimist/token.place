@@ -9,6 +9,7 @@ import uuid
 from encrypt import generate_keys, encrypt, decrypt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from utils.inference_timeout import DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -32,7 +33,7 @@ API_FALLBACK_URLS = [
 ]
 # Or use "http://localhost:5070" if targeting relay endpoints directly
 
-REQUEST_TIMEOUT = 10  # seconds
+REQUEST_TIMEOUT = DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
 UNKNOWN_REQUEST_ID = object()
 
 CLIENT_KEYS_DIR = "client_keys"
@@ -272,7 +273,12 @@ class ChatClient:
             )
             return None
 
-    def retrieve_response(self, timeout=60, request_id=None, chat_history=None):
+    def retrieve_response(
+        self,
+        timeout=DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS,
+        request_id=None,
+        chat_history=None,
+    ):
         start_time = time.time()
         while True:
             try:
@@ -399,7 +405,7 @@ class ChatClient:
             )
             if response_request and response_request.status_code == 200:
                 start_time = time.time()
-                timeout = 60  # Adjust the timeout as needed
+                timeout = DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
                 while True:
                     response = self.retrieve_response(request_id=request_id, chat_history=self.chat_history)
                     if response is UNKNOWN_REQUEST_ID:

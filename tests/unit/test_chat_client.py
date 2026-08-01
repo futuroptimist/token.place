@@ -3,6 +3,12 @@ import json
 from unittest.mock import patch, MagicMock
 
 from client import ChatClient, REQUEST_TIMEOUT
+from utils.inference_timeout import DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
+
+
+def test_chat_client_uses_canonical_transport_timeout():
+    assert REQUEST_TIMEOUT == DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
+    assert ChatClient.retrieve_response.__defaults__[0] == DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
 
 
 def test_get_server_public_key():

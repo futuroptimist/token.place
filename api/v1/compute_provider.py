@@ -53,6 +53,16 @@ _RELAY_PUBLIC_URL_ENVS = (
 )
 
 
+def _coerce_admitted_ttl(value: object) -> float:
+    """Return a numeric relay TTL, rejecting booleans as invalid metadata."""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass(frozen=True)
 class DistributedTargetSelection:
     """Resolved distributed relay target and diagnostics for provider logs."""
@@ -434,10 +444,9 @@ class DistributedApiV1ComputeProvider:
         except ValueError:
             admission_payload = None
         if isinstance(admission_payload, dict):
-            try:
-                admitted_ttl = float(admission_payload.get("request_ttl_seconds"))
-            except (TypeError, ValueError):
-                admitted_ttl = 0.0
+            admitted_ttl = _coerce_admitted_ttl(
+                admission_payload.get("request_ttl_seconds")
+            )
             if admitted_ttl > 0:
                 deadline = time.time() + min(
                     relay_timeout,

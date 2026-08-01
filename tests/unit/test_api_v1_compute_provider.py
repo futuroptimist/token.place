@@ -15,6 +15,12 @@ from api.v1.compute_provider import (
 from relay import app
 
 
+def test_admitted_ttl_rejects_boolean_metadata():
+    assert compute_provider._coerce_admitted_ttl(True) == 0.0
+    assert compute_provider._coerce_admitted_ttl(False) == 0.0
+    assert compute_provider._coerce_admitted_ttl("30") == 30.0
+
+
 def test_completion_result_message_compatibility_contract():
     message = {"role": "assistant", "content": "hello"}
     result = CompletionResult(

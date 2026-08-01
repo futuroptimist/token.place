@@ -1,5 +1,6 @@
 import base64
 import json
+import pytest
 from unittest.mock import patch, MagicMock
 
 from client import (
@@ -67,11 +68,31 @@ def test_send_message_flow():
             base64.b64encode(b'server_key').decode('utf-8'),
             base64.b64encode(b'cipher').decode('utf-8'),
             request_id='chat-client-abc123',
+            cancel_token='abc123',
         )
         m_retrieve.assert_called_once_with(
             request_id='chat-client-abc123',
             chat_history=[{'role': 'user', 'content': 'hi'}],
+            cancellation={
+                'request_id': 'chat-client-abc123',
+                'cancel_token': 'abc123',
+                'admitted': True,
+                'cancelled': False,
+            },
         )
+
+
+def test_relay_submission_carries_cancel_token_outside_encrypted_payload():
+    client = ChatClient('http://test', relay_port=5000)
+    with patch('client.requests.post', return_value=MagicMock(status_code=200)) as m_post:
+        client.send_request_to_relay_requests(
+            'ciphertext', 'iv', 'server-key', 'cipherkey',
+            request_id='req-1', cancel_token='cancel-1',
+        )
+
+    payload = m_post.call_args.kwargs['json']
+    assert payload['cancel_token'] == 'cancel-1'
+    assert payload['chat_history'] == 'ciphertext'
 
 
 def test_send_message_uses_exactly_one_response_budget():
@@ -153,3 +174,55 @@ def test_retrieve_response_bounds_each_request_by_remaining_budget():
         assert client.retrieve_response(timeout=3.0, request_id='req-1') is UNKNOWN_REQUEST_ID
 
     assert m_post.call_args.kwargs['timeout'] == 3.0
+
+
+def test_retrieve_response_timeout_cancels_once_without_sleeping():
+    client = ChatClient('http://test', relay_port=5000)
+    cancellation = {
+        'request_id': 'req-1', 'cancel_token': 'cancel-1',
+        'admitted': True, 'cancelled': False,
+    }
+    pending = MagicMock(status_code=202)
+    with patch('client.time.time', side_effect=[0.0, 0.0] + [1.0] * 10), \
+         patch('client.time.sleep') as m_sleep, \
+         patch('client.requests.post', return_value=pending) as m_post:
+        assert client.retrieve_response(
+            timeout=1.0, request_id='req-1', cancellation=cancellation,
+        ) is None
+
+    m_sleep.assert_not_called()
+    assert m_post.call_count == 2
+    cancel_call = m_post.call_args
+    assert cancel_call.kwargs['json'] == {
+        'client_public_key': client.public_key_b64,
+        'request_id': 'req-1',
+        'cancel_token': 'cancel-1',
+        'status': 'cancelled',
+        'reason': 'client_timeout',
+    }
+    client.cancel_relay_request(cancellation, 'client_timeout')
+    assert m_post.call_count == 2
+
+
+def test_send_message_interrupt_after_admission_cancels_once_and_propagates():
+    client = ChatClient('http://test', relay_port=5000)
+    with patch.object(client, 'get_server_public_key', return_value=b'server-key'), \
+         patch('client.encrypt', return_value=({'ciphertext': b'data'}, b'key', b'iv')), \
+         patch.object(client, 'send_request_to_relay_requests', return_value=MagicMock(status_code=200)), \
+         patch.object(client, 'retrieve_response', side_effect=KeyboardInterrupt), \
+         patch.object(client, 'cancel_relay_request') as m_cancel:
+        with pytest.raises(KeyboardInterrupt):
+            client.send_message('hi')
+
+    m_cancel.assert_called_once()
+    assert m_cancel.call_args.args[1] == 'requester_cancelled'
+
+
+def test_send_message_pre_admission_failure_does_not_cancel():
+    client = ChatClient('http://test', relay_port=5000)
+    with patch.object(client, 'get_server_public_key', return_value=b'server-key'), \
+         patch('client.encrypt', return_value=({'ciphertext': b'data'}, b'key', b'iv')), \
+         patch.object(client, 'send_request_to_relay_requests', return_value=None), \
+         patch.object(client, 'cancel_relay_request') as m_cancel:
+        assert client.send_message('hi') is None
+    m_cancel.assert_not_called()

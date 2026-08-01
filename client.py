@@ -254,6 +254,7 @@ class ChatClient:
         server_public_key_b64,
         encrypted_cipherkey_b64,
         request_id=None,
+        cancel_token=None,
     ):
         """Send an encrypted API v1 E2EE relay envelope to the relay requests endpoint."""
         try:
@@ -268,6 +269,8 @@ class ChatClient:
             }
             if request_id:
                 data["request_id"] = request_id
+            if cancel_token:
+                data["cancel_token"] = cancel_token
             response = requests.post(
                 f'{self.base_url}:{self.relay_port}/api/v1/relay/requests',
                 json=data,
@@ -281,17 +284,40 @@ class ChatClient:
             )
             return None
 
+    def cancel_relay_request(self, cancellation, reason):
+        """Cancel an admitted request at most once using routing metadata only."""
+        if not cancellation.get("admitted") or cancellation.get("cancelled"):
+            return
+        cancellation["cancelled"] = True
+        try:
+            requests.post(
+                f'{self.base_url}:{self.relay_port}/api/v1/relay/requests/cancel',
+                json={
+                    "client_public_key": self.public_key_b64,
+                    "request_id": cancellation["request_id"],
+                    "cancel_token": cancellation["cancel_token"],
+                    "status": "cancelled",
+                    "reason": reason,
+                },
+                timeout=SHORT_OPERATIONAL_TIMEOUT_SECONDS,
+            )
+        except requests.exceptions.RequestException as e:
+            logger.warning("Error while cancelling relay request: %s", e.__class__.__name__)
+
     def retrieve_response(
         self,
         timeout=DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS,
         request_id=None,
         chat_history=None,
+        cancellation=None,
     ):
         start_time = time.time()
         while True:
             remaining = timeout - (time.time() - start_time)
             if remaining <= 0:
                 logger.warning("Timeout while waiting for response.")
+                if cancellation is not None:
+                    self.cancel_relay_request(cancellation, "client_timeout")
                 return None
             try:
                 response = requests.post(
@@ -377,6 +403,8 @@ class ChatClient:
             remaining = timeout - (time.time() - start_time)
             if remaining <= 0:
                 logger.warning("Timeout while waiting for response.")
+                if cancellation is not None:
+                    self.cancel_relay_request(cancellation, "client_timeout")
                 return None
             time.sleep(min(2, remaining))
 
@@ -388,6 +416,12 @@ class ChatClient:
         if server_public_key:
             logger.debug("Retrieved server public key (%d bytes)", len(server_public_key))
             request_id = f"chat-client-{uuid.uuid4().hex}"
+            cancellation = {
+                "request_id": request_id,
+                "cancel_token": uuid.uuid4().hex,
+                "admitted": False,
+                "cancelled": False,
+            }
             bound_payload = {
                 "protocol": "tokenplace_api_v1_relay_e2ee",
                 "version": 1,
@@ -413,12 +447,19 @@ class ChatClient:
                 base64.b64encode(server_public_key).decode('utf-8'),
                 encrypted_cipherkey_b64,
                 request_id=request_id,
+                cancel_token=cancellation["cancel_token"],
             )
             if response_request and response_request.status_code == 200:
-                response = self.retrieve_response(
-                    request_id=request_id,
-                    chat_history=self.chat_history,
-                )
+                cancellation["admitted"] = True
+                try:
+                    response = self.retrieve_response(
+                        request_id=request_id,
+                        chat_history=self.chat_history,
+                        cancellation=cancellation,
+                    )
+                except KeyboardInterrupt:
+                    self.cancel_relay_request(cancellation, "requester_cancelled")
+                    raise
                 if response is UNKNOWN_REQUEST_ID:
                     logger.warning("Stopping polling for unknown request_id %s.", request_id)
                 elif response:

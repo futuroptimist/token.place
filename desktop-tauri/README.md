@@ -2,6 +2,15 @@
 
 This folder contains the forward-looking Tauri desktop MVP for token.place.
 
+## Version bumps
+
+Functional changes that ship in the desktop installer normally require a patch bump; major and
+minor bumps remain maintainer-controlled. Update `package.json` and `package-lock.json` with
+`npm version <version> --no-git-tag-version`, then synchronize `src-tauri/tauri.conf.json`,
+`src-tauri/Cargo.toml`, the root package entry in `src-tauri/Cargo.lock`, Windows installer
+expectations, and version-dependent tests. Validate with
+`pytest -q tests/unit/test_desktop_release_artifacts.py`; a bump does not create a tag or release.
+
 ## Scope of this MVP
 
 - Single-screen UI with a background compute-node operator mode plus a local prompt smoke-test panel.

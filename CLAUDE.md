@@ -3,6 +3,8 @@
 This file summarizes best practices from [Anthropic's "Claude Code Best Practices"](https://www.anthropic.com/engineering/claude-code-best-practices).
 It complements [AGENTS.md](AGENTS.md) and [llms.txt](llms.txt) by focusing on guidance specific to the Claude model family.
 
+Desktop changes must follow the canonical semantic-version policy in [AGENTS.md](AGENTS.md#desktop-semantic-versioning-mandatory).
+
 ## Key Points
 - Keep prompts concise and provide explicit context.
 - Prefer deterministic functions with clear input and output formats.

@@ -1065,9 +1065,20 @@ def test_get_provider_defaults_invalid_distributed_timeout(monkeypatch):
     try:
         provider = compute_provider.get_api_v1_compute_provider()
         assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
-        assert provider.timeout_seconds == 120.0
+        assert (
+            provider.timeout_seconds
+            == compute_provider.DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
+        )
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
+
+
+def test_distributed_provider_default_includes_only_response_grace():
+    provider = DistributedApiV1ComputeProvider(base_url="https://node-a.example")
+
+    assert compute_provider.DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS == 485.0
+    assert provider.timeout_seconds == 485.0
+
 
 def test_get_provider_floors_distributed_timeout_to_one_second(monkeypatch):
     monkeypatch.setenv("TOKENPLACE_API_V1_COMPUTE_PROVIDER", "distributed")

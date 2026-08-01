@@ -1065,7 +1065,7 @@ def test_get_provider_defaults_invalid_distributed_timeout(monkeypatch):
     try:
         provider = compute_provider.get_api_v1_compute_provider()
         assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
-        assert provider.timeout_seconds == 120.0
+        assert provider.timeout_seconds == 485.0
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
 

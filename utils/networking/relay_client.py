@@ -24,11 +24,12 @@ from urllib.parse import urlparse, urlunparse
 from utils.networking.http_requests_compat import requests
 from utils.context_profiles import DEFAULT_CONTEXT_TIER, get_context_profile, normalize_context_tier
 from utils.llm.model_profiles import build_model_aliases
+from utils.inference_timeout import DEFAULT_INFERENCE_TIMEOUT_SECONDS
 
 # Configure logging
 logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
-_API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS = 300.0
+_API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS = DEFAULT_INFERENCE_TIMEOUT_SECONDS
 _API_V1_CONTROL_MIN_POLL_SECONDS = 1.0
 _API_V1_CONTROL_MAX_POLL_SECONDS = 10.0
 _API_V1_CONTROL_ACK_TIMEOUT_SECONDS = 2.0
@@ -2402,7 +2403,7 @@ class RelayClient:
         ]
         valid = [value for value in candidates if value is not None]
         # Legacy relays may omit deadline metadata; cap such requests at the
-        # documented 300-second compatibility deadline rather than running forever.
+        # canonical inference deadline rather than running forever.
         remaining = min(valid) if valid else _API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS
         return (time.monotonic() if now is None else now) + remaining
 

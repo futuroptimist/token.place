@@ -2091,13 +2091,18 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
         ),
     )
     page.route(
-        "**/api/v1/relay/servers/next",
+        "**/api/v1/relay/servers/next**",
         lambda route: (
             state.__setitem__("next_calls", state["next_calls"] + 1),
             route.fulfill(
                 status=200,
                 headers={"Content-Type": "application/json"},
-                body=json.dumps({"server_public_key": SERVER_PUBLIC_KEY_B64}),
+                body=json.dumps(
+                    {
+                        "server_public_key": SERVER_PUBLIC_KEY_B64,
+                        "selected_context_tier": "8k-fast",
+                    }
+                ),
             ),
         ),
     )
@@ -2150,11 +2155,13 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
     assert "Could not load the API v1 model list" in page.locator(".model-error").inner_text()
 
     page.locator("textarea").first.fill("hello")
-    wait_for_landing_send_enabled(page).click()
+    with page.expect_request("**/api/v1/relay/requests") as request_info:
+        wait_for_landing_send_enabled(page).click()
 
-    page.locator(".assistant-message").last.wait_for(state="visible")
-    assert state["relay_requests"], "expected the landing chat to POST the API v1 fallback relay payload"
-    request_envelope = json.loads(state["relay_requests"][-1]["ciphertext"])
+    assistant_message = page.locator(".assistant-message").filter(has_text="Fallback model acknowledged.")
+    assistant_message.wait_for(state="visible")
+    expect(assistant_message).to_have_text("Fallback model acknowledged.")
+    request_envelope = json.loads(request_info.value.post_data_json["ciphertext"])
     assert request_envelope["api_v1_request"]["model"] == "qwen3-8b-instruct"
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []

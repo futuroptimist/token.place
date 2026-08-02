@@ -76,6 +76,10 @@ def route_landing_relay_chat(
     retrieve_statuses: list[int] | None = None,
     diagnostics_count: int | None = None,
     diagnostics_counts: list[int] | None = None,
+    admission_payload: dict | None = None,
+    pending_payload: dict | None = None,
+    cancel_status: int = 200,
+    cancel_payload: dict | None = None,
 ):
     """Mock the direct API v1 relay routes used by the landing chat."""
     state = {
@@ -162,7 +166,7 @@ def route_landing_relay_chat(
         status = 200
         if request_statuses:
             status = request_statuses[min(len(state["relay_requests"]) - 1, len(request_statuses) - 1)]
-        body = {"message": "Request received"} if status == 200 else {"error": {"code": "server_unavailable"}}
+        body = (admission_payload or {"message": "Request received"}) if status == 200 else {"error": {"code": "server_unavailable"}}
         route.fulfill(
             status=status,
             headers={"Content-Type": "application/json"},
@@ -180,10 +184,11 @@ def route_landing_relay_chat(
         if retrieve_statuses:
             status = retrieve_statuses[min(len(state["retrieve_requests"]) - 1, len(retrieve_statuses) - 1)]
         if status != 200:
+            body = pending_payload if status == 202 and pending_payload is not None else {"error": {"code": "selected_server_terminal"}}
             route.fulfill(
                 status=status,
                 headers={"Content-Type": "application/json"},
-                body=json.dumps({"error": {"code": "selected_server_terminal"}}),
+                body=json.dumps(body),
             )
             return
         retrieve_index = len(state["retrieve_requests"]) - 1
@@ -221,7 +226,7 @@ def route_landing_relay_chat(
         "**/api/v1/relay/requests/cancel",
         lambda route: (
             state["cancel_requests"].append(route.request.post_data_json),
-            route.fulfill(status=200, headers={"Content-Type": "application/json"}, body=json.dumps({"status": "cancelled"})),
+            route.fulfill(status=cancel_status, headers={"Content-Type": "application/json"}, body=json.dumps(cancel_payload or {"status": "cancelled"})),
         ),
     )
     page.route(
@@ -1038,7 +1043,7 @@ def test_landing_chat_timeout_cancels_relay_request_once(
     page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
     page.clock.fast_forward(486_000)
     page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
-    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest.cancelled")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
 
     assert len(state["cancel_requests"]) == 1
     payload = state["cancel_requests"][0]
@@ -1046,6 +1051,131 @@ def test_landing_chat_timeout_cancels_relay_request_once(
     assert payload["reason"] == "client_timeout"
     assert payload["request_id"] == state["relay_requests"][0]["request_id"]
     assert payload["cancel_token"] == state["relay_requests"][0]["cancel_token"]
+
+
+@pytest.mark.e2e
+def test_landing_chat_admission_ttl_controls_deadline_and_grace_once(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"message": "Request received", "request_ttl_seconds": 10},
+        retrieve_statuses=[202],
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("metadata deadline")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(14_000)
+    assert len(state["cancel_requests"]) == 0
+    page.clock.fast_forward(2_000)
+    page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
+    assert len(state["cancel_requests"]) == 1
+
+
+@pytest.mark.e2e
+def test_landing_chat_pending_deadline_only_shortens(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"request_ttl_seconds": 480},
+        retrieve_statuses=[202],
+        pending_payload={"request_deadline_remaining_seconds": 2, "request_ttl_seconds": 900},
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("shorten deadline")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(8_000)
+    page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
+    assert len(state["cancel_requests"]) == 1
+
+
+@pytest.mark.e2e
+def test_landing_chat_cancellation_http_failure_is_one_coherent_warning(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"request_ttl_seconds": 1},
+        retrieve_statuses=[202],
+        cancel_status=503,
+        cancel_payload={"error": {"code": "unavailable"}},
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("failed cancellation")
+    wait_for_landing_send_enabled(page).click()
+    page.clock.fast_forward(7_000)
+    warning = "cancellation could not be confirmed. Compute may continue briefly."
+    page.wait_for_function("warning => document.body.textContent.includes(warning)", arg=warning)
+    assert len(state["cancel_requests"]) == 1
+    assert page.locator(".assistant-message").filter(has_text=warning).count() == 1
+
+
+def test_landing_chat_deadline_metadata_validation(page: Page, base_url: str, setup_servers):
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    result = page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            const invalid = [true, false, 0, -1, NaN, Infinity, -Infinity, '480', 'bad', null];
+            return {
+                invalid: invalid.map(value => vm.validRelayDeadlineSeconds(value)),
+                valid: vm.validRelayDeadlineSeconds(480),
+                fallback: vm.relayResponseDeadlineFromAdmission({}, 1000),
+                admitted: vm.relayResponseDeadlineFromAdmission({request_ttl_seconds: 10}, 1000),
+                afterLegacyLimit: vm.relayResponseDeadlineFromAdmission({request_ttl_seconds: 480}, 0) > 300000,
+                neverExtend: vm.shortenRelayResponseDeadline(5000, {request_ttl_seconds: 99}, 1000)
+            };
+        }
+        """
+    )
+    assert result["invalid"] == [None] * 10
+    assert result["valid"] == 480
+    assert result["fallback"] == 486_000
+    assert result["admitted"] == 16_000
+    assert result["afterLegacyLimit"] is True
+    assert result["neverExtend"] == 5000
+
+
+@pytest.mark.e2e
+def test_landing_chat_cancellation_network_failure_is_unconfirmed(
+    page: Page, base_url: str, setup_servers
+):
+    route_landing_relay_chat(page)
+    page.unroute("**/api/v1/relay/requests/cancel")
+    page.route("**/api/v1/relay/requests/cancel", lambda route: route.abort("failed"))
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    result = page.evaluate(
+        """
+        async () => {
+            const vm = document.querySelector('#app').__vue__;
+            vm.activeRelayRequest = {
+                clientPublicKey: 'safe-client-key', requestId: 'safe-request-id',
+                cancelToken: 'safe-cancel-token', cancelled: false,
+                cancellationAttempted: false, cancellationConfirmed: false, cancellationOutcome: null
+            };
+            const first = await vm.cancelRelayRequest('client_timeout');
+            const second = await vm.cancelRelayRequest('client_timeout');
+            return {first, second, request: vm.activeRelayRequest};
+        }
+        """
+    )
+    assert result["first"] == {"attempted": True, "confirmed": False, "outcome": "network_error"}
+    assert result["second"] == result["first"]
+    assert result["request"]["cancellationConfirmed"] is False
 
 
 @pytest.mark.e2e

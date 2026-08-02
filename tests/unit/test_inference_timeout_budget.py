@@ -19,8 +19,8 @@ def test_upgraded_inference_deadlines_preserve_legacy_300_second_boundary():
     assert relay.DEFAULT_API_V1_REQUEST_DEADLINE_SECONDS == 480.0
     assert relay_client._API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS == 300.0
     assert DistributedApiV1ComputeProvider("https://relay.example").timeout_seconds == 485.0
-    assert "RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000" in chat_js
-    assert "RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000" not in chat_js
+    assert "RELAY_RESPONSE_DEADLINE_COMPATIBILITY_FALLBACK_MS = 485000" in chat_js
+    assert "RELAY_RESPONSE_DEADLINE_COMPATIBILITY_FALLBACK_MS = 300000" not in chat_js
 
 
 def test_short_operational_timeouts_are_not_inference_budget_aliases():

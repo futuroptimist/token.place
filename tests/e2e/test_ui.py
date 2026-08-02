@@ -76,6 +76,10 @@ def route_landing_relay_chat(
     retrieve_statuses: list[int] | None = None,
     diagnostics_count: int | None = None,
     diagnostics_counts: list[int] | None = None,
+    admission_payload: dict | None = None,
+    pending_payloads: list[dict] | None = None,
+    cancel_status: int = 200,
+    cancel_network_failure: bool = False,
 ):
     """Mock the direct API v1 relay routes used by the landing chat."""
     state = {
@@ -162,7 +166,7 @@ def route_landing_relay_chat(
         status = 200
         if request_statuses:
             status = request_statuses[min(len(state["relay_requests"]) - 1, len(request_statuses) - 1)]
-        body = {"message": "Request received"} if status == 200 else {"error": {"code": "server_unavailable"}}
+        body = (admission_payload or {"message": "Request received"}) if status == 200 else {"error": {"code": "server_unavailable"}}
         route.fulfill(
             status=status,
             headers={"Content-Type": "application/json"},
@@ -180,10 +184,13 @@ def route_landing_relay_chat(
         if retrieve_statuses:
             status = retrieve_statuses[min(len(state["retrieve_requests"]) - 1, len(retrieve_statuses) - 1)]
         if status != 200:
+            body = {"error": {"code": "selected_server_terminal"}}
+            if status == 202 and pending_payloads:
+                body = pending_payloads[min(len(state["retrieve_requests"]) - 1, len(pending_payloads) - 1)]
             route.fulfill(
                 status=status,
                 headers={"Content-Type": "application/json"},
-                body=json.dumps({"error": {"code": "selected_server_terminal"}}),
+                body=json.dumps(body),
             )
             return
         retrieve_index = len(state["retrieve_requests"]) - 1
@@ -217,13 +224,16 @@ def route_landing_relay_chat(
         )
 
     page.route("**/api/v1/relay/responses/retrieve", handle_retrieve)
-    page.route(
-        "**/api/v1/relay/requests/cancel",
-        lambda route: (
-            state["cancel_requests"].append(route.request.post_data_json),
-            route.fulfill(status=200, headers={"Content-Type": "application/json"}, body=json.dumps({"status": "cancelled"})),
-        ),
-    )
+    def handle_cancel(route):
+        payload = route.request.post_data_json
+        state["cancel_requests"].append(payload)
+        if cancel_network_failure:
+            route.abort("connectionfailed")
+            return
+        body = {"status": "cancelled", "request_id": payload["request_id"]} if cancel_status == 200 else {"error": {"code": "cancel_failed"}}
+        route.fulfill(status=cancel_status, headers={"Content-Type": "application/json"}, body=json.dumps(body))
+
+    page.route("**/api/v1/relay/requests/cancel", handle_cancel)
     page.route(
         "**/api/v1/chat/completions",
         lambda route: (
@@ -1038,7 +1048,7 @@ def test_landing_chat_timeout_cancels_relay_request_once(
     page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
     page.clock.fast_forward(486_000)
     page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
-    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest.cancelled")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
 
     assert len(state["cancel_requests"]) == 1
     payload = state["cancel_requests"][0]
@@ -1061,12 +1071,116 @@ def test_landing_chat_abort_cancels_relay_request_once(
     wait_for_landing_send_enabled(page).click()
     page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
     page.evaluate("() => { window.dispatchEvent(new Event('pagehide')); window.dispatchEvent(new Event('pagehide')); }")
-    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest.cancelled")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+    page.wait_for_timeout(100)
 
     assert len(state["cancel_requests"]) == 1
     payload = state["cancel_requests"][0]
     assert_cancel_payload_is_routing_metadata_only(payload)
     assert payload["reason"] == "requester_cancelled"
+
+
+@pytest.mark.e2e
+def test_landing_chat_deadline_helpers_follow_metadata_without_extension(
+    page: Page, base_url: str, setup_servers
+):
+    route_landing_relay_chat(page)
+    page.goto(base_url)
+    result = page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            const admitted = vm.relayResponseDeadlineFromAdmission({request_ttl_seconds: 480}, 1000);
+            const shortened = vm.shortenRelayResponseDeadline(admitted, {request_deadline_remaining_seconds: 10}, 2000);
+            const notExtended = vm.shortenRelayResponseDeadline(shortened, {request_ttl_seconds: 999}, 3000);
+            const invalid = [true, false, 0, -1, NaN, Infinity, -Infinity, '480', 'bad', null, undefined]
+                .map((value) => vm.validRelayDeadlineSeconds(value));
+            return {
+                admitted,
+                shortened,
+                notExtended,
+                fallback: vm.relayResponseDeadlineFromAdmission({}, 1000),
+                malformedFallback: vm.relayResponseDeadlineFromAdmission({request_ttl_seconds: '480'}, 1000),
+                invalid
+            };
+        }
+        """
+    )
+    assert result["admitted"] == 486_000  # 480 seconds plus grace exactly once.
+    assert result["shortened"] == 17_000
+    assert result["notExtended"] == result["shortened"]
+    assert result["fallback"] == 486_000
+    assert result["malformedFallback"] == 486_000
+    assert result["invalid"] == [None] * 11
+
+
+@pytest.mark.e2e
+def test_landing_chat_valid_admission_ttl_expires_and_cancels_once(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"message": "Request received", "request_ttl_seconds": 2},
+        retrieve_statuses=[202],
+    )
+    page.goto(base_url)
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("use admitted deadline")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(6_500)
+    assert "took too long to respond" not in page.locator("body").inner_text()
+    page.clock.fast_forward(1_000)
+    page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
+    assert len(state["cancel_requests"]) == 1
+    assert "cancellation could not be confirmed" not in page.locator("body").inner_text()
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("cancel_status", [503])
+def test_landing_chat_cancellation_http_failure_is_one_coherent_warning(
+    page: Page, base_url: str, setup_servers, cancel_status: int
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"request_ttl_seconds": 1},
+        retrieve_statuses=[202],
+        cancel_status=cancel_status,
+    )
+    page.goto(base_url)
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("cancel failure")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(7_000)
+    page.wait_for_function("() => document.body.textContent.includes('cancellation could not be confirmed')")
+    body = page.locator("body").inner_text()
+    assert body.count("cancellation could not be confirmed") == 1
+    assert len(state["cancel_requests"]) == 1
+    assert page.evaluate("() => document.querySelector('#app').__vue__.activeRelayRequest") is None
+
+
+@pytest.mark.e2e
+def test_landing_chat_cancellation_network_failure_is_visible(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"request_ttl_seconds": 1},
+        retrieve_statuses=[202],
+        cancel_network_failure=True,
+    )
+    page.goto(base_url)
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("cancel network failure")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(7_000)
+    page.wait_for_function("() => document.body.textContent.includes('cancellation could not be confirmed')")
+    assert len(state["cancel_requests"]) == 1
 
 
 def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):

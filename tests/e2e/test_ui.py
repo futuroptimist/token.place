@@ -2145,8 +2145,8 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
 
     model_select = page.get_by_test_id("landing-model-select")
     model_select.wait_for(state="visible")
-    assert model_select.input_value() == "llama-3.1-8b-instruct"
-    assert "llama-3.1-8b-instruct (emergency fallback)" in model_select.locator("option").inner_text()
+    assert model_select.input_value() == "qwen3-8b-instruct"
+    assert "qwen3-8b-instruct (emergency fallback)" in model_select.locator("option").inner_text()
     assert "Could not load the API v1 model list" in page.locator(".model-error").inner_text()
 
     page.locator("textarea").first.fill("hello")
@@ -2155,7 +2155,7 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
     page.locator(".assistant-message").last.wait_for(state="visible")
     assert state["relay_requests"], "expected the landing chat to POST the API v1 fallback relay payload"
     request_envelope = json.loads(state["relay_requests"][-1]["ciphertext"])
-    assert request_envelope["api_v1_request"]["model"] == "llama-3.1-8b-instruct"
+    assert request_envelope["api_v1_request"]["model"] == "qwen3-8b-instruct"
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 

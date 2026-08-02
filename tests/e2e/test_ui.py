@@ -1075,20 +1075,60 @@ def test_landing_chat_abort_cancels_relay_request_once(
     page: Page, base_url: str, setup_servers
 ):
     state = route_landing_relay_chat(page, retrieve_statuses=[202])
+    page_errors = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
     patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.evaluate(
+        """
+        () => {
+            window.__landingUnhandledRejections = [];
+            window.__landingRetrieveCount = 0;
+            const originalFetch = window.fetch;
+            window.fetch = (...args) => {
+                const url = String(args[0]);
+                if (url.includes('/api/v1/relay/responses/retrieve')) {
+                    window.__landingRetrieveCount += 1;
+                }
+                return originalFetch(...args);
+            };
+            window.addEventListener('unhandledrejection', (event) => {
+                window.__landingUnhandledRejections.push(String(event.reason));
+            });
+        }
+        """
+    )
 
     page.locator("textarea").first.fill("cancel when leaving")
     wait_for_landing_send_enabled(page).click()
     page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.isGeneratingResponse")
+    page.clock.fast_forward(500)
+    page.wait_for_function("() => window.__landingRetrieveCount > 0")
     page.evaluate("() => { window.dispatchEvent(new Event('pagehide')); window.dispatchEvent(new Event('pagehide')); }")
-    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest.cancelled")
+    page.wait_for_function(
+        """() => {
+            const vm = document.querySelector('#app').__vue__;
+            return vm.activeRelayRequest === null && vm.isGeneratingResponse === false;
+        }"""
+    )
+    retrieve_count_after_pagehide = page.evaluate("() => window.__landingRetrieveCount")
+    page.clock.fast_forward(5_000)
 
     assert len(state["cancel_requests"]) == 1
+    assert page.evaluate("() => window.__landingRetrieveCount") == retrieve_count_after_pagehide
     payload = state["cancel_requests"][0]
     assert_cancel_payload_is_routing_metadata_only(payload)
     assert payload["reason"] == "requester_cancelled"
+    assistant_messages = page.evaluate(
+        "() => document.querySelector('#app').__vue__.chatHistory.filter((entry) => entry.role === 'assistant')"
+    )
+    assert assistant_messages == []
+    assert "cancellation could not be confirmed" not in page.locator("body").inner_text()
+    assert page_errors == []
+    assert page.evaluate("() => window.__landingUnhandledRejections") == []
 
 
 @pytest.mark.e2e

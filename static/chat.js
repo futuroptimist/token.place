@@ -978,10 +978,25 @@ new Vue({
         },
 
         handleRelayPageHide() {
-            const requestId = this.activeRelayRequest && this.activeRelayRequest.requestId;
-            Promise.resolve(this.cancelRelayRequest('requester_cancelled'))
+            const activeRequest = this.activeRelayRequest;
+            const requestId = activeRequest && activeRequest.requestId;
+            this.terminateRelayRequestLocally(activeRequest);
+            const cancellationPromise = this.cancelRelayRequest('requester_cancelled');
+            this.clearActiveRelayRequest(requestId);
+            Promise.resolve(cancellationPromise)
                 .catch(() => null)
                 .finally(() => this.clearActiveRelayRequest(requestId));
+        },
+
+        terminateRelayRequestLocally(activeRequest) {
+            if (!activeRequest || activeRequest.terminated) {
+                return;
+            }
+            activeRequest.terminated = true;
+            if (activeRequest.retrievalController) {
+                activeRequest.retrievalController.abort();
+            }
+            activeRequest.resolveTermination(RELAY_REQUEST_TERMINATED);
         },
 
         clearActiveRelayRequest(requestId) {
@@ -1056,11 +1071,19 @@ new Vue({
         async retrieveRelayResponse(clientPublicKeyB64, requestId, responseDeadlineMs) {
             const pollIntervalMs = 500;
             let deadline = responseDeadlineMs;
+            const activeRequest = this.activeRelayRequest;
+            const waitForOperation = (operation) => Promise.race([
+                operation,
+                activeRequest.terminationPromise
+            ]);
 
             while (Date.now() < deadline) {
+                if (activeRequest.terminated) {
+                    return RELAY_REQUEST_TERMINATED;
+                }
                 let response;
                 try {
-                    response = await fetch('/api/v1/relay/responses/retrieve', {
+                    response = await waitForOperation(fetch('/api/v1/relay/responses/retrieve', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json'
@@ -1068,32 +1091,56 @@ new Vue({
                         body: JSON.stringify({
                             client_public_key: clientPublicKeyB64,
                             request_id: requestId
-                        })
-                    });
+                        }),
+                        signal: activeRequest.retrievalController.signal
+                    }));
                 } catch (error) {
+                    if (activeRequest.terminated) {
+                        return RELAY_REQUEST_TERMINATED;
+                    }
                     const cancellation = await this.cancelRelayRequest('requester_cancelled');
                     this.clearActiveRelayRequest(requestId);
                     return { error: { userMessage: this.cancellationFailureUserMessage(ASSISTANT_GENERIC_FALLBACK_MESSAGE, cancellation) } };
+                }
+                if (response === RELAY_REQUEST_TERMINATED) {
+                    return response;
                 }
 
                 if (response.status === 202) {
                     let pendingPayload = null;
                     try {
-                        pendingPayload = await response.json();
+                        pendingPayload = await waitForOperation(response.json());
                     } catch (_jsonError) {
+                        if (activeRequest.terminated) {
+                            return RELAY_REQUEST_TERMINATED;
+                        }
                         pendingPayload = null;
                     }
+                    if (pendingPayload === RELAY_REQUEST_TERMINATED) {
+                        return pendingPayload;
+                    }
                     deadline = this.shortenRelayResponseDeadline(deadline, pendingPayload, Date.now());
-                    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+                    const pollDelay = await waitForOperation(
+                        new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+                    );
+                    if (pollDelay === RELAY_REQUEST_TERMINATED) {
+                        return pollDelay;
+                    }
                     continue;
                 }
 
                 if (!response.ok) {
                     let errorData = null;
                     try {
-                        errorData = await response.json();
+                        errorData = await waitForOperation(response.json());
                     } catch (_jsonError) {
+                        if (activeRequest.terminated) {
+                            return RELAY_REQUEST_TERMINATED;
+                        }
                         errorData = null;
+                    }
+                    if (errorData === RELAY_REQUEST_TERMINATED) {
+                        return errorData;
                     }
                     const userMessage = this.getUserFacingRelayRetrieveError(response.status);
                     const terminalStatus = errorData && typeof errorData === 'object'
@@ -1123,8 +1170,11 @@ new Vue({
                 }
 
                 try {
-                    return await response.json();
+                    return await waitForOperation(response.json());
                 } catch (_jsonError) {
+                    if (activeRequest.terminated) {
+                        return RELAY_REQUEST_TERMINATED;
+                    }
                     const cancellation = await this.cancelRelayRequest('requester_cancelled');
                     return {
                         error: {
@@ -1258,8 +1308,15 @@ new Vue({
                     cancelled: false,
                     cancellationAttempted: false,
                     cancellationConfirmed: false,
-                    cancellationPromise: null
+                    cancellationPromise: null,
+                    terminated: false,
+                    retrievalController: new AbortController(),
+                    terminationPromise: null,
+                    resolveTermination: null
                 };
+                activeRelayRequest.terminationPromise = new Promise((resolve) => {
+                    activeRelayRequest.resolveTermination = resolve;
+                });
                 this.activeRelayRequest = activeRelayRequest;
 
                 let admissionPayload = null;
@@ -1274,6 +1331,9 @@ new Vue({
                 const responseDeadlineMs = this.relayResponseDeadlineFromAdmission(admissionPayload, admittedAtMs);
 
                 const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, responseDeadlineMs);
+                if (encryptedResponse === RELAY_REQUEST_TERMINATED) {
+                    return encryptedResponse;
+                }
                 if (encryptedResponse && encryptedResponse.error) {
                     return encryptedResponse;
                 }
@@ -1346,6 +1406,9 @@ new Vue({
                     });
                     preserveSelectedServerForDispatch = false;
                     forceReselectForDispatch = false;
+                    if (response === RELAY_REQUEST_TERMINATED) {
+                        return response;
+                    }
                     if (response && response.error && response.error.terminalSelectedServer === true && this.selectedServerPublicKeyB64) {
                         terminallyFailedServerPublicKeysB64.add(this.selectedServerPublicKeyB64);
                     }
@@ -1656,7 +1719,9 @@ new Vue({
         if (typeof window !== 'undefined') {
             window.removeEventListener('pagehide', this.handleRelayPageHide);
         }
-        const activeRequestId = this.activeRelayRequest && this.activeRelayRequest.requestId;
+        const activeRequest = this.activeRelayRequest;
+        const activeRequestId = activeRequest && activeRequest.requestId;
+        this.terminateRelayRequestLocally(activeRequest);
         this.cancelRelayRequest('requester_cancelled');
         this.clearActiveRelayRequest(activeRequestId);
         if (!Array.isArray(this.chatHistory)) {

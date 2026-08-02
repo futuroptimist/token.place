@@ -3336,7 +3336,10 @@ def api_v1_relay_responses_retrieve():
                 "relay.api_v1.response_pending",
                 extra={"client_fingerprint": _safe_key_fingerprint(client_public_key)},
             )
-            return jsonify({"status": "pending"}), 202
+            return jsonify({
+                "status": "pending",
+                **_api_v1_deadline_metadata(_pending_request_deadline(client_public_key, request_id)),
+            }), 202
         terminal = _get_terminal_request(client_public_key, request_id)
         if terminal is not None:
             status = terminal.get('status', 'cancelled')

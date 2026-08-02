@@ -1,4 +1,5 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
+const RELAY_REQUEST_TERMINATED = Object.freeze({ relayRequestTerminated: true });
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
 const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1000;
@@ -919,7 +920,7 @@ new Vue({
         cancelRelayRequest(reason = 'requester_cancelled') {
             const activeRequest = this.activeRelayRequest;
             if (!activeRequest) {
-                return { attempted: false, confirmed: false, failure: null };
+                return Promise.resolve({ attempted: false, confirmed: false, failure: null });
             }
             if (activeRequest.cancellationAttempted) {
                 return activeRequest.cancellationPromise;
@@ -978,7 +979,9 @@ new Vue({
 
         handleRelayPageHide() {
             const requestId = this.activeRelayRequest && this.activeRelayRequest.requestId;
-            this.cancelRelayRequest('requester_cancelled').finally(() => this.clearActiveRelayRequest(requestId));
+            Promise.resolve(this.cancelRelayRequest('requester_cancelled'))
+                .catch(() => null)
+                .finally(() => this.clearActiveRelayRequest(requestId));
         },
 
         clearActiveRelayRequest(requestId) {
@@ -1119,9 +1122,21 @@ new Vue({
                     };
                 }
 
-                const result = await response.json();
-                this.clearActiveRelayRequest(requestId);
-                return result;
+                try {
+                    return await response.json();
+                } catch (_jsonError) {
+                    const cancellation = await this.cancelRelayRequest('requester_cancelled');
+                    return {
+                        error: {
+                            userMessage: this.cancellationFailureUserMessage(
+                                ASSISTANT_GENERIC_FALLBACK_MESSAGE,
+                                cancellation
+                            )
+                        }
+                    };
+                } finally {
+                    this.clearActiveRelayRequest(requestId);
+                }
             }
 
             const cancellation = await this.cancelRelayRequest('client_timeout');
@@ -1254,7 +1269,7 @@ new Vue({
                     admissionPayload = null;
                 }
                 if (this.activeRelayRequest !== activeRelayRequest || activeRelayRequest.cancelled) {
-                    return { error: { userMessage: ASSISTANT_GENERIC_FALLBACK_MESSAGE } };
+                    return RELAY_REQUEST_TERMINATED;
                 }
                 const responseDeadlineMs = this.relayResponseDeadlineFromAdmission(admissionPayload, admittedAtMs);
 
@@ -1566,6 +1581,10 @@ new Vue({
             try {
                 // Relay-path landing chat in v0.1.0 is API v1-only and non-streaming.
                 let response = await this.sendMessageApi(messageContent);
+
+                if (response === RELAY_REQUEST_TERMINATED) {
+                    return;
+                }
 
                 // Process the response
                 if (response) {

@@ -1126,6 +1126,98 @@ def test_landing_chat_uses_relay_deadline_metadata(page: Page, base_url: str, se
 
 
 @pytest.mark.e2e
+def test_landing_chat_pagehide_without_active_request_is_quiet(page: Page, base_url: str, setup_servers):
+    route_landing_relay_chat(page)
+    errors = attach_landing_console_error_collector(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+
+    assert_no_landing_console_regressions(errors)
+    assert page.locator(".assistant-message").count() == 0
+
+
+@pytest.mark.e2e
+def test_landing_chat_response_after_300_seconds_before_admitted_deadline_succeeds(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page, admission_payload={"message": "Request received", "request_ttl_seconds": 480}
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.evaluate(
+        """
+        () => {
+            const originalFetch = window.fetch.bind(window);
+            const startedAt = Date.now();
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : input.url;
+                if (url !== '/api/v1/relay/responses/retrieve') return originalFetch(input, init);
+                if (Date.now() - startedAt <= 300000) {
+                    return Promise.resolve(new Response(JSON.stringify({status: 'pending'}), {status: 202}));
+                }
+                const request = JSON.parse(init.body);
+                return Promise.resolve(new Response(JSON.stringify({
+                    chat_history: JSON.stringify({
+                        protocol: 'tokenplace_api_v1_relay_e2ee', version: 1,
+                        request_id: request.request_id, client_public_key: request.client_public_key,
+                        api_v1_response: {message: {role: 'assistant', content: 'finished after five minutes'}}
+                    }), cipherkey: 'test-cipherkey', iv: 'test-iv'
+                }), {status: 200}));
+            };
+        }
+        """
+    )
+
+    page.locator("textarea").first.fill("take longer than five minutes")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(301_000)
+    page.wait_for_function("() => document.body.textContent.includes('finished after five minutes')")
+
+    assert state["cancel_requests"] == []
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+@pytest.mark.e2e
+def test_landing_chat_malformed_completed_response_cancels_once_and_clears_state(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.evaluate(
+        """
+        () => {
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : input.url;
+                if (url !== '/api/v1/relay/responses/retrieve') return originalFetch(input, init);
+                return Promise.resolve({ok: true, status: 200, json: async () => {
+                    throw new SyntaxError('malformed completed response');
+                }});
+            };
+        }
+        """
+    )
+
+    page.locator("textarea").first.fill("malformed completion")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+    page.wait_for_function("() => document.body.textContent.includes('Sorry, I encountered an issue')")
+
+    assert len(state["cancel_requests"]) == 1
+    assert page.locator("body").inner_text().count("Sorry, I encountered an issue") == 1
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+@pytest.mark.e2e
 def test_landing_chat_pending_deadline_expires_and_successful_cancel_is_quiet(
     page: Page, base_url: str, setup_servers
 ):
@@ -1186,11 +1278,12 @@ def test_landing_chat_tracks_admission_before_response_metadata_body(
     page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
     page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
     page.evaluate("() => window.admissionBodyResolve({request_ttl_seconds: 480})")
-    page.wait_for_timeout(50)
+    page.wait_for_function("() => document.querySelector('#app').__vue__.isGeneratingResponse === false")
 
     assert len(state["cancel_requests"]) == 1
     assert state["cancel_requests"][0]["reason"] == "requester_cancelled"
     assert page.evaluate("() => window.retrievalsAfterPagehide") == 0
+    assert page.locator("body").inner_text().count("Sorry, I encountered an issue") == 0
 
 
 @pytest.mark.e2e
@@ -1200,7 +1293,8 @@ def test_landing_chat_cancellation_contract_timeout_and_shared_promise(
     route_landing_relay_chat(page)
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
-    result = page.evaluate(
+    page.clock.install()
+    handle = page.evaluate_handle(
         """
         async () => {
             const vm = document.querySelector('#app').__vue__;
@@ -1221,13 +1315,14 @@ def test_landing_chat_cancellation_contract_timeout_and_shared_promise(
             const first = vm.cancelRelayRequest();
             const second = vm.cancelRelayRequest();
             const samePromise = first === second;
-            await new Promise((resolve) => setTimeout(resolve, 2100));
             const values = await Promise.all([first, second]);
             vm.clearActiveRelayRequest('request');
             return {posts, samePromise, values, active: vm.activeRelayRequest};
         }
         """
     )
+    page.clock.fast_forward(2_100)
+    result = handle.json_value()
 
     assert result == {
         "posts": 1,

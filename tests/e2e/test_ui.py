@@ -2681,8 +2681,15 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "Sorry, I encountered an issue generating a response. Please try again.",
             "Sorry, the relay returned an invalid response. Please try again.",
             "Sorry, an error occurred while sending your message. Please try again.",
+            "The relay is unavailable right now. Please try again later.",
         }
+        cancellation_failure_text = (
+            "The request stopped waiting locally, but cancellation could not be confirmed."
+        )
         max_attempts = 10
+        observed_max_tokens = None
+        relay_request_count = len(relay_requests)
+        accepted_attempt = False
         for attempt in range(max_attempts):
             relay_ready, relay_server_selection_body = wait_for_relay_ready(
                 required_consecutive=2,
@@ -2693,6 +2700,8 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 "relay lost active server selection while waiting to retry chat request. "
                 f"Last response body: {relay_server_selection_body!r}"
             )
+            relay_request_count_before = len(relay_requests)
+            page.evaluate("window.__landingRequestedMaxTokens = null")
             textarea.fill(prompt_text)
             wait_for_landing_send_enabled(page).click()
             user_message_count += 1
@@ -2717,18 +2726,29 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 },
             )
             assistant_text = assistant_message.inner_text().strip()
+            observed_max_tokens = page.evaluate("window.__landingRequestedMaxTokens")
+            relay_request_count = len(relay_requests)
             if (
                 assistant_text
                 and assistant_text not in transient_bridge_errors
                 and assistant_text not in disallowed_assistant_outputs
+                and cancellation_failure_text not in assistant_text
+                and observed_max_tokens == 8192
+                and relay_request_count > relay_request_count_before
             ):
+                accepted_attempt = True
                 break
 
             if attempt < max_attempts - 1:
                 # Give the relay/bridge path a brief backoff window before retrying.
                 page.wait_for_timeout(800 * (attempt + 1))
 
-        assert assistant_text, "assistant response should not be empty"
+        attempt_diagnostics = (
+            f"last assistant text={assistant_text!r}, observed max_tokens={observed_max_tokens!r}, "
+            f"relay request count={relay_request_count}"
+        )
+        assert accepted_attempt, f"no retry satisfied the API v1 request contract; {attempt_diagnostics}"
+        assert assistant_text, f"assistant response should not be empty; {attempt_diagnostics}"
         assert assistant_text.strip(), "assistant response should not be empty"
         assert assistant_text.lower() != "stub"
         assert assistant_text != "Sorry, I encountered an issue generating a response. Please try again."
@@ -2736,9 +2756,9 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert assistant_text != "Sorry, the relay returned an invalid response. Please try again."
         assert assistant_text not in transient_bridge_errors
         assert "Unknown streaming error" not in assistant_text
-        assert page.evaluate("window.__landingRequestedMaxTokens") == 8192
+        assert observed_max_tokens == 8192, attempt_diagnostics
 
-        assert len(relay_requests) >= 1
+        assert relay_request_count >= 1, attempt_diagnostics
         assert chat_completion_requests == []
         assert v2_requests == []
 

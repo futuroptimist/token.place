@@ -213,6 +213,7 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
     assert "LEGACY_RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000" in chat_js
     assert "RELAY_RESPONSE_PROPAGATION_GRACE_MS = 5000" in chat_js
+    assert "RELAY_CANCELLATION_CONFIRMATION_TIMEOUT_MS = 2000" in chat_js
     assert "admissionPayload.request_ttl_seconds" in chat_js
     assert "pendingPayload.request_deadline_remaining_seconds" in chat_js
     assert "validRelayDeadlineRemainingSeconds" in chat_js
@@ -220,9 +221,12 @@ def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     assert "failure: 'no_active_request'" not in chat_js
     assert "response.status === 410" in chat_js
     assert "['cancelled', 'expired'].includes(terminalStatus)" in chat_js
+    assert "payload.request_id === activeRequest.requestId" in chat_js
     admission_tracking = chat_js.index("const admittedAtMs = Date.now();")
     admission_body_parse = chat_js.index("admissionPayload = await dispatchResponse.json();")
-    assert admission_tracking < chat_js.index("this.activeRelayRequest = {", admission_tracking) < admission_body_parse
+    active_request_assignment = chat_js.index("this.activeRelayRequest = activeRelayRequest;", admission_tracking)
+    assert admission_tracking < active_request_assignment < admission_body_parse
+    assert "this.activeRelayRequest !== activeRelayRequest || activeRelayRequest.cancelled" in chat_js
     assert "cancelRelayRequest" in chat_js
     assert "/api/v1/relay/requests/cancel" in chat_js
     assert "cancel_token: cancelToken" in chat_js

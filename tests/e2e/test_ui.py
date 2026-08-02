@@ -230,17 +230,22 @@ def route_landing_relay_chat(
         )
 
     page.route("**/api/v1/relay/responses/retrieve", handle_retrieve)
-    page.route(
-        "**/api/v1/relay/requests/cancel",
-        lambda route: (
-            state["cancel_requests"].append(route.request.post_data_json),
-            route.abort("connectionfailed") if cancel_network_failure else route.fulfill(
+    def handle_cancel(route):
+        request_payload = route.request.post_data_json
+        state["cancel_requests"].append(request_payload)
+        if cancel_network_failure:
+            route.abort("connectionfailed")
+        else:
+            route.fulfill(
                 status=cancel_status,
                 headers={"Content-Type": "application/json"},
-                body=json.dumps(cancel_payload or {"status": "cancelled"}),
-            ),
-        ),
-    )
+                body=json.dumps(cancel_payload or {
+                    "status": "cancelled",
+                    "request_id": request_payload["request_id"],
+                }),
+            )
+
+    page.route("**/api/v1/relay/requests/cancel", handle_cancel)
     page.route(
         "**/api/v1/chat/completions",
         lambda route: (
@@ -1156,13 +1161,18 @@ def test_landing_chat_tracks_admission_before_response_metadata_body(
         """
         () => {
             const originalFetch = window.fetch.bind(window);
+            window.admissionBodyResolve = null;
+            window.retrievalsAfterPagehide = 0;
             window.fetch = (input, init) => {
                 const url = typeof input === 'string' ? input : input.url;
                 if (url === '/api/v1/relay/requests' && init && init.method === 'POST') {
-                    return Promise.resolve(new Response(new ReadableStream({start() {}}), {
-                        status: 200,
-                        headers: {'Content-Type': 'application/json'}
-                    }));
+                    return Promise.resolve({
+                        ok: true,
+                        json: () => new Promise((resolve) => { window.admissionBodyResolve = resolve; })
+                    });
+                }
+                if (url === '/api/v1/relay/responses/retrieve') {
+                    window.retrievalsAfterPagehide += 1;
                 }
                 return originalFetch(input, init);
             };
@@ -1175,9 +1185,96 @@ def test_landing_chat_tracks_admission_before_response_metadata_body(
     page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
     page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
     page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+    page.evaluate("() => window.admissionBodyResolve({request_ttl_seconds: 480})")
+    page.wait_for_timeout(50)
 
     assert len(state["cancel_requests"]) == 1
     assert state["cancel_requests"][0]["reason"] == "requester_cancelled"
+    assert page.evaluate("() => window.retrievalsAfterPagehide") == 0
+
+
+@pytest.mark.e2e
+def test_landing_chat_cancellation_contract_timeout_and_shared_promise(
+    page: Page, base_url: str, setup_servers
+):
+    route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    result = page.evaluate(
+        """
+        async () => {
+            const vm = document.querySelector('#app').__vue__;
+            let posts = 0;
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = (url, options) => {
+                if (url !== '/api/v1/relay/requests/cancel') return originalFetch(url, options);
+                posts += 1;
+                return new Promise((_resolve, reject) => {
+                    options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+                });
+            };
+            vm.activeRelayRequest = {
+                clientPublicKey: 'client', requestId: 'request', cancelToken: 'proof',
+                cancelled: false, cancellationAttempted: false,
+                cancellationConfirmed: false, cancellationPromise: null
+            };
+            const first = vm.cancelRelayRequest();
+            const second = vm.cancelRelayRequest();
+            const samePromise = first === second;
+            await new Promise((resolve) => setTimeout(resolve, 2100));
+            const values = await Promise.all([first, second]);
+            vm.clearActiveRelayRequest('request');
+            return {posts, samePromise, values, active: vm.activeRelayRequest};
+        }
+        """
+    )
+
+    assert result == {
+        "posts": 1,
+        "samePromise": True,
+        "values": [
+            {"attempted": True, "confirmed": False, "failure": "network_failure"},
+            {"attempted": True, "confirmed": False, "failure": "network_failure"},
+        ],
+        "active": None,
+    }
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "response_payload",
+    [None, {"status": "cancelled"}, {"status": "cancelled", "request_id": "other"}],
+)
+def test_landing_chat_malformed_or_mismatched_cancellation_is_unconfirmed(
+    page: Page, base_url: str, setup_servers, response_payload: dict | None
+):
+    route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    result = page.evaluate(
+        """
+        async (responsePayload) => {
+            const vm = document.querySelector('#app').__vue__;
+            window.fetch = async () => ({
+                ok: true,
+                json: async () => {
+                    if (responsePayload === null) throw new SyntaxError('missing JSON');
+                    return responsePayload;
+                }
+            });
+            vm.activeRelayRequest = {
+                clientPublicKey: 'client', requestId: 'request', cancelToken: 'proof',
+                cancelled: false, cancellationAttempted: false,
+                cancellationConfirmed: false, cancellationPromise: null
+            };
+            return vm.cancelRelayRequest();
+        }
+        """,
+        response_payload,
+    )
+
+    assert result == {"attempted": True, "confirmed": False, "failure": "unconfirmed_response"}
 
 
 @pytest.mark.e2e

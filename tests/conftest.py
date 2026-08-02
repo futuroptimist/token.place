@@ -170,6 +170,8 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_abort_cancels_relay_request_once",
     "tests/e2e/test_ui.py::test_landing_chat_uses_relay_deadline_metadata",
     "tests/e2e/test_ui.py::test_landing_chat_tracks_admission_before_response_metadata_body",
+    "tests/e2e/test_ui.py::test_landing_chat_cancellation_contract_timeout_and_shared_promise",
+    "tests/e2e/test_ui.py::test_landing_chat_malformed_or_mismatched_cancellation_is_unconfirmed",
     "tests/e2e/test_ui.py::test_landing_chat_terminal_retrieval_confirms_cancellation_without_cancel_request",
     "tests/e2e/test_ui.py::test_landing_chat_pending_deadline_expires_and_successful_cancel_is_quiet",
     "tests/e2e/test_ui.py::test_landing_chat_cancel_http_failure_is_one_coherent_error",

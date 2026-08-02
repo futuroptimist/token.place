@@ -6,6 +6,7 @@ const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1000;
 // inference budget plus five seconds for ciphertext response propagation.
 const LEGACY_RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000;
 const RELAY_RESPONSE_PROPAGATION_GRACE_MS = 5000;
+const RELAY_CANCELLATION_CONFIRMATION_TIMEOUT_MS = 2000;
 const RELAY_CANCELLATION_UNCONFIRMED_MESSAGE = 'The request stopped waiting locally, but cancellation could not be confirmed. Compute may continue briefly.';
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
@@ -915,7 +916,7 @@ new Vue({
             return ASSISTANT_GENERIC_FALLBACK_MESSAGE;
         },
 
-        async cancelRelayRequest(reason = 'requester_cancelled') {
+        cancelRelayRequest(reason = 'requester_cancelled') {
             const activeRequest = this.activeRelayRequest;
             if (!activeRequest) {
                 return { attempted: false, confirmed: false, failure: null };
@@ -930,6 +931,11 @@ new Vue({
         },
 
         async sendRelayCancellation(activeRequest, reason) {
+            const controller = new AbortController();
+            const confirmationTimeout = setTimeout(
+                () => controller.abort(),
+                RELAY_CANCELLATION_CONFIRMATION_TIMEOUT_MS
+            );
             try {
                 const response = await fetch('/api/v1/relay/requests/cancel', {
                     method: 'POST',
@@ -943,7 +949,8 @@ new Vue({
                         status: 'cancelled',
                         reason
                     }),
-                    keepalive: true
+                    keepalive: true,
+                    signal: controller.signal
                 });
                 let payload = null;
                 try {
@@ -952,7 +959,9 @@ new Vue({
                     payload = null;
                 }
                 const terminalStatus = payload && typeof payload === 'object' ? payload.status : null;
-                const confirmed = response.ok && ['cancelled', 'expired'].includes(terminalStatus);
+                const confirmed = response.ok
+                    && ['cancelled', 'expired'].includes(terminalStatus)
+                    && payload.request_id === activeRequest.requestId;
                 activeRequest.cancellationConfirmed = confirmed;
                 if (!confirmed) {
                     console.warn('API v1 relay request cancellation was not confirmed.');
@@ -962,6 +971,8 @@ new Vue({
                 activeRequest.cancellationConfirmed = false;
                 console.warn('API v1 relay request cancellation was not confirmed.');
                 return { attempted: true, confirmed: false, failure: 'network_failure' };
+            } finally {
+                clearTimeout(confirmationTimeout);
             }
         },
 
@@ -1225,7 +1236,7 @@ new Vue({
                 }
 
                 const admittedAtMs = Date.now();
-                this.activeRelayRequest = {
+                const activeRelayRequest = {
                     clientPublicKey: clientPublicKeyB64,
                     requestId,
                     cancelToken,
@@ -1234,12 +1245,16 @@ new Vue({
                     cancellationConfirmed: false,
                     cancellationPromise: null
                 };
+                this.activeRelayRequest = activeRelayRequest;
 
                 let admissionPayload = null;
                 try {
                     admissionPayload = await dispatchResponse.json();
                 } catch (_jsonError) {
                     admissionPayload = null;
+                }
+                if (this.activeRelayRequest !== activeRelayRequest || activeRelayRequest.cancelled) {
+                    return { error: { userMessage: ASSISTANT_GENERIC_FALLBACK_MESSAGE } };
                 }
                 const responseDeadlineMs = this.relayResponseDeadlineFromAdmission(admissionPayload, admittedAtMs);
 

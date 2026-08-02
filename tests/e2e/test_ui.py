@@ -78,6 +78,7 @@ def route_landing_relay_chat(
     diagnostics_counts: list[int] | None = None,
     admission_payload: dict | None = None,
     pending_payload: dict | None = None,
+    retrieve_error_payload: dict | None = None,
     cancel_status: int = 200,
     cancel_payload: dict | None = None,
     cancel_network_failure: bool = False,
@@ -195,7 +196,7 @@ def route_landing_relay_chat(
             route.fulfill(
                 status=status,
                 headers={"Content-Type": "application/json"},
-                body=json.dumps({"error": {"code": "selected_server_terminal"}}),
+                body=json.dumps(retrieve_error_payload or {"error": {"code": "selected_server_terminal"}}),
             )
             return
         retrieve_index = len(state["retrieve_requests"]) - 1
@@ -1098,10 +1099,12 @@ def test_landing_chat_uses_relay_deadline_metadata(page: Page, base_url: str, se
             const admittedAt = 100000;
             const valid = vm.relayResponseDeadlineFromAdmission({request_ttl_seconds: 480}, admittedAt);
             const shortened = vm.shortenRelayResponseDeadline(valid, {request_deadline_remaining_seconds: 10}, admittedAt + 1000);
+            const expired = vm.shortenRelayResponseDeadline(valid, {request_deadline_remaining_seconds: 0}, admittedAt + 2000);
             const notExtended = vm.shortenRelayResponseDeadline(shortened, {request_ttl_seconds: 999}, admittedAt + 2000);
             const invalid = [true, false, 0, -1, NaN, Infinity, -Infinity, '480', 'bad', null, undefined]
                 .map((value) => vm.relayResponseDeadlineFromAdmission({request_ttl_seconds: value}, admittedAt));
-            return {valid, shortened, notExtended, invalid};
+            const noActiveCancellation = vm.cancelRelayRequest();
+            return Promise.resolve(noActiveCancellation).then((result) => ({valid, shortened, expired, notExtended, invalid, noActiveCancellation: result}));
         }
         """
     )
@@ -1109,8 +1112,10 @@ def test_landing_chat_uses_relay_deadline_metadata(page: Page, base_url: str, se
     # Admission is the time origin: 480 seconds plus propagation grace exactly once.
     assert deadlines["valid"] == 585000
     assert deadlines["shortened"] == 116000
+    assert deadlines["expired"] == 107000
     assert deadlines["notExtended"] == deadlines["shortened"]
     assert deadlines["invalid"] == [585000] * 11
+    assert deadlines["noActiveCancellation"] == {"attempted": False, "confirmed": False, "failure": None}
     # A completion after the legacy 300-second budget remains inside this deadline.
     assert 100000 + 301000 < deadlines["valid"]
 
@@ -1136,6 +1141,65 @@ def test_landing_chat_pending_deadline_expires_and_successful_cancel_is_quiet(
     page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
 
     assert len(state["cancel_requests"]) == 1
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+@pytest.mark.e2e
+def test_landing_chat_tracks_admission_before_response_metadata_body(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.evaluate(
+        """
+        () => {
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : input.url;
+                if (url === '/api/v1/relay/requests' && init && init.method === 'POST') {
+                    return Promise.resolve(new Response(new ReadableStream({start() {}}), {
+                        status: 200,
+                        headers: {'Content-Type': 'application/json'}
+                    }));
+                }
+                return originalFetch(input, init);
+            };
+        }
+        """
+    )
+
+    page.locator("textarea").first.fill("leave while admission metadata stalls")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+
+    assert len(state["cancel_requests"]) == 1
+    assert state["cancel_requests"][0]["reason"] == "requester_cancelled"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("terminal_status", ["cancelled", "expired"])
+def test_landing_chat_terminal_retrieval_confirms_cancellation_without_cancel_request(
+    page: Page, base_url: str, setup_servers, terminal_status: str
+):
+    state = route_landing_relay_chat(
+        page,
+        retrieve_statuses=[410],
+        retrieve_error_payload={
+            "error": {"code": terminal_status, "status": terminal_status, "reason": terminal_status}
+        },
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.locator("textarea").first.fill("terminal relay response")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+
+    assert state["cancel_requests"] == []
     assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
 
 

@@ -918,7 +918,7 @@ new Vue({
         async cancelRelayRequest(reason = 'requester_cancelled') {
             const activeRequest = this.activeRelayRequest;
             if (!activeRequest) {
-                return { attempted: false, confirmed: false, failure: 'no_active_request' };
+                return { attempted: false, confirmed: false, failure: null };
             }
             if (activeRequest.cancellationAttempted) {
                 return activeRequest.cancellationPromise;
@@ -1005,6 +1005,10 @@ new Vue({
             return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
         },
 
+        validRelayDeadlineRemainingSeconds(value) {
+            return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+        },
+
         relayResponseDeadlineFromAdmission(admissionPayload, admittedAtMs) {
             const ttlSeconds = admissionPayload && typeof admissionPayload === 'object'
                 ? this.validRelayDeadlineSeconds(admissionPayload.request_ttl_seconds)
@@ -1019,7 +1023,7 @@ new Vue({
                 return currentDeadlineMs;
             }
             const candidates = [
-                this.validRelayDeadlineSeconds(pendingPayload.request_deadline_remaining_seconds),
+                this.validRelayDeadlineRemainingSeconds(pendingPayload.request_deadline_remaining_seconds),
                 this.validRelayDeadlineSeconds(pendingPayload.request_ttl_seconds)
             ].filter((value) => value !== null);
             if (!candidates.length) {
@@ -1078,7 +1082,23 @@ new Vue({
                         errorData = null;
                     }
                     const userMessage = this.getUserFacingRelayRetrieveError(response.status);
-                    const cancellation = await this.cancelRelayRequest('requester_cancelled');
+                    const terminalStatus = errorData && typeof errorData === 'object'
+                        && errorData.error && typeof errorData.error === 'object'
+                        ? errorData.error.status
+                        : null;
+                    const relayConfirmedTerminal = response.status === 410
+                        && ['cancelled', 'expired'].includes(terminalStatus);
+                    let cancellation;
+                    if (relayConfirmedTerminal) {
+                        const activeRequest = this.activeRelayRequest;
+                        if (activeRequest && activeRequest.requestId === requestId) {
+                            activeRequest.cancelled = true;
+                            activeRequest.cancellationConfirmed = true;
+                        }
+                        cancellation = { attempted: false, confirmed: true, failure: null };
+                    } else {
+                        cancellation = await this.cancelRelayRequest('requester_cancelled');
+                    }
                     this.clearActiveRelayRequest(requestId);
                     return {
                         error: {
@@ -1204,15 +1224,7 @@ new Vue({
                     };
                 }
 
-                let admissionPayload = null;
-                try {
-                    admissionPayload = await dispatchResponse.json();
-                } catch (_jsonError) {
-                    admissionPayload = null;
-                }
                 const admittedAtMs = Date.now();
-                const responseDeadlineMs = this.relayResponseDeadlineFromAdmission(admissionPayload, admittedAtMs);
-
                 this.activeRelayRequest = {
                     clientPublicKey: clientPublicKeyB64,
                     requestId,
@@ -1222,6 +1234,14 @@ new Vue({
                     cancellationConfirmed: false,
                     cancellationPromise: null
                 };
+
+                let admissionPayload = null;
+                try {
+                    admissionPayload = await dispatchResponse.json();
+                } catch (_jsonError) {
+                    admissionPayload = null;
+                }
+                const responseDeadlineMs = this.relayResponseDeadlineFromAdmission(admissionPayload, admittedAtMs);
 
                 const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, responseDeadlineMs);
                 if (encryptedResponse && encryptedResponse.error) {

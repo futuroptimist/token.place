@@ -1290,6 +1290,10 @@ def run(args: argparse.Namespace) -> int:
     runtime.model_manager.parent_model_path_exists = parent_model_path_exists
     runtime.model_manager.model_path_was_relative = model_path_was_relative
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
+    from utils.qwen_64k_batch_profiles import normalize_qwen_64k_batch_profile
+    runtime.model_manager.qwen_64k_batch_profile = normalize_qwen_64k_batch_profile(
+        getattr(args, "qwen_64k_batch_profile", None)
+    )
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
         private_runtime_setup = dict(runtime_setup)
@@ -2782,7 +2786,7 @@ def run(args: argparse.Namespace) -> int:
 
 
 
-def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Dict[str, Any]:
+def installed_context_smoke_payload(context_tier: str, launch_number: str, qwen_64k_batch_profile: str = "balanced") -> Dict[str, Any]:
     """Return a bounded installed-artifact context probe record.
 
     This runs inside the resolved packaged interpreter and exercises the normal
@@ -2907,6 +2911,8 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
         )
         manager = ModelManager(config)
         profile = apply_context_profile(manager, normalized_tier)
+        from utils.qwen_64k_batch_profiles import normalize_qwen_64k_batch_profile
+        manager.qwen_64k_batch_profile = normalize_qwen_64k_batch_profile(qwen_64k_batch_profile)
         apply_compute_mode(manager, "auto")
         Path(manager.model_path).write_bytes(b"deterministic fake installed model artifact")
         manager.desktop_runtime_probe = {
@@ -3069,10 +3075,11 @@ def main() -> int:
     )
     parser.add_argument("--relay-port", type=int, default=None)
     parser.add_argument("--context-tier", default="8k-fast")
+    parser.add_argument("--qwen-64k-batch-profile", choices=("safe", "balanced", "experimental"), default="balanced")
     args = parser.parse_args()
 
     if args.installed_context_smoke:
-        print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))
+        print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1"), args.qwen_64k_batch_profile), sort_keys=True, separators=(",", ":")))
         return 0
     if args.operator_runtime_preflight or args.operator_runtime_preflight_cpu_smoke:
         # Release acceptance must execute the immutable runtime checks; it may

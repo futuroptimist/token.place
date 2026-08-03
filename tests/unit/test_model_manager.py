@@ -13770,3 +13770,17 @@ def test_subprocess_worker_identity_mismatch_fails_before_constructor_without_le
     assert str(module_path) not in message
     assert str(other) not in message
     assert probe['llama_module_identity'] not in message
+def test_qwen_64k_batch_profile_contract_and_normalization():
+    from utils.qwen_64k_batch_profiles import (
+        QWEN_64K_BATCH_PROFILES,
+        normalize_qwen_64k_batch_profile,
+    )
+
+    assert QWEN_64K_BATCH_PROFILES == {
+        'safe': {'n_batch': 256, 'n_ubatch': 128},
+        'balanced': {'n_batch': 512, 'n_ubatch': 256},
+        'experimental': {'n_batch': 1024, 'n_ubatch': 512},
+    }
+    assert normalize_qwen_64k_batch_profile(None) == 'balanced'
+    assert normalize_qwen_64k_batch_profile('unknown') == 'balanced'
+    assert normalize_qwen_64k_batch_profile('experimental') == 'experimental'

@@ -133,7 +133,14 @@ For the planned Qwen3 default-model migration, see [Qwen3 8B Q4_K_M API v1 model
   representation.
 - A rough 64K f16 KV-cache estimate for this GQA model is about 8 GB before
   other runtime buffers.
-- q8 or q4 KV cache can materially reduce KV memory, when supported and validated.
+- The 64K CUDA/Metal profile normally uses symmetric Q8_0 K and V caches. F16
+  remains the compatibility fallback when quantized KV cannot be expressed or
+  a permitted non-memory compatibility failure occurs. Symmetric Q4_0 is
+  reserved for positively classified KV/GPU memory pressure because its
+  quality tradeoff may be larger.
+- KV-cache precision is independent of the Q4_K_M quantization of the model
+  weights. Quantized V is enabled only with confirmed Flash Attention support;
+  K and V never use mixed precisions.
 - Flash attention, batch size, backend, K/Q/V offload, GPU layer offload, runtime
   scratch buffers, driver overhead, and allocator behavior alter the real
   footprint.
@@ -146,7 +153,7 @@ For the planned Qwen3 default-model migration, see [Qwen3 8B Q4_K_M API v1 model
 | Profile | Backend | KV cache | Batch defaults | Warm-load validation | Benchmark prompts | Required metrics | Pass condition |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `8k-fast` | Metal on initial Mac policy | Existing default initially | Existing default initially | Load exact `n_ctx=8192`; run a small non-sensitive smoke prompt | 1K, 4K, near-8K synthetic/private-safe prompts | warm-load time, prompt eval tok/s band, gen tok/s band, p50/p95 latency, peak memory band | No OOM; latency within operator policy; encrypted API v1 success |
-| `64k-full` | CUDA on initial Windows policy | Existing default first; later q8/q4 trials | Existing default first; later tuned | Load exact `n_ctx=65536`; validate memory headroom under expected GPU availability | 8K, 32K, near-64K synthetic/private-safe prompts | warm-load time, prompt eval tok/s band, gen tok/s band, p50/p95 latency, peak VRAM/system RAM bands | No OOM; no severe spill under baseline; encrypted API v1 success |
+| `64k-full` | CUDA/Metal | Q8_0 normally; F16 compatibility; Q4_0 only for memory pressure | `n_batch=256`, `n_ubatch=128`, Flash Attention + KQV offload | Load exact `n_ctx=65536`; validate memory headroom under expected GPU availability | 8K, 32K, near-64K synthetic/private-safe prompts | warm-load time, prompt eval tok/s band, gen tok/s band, p50/p95 latency, peak VRAM/system RAM bands | No OOM; no severe spill under baseline; encrypted API v1 success |
 | Future tuned 64K | CUDA/Metal | q8/q4 candidate | Tuned batch + flash attention candidate | Compare against baseline | Same privacy-safe suite | deltas for memory, latency, failures | Adopt only if stable and faster/safer |
 
 Benchmarks must avoid real user content. Publish coarse bands or aggregate

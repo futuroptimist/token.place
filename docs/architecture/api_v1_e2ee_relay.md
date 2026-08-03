@@ -95,3 +95,36 @@ The migration roadmap follow-up phases own the implementation repair:
 4. add final guardrails proving active production paths no longer use legacy routes.
 
 This documentation baseline intentionally does **not** implement those code migrations.
+
+## Encrypted inference progress sideband
+
+API v1 registration responses advertise `relay_capabilities.encrypted_progress_v1`. A compute node
+stores that capability for the exact relay and otherwise disables remote progress without affecting
+inference. This permits either relay or desktop 0.1.11 to roll out first; there is no plaintext or
+legacy-route fallback.
+
+The compute-only `POST /api/v1/relay/progress` route requires registration authentication plus the
+active server's exact control credential. Under the terminal-transition lock, the relay verifies
+that server owns the in-flight `(client_public_key, request_id)` pair. The strict, 16 KiB outer
+schema contains routing identities, protocol/version, ciphertext, an encrypted fresh content key,
+and a fresh IV only. Phase and counters occur solely in the client-encrypted inner envelope:
+`api_v1_progress` has schema version and monotonic external-request sequence plus a fixed phase
+(`preparing`, `prefill`, or `generating`) and non-negative prompt/cached/processed/generated/elapsed
+counters. No arbitrary worker event fields are serialized.
+
+The relay keeps only the newest ciphertext envelope per active request. A pending response poll
+atomically pops that value as `encrypted_progress`; final response, cancellation, expiry,
+unregistration, eviction, retrieval, and every other terminal transition clear it. Progress never
+renews the request deadline or accounting lease and cannot complete or revive a request. The
+compute publisher is request-scoped, non-blocking at callback submission, latest-value bounded,
+approximately one update per second, and permits phase transitions promptly. Telemetry encryption
+or transport failure is best-effort and never fails inference.
+
+The landing chat decrypts and validates both bindings, fixed schemas, safe-integer counters, and a
+newer sequence after every asynchronous boundary. It shows a labelled native `<progress>` element:
+waiting, preparing, unknown-total prefill, and generating are indeterminate; known-total prefill is
+determinate. A polite atomic live region announces phase changes rather than every counter update.
+Terminal outcomes, failover, and page teardown remove the component.
+
+This sideband is telemetry, not response-token streaming. The full API v1 completion remains a
+single encrypted response accepted, retrieved, decrypted, and rendered atomically after generation.

@@ -554,6 +554,19 @@
                     >Response stopped at the output-token limit.</p>
                 </div>
             </template>
+            <div v-if="inferenceProgress" class="inference-progress" data-testid="inference-progress-container">
+                <label id="inference-progress-label" for="inference-progress">Inference progress</label>
+                <progress
+                    id="inference-progress"
+                    data-testid="inference-progress"
+                    aria-labelledby="inference-progress-label"
+                    aria-describedby="inference-progress-status"
+                    :max="inferenceProgress.phase === 'prefill' && inferenceProgress.total_prompt_tokens > 0 ? inferenceProgress.total_prompt_tokens : null"
+                    :value="inferenceProgress.phase === 'prefill' && inferenceProgress.total_prompt_tokens > 0 ? inferenceProgress.processed_prompt_tokens : null"
+                ></progress>
+                <span id="inference-progress-status" data-testid="inference-progress-status" v-text="inferenceProgressText"></span>
+                <span class="sr-only" aria-live="polite" aria-atomic="true" v-text="inferenceProgress.phase"></span>
+            </div>
             <div class="input-container">
                 <textarea
                     ref="messageInput"

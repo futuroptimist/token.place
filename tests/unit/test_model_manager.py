@@ -13770,3 +13770,59 @@ def test_subprocess_worker_identity_mismatch_fails_before_constructor_without_le
     assert str(module_path) not in message
     assert str(other) not in message
     assert probe['llama_module_identity'] not in message
+def test_qwen_64k_batch_profile_contract_and_safe_normalization():
+    from utils.qwen_64k_batch_profiles import (
+        QWEN_64K_BATCH_PROFILES,
+        normalize_qwen_64k_batch_profile,
+    )
+
+    assert {key: (value.n_batch, value.n_ubatch) for key, value in QWEN_64K_BATCH_PROFILES.items()} == {
+        'safe': (256, 128),
+        'balanced': (512, 256),
+        'experimental': (1024, 512),
+    }
+    assert normalize_qwen_64k_batch_profile(None) == 'balanced'
+    assert normalize_qwen_64k_batch_profile('invalid') == 'balanced'
+    assert normalize_qwen_64k_batch_profile('experimental') == 'experimental'
+
+
+def test_qwen_64k_batch_profile_fallback_graph_is_structured_and_deterministic():
+    from types import SimpleNamespace
+    from utils.llm.model_manager import (
+        _build_qwen_64k_runtime_profiles,
+        _next_qwen_64k_runtime_profile_index,
+    )
+
+    class Llama:
+        def __init__(self, type_k=None, type_v=None, flash_attn=None, offload_kqv=None, n_batch=None, n_ubatch=None):
+            pass
+
+    module = SimpleNamespace(GGML_TYPE_Q8_0=8, GGML_TYPE_Q4_0=4, __version__='test')
+    profiles = _build_qwen_64k_runtime_profiles(
+        module, Llama, model_path='', n_ctx=65536, batch_profile='experimental'
+    )
+    combinations = [
+        (p['diagnostics']['batch_profile'], p['diagnostics']['kv_precision'], p['kwargs']['n_batch'], p['kwargs']['n_ubatch'])
+        for p in profiles
+    ]
+    assert combinations == [
+        ('experimental', 'q8', 1024, 512), ('experimental', 'f16', 1024, 512),
+        ('balanced', 'q8', 512, 256), ('balanced', 'f16', 512, 256),
+        ('safe', 'q8', 256, 128), ('safe', 'f16', 256, 128),
+        ('safe', 'q4', 256, 128),
+    ]
+    active = profiles[0]['profile_id']
+    memory_path = []
+    for _ in range(4):
+        memory_path.append(active)
+        next_index = _next_qwen_64k_runtime_profile_index(profiles, active, 'cuda_memory_allocation')
+        if next_index is None:
+            break
+        active = profiles[next_index]['profile_id']
+    assert memory_path == [
+        'qwen64k_kv_q8_fa_experimental_batch',
+        'qwen64k_kv_q8_fa_balanced_batch',
+        'qwen64k_kv_q8_fa_small_batch',
+        'qwen64k_kv_q4_fa_small_batch',
+    ]
+    assert profiles[_next_qwen_64k_runtime_profile_index(profiles, profiles[0]['profile_id'], 'runtime_context_create_unsupported_kwarg')]['profile_id'] == 'qwen64k_f16_fa_experimental_batch'

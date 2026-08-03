@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
 type BackendMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
 type ContextTier = '8k-fast' | '64k-full';
+type Qwen64KBatchProfile = 'safe' | 'balanced' | 'experimental';
 
 // Context tiers intentionally use static, duplicated profile constants instead of
 // runtime codegen/manifest loading. Keep these IDs and token counts
@@ -15,6 +16,12 @@ const CONTEXT_PROFILES: Array<{ id: ContextTier; displayLabel: string; totalCont
   { id: '64k-full', displayLabel: '64K Full', totalContextTokens: 65536, enabled: true },
 ];
 const DEFAULT_CONTEXT_TIER: ContextTier = '8k-fast';
+const DEFAULT_QWEN_64K_BATCH_PROFILE: Qwen64KBatchProfile = 'balanced';
+const QWEN_64K_BATCH_PROFILES: Array<{ id: Qwen64KBatchProfile; label: string; values: string }> = [
+  { id: 'balanced', label: 'Balanced (Recommended)', values: '512/256' },
+  { id: 'safe', label: 'Safe', values: '256/128' },
+  { id: 'experimental', label: 'Experimental', values: '1024/512' },
+];
 
 interface BackendInfo {
   platform_label: string;
@@ -29,6 +36,7 @@ interface DesktopConfig {
   relay_base_urls: string[];
   preferred_mode: BackendMode;
   context_tier: ContextTier;
+  qwen_64k_batch_profile: Qwen64KBatchProfile;
 }
 
 const DEFAULT_RELAY_BASE_URL = 'https://token.place';
@@ -40,6 +48,7 @@ type PartialDesktopConfig = Omit<Partial<DesktopConfig>, 'model_path' | 'relay_b
   relay_base_urls?: unknown;
   preferred_mode?: unknown;
   context_tier?: unknown;
+  qwen_64k_batch_profile?: unknown;
 };
 
 interface RelayStatus {
@@ -85,6 +94,8 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
   'api_v1_readiness_completion_smoke_plain_completion_metal_error_category',
   'api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status',
   'api_v1_readiness_qwen_64k_runtime_profile_id',
+  'api_v1_readiness_qwen_64k_batch_profile_requested',
+  'api_v1_readiness_qwen_64k_batch_profile_selected',
   'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids',
   'api_v1_readiness_qwen_64k_runtime_profile_recovery_count',
   'api_v1_readiness_qwen_64k_runtime_profile_flash_attn',
@@ -419,6 +430,12 @@ function normalizeContextTier(contextTier: unknown): ContextTier {
   return contextTier === '64k-full' || contextTier === '8k-fast' ? contextTier : DEFAULT_CONTEXT_TIER;
 }
 
+function normalizeQwen64KBatchProfile(value: unknown): Qwen64KBatchProfile {
+  return value === 'safe' || value === 'balanced' || value === 'experimental'
+    ? value
+    : DEFAULT_QWEN_64K_BATCH_PROFILE;
+}
+
 function normalizeBackendMode(preferredMode: unknown): BackendMode {
   return preferredMode === 'cpu' ||
     preferredMode === 'gpu' ||
@@ -437,6 +454,7 @@ export function normalizeDesktopConfig(config: PartialDesktopConfig): DesktopCon
     relay_base_urls: relayBaseUrls,
     preferred_mode: normalizeBackendMode(config.preferred_mode),
     context_tier: normalizeContextTier(config.context_tier),
+    qwen_64k_batch_profile: normalizeQwen64KBatchProfile(config.qwen_64k_batch_profile),
   };
 }
 
@@ -849,6 +867,7 @@ export function App() {
     relay_base_urls: [DEFAULT_RELAY_BASE_URL],
     preferred_mode: 'auto',
     context_tier: DEFAULT_CONTEXT_TIER,
+    qwen_64k_batch_profile: DEFAULT_QWEN_64K_BATCH_PROFILE,
   });
   const [computeStatus, setComputeStatus] = useState<ComputeNodeStatus>(defaultComputeStatus);
   const [prompt, setPrompt] = useState('');
@@ -1140,6 +1159,7 @@ export function App() {
           relay_base_urls: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url),
           mode: config.preferred_mode,
           context_tier: config.context_tier,
+          qwen_64k_batch_profile: config.qwen_64k_batch_profile,
         },
       });
     } catch (e) {
@@ -1359,6 +1379,24 @@ export function App() {
           </select>
         </label>
         <p style={{ marginTop: 0, fontSize: 12, color: '#555' }}>Changing tiers requires Stop Operator followed by Start Operator.</p>
+        <label style={{ display: 'block', marginBottom: 8 }}>
+          Qwen 64K batch profile
+          <select
+            aria-label="Qwen 64K batch profile"
+            aria-describedby="qwen-64k-batch-help"
+            value={config.qwen_64k_batch_profile}
+            disabled={!canChangeContextTier || config.context_tier !== '64k-full'}
+            onChange={(event) => updateConfig({ ...config, qwen_64k_batch_profile: normalizeQwen64KBatchProfile(event.target.value) })}
+            style={{ display: 'block', marginTop: 4 }}
+          >
+            {QWEN_64K_BATCH_PROFILES.map((profile) => (
+              <option key={profile.id} value={profile.id}>{profile.label}</option>
+            ))}
+          </select>
+        </label>
+        <p id="qwen-64k-batch-help" style={{ marginTop: 0, fontSize: 12, color: '#555' }}>
+          Applies only to 64K Full and requires stopping and restarting the operator. Balanced: 512/256; Safe: 256/128; Experimental: 1024/512. Experimental can increase memory use or instability.
+        </p>
         <div style={{ display: 'flex', gap: 8 }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
           <button

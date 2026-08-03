@@ -11277,6 +11277,86 @@ def test_qwen_64k_q8_context_memory_failure_retries_q4_profile(tmp_path):
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_kv_cache_allocation'
 
 
+def test_qwen_64k_q8_memory_failure_without_q4_stops_before_f16(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    attempts = []
+    failed_attempts = []
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class ClosableMemoryFailure(ValueError):
+        def __init__(self):
+            super().__init__('Failed to create llama_context: CUDA out of memory SECRET_PAYLOAD')
+            self.close = MagicMock()
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            failure = ClosableMemoryFailure()
+            failed_attempts.append(failure)
+            raise failure
+
+    q8_profile = {
+        'profile_id': 'qwen64k_kv_q8_fa_small_batch',
+        'kwargs': {'type_k': 8, 'type_v': 8, 'flash_attn': True, 'offload_kqv': True},
+        'diagnostics': {
+            'profile_id': 'qwen64k_kv_q8_fa_small_batch',
+            'preferred_profile_id': 'qwen64k_kv_q8_fa_small_batch',
+            'kv_precision': 'q8',
+            'applied': {'type_k': 8, 'type_v': 8, 'flash_attn': True, 'offload_kqv': True},
+            'backend': 'cuda',
+        },
+    }
+    f16_profile = {
+        'profile_id': 'qwen64k_f16_fa_small_batch',
+        'kwargs': {'flash_attn': True, 'offload_kqv': True},
+        'diagnostics': {
+            'profile_id': 'qwen64k_f16_fa_small_batch',
+            'kv_precision': 'f16',
+            'applied': {'flash_attn': True, 'offload_kqv': True},
+            'backend': 'cuda',
+        },
+    }
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch('utils.llm.model_manager._build_qwen_64k_runtime_profiles', return_value=[q8_profile, f16_profile]), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is None
+
+    assert len(attempts) == 1
+    assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
+    assert failed_attempts[0].close.call_count == 1
+    assert manager.llm is None
+    assert manager.last_compute_diagnostics['api_v1_runtime_ready'] is False
+    assert manager.last_compute_diagnostics['api_v1_readiness_result'] == 'failed'
+    assert manager._qwen_64k_profile_attempt_ids == ['qwen64k_kv_q8_fa_small_batch']
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
+    assert manager.last_compute_diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category'] == 'runtime_context_create_cuda_memory'
+    assert manager.last_compute_diagnostics['api_v1_readiness_qwen_64k_runtime_profile_fallback_reason'] == 'memory_pressure'
+    assert 'profile exhaustion before registration' in manager.last_runtime_init_error
+    assert 'SECRET_PAYLOAD' not in manager.last_runtime_init_error
+    assert 'type_k' not in f16_profile['kwargs']
+    assert 'type_v' not in f16_profile['kwargs']
+
+
 def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
     from utils.context_profiles import apply_context_profile
     from utils.llm import model_manager as model_manager_module

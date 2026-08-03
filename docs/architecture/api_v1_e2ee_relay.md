@@ -2,6 +2,44 @@
 
 This note is the canonical architecture baseline for the API v1 E2EE migration roadmap.
 
+## Encrypted inference progress sideband
+
+Registration advertises `relay_capabilities.encrypted_progress_v1`. The compute node retains this
+per relay and uses the compute-only `POST /api/v1/relay/progress` route only when that exact relay
+advertises support. Either rollout order is safe: an older desktop sends no updates and a new
+desktop treats a missing capability as disabled. There is no plaintext or legacy fallback.
+
+The route requires registration authentication plus the exact registered server control
+credential. Under the terminal-transition locks, the relay verifies ownership of the active
+`(client_public_key, request_id)` pair. Its strict 16 KiB contract contains only those routing
+identities, protocol/version, credential, ciphertext, encrypted content key, and IV. Phase,
+counters, prompt, options, and output stay encrypted.
+
+The freshly hybrid-encrypted client-bound plaintext is:
+
+```json
+{"protocol":"tokenplace_api_v1_relay_e2ee","version":1,"request_id":"opaque","client_public_key":"client key","api_v1_progress":{"schema_version":1,"sequence":1,"phase":"preparing","total_prompt_tokens":0,"cached_prompt_tokens":0,"processed_prompt_tokens":0,"generated_tokens":0,"elapsed_ms":0}}
+```
+
+Phases are `preparing`, `prefill`, or `generating`. Counters are non-negative safe integers and a
+positive total requires `cached <= processed <= total`. A request-scoped publisher supplies a
+monotonic sequence across worker recovery. Its single worker retains only the latest event,
+coalesces same-phase bursts to roughly one update per second, sends phase changes promptly, and
+uses bounded timeouts/backoff. Progress failure never fails inference.
+
+The relay buffers at most one ciphertext envelope per active request. A pending response poll
+atomically pops it as `encrypted_progress`. Cancellation, expiry, completion, unregister, eviction,
+and all terminal transitions clear it; progress neither revives work nor renews deadlines or
+accounting leases. The browser rechecks active request/client bindings around decryption, validates
+the fixed schema and increasing sequence, and ignores malformed or stale events.
+
+The landing chat renders a labelled native `<progress>` element. Waiting, Preparing, unknown
+Prefill, and Generating are indeterminate; known Prefill uses token `value` and `max`. A polite,
+atomic live region announces phase changes and coarse milestones, not each update. Terminal states
+and teardown remove it. This sideband is not response-token streaming: API v1 still returns the
+fully generated encrypted completion once and atomically. Telemetry failure cannot downgrade to
+plaintext or affect completion.
+
 ## Release target and scope
 
 - **API v1 is the active API for token.place v0.1.0.**

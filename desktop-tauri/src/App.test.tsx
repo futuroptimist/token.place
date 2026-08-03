@@ -92,6 +92,7 @@ describe('desktop app start failure handling', () => {
       relay_base_urls: ['https://token.place', 'https://staging.token.place'],
       preferred_mode: 'auto',
       context_tier: '8k-fast',
+      qwen_64k_batch_profile: 'balanced',
     });
   });
 

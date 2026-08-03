@@ -374,3 +374,20 @@ and must not run pip, reinstall `llama-cpp-python`, require network access, or
 silently fall back from Metal to CPU. Repair packages, when explicitly needed,
 remain in the writable app-data dependency target and are installed by invoking
 pip through the bundled interpreter rather than modifying `Contents/Resources`.
+
+### Qwen 64K batch profiles
+
+The packaged operator offers three deterministic profiles for the **64K Full** context tier:
+
+| Profile | `n_batch` | `n_ubatch` | Use |
+| --- | ---: | ---: | --- |
+| Balanced (default) | 512 | 256 | Recommended initial product setting |
+| Safe | 256 | 128 | Conservative P4-equivalent setting |
+| Experimental | 1024 | 512 | Explicit opt-in with greater memory and stability risk |
+
+Changing this preference requires stopping and restarting the operator. The preference is retained
+but not applied for the 8K tier. On recognized memory pressure, Q8 and F16 profiles downshift from
+Experimental to Balanced to Safe before the Safe Q4 memory fallback. Q8 compatibility failures
+instead use F16 at the current batch size; arbitrary backend or decode failures do not trigger a
+batch or Q4 fallback. Performance varies by backend and hardware. P8 will add formal comparative
+benchmarks and regression thresholds; these values are not performance guarantees.

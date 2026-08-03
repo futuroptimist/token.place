@@ -11365,7 +11365,7 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_result'] == 'failed'
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category'] == 'runtime_context_create_metal_buffer_limit'
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_attempt_ids'] == (
-        'qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
+        'qwen64k_kv_q8_fa_small_batch,qwen64k_f16_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
     )
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
     assert diagnostics['api_v1_readiness_backend_used'] == 'metal'
@@ -11581,6 +11581,31 @@ def test_unrecognized_init_failure_is_not_context_create_retryable():
 
     assert category == 'runtime_init_unclassified'
     assert category not in model_manager_module.QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES
+
+
+def test_qwen_64k_profile_fallback_policy_is_reason_driven():
+    from utils.llm import model_manager as model_manager_module
+
+    q8 = model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q8
+    f16 = model_manager_module.QWEN_64K_RUNTIME_PROFILE_F16
+    q4 = model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q4
+
+    assert model_manager_module.QWEN_64K_RUNTIME_PROFILE_DEFAULT == q8
+    assert model_manager_module._next_qwen_64k_profile_id(
+        q8, 'runtime_context_create_failed'
+    ) == f16
+    assert model_manager_module._next_qwen_64k_profile_id(
+        q8, 'runtime_context_create_cuda_memory'
+    ) == q4
+    assert model_manager_module._next_qwen_64k_profile_id(
+        f16, 'runtime_context_create_kv_cache_allocation'
+    ) == q4
+    assert model_manager_module._next_qwen_64k_profile_id(
+        f16, 'runtime_context_create_failed'
+    ) is None
+    assert model_manager_module._next_qwen_64k_profile_id(
+        q4, 'runtime_context_create_cuda_memory'
+    ) is None
 
 
 def test_cuda_cublas_not_initialized_is_not_memory_retryable():

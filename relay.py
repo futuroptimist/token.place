@@ -3339,14 +3339,25 @@ _API_V1_PROGRESS_CLIENT_FIELDS = {
 @app.route('/api/v1/relay/progress', methods=['POST'])
 def api_v1_relay_progress():
     """Accept one relay-blind, owner-authenticated encrypted progress update."""
+    limit = 16 * 1024
+    if request.content_length is not None and request.content_length > limit:
+        return jsonify({'error': {'message': 'Progress envelope too large', 'code': 413}}), 413
+    # Read at most one byte beyond the cap.  get_data() would buffer an
+    # unbounded chunked body before allowing us to enforce the limit.
+    raw_body = (request.get_data(cache=True) if request.content_length is not None
+                else request.stream.read(limit + 1))
+    if len(raw_body) > limit:
+        return jsonify({'error': {'message': 'Progress envelope too large', 'code': 413}}), 413
+    # Restore the bounded body for the shared authentication helper, which
+    # validates JSON credentials before endpoint-specific schema checks.
+    request._cached_data = raw_body
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
-    if request.content_length is not None and request.content_length > 16 * 1024:
-        return jsonify({'error': {'message': 'Progress envelope too large', 'code': 413}}), 413
-    if len(request.get_data(cache=True)) > 16 * 1024:
-        return jsonify({'error': {'message': 'Progress envelope too large', 'code': 413}}), 413
-    data = request.get_json(silent=True)
+    try:
+        data = json.loads(raw_body)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        data = None
     if not isinstance(data, dict) or set(data) != _API_V1_PROGRESS_FIELDS:
         return jsonify({'error': {'message': 'Invalid encrypted progress schema', 'code': 400}}), 400
     if _payload_has_plaintext_fields(data):

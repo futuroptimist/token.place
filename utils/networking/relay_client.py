@@ -15,6 +15,7 @@ import re
 import sys
 import threading
 import time
+import queue
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
@@ -111,10 +112,10 @@ class _ApiV1ProgressPublisher:
                 if self._stopped:
                     return
                 self._pending = {"phase": phase, **values}
-                phase_changed = phase != self._last_phase
                 self._last_phase = phase
-                if phase_changed:
-                    self._condition.notify()
+                # Wake for counter-only updates too.  The worker still applies
+                # the cadence below, so bursts remain latest-value coalesced.
+                self._condition.notify()
         except Exception:
             return
 
@@ -123,9 +124,10 @@ class _ApiV1ProgressPublisher:
             self._stopped = True
             self._pending = None
             self._condition.notify_all()
-        # Network I/O has its own short bound; completion must never wait for
-        # best-effort telemetry to drain.
-        self._thread.join(timeout=0.05)
+        # This request-owned worker never performs network I/O itself, so it
+        # must always quiesce.  Potentially wedged transports are isolated in
+        # the single process-wide best-effort worker below.
+        self._thread.join()
 
     def _run(self) -> None:
         next_allowed = 0.0
@@ -161,10 +163,8 @@ class _ApiV1ProgressPublisher:
                 headers = self.owner._auth_headers()
                 if headers:
                     kwargs["headers"] = headers
-                response = requests.post(self.owner._build_api_v1_url(self.relay_url, "/relay/progress"), **kwargs)
-                if response.status_code in {400, 401, 403, 404, 410}:
-                    self.stop_from_worker()
-                    return
+                url = self.owner._build_api_v1_url(self.relay_url, "/relay/progress")
+                _API_V1_PROGRESS_HTTP_WORKER.submit(url, kwargs)
             except Exception:
                 pass
             next_allowed = time.monotonic() + _API_V1_PROGRESS_INTERVAL_SECONDS
@@ -173,6 +173,42 @@ class _ApiV1ProgressPublisher:
         with self._condition:
             self._stopped = True
             self._pending = None
+
+
+class _ApiV1ProgressHttpWorker:
+    """One reusable, bounded worker isolates best-effort progress transport.
+
+    Requests timeouts are not wall-clock guarantees.  A singleton daemon and a
+    one-item queue ensure a wedged adapter can retain neither an unbounded set
+    of request threads nor their RelayClient owners.
+    """
+
+    def __init__(self) -> None:
+        self._queue = queue.Queue(maxsize=1)
+        self._thread = threading.Thread(
+            target=self._run, name="tokenplace-api-v1-progress-http", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, url: str, kwargs: Dict[str, Any]) -> bool:
+        try:
+            self._queue.put_nowait((url, kwargs))
+            return True
+        except queue.Full:
+            return False
+
+    def _run(self) -> None:
+        while True:
+            url, kwargs = self._queue.get()
+            try:
+                requests.post(url, **kwargs)
+            except Exception:
+                pass
+            finally:
+                self._queue.task_done()
+
+
+_API_V1_PROGRESS_HTTP_WORKER = _ApiV1ProgressHttpWorker()
 
 
 class _PostApiV1Outcome(NamedTuple):

@@ -1010,14 +1010,7 @@ new Vue({
         },
 
         relayProgressText(progress = this.relayProgress) {
-            if (!progress || progress.phase === 'waiting') return 'Waiting for compute node…';
-            if (progress.phase === 'preparing') return 'Preparing request…';
-            if (progress.phase === 'prefill' && progress.total_prompt_tokens > 0) {
-                const percent = Math.floor((progress.processed_prompt_tokens / progress.total_prompt_tokens) * 100);
-                return `Processing prompt: ${progress.processed_prompt_tokens.toLocaleString()} of ${progress.total_prompt_tokens.toLocaleString()} tokens (${percent}%)`;
-            }
-            if (progress.phase === 'prefill') return 'Processing prompt…';
-            return `Generating response… ${progress.generated_tokens.toLocaleString()} tokens generated`;
+            return window.TokenPlaceProgress.relayProgressText(progress);
         },
 
         async applyEncryptedRelayProgress(outer, activeRequest) {
@@ -1030,18 +1023,8 @@ new Vue({
                 if (this.activeRelayRequest !== activeRequest || activeRequest.terminated || !plaintext) return;
                 const envelope = JSON.parse(plaintext);
                 const progress = envelope && envelope.api_v1_progress;
-                const counters = progress && ['total_prompt_tokens', 'cached_prompt_tokens', 'processed_prompt_tokens', 'generated_tokens', 'elapsed_ms'];
-                const progressKeys = progress && Object.keys(progress).sort();
-                const expectedProgressKeys = ['cached_prompt_tokens', 'elapsed_ms', 'generated_tokens', 'phase', 'processed_prompt_tokens', 'schema_version', 'sequence', 'total_prompt_tokens'];
-                if (!progress || envelope.protocol !== 'tokenplace_api_v1_relay_e2ee' || envelope.version !== 1
-                    || envelope.request_id !== activeRequest.requestId || envelope.client_public_key !== activeRequest.clientPublicKey
-                    || JSON.stringify(Object.keys(envelope).sort()) !== JSON.stringify(['api_v1_progress', 'client_public_key', 'protocol', 'request_id', 'version'])
-                    || JSON.stringify(progressKeys) !== JSON.stringify(expectedProgressKeys)
-                    || progress.schema_version !== 1 || !Number.isSafeInteger(progress.sequence) || progress.sequence <= activeRequest.lastProgressSequence
-                    || !['preparing', 'prefill', 'generating'].includes(progress.phase)
-                    || counters.some((key) => !Number.isSafeInteger(progress[key]) || progress[key] < 0)
-                    || (progress.total_prompt_tokens > 0 && !(progress.cached_prompt_tokens <= progress.processed_prompt_tokens
-                        && progress.processed_prompt_tokens <= progress.total_prompt_tokens))) return;
+                if (!window.TokenPlaceProgress.validProgressEnvelope(envelope, activeRequest.requestId,
+                    activeRequest.clientPublicKey, activeRequest.lastProgressSequence)) return;
                 if (this.activeRelayRequest !== activeRequest || activeRequest.terminated) return;
                 const old = this.relayProgress;
                 const oldMilestone = old && old.total_prompt_tokens > 0

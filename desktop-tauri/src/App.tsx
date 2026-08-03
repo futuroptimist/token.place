@@ -100,6 +100,8 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
   'api_v1_readiness_qwen_64k_runtime_profile_result',
   'api_v1_readiness_qwen_64k_runtime_profile_failure_category',
   'api_v1_readiness_qwen_64k_runtime_preferred_profile_id',
+  'api_v1_readiness_qwen_64k_batch_profile_requested',
+  'api_v1_readiness_qwen_64k_batch_profile_selected',
   'api_v1_readiness_qwen_64k_runtime_profile_kv_precision',
   'api_v1_readiness_qwen_64k_runtime_profile_fallback_reason',
   'api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback',

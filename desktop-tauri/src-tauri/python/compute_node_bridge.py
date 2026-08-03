@@ -699,6 +699,8 @@ _SAFE_READINESS_DIAGNOSTIC_KEYS = {
     "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status",
     "api_v1_readiness_qwen_64k_runtime_profile_id",
     "api_v1_readiness_qwen_64k_runtime_preferred_profile_id",
+    "api_v1_readiness_qwen_64k_batch_profile_requested",
+    "api_v1_readiness_qwen_64k_batch_profile_selected",
     "api_v1_readiness_qwen_64k_runtime_profile_kv_precision",
     "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason",
     "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids",

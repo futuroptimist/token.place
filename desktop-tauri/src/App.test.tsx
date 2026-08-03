@@ -1233,6 +1233,8 @@ describe('desktop app start failure handling', () => {
           api_v1_readiness_completion_smoke_method: 'create_completion_keyword_prompt',
           api_v1_readiness_completion_smoke_rejected_option: 'temperature',
           api_v1_readiness_qwen_64k_runtime_preferred_profile_id: 'qwen64k_kv_q8_fa_small_batch',
+          api_v1_readiness_qwen_64k_batch_profile_requested: 'experimental',
+          api_v1_readiness_qwen_64k_batch_profile_selected: 'safe',
           api_v1_readiness_qwen_64k_runtime_profile_kv_precision: 'q4',
           api_v1_readiness_qwen_64k_runtime_profile_fallback_reason: 'memory_pressure',
           api_v1_readiness_completion_smoke_internal_reason: 'SECRET_PROMPT',
@@ -1253,6 +1255,12 @@ describe('desktop app start failure handling', () => {
     );
     expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
       'api_v1_readiness_qwen_64k_runtime_preferred_profile_id=qwen64k_kv_q8_fa_small_batch'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_qwen_64k_batch_profile_requested=experimental'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_qwen_64k_batch_profile_selected=safe'
     );
     expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
       'api_v1_readiness_qwen_64k_runtime_profile_kv_precision=q4'

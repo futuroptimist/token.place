@@ -11769,7 +11769,7 @@ def test_qwen_64k_failure_readiness_publisher_prefers_persisted_transition_reaso
 
     diagnostics = manager.last_compute_diagnostics
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_preferred_profile_id'] == (
-        'qwen64k_kv_q8_fa_small_batch'
+        'qwen64k_kv_q8_fa_balanced_batch'
     )
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_kv_precision'] == 'q4'
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_fallback_reason'] == 'memory_pressure'
@@ -13794,6 +13794,7 @@ def test_qwen_64k_batch_profiles_have_exact_values_and_unique_structured_ids(bat
     assert len(combinations) == len(set(combinations))
     q8 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q8' and p['diagnostics']['batch_profile'] == batch_profile)
     assert (q8['kwargs']['n_batch'], q8['kwargs']['n_ubatch']) == expected
+    assert q8['diagnostics']['preferred_profile_id'] == q8['profile_id']
     assert all(p['kwargs']['n_batch'] >= p['kwargs']['n_ubatch'] > 0 for p in profiles)
     q4 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q4')
     assert (q4['kwargs']['n_batch'], q4['kwargs']['n_ubatch']) == (256, 128)
@@ -13806,3 +13807,17 @@ def test_qwen_64k_batch_profile_normalization_defaults_safely_without_implicit_e
     assert normalize_qwen_64k_batch_profile('unknown') == 'balanced'
     assert normalize_qwen_64k_batch_profile(' experimental ') == 'balanced'
     assert normalize_qwen_64k_batch_profile('experimental') == 'experimental'
+
+
+def test_qwen_64k_readiness_budget_covers_all_remaining_runtime_profiles():
+    manager = object.__new__(ModelManager)
+    manager.model_profile = {'provider': 'qwen'}
+    manager.context_tier = '64k-full'
+    manager._qwen_64k_selected_profile_index = 0
+    manager._qwen_64k_runtime_profiles = [
+        {'profile_id': f'profile-{index}'} for index in range(7)
+    ]
+
+    assert manager.qwen_64k_readiness_profile_attempt_budget() == 7
+    manager._qwen_64k_selected_profile_index = 3
+    assert manager.qwen_64k_readiness_profile_attempt_budget() == 4

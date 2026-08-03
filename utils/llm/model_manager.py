@@ -554,7 +554,7 @@ def _build_qwen_64k_runtime_profiles(
             enabled = False
         diagnostics = {
             'profile_id': profile_id,
-            'preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
+            'preferred_profile_id': _qwen_64k_profile_id('q8', requested_batch_profile),
             'enabled': bool(enabled),
             'applied': dict(kwargs),
             'omitted': omitted,
@@ -5760,8 +5760,13 @@ class ModelManager:
                     'kwargs': {},
                     'diagnostics': {
                         'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
-                        'preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
+                        'preferred_profile_id': _qwen_64k_profile_id(
+                            'q8', self.qwen_64k_batch_profile
+                        ),
                         'fallback_reason': 'capability_incompatibility',
+                        'kv_precision': 'f16',
+                        'batch_profile': self.qwen_64k_batch_profile,
+                        'qwen_64k_batch_profile_requested': self.qwen_64k_batch_profile,
                         'enabled': False,
                         'applied': {},
                     },
@@ -5772,8 +5777,13 @@ class ModelManager:
             profile_diagnostics = runtime_profile.get('diagnostics') if isinstance(runtime_profile, dict) else None
             self.last_qwen_64k_memory_profile_diagnostics = dict(profile_diagnostics) if isinstance(profile_diagnostics, dict) else {
                 'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
-                'preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
+                'preferred_profile_id': _qwen_64k_profile_id(
+                    'q8', self.qwen_64k_batch_profile
+                ),
                 'fallback_reason': 'capability_incompatibility',
+                'kv_precision': 'f16',
+                'batch_profile': self.qwen_64k_batch_profile,
+                'qwen_64k_batch_profile_requested': self.qwen_64k_batch_profile,
                 'enabled': True,
                 'applied': {},
             }
@@ -6137,6 +6147,17 @@ class ModelManager:
         memory_profile = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)
         applied_memory = memory_profile.get('applied') if isinstance(memory_profile, dict) and isinstance(memory_profile.get('applied'), dict) else {}
         kv_precision = memory_profile.get('kv_precision') if isinstance(memory_profile, dict) else None
+        requested_batch_profile = normalize_qwen_64k_batch_profile(
+            memory_profile.get(
+                'qwen_64k_batch_profile_requested',
+                getattr(self, 'qwen_64k_batch_profile', None),
+            )
+            if isinstance(memory_profile, dict)
+            else getattr(self, 'qwen_64k_batch_profile', None)
+        )
+        selected_batch_profile = (
+            memory_profile.get('batch_profile') if isinstance(memory_profile, dict) else None
+        )
         selected_fallback_reason = getattr(
             self, '_qwen_64k_selected_profile_fallback_reason', None
         )
@@ -6156,7 +6177,11 @@ class ModelManager:
             'api_v1_readiness_error_code': 'compute_node_runtime_init_failed',
             'api_v1_readiness_error_reason': 'qwen_64k_runtime_profile_initialization_failed',
             'api_v1_readiness_qwen_64k_runtime_profile_id': profile_id,
-            'api_v1_readiness_qwen_64k_runtime_preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
+            'api_v1_readiness_qwen_64k_runtime_preferred_profile_id': _qwen_64k_profile_id(
+                'q8', requested_batch_profile
+            ),
+            'api_v1_readiness_qwen_64k_batch_profile_requested': requested_batch_profile,
+            'api_v1_readiness_qwen_64k_batch_profile_selected': selected_batch_profile,
             'api_v1_readiness_qwen_64k_runtime_profile_kv_precision': kv_precision,
             'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids': ','.join(attempted_profile_ids),
             'api_v1_readiness_qwen_64k_runtime_profile_recovery_count': max(0, len(attempted_profile_ids) - 1),
@@ -6365,9 +6390,13 @@ class ModelManager:
                                             'kwargs': {},
                                             'diagnostics': {
                                                 'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
-                                                'preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
+                                                'preferred_profile_id': _qwen_64k_profile_id(
+                                                    'q8', self.qwen_64k_batch_profile
+                                                ),
                                                 'fallback_reason': 'capability_incompatibility',
                                                 'kv_precision': 'f16',
+                                                'batch_profile': self.qwen_64k_batch_profile,
+                                                'qwen_64k_batch_profile_requested': self.qwen_64k_batch_profile,
                                                 'enabled': True,
                                                 'applied': {},
                                                 'backend': str(compute_plan.get('backend_used') or '').lower(),
@@ -6640,7 +6669,7 @@ class ModelManager:
         profiles = list(self._qwen_64k_runtime_profiles or [])
         profile_ids = [
             profile.get('profile_id')
-            for profile in profiles[:3]
+            for profile in profiles
             if isinstance(profile, dict) and profile.get('profile_id')
         ]
         if not profile_ids:

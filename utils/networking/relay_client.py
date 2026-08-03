@@ -94,6 +94,84 @@ class _PostApiV1Outcome(NamedTuple):
     suppressed_code: Optional[str] = None
 
 
+class _ApiV1ProgressPublisher:
+    """Request-owned bounded latest-value encrypted telemetry publisher."""
+
+    _FIELDS = ('total_prompt_tokens', 'cached_prompt_tokens', 'processed_prompt_tokens',
+               'generated_tokens', 'elapsed_ms')
+
+    def __init__(self, client, relay_url, request_id, client_key_b64, client_key):
+        self.client, self.relay_url, self.request_id = client, relay_url, request_id
+        self.client_key_b64, self.client_key = client_key_b64, client_key
+        self._condition = threading.Condition()
+        self._pending = None
+        self._stopped = False
+        self._sequence = 0
+        self._thread = threading.Thread(target=self._run, name='api_v1_progress', daemon=True)
+        self._thread.start()
+
+    def observe(self, event):
+        phase = event.get('phase') if isinstance(event, dict) else None
+        if phase not in {'preparing', 'prefill', 'generating'}:
+            return
+        try:
+            counters = {key: int(event.get(key, 0)) for key in self._FIELDS}
+        except (TypeError, ValueError):
+            return
+        if any(value < 0 or value > 2**53 - 1 for value in counters.values()):
+            return
+        total, cached, processed = (counters['total_prompt_tokens'], counters['cached_prompt_tokens'], counters['processed_prompt_tokens'])
+        if total > 0 and not cached <= processed <= total:
+            return
+        with self._condition:
+            if self._stopped:
+                return
+            self._sequence += 1
+            self._pending = {'schema_version': 1, 'sequence': self._sequence, 'phase': phase, **counters}
+            self._condition.notify()
+
+    def close(self):
+        with self._condition:
+            self._stopped = True
+            self._pending = None
+            self._condition.notify_all()
+
+    def _run(self):
+        last_post = 0.0
+        while True:
+            with self._condition:
+                while self._pending is None and not self._stopped:
+                    self._condition.wait()
+                if self._stopped:
+                    return
+                delay = max(0.0, 1.0 - (time.monotonic() - last_post))
+                if delay:
+                    self._condition.wait(delay)
+                    if self._stopped:
+                        return
+                progress, self._pending = self._pending, None
+            envelope = {'protocol': 'tokenplace_api_v1_relay_e2ee', 'version': 1,
+                        'request_id': self.request_id, 'client_public_key': self.client_key_b64,
+                        'api_v1_progress': progress}
+            try:
+                encrypted = self.client.crypto_manager.encrypt_message(envelope, self.client_key)
+                payload = {'server_public_key': self.client.crypto_manager.public_key_b64,
+                           'client_public_key': self.client_key_b64, 'request_id': self.request_id,
+                           'control_credential': self.client._api_v1_control_credential_for_relay(self.relay_url),
+                           'protocol': 'tokenplace_api_v1_relay_e2ee', 'version': 1, **encrypted}
+                kwargs = {'json': payload, 'timeout': min(float(self.client._request_timeout), 2.0)}
+                headers = self.client._auth_headers()
+                if headers:
+                    kwargs['headers'] = headers
+                response = requests.post(self.client._build_api_v1_url(self.relay_url, '/relay/progress'), **kwargs)
+                if response.status_code in {400, 401, 403, 404, 410}:
+                    self.close()
+                    return
+                last_post = time.monotonic()
+            except Exception:
+                last_post = time.monotonic()
+
+
 def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     """Return True for request-scoped llama.cpp inference validation failures."""
 
@@ -1090,6 +1168,7 @@ class RelayClient:
         self._api_v1_last_heartbeat_at: Dict[str, float] = {}
         self._api_v1_relay_wait_hints: Dict[str, Dict[str, Any]] = {}
         self._api_v1_control_credentials_by_relay: Dict[str, str] = {}
+        self._api_v1_relay_capabilities_by_relay: Dict[str, Dict[str, bool]] = {}
         self._api_v1_control_credentials_lock = threading.Lock()
         self._unregister_attempted = False
         self._unregister_complete = False
@@ -1594,6 +1673,7 @@ class RelayClient:
                     unregistered_relays.add(candidate_url)
                     self._api_v1_registered_relays.discard(candidate_url)
                     self._pop_api_v1_control_credential(candidate_url)
+                    self._api_v1_relay_capabilities_by_relay.pop(candidate_url, None)
                     self._api_v1_last_heartbeat_at.pop(candidate_url, None)
                     relay_wait_hints.pop(candidate_url, None)
                     continue
@@ -1639,6 +1719,7 @@ class RelayClient:
             self._api_v1_registered_relays.difference_update(unregistered_relays)
             for relay_url in unregistered_relays:
                 self._pop_api_v1_control_credential(relay_url)
+                self._api_v1_relay_capabilities_by_relay.pop(relay_url, None)
                 self._api_v1_last_heartbeat_at.pop(relay_url, None)
                 relay_wait_hints.pop(relay_url, None)
         return True
@@ -1985,6 +2066,12 @@ class RelayClient:
             control_credential = payload.get('control_credential')
             if isinstance(control_credential, str) and control_credential:
                 self._store_api_v1_control_credential(target_url, control_credential)
+            capabilities = payload.get('relay_capabilities')
+            self._api_v1_relay_capabilities_by_relay[target_url] = (
+                {'encrypted_progress_v1': True}
+                if isinstance(capabilities, dict) and capabilities.get('encrypted_progress_v1') is True
+                else {}
+            )
         return payload
 
     @staticmethod
@@ -2495,7 +2582,7 @@ class RelayClient:
         except Exception:
             log_info('api_v1.control_ack_failed request_id={}', request_id)
 
-    def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any], *, local_deadline: Optional[float] = None) -> _ApiV1SupervisorOutcome:
+    def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any], *, local_deadline: Optional[float] = None, progress_observer=None) -> _ApiV1SupervisorOutcome:
         supervisor_started_at = time.monotonic()
         request_id = api_v1_request_payload['request_id']
         relay_url = self._api_v1_response_relay_url()
@@ -2545,6 +2632,7 @@ class RelayClient:
                 messages=api_v1_request_payload['messages'],
                 options=dict(api_v1_request_payload['options']),
                 requested_context_tier=api_v1_request_payload['routing']['context_tier'],
+                progress_observer=progress_observer,
             )
 
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_inference')
@@ -4622,6 +4710,7 @@ class RelayClient:
         messages: List[Dict[str, Any]],
         options: Dict[str, Any],
         requested_context_tier: str = DEFAULT_CONTEXT_TIER,
+        progress_observer=None,
     ) -> Dict[str, Any]:
         """Generate an API v1 assistant message with the desktop runtime model."""
 
@@ -4845,7 +4934,7 @@ class RelayClient:
                                 qwen_render_complete,
                                 llm_instance=llm_instance,
                                 request_id=request_id,
-                                observer=self._api_v1_local_progress_observer,
+                                observer=progress_observer or self._api_v1_local_progress_observer,
                             ),
                         )
 
@@ -4865,7 +4954,7 @@ class RelayClient:
                 create_chat_completion = functools.partial(
                     create_chat_completion,
                     progress_request_id=request_id,
-                    progress_observer=self._api_v1_local_progress_observer,
+                    progress_observer=progress_observer or self._api_v1_local_progress_observer,
                 )
 
             if self._api_v1_qwen_non_thinking_required(model_profile) and not callable(qwen_render_complete):
@@ -5256,7 +5345,19 @@ class RelayClient:
                             cancel_snapshot = candidate_snapshot
                     if getattr(self, "_api_v1_registered_relays", set()):
                         self._api_v1_start_heartbeat_worker()
-                    supervisor_outcome = self._supervise_api_v1_inference(api_v1_request_payload, local_deadline=outer_api_v1_deadline)
+                    progress_publisher = None
+                    relay_url = self._api_v1_response_relay_url()
+                    if self._api_v1_relay_capabilities_by_relay.get(relay_url, {}).get('encrypted_progress_v1'):
+                        progress_publisher = _ApiV1ProgressPublisher(self, relay_url, api_v1_request_payload['request_id'], client_pub_key_b64, client_pub_key)
+                    def progress_observer(event):
+                        self._api_v1_local_progress_observer(event)
+                        if progress_publisher is not None:
+                            progress_publisher.observe(event)
+                    try:
+                        supervisor_outcome = self._supervise_api_v1_inference(api_v1_request_payload, local_deadline=outer_api_v1_deadline, progress_observer=progress_observer)
+                    finally:
+                        if progress_publisher is not None:
+                            progress_publisher.close()
                     response_envelope = supervisor_outcome.response_envelope
                     if response_envelope is None:
                         return RelayProcessingResult(

@@ -95,3 +95,37 @@ The migration roadmap follow-up phases own the implementation repair:
 4. add final guardrails proving active production paths no longer use legacy routes.
 
 This documentation baseline intentionally does **not** implement those code migrations.
+
+## Encrypted inference progress sideband
+
+API v1 progress is optional, best-effort telemetry and does not stream model output. A relay advertises
+`relay_capabilities.encrypted_progress_v1` during compute registration. Nodes retain that capability per
+relay; an absent capability disables publication without changing inference, which permits relay and
+desktop 0.1.11 rollout in either order.
+
+For an active request, the compute node maps the structured local progress callback to a fixed inner
+envelope containing protocol/version and the request/client bindings plus `schema_version`, a
+request-monotonic `sequence`, one of `preparing`, `prefill`, or `generating`, and non-negative prompt,
+generation, and elapsed counters. It hybrid-encrypts each envelope to the requesting client's public key
+with fresh symmetric material and posts only ciphertext and safe routing metadata to compute-only
+`POST /api/v1/relay/progress`. Registration authentication and the exact server control credential are
+both required. The relay validates ownership against the active in-flight entry under the same terminal
+transition lock used for cancellation and completion.
+
+The compute publisher is request-scoped, non-blocking, and latest-value bounded: one worker permits one
+POST in flight, coalesces intermediate updates, and limits ordinary publication to approximately once a
+second. Encryption or transport failure neither fails inference nor falls back to plaintext. Cancellation,
+timeout, Stop, recovery teardown, completion, and shutdown invalidate pending publication.
+
+The relay stores at most one opaque encrypted envelope for each `(client_public_key, request_id)` and
+atomically pops it into a `202 pending` response from `/api/v1/relay/responses/retrieve`. It clears the
+slot at every terminal lifecycle transition; progress neither renews the deadline/accounting lease nor
+changes final response acceptance. The final API v1 completion remains a single atomic encrypted
+response after full generation, so this sideband does not make API v1 streaming.
+
+The landing chat validates both bindings and both protocol versions before and after decryption, accepts
+only newer valid sequences, and keeps progress outside conversation history. It renders a labelled native
+`<progress>` element: waiting, preparing, unknown-total prefill, and generating are indeterminate; known-
+total prefill is determinate. A polite atomic live region announces phase changes without making ETA
+claims or announcing every counter update. Terminal outcomes, failover, page hide, and teardown remove
+the component. Clients that ignore the optional field retain normal inference behavior.

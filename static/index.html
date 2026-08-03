@@ -83,6 +83,9 @@
             margin-top: 30px;
             min-height: 260px;
         }
+        .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+        .inference-progress { margin: 0.75rem 0; }
+        .inference-progress progress { width: 100%; accent-color: #4f8cff; }
         .compute-node-status {
             display: flex;
             justify-content: space-between;
@@ -554,6 +557,19 @@
                     >Response stopped at the output-token limit.</p>
                 </div>
             </template>
+            <section v-if="inferenceProgress" class="inference-progress" data-testid="landing-inference-progress">
+                <label id="inference-progress-label" for="inference-progress">Inference progress</label>
+                <progress
+                    id="inference-progress"
+                    data-testid="landing-inference-progress-bar"
+                    aria-labelledby="inference-progress-label"
+                    aria-describedby="inference-progress-status"
+                    :max="inferenceProgress.phase === 'prefill' && inferenceProgress.total_prompt_tokens > 0 ? inferenceProgress.total_prompt_tokens : null"
+                    :value="inferenceProgress.phase === 'prefill' && inferenceProgress.total_prompt_tokens > 0 ? inferenceProgress.processed_prompt_tokens : null"
+                ></progress>
+                <p id="inference-progress-status" data-testid="landing-inference-progress-status" v-text="inferenceProgressText"></p>
+                <span class="sr-only" aria-live="polite" aria-atomic="true" v-text="inferenceProgress.phase"></span>
+            </section>
             <div class="input-container">
                 <textarea
                     ref="messageInput"
@@ -764,6 +780,7 @@
                 <tr><td><code>POST /api/v1/relay/servers/control</code></td><td>Authenticated owner-only in-flight request control poll exposing only active/cancelled/expired/completed/unavailable state and bounded retry hints.</td></tr>
                 <tr><td><code>POST /api/v1/relay/requests/cancel</code></td><td>Client request cancellation with a requester proof token.</td></tr>
                 <tr><td><code>POST /api/v1/relay/responses</code></td><td>Compute node stores an encrypted response envelope for client retrieval.</td></tr>
+                <tr><td><code>POST /api/v1/relay/progress</code></td><td>Compute node stores an optional encrypted progress sideband envelope.</td></tr>
             </tbody>
         </table>
         <p>Internal fail-closed relay dispatch routes <code>POST /relay/api/v1/chat/completions</code> and <code>POST /relay/api/v1/source</code> intentionally reject plaintext distributed API v1 payloads.</p>

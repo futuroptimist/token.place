@@ -17,6 +17,7 @@ const AUTO_OUTPUT_RESERVATION_TOKENS = 1024;
 const AUTO_CONTEXT_SAFETY_MARGIN_TOKENS = 1024;
 const AUTO_MESSAGE_OVERHEAD_TOKENS = 8;
 const API_V1_MAX_OUTPUT_TOKENS = 8192;
+const API_V1_E2EE_PROTOCOL = 'tokenplace_api_v1_relay_e2ee';
 const CONTEXT_TIER_ORDER = {
     '8k-fast': 8192,
     '64k-full': 65536
@@ -57,6 +58,7 @@ new Vue({
         computeNodeCountFetchController: null,
         computeNodeCountDestroyed: false,
         activeRelayRequest: null
+        ,inferenceProgress: null
     },
     mounted() {
         this.detectTouchInput();
@@ -75,6 +77,20 @@ new Vue({
         });
     },
     computed: {
+        inferenceProgressText() {
+            const progress = this.inferenceProgress;
+            if (!progress) return '';
+            if (progress.phase === 'waiting') return 'Waiting for compute node…';
+            if (progress.phase === 'preparing') return 'Preparing request…';
+            if (progress.phase === 'generating') {
+                return `Generating response…${progress.generated_tokens ? ` ${progress.generated_tokens.toLocaleString()} tokens generated` : ''}`;
+            }
+            if (progress.phase === 'prefill' && progress.total_prompt_tokens > 0) {
+                const percent = Math.floor(progress.processed_prompt_tokens * 100 / progress.total_prompt_tokens);
+                return `Processing prompt: ${progress.processed_prompt_tokens.toLocaleString()} of ${progress.total_prompt_tokens.toLocaleString()} tokens (${percent}%)`;
+            }
+            return 'Processing prompt…';
+        },
         computeNodeCountLabel() {
             if (this.computeNodeCountStatus === 'loading') {
                 return '';
@@ -120,6 +136,40 @@ new Vue({
         }
     },
     methods: {
+        clearInferenceProgress() {
+            this.inferenceProgress = null;
+        },
+
+        validProgressCounters(progress) {
+            const keys = ['sequence', 'total_prompt_tokens', 'cached_prompt_tokens', 'processed_prompt_tokens', 'generated_tokens', 'elapsed_ms'];
+            if (!keys.every((key) => Number.isSafeInteger(progress[key]) && progress[key] >= 0)) return false;
+            return progress.total_prompt_tokens <= 0 || (
+                progress.cached_prompt_tokens <= progress.processed_prompt_tokens &&
+                progress.processed_prompt_tokens <= progress.total_prompt_tokens
+            );
+        },
+
+        async applyEncryptedProgress(outer, activeRequest) {
+            if (!outer || this.activeRelayRequest !== activeRequest ||
+                outer.client_public_key !== activeRequest.clientPublicKey || outer.request_id !== activeRequest.requestId ||
+                outer.protocol !== API_V1_E2EE_PROTOCOL || outer.version !== 1) return;
+            try {
+                const plaintext = await this.decrypt(outer.ciphertext, outer.cipherkey, outer.iv);
+                if (this.activeRelayRequest !== activeRequest || activeRequest.terminated) return;
+                const envelope = JSON.parse(plaintext);
+                const progress = envelope.api_v1_progress;
+                if (!envelope || envelope.protocol !== API_V1_E2EE_PROTOCOL || envelope.version !== 1 ||
+                    envelope.request_id !== activeRequest.requestId || envelope.client_public_key !== activeRequest.clientPublicKey ||
+                    !progress || progress.schema_version !== 1 ||
+                    !['preparing', 'prefill', 'generating'].includes(progress.phase) ||
+                    !this.validProgressCounters(progress) || progress.sequence <= activeRequest.progressSequence) return;
+                if (this.activeRelayRequest !== activeRequest) return;
+                activeRequest.progressSequence = progress.sequence;
+                this.inferenceProgress = {...progress};
+            } catch (_error) {
+                // Progress is best-effort and can never affect final completion.
+            }
+        },
         clearComputeNodeCountPoller() {
             if (this.computeNodeCountPollTimeout) {
                 clearTimeout(this.computeNodeCountPollTimeout);
@@ -1003,6 +1053,7 @@ new Vue({
             if (this.activeRelayRequest && this.activeRelayRequest.requestId === requestId) {
                 this.activeRelayRequest = null;
             }
+            this.clearInferenceProgress();
         },
 
         isTerminalSelectedServerError(status, errorPayload) {
@@ -1118,6 +1169,9 @@ new Vue({
                     }
                     if (pendingPayload === RELAY_REQUEST_TERMINATED) {
                         return pendingPayload;
+                    }
+                    if (pendingPayload && pendingPayload.encrypted_progress) {
+                        await this.applyEncryptedProgress(pendingPayload.encrypted_progress, activeRequest);
                     }
                     deadline = this.shortenRelayResponseDeadline(deadline, pendingPayload, Date.now());
                     const pollDelay = await waitForOperation(
@@ -1313,11 +1367,13 @@ new Vue({
                     retrievalController: new AbortController(),
                     terminationPromise: null,
                     resolveTermination: null
+                    ,progressSequence: 0
                 };
                 activeRelayRequest.terminationPromise = new Promise((resolve) => {
                     activeRelayRequest.resolveTermination = resolve;
                 });
                 this.activeRelayRequest = activeRelayRequest;
+                this.inferenceProgress = {phase: 'waiting'};
 
                 let admissionPayload = null;
                 try {

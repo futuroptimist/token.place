@@ -145,6 +145,12 @@ For the planned Qwen3 default-model migration, see [Qwen3 8B Q4_K_M API v1 model
 - Flash attention, batch size, backend, K/Q/V offload, GPU layer offload, runtime
   scratch buffers, driver overhead, and allocator behavior alter the real
   footprint.
+- The selectable 64K batch classes are Safe (`256`/`128`), Balanced (`512`/`256`,
+  default and recommended), and Experimental (`1024`/`512`, explicit opt-in).
+  Changing the saved choice requires an operator restart and does not affect 8K.
+  Recognized memory pressure downshifts within the current KV precision before
+  Safe Q4 is considered; Q8 compatibility fallback uses same-batch F16. Backend
+  and hardware determine actual performance, and P8 owns formal comparisons.
 - These estimates must not become admission guarantees. A context profile may
   register only after the node has warm-loaded the exact runtime and completed
   profile-specific memory validation.
@@ -154,8 +160,7 @@ For the planned Qwen3 default-model migration, see [Qwen3 8B Q4_K_M API v1 model
 | Profile | Backend | KV cache | Batch defaults | Warm-load validation | Benchmark prompts | Required metrics | Pass condition |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `8k-fast` | Metal on initial Mac policy | Existing default initially | Existing default initially | Load exact `n_ctx=8192`; run a small non-sensitive smoke prompt | 1K, 4K, near-8K synthetic/private-safe prompts | warm-load time, prompt eval tok/s band, gen tok/s band, p50/p95 latency, peak memory band | No OOM; latency within operator policy; encrypted API v1 success |
-| `64k-full` | CUDA or Metal | Symmetric Q8_0; F16 compatibility; symmetric Q4_0 only under memory pressure | `n_batch=256`, `n_ubatch=128`, Flash Attention | Load exact `n_ctx=65536`; validate memory headroom under expected GPU availability | 8K, 32K, near-64K synthetic/private-safe prompts | warm-load time, prompt eval tok/s band, gen tok/s band, p50/p95 latency, peak VRAM/system RAM bands | No OOM; no CPU fallback; encrypted API v1 success |
-| Future tuned 64K | CUDA/Metal | Same validated precision policy | P5-tuned candidate | Compare against baseline | Same privacy-safe suite | deltas for memory, latency, failures | Adopt only if stable and faster/safer |
+| `64k-full` | CUDA or Metal | Symmetric Q8_0; F16 compatibility; symmetric Q4_0 only under memory pressure | Balanced `512`/`256`; Safe `256`/`128`; Experimental `1024`/`512`; Flash Attention | Load exact `n_ctx=65536`; validate memory headroom under expected GPU availability | 8K, 32K, near-64K synthetic/private-safe prompts | warm-load time, prompt eval tok/s band, gen tok/s band, p50/p95 latency, peak VRAM/system RAM bands | No OOM; no CPU fallback; encrypted API v1 success |
 
 Benchmarks must avoid real user content. Publish coarse bands or aggregate
 operator diagnostics only; do not publish prompts or exact user-derived token

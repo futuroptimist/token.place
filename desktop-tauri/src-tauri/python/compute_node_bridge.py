@@ -698,6 +698,8 @@ _SAFE_READINESS_DIAGNOSTIC_KEYS = {
     "api_v1_readiness_completion_smoke_plain_completion_metal_error_category",
     "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status",
     "api_v1_readiness_qwen_64k_runtime_profile_id",
+    "api_v1_readiness_qwen_64k_batch_profile_requested",
+    "api_v1_readiness_qwen_64k_batch_profile_selected",
     "api_v1_readiness_qwen_64k_runtime_preferred_profile_id",
     "api_v1_readiness_qwen_64k_runtime_profile_kv_precision",
     "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason",
@@ -816,6 +818,11 @@ def _startup_context_tier(args: argparse.Namespace) -> str:
     if raw_context_tier in {"8k-fast", "64k-full"}:
         return raw_context_tier
     return "8k-fast"
+
+
+def _startup_qwen_64k_batch_profile(args: argparse.Namespace) -> str:
+    value = getattr(args, "qwen_64k_batch_profile", "balanced")
+    return value if value in {"safe", "balanced", "experimental"} else "balanced"
 
 
 def _load_context_profile_helpers() -> Tuple[Any, Any]:
@@ -1203,6 +1210,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     args.context_tier = normalize_context_tier(getattr(args, "context_tier", "8k-fast"))
+    args.qwen_64k_batch_profile = _startup_qwen_64k_batch_profile(args)
 
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),
@@ -1216,6 +1224,7 @@ def run(args: argparse.Namespace) -> int:
         f"operator_session_id={bridge_session_id} "
         f"model_path_was_relative={model_path_was_relative} parent_model_path_exists={parent_model_path_exists} "
         f"mode={args.mode} context_tier={args.context_tier} "
+        f"qwen_64k_batch_profile={args.qwen_64k_batch_profile if args.context_tier == '64k-full' else 'not_applied'} "
         f"relay_count={len(relay_urls)} "
         f"relay_url={_sanitize_relay_target(relay_url)} "
         f"relay_port={relay_port if relay_port is not None else 'none'}",
@@ -1290,6 +1299,7 @@ def run(args: argparse.Namespace) -> int:
     runtime.model_manager.parent_model_path_exists = parent_model_path_exists
     runtime.model_manager.model_path_was_relative = model_path_was_relative
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
+    runtime.model_manager.qwen_64k_batch_profile = args.qwen_64k_batch_profile
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
         private_runtime_setup = dict(runtime_setup)
@@ -2782,7 +2792,9 @@ def run(args: argparse.Namespace) -> int:
 
 
 
-def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Dict[str, Any]:
+def installed_context_smoke_payload(
+    context_tier: str, launch_number: str, qwen_64k_batch_profile: str = "balanced"
+) -> Dict[str, Any]:
     """Return a bounded installed-artifact context probe record.
 
     This runs inside the resolved packaged interpreter and exercises the normal
@@ -2903,6 +2915,11 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
                 "model.enforce_gpu_memory_headroom": False,
                 "model.chat_format": "llama-3",
                 "paths.models_dir": str(models_dir),
+                "qwen_64k_batch_profile": (
+                    qwen_64k_batch_profile
+                    if qwen_64k_batch_profile in {"safe", "balanced", "experimental"}
+                    else "balanced"
+                ),
             }
         )
         manager = ModelManager(config)
@@ -2986,6 +3003,12 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
         "installed_context_probe": True,
         "gpu_capability": "mocked_hosted_windows_contract_no_real_cuda",
         "context_tier": getattr(profile, "profile_id", normalized_tier),
+        "qwen_64k_batch_profile_requested": qwen_64k_batch_profile,
+        "qwen_64k_batch_profile_selected": (
+            getattr(manager, "last_qwen_64k_memory_profile_diagnostics", {}).get("batch_profile")
+            if normalized_tier == "64k-full"
+            else "not_applied"
+        ),
         "selected_model_profile": (
             active_profile_id.removesuffix("-k-m")
             if isinstance(active_profile_id, str) and active_profile_id.endswith("-k-m")
@@ -3069,10 +3092,15 @@ def main() -> int:
     )
     parser.add_argument("--relay-port", type=int, default=None)
     parser.add_argument("--context-tier", default="8k-fast")
+    parser.add_argument(
+        "--qwen-64k-batch-profile",
+        choices=("safe", "balanced", "experimental"),
+        default="balanced",
+    )
     args = parser.parse_args()
 
     if args.installed_context_smoke:
-        print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))
+        print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1"), args.qwen_64k_batch_profile), sort_keys=True, separators=(",", ":")))
         return 0
     if args.operator_runtime_preflight or args.operator_runtime_preflight_cpu_smoke:
         # Release acceptance must execute the immutable runtime checks; it may

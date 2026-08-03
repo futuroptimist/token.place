@@ -173,9 +173,17 @@ KV caches, with Flash Attention and KQV offload enabled. F16 is retained as the 
 fallback, while symmetric Q4_0 is attempted only for a positively classified memory or GPU-buffer
 pressure failure and may have a larger quality tradeoff. This cache precision is independent of
 the Q4_K_M quantization of the model weights. Quantized V cache is never enabled without confirmed
-Flash Attention and matching K/V type support. Batch values remain `n_batch=256` and
-`n_ubatch=128`; later batch tuning and packaged performance/quality benchmarking are separate work,
-so this change does not claim an unmeasured speedup.
+Flash Attention and matching K/V type support. A second stopped-only control selects the saved
+64K batch profile: **Balanced (Recommended)** uses `n_batch=512`/`n_ubatch=256` and is the default,
+**Safe** preserves the P4 `256`/`128` baseline, and **Experimental** is an explicit opt-in at
+`1024`/`512` that can increase memory use or instability. It is inactive for 8K and changes require
+stopping and restarting the operator.
+
+On recognized memory pressure, the runtime downshifts Experimental to Balanced to Safe without
+changing Q8 precision, then may use Safe Q4. A Q8 compatibility failure instead selects F16 at the
+same batch class; subsequent memory pressure downshifts F16 batches before Safe Q4. Other failures
+do not reduce batches or select Q4. Performance varies by backend and hardware; P8 will add formal
+comparative benchmarks, so these initial defaults make no guaranteed latency claim.
 This context tier selector only chooses and warm-loads the operator runtime context window. It intentionally
 does not change API v1 request admission, relay request-size policy, relay scheduling, or registration
 capabilities; long-context admission and tier-aware selection remain follow-up work so the API v1

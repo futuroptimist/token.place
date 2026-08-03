@@ -5250,9 +5250,10 @@ def test_empty_stderr_cuda_category_survives_proxy_and_advances_qwen64k_profile(
 
     assert len(attempts) == 2
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 8
+    assert (attempts[1]['n_batch'], attempts[1]['n_ubatch']) == (256, 128)
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
-    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
+    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
 
 
 def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monkeypatch, tmp_path):
@@ -13770,3 +13771,38 @@ def test_subprocess_worker_identity_mismatch_fails_before_constructor_without_le
     assert str(module_path) not in message
     assert str(other) not in message
     assert probe['llama_module_identity'] not in message
+
+@pytest.mark.parametrize(
+    ('batch_profile', 'expected'),
+    [('safe', (256, 128)), ('balanced', (512, 256)), ('experimental', (1024, 512))],
+)
+def test_qwen_64k_batch_profiles_have_exact_values_and_unique_structured_ids(batch_profile, expected):
+    from utils.llm.model_manager import _build_qwen_64k_runtime_profiles
+
+    class Llama:
+        def __init__(self, *, type_k=None, type_v=None, flash_attn=None, offload_kqv=None, n_batch=None, n_ubatch=None):
+            pass
+
+    module = SimpleNamespace(
+        Llama=Llama, GGML_TYPE_Q8_0=8, GGML_TYPE_Q4_0=2,
+        __file__='/opt/llama_cpp/__init__.py', __version__='0.3.32',
+    )
+    profiles = _build_qwen_64k_runtime_profiles(
+        module, Llama, model_path='model.gguf', n_ctx=65536, batch_profile=batch_profile,
+    )
+    combinations = [(p['diagnostics']['kv_precision'], p['diagnostics']['batch_profile']) for p in profiles]
+    assert len(combinations) == len(set(combinations))
+    q8 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q8' and p['diagnostics']['batch_profile'] == batch_profile)
+    assert (q8['kwargs']['n_batch'], q8['kwargs']['n_ubatch']) == expected
+    assert all(p['kwargs']['n_batch'] >= p['kwargs']['n_ubatch'] > 0 for p in profiles)
+    q4 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q4')
+    assert (q4['kwargs']['n_batch'], q4['kwargs']['n_ubatch']) == (256, 128)
+
+
+def test_qwen_64k_batch_profile_normalization_defaults_safely_without_implicit_experimental():
+    from utils.llm.model_manager import normalize_qwen_64k_batch_profile
+
+    assert normalize_qwen_64k_batch_profile(None) == 'balanced'
+    assert normalize_qwen_64k_batch_profile('unknown') == 'balanced'
+    assert normalize_qwen_64k_batch_profile(' experimental ') == 'balanced'
+    assert normalize_qwen_64k_batch_profile('experimental') == 'experimental'

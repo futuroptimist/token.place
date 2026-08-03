@@ -13897,3 +13897,6 @@ def test_qwen_64k_q8_compatibility_fallback_stays_in_same_batch_without_q4(batch
     assert model_manager_module._next_qwen_64k_runtime_profile_index(
         profiles, profiles[next_index]["profile_id"], "runtime_context_create_failed"
     ) is None
+    assert model_manager_module._next_qwen_64k_runtime_profile_index(
+        profiles, "qwen64k_unknown_profile", "runtime_context_create_cuda_memory"
+    ) is None

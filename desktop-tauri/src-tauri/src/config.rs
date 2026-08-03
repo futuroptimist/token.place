@@ -5,6 +5,18 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_RELAY_BASE_URL: &str = "https://token.place";
 pub const MAX_RELAY_BASE_URLS: usize = 10;
+pub const DEFAULT_QWEN_64K_BATCH_PROFILE: &str = "balanced";
+
+pub fn normalize_qwen_64k_batch_profile(value: &str) -> String {
+    match value {
+        "safe" | "balanced" | "experimental" => value.to_string(),
+        _ => DEFAULT_QWEN_64K_BATCH_PROFILE.to_string(),
+    }
+}
+
+fn default_qwen_64k_batch_profile() -> String {
+    DEFAULT_QWEN_64K_BATCH_PROFILE.to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopConfig {
@@ -18,6 +30,8 @@ pub struct DesktopConfig {
     pub preferred_mode: ComputeMode,
     #[serde(default = "default_context_tier")]
     pub context_tier: String,
+    #[serde(default = "default_qwen_64k_batch_profile")]
+    pub qwen_64k_batch_profile: String,
 }
 
 fn default_relay_base_url() -> String {
@@ -67,6 +81,8 @@ impl DesktopConfig {
             .cloned()
             .unwrap_or_else(default_relay_base_url);
         self.context_tier = normalize_context_tier(&self.context_tier);
+        self.qwen_64k_batch_profile =
+            normalize_qwen_64k_batch_profile(&self.qwen_64k_batch_profile);
         self
     }
 }
@@ -79,6 +95,7 @@ impl Default for DesktopConfig {
             relay_base_urls: vec![DEFAULT_RELAY_BASE_URL.into()],
             preferred_mode: ComputeMode::Auto,
             context_tier: default_context_tier(),
+            qwen_64k_batch_profile: default_qwen_64k_batch_profile(),
         }
     }
 }
@@ -95,6 +112,7 @@ mod tests {
         assert_eq!(config.relay_base_url, DEFAULT_RELAY_BASE_URL);
         assert_eq!(config.relay_base_urls, vec![DEFAULT_RELAY_BASE_URL]);
         assert_eq!(config.context_tier, "8k-fast");
+        assert_eq!(config.qwen_64k_batch_profile, "balanced");
     }
 
     #[test]
@@ -113,6 +131,7 @@ mod tests {
         assert_eq!(config.relay_base_urls, vec!["https://staging.token.place"]);
         assert_eq!(config.model_path, "/tmp/model.gguf");
         assert_eq!(config.context_tier, "8k-fast");
+        assert_eq!(config.qwen_64k_batch_profile, "balanced");
     }
 
     #[test]
@@ -127,6 +146,15 @@ mod tests {
         .normalized();
 
         assert_eq!(config.context_tier, "8k-fast");
+    }
+
+    #[test]
+    fn desktop_config_normalizes_unknown_batch_profile_without_experimental_opt_in() {
+        let config: DesktopConfig =
+            serde_json::from_str::<DesktopConfig>(r#"{"qwen_64k_batch_profile":"unknown"}"#)
+                .expect("config should deserialize")
+                .normalized();
+        assert_eq!(config.qwen_64k_batch_profile, "balanced");
     }
 
     #[test]

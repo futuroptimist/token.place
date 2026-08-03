@@ -13770,3 +13770,54 @@ def test_subprocess_worker_identity_mismatch_fails_before_constructor_without_le
     assert str(module_path) not in message
     assert str(other) not in message
     assert probe['llama_module_identity'] not in message
+def test_qwen_64k_batch_profile_contract_and_normalization():
+    import utils.llm.model_manager as module
+
+    assert module.QWEN_64K_BATCH_PROFILES == {
+        'safe': {'n_batch': 256, 'n_ubatch': 128},
+        'balanced': {'n_batch': 512, 'n_ubatch': 256},
+        'experimental': {'n_batch': 1024, 'n_ubatch': 512},
+    }
+    assert module.normalize_qwen_64k_batch_profile(None) == 'balanced'
+    assert module.normalize_qwen_64k_batch_profile('invalid') == 'balanced'
+    assert module.normalize_qwen_64k_batch_profile('experimental') == 'experimental'
+
+
+def test_qwen_64k_batch_profile_fallback_graph_is_structured(monkeypatch, tmp_path):
+    import types
+    import utils.llm.model_manager as module
+
+    class Llama:
+        def __init__(self, type_k=None, type_v=None, flash_attn=None, offload_kqv=None, n_batch=None, n_ubatch=None):
+            pass
+
+    llama_module = types.SimpleNamespace(
+        Llama=Llama,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=2,
+        __version__='test',
+    )
+    monkeypatch.setattr(module, '_qwen_64k_runtime_capabilities', lambda *_: {
+        'constructor_kwarg_support': {key: True for key in ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')},
+        'backend': 'cuda', 'kv_constants': {
+            'q8': {'value': 8}, 'q4': {'value': 2}, 'f16': {'value': None},
+        }, 'capability_source': 'test', 'llama_cpp_python_version': 'test',
+    })
+    profiles = module._build_qwen_64k_runtime_profiles(
+        llama_module, Llama, model_path=tmp_path / 'model.gguf', n_ctx=65536,
+        batch_profile='experimental',
+    )
+    by_id = {profile['profile_id']: profile for profile in profiles}
+    assert by_id['qwen64k_kv_q8_fa_experimental_batch']['kwargs']['n_batch'] == 1024
+    assert by_id['qwen64k_f16_fa_balanced_batch']['kwargs']['n_ubatch'] == 256
+    assert by_id['qwen64k_kv_q4_fa_small_batch']['kwargs']['n_batch'] == 256
+
+    def next_id(active, category):
+        index = module._next_qwen_64k_runtime_profile_index(profiles, active, category)
+        return profiles[index]['profile_id'] if index is not None else None
+
+    assert next_id('qwen64k_kv_q8_fa_experimental_batch', 'cuda_memory_allocation') == 'qwen64k_kv_q8_fa_balanced_batch'
+    assert next_id('qwen64k_kv_q8_fa_balanced_batch', 'cuda_memory_allocation') == 'qwen64k_kv_q8_fa_small_batch'
+    assert next_id('qwen64k_kv_q8_fa_small_batch', 'cuda_memory_allocation') == 'qwen64k_kv_q4_fa_small_batch'
+    assert next_id('qwen64k_kv_q8_fa_experimental_batch', 'runtime_context_create_unsupported_kwarg') == 'qwen64k_f16_fa_experimental_batch'
+    assert next_id('qwen64k_f16_fa_experimental_batch', 'runtime_context_create_failed') is None

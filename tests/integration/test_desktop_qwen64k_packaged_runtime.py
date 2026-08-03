@@ -154,7 +154,11 @@ class Llama:
 
 def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_path, monkeypatch):
     runtime_root = tmp_path / 'runtime'
-    _write_fake_llama_cpp_runtime(runtime_root, init_failure_stderr='')
+    _write_fake_llama_cpp_runtime(
+        runtime_root,
+        init_failure_message="unexpected keyword argument 'type_k'",
+        init_failure_stderr='',
+    )
     attempts_file = tmp_path / 'attempts.jsonl'
     monkeypatch.syspath_prepend(str(runtime_root))
     monkeypatch.setenv('TOKEN_PLACE_ATTEMPTS_JSONL', str(attempts_file))
@@ -190,7 +194,8 @@ def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_pa
     assert len(attempts) == 2
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
     assert 'type_k' not in attempts[1]
-    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_f16_fa_small_batch'
+    assert attempts[0]['n_batch'] == attempts[1]['n_batch'] == 512
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_f16_fa_balanced_batch'
 
 
 def test_packaged_subprocess_qwen64k_cuda_empty_stderr_category_advances_to_q8(tmp_path, monkeypatch):
@@ -232,9 +237,10 @@ def test_packaged_subprocess_qwen64k_cuda_empty_stderr_category_advances_to_q8(t
         assert manager.get_llm_instance() is not None
 
     attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
-    assert len(attempts) == 2
+    assert len(attempts) == 3
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 8
+    assert attempts[2]['type_k'] == attempts[2]['type_v'] == 2
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
     assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
 
@@ -282,9 +288,10 @@ def test_packaged_subprocess_qwen64k_cuda_delayed_stderr_refines_generic_error_t
         assert manager.get_llm_instance() is not None
 
     attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
-    assert len(attempts) == 2
+    assert len(attempts) == 3
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 8
+    assert attempts[2]['type_k'] == attempts[2]['type_v'] == 2
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
     assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
 

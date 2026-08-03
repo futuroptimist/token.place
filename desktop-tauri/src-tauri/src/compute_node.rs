@@ -1,5 +1,5 @@
 use crate::backend::ComputeMode;
-use crate::config::{normalize_relay_base_urls, DesktopConfig};
+use crate::config::{normalize_qwen_64k_batch_profile, normalize_relay_base_urls, DesktopConfig};
 use crate::context_profiles::{context_profile, normalize_context_tier, DEFAULT_CONTEXT_TIER};
 use crate::operator_logs::{
     append_line_to_path, read_log_tail, sanitize_operator_diagnostic_line,
@@ -46,6 +46,8 @@ pub struct ComputeNodeRequest {
     pub mode: ComputeMode,
     #[serde(default = "default_request_context_tier")]
     pub context_tier: String,
+    #[serde(default = "default_request_qwen_64k_batch_profile")]
+    pub qwen_64k_batch_profile: String,
 }
 
 const DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
@@ -86,6 +88,7 @@ pub struct ComputeNodeStatus {
     pub warm_load_enabled: Option<bool>,
     pub warm_load_duration_ms: Option<u64>,
     pub context_tier: Option<String>,
+    pub qwen_64k_batch_profile: String,
     pub context_window_tokens: Option<u32>,
     pub runtime_path: Option<String>,
     pub relay_runtime_path: Option<String>,
@@ -119,6 +122,10 @@ pub struct ComputeNodeStatus {
 
 fn default_request_context_tier() -> String {
     DEFAULT_CONTEXT_TIER.to_string()
+}
+
+fn default_request_qwen_64k_batch_profile() -> String {
+    "balanced".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,6 +795,7 @@ fn startup_failure_status(
         warm_load_enabled: Some(true),
         warm_load_duration_ms: None,
         context_tier: Some(normalize_context_tier(&request.context_tier)),
+        qwen_64k_batch_profile: "balanced".into(),
         context_window_tokens: context_profile(&normalize_context_tier(&request.context_tier))
             .map(|profile| profile.total_context_tokens),
         runtime_path: Some("bridge".into()),
@@ -1919,7 +1927,11 @@ fn operator_session_smoke_record_from_preparation(
     context_probe_command.arg("--installed-context-smoke");
     context_probe_command
         .arg("--context-tier")
-        .arg(normalize_context_tier(&config.context_tier));
+        .arg(normalize_context_tier(&config.context_tier))
+        .arg("--qwen-64k-batch-profile")
+        .arg(normalize_qwen_64k_batch_profile(
+            &config.qwen_64k_batch_profile,
+        ));
     let context_probe_output = context_probe_command.output()?;
     if !context_probe_output.status.success() {
         anyhow::bail!(
@@ -1974,7 +1986,11 @@ pub(crate) fn operator_start_preflight_record(
         .arg("--mode")
         .arg(format!("{:?}", config.preferred_mode).to_lowercase())
         .arg("--context-tier")
-        .arg(normalize_context_tier(&config.context_tier));
+        .arg(normalize_context_tier(&config.context_tier))
+        .arg("--qwen-64k-batch-profile")
+        .arg(normalize_qwen_64k_batch_profile(
+            &config.qwen_64k_batch_profile,
+        ));
     let event = std::thread::spawn(move || -> anyhow::Result<Value> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2051,7 +2067,11 @@ pub(crate) fn operator_start_preflight_cpu_smoke_record(
         .arg("--mode")
         .arg("cpu")
         .arg("--context-tier")
-        .arg(normalize_context_tier(&config.context_tier));
+        .arg(normalize_context_tier(&config.context_tier))
+        .arg("--qwen-64k-batch-profile")
+        .arg(normalize_qwen_64k_batch_profile(
+            &config.qwen_64k_batch_profile,
+        ));
     let event = std::thread::spawn(move || -> anyhow::Result<Value> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2583,6 +2603,10 @@ pub async fn start_compute_node(
         .arg(format!("{:?}", request.mode).to_lowercase())
         .arg("--context-tier")
         .arg(normalize_context_tier(&request.context_tier))
+        .arg("--qwen-64k-batch-profile")
+        .arg(normalize_qwen_64k_batch_profile(
+            &request.qwen_64k_batch_profile,
+        ))
         .args(
             relay_base_urls
                 .iter()
@@ -2695,6 +2719,7 @@ pub async fn start_compute_node(
             warm_load_enabled: Some(true),
             warm_load_duration_ms: None,
             context_tier: Some(normalize_context_tier(&request.context_tier)),
+            qwen_64k_batch_profile: "balanced".into(),
             context_window_tokens: context_profile(&normalize_context_tier(&request.context_tier))
                 .map(|profile| profile.total_context_tokens),
             runtime_path: Some("bridge".into()),
@@ -3555,6 +3580,7 @@ mod tests {
             relay_base_urls: vec!["https://token.place".into()],
             mode: ComputeMode::Cpu,
             context_tier: "64k-full".into(),
+            qwen_64k_batch_profile: "balanced".into(),
         };
 
         let payload = serde_json::to_value(&request).expect("serialize request");
@@ -6170,6 +6196,7 @@ mod tests {
             relay_base_urls: vec![],
             mode: ComputeMode::Cpu,
             context_tier: "64k-full".into(),
+            qwen_64k_batch_profile: "balanced".into(),
         }
     }
 
@@ -6529,6 +6556,7 @@ mod tests {
             relay_base_urls: vec![],
             mode: ComputeMode::Cpu,
             context_tier: "64k-full".into(),
+            qwen_64k_batch_profile: "balanced".into(),
         };
         let status = startup_failure_status(
             &request,
@@ -6825,6 +6853,7 @@ mod tests {
             relay_base_urls: vec![],
             mode: ComputeMode::Auto,
             context_tier: "unknown".into(),
+            qwen_64k_batch_profile: "balanced".into(),
         };
 
         let status = startup_failure_status(

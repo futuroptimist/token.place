@@ -13770,3 +13770,44 @@ def test_subprocess_worker_identity_mismatch_fails_before_constructor_without_le
     assert str(module_path) not in message
     assert str(other) not in message
     assert probe['llama_module_identity'] not in message
+
+
+def test_qwen_64k_selectable_batch_profile_contract_and_fallback_graph():
+    from utils.llm.model_manager import (
+        QWEN_64K_BATCH_PROFILES,
+        _build_qwen_64k_runtime_profiles,
+        _next_qwen_64k_runtime_profile_index,
+        normalize_qwen_64k_batch_profile,
+    )
+
+    assert QWEN_64K_BATCH_PROFILES == {
+        'safe': {'n_batch': 256, 'n_ubatch': 128},
+        'balanced': {'n_batch': 512, 'n_ubatch': 256},
+        'experimental': {'n_batch': 1024, 'n_ubatch': 512},
+    }
+    assert normalize_qwen_64k_batch_profile(None) == 'balanced'
+    assert normalize_qwen_64k_batch_profile('invalid') == 'balanced'
+    assert normalize_qwen_64k_batch_profile('experimental') == 'experimental'
+
+    class Llama:
+        def __init__(self, *, type_k=None, type_v=None, flash_attn=None, offload_kqv=None, n_batch=None, n_ubatch=None):
+            pass
+
+    module = SimpleNamespace(GGML_TYPE_Q8_0=8, GGML_TYPE_Q4_0=2, GGML_TYPE_F16=1)
+    profiles = _build_qwen_64k_runtime_profiles(
+        module, Llama, model_path='', n_ctx=65536, batch_profile='experimental'
+    )
+    combinations = {
+        (p['diagnostics']['kv_precision'], p['diagnostics']['batch_profile']):
+        (p['kwargs']['n_batch'], p['kwargs']['n_ubatch']) for p in profiles
+    }
+    assert combinations[('q8', 'experimental')] == (1024, 512)
+    assert combinations[('f16', 'balanced')] == (512, 256)
+    assert combinations[('q4', 'safe')] == (256, 128)
+    active = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q8' and p['diagnostics']['batch_profile'] == 'experimental')
+    next_index = _next_qwen_64k_runtime_profile_index(profiles, active['profile_id'], 'cuda_memory_allocation')
+    assert profiles[next_index]['diagnostics']['batch_profile'] == 'balanced'
+    assert profiles[next_index]['diagnostics']['kv_precision'] == 'q8'
+    compat_index = _next_qwen_64k_runtime_profile_index(profiles, active['profile_id'], 'runtime_context_create_unsupported_kwarg')
+    assert profiles[compat_index]['diagnostics']['batch_profile'] == 'experimental'
+    assert profiles[compat_index]['diagnostics']['kv_precision'] == 'f16'

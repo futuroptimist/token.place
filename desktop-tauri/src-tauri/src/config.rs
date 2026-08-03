@@ -1,5 +1,8 @@
 use crate::backend::ComputeMode;
 use crate::context_profiles::{default_context_tier, normalize_context_tier};
+use crate::qwen_batch_profiles::{
+    default_qwen_64k_batch_profile, normalize_qwen_64k_batch_profile,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -18,6 +21,8 @@ pub struct DesktopConfig {
     pub preferred_mode: ComputeMode,
     #[serde(default = "default_context_tier")]
     pub context_tier: String,
+    #[serde(default = "default_qwen_64k_batch_profile")]
+    pub qwen_64k_batch_profile: String,
 }
 
 fn default_relay_base_url() -> String {
@@ -67,6 +72,8 @@ impl DesktopConfig {
             .cloned()
             .unwrap_or_else(default_relay_base_url);
         self.context_tier = normalize_context_tier(&self.context_tier);
+        self.qwen_64k_batch_profile =
+            normalize_qwen_64k_batch_profile(&self.qwen_64k_batch_profile);
         self
     }
 }
@@ -79,6 +86,7 @@ impl Default for DesktopConfig {
             relay_base_urls: vec![DEFAULT_RELAY_BASE_URL.into()],
             preferred_mode: ComputeMode::Auto,
             context_tier: default_context_tier(),
+            qwen_64k_batch_profile: default_qwen_64k_batch_profile(),
         }
     }
 }

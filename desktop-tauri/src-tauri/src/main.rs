@@ -8,6 +8,7 @@ pub mod keygen;
 mod logging;
 mod operator_logs;
 mod python_runtime;
+mod qwen_batch_profiles;
 mod sidecar;
 mod subprocess_logging;
 

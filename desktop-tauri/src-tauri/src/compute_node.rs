@@ -16,6 +16,9 @@ use crate::python_runtime::{
     PythonLauncherResolutionOptions, PythonLauncherSource, ResourceLayoutKind,
     ENABLE_RUNTIME_BOOTSTRAP_ENV,
 };
+use crate::qwen_batch_profiles::{
+    default_qwen_64k_batch_profile, normalize_qwen_64k_batch_profile,
+};
 use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -46,6 +49,8 @@ pub struct ComputeNodeRequest {
     pub mode: ComputeMode,
     #[serde(default = "default_request_context_tier")]
     pub context_tier: String,
+    #[serde(default = "default_qwen_64k_batch_profile")]
+    pub qwen_64k_batch_profile: String,
 }
 
 const DEFAULT_BRIDGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
@@ -703,6 +708,8 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
     "api_v1_readiness_completion_smoke_plain_completion_metal_error_category",
     "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status",
     "api_v1_readiness_qwen_64k_runtime_profile_id",
+    "api_v1_readiness_qwen_64k_batch_profile_requested",
+    "api_v1_readiness_qwen_64k_batch_profile_selected",
     "api_v1_readiness_qwen_64k_runtime_preferred_profile_id",
     "api_v1_readiness_qwen_64k_runtime_profile_kv_precision",
     "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason",
@@ -1920,6 +1927,11 @@ fn operator_session_smoke_record_from_preparation(
     context_probe_command
         .arg("--context-tier")
         .arg(normalize_context_tier(&config.context_tier));
+    context_probe_command
+        .arg("--qwen-64k-batch-profile")
+        .arg(normalize_qwen_64k_batch_profile(
+            &config.qwen_64k_batch_profile,
+        ));
     let context_probe_output = context_probe_command.output()?;
     if !context_probe_output.status.success() {
         anyhow::bail!(
@@ -1975,6 +1987,11 @@ pub(crate) fn operator_start_preflight_record(
         .arg(format!("{:?}", config.preferred_mode).to_lowercase())
         .arg("--context-tier")
         .arg(normalize_context_tier(&config.context_tier));
+    command
+        .arg("--qwen-64k-batch-profile")
+        .arg(normalize_qwen_64k_batch_profile(
+            &config.qwen_64k_batch_profile,
+        ));
     let event = std::thread::spawn(move || -> anyhow::Result<Value> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2052,6 +2069,11 @@ pub(crate) fn operator_start_preflight_cpu_smoke_record(
         .arg("cpu")
         .arg("--context-tier")
         .arg(normalize_context_tier(&config.context_tier));
+    command
+        .arg("--qwen-64k-batch-profile")
+        .arg(normalize_qwen_64k_batch_profile(
+            &config.qwen_64k_batch_profile,
+        ));
     let event = std::thread::spawn(move || -> anyhow::Result<Value> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2583,6 +2605,10 @@ pub async fn start_compute_node(
         .arg(format!("{:?}", request.mode).to_lowercase())
         .arg("--context-tier")
         .arg(normalize_context_tier(&request.context_tier))
+        .arg("--qwen-64k-batch-profile")
+        .arg(normalize_qwen_64k_batch_profile(
+            &request.qwen_64k_batch_profile,
+        ))
         .args(
             relay_base_urls
                 .iter()
@@ -3555,6 +3581,7 @@ mod tests {
             relay_base_urls: vec!["https://token.place".into()],
             mode: ComputeMode::Cpu,
             context_tier: "64k-full".into(),
+            qwen_64k_batch_profile: "balanced".into(),
         };
 
         let payload = serde_json::to_value(&request).expect("serialize request");
@@ -6170,6 +6197,7 @@ mod tests {
             relay_base_urls: vec![],
             mode: ComputeMode::Cpu,
             context_tier: "64k-full".into(),
+            qwen_64k_batch_profile: "balanced".into(),
         }
     }
 
@@ -6529,6 +6557,7 @@ mod tests {
             relay_base_urls: vec![],
             mode: ComputeMode::Cpu,
             context_tier: "64k-full".into(),
+            qwen_64k_batch_profile: "balanced".into(),
         };
         let status = startup_failure_status(
             &request,
@@ -6825,6 +6854,7 @@ mod tests {
             relay_base_urls: vec![],
             mode: ComputeMode::Auto,
             context_tier: "unknown".into(),
+            qwen_64k_batch_profile: "balanced".into(),
         };
 
         let status = startup_failure_status(

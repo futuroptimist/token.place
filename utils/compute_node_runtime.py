@@ -987,6 +987,8 @@ class ComputeNodeRuntime:
             })
             for _key in (
                 "qwen_64k_runtime_profile_id",
+                "qwen_64k_batch_profile_requested",
+                "qwen_64k_batch_profile_selected",
                 "qwen_64k_runtime_preferred_profile_id",
                 "qwen_64k_runtime_profile_kv_precision",
                 "qwen_64k_runtime_profile_fallback_reason",

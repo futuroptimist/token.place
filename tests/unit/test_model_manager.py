@@ -11626,6 +11626,8 @@ def test_qwen_64k_failure_readiness_publisher_handles_empty_and_non_dict_kwargs(
     manager.last_compute_diagnostics = {'existing': 'unchanged'}
     manager._qwen_64k_profile_attempt_ids = ['qwen64k_f16_fa_small_batch']
     manager.last_qwen_64k_memory_profile_diagnostics = {
+        'kv_precision': 'q4',
+        'fallback_reason': 'memory_pressure',
         'applied': {
             'type_k': 8,
             'type_v': 8,
@@ -11653,6 +11655,8 @@ def test_qwen_64k_failure_readiness_publisher_handles_empty_and_non_dict_kwargs(
 
     diagnostics = manager.last_compute_diagnostics
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_type_k'] == 8
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_kv_precision'] == 'q4'
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_fallback_reason'] == 'memory_pressure'
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_result'] == 'failed'
     assert (
         diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category']

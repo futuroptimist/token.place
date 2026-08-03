@@ -6094,6 +6094,8 @@ class ModelManager:
             attempted_kwargs = {}
         memory_profile = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)
         applied_memory = memory_profile.get('applied') if isinstance(memory_profile, dict) and isinstance(memory_profile.get('applied'), dict) else {}
+        kv_precision = memory_profile.get('kv_precision') if isinstance(memory_profile, dict) else None
+        selected_fallback_reason = memory_profile.get('fallback_reason') if isinstance(memory_profile, dict) else None
         profile_id = current_profile_id or latest_failure.get('profile_id')
         attempted_profile_ids = [
             str(failure.get('profile_id'))
@@ -6109,6 +6111,7 @@ class ModelManager:
             'api_v1_readiness_error_reason': 'qwen_64k_runtime_profile_initialization_failed',
             'api_v1_readiness_qwen_64k_runtime_profile_id': profile_id,
             'api_v1_readiness_qwen_64k_runtime_preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
+            'api_v1_readiness_qwen_64k_runtime_profile_kv_precision': kv_precision,
             'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids': ','.join(attempted_profile_ids),
             'api_v1_readiness_qwen_64k_runtime_profile_recovery_count': max(0, len(attempted_profile_ids) - 1),
             'api_v1_readiness_qwen_64k_runtime_profile_flash_attn': attempted_kwargs.get('flash_attn', applied_memory.get('flash_attn')),
@@ -6120,9 +6123,11 @@ class ModelManager:
             'api_v1_readiness_qwen_64k_runtime_profile_result': 'failed',
             'api_v1_readiness_qwen_64k_runtime_profile_failure_category': latest_failure.get('safe_error_category'),
             'api_v1_readiness_qwen_64k_runtime_profile_fallback_reason': (
-                'memory_pressure'
-                if is_qwen_64k_memory_pressure_failure_category(latest_failure.get('safe_error_category'))
-                else 'compatibility_failure'
+                selected_fallback_reason or (
+                    'memory_pressure'
+                    if is_qwen_64k_memory_pressure_failure_category(latest_failure.get('safe_error_category'))
+                    else 'compatibility_failure'
+                )
             ),
         })
         n_ctx = attempted_kwargs.get('n_ctx') or latest_failure.get('n_ctx')

@@ -987,6 +987,9 @@ class ComputeNodeRuntime:
             })
             for _key in (
                 "qwen_64k_runtime_profile_id",
+                "qwen_64k_runtime_preferred_profile_id",
+                "qwen_64k_runtime_profile_kv_precision",
+                "qwen_64k_runtime_profile_fallback_reason",
                 "qwen_64k_runtime_profile_attempt_ids",
                 "qwen_64k_runtime_profile_recovery_count",
                 "qwen_64k_runtime_profile_flash_attn",

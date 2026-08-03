@@ -703,6 +703,9 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS: &[&str] = &[
     "api_v1_readiness_completion_smoke_plain_completion_metal_error_category",
     "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status",
     "api_v1_readiness_qwen_64k_runtime_profile_id",
+    "api_v1_readiness_qwen_64k_runtime_preferred_profile_id",
+    "api_v1_readiness_qwen_64k_runtime_profile_kv_precision",
+    "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason",
     "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids",
     "api_v1_readiness_qwen_64k_runtime_profile_recovery_count",
     "api_v1_readiness_qwen_64k_runtime_profile_flash_attn",
@@ -1449,6 +1452,9 @@ fn summarize_bridge_stdout_payload(payload: &Value) -> String {
         "api_v1_readiness_error_code",
         "api_v1_readiness_error_reason",
         "api_v1_readiness_qwen_64k_runtime_profile_id",
+        "api_v1_readiness_qwen_64k_runtime_preferred_profile_id",
+        "api_v1_readiness_qwen_64k_runtime_profile_kv_precision",
+        "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason",
         "api_v1_readiness_qwen_64k_runtime_profile_result",
         "api_v1_readiness_qwen_64k_runtime_profile_recovery_count",
         "api_v1_readiness_qwen_64k_first_readiness_failure_backend_failure_category",
@@ -3924,6 +3930,9 @@ mod tests {
             "api_v1_readiness_result": "failed",
             "api_v1_readiness_error_code": "compute_node_inference_failed",
             "api_v1_readiness_qwen_64k_runtime_profile_id": "qwen64k_kv_q8_fa_small_batch",
+            "api_v1_readiness_qwen_64k_runtime_preferred_profile_id": "qwen64k_kv_q8_fa_small_batch",
+            "api_v1_readiness_qwen_64k_runtime_profile_kv_precision": "q4",
+            "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason": "memory_pressure",
             "api_v1_readiness_qwen_64k_runtime_profile_result": "failed",
             "api_v1_readiness_qwen_64k_runtime_profile_recovery_count": 1,
             "api_v1_readiness_qwen_64k_first_readiness_failure_backend_failure_category": "backend_graph_compute_failure",
@@ -3942,6 +3951,12 @@ mod tests {
                 .get("api_v1_readiness_qwen_64k_runtime_profile_id")
                 .and_then(Value::as_str),
             Some("qwen64k_kv_q8_fa_small_batch")
+        );
+        assert_eq!(
+            summary_payload
+                .get("api_v1_readiness_qwen_64k_runtime_profile_fallback_reason")
+                .and_then(Value::as_str),
+            Some("memory_pressure")
         );
         assert!(summary_payload
             .get("api_v1_readiness_completion_smoke_method")

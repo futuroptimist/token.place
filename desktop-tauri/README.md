@@ -167,6 +167,15 @@ The operator also has a stopped-only **Context tier** selector. Choose **8K Fast
 The selected tier is saved in the desktop config and is applied during warm-load before relay
 registration; changing it requires **Stop operator** followed by **Start operator** so only one
 context profile is warm in each operator process.
+
+On a capable Metal or CUDA runtime, **64K Full** normally uses symmetric Q8_0 for both the K and V
+KV caches, with Flash Attention and KQV offload enabled. F16 is retained as the compatibility
+fallback, while symmetric Q4_0 is attempted only for a positively classified memory or GPU-buffer
+pressure failure and may have a larger quality tradeoff. This cache precision is independent of
+the Q4_K_M quantization of the model weights. Quantized V cache is never enabled without confirmed
+Flash Attention and matching K/V type support. Batch values remain `n_batch=256` and
+`n_ubatch=128`; later batch tuning and packaged performance/quality benchmarking are separate work,
+so this change does not claim an unmeasured speedup.
 This context tier selector only chooses and warm-loads the operator runtime context window. It intentionally
 does not change API v1 request admission, relay request-size policy, relay scheduling, or registration
 capabilities; long-context admission and tier-aware selection remain follow-up work so the API v1

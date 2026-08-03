@@ -131,9 +131,17 @@ For the planned Qwen3 default-model migration, see [Qwen3 8B Q4_K_M API v1 model
 
 - Quantized weights are approximately 5-6 GB, depending on the file and runtime
   representation.
-- A rough 64K f16 KV-cache estimate for this GQA model is about 8 GB before
+- A rough 64K F16 KV-cache estimate for this GQA model is about 8 GB before
   other runtime buffers.
-- q8 or q4 KV cache can materially reduce KV memory, when supported and validated.
+- The normal GPU `64k-full` runtime uses symmetric Q8_0 K/V cache. F16 remains
+  the compatibility fallback when the binding cannot express Q8_0 or a bounded
+  Q8_0 compatibility retry fails. Symmetric Q4_0 K/V is reserved for positively
+  classified memory or buffer pressure and carries a potentially larger quality
+  tradeoff.
+- KV-cache precision is independent of the Q4_K_M quantization of the model
+  weights. Quantized V cache is enabled only when the GPU runtime confirms both
+  K/V type controls and Flash Attention support; K and V always use the same
+  precision.
 - Flash attention, batch size, backend, K/Q/V offload, GPU layer offload, runtime
   scratch buffers, driver overhead, and allocator behavior alter the real
   footprint.
@@ -146,12 +154,13 @@ For the planned Qwen3 default-model migration, see [Qwen3 8B Q4_K_M API v1 model
 | Profile | Backend | KV cache | Batch defaults | Warm-load validation | Benchmark prompts | Required metrics | Pass condition |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `8k-fast` | Metal on initial Mac policy | Existing default initially | Existing default initially | Load exact `n_ctx=8192`; run a small non-sensitive smoke prompt | 1K, 4K, near-8K synthetic/private-safe prompts | warm-load time, prompt eval tok/s band, gen tok/s band, p50/p95 latency, peak memory band | No OOM; latency within operator policy; encrypted API v1 success |
-| `64k-full` | CUDA on initial Windows policy | Existing default first; later q8/q4 trials | Existing default first; later tuned | Load exact `n_ctx=65536`; validate memory headroom under expected GPU availability | 8K, 32K, near-64K synthetic/private-safe prompts | warm-load time, prompt eval tok/s band, gen tok/s band, p50/p95 latency, peak VRAM/system RAM bands | No OOM; no severe spill under baseline; encrypted API v1 success |
-| Future tuned 64K | CUDA/Metal | q8/q4 candidate | Tuned batch + flash attention candidate | Compare against baseline | Same privacy-safe suite | deltas for memory, latency, failures | Adopt only if stable and faster/safer |
+| `64k-full` | CUDA or Metal | Symmetric Q8_0; F16 compatibility; symmetric Q4_0 only under memory pressure | `n_batch=256`, `n_ubatch=128`, Flash Attention | Load exact `n_ctx=65536`; validate memory headroom under expected GPU availability | 8K, 32K, near-64K synthetic/private-safe prompts | warm-load time, prompt eval tok/s band, gen tok/s band, p50/p95 latency, peak VRAM/system RAM bands | No OOM; no CPU fallback; encrypted API v1 success |
+| Future tuned 64K | CUDA/Metal | Same validated precision policy | P5-tuned candidate | Compare against baseline | Same privacy-safe suite | deltas for memory, latency, failures | Adopt only if stable and faster/safer |
 
 Benchmarks must avoid real user content. Publish coarse bands or aggregate
 operator diagnostics only; do not publish prompts or exact user-derived token
-counts.
+counts. The Q8_0 preference does not promise an unmeasured speedup: P5 owns
+batch-profile tuning, and P8 owns performance and quality benchmarks.
 
 ## Context profile schema
 

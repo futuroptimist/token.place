@@ -2606,7 +2606,7 @@ def _real_qwen_64k_model_manager(runtimes):
     manager.download_model_if_needed = MagicMock(return_value=True)
     manager.last_compute_diagnostics = {
         "active_profile_id": "qwen3-8b-q4-k-m",
-        "qwen_64k_runtime_profile_id": "qwen64k_f16_fa_small_batch",
+        "qwen_64k_runtime_profile_id": "qwen64k_kv_q8_fa_small_batch",
         "n_ctx": 65536,
         "native_context_tokens": 32768,
         "kv_cache_mode": {"type_k": 8, "type_v": 8, "flash_attn": True},
@@ -2622,12 +2622,12 @@ def _real_qwen_64k_model_manager(runtimes):
     manager._qwen_64k_profile_recovery_count = 0
     manager._qwen_64k_first_readiness_failure_category = None
     manager._qwen_64k_first_readiness_failure_diagnostics = {}
-    manager._qwen_64k_profile_attempt_ids = ["qwen64k_f16_fa_small_batch"]
+    manager._qwen_64k_profile_attempt_ids = ["qwen64k_kv_q8_fa_small_batch"]
     manager._qwen_64k_selected_profile_index = 0
-    manager._qwen_64k_selected_profile_id = "qwen64k_f16_fa_small_batch"
+    manager._qwen_64k_selected_profile_id = "qwen64k_kv_q8_fa_small_batch"
     manager._qwen_64k_runtime_profiles = [
-        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
         {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
         {"profile_id": "qwen64k_kv_q4_fa_small_batch", "diagnostics": {"backend": "metal"}},
     ]
     close_calls = []
@@ -2726,7 +2726,7 @@ def test_qwen_64k_readiness_recovery_prefers_recoverable_backend_diagnostic():
 
     assert runtime.ensure_api_v1_runtime_ready() is True
     assert model_manager._test_close_calls == [failed_runtime]
-    assert model_manager._qwen_64k_selected_profile_index == 1
+    assert model_manager._qwen_64k_selected_profile_index == 2
     assert model_manager._qwen_64k_profile_recovery_count == 1
     assert model_manager.llm is recovered_runtime
     assert model_manager._qwen_64k_first_readiness_failure_category == "metal_command_buffer_out_of_memory"
@@ -2865,11 +2865,11 @@ def test_qwen_64k_readiness_decode_recovery_honors_cancellation():
 @pytest.mark.parametrize(
     ("budget_value", "expected_attempts"),
     [
-        (None, 3),
-        (0, 3),
-        (False, 3),
-        ("3", 3),
-        (99, 3),
+        (None, 2),
+        (0, 2),
+        (False, 2),
+        ("3", 2),
+        (99, 2),
         (2, 2),
     ],
 )
@@ -3284,8 +3284,8 @@ def test_compute_node_runtime_has_single_authoritative_yarn_original_context_ass
     assert all(count == 1 for count in matching_dicts)
 
 
-def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
-    """F16 smoke raises backend_graph_compute_failure; Q8 runtime passes; recovery count is 1."""
+def test_qwen_64k_profile_recovery_q8_fail_then_f16_success():
+    """A non-memory Q8 failure retries the compatible F16 runtime."""
     f16_runtime = _Qwen64kRuntime()
     q8_runtime = _Qwen64kRuntime()
     model_manager = _real_qwen_64k_model_manager([f16_runtime, q8_runtime])
@@ -3332,8 +3332,8 @@ def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
     assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
 
 
-def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
-    """All three Metal profiles fail the smoke; ensure_api_v1_runtime_ready returns False."""
+def test_qwen_64k_profile_recovery_generic_failure_stops_before_q4():
+    """A generic failure on Q8 then F16 fails closed without attempting Q4."""
     f16_runtime = _Qwen64kRuntime()
     q8_runtime = _Qwen64kRuntime()
     q4_runtime = _Qwen64kRuntime()
@@ -3367,13 +3367,13 @@ def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is False
-    assert model_manager._test_close_calls == [f16_runtime, q8_runtime, q4_runtime]
-    assert relay_client._api_v1_authoritative_context_admission.call_count == 3
-    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 3
+    assert model_manager._test_close_calls == [f16_runtime, q8_runtime]
+    assert relay_client._api_v1_authoritative_context_admission.call_count == 2
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 2
     assert model_manager.download_model_if_needed.call_count == 1
-    assert model_manager.get_llm_instance.call_count == 3
+    assert model_manager.get_llm_instance.call_count == 2
     assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
-    assert model_manager._qwen_64k_profile_recovery_count == 3
+    assert model_manager._qwen_64k_profile_recovery_count == 2
 
 
 def test_completion_smoke_cuda_oom_classification_is_qwen64k_recoverable():

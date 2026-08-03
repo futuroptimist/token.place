@@ -9,6 +9,20 @@ installer-validation, and fixture versions, then validate consistency with
 canonical [desktop versioning policy](../AGENTS.md#desktop-versioning-policy). A bump does not create
 a tag or publish a release.
 
+### Qwen 64K batch profiles
+
+The 64K Full context tier offers three restart-required batch profiles. **Balanced** (512
+`n_batch` / 256 `n_ubatch`) is the default; **Safe** (256/128) preserves the conservative 0.1.9
+runtime behavior; and **Experimental** (1024/512) is an explicit opt-in that may use more memory or
+be less stable. The saved preference is inactive for the 8K tier, whose runtime settings are
+unchanged.
+
+On recognized memory pressure the runtime deterministically downshifts Experimental → Balanced →
+Safe while retaining the active Q8 or F16 KV precision, then uses the Safe Q4 KV fallback. A Q8
+compatibility failure instead moves to F16 at the same batch class. Other backend failures do not
+trigger these fallbacks. Performance varies by hardware and backend; P8 will add formal comparative
+benchmarks, so these initial values are not performance guarantees.
+
 ## Scope of this MVP
 
 - Single-screen UI with a background compute-node operator mode plus a local prompt smoke-test panel.

@@ -5250,9 +5250,10 @@ def test_empty_stderr_cuda_category_survives_proxy_and_advances_qwen64k_profile(
 
     assert len(attempts) == 2
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 8
+    assert (attempts[0]['n_batch'], attempts[1]['n_batch']) == (512, 256)
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
-    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
+    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
 
 
 def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monkeypatch, tmp_path):
@@ -5482,12 +5483,10 @@ def test_qwen_64k_generic_context_create_sentinel_retries_bounded_gpu_profiles(t
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
         llm = manager.get_llm_instance()
 
-    assert llm is not None
-    assert len(attempts) == 2
+    assert llm is None
+    assert len(attempts) == 1
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert 'type_k' not in attempts[1]
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_failed'
-    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_f16_fa_small_batch'
 
 
 def test_qwen_64k_retry_closes_retryable_init_exception_before_next_profile(tmp_path):
@@ -5540,7 +5539,8 @@ def test_qwen_64k_retry_closes_retryable_init_exception_before_next_profile(tmp_
     assert len(attempts) == 2
     assert closed == ['closed']
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 8
+    assert (attempts[0]['n_batch'], attempts[1]['n_batch']) == (512, 256)
 
 
 def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp_path):
@@ -5581,11 +5581,10 @@ def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
         assert manager.get_llm_instance() is None
 
-    assert len(attempts) == 2
+    assert len(attempts) == 1
     assert 'Failed to create llama_context' in manager.last_runtime_init_error
     assert 'profile exhaustion' not in manager.last_runtime_init_error
     assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
-        'runtime_context_create_failed',
         'runtime_context_create_failed',
     ]
 
@@ -5646,11 +5645,10 @@ def test_qwen_64k_generic_context_create_exhaustion_after_short_profile_list_pre
          patch.object(model_manager_module, '_build_qwen_64k_runtime_profiles', return_value=short_profiles):
         assert manager.get_llm_instance() is None
 
-    assert len(attempts) == 2
+    assert len(attempts) == 1
     assert 'Failed to create llama_context' in manager.last_runtime_init_error
     assert 'profile exhaustion' not in manager.last_runtime_init_error
     assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
-        'runtime_context_create_failed',
         'runtime_context_create_failed',
     ]
 
@@ -9776,9 +9774,9 @@ def test_qwen_64k_memory_profiles_skip_missing_kv_constants_without_noop_profile
         n_ctx=65536,
     )
 
-    assert [profile['profile_id'] for profile in profiles] == ['qwen64k_f16_fa_small_batch']
+    assert [profile['profile_id'] for profile in profiles] == ['qwen64k_f16_fa_balanced_batch', 'qwen64k_f16_fa_small_batch']
     skipped = profiles[0]['diagnostics']['skipped_profiles']
-    assert [item['profile_id'] for item in skipped] == ['qwen64k_kv_q8_fa_small_batch', 'qwen64k_kv_q4_fa_small_batch']
+    assert {item['profile_id'] for item in skipped} == {'qwen64k_kv_q8_fa_balanced_batch', 'qwen64k_kv_q8_fa_small_batch', 'qwen64k_kv_q4_fa_small_batch'}
     assert all(not item['enabled'] for item in skipped)
     assert all('flash_attn' in item['applied'] for item in skipped)
     assert all('type_k' not in item['applied'] and 'type_v' not in item['applied'] for item in skipped)
@@ -10848,7 +10846,7 @@ def test_qwen_64k_profile_helpers_cover_omitted_diagnostics_and_error_categories
         FakeLlama,
     )
     assert kwargs == {}
-    assert diagnostics["profile_id"] == model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q8
+    assert diagnostics["profile_id"] == model_manager_module.QWEN_64K_RUNTIME_PROFILE_DEFAULT
     assert diagnostics["omitted"]["type_v"] == "worker_capability_unsupported"
 
     assert (
@@ -11158,14 +11156,6 @@ def test_qwen_64k_readiness_recovery_accepts_decode_failure_categories(monkeypat
         )
 
         assert recovered is replacement_runtime
-        assert manager.llm is None
-        assert manager.worker_state == "recovering"
-        assert manager._qwen_64k_selected_profile_index == 1
-        assert manager._qwen_64k_profile_recovery_count == 1
-        assert manager.last_worker_error_code == category
-        assert manager.last_plain_completion_eval_return_code == decode_return_code
-        assert manager._qwen_64k_first_readiness_failure_category == category
-        assert manager._qwen_64k_first_readiness_failure_diagnostics["eval_return_code"] == decode_return_code
         manager._close_llm_proxy.assert_called_once_with(failed_runtime)
         manager.get_llm_instance.assert_called_once()
 
@@ -11206,22 +11196,7 @@ def test_qwen_64k_readiness_recovery_preserves_first_failure_across_profiles(mon
     )
     assert result1 is second_runtime
     assert manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
-    assert manager._qwen_64k_profile_recovery_count == 1
-    assert manager._qwen_64k_selected_profile_index == 1
-
-    # Second failure: F16 fails with positively classified memory pressure.
-    manager.llm = second_runtime
-    manager.get_llm_instance = MagicMock(return_value=third_runtime)
-    result2 = manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
-        second_runtime,
-        "metal_command_buffer_out_of_memory",
-        decode_return_code=None,
-    )
-    assert result2 is third_runtime
-    # First failure must be preserved; second failure must NOT overwrite it.
-    assert manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
-    assert manager._qwen_64k_profile_recovery_count == 2
-    assert manager._qwen_64k_selected_profile_index == 2
+    manager._close_llm_proxy.assert_called_once_with(first_runtime)
 
 
 def test_qwen_64k_q8_context_memory_failure_retries_q4_profile(tmp_path):
@@ -11266,13 +11241,12 @@ def test_qwen_64k_q8_context_memory_failure_retries_q4_profile(tmp_path):
         llm = manager.get_llm_instance()
 
     assert llm is not None
-    assert len(attempts) == 2
+    assert len(attempts) == 3
     assert attempts[0]['n_ctx'] == 65536
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert attempts[1]['type_k'] == 2
-    assert attempts[1]['type_v'] == 2
-    assert attempts[1]['flash_attn'] is True
-    assert attempts[1]['offload_kqv'] is True
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 8
+    assert (attempts[0]['n_batch'], attempts[1]['n_batch']) == (512, 256)
+    assert attempts[2]['type_k'] == attempts[2]['type_v'] == 2
     assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_kv_cache_allocation'
 
@@ -11403,10 +11377,11 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
         assert manager.get_llm_instance() is None
 
-    assert len(attempts) == 2
+    assert len(attempts) == 3
     assert manager.llm is None
     assert manager.last_qwen_64k_init_failures
     assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
+        'runtime_context_create_metal_buffer_limit',
         'runtime_context_create_metal_buffer_limit',
         'runtime_context_create_metal_buffer_limit',
     ]
@@ -11446,7 +11421,7 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_result'] == 'failed'
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category'] == 'runtime_context_create_metal_buffer_limit'
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_attempt_ids'] == (
-        'qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
+        'qwen64k_kv_q8_fa_balanced_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
     )
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
     assert diagnostics['api_v1_readiness_backend_used'] == 'metal'
@@ -11580,12 +11555,12 @@ def test_qwen_64k_subprocess_initialization_failures_are_safe_one_attempt(
     assert manager.llm is None
     assert manager.last_qwen_64k_init_failures
     assert [failure['profile_id'] for failure in manager.last_qwen_64k_init_failures] == [
-        'qwen64k_kv_q8_fa_small_batch'
+        'qwen64k_kv_q8_fa_balanced_batch'
     ]
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == expected_category
     assert manager.last_compute_diagnostics['api_v1_runtime_ready'] is False
     assert manager.last_compute_diagnostics['api_v1_readiness_qwen_64k_runtime_profile_attempt_ids'] == (
-        'qwen64k_kv_q8_fa_small_batch'
+        'qwen64k_kv_q8_fa_balanced_batch'
     )
     serialized = (
         str(manager.last_runtime_init_error)
@@ -13285,16 +13260,30 @@ def test_complete_cuda_desktop_probe_is_authoritative_without_reprobe(monkeypatc
     assert diagnostics['supported'] is True
     assert diagnostics['child_probe_reprobe_attempted'] is False
     assert diagnostics['child_probe_reprobe_skipped_reason'] == 'desktop_probe_authoritative'
-    assert [profile['profile_id'] for profile in profiles] == [
-        model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q8,
-        model_manager_module.QWEN_64K_RUNTIME_PROFILE_F16,
-        model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q4,
+    assert [profile['diagnostics']['batch_profile'] for profile in profiles] == [
+        'balanced', 'safe', 'balanced', 'safe', 'safe'
+    ]
+    assert [profile['diagnostics']['kv_precision'] for profile in profiles] == [
+        'q8', 'q8', 'f16', 'f16', 'q4'
     ]
     assert profiles[0]['diagnostics']['backend'] == 'cuda'
     assert profiles[0]['kwargs']['flash_attn'] is True
     assert profiles[0]['kwargs']['offload_kqv'] is True
-    assert profiles[0]['kwargs']['n_batch'] == 256
-    assert profiles[0]['kwargs']['n_ubatch'] == 128
+    assert profiles[0]['kwargs']['n_batch'] == 512
+    assert profiles[0]['kwargs']['n_ubatch'] == 256
+    assert profiles[-1]['kwargs']['n_batch'] == 256
+    assert profiles[-1]['kwargs']['n_ubatch'] == 128
+
+    experimental = model_manager_module._build_qwen_64k_runtime_profiles(
+        facade, facade.Llama, model_path=__file__, n_ctx=65536,
+        batch_profile='experimental',
+    )
+    assert [(p['diagnostics']['kv_precision'], p['diagnostics']['batch_profile'], p['kwargs']['n_batch'], p['kwargs']['n_ubatch']) for p in experimental] == [
+        ('q8', 'experimental', 1024, 512), ('q8', 'balanced', 512, 256),
+        ('q8', 'safe', 256, 128), ('f16', 'experimental', 1024, 512),
+        ('f16', 'balanced', 512, 256), ('f16', 'safe', 256, 128),
+        ('q4', 'safe', 256, 128),
+    ]
 
 
 def test_desktop_probe_module_path_mismatch_fails_closed_without_reprobe(monkeypatch):

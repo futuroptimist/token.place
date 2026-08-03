@@ -184,13 +184,12 @@ def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_pa
 
     with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=facade), \
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
-        assert manager.get_llm_instance() is not None
+        assert manager.get_llm_instance() is None
 
     attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
-    assert len(attempts) == 2
+    assert len(attempts) == 1
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert 'type_k' not in attempts[1]
-    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_f16_fa_small_batch'
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_failed'
 
 
 def test_packaged_subprocess_qwen64k_cuda_empty_stderr_category_advances_to_q8(tmp_path, monkeypatch):
@@ -232,9 +231,10 @@ def test_packaged_subprocess_qwen64k_cuda_empty_stderr_category_advances_to_q8(t
         assert manager.get_llm_instance() is not None
 
     attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
-    assert len(attempts) == 2
+    assert len(attempts) == 3
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 8
+    assert attempts[2]['type_k'] == attempts[2]['type_v'] == 2
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
     assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
 
@@ -282,9 +282,10 @@ def test_packaged_subprocess_qwen64k_cuda_delayed_stderr_refines_generic_error_t
         assert manager.get_llm_instance() is not None
 
     attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
-    assert len(attempts) == 2
+    assert len(attempts) == 3
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 8
+    assert attempts[2]['type_k'] == attempts[2]['type_v'] == 2
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
     assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
 

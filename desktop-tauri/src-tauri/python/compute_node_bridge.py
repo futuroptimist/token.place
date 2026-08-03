@@ -699,6 +699,8 @@ _SAFE_READINESS_DIAGNOSTIC_KEYS = {
     "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status",
     "api_v1_readiness_qwen_64k_runtime_profile_id",
     "api_v1_readiness_qwen_64k_runtime_preferred_profile_id",
+    "api_v1_readiness_qwen_64k_batch_profile_requested",
+    "api_v1_readiness_qwen_64k_batch_profile_selected",
     "api_v1_readiness_qwen_64k_runtime_profile_kv_precision",
     "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason",
     "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids",
@@ -816,6 +818,10 @@ def _startup_context_tier(args: argparse.Namespace) -> str:
     if raw_context_tier in {"8k-fast", "64k-full"}:
         return raw_context_tier
     return "8k-fast"
+
+
+def _normalize_qwen_64k_batch_profile(value: Any) -> str:
+    return value if value in {"safe", "balanced", "experimental"} else "balanced"
 
 
 def _load_context_profile_helpers() -> Tuple[Any, Any]:
@@ -1203,6 +1209,9 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     args.context_tier = normalize_context_tier(getattr(args, "context_tier", "8k-fast"))
+    args.qwen_64k_batch_profile = _normalize_qwen_64k_batch_profile(
+        getattr(args, "qwen_64k_batch_profile", "balanced")
+    )
 
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),
@@ -1290,6 +1299,7 @@ def run(args: argparse.Namespace) -> int:
     runtime.model_manager.parent_model_path_exists = parent_model_path_exists
     runtime.model_manager.model_path_was_relative = model_path_was_relative
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
+    runtime.model_manager.qwen_64k_batch_profile = args.qwen_64k_batch_profile
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
         private_runtime_setup = dict(runtime_setup)
@@ -3069,6 +3079,7 @@ def main() -> int:
     )
     parser.add_argument("--relay-port", type=int, default=None)
     parser.add_argument("--context-tier", default="8k-fast")
+    parser.add_argument("--qwen-64k-batch-profile", default="balanced", choices=("safe", "balanced", "experimental"))
     args = parser.parse_args()
 
     if args.installed_context_smoke:

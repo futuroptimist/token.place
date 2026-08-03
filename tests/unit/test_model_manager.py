@@ -5250,9 +5250,10 @@ def test_empty_stderr_cuda_category_survives_proxy_and_advances_qwen64k_profile(
 
     assert len(attempts) == 2
     assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
-    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 8
+    assert (attempts[1]['n_batch'], attempts[1]['n_ubatch']) == (256, 128)
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
-    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
+    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
 
 
 def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monkeypatch, tmp_path):
@@ -5452,6 +5453,7 @@ def test_qwen_64k_generic_context_create_sentinel_retries_bounded_gpu_profiles(t
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -5503,6 +5505,7 @@ def test_qwen_64k_retry_closes_retryable_init_exception_before_next_profile(tmp_
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -5555,6 +5558,7 @@ def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -5603,6 +5607,7 @@ def test_qwen_64k_generic_context_create_exhaustion_after_short_profile_list_pre
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -5633,12 +5638,14 @@ def test_qwen_64k_generic_context_create_exhaustion_after_short_profile_list_pre
                 'profile_id': 'qwen64k_kv_q8_fa_small_batch',
                 'applied': {'type_k': 8, 'type_v': 8},
                 'backend': 'cuda',
+                'kv_precision': 'q8',
+                'batch_profile': 'safe',
             },
         },
         {
             'profile_id': 'qwen64k_f16_fa_small_batch',
             'kwargs': {},
-            'diagnostics': {'profile_id': 'qwen64k_f16_fa_small_batch', 'applied': {}, 'backend': 'cuda'},
+            'diagnostics': {'profile_id': 'qwen64k_f16_fa_small_batch', 'applied': {}, 'backend': 'cuda', 'kv_precision': 'f16', 'batch_profile': 'safe'},
         },
     ]
     with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
@@ -5667,6 +5674,7 @@ def test_qwen_64k_mixed_terminal_generic_context_create_preserves_original_error
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -9774,6 +9782,7 @@ def test_qwen_64k_memory_profiles_skip_missing_kv_constants_without_noop_profile
         NoKvEnumLlama,
         model_path='model.gguf',
         n_ctx=65536,
+        batch_profile='safe',
     )
 
     assert [profile['profile_id'] for profile in profiles] == ['qwen64k_f16_fa_small_batch']
@@ -10848,7 +10857,7 @@ def test_qwen_64k_profile_helpers_cover_omitted_diagnostics_and_error_categories
         FakeLlama,
     )
     assert kwargs == {}
-    assert diagnostics["profile_id"] == model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q8
+    assert diagnostics["profile_id"] == "qwen64k_kv_q8_fa_balanced_batch"
     assert diagnostics["omitted"]["type_v"] == "worker_capability_unsupported"
 
     assert (
@@ -11144,8 +11153,8 @@ def test_qwen_64k_readiness_recovery_accepts_decode_failure_categories(monkeypat
         manager._qwen_64k_selected_profile_index = 0
         manager._qwen_64k_selected_profile_id = "qwen64k_kv_q8_fa_small_batch"
         manager._qwen_64k_runtime_profiles = [
-            {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
-            {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
+            {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal", "kv_precision": "q8", "batch_profile": "safe"}},
+            {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal", "kv_precision": "f16", "batch_profile": "safe"}},
         ]
         monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock())
         monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=replacement_runtime))
@@ -11191,9 +11200,9 @@ def test_qwen_64k_readiness_recovery_preserves_first_failure_across_profiles(mon
     manager._qwen_64k_selected_profile_index = 0
     manager._qwen_64k_selected_profile_id = "qwen64k_kv_q8_fa_small_batch"
     manager._qwen_64k_runtime_profiles = [
-        {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
-        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
-        {"profile_id": "qwen64k_kv_q4_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal", "kv_precision": "q8", "batch_profile": "safe"}},
+        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal", "kv_precision": "f16", "batch_profile": "safe"}},
+        {"profile_id": "qwen64k_kv_q4_fa_small_batch", "diagnostics": {"backend": "metal", "kv_precision": "q4", "batch_profile": "safe"}},
     ]
     monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock())
     monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=second_runtime))
@@ -11235,6 +11244,7 @@ def test_qwen_64k_q8_context_memory_failure_retries_q4_profile(tmp_path):
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -11369,6 +11379,7 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -11523,6 +11534,7 @@ def test_qwen_64k_subprocess_initialization_failures_are_safe_one_attempt(
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'model.download_chunk_size_mb': 1,
         'paths.models_dir': str(tmp_path),
@@ -11768,7 +11780,7 @@ def test_qwen_64k_failure_readiness_publisher_prefers_persisted_transition_reaso
 
     diagnostics = manager.last_compute_diagnostics
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_preferred_profile_id'] == (
-        'qwen64k_kv_q8_fa_small_batch'
+        'qwen64k_kv_q8_fa_balanced_batch'
     )
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_kv_precision'] == 'q4'
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_fallback_reason'] == 'memory_pressure'
@@ -13280,6 +13292,7 @@ def test_complete_cuda_desktop_probe_is_authoritative_without_reprobe(monkeypatc
         facade.Llama,
         model_path=__file__,
         n_ctx=65536,
+        batch_profile='safe',
     )
 
     assert diagnostics['supported'] is True
@@ -13770,3 +13783,120 @@ def test_subprocess_worker_identity_mismatch_fails_before_constructor_without_le
     assert str(module_path) not in message
     assert str(other) not in message
     assert probe['llama_module_identity'] not in message
+
+@pytest.mark.parametrize(
+    ('batch_profile', 'expected'),
+    [('safe', (256, 128)), ('balanced', (512, 256)), ('experimental', (1024, 512))],
+)
+def test_qwen_64k_batch_profiles_have_exact_values_and_unique_structured_ids(batch_profile, expected):
+    from utils.llm.model_manager import _build_qwen_64k_runtime_profiles
+
+    class Llama:
+        def __init__(self, *, type_k=None, type_v=None, flash_attn=None, offload_kqv=None, n_batch=None, n_ubatch=None):
+            pass
+
+    module = SimpleNamespace(
+        Llama=Llama, GGML_TYPE_Q8_0=8, GGML_TYPE_Q4_0=2,
+        __file__='/opt/llama_cpp/__init__.py', __version__='0.3.32',
+    )
+    profiles = _build_qwen_64k_runtime_profiles(
+        module, Llama, model_path='model.gguf', n_ctx=65536, batch_profile=batch_profile,
+    )
+    combinations = [(p['diagnostics']['kv_precision'], p['diagnostics']['batch_profile']) for p in profiles]
+    assert len(combinations) == len(set(combinations))
+    q8 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q8' and p['diagnostics']['batch_profile'] == batch_profile)
+    assert (q8['kwargs']['n_batch'], q8['kwargs']['n_ubatch']) == expected
+    assert q8['diagnostics']['preferred_profile_id'] == q8['profile_id']
+    assert all(p['kwargs']['n_batch'] >= p['kwargs']['n_ubatch'] > 0 for p in profiles)
+    q4 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q4')
+    assert (q4['kwargs']['n_batch'], q4['kwargs']['n_ubatch']) == (256, 128)
+
+
+def test_qwen_64k_batch_profile_normalization_defaults_safely_without_implicit_experimental():
+    from utils.llm.model_manager import normalize_qwen_64k_batch_profile
+
+    assert normalize_qwen_64k_batch_profile(None) == 'balanced'
+    assert normalize_qwen_64k_batch_profile('unknown') == 'balanced'
+    assert normalize_qwen_64k_batch_profile(' experimental ') == 'balanced'
+    assert normalize_qwen_64k_batch_profile('experimental') == 'experimental'
+
+
+def test_qwen_64k_readiness_budget_covers_all_remaining_runtime_profiles():
+    manager = object.__new__(ModelManager)
+    manager.model_profile = {'provider': 'qwen'}
+    manager.context_tier = '64k-full'
+    manager._qwen_64k_selected_profile_index = 0
+    manager._qwen_64k_runtime_profiles = [
+        {'profile_id': f'profile-{index}'} for index in range(7)
+    ]
+
+    assert manager.qwen_64k_readiness_profile_attempt_budget() == 7
+    manager._qwen_64k_selected_profile_index = 3
+    assert manager.qwen_64k_readiness_profile_attempt_budget() == 4
+
+
+@pytest.mark.parametrize(
+    ("requested", "precision", "category", "expected"),
+    [
+        ("safe", "q8", "runtime_context_create_cuda_memory", [("q8", "safe"), ("q4", "safe")]),
+        ("balanced", "q8", "runtime_context_create_cuda_memory", [("q8", "balanced"), ("q8", "safe"), ("q4", "safe")]),
+        ("experimental", "q8", "runtime_context_create_cuda_memory", [("q8", "experimental"), ("q8", "balanced"), ("q8", "safe"), ("q4", "safe")]),
+        ("safe", "f16", "runtime_context_create_cuda_memory", [("f16", "safe"), ("q4", "safe")]),
+        ("balanced", "f16", "runtime_context_create_cuda_memory", [("f16", "balanced"), ("f16", "safe"), ("q4", "safe")]),
+        ("experimental", "f16", "runtime_context_create_cuda_memory", [("f16", "experimental"), ("f16", "balanced"), ("f16", "safe"), ("q4", "safe")]),
+    ],
+)
+def test_qwen_64k_structured_memory_fallback_graph(requested, precision, category, expected):
+    from utils.llm import model_manager as model_manager_module
+
+    profiles = [
+        {
+            "profile_id": model_manager_module._qwen_64k_profile_id(kv_precision, batch_profile),
+            "diagnostics": {"kv_precision": kv_precision, "batch_profile": batch_profile},
+        }
+        for batch_profile in ("experimental", "balanced", "safe")
+        for kv_precision in ("q8", "f16")
+        if batch_profile in ({"experimental", "balanced", "safe"} if requested == "experimental" else {requested, "safe"})
+    ]
+    profiles.append({
+        "profile_id": model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q4,
+        "diagnostics": {"kv_precision": "q4", "batch_profile": "safe"},
+    })
+    active = model_manager_module._qwen_64k_profile_id(precision, requested)
+    attempts = []
+    while active:
+        profile = next(item for item in profiles if item["profile_id"] == active)
+        attempts.append((profile["diagnostics"]["kv_precision"], profile["diagnostics"]["batch_profile"]))
+        next_index = model_manager_module._next_qwen_64k_runtime_profile_index(profiles, active, category)
+        active = profiles[next_index]["profile_id"] if next_index is not None else None
+
+    assert attempts == expected
+    assert len(attempts) == len(set(attempts))
+    if requested != "experimental":
+        assert all(batch_profile != "experimental" for _, batch_profile in attempts)
+    if attempts[-1][0] == "q4":
+        assert model_manager_module.QWEN_64K_BATCH_PROFILES[attempts[-1][1]] == {"n_batch": 256, "n_ubatch": 128}
+
+
+@pytest.mark.parametrize("batch_profile", ["safe", "balanced", "experimental"])
+def test_qwen_64k_q8_compatibility_fallback_stays_in_same_batch_without_q4(batch_profile):
+    from utils.llm import model_manager as model_manager_module
+
+    profiles = [
+        {
+            "profile_id": model_manager_module._qwen_64k_profile_id(precision, batch_profile),
+            "diagnostics": {"kv_precision": precision, "batch_profile": batch_profile},
+        }
+        for precision in ("q8", "f16")
+    ]
+    q8_id = profiles[0]["profile_id"]
+    next_index = model_manager_module._next_qwen_64k_runtime_profile_index(
+        profiles, q8_id, "runtime_context_create_unsupported_kwarg"
+    )
+    assert profiles[next_index]["diagnostics"] == {"kv_precision": "f16", "batch_profile": batch_profile}
+    assert model_manager_module._next_qwen_64k_runtime_profile_index(
+        profiles, profiles[next_index]["profile_id"], "runtime_context_create_failed"
+    ) is None
+    assert model_manager_module._next_qwen_64k_runtime_profile_index(
+        profiles, "qwen64k_unknown_profile", "runtime_context_create_cuda_memory"
+    ) is None

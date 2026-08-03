@@ -2626,9 +2626,18 @@ def _real_qwen_64k_model_manager(runtimes):
     manager._qwen_64k_selected_profile_index = 0
     manager._qwen_64k_selected_profile_id = "qwen64k_kv_q8_fa_small_batch"
     manager._qwen_64k_runtime_profiles = [
-        {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
-        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
-        {"profile_id": "qwen64k_kv_q4_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {
+            "profile_id": "qwen64k_kv_q8_fa_small_batch",
+            "diagnostics": {"backend": "metal", "kv_precision": "q8", "batch_profile": "safe"},
+        },
+        {
+            "profile_id": "qwen64k_f16_fa_small_batch",
+            "diagnostics": {"backend": "metal", "kv_precision": "f16", "batch_profile": "safe"},
+        },
+        {
+            "profile_id": "qwen64k_kv_q4_fa_small_batch",
+            "diagnostics": {"backend": "metal", "kv_precision": "q4", "batch_profile": "safe"},
+        },
     ]
     close_calls = []
     manager._close_llm_proxy = MagicMock(side_effect=lambda runtime: close_calls.append(runtime))
@@ -2866,6 +2875,7 @@ def test_qwen_64k_readiness_decode_recovery_honors_cancellation():
     ("budget_value", "expected_attempts"),
     [
         (None, 2),
+        (RuntimeError("budget unavailable"), 2),
         (0, 2),
         (False, 2),
         ("3", 2),
@@ -2878,6 +2888,10 @@ def test_qwen_64k_readiness_profile_budget_validation_is_bounded(budget_value, e
     model_manager = _real_qwen_64k_model_manager(runtimes)
     if budget_value is None:
         model_manager.qwen_64k_readiness_profile_attempt_budget = None
+    elif isinstance(budget_value, Exception):
+        model_manager.qwen_64k_readiness_profile_attempt_budget = MagicMock(
+            side_effect=budget_value
+        )
     else:
         model_manager.qwen_64k_readiness_profile_attempt_budget = MagicMock(return_value=budget_value)
     relay_client = MagicMock()

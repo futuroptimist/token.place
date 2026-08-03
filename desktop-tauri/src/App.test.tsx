@@ -92,6 +92,7 @@ describe('desktop app start failure handling', () => {
       relay_base_urls: ['https://token.place', 'https://staging.token.place'],
       preferred_mode: 'auto',
       context_tier: '8k-fast',
+      qwen_64k_batch_profile: 'balanced',
     });
   });
 
@@ -1232,6 +1233,8 @@ describe('desktop app start failure handling', () => {
           api_v1_readiness_completion_smoke_method: 'create_completion_keyword_prompt',
           api_v1_readiness_completion_smoke_rejected_option: 'temperature',
           api_v1_readiness_qwen_64k_runtime_preferred_profile_id: 'qwen64k_kv_q8_fa_small_batch',
+          api_v1_readiness_qwen_64k_batch_profile_requested: 'experimental',
+          api_v1_readiness_qwen_64k_batch_profile_selected: 'safe',
           api_v1_readiness_qwen_64k_runtime_profile_kv_precision: 'q4',
           api_v1_readiness_qwen_64k_runtime_profile_fallback_reason: 'memory_pressure',
           api_v1_readiness_completion_smoke_internal_reason: 'SECRET_PROMPT',
@@ -1252,6 +1255,12 @@ describe('desktop app start failure handling', () => {
     );
     expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
       'api_v1_readiness_qwen_64k_runtime_preferred_profile_id=qwen64k_kv_q8_fa_small_batch'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_qwen_64k_batch_profile_requested=experimental'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_qwen_64k_batch_profile_selected=safe'
     );
     expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
       'api_v1_readiness_qwen_64k_runtime_profile_kv_precision=q4'
@@ -1987,9 +1996,13 @@ describe('desktop app start failure handling', () => {
 
     render(<App />);
     const contextSelect = (await screen.findByLabelText('Context tier')) as HTMLSelectElement;
+    const batchSelect = (await screen.findByLabelText('Qwen 64K batch profile')) as HTMLSelectElement;
     await waitFor(() => expect(contextSelect.disabled).toBe(false));
+    expect(batchSelect.disabled).toBe(true);
 
     fireEvent.change(contextSelect, { target: { value: '64k-full' } });
+    await waitFor(() => expect(batchSelect.disabled).toBe(false));
+    fireEvent.change(batchSelect, { target: { value: 'experimental' } });
     await waitFor(() =>
       expect(screen.getByText(/Context window:/).textContent).toContain('65536')
     );
@@ -1998,19 +2011,22 @@ describe('desktop app start failure handling', () => {
         invokeMock.mock.calls.some(
           ([command, args]) =>
             command === 'save_config' &&
-            args?.config?.context_tier === '64k-full'
+            args?.config?.context_tier === '64k-full' &&
+            args?.config?.qwen_64k_batch_profile === 'experimental'
         )
       ).toBe(true)
     );
 
     fireEvent.click((await screen.findByText('Start operator')) as HTMLButtonElement);
     expect(contextSelect.disabled).toBe(true);
+    expect(batchSelect.disabled).toBe(true);
     await waitFor(() =>
       expect(
         invokeMock.mock.calls.some(
           ([command, args]) =>
             command === 'start_compute_node' &&
             args?.request?.context_tier === '64k-full' &&
+            args?.request?.qwen_64k_batch_profile === 'experimental' &&
             args?.request?.n_ctx === undefined &&
             args?.request?.context_window_tokens === undefined
         )

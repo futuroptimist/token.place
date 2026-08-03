@@ -817,21 +817,25 @@ class ComputeNodeRuntime:
             model_profile_for_budget.get("provider") == "qwen"
             and getattr(self.model_manager, "context_tier", "8k-fast") == "64k-full"
         )
-        profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
+        # Three batch classes each permit Q8/F16, followed by Safe Q4.
+        # Bound readiness at the full seven-profile graph rather than cutting
+        # off a policy-authorized fallback before its smoke test.
+        qwen_64k_profile_attempt_limit = 7
+        profile_attempt_budget = qwen_64k_profile_attempt_limit if is_qwen_64k_for_budget else 1
         if callable(profile_budget_fn):
             try:
                 budget_result = profile_budget_fn()
             except Exception:
-                profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
+                profile_attempt_budget = qwen_64k_profile_attempt_limit if is_qwen_64k_for_budget else 1
             else:
                 if (
                     isinstance(budget_result, int)
                     and not isinstance(budget_result, bool)
                     and budget_result > 0
                 ):
-                    profile_attempt_budget = min(budget_result, 3)
+                    profile_attempt_budget = min(budget_result, qwen_64k_profile_attempt_limit)
                 else:
-                    profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
+                    profile_attempt_budget = qwen_64k_profile_attempt_limit if is_qwen_64k_for_budget else 1
         seen_runtime_ids: set[int] = set()
         seen_profile_ids: set[str] = set()
         pending_runtime = None
@@ -988,6 +992,8 @@ class ComputeNodeRuntime:
             for _key in (
                 "qwen_64k_runtime_profile_id",
                 "qwen_64k_runtime_preferred_profile_id",
+                "qwen_64k_batch_profile_requested",
+                "qwen_64k_batch_profile_selected",
                 "qwen_64k_runtime_profile_kv_precision",
                 "qwen_64k_runtime_profile_fallback_reason",
                 "qwen_64k_runtime_profile_attempt_ids",

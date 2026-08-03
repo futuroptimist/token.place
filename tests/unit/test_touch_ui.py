@@ -276,3 +276,18 @@ def test_api_v1_structured_error_logs_safe_diagnostic_fields():
     ):
         assert field in chat_js
     assert "{ code: normalizedError.code }" not in chat_js
+
+
+def test_landing_inference_progress_uses_native_accessible_sideband_ui():
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    assert '<progress' in index_html
+    assert 'data-testid="inference-progress"' in index_html
+    assert 'aria-labelledby="inference-progress-label"' in index_html
+    assert 'aria-describedby="inference-progress-status"' in index_html
+    assert 'role="progressbar"' not in index_html
+    assert 'aria-live="polite"' in index_html
+    assert "inferenceProgress: null" in chat_js
+    assert "this.inferenceProgress = { phase: 'waiting' }" in chat_js
+    assert "applyEncryptedProgress" in chat_js
+    assert "this.inferenceProgress = null" in chat_js

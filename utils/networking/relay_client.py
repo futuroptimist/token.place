@@ -94,6 +94,58 @@ class _PostApiV1Outcome(NamedTuple):
     suppressed_code: Optional[str] = None
 
 
+class _ApiV1EncryptedProgressPublisher:
+    """Request-owned, bounded latest-value encrypted telemetry publisher."""
+    def __init__(self, owner, relay_url, request_id, client_key_b64, client_key):
+        self.owner, self.relay_url, self.request_id = owner, relay_url, request_id
+        self.client_key_b64, self.client_key = client_key_b64, client_key
+        self._condition, self._pending, self._stopped = threading.Condition(), None, False
+        self._sequence = 0
+        self._thread = threading.Thread(target=self._run, name='tokenplace-progress-publisher', daemon=True)
+        self._thread.start()
+
+    def submit(self, event):
+        fields = ('phase', 'total_prompt_tokens', 'cached_prompt_tokens', 'processed_prompt_tokens', 'generated_tokens', 'elapsed_ms')
+        try: candidate = {key: event[key] for key in fields}
+        except (KeyError, TypeError): return
+        with self._condition:
+            if self._stopped: return
+            self._pending = candidate
+            self._condition.notify()
+
+    def close(self):
+        with self._condition:
+            self._stopped, self._pending = True, None
+            self._condition.notify_all()
+        self._thread.join(timeout=2.1)
+
+    def _run(self):
+        last_sent, last_phase = 0.0, None
+        while True:
+            with self._condition:
+                while self._pending is None and not self._stopped: self._condition.wait()
+                if self._stopped: return
+                event, self._pending = self._pending, None
+            delay = max(0.0, 1.0 - (time.monotonic() - last_sent)) if event['phase'] == last_phase else 0.0
+            if delay: time.sleep(delay)
+            with self._condition:
+                if self._stopped: return
+                if self._pending is not None: event, self._pending = self._pending, None
+            self._sequence += 1
+            envelope = {'protocol': 'tokenplace_api_v1_relay_e2ee', 'version': 1, 'request_id': self.request_id,
+                        'client_public_key': self.client_key_b64, 'api_v1_progress': {'schema_version': 1, 'sequence': self._sequence, **event}}
+            try:
+                encrypted = self.owner.crypto_manager.encrypt_message(envelope, self.client_key)
+                payload = {'server_public_key': self.owner.crypto_manager.public_key_b64, 'client_public_key': self.client_key_b64,
+                           'request_id': self.request_id, 'control_credential': self.owner._api_v1_control_credential_for_relay(self.relay_url),
+                           'protocol': 'tokenplace_api_v1_relay_e2ee', 'version': 1, **encrypted}
+                response = requests.post(self.owner._build_api_v1_url(self.relay_url, '/relay/progress'), json=payload,
+                                         headers=self.owner._auth_headers(), timeout=2.0)
+                if response.status_code in {401, 403, 404, 410}: return
+            except Exception: pass
+            last_sent, last_phase = time.monotonic(), event['phase']
+
+
 def _is_llama_cpp_inference_request_error(exc: BaseException) -> bool:
     """Return True for request-scoped llama.cpp inference validation failures."""
 
@@ -1090,6 +1142,7 @@ class RelayClient:
         self._api_v1_last_heartbeat_at: Dict[str, float] = {}
         self._api_v1_relay_wait_hints: Dict[str, Dict[str, Any]] = {}
         self._api_v1_control_credentials_by_relay: Dict[str, str] = {}
+        self._api_v1_relay_capabilities: Dict[str, Dict[str, bool]] = {}
         self._api_v1_control_credentials_lock = threading.Lock()
         self._unregister_attempted = False
         self._unregister_complete = False
@@ -1805,12 +1858,14 @@ class RelayClient:
 
         with self._api_v1_control_credentials_lock:
             self._api_v1_control_credentials_by_relay.pop(relay_url, None)
+        getattr(self, '_api_v1_relay_capabilities', {}).pop(relay_url, None)
 
     def _clear_api_v1_control_credentials(self) -> None:
         """Clear all relay control credentials under the dedicated credential-map lock."""
 
         with self._api_v1_control_credentials_lock:
             self._api_v1_control_credentials_by_relay.clear()
+        getattr(self, '_api_v1_relay_capabilities', {}).clear()
 
     def _api_v1_non_200_diagnostic(
         self,
@@ -1985,6 +2040,8 @@ class RelayClient:
             control_credential = payload.get('control_credential')
             if isinstance(control_credential, str) and control_credential:
                 self._store_api_v1_control_credential(target_url, control_credential)
+            capabilities = payload.get('relay_capabilities')
+            self._api_v1_relay_capabilities[target_url] = capabilities if isinstance(capabilities, dict) else {}
         return payload
 
     @staticmethod
@@ -2495,7 +2552,7 @@ class RelayClient:
         except Exception:
             log_info('api_v1.control_ack_failed request_id={}', request_id)
 
-    def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any], *, local_deadline: Optional[float] = None) -> _ApiV1SupervisorOutcome:
+    def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any], *, local_deadline: Optional[float] = None, progress_observer=None) -> _ApiV1SupervisorOutcome:
         supervisor_started_at = time.monotonic()
         request_id = api_v1_request_payload['request_id']
         relay_url = self._api_v1_response_relay_url()
@@ -2545,6 +2602,7 @@ class RelayClient:
                 messages=api_v1_request_payload['messages'],
                 options=dict(api_v1_request_payload['options']),
                 requested_context_tier=api_v1_request_payload['routing']['context_tier'],
+                progress_observer=progress_observer,
             )
 
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_inference')
@@ -4589,12 +4647,12 @@ class RelayClient:
         return shape
 
     def _api_v1_local_progress_observer(self, event: Dict[str, Any]) -> None:
-        """Log local-only preparing/prefill/generating progress, privacy-safe.
+        """Log preparing/prefill/generating progress locally, privacy-safe.
 
         `event` is bound to a real request_id and worker generation by
         ModelManager.create_chat_completion_with_recovery. Never forwarded to
-        the relay: this is a local log line only, matching the relay-blind
-        E2EE guardrail (relay sees ciphertext + safe metadata only).
+        the relay in plaintext; a request-scoped observer may separately publish
+        its fixed-schema encrypted projection.
         """
         try:
             log_info(
@@ -4622,6 +4680,7 @@ class RelayClient:
         messages: List[Dict[str, Any]],
         options: Dict[str, Any],
         requested_context_tier: str = DEFAULT_CONTEXT_TIER,
+        progress_observer=None,
     ) -> Dict[str, Any]:
         """Generate an API v1 assistant message with the desktop runtime model."""
 
@@ -4845,7 +4904,7 @@ class RelayClient:
                                 qwen_render_complete,
                                 llm_instance=llm_instance,
                                 request_id=request_id,
-                                observer=self._api_v1_local_progress_observer,
+                                observer=progress_observer or self._api_v1_local_progress_observer,
                             ),
                         )
 
@@ -4865,7 +4924,7 @@ class RelayClient:
                 create_chat_completion = functools.partial(
                     create_chat_completion,
                     progress_request_id=request_id,
-                    progress_observer=self._api_v1_local_progress_observer,
+                    progress_observer=progress_observer or self._api_v1_local_progress_observer,
                 )
 
             if self._api_v1_qwen_non_thinking_required(model_profile) and not callable(qwen_render_complete):
@@ -5256,7 +5315,19 @@ class RelayClient:
                             cancel_snapshot = candidate_snapshot
                     if getattr(self, "_api_v1_registered_relays", set()):
                         self._api_v1_start_heartbeat_worker()
-                    supervisor_outcome = self._supervise_api_v1_inference(api_v1_request_payload, local_deadline=outer_api_v1_deadline)
+                    relay_url = self._api_v1_response_relay_url()
+                    publisher = None
+                    if getattr(self, '_api_v1_relay_capabilities', {}).get(relay_url, {}).get('encrypted_progress_v1') is True:
+                        publisher = _ApiV1EncryptedProgressPublisher(self, relay_url, api_v1_request_payload['request_id'], client_pub_key_b64, client_pub_key)
+                    def progress_observer(event):
+                        self._api_v1_local_progress_observer(event)
+                        if publisher is not None:
+                            publisher.submit(event)
+                    try:
+                        supervisor_outcome = self._supervise_api_v1_inference(api_v1_request_payload, local_deadline=outer_api_v1_deadline, progress_observer=progress_observer)
+                    finally:
+                        if publisher is not None:
+                            publisher.close()
                     response_envelope = supervisor_outcome.response_envelope
                     if response_envelope is None:
                         return RelayProcessingResult(

@@ -114,6 +114,7 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | API_RELAY_CONTROL_PLANE_UNREGISTER_RATE_LIMIT | 240/hour | Per-server-public-key budget for authenticated compute-node unregister/shutdown traffic |
 | API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT | 1200/hour | Per-server-public-key budget for authenticated compute-node poll/heartbeat traffic |
 | API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT | 1200/hour | Per-client-public-key budget for authenticated encrypted compute-node response submissions |
+| API_RELAY_CONTROL_PLANE_PROGRESS_RATE_LIMIT | 7200/hour | Per-server-public-key budget for authenticated encrypted progress submissions; aggregate per-IP protection still applies |
 | API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT | 10000/hour | Aggregate per-IP abuse budget shared by compute-node control-plane routes |
 | TOKENPLACE_RATE_LIMIT_STORAGE_URI | (in-memory) | Optional shared Flask-Limiter/limits backend URI (for example Redis or Memcached) used by public and control-plane budgets |
 | API_STREAM_RATE_LIMIT | 30/minute   | Per-IP rate limit applied only to streaming chat completions          |

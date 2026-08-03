@@ -83,6 +83,10 @@
             margin-top: 30px;
             min-height: 260px;
         }
+        .inference-progress { margin: 18px 0; padding: 12px; border: 1px solid rgba(0,255,255,.35); border-radius: 8px; }
+        .inference-progress label, .inference-progress small { display: block; }
+        .inference-progress progress { width: 100%; height: 1rem; accent-color: #00bfc7; }
+        .sr-progress-announcement { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
         .compute-node-status {
             display: flex;
             justify-content: space-between;
@@ -554,6 +558,19 @@
                     >Response stopped at the output-token limit.</p>
                 </div>
             </template>
+            <div v-if="inferenceProgress" class="inference-progress" data-testid="inference-progress-container">
+                <label id="inference-progress-label" for="inference-progress-native" data-testid="inference-progress-label">Inference progress</label>
+                <progress
+                    id="inference-progress-native"
+                    data-testid="inference-progress"
+                    aria-labelledby="inference-progress-label"
+                    aria-describedby="inference-progress-status"
+                    :max="inferenceProgressDeterminate ? inferenceProgress.total_prompt_tokens : null"
+                    :value="inferenceProgressDeterminate ? inferenceProgress.processed_prompt_tokens : null"
+                ></progress>
+                <small id="inference-progress-status" data-testid="inference-progress-status" v-text="inferenceProgressText"></small>
+                <span class="sr-progress-announcement" aria-live="polite" aria-atomic="true" v-text="inferenceProgressAnnouncement"></span>
+            </div>
             <div class="input-container">
                 <textarea
                     ref="messageInput"
@@ -762,6 +779,7 @@
                 <tr><td><code>POST /api/v1/relay/servers/unregister</code></td><td>Compute node self-unregister with relay registration authentication.</td></tr>
                 <tr><td><code>POST /api/v1/relay/servers/poll</code></td><td>Compute node long-poll for the next encrypted workload envelope.</td></tr>
                 <tr><td><code>POST /api/v1/relay/servers/control</code></td><td>Authenticated owner-only in-flight request control poll exposing only active/cancelled/expired/completed/unavailable state and bounded retry hints.</td></tr>
+                <tr><td><code>POST /api/v1/relay/progress</code></td><td>Authenticated exact-owner submission of client-encrypted, latest-value inference progress telemetry.</td></tr>
                 <tr><td><code>POST /api/v1/relay/requests/cancel</code></td><td>Client request cancellation with a requester proof token.</td></tr>
                 <tr><td><code>POST /api/v1/relay/responses</code></td><td>Compute node stores an encrypted response envelope for client retrieval.</td></tr>
             </tbody>

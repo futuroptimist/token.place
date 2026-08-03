@@ -52,14 +52,20 @@ QWEN_64K_KV_CACHE_TYPE_NAMES = {
     'q8': ('GGML_TYPE_Q8_0', 'LLAMA_TYPE_Q8_0'),
     'q4': ('GGML_TYPE_Q4_0', 'LLAMA_TYPE_Q4_0'),
 }
-QWEN_64K_BATCH_TOKENS = 256
-QWEN_64K_UBATCH_TOKENS = 128
+QWEN_64K_BATCH_PROFILES = {
+    'safe': {'n_batch': 256, 'n_ubatch': 128},
+    'balanced': {'n_batch': 512, 'n_ubatch': 256},
+    'experimental': {'n_batch': 1024, 'n_ubatch': 512},
+}
+QWEN_64K_BATCH_PROFILE_DEFAULT = 'balanced'
+QWEN_64K_BATCH_TOKENS = QWEN_64K_BATCH_PROFILES['safe']['n_batch']
+QWEN_64K_UBATCH_TOKENS = QWEN_64K_BATCH_PROFILES['safe']['n_ubatch']
 QWEN_64K_RUNTIME_PROFILE_F16 = 'qwen64k_f16_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4_fa_small_batch'
 # The named default follows the preferred profile. Keep the precision-specific
 # constants above for compatibility code that must distinguish F16 from Q8.
-QWEN_64K_RUNTIME_PROFILE_DEFAULT = QWEN_64K_RUNTIME_PROFILE_Q8
+QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_kv_q8_fa_balanced_batch'
 GGUF_MAGIC = b'GGUF'
 
 LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
@@ -472,6 +478,7 @@ def _build_qwen_64k_runtime_profiles(
     model_path: Any,
     n_ctx: int,
     enable_kqv_offload: bool = True,
+    batch_profile: Any = QWEN_64K_BATCH_PROFILE_DEFAULT,
 ) -> list[Dict[str, Any]]:
     """Build ordered Qwen 64K Metal-safe generation profiles.
 
@@ -482,10 +489,22 @@ def _build_qwen_64k_runtime_profiles(
     support = capabilities['constructor_kwarg_support']
     backend = str(capabilities.get('backend') or '').lower()
 
-    def _base_kwargs() -> tuple[Dict[str, Any], Dict[str, str]]:
+    requested_batch_profile = normalize_qwen_64k_batch_profile(batch_profile)
+    batch_order = ('experimental', 'balanced', 'safe')
+    enabled_batches = batch_order[batch_order.index(requested_batch_profile):]
+
+    def _profile_id(precision: str, batch: str) -> str:
+        if batch == 'safe':
+            return {'q8': QWEN_64K_RUNTIME_PROFILE_Q8, 'f16': QWEN_64K_RUNTIME_PROFILE_F16,
+                    'q4': QWEN_64K_RUNTIME_PROFILE_Q4}[precision]
+        prefix = 'kv_q8' if precision == 'q8' else precision
+        return f'qwen64k_{prefix}_fa_{batch}_batch'
+
+    def _base_kwargs(batch: str) -> tuple[Dict[str, Any], Dict[str, str]]:
         kwargs: Dict[str, Any] = {}
         omitted: Dict[str, str] = {}
-        for key, value in (('flash_attn', True), ('offload_kqv', True), ('n_batch', QWEN_64K_BATCH_TOKENS), ('n_ubatch', QWEN_64K_UBATCH_TOKENS)):
+        values = QWEN_64K_BATCH_PROFILES[batch]
+        for key, value in (('flash_attn', True), ('offload_kqv', True), ('n_batch', values['n_batch']), ('n_ubatch', values['n_ubatch'])):
             if support.get(key):
                 kwargs[key] = value
             else:
@@ -498,12 +517,11 @@ def _build_qwen_64k_runtime_profiles(
     profiles: list[Dict[str, Any]] = []
     skipped_profiles: list[Dict[str, Any]] = []
 
-    for precision, profile_id in (
-        ('q8', QWEN_64K_RUNTIME_PROFILE_Q8),
-        ('f16', QWEN_64K_RUNTIME_PROFILE_F16),
-        ('q4', QWEN_64K_RUNTIME_PROFILE_Q4),
-    ):
-        kwargs, omitted = _base_kwargs()
+    combinations = [(precision, batch) for batch in enabled_batches for precision in ('q8', 'f16')]
+    combinations.append(('q4', 'safe'))
+    for precision, batch in combinations:
+        profile_id = _profile_id(precision, batch)
+        kwargs, omitted = _base_kwargs(batch)
         kv_info = capabilities['kv_constants'].get(precision) or {}
         kv_value = kv_info.get('value')
         if precision != 'f16':
@@ -532,6 +550,9 @@ def _build_qwen_64k_runtime_profiles(
             'applied': dict(kwargs),
             'omitted': omitted,
             'kv_precision': precision,
+            'batch_profile': batch,
+            'qwen_64k_batch_profile_requested': requested_batch_profile,
+            'qwen_64k_batch_profile_selected': batch,
             'kv_cache_type': kv_info,
             'constructor_kwarg_support': support,
             'capability_source': capabilities['capability_source'],
@@ -551,6 +572,11 @@ def _build_qwen_64k_runtime_profiles(
     return profiles
 
 
+def normalize_qwen_64k_batch_profile(value: Any) -> str:
+    """Normalize persisted/user input without ever implicitly opting into experimental."""
+    return value if isinstance(value, str) and value in QWEN_64K_BATCH_PROFILES else QWEN_64K_BATCH_PROFILE_DEFAULT
+
+
 def is_qwen_64k_memory_pressure_failure_category(category: Any) -> bool:
     """Return whether a sanitized failure positively identifies memory pressure."""
 
@@ -567,14 +593,22 @@ def _next_qwen_64k_runtime_profile_index(
     profile_ids = [
         profile.get('profile_id') for profile in profiles if isinstance(profile, dict)
     ]
-    active = str(active_profile_id or '')
+    active = next((profile for profile in profiles if profile.get('profile_id') == active_profile_id), None)
+    if not active:
+        return None
+    active_precision = active.get('diagnostics', {}).get('kv_precision')
+    active_batch = active.get('diagnostics', {}).get('batch_profile')
     if is_qwen_64k_memory_pressure_failure_category(failure_category):
-        target = QWEN_64K_RUNTIME_PROFILE_Q4
-    elif active == QWEN_64K_RUNTIME_PROFILE_Q8:
-        target = QWEN_64K_RUNTIME_PROFILE_F16
+        downshift = {'experimental': 'balanced', 'balanced': 'safe'}.get(active_batch)
+        target_precision, target_batch = ((active_precision, downshift) if downshift else ('q4', 'safe'))
+    elif active_precision == 'q8':
+        target_precision, target_batch = 'f16', active_batch
     else:
         return None
-    if target == active or target not in profile_ids:
+    target = next((profile.get('profile_id') for profile in profiles
+                   if profile.get('diagnostics', {}).get('kv_precision') == target_precision
+                   and profile.get('diagnostics', {}).get('batch_profile') == target_batch), None)
+    if not target or target == active_profile_id or target not in profile_ids:
         return None
     return profile_ids.index(target)
 
@@ -5286,6 +5320,9 @@ class ModelManager:
         self.worker_state = 'stopped'
         self.last_runtime_init_error: Optional[str] = None
         self._qwen_64k_runtime_profiles: list[Dict[str, Any]] = []
+        self.qwen_64k_batch_profile = normalize_qwen_64k_batch_profile(
+            config.get('model.qwen_64k_batch_profile', QWEN_64K_BATCH_PROFILE_DEFAULT)
+        )
         self._qwen_64k_selected_profile_index = 0
         self._qwen_64k_selected_profile_id: Optional[str] = None
         self._qwen_64k_selected_profile_fallback_reason: Optional[str] = None
@@ -5316,6 +5353,8 @@ class ModelManager:
             'fallback_reason': None,
             'context_tier': getattr(self, 'context_tier', '8k-fast'),
             'context_window_tokens': config.get('model.context_size', 8192),
+            'qwen_64k_batch_profile_requested': self.qwen_64k_batch_profile,
+            'qwen_64k_batch_profile_selected': 'not_applied',
         }
 
     def _runtime_capabilities(self=None) -> Dict[str, Any]:
@@ -5713,6 +5752,7 @@ class ModelManager:
                     model_path=self.model_path,
                     n_ctx=n_ctx,
                     enable_kqv_offload=n_gpu_layers != 0,
+                    batch_profile=self.qwen_64k_batch_profile,
                 )
                 runtime_profile = built_profiles[0] if built_profiles else {
                     'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
@@ -6115,7 +6155,9 @@ class ModelManager:
             'api_v1_readiness_error_code': 'compute_node_runtime_init_failed',
             'api_v1_readiness_error_reason': 'qwen_64k_runtime_profile_initialization_failed',
             'api_v1_readiness_qwen_64k_runtime_profile_id': profile_id,
-            'api_v1_readiness_qwen_64k_runtime_preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
+            'api_v1_readiness_qwen_64k_runtime_preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT,
+            'api_v1_readiness_qwen_64k_batch_profile_requested': self.qwen_64k_batch_profile,
+            'api_v1_readiness_qwen_64k_batch_profile_selected': memory_profile.get('batch_profile') if isinstance(memory_profile, dict) else None,
             'api_v1_readiness_qwen_64k_runtime_profile_kv_precision': kv_precision,
             'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids': ','.join(attempted_profile_ids),
             'api_v1_readiness_qwen_64k_runtime_profile_recovery_count': max(0, len(attempted_profile_ids) - 1),
@@ -6316,6 +6358,7 @@ class ModelManager:
                                         model_path=self.model_path,
                                         n_ctx=int(self.config.get('model.context_size', 65536)),
                                         enable_kqv_offload=n_gpu_layers != 0,
+                                        batch_profile=self.qwen_64k_batch_profile,
                                     )
                                     if not runtime_profiles:
                                         runtime_profiles = [{
@@ -6506,6 +6549,8 @@ class ModelManager:
                                 }
                                 compute_plan.update({
                                     'qwen_64k_runtime_profile_id': memory_profile.get('profile_id'),
+                                    'qwen_64k_batch_profile_requested': self.qwen_64k_batch_profile,
+                                    'qwen_64k_batch_profile_selected': memory_profile.get('batch_profile'),
                                     'qwen_64k_runtime_preferred_profile_id': memory_profile.get('preferred_profile_id', QWEN_64K_RUNTIME_PROFILE_Q8),
                                     'qwen_64k_runtime_profile_kv_precision': memory_profile.get('kv_precision', 'f16'),
                                     'qwen_64k_runtime_profile_fallback_reason': (

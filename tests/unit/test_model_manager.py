@@ -24,6 +24,43 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
 from utils.llm.model_manager import ModelManager
+from utils.llm import model_manager as model_manager_module
+
+
+def test_qwen_64k_batch_profile_contract_and_normalization():
+    assert model_manager_module.QWEN_64K_BATCH_PROFILES == {
+        'safe': {'n_batch': 256, 'n_ubatch': 128},
+        'balanced': {'n_batch': 512, 'n_ubatch': 256},
+        'experimental': {'n_batch': 1024, 'n_ubatch': 512},
+    }
+    assert model_manager_module.normalize_qwen_64k_batch_profile(None) == 'balanced'
+    assert model_manager_module.normalize_qwen_64k_batch_profile('invalid') == 'balanced'
+    assert model_manager_module.normalize_qwen_64k_batch_profile('experimental') == 'experimental'
+
+
+def test_qwen_64k_structured_batch_fallback_graph():
+    class Llama:
+        __token_place_supported_constructor_kwargs__ = (
+            'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch', 'type_k', 'type_v'
+        )
+    module = SimpleNamespace(GGML_TYPE_Q8_0=8, GGML_TYPE_Q4_0=4, __version__='test')
+    profiles = model_manager_module._build_qwen_64k_runtime_profiles(
+        module, Llama, model_path='/missing', n_ctx=65536, batch_profile='experimental'
+    )
+    lookup = {(p['diagnostics']['kv_precision'], p['diagnostics']['batch_profile']): p for p in profiles}
+    for batch, values in model_manager_module.QWEN_64K_BATCH_PROFILES.items():
+        for precision in ('q8', 'f16'):
+            assert lookup[(precision, batch)]['kwargs']['n_batch'] == values['n_batch']
+            assert lookup[(precision, batch)]['kwargs']['n_ubatch'] == values['n_ubatch']
+    assert lookup[('q4', 'safe')]['kwargs']['n_batch'] == 256
+    current = lookup[('q8', 'experimental')]['profile_id']
+    current = profiles[model_manager_module._next_qwen_64k_runtime_profile_index(
+        profiles, current, 'cuda_memory_allocation')]['profile_id']
+    assert current == lookup[('q8', 'balanced')]['profile_id']
+    same_batch_f16 = profiles[model_manager_module._next_qwen_64k_runtime_profile_index(
+        profiles, current, 'runtime_context_create_unsupported_kwarg')]
+    assert same_batch_f16['diagnostics']['kv_precision'] == 'f16'
+    assert same_batch_f16['diagnostics']['batch_profile'] == 'balanced'
 
 
 class _FakeNamedOS:

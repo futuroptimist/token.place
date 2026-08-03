@@ -11664,6 +11664,36 @@ def test_qwen_64k_failure_readiness_publisher_handles_empty_and_non_dict_kwargs(
     )
 
 
+def test_qwen_64k_failure_readiness_publisher_prefers_persisted_transition_reason():
+    manager = object.__new__(ModelManager)
+    manager._qwen_64k_profile_attempt_ids = [
+        'qwen64k_kv_q8_fa_small_batch',
+        'qwen64k_kv_q4_fa_small_batch',
+    ]
+    manager._qwen_64k_selected_profile_fallback_reason = 'memory_pressure'
+    manager.last_qwen_64k_memory_profile_diagnostics = {
+        'kv_precision': 'q4',
+        'fallback_reason': 'compatibility_failure',
+        'applied': {},
+    }
+
+    manager._publish_qwen_64k_init_failure_readiness_diagnostics(
+        compute_plan={'backend_used': 'cuda'},
+        profile_failures=[{
+            'profile_id': 'qwen64k_kv_q4_fa_small_batch',
+            'safe_error_category': 'runtime_context_create_failed',
+            'attempted_runtime_kwargs': {},
+        }],
+    )
+
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_preferred_profile_id'] == (
+        'qwen64k_kv_q8_fa_small_batch'
+    )
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_kv_precision'] == 'q4'
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_fallback_reason'] == 'memory_pressure'
+
+
 def test_qwen_64k_failure_readiness_publisher_falls_back_to_attempted_profile_ids():
     manager = object.__new__(ModelManager)
     manager.last_compute_diagnostics = {}

@@ -6066,6 +6066,9 @@ def test_qwen64k_init_failure_stderr_includes_safe_profile_diagnostics(capsys):
         last_compute_diagnostics={
             'api_v1_readiness_result': 'failed',
             'api_v1_readiness_qwen_64k_runtime_profile_id': 'qwen64k_kv_q4_fa_small_batch',
+            'api_v1_readiness_qwen_64k_runtime_preferred_profile_id': 'qwen64k_kv_q8_fa_small_batch',
+            'api_v1_readiness_qwen_64k_runtime_profile_kv_precision': 'q4',
+            'api_v1_readiness_qwen_64k_runtime_profile_fallback_reason': 'memory_pressure',
             'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids': (
                 'qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
             ),
@@ -6095,6 +6098,9 @@ def test_qwen64k_init_failure_stderr_includes_safe_profile_diagnostics(capsys):
     assert 'desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics' in err
     assert 'unavailable=true' not in err
     assert 'api_v1_readiness_qwen_64k_runtime_profile_id=qwen64k_kv_q4_fa_small_batch' in err
+    assert 'api_v1_readiness_qwen_64k_runtime_preferred_profile_id=qwen64k_kv_q8_fa_small_batch' in err
+    assert 'api_v1_readiness_qwen_64k_runtime_profile_kv_precision=q4' in err
+    assert 'api_v1_readiness_qwen_64k_runtime_profile_fallback_reason=memory_pressure' in err
     assert 'api_v1_readiness_qwen_64k_runtime_profile_failure_category=runtime_context_create_cuda_memory' in err
     assert 'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids=qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch' in err
     for secret in (

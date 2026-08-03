@@ -5288,6 +5288,7 @@ class ModelManager:
         self._qwen_64k_runtime_profiles: list[Dict[str, Any]] = []
         self._qwen_64k_selected_profile_index = 0
         self._qwen_64k_selected_profile_id: Optional[str] = None
+        self._qwen_64k_selected_profile_fallback_reason: Optional[str] = None
         self._qwen_64k_profile_attempt_ids: list[str] = []
         self._qwen_64k_profile_recovery_count = 0
         # Preserved across profile advances: the first recoverable failure
@@ -6095,7 +6096,11 @@ class ModelManager:
         memory_profile = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)
         applied_memory = memory_profile.get('applied') if isinstance(memory_profile, dict) and isinstance(memory_profile.get('applied'), dict) else {}
         kv_precision = memory_profile.get('kv_precision') if isinstance(memory_profile, dict) else None
-        selected_fallback_reason = memory_profile.get('fallback_reason') if isinstance(memory_profile, dict) else None
+        selected_fallback_reason = getattr(
+            self, '_qwen_64k_selected_profile_fallback_reason', None
+        )
+        if selected_fallback_reason is None and isinstance(memory_profile, dict):
+            selected_fallback_reason = memory_profile.get('fallback_reason')
         profile_id = current_profile_id or latest_failure.get('profile_id')
         attempted_profile_ids = [
             str(failure.get('profile_id'))
@@ -6312,6 +6317,21 @@ class ModelManager:
                                         n_ctx=int(self.config.get('model.context_size', 65536)),
                                         enable_kqv_offload=n_gpu_layers != 0,
                                     )
+                                    if not runtime_profiles:
+                                        runtime_profiles = [{
+                                            'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
+                                            'kwargs': {},
+                                            'diagnostics': {
+                                                'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
+                                                'preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
+                                                'fallback_reason': 'capability_incompatibility',
+                                                'kv_precision': 'f16',
+                                                'enabled': True,
+                                                'applied': {},
+                                                'backend': str(compute_plan.get('backend_used') or '').lower(),
+                                            },
+                                        }]
+                                        self._qwen_64k_selected_profile_fallback_reason = 'capability_incompatibility'
                                     self._qwen_64k_runtime_profiles = list(runtime_profiles)
                                     start_index = max(0, min(int(getattr(self, '_qwen_64k_selected_profile_index', 0) or 0), len(runtime_profiles)))
                                     runtime_profiles = runtime_profiles[start_index:]
@@ -6410,6 +6430,7 @@ class ModelManager:
                                         if is_qwen_64k_memory_pressure_failure_category(category)
                                         else 'compatibility_failure'
                                     )
+                                    self._qwen_64k_selected_profile_fallback_reason = fallback_reason
                                     next_diagnostics = runtime_profiles[next_index].get('diagnostics')
                                     if isinstance(next_diagnostics, dict):
                                         next_diagnostics['fallback_reason'] = fallback_reason
@@ -6487,7 +6508,10 @@ class ModelManager:
                                     'qwen_64k_runtime_profile_id': memory_profile.get('profile_id'),
                                     'qwen_64k_runtime_preferred_profile_id': memory_profile.get('preferred_profile_id', QWEN_64K_RUNTIME_PROFILE_Q8),
                                     'qwen_64k_runtime_profile_kv_precision': memory_profile.get('kv_precision', 'f16'),
-                                    'qwen_64k_runtime_profile_fallback_reason': memory_profile.get('fallback_reason'),
+                                    'qwen_64k_runtime_profile_fallback_reason': (
+                                        self._qwen_64k_selected_profile_fallback_reason
+                                        or memory_profile.get('fallback_reason')
+                                    ),
                                     'qwen_64k_runtime_profile_attempt_ids': ','.join(self._qwen_64k_profile_attempt_ids),
                                     'qwen_64k_runtime_profile_recovery_count': self._qwen_64k_profile_recovery_count,
                                     'qwen_64k_runtime_profile_flash_attn': applied_memory.get('flash_attn'),
@@ -6656,13 +6680,15 @@ class ModelManager:
                     exhausted = True
                 else:
                     self._qwen_64k_selected_profile_index = next_index
+                    fallback_reason = (
+                        'memory_pressure'
+                        if is_qwen_64k_memory_pressure_failure_category(category)
+                        else 'compatibility_failure'
+                    )
+                    self._qwen_64k_selected_profile_fallback_reason = fallback_reason
                     next_diagnostics = profiles[next_index].get('diagnostics')
                     if isinstance(next_diagnostics, dict):
-                        next_diagnostics['fallback_reason'] = (
-                            'memory_pressure'
-                            if is_qwen_64k_memory_pressure_failure_category(category)
-                            else 'compatibility_failure'
-                        )
+                        next_diagnostics['fallback_reason'] = fallback_reason
         self._close_llm_proxy(failed_runtime)
         if exhausted:
             return None

@@ -56,7 +56,9 @@ new Vue({
         computeNodeCountQueuedRefreshActive: false,
         computeNodeCountFetchController: null,
         computeNodeCountDestroyed: false,
-        activeRelayRequest: null
+        activeRelayRequest: null,
+        relayProgress: null,
+        relayProgressAnnouncement: ''
     },
     mounted() {
         this.detectTouchInput();
@@ -1002,6 +1004,57 @@ new Vue({
         clearActiveRelayRequest(requestId) {
             if (this.activeRelayRequest && this.activeRelayRequest.requestId === requestId) {
                 this.activeRelayRequest = null;
+                this.relayProgress = null;
+                this.relayProgressAnnouncement = '';
+            }
+        },
+
+        relayProgressText(progress = this.relayProgress) {
+            if (!progress || progress.phase === 'waiting') return 'Waiting for compute node…';
+            if (progress.phase === 'preparing') return 'Preparing request…';
+            if (progress.phase === 'prefill' && progress.total_prompt_tokens > 0) {
+                const percent = Math.floor((progress.processed_prompt_tokens / progress.total_prompt_tokens) * 100);
+                return `Processing prompt: ${progress.processed_prompt_tokens.toLocaleString()} of ${progress.total_prompt_tokens.toLocaleString()} tokens (${percent}%)`;
+            }
+            if (progress.phase === 'prefill') return 'Processing prompt…';
+            return `Generating response… ${progress.generated_tokens.toLocaleString()} tokens generated`;
+        },
+
+        async applyEncryptedRelayProgress(outer, activeRequest) {
+            try {
+                if (this.activeRelayRequest !== activeRequest || activeRequest.terminated || !outer
+                    || outer.client_public_key !== activeRequest.clientPublicKey
+                    || outer.request_id !== activeRequest.requestId
+                    || outer.protocol !== 'tokenplace_api_v1_relay_e2ee' || outer.version !== 1) return;
+                const plaintext = await this.decrypt(outer.ciphertext, outer.cipherkey, outer.iv);
+                if (this.activeRelayRequest !== activeRequest || activeRequest.terminated || !plaintext) return;
+                const envelope = JSON.parse(plaintext);
+                const progress = envelope && envelope.api_v1_progress;
+                const counters = progress && ['total_prompt_tokens', 'cached_prompt_tokens', 'processed_prompt_tokens', 'generated_tokens', 'elapsed_ms'];
+                const progressKeys = progress && Object.keys(progress).sort();
+                const expectedProgressKeys = ['cached_prompt_tokens', 'elapsed_ms', 'generated_tokens', 'phase', 'processed_prompt_tokens', 'schema_version', 'sequence', 'total_prompt_tokens'];
+                if (!progress || envelope.protocol !== 'tokenplace_api_v1_relay_e2ee' || envelope.version !== 1
+                    || envelope.request_id !== activeRequest.requestId || envelope.client_public_key !== activeRequest.clientPublicKey
+                    || JSON.stringify(Object.keys(envelope).sort()) !== JSON.stringify(['api_v1_progress', 'client_public_key', 'protocol', 'request_id', 'version'])
+                    || JSON.stringify(progressKeys) !== JSON.stringify(expectedProgressKeys)
+                    || progress.schema_version !== 1 || !Number.isSafeInteger(progress.sequence) || progress.sequence <= activeRequest.lastProgressSequence
+                    || !['preparing', 'prefill', 'generating'].includes(progress.phase)
+                    || counters.some((key) => !Number.isSafeInteger(progress[key]) || progress[key] < 0)
+                    || (progress.total_prompt_tokens > 0 && !(progress.cached_prompt_tokens <= progress.processed_prompt_tokens
+                        && progress.processed_prompt_tokens <= progress.total_prompt_tokens))) return;
+                if (this.activeRelayRequest !== activeRequest || activeRequest.terminated) return;
+                const old = this.relayProgress;
+                const oldMilestone = old && old.total_prompt_tokens > 0
+                    ? Math.floor((old.processed_prompt_tokens / old.total_prompt_tokens) * 4) : -1;
+                const milestone = progress.total_prompt_tokens > 0
+                    ? Math.floor((progress.processed_prompt_tokens / progress.total_prompt_tokens) * 4) : -1;
+                activeRequest.lastProgressSequence = progress.sequence;
+                this.relayProgress = { ...progress };
+                if (!old || old.phase !== progress.phase || milestone !== oldMilestone) {
+                    this.relayProgressAnnouncement = this.relayProgressText(progress);
+                }
+            } catch (_error) {
+                // Progress is best-effort and never changes the completion lifecycle.
             }
         },
 
@@ -1118,6 +1171,9 @@ new Vue({
                     }
                     if (pendingPayload === RELAY_REQUEST_TERMINATED) {
                         return pendingPayload;
+                    }
+                    if (pendingPayload && pendingPayload.encrypted_progress) {
+                        await this.applyEncryptedRelayProgress(pendingPayload.encrypted_progress, activeRequest);
                     }
                     deadline = this.shortenRelayResponseDeadline(deadline, pendingPayload, Date.now());
                     const pollDelay = await waitForOperation(
@@ -1312,12 +1368,15 @@ new Vue({
                     terminated: false,
                     retrievalController: new AbortController(),
                     terminationPromise: null,
-                    resolveTermination: null
+                    resolveTermination: null,
+                    lastProgressSequence: 0
                 };
                 activeRelayRequest.terminationPromise = new Promise((resolve) => {
                     activeRelayRequest.resolveTermination = resolve;
                 });
                 this.activeRelayRequest = activeRelayRequest;
+                this.relayProgress = { phase: 'waiting' };
+                this.relayProgressAnnouncement = 'Waiting for compute node…';
 
                 let admissionPayload = null;
                 try {
@@ -1724,6 +1783,7 @@ new Vue({
         this.terminateRelayRequestLocally(activeRequest);
         this.cancelRelayRequest('requester_cancelled');
         this.clearActiveRelayRequest(activeRequestId);
+        this.relayProgress = null;
         if (!Array.isArray(this.chatHistory)) {
             return;
         }

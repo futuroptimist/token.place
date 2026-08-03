@@ -95,3 +95,44 @@ The migration roadmap follow-up phases own the implementation repair:
 4. add final guardrails proving active production paths no longer use legacy routes.
 
 This documentation baseline intentionally does **not** implement those code migrations.
+
+## Encrypted inference progress sideband
+
+Registration responses advertise `relay_capabilities.encrypted_progress_v1`. A compute node retains
+that capability for the exact relay registration and otherwise does not publish progress. This makes
+new-relay/old-desktop and old-relay/new-desktop rollout orders safe, with ordinary inference retained.
+There is no plaintext or legacy-route fallback.
+
+A capable compute node sends `POST /api/v1/relay/progress` using registration authentication and the
+exact server control credential. The relay verifies that server owns the active client/request pair
+under the terminal-transition locks. The strictly allowlisted outer envelope contains only routing
+identities, protocol/version, and `ciphertext`, `cipherkey`, and `iv`. Phase and counters occur only in
+the hybrid-encrypted inner envelope:
+
+```json
+{"protocol":"tokenplace_api_v1_relay_e2ee","version":1,"request_id":"opaque","client_public_key":"recipient","api_v1_progress":{"schema_version":1,"sequence":1,"phase":"preparing","total_prompt_tokens":0,"cached_prompt_tokens":0,"processed_prompt_tokens":0,"generated_tokens":0,"elapsed_ms":0}}
+```
+
+Phases are `preparing`, `prefill`, or `generating`; counters are non-negative safe integers and known
+prompt totals bound cached and processed counts. A request-owned publisher serializes only these
+fields, assigns an external monotonic sequence independent of worker generations, encrypts each
+update with fresh AES key/IV material to the requesting browser key, and performs bounded network
+work off the inference callback. It keeps only the latest value, coalesces bursts at about one update
+per second, and stops on terminal lifecycle results. Failures are best-effort and never fail inference.
+
+The relay stores at most one ciphertext update per active client/request pair. A pending response poll
+atomically pops it as `encrypted_progress`; terminal completion, cancellation, expiration,
+unregistration, eviction, and retrieval cleanup discard it. Progress neither renews the authoritative
+deadline/accounting lease nor completes a request. Terminal locking prevents late progress from
+reviving work.
+
+The landing client verifies both outer and decrypted inner identities and protocol versions, validates
+the fixed schema, and accepts only increasing sequences for its current request. Invalid progress is
+ignored. A native `<progress>` is indeterminate while waiting, preparing, or generating, determinate
+only for prefill with a positive total, and is removed for every terminal transition. Visible labeling,
+descriptive text, and a polite atomic live region announce phase changes and coarse milestones rather
+than every counter update.
+
+This is encrypted telemetry, not token streaming: API v1 still publishes the assistant response once,
+after full generation and encryption. Progress failure never exposes plaintext and never delays,
+changes, or fragments that atomic completion.

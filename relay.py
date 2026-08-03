@@ -875,6 +875,8 @@ API_V1_SERVER_MARKER = "api_v1_registered"
 client_inference_requests = {}
 client_responses = {}
 client_responses_lock = threading.Lock()
+client_progress: dict[tuple[str, str], dict[str, Any]] = {}
+client_progress_lock = threading.Lock()
 client_pending_request_ids = {}
 client_pending_request_deadlines = {}
 client_pending_request_ids_lock = threading.Lock()
@@ -2507,6 +2509,20 @@ def _remove_client_responses_for_request(client_public_key, request_id):
     return 0
 
 
+def _clear_client_progress(client_public_key, request_id):
+    if client_public_key and request_id:
+        with client_progress_lock:
+            return client_progress.pop((client_public_key, request_id), None) is not None
+    return False
+
+
+def _pop_client_progress(client_public_key, request_id):
+    if not client_public_key or not request_id:
+        return None
+    with client_progress_lock:
+        return client_progress.pop((client_public_key, request_id), None)
+
+
 def _has_client_response_for_request(client_public_key, request_id):
     if not client_public_key or not request_id:
         return False
@@ -2532,6 +2548,7 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
     status = _sanitize_terminal_status(status)
     reason = _sanitize_terminal_reason(reason, status)
     with api_v1_terminal_transition_lock:
+        _clear_client_progress(client_public_key, request_id)
         completed_won = _has_client_response_for_request(client_public_key, request_id)
         removed = _remove_request_from_server_queues(client_public_key, request_id)
         pending_removed = _clear_pending_request(client_public_key, request_id)
@@ -2828,6 +2845,7 @@ def api_v1_relay_servers_register():
     response_payload = {
         'next_ping_in_x_seconds': lease_seconds,
         'poll_wait_seconds': _api_v1_poll_wait_seconds(),
+        'relay_capabilities': {'encrypted_progress_v1': True},
     }
     if control_credential:
         response_payload['control_credential'] = control_credential
@@ -3296,6 +3314,7 @@ def api_v1_relay_responses():
                 terminal = _get_terminal_request(client_public_key, request_id)
                 status = terminal.get('status', 'cancelled') if terminal else 'cancelled'
                 return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
+            _clear_client_progress(client_public_key, request_id)
             _queue_client_response(client_public_key, envelope)
     else:
         _queue_client_response(client_public_key, envelope)
@@ -3306,6 +3325,60 @@ def api_v1_relay_responses():
         },
     )
     return jsonify({'message': 'Response received and queued for client'}), 200
+
+
+_API_V1_PROGRESS_FIELDS = {
+    "server_public_key", "client_public_key", "request_id", "control_credential",
+    "protocol", "version", "ciphertext", "cipherkey", "iv",
+}
+_API_V1_PROGRESS_CLIENT_FIELDS = {
+    "client_public_key", "request_id", "protocol", "version", "ciphertext", "cipherkey", "iv",
+}
+
+
+@app.route('/api/v1/relay/progress', methods=['POST'])
+def api_v1_relay_progress():
+    """Accept one relay-blind, owner-authenticated encrypted progress update."""
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+    if request.content_length is not None and request.content_length > 16 * 1024:
+        return jsonify({'error': {'message': 'Progress envelope too large', 'code': 413}}), 413
+    if len(request.get_data(cache=True)) > 16 * 1024:
+        return jsonify({'error': {'message': 'Progress envelope too large', 'code': 413}}), 413
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or set(data) != _API_V1_PROGRESS_FIELDS:
+        return jsonify({'error': {'message': 'Invalid encrypted progress schema', 'code': 400}}), 400
+    if _payload_has_plaintext_fields(data):
+        return jsonify({'error': {'message': 'Plaintext progress is forbidden', 'code': 400}}), 400
+    server_key = data.get('server_public_key')
+    client_key = data.get('client_public_key')
+    request_id = data.get('request_id')
+    if data.get('protocol') != 'tokenplace_api_v1_relay_e2ee' or data.get('version') != 1:
+        return jsonify({'error': {'message': 'Invalid encrypted progress protocol', 'code': 400}}), 400
+    if not all(isinstance(data.get(key), str) and data[key] for key in _API_V1_PROGRESS_FIELDS - {'version'}):
+        return jsonify({'error': {'message': 'Invalid encrypted progress envelope', 'code': 400}}), 400
+    now = time.monotonic()
+    with api_v1_terminal_transition_lock:
+        with server_round_robin_lock:
+            server = known_servers.get(server_key)
+            if not (isinstance(server, dict) and server.get(API_V1_SERVER_MARKER)
+                    and _api_v1_server_control_credential_valid(server, data.get('control_credential'))):
+                return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
+            with api_v1_in_flight_requests_lock:
+                entries = server.get('api_v1_in_flight_requests')
+                entry = entries.get(request_id) if isinstance(entries, dict) else None
+                if not _in_flight_entry_matches_client(entry, client_key):
+                    return jsonify({'error': {'message': 'Progress request is not active for this owner', 'code': 410}}), 410
+                deadline = _valid_request_deadline_monotonic(entry.get('request_deadline_monotonic'))
+                if deadline is not None and deadline <= now:
+                    return jsonify({'error': {'message': 'Progress request has expired', 'code': 410}}), 410
+        envelope = {key: data[key] for key in _API_V1_PROGRESS_CLIENT_FIELDS}
+        with client_progress_lock:
+            replaced = (client_key, request_id) in client_progress
+            client_progress[(client_key, request_id)] = envelope
+    LOGGER.info("relay.api_v1.progress_accepted", extra={"progress_state": "replaced" if replaced else "accepted"})
+    return jsonify({'message': 'Encrypted progress accepted'}), 202
 
 
 @app.route('/api/v1/relay/responses/retrieve', methods=['POST'])
@@ -3339,6 +3412,7 @@ def api_v1_relay_responses_retrieve():
             return jsonify({
                 "status": "pending",
                 **_api_v1_deadline_metadata(_pending_request_deadline(client_public_key, request_id)),
+                **({"encrypted_progress": progress} if (progress := _pop_client_progress(client_public_key, request_id)) else {}),
             }), 202
         terminal = _get_terminal_request(client_public_key, request_id)
         if terminal is not None:

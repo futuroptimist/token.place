@@ -2903,3 +2903,28 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             bridge_process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             bridge_process.kill()
+
+
+def test_encrypted_progress_native_ui_semantics(page: Page, base_url: str, setup_servers):
+    page.goto(base_url)
+    page.wait_for_function("() => Boolean(document.querySelector('#app').__vue__)")
+    page.evaluate("""
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            vm.relayProgress = {
+                schema_version: 1, sequence: 1, phase: 'prefill',
+                total_prompt_tokens: 55229, cached_prompt_tokens: 0,
+                processed_prompt_tokens: 12345, generated_tokens: 0, elapsed_ms: 1000
+            };
+            vm.relayProgressAnnouncement = vm.relayProgressText();
+        }
+    """)
+    progress = page.get_by_test_id('landing-native-progress')
+    expect(progress).to_have_attribute('max', '55229')
+    expect(progress).to_have_attribute('value', '12345')
+    expect(page.get_by_test_id('landing-progress-status')).to_contain_text('12,345 of 55,229 tokens (22%)')
+    assert progress.get_attribute('role') is None
+
+    page.evaluate("document.querySelector('#app').__vue__.relayProgress = {phase: 'generating', generated_tokens: 12}")
+    expect(progress).not_to_have_attribute('value', re.compile('.+'))
+    expect(page.get_by_test_id('landing-progress-status')).to_contain_text('12 tokens generated')

@@ -52,6 +52,7 @@ def client():
     relay_module.client_pending_request_deadlines.clear()
     client_terminal_request_ids.clear()
     client_responses.clear()
+    relay_module.client_progress.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
     relay_module.api_v1_recently_unregistered_servers.clear()
@@ -88,6 +89,7 @@ def client():
     relay_module.client_pending_request_deadlines.clear()
     client_terminal_request_ids.clear()
     client_responses.clear()
+    relay_module.client_progress.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
     relay_module.api_v1_recently_unregistered_servers.clear()
@@ -5077,3 +5079,66 @@ def test_api_v1_terminal_registry_queue_inflight_deadlock_regression(client, mon
     assert DUMMY_CLIENT_PUB_KEY not in relay_module.client_pending_request_deadlines
     assert server not in client_inference_requests
     assert server not in known_servers
+
+
+def test_api_v1_encrypted_progress_exact_owner_latest_value_and_pop(client):
+    registration = client.post('/api/v1/relay/servers/register', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'capabilities': _capabilities(),
+    })
+    assert registration.status_code == 200
+    assert registration.get_json()['relay_capabilities'] == {'encrypted_progress_v1': True}
+    credential = registration.get_json()['control_credential']
+    request_id = 'req-progress'
+    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, request_id)
+    known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'] = {
+        request_id: {'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_deadline_monotonic': time.monotonic() + 30}
+    }
+
+    def payload(ciphertext):
+        return {
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': request_id,
+            'control_credential': credential,
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'ciphertext': ciphertext,
+            'cipherkey': 'encrypted-key',
+            'iv': 'fresh-iv',
+        }
+
+    assert client.post('/api/v1/relay/progress', json=payload('old')).status_code == 202
+    assert client.post('/api/v1/relay/progress', json=payload('new')).status_code == 202
+    pending = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': request_id,
+    })
+    assert pending.status_code == 202
+    encrypted_progress = pending.get_json()['encrypted_progress']
+    assert encrypted_progress['ciphertext'] == 'new'
+    assert 'server_public_key' not in encrypted_progress
+    assert 'control_credential' not in encrypted_progress
+    second = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': request_id,
+    })
+    assert second.status_code == 202
+    assert 'encrypted_progress' not in second.get_json()
+
+
+def test_api_v1_encrypted_progress_rejects_unknown_plaintext_and_wrong_owner(client):
+    registration = client.post('/api/v1/relay/servers/register', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'capabilities': _capabilities(),
+    }).get_json()
+    base = {
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'unknown-request',
+        'control_credential': registration['control_credential'],
+        'protocol': 'tokenplace_api_v1_relay_e2ee', 'version': 1,
+        'ciphertext': 'opaque', 'cipherkey': 'key', 'iv': 'iv',
+    }
+    assert client.post('/api/v1/relay/progress', json=base).status_code == 410
+    assert client.post('/api/v1/relay/progress', json={**base, 'phase': 'prefill'}).status_code == 400
+    assert client.post('/api/v1/relay/progress', json={**base, 'control_credential': 'wrong'}).status_code == 403
+    assert relay_module.client_progress == {}

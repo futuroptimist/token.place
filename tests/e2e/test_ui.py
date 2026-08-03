@@ -320,15 +320,16 @@ def measure_landing_chat_layout(page: Page):
         () => {
             const chat = document.querySelector('.chat-container');
             const select = document.querySelector('[data-testid=landing-model-select]');
+            const contextTierSelect = document.querySelector('[data-testid=landing-context-tier-select]');
             const textarea = document.querySelector('textarea.message-input');
-            if (!chat || !select || !textarea) {
+            if (!chat || !select || !contextTierSelect || !textarea) {
                 throw new Error('missing landing chat layout node');
             }
             const chatRect = chat.getBoundingClientRect();
-            const selectRect = select.getBoundingClientRect();
+            const contextTierSelectRect = contextTierSelect.getBoundingClientRect();
             const textareaRect = textarea.getBoundingClientRect();
             return {
-                modelToTextareaGap: textareaRect.top - selectRect.bottom,
+                contextTierToTextareaGap: textareaRect.top - contextTierSelectRect.bottom,
                 chatHeight: chatRect.height,
                 textareaTopRelativeToChat: textareaRect.top - chatRect.top,
             };
@@ -383,7 +384,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     expect(textarea).to_be_visible()
     assert message_nodes.count() == 0
     first_paint_layout = measure_landing_chat_layout(page)
-    assert 20 <= first_paint_layout["modelToTextareaGap"] <= 70
+    assert 20 <= first_paint_layout["contextTierToTextareaGap"] <= 70
     expect(send_button).to_be_visible()
     expect(send_button).to_be_disabled()
     expect(page.get_by_test_id("landing-model-select")).to_be_visible()
@@ -420,7 +421,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     )
     page.wait_for_load_state("networkidle")
     hydrated_layout = measure_landing_chat_layout(page)
-    assert abs(hydrated_layout["modelToTextareaGap"] - first_paint_layout["modelToTextareaGap"]) <= 4
+    assert abs(hydrated_layout["contextTierToTextareaGap"] - first_paint_layout["contextTierToTextareaGap"]) <= 4
     assert abs(hydrated_layout["textareaTopRelativeToChat"] - first_paint_layout["textareaTopRelativeToChat"]) <= 4
     assert abs(hydrated_layout["chatHeight"] - first_paint_layout["chatHeight"]) <= 4
     assert page.get_by_test_id("landing-model-select").input_value() == "llama-3.1-8b-instruct"

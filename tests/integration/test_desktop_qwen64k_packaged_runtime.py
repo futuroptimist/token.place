@@ -88,7 +88,9 @@ class Llama:
         if path:
             with open(path, 'a', encoding='utf-8') as handle:
                 handle.write(json.dumps(kwargs, sort_keys=True) + '\\n')
-        if os.environ.get('TOKEN_PLACE_FAIL_ALL_PROFILES') == '1' or 'type_k' not in kwargs:
+        if os.environ.get('TOKEN_PLACE_FAIL_ALL_PROFILES') == '1' or (
+            os.environ.get('TOKEN_PLACE_FAIL_Q8_PROFILE') == '1' and kwargs.get('type_k') == 8
+        ):
             stderr = os.environ.get('TOKEN_PLACE_INIT_FAILURE_STDERR', INIT_FAILURE_STDERR)
             delayed_stderr = os.environ.get('TOKEN_PLACE_INIT_FAILURE_DELAYED_STDERR', '')
             if delayed_stderr:
@@ -152,10 +154,11 @@ class Llama:
 
 def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_path, monkeypatch):
     runtime_root = tmp_path / 'runtime'
-    _write_fake_llama_cpp_runtime(runtime_root)
+    _write_fake_llama_cpp_runtime(runtime_root, init_failure_stderr='')
     attempts_file = tmp_path / 'attempts.jsonl'
     monkeypatch.syspath_prepend(str(runtime_root))
     monkeypatch.setenv('TOKEN_PLACE_ATTEMPTS_JSONL', str(attempts_file))
+    monkeypatch.setenv('TOKEN_PLACE_FAIL_Q8_PROFILE', '1')
 
     manager = ModelManager(_config(tmp_path))
     apply_context_profile(manager, '64k-full')
@@ -185,9 +188,9 @@ def test_packaged_subprocess_qwen64k_retries_after_context_create_failure(tmp_pa
 
     attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
     assert len(attempts) == 2
-    assert 'type_k' not in attempts[0]
-    assert attempts[1]['type_k'] == 8
-    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
+    assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
+    assert 'type_k' not in attempts[1]
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_f16_fa_small_batch'
 
 
 def test_packaged_subprocess_qwen64k_cuda_empty_stderr_category_advances_to_q8(tmp_path, monkeypatch):
@@ -200,6 +203,7 @@ def test_packaged_subprocess_qwen64k_cuda_empty_stderr_category_advances_to_q8(t
     attempts_file = tmp_path / 'attempts.jsonl'
     monkeypatch.syspath_prepend(str(runtime_root))
     monkeypatch.setenv('TOKEN_PLACE_ATTEMPTS_JSONL', str(attempts_file))
+    monkeypatch.setenv('TOKEN_PLACE_FAIL_Q8_PROFILE', '1')
 
     manager = ModelManager(_config(tmp_path))
     apply_context_profile(manager, '64k-full')
@@ -229,10 +233,10 @@ def test_packaged_subprocess_qwen64k_cuda_empty_stderr_category_advances_to_q8(t
 
     attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
     assert len(attempts) == 2
-    assert 'type_k' not in attempts[0]
-    assert attempts[1]['type_k'] == 8
+    assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
-    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
 
 
 def test_packaged_subprocess_qwen64k_cuda_delayed_stderr_refines_generic_error_to_q8(tmp_path, monkeypatch):
@@ -245,6 +249,7 @@ def test_packaged_subprocess_qwen64k_cuda_delayed_stderr_refines_generic_error_t
     attempts_file = tmp_path / 'attempts.jsonl'
     monkeypatch.syspath_prepend(str(runtime_root))
     monkeypatch.setenv('TOKEN_PLACE_ATTEMPTS_JSONL', str(attempts_file))
+    monkeypatch.setenv('TOKEN_PLACE_FAIL_Q8_PROFILE', '1')
     monkeypatch.setenv(
         'TOKEN_PLACE_INIT_FAILURE_DELAYED_STDERR',
         'ggml_cuda: buffer allocation failed while creating llama_context',
@@ -278,10 +283,10 @@ def test_packaged_subprocess_qwen64k_cuda_delayed_stderr_refines_generic_error_t
 
     attempts = [json.loads(line) for line in attempts_file.read_text().splitlines()]
     assert len(attempts) == 2
-    assert 'type_k' not in attempts[0]
-    assert attempts[1]['type_k'] == 8
+    assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
-    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
 
 
 def test_packaged_subprocess_qwen64k_profile_exhaustion_fails_closed(tmp_path, monkeypatch):

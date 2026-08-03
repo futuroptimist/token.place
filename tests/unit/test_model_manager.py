@@ -3209,6 +3209,7 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
 
 
 def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch, posix_os):
+    _ = posix_os
     from utils.llm import model_manager as model_manager_module
 
     stop_stdout = threading.Event()
@@ -4377,6 +4378,7 @@ def test_close_signals_stdin_eof_before_terminating_the_process(posix_os):
     lock in the stdin/terminate/wait ordering deterministically via a
     recorded call order, not timing).
     """
+    _ = posix_os
     from utils.llm import model_manager as model_manager_module
 
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
@@ -4489,6 +4491,7 @@ def test_signal_worker_process_tree_rejects_non_positive_or_non_int_pids(monkeyp
 def test_signal_worker_process_tree_windows_soft_uses_ctrl_break_event(monkeypatch, windows_os):
     """Windows graceful phase: CTRL_BREAK_EVENT to the process group, never
     taskkill /F (that's forceful, hard-phase only)."""
+    _ = windows_os
     from utils.llm import model_manager as model_manager_module
 
     run_calls = []
@@ -4509,6 +4512,7 @@ def test_signal_worker_process_tree_windows_hard_uses_taskkill_bounded_by_remain
     """Windows hard phase: taskkill /F /T, bounded by whatever remains of
     the caller's own cleanup budget - not an independent five-second
     timeout stacked on top of it."""
+    _ = windows_os
     from utils.llm import model_manager as model_manager_module
 
     run_calls = []
@@ -4789,6 +4793,7 @@ def test_read_llama_subprocess_message_demux_aware_timeout():
 
 
 def test_subprocess_proxy_uses_windows_process_group_creationflags(monkeypatch, windows_os):
+    _ = windows_os
     from utils.llm import model_manager as model_manager_module
 
     class FakeStdin:
@@ -6619,6 +6624,7 @@ def test_llama_subprocess_transport_error_omits_unsafely_unallowlisted_secret():
     assert 'authorization' not in error
 
 def test_subprocess_llama_proxy_liveness_and_close_edge_cases(monkeypatch, posix_os):
+    _ = posix_os
     from utils.llm import model_manager as model_manager_module
 
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
@@ -6775,6 +6781,7 @@ def test_model_manager_cancellation_recreates_outside_non_reentrant_lock(monkeyp
 
 
 def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_path, monkeypatch, posix_os):
+    _ = posix_os
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
 
     already_dead = SimpleNamespace(
@@ -6865,6 +6872,7 @@ def test_model_manager_cancellation_without_active_worker_recreate_false_and_fai
 
 
 def test_close_llm_proxy_wait_failure_after_kill_is_bounded(tmp_path, monkeypatch, posix_os):
+    _ = posix_os
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
     process = SimpleNamespace(
         poll=MagicMock(return_value=None),
@@ -6972,6 +6980,7 @@ def test_model_manager_cancellation_active_worker_skip_recreation_and_close_with
 
 
 def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch, posix_os):
+    _ = posix_os
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
     close_fails = SimpleNamespace(close=MagicMock(side_effect=RuntimeError("close failed")))
 
@@ -6994,6 +7003,7 @@ def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch, 
 
 
 def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, monkeypatch, posix_os):
+    _ = posix_os
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
     close_entered = threading.Event()
     close_release = threading.Event()
@@ -7126,6 +7136,7 @@ sys.exit(0)
 
 
 def test_invalidate_llm_detaches_before_bounded_subprocess_cleanup(tmp_path, monkeypatch, posix_os):
+    _ = posix_os
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
     poll_values = iter([None, None, None, 0])
     process = SimpleNamespace(
@@ -10329,6 +10340,7 @@ def test_subprocess_proxy_reports_actual_child_model_path_exists_with_relative_s
 
 
 def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch, posix_os):
+    _ = posix_os
     from utils.llm import model_manager as model_manager_module
 
     popen_calls = []

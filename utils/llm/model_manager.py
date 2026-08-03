@@ -54,9 +54,12 @@ QWEN_64K_KV_CACHE_TYPE_NAMES = {
 }
 QWEN_64K_BATCH_TOKENS = 256
 QWEN_64K_UBATCH_TOKENS = 128
-QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_f16_fa_small_batch'
+QWEN_64K_RUNTIME_PROFILE_F16 = 'qwen64k_f16_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4_fa_small_batch'
+# The default is intentionally the preferred profile, rather than a synonym
+# for the compatibility profile.
+QWEN_64K_RUNTIME_PROFILE_DEFAULT = QWEN_64K_RUNTIME_PROFILE_Q8
 GGUF_MAGIC = b'GGUF'
 
 LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
@@ -66,8 +69,9 @@ LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
 )
 # Retry context-create failures backed by safe Metal/KV/cache/buffer evidence.
 # ``runtime_context_create_failed`` remains excluded from these general retry
-# categories. Its sole exception is the bounded pre-registration Qwen 64K
-# CUDA/Metal F16 -> Q8 -> Q4 loop, capped at those three profiles. If every
+# categories. Its sole exception is bounded pre-registration Qwen 64K
+# compatibility recovery. Profile choice is reason-driven and capped at Q8,
+# F16, and Q4. If every
 # generic attempt fails, the original generic init exception is re-raised so
 # corrupt GGUF/runtime/ABI causes are not reported as memory-profile exhaustion.
 QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
@@ -78,6 +82,24 @@ QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_cuda_buffer_limit',
     'runtime_context_create_failed',
 }
+QWEN_64K_MEMORY_PRESSURE_CATEGORIES = {
+    'backend_allocation_failure',
+    'runtime_context_create_metal_memory',
+    'runtime_context_create_kv_cache_allocation',
+    'runtime_context_create_metal_buffer_limit',
+    'runtime_context_create_cuda_memory',
+    'runtime_context_create_cuda_buffer_limit',
+    'metal_command_buffer_out_of_memory',
+    'kv_cache_allocation',
+    'metal_memory_allocation',
+    'cuda_memory_allocation',
+}
+
+
+def is_qwen_64k_memory_pressure_failure_category(category: Any) -> bool:
+    """Return whether a sanitized failure positively identifies memory pressure."""
+
+    return str(category or '') in QWEN_64K_MEMORY_PRESSURE_CATEGORIES
 
 _INIT_SAFE_CATEGORY_ALIASES = {
     'cuda_memory_allocation': 'runtime_context_create_cuda_memory',
@@ -483,8 +505,8 @@ def _build_qwen_64k_runtime_profiles(
     skipped_profiles: list[Dict[str, Any]] = []
 
     for precision, profile_id in (
-        ('f16', QWEN_64K_RUNTIME_PROFILE_DEFAULT),
         ('q8', QWEN_64K_RUNTIME_PROFILE_Q8),
+        ('f16', QWEN_64K_RUNTIME_PROFILE_F16),
         ('q4', QWEN_64K_RUNTIME_PROFILE_Q4),
     ):
         kwargs, omitted = _base_kwargs()
@@ -511,6 +533,7 @@ def _build_qwen_64k_runtime_profiles(
             enabled = False
         diagnostics = {
             'profile_id': profile_id,
+            'preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
             'enabled': bool(enabled),
             'applied': dict(kwargs),
             'omitted': omitted,
@@ -805,7 +828,7 @@ def _qwen_64k_memory_profile_kwargs(
     *,
     enable_kqv_offload: bool = True,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Backward-compatible helper returning the first quantized Qwen 64K profile."""
+    """Backward-compatible helper returning the Q8 Qwen 64K profile."""
     profiles = _build_qwen_64k_runtime_profiles(
         llama_cpp_module,
         llama_cls,
@@ -814,7 +837,7 @@ def _qwen_64k_memory_profile_kwargs(
         enable_kqv_offload=enable_kqv_offload,
     )
     for profile in profiles:
-        if profile.get('profile_id') != QWEN_64K_RUNTIME_PROFILE_DEFAULT:
+        if profile.get('profile_id') == QWEN_64K_RUNTIME_PROFILE_Q8:
             return dict(profile.get('kwargs') or {}), dict(profile.get('diagnostics') or {})
     default_diag = dict(profiles[0].get('diagnostics') or {}) if profiles else {'enabled': False, 'applied': {}}
     skipped = default_diag.get('skipped_profiles')
@@ -828,6 +851,19 @@ def _qwen_64k_memory_profile_kwargs(
             diag['omitted'] = omitted
         return {}, diag
     return {}, default_diag
+
+
+def _next_qwen_64k_profile_id(current_profile_id: Any, category: Any) -> Optional[str]:
+    """Choose a bounded fallback by sanitized failure reason, never by list order."""
+
+    current = str(current_profile_id or '')
+    if current == QWEN_64K_RUNTIME_PROFILE_Q4:
+        return None
+    if is_qwen_64k_memory_pressure_failure_category(category):
+        return QWEN_64K_RUNTIME_PROFILE_Q4
+    if current == QWEN_64K_RUNTIME_PROFILE_Q8:
+        return QWEN_64K_RUNTIME_PROFILE_F16
+    return None
 
 def _format_qwen_yarn_unsupported_diagnostics(diagnostics: Dict[str, Any]) -> str:
     safe_fields = (
@@ -5667,16 +5703,16 @@ class ModelManager:
                     enable_kqv_offload=n_gpu_layers != 0,
                 )
                 runtime_profile = built_profiles[0] if built_profiles else {
-                    'profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT,
+                    'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
                     'kwargs': {},
-                    'diagnostics': {'profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT, 'enabled': False, 'applied': {}},
+                    'diagnostics': {'profile_id': QWEN_64K_RUNTIME_PROFILE_F16, 'enabled': False, 'applied': {}},
                 }
             profile_kwargs = runtime_profile.get('kwargs') if isinstance(runtime_profile, dict) else {}
             if isinstance(profile_kwargs, dict):
                 kwargs.update(profile_kwargs)
             profile_diagnostics = runtime_profile.get('diagnostics') if isinstance(runtime_profile, dict) else None
             self.last_qwen_64k_memory_profile_diagnostics = dict(profile_diagnostics) if isinstance(profile_diagnostics, dict) else {
-                'profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT,
+                'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
                 'enabled': True,
                 'applied': {},
             }
@@ -6053,6 +6089,10 @@ class ModelManager:
             'api_v1_readiness_error_code': 'compute_node_runtime_init_failed',
             'api_v1_readiness_error_reason': 'qwen_64k_runtime_profile_initialization_failed',
             'api_v1_readiness_qwen_64k_runtime_profile_id': profile_id,
+            'api_v1_readiness_qwen_64k_runtime_preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
+            'api_v1_readiness_qwen_64k_runtime_profile_kv_precision': (
+                memory_profile.get('kv_precision') if isinstance(memory_profile, dict) else None
+            ),
             'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids': ','.join(attempted_profile_ids),
             'api_v1_readiness_qwen_64k_runtime_profile_recovery_count': max(0, len(attempted_profile_ids) - 1),
             'api_v1_readiness_qwen_64k_runtime_profile_flash_attn': attempted_kwargs.get('flash_attn', applied_memory.get('flash_attn')),
@@ -6063,6 +6103,10 @@ class ModelManager:
             'api_v1_readiness_qwen_64k_runtime_profile_n_ubatch': attempted_kwargs.get('n_ubatch', applied_memory.get('n_ubatch')),
             'api_v1_readiness_qwen_64k_runtime_profile_result': 'failed',
             'api_v1_readiness_qwen_64k_runtime_profile_failure_category': latest_failure.get('safe_error_category'),
+            'api_v1_readiness_qwen_64k_runtime_profile_fallback_reason': (
+                'memory_pressure' if is_qwen_64k_memory_pressure_failure_category(latest_failure.get('safe_error_category'))
+                else 'compatibility'
+            ),
         })
         n_ctx = attempted_kwargs.get('n_ctx') or latest_failure.get('n_ctx')
         if n_ctx is not None:
@@ -6255,7 +6299,10 @@ class ModelManager:
                             first_context_create_init_exc = None
                             llm_instance = None
                             runtime_kwargs = {}
-                            for runtime_profile in runtime_profiles:
+                            remaining_profiles = list(runtime_profiles)
+                            attempted_init_profile_ids: set[str] = set()
+                            while remaining_profiles:
+                                runtime_profile = remaining_profiles.pop(0)
                                 runtime_kwargs = self._runtime_init_kwargs(Llama, n_gpu_layers, llama_cpp, runtime_profile)
                                 profile_diag = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', {})
                                 profile_id = profile_diag.get('profile_id') if isinstance(profile_diag, dict) else 'default'
@@ -6321,6 +6368,14 @@ class ModelManager:
                                         first_context_create_init_exc = init_exc
                                     if not is_qwen_64k or category not in QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES:
                                         raise
+                                    next_profile_id = _next_qwen_64k_profile_id(profile_id, category)
+                                    attempted_init_profile_ids.add(str(profile_id))
+                                    next_profile = next((
+                                        profile for profile in self._qwen_64k_runtime_profiles
+                                        if profile.get('profile_id') == next_profile_id
+                                        and next_profile_id not in attempted_init_profile_ids
+                                    ), None)
+                                    remaining_profiles = [next_profile] if next_profile is not None else []
                                     close = getattr(init_exc, 'close', None)
                                     if callable(close):
                                         close()
@@ -6396,6 +6451,8 @@ class ModelManager:
                                 }
                                 compute_plan.update({
                                     'qwen_64k_runtime_profile_id': memory_profile.get('profile_id'),
+                                    'qwen_64k_runtime_preferred_profile_id': QWEN_64K_RUNTIME_PROFILE_Q8,
+                                    'qwen_64k_runtime_profile_kv_precision': memory_profile.get('kv_precision'),
                                     'qwen_64k_runtime_profile_attempt_ids': ','.join(self._qwen_64k_profile_attempt_ids),
                                     'qwen_64k_runtime_profile_recovery_count': self._qwen_64k_profile_recovery_count,
                                     'qwen_64k_runtime_profile_flash_attn': applied_memory.get('flash_attn'),
@@ -6405,6 +6462,22 @@ class ModelManager:
                                     'qwen_64k_runtime_profile_n_batch': applied_memory.get('n_batch'),
                                     'qwen_64k_runtime_profile_n_ubatch': applied_memory.get('n_ubatch'),
                                     'qwen_64k_runtime_profile_result': 'constructed',
+                                    'qwen_64k_runtime_profile_fallback_reason': (
+                                        'memory_pressure'
+                                        if profile_failures and is_qwen_64k_memory_pressure_failure_category(profile_failures[-1].get('safe_error_category'))
+                                        else (
+                                            'compatibility' if profile_failures else (
+                                                'capability_incompatibility'
+                                                if memory_profile.get('profile_id') == QWEN_64K_RUNTIME_PROFILE_F16
+                                                and any(
+                                                    item.get('profile_id') == QWEN_64K_RUNTIME_PROFILE_Q8
+                                                    for item in (memory_profile.get('skipped_profiles') or [])
+                                                    if isinstance(item, dict)
+                                                )
+                                                else 'none'
+                                            )
+                                        )
+                                    ),
                                     'llama_cpp_runtime_profile_backend': memory_profile.get('backend'),
                                 })
                                 first_failure = getattr(self, '_qwen_64k_first_readiness_failure_diagnostics', {})
@@ -6486,7 +6559,7 @@ class ModelManager:
         if not profile_ids:
             profile_ids = [
                 QWEN_64K_RUNTIME_PROFILE_DEFAULT,
-                QWEN_64K_RUNTIME_PROFILE_Q8,
+                QWEN_64K_RUNTIME_PROFILE_F16,
                 QWEN_64K_RUNTIME_PROFILE_Q4,
             ]
         current_index = max(0, int(getattr(self, '_qwen_64k_selected_profile_index', 0) or 0))
@@ -6552,7 +6625,8 @@ class ModelManager:
                 self._qwen_64k_first_readiness_failure_diagnostics.setdefault('category', category)
                 if decode_return_code is not None:
                     self._qwen_64k_first_readiness_failure_diagnostics.setdefault('eval_return_code', decode_return_code)
-            next_index = int(self._qwen_64k_selected_profile_index or 0) + 1
+            next_profile_id = _next_qwen_64k_profile_id(active_profile_id, category)
+            next_index = profile_ids.index(next_profile_id) if next_profile_id in profile_ids else len(profiles)
             self._qwen_64k_selected_profile_index = next_index
             exhausted = next_index >= len(profiles)
         self._close_llm_proxy(failed_runtime)

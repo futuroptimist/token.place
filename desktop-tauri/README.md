@@ -306,12 +306,22 @@ It prints:
   ```powershell
   python desktop-tauri/scripts/windows_nvidia_gpu_smoke_test.py --installer C:\path\to\token-place-setup.exe --mode gpu --context-tier 64k-full --model "$env:APPDATA\token.place\models\Qwen3-8B-Q4_K_M.gguf"
   ```
-  Pass means the canonical Qwen3 artifact matches its filename, size, and SHA-256; the installed
-  Tauri executable starts the Rust-managed operator through the UI; and status proves a concrete
-  NVIDIA device, bundled runtime, CUDA selection/use, positive offload, non-CPU KV cache, and warm
-  load. The gate completes a non-mock encrypted API-v1 turn, clicks Stop, observes relay count zero,
+Pass means the canonical Qwen3 artifact matches its filename, size, and SHA-256; the installed
+Tauri executable starts the Rust-managed operator through the UI; and status proves a concrete
+NVIDIA device, bundled runtime, CUDA selection/use, positive offload, non-CPU KV cache, and warm
+load. The gate completes a non-mock encrypted API-v1 turn, clicks Stop, observes relay count zero,
   and requires ordered unregister success followed by a natural bridge exit. Direct bridge launch
-  or cancellation, `physical_device_missing`, CPU fallback, repo shims, and mock inference fail.
+or cancellation, `physical_device_missing`, CPU fallback, repo shims, and mock inference fail.
+
+For the 64K GPU tier, the normal KV-cache profile is symmetric Q8_0 for both K
+and V, with Flash Attention and KQV offload enabled. F16 is retained as the
+compatibility fallback; symmetric Q4_0 is attempted only after a classified
+memory-pressure failure and may have a larger quality tradeoff. These settings
+quantize the KV cache independently of the Q4_K_M model weights. Quantized V is
+never enabled without confirmed constructor and Flash Attention support. Batch
+sizes remain `n_batch=256` and `n_ubatch=128`; later batch tuning and packaged
+performance/quality benchmarking are separate roadmap work, so no speedup is
+claimed here.
 
 ## Packaged operator debug logs
 

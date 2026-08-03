@@ -6067,7 +6067,7 @@ def test_qwen64k_init_failure_stderr_includes_safe_profile_diagnostics(capsys):
             'api_v1_readiness_result': 'failed',
             'api_v1_readiness_qwen_64k_runtime_profile_id': 'qwen64k_kv_q4_fa_small_batch',
             'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids': (
-                'qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
+                'qwen64k_kv_q8_fa_small_batch,qwen64k_f16_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
             ),
             'api_v1_readiness_qwen_64k_runtime_profile_result': 'failed',
             'api_v1_readiness_qwen_64k_runtime_profile_failure_category': 'runtime_context_create_cuda_memory',
@@ -6096,7 +6096,7 @@ def test_qwen64k_init_failure_stderr_includes_safe_profile_diagnostics(capsys):
     assert 'unavailable=true' not in err
     assert 'api_v1_readiness_qwen_64k_runtime_profile_id=qwen64k_kv_q4_fa_small_batch' in err
     assert 'api_v1_readiness_qwen_64k_runtime_profile_failure_category=runtime_context_create_cuda_memory' in err
-    assert 'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids=qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch' in err
+    assert 'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids=qwen64k_kv_q8_fa_small_batch,qwen64k_f16_fa_small_batch,qwen64k_kv_q4_fa_small_batch' in err
     for secret in (
         'SECRET_PROMPT',
         'SECRET_STDERR',

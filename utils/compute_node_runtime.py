@@ -987,6 +987,8 @@ class ComputeNodeRuntime:
             })
             for _key in (
                 "qwen_64k_runtime_profile_id",
+                "qwen_64k_runtime_preferred_profile_id",
+                "qwen_64k_runtime_profile_kv_precision",
                 "qwen_64k_runtime_profile_attempt_ids",
                 "qwen_64k_runtime_profile_recovery_count",
                 "qwen_64k_runtime_profile_flash_attn",
@@ -997,6 +999,7 @@ class ComputeNodeRuntime:
                 "qwen_64k_runtime_profile_n_ubatch",
                 "qwen_64k_runtime_profile_result",
                 "qwen_64k_runtime_profile_failure_category",
+                "qwen_64k_runtime_profile_fallback_reason",
                 "qwen_64k_first_readiness_failure_category",
                 "qwen_64k_first_readiness_failure_method",
                 "qwen_64k_first_readiness_failure_backend_failure_category",

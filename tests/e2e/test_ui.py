@@ -76,6 +76,12 @@ def route_landing_relay_chat(
     retrieve_statuses: list[int] | None = None,
     diagnostics_count: int | None = None,
     diagnostics_counts: list[int] | None = None,
+    admission_payload: dict | None = None,
+    pending_payload: dict | None = None,
+    retrieve_error_payload: dict | None = None,
+    cancel_status: int = 200,
+    cancel_payload: dict | None = None,
+    cancel_network_failure: bool = False,
 ):
     """Mock the direct API v1 relay routes used by the landing chat."""
     state = {
@@ -162,7 +168,7 @@ def route_landing_relay_chat(
         status = 200
         if request_statuses:
             status = request_statuses[min(len(state["relay_requests"]) - 1, len(request_statuses) - 1)]
-        body = {"message": "Request received"} if status == 200 else {"error": {"code": "server_unavailable"}}
+        body = (admission_payload or {"message": "Request received"}) if status == 200 else {"error": {"code": "server_unavailable"}}
         route.fulfill(
             status=status,
             headers={"Content-Type": "application/json"},
@@ -180,10 +186,17 @@ def route_landing_relay_chat(
         if retrieve_statuses:
             status = retrieve_statuses[min(len(state["retrieve_requests"]) - 1, len(retrieve_statuses) - 1)]
         if status != 200:
+            if status == 202:
+                route.fulfill(
+                    status=202,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(pending_payload or {"status": "pending"}),
+                )
+                return
             route.fulfill(
                 status=status,
                 headers={"Content-Type": "application/json"},
-                body=json.dumps({"error": {"code": "selected_server_terminal"}}),
+                body=json.dumps(retrieve_error_payload or {"error": {"code": "selected_server_terminal"}}),
             )
             return
         retrieve_index = len(state["retrieve_requests"]) - 1
@@ -217,13 +230,22 @@ def route_landing_relay_chat(
         )
 
     page.route("**/api/v1/relay/responses/retrieve", handle_retrieve)
-    page.route(
-        "**/api/v1/relay/requests/cancel",
-        lambda route: (
-            state["cancel_requests"].append(route.request.post_data_json),
-            route.fulfill(status=200, headers={"Content-Type": "application/json"}, body=json.dumps({"status": "cancelled"})),
-        ),
-    )
+    def handle_cancel(route):
+        request_payload = route.request.post_data_json
+        state["cancel_requests"].append(request_payload)
+        if cancel_network_failure:
+            route.abort("connectionfailed")
+        else:
+            route.fulfill(
+                status=cancel_status,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(cancel_payload or {
+                    "status": "cancelled",
+                    "request_id": request_payload["request_id"],
+                }),
+            )
+
+    page.route("**/api/v1/relay/requests/cancel", handle_cancel)
     page.route(
         "**/api/v1/chat/completions",
         lambda route: (
@@ -298,15 +320,16 @@ def measure_landing_chat_layout(page: Page):
         () => {
             const chat = document.querySelector('.chat-container');
             const select = document.querySelector('[data-testid=landing-model-select]');
+            const contextTierSelect = document.querySelector('[data-testid=landing-context-tier-select]');
             const textarea = document.querySelector('textarea.message-input');
-            if (!chat || !select || !textarea) {
+            if (!chat || !select || !contextTierSelect || !textarea) {
                 throw new Error('missing landing chat layout node');
             }
             const chatRect = chat.getBoundingClientRect();
-            const selectRect = select.getBoundingClientRect();
+            const contextTierSelectRect = contextTierSelect.getBoundingClientRect();
             const textareaRect = textarea.getBoundingClientRect();
             return {
-                modelToTextareaGap: textareaRect.top - selectRect.bottom,
+                contextTierToTextareaGap: textareaRect.top - contextTierSelectRect.bottom,
                 chatHeight: chatRect.height,
                 textareaTopRelativeToChat: textareaRect.top - chatRect.top,
             };
@@ -361,7 +384,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     expect(textarea).to_be_visible()
     assert message_nodes.count() == 0
     first_paint_layout = measure_landing_chat_layout(page)
-    assert 20 <= first_paint_layout["modelToTextareaGap"] <= 70
+    assert 20 <= first_paint_layout["contextTierToTextareaGap"] <= 70
     expect(send_button).to_be_visible()
     expect(send_button).to_be_disabled()
     expect(page.get_by_test_id("landing-model-select")).to_be_visible()
@@ -398,7 +421,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     )
     page.wait_for_load_state("networkidle")
     hydrated_layout = measure_landing_chat_layout(page)
-    assert abs(hydrated_layout["modelToTextareaGap"] - first_paint_layout["modelToTextareaGap"]) <= 4
+    assert abs(hydrated_layout["contextTierToTextareaGap"] - first_paint_layout["contextTierToTextareaGap"]) <= 4
     assert abs(hydrated_layout["textareaTopRelativeToChat"] - first_paint_layout["textareaTopRelativeToChat"]) <= 4
     assert abs(hydrated_layout["chatHeight"] - first_paint_layout["chatHeight"]) <= 4
     assert page.get_by_test_id("landing-model-select").input_value() == "llama-3.1-8b-instruct"
@@ -1038,7 +1061,7 @@ def test_landing_chat_timeout_cancels_relay_request_once(
     page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
     page.clock.fast_forward(486_000)
     page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
-    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest.cancelled")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
 
     assert len(state["cancel_requests"]) == 1
     payload = state["cancel_requests"][0]
@@ -1053,20 +1076,421 @@ def test_landing_chat_abort_cancels_relay_request_once(
     page: Page, base_url: str, setup_servers
 ):
     state = route_landing_relay_chat(page, retrieve_statuses=[202])
+    page_errors = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
     patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.evaluate(
+        """
+        () => {
+            window.__landingUnhandledRejections = [];
+            window.__landingRetrieveCount = 0;
+            const originalFetch = window.fetch;
+            window.fetch = (...args) => {
+                const url = String(args[0]);
+                if (url.includes('/api/v1/relay/responses/retrieve')) {
+                    window.__landingRetrieveCount += 1;
+                }
+                return originalFetch(...args);
+            };
+            window.addEventListener('unhandledrejection', (event) => {
+                window.__landingUnhandledRejections.push(String(event.reason));
+            });
+        }
+        """
+    )
 
     page.locator("textarea").first.fill("cancel when leaving")
     wait_for_landing_send_enabled(page).click()
     page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.isGeneratingResponse")
+    page.clock.fast_forward(500)
+    page.wait_for_function("() => window.__landingRetrieveCount > 0")
     page.evaluate("() => { window.dispatchEvent(new Event('pagehide')); window.dispatchEvent(new Event('pagehide')); }")
-    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest.cancelled")
+    page.wait_for_function(
+        """() => {
+            const vm = document.querySelector('#app').__vue__;
+            return vm.activeRelayRequest === null && vm.isGeneratingResponse === false;
+        }"""
+    )
+    retrieve_count_after_pagehide = page.evaluate("() => window.__landingRetrieveCount")
+    page.clock.fast_forward(5_000)
 
     assert len(state["cancel_requests"]) == 1
+    assert page.evaluate("() => window.__landingRetrieveCount") == retrieve_count_after_pagehide
     payload = state["cancel_requests"][0]
     assert_cancel_payload_is_routing_metadata_only(payload)
     assert payload["reason"] == "requester_cancelled"
+    assistant_messages = page.evaluate(
+        "() => document.querySelector('#app').__vue__.chatHistory.filter((entry) => entry.role === 'assistant')"
+    )
+    assert assistant_messages == []
+    assert "cancellation could not be confirmed" not in page.locator("body").inner_text()
+    assert page_errors == []
+    assert page.evaluate("() => window.__landingUnhandledRejections") == []
+
+
+@pytest.mark.e2e
+def test_landing_chat_uses_relay_deadline_metadata(page: Page, base_url: str, setup_servers):
+    route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    deadlines = page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            const admittedAt = 100000;
+            const valid = vm.relayResponseDeadlineFromAdmission({request_ttl_seconds: 480}, admittedAt);
+            const shortened = vm.shortenRelayResponseDeadline(valid, {request_deadline_remaining_seconds: 10}, admittedAt + 1000);
+            const expired = vm.shortenRelayResponseDeadline(valid, {request_deadline_remaining_seconds: 0}, admittedAt + 2000);
+            const notExtended = vm.shortenRelayResponseDeadline(shortened, {request_ttl_seconds: 999}, admittedAt + 2000);
+            const invalid = [true, false, 0, -1, NaN, Infinity, -Infinity, '480', 'bad', null, undefined]
+                .map((value) => vm.relayResponseDeadlineFromAdmission({request_ttl_seconds: value}, admittedAt));
+            const noActiveCancellation = vm.cancelRelayRequest();
+            return Promise.resolve(noActiveCancellation).then((result) => ({valid, shortened, expired, notExtended, invalid, noActiveCancellation: result}));
+        }
+        """
+    )
+
+    # Admission is the time origin: 480 seconds plus propagation grace exactly once.
+    assert deadlines["valid"] == 585000
+    assert deadlines["shortened"] == 116000
+    assert deadlines["expired"] == 107000
+    assert deadlines["notExtended"] == deadlines["shortened"]
+    assert deadlines["invalid"] == [585000] * 11
+    assert deadlines["noActiveCancellation"] == {"attempted": False, "confirmed": False, "failure": None}
+    # A completion after the legacy 300-second budget remains inside this deadline.
+    assert 100000 + 301000 < deadlines["valid"]
+
+
+@pytest.mark.e2e
+def test_landing_chat_pagehide_without_active_request_is_quiet(page: Page, base_url: str, setup_servers):
+    route_landing_relay_chat(page)
+    errors = attach_landing_console_error_collector(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+
+    assert_no_landing_console_regressions(errors)
+    assert page.locator(".assistant-message").count() == 0
+
+
+@pytest.mark.e2e
+def test_landing_chat_response_after_300_seconds_before_admitted_deadline_succeeds(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page, admission_payload={"message": "Request received", "request_ttl_seconds": 480}
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.evaluate(
+        """
+        () => {
+            const originalFetch = window.fetch.bind(window);
+            const startedAt = Date.now();
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : input.url;
+                if (url !== '/api/v1/relay/responses/retrieve') return originalFetch(input, init);
+                if (Date.now() - startedAt <= 300000) {
+                    return Promise.resolve(new Response(JSON.stringify({status: 'pending'}), {status: 202}));
+                }
+                const request = JSON.parse(init.body);
+                return Promise.resolve(new Response(JSON.stringify({
+                    chat_history: JSON.stringify({
+                        protocol: 'tokenplace_api_v1_relay_e2ee', version: 1,
+                        request_id: request.request_id, client_public_key: request.client_public_key,
+                        api_v1_response: {message: {role: 'assistant', content: 'finished after five minutes'}}
+                    }), cipherkey: 'test-cipherkey', iv: 'test-iv'
+                }), {status: 200}));
+            };
+        }
+        """
+    )
+
+    page.locator("textarea").first.fill("take longer than five minutes")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(301_000)
+    page.wait_for_function("() => document.body.textContent.includes('finished after five minutes')")
+
+    assert state["cancel_requests"] == []
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+@pytest.mark.e2e
+def test_landing_chat_malformed_completed_response_cancels_once_and_clears_state(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.evaluate(
+        """
+        () => {
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : input.url;
+                if (url !== '/api/v1/relay/responses/retrieve') return originalFetch(input, init);
+                return Promise.resolve({ok: true, status: 200, json: async () => {
+                    throw new SyntaxError('malformed completed response');
+                }});
+            };
+        }
+        """
+    )
+
+    page.locator("textarea").first.fill("malformed completion")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+    page.wait_for_function("() => document.body.textContent.includes('Sorry, I encountered an issue')")
+
+    assert len(state["cancel_requests"]) == 1
+    assert page.locator("body").inner_text().count("Sorry, I encountered an issue") == 1
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+@pytest.mark.e2e
+def test_landing_chat_pending_deadline_expires_and_successful_cancel_is_quiet(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"message": "Request received", "request_ttl_seconds": 100},
+        retrieve_statuses=[202],
+        pending_payload={"status": "pending", "request_deadline_remaining_seconds": 1},
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("shorten my deadline")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(7_000)
+    page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
+
+    assert len(state["cancel_requests"]) == 1
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+@pytest.mark.e2e
+def test_landing_chat_tracks_admission_before_response_metadata_body(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.evaluate(
+        """
+        () => {
+            const originalFetch = window.fetch.bind(window);
+            window.admissionBodyResolve = null;
+            window.retrievalsAfterPagehide = 0;
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : input.url;
+                if (url === '/api/v1/relay/requests' && init && init.method === 'POST') {
+                    return Promise.resolve({
+                        ok: true,
+                        json: () => new Promise((resolve) => { window.admissionBodyResolve = resolve; })
+                    });
+                }
+                if (url === '/api/v1/relay/responses/retrieve') {
+                    window.retrievalsAfterPagehide += 1;
+                }
+                return originalFetch(input, init);
+            };
+        }
+        """
+    )
+
+    page.locator("textarea").first.fill("leave while admission metadata stalls")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+    page.evaluate("() => window.admissionBodyResolve({request_ttl_seconds: 480})")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.isGeneratingResponse === false")
+
+    assert len(state["cancel_requests"]) == 1
+    assert state["cancel_requests"][0]["reason"] == "requester_cancelled"
+    assert page.evaluate("() => window.retrievalsAfterPagehide") == 0
+    assert page.locator("body").inner_text().count("Sorry, I encountered an issue") == 0
+
+
+@pytest.mark.e2e
+def test_landing_chat_cancellation_contract_timeout_and_shared_promise(
+    page: Page, base_url: str, setup_servers
+):
+    route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    page.clock.install()
+    handle = page.evaluate_handle(
+        """
+        async () => {
+            const vm = document.querySelector('#app').__vue__;
+            let posts = 0;
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = (url, options) => {
+                if (url !== '/api/v1/relay/requests/cancel') return originalFetch(url, options);
+                posts += 1;
+                return new Promise((_resolve, reject) => {
+                    options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+                });
+            };
+            vm.activeRelayRequest = {
+                clientPublicKey: 'client', requestId: 'request', cancelToken: 'proof',
+                cancelled: false, cancellationAttempted: false,
+                cancellationConfirmed: false, cancellationPromise: null
+            };
+            const first = vm.cancelRelayRequest();
+            const second = vm.cancelRelayRequest();
+            const samePromise = first === second;
+            const values = await Promise.all([first, second]);
+            vm.clearActiveRelayRequest('request');
+            return {posts, samePromise, values, active: vm.activeRelayRequest};
+        }
+        """
+    )
+    page.clock.fast_forward(2_100)
+    result = handle.json_value()
+
+    assert result == {
+        "posts": 1,
+        "samePromise": True,
+        "values": [
+            {"attempted": True, "confirmed": False, "failure": "network_failure"},
+            {"attempted": True, "confirmed": False, "failure": "network_failure"},
+        ],
+        "active": None,
+    }
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "response_payload",
+    [None, {"status": "cancelled"}, {"status": "cancelled", "request_id": "other"}],
+)
+def test_landing_chat_malformed_or_mismatched_cancellation_is_unconfirmed(
+    page: Page, base_url: str, setup_servers, response_payload: dict | None
+):
+    route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    result = page.evaluate(
+        """
+        async (responsePayload) => {
+            const vm = document.querySelector('#app').__vue__;
+            window.fetch = async () => ({
+                ok: true,
+                json: async () => {
+                    if (responsePayload === null) throw new SyntaxError('missing JSON');
+                    return responsePayload;
+                }
+            });
+            vm.activeRelayRequest = {
+                clientPublicKey: 'client', requestId: 'request', cancelToken: 'proof',
+                cancelled: false, cancellationAttempted: false,
+                cancellationConfirmed: false, cancellationPromise: null
+            };
+            return vm.cancelRelayRequest();
+        }
+        """,
+        response_payload,
+    )
+
+    assert result == {"attempted": True, "confirmed": False, "failure": "unconfirmed_response"}
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("terminal_status", ["cancelled", "expired"])
+def test_landing_chat_terminal_retrieval_confirms_cancellation_without_cancel_request(
+    page: Page, base_url: str, setup_servers, terminal_status: str
+):
+    state = route_landing_relay_chat(
+        page,
+        retrieve_statuses=[410],
+        retrieve_error_payload={
+            "error": {"code": terminal_status, "status": terminal_status, "reason": terminal_status}
+        },
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.locator("textarea").first.fill("terminal relay response")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+
+    assert state["cancel_requests"] == []
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+RELAY_CANCELLATION_WARNING = (
+    "The request stopped waiting locally, but cancellation could not be confirmed. "
+    "Compute may continue briefly."
+)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("cancel_status", [500])
+def test_landing_chat_cancel_http_failure_is_one_coherent_error(
+    page: Page, base_url: str, setup_servers, cancel_status: int
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"request_ttl_seconds": 1},
+        retrieve_statuses=[202],
+        cancel_status=cancel_status,
+        cancel_payload={"error": {"code": "unavailable"}},
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("cancel failure")
+    wait_for_landing_send_enabled(page).click()
+    page.clock.fast_forward(7_000)
+    page.wait_for_function(f"() => document.body.textContent.includes({json.dumps(RELAY_CANCELLATION_WARNING)})")
+
+    body = page.locator("body").inner_text()
+    assert body.count(RELAY_CANCELLATION_WARNING) == 1
+    assert "took too long to respond" in body
+    assert len(state["cancel_requests"]) == 1
+    assert not page.evaluate("() => document.querySelector('#app').__vue__.activeRelayRequest")
+
+
+@pytest.mark.e2e
+def test_landing_chat_cancel_network_failure_is_visible(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"request_ttl_seconds": 1},
+        retrieve_statuses=[202],
+        cancel_network_failure=True,
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("network cancellation failure")
+    wait_for_landing_send_enabled(page).click()
+    page.clock.fast_forward(7_000)
+    page.wait_for_function(f"() => document.body.textContent.includes({json.dumps(RELAY_CANCELLATION_WARNING)})")
+
+    assert page.locator("body").inner_text().count(RELAY_CANCELLATION_WARNING) == 1
+    assert len(state["cancel_requests"]) == 1
 
 
 def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
@@ -1668,13 +2092,18 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
         ),
     )
     page.route(
-        "**/api/v1/relay/servers/next",
+        "**/api/v1/relay/servers/next**",
         lambda route: (
             state.__setitem__("next_calls", state["next_calls"] + 1),
             route.fulfill(
                 status=200,
                 headers={"Content-Type": "application/json"},
-                body=json.dumps({"server_public_key": SERVER_PUBLIC_KEY_B64}),
+                body=json.dumps(
+                    {
+                        "server_public_key": SERVER_PUBLIC_KEY_B64,
+                        "selected_context_tier": "8k-fast",
+                    }
+                ),
             ),
         ),
     )
@@ -1722,17 +2151,19 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
 
     model_select = page.get_by_test_id("landing-model-select")
     model_select.wait_for(state="visible")
-    assert model_select.input_value() == "llama-3.1-8b-instruct"
-    assert "llama-3.1-8b-instruct (emergency fallback)" in model_select.locator("option").inner_text()
+    assert model_select.input_value() == "qwen3-8b-instruct"
+    assert "qwen3-8b-instruct (emergency fallback)" in model_select.locator("option").inner_text()
     assert "Could not load the API v1 model list" in page.locator(".model-error").inner_text()
 
     page.locator("textarea").first.fill("hello")
-    wait_for_landing_send_enabled(page).click()
+    with page.expect_request("**/api/v1/relay/requests") as request_info:
+        wait_for_landing_send_enabled(page).click()
 
-    page.locator(".assistant-message").last.wait_for(state="visible")
-    assert state["relay_requests"], "expected the landing chat to POST the API v1 fallback relay payload"
-    request_envelope = json.loads(state["relay_requests"][-1]["ciphertext"])
-    assert request_envelope["api_v1_request"]["model"] == "llama-3.1-8b-instruct"
+    assistant_message = page.locator(".assistant-message").filter(has_text="Fallback model acknowledged.")
+    assistant_message.wait_for(state="visible")
+    expect(assistant_message).to_have_text("Fallback model acknowledged.")
+    request_envelope = json.loads(request_info.value.post_data_json["ciphertext"])
+    assert request_envelope["api_v1_request"]["model"] == "qwen3-8b-instruct"
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 
@@ -2251,8 +2682,15 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "Sorry, I encountered an issue generating a response. Please try again.",
             "Sorry, the relay returned an invalid response. Please try again.",
             "Sorry, an error occurred while sending your message. Please try again.",
+            "The relay is unavailable right now. Please try again later.",
         }
+        cancellation_failure_text = (
+            "The request stopped waiting locally, but cancellation could not be confirmed."
+        )
         max_attempts = 10
+        observed_max_tokens = None
+        relay_request_count = len(relay_requests)
+        accepted_attempt = False
         for attempt in range(max_attempts):
             relay_ready, relay_server_selection_body = wait_for_relay_ready(
                 required_consecutive=2,
@@ -2263,6 +2701,8 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 "relay lost active server selection while waiting to retry chat request. "
                 f"Last response body: {relay_server_selection_body!r}"
             )
+            relay_request_count_before = len(relay_requests)
+            page.evaluate("window.__landingRequestedMaxTokens = null")
             textarea.fill(prompt_text)
             wait_for_landing_send_enabled(page).click()
             user_message_count += 1
@@ -2287,18 +2727,29 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 },
             )
             assistant_text = assistant_message.inner_text().strip()
+            observed_max_tokens = page.evaluate("window.__landingRequestedMaxTokens")
+            relay_request_count = len(relay_requests)
             if (
                 assistant_text
                 and assistant_text not in transient_bridge_errors
                 and assistant_text not in disallowed_assistant_outputs
+                and cancellation_failure_text not in assistant_text
+                and observed_max_tokens == 8192
+                and relay_request_count > relay_request_count_before
             ):
+                accepted_attempt = True
                 break
 
             if attempt < max_attempts - 1:
                 # Give the relay/bridge path a brief backoff window before retrying.
                 page.wait_for_timeout(800 * (attempt + 1))
 
-        assert assistant_text, "assistant response should not be empty"
+        attempt_diagnostics = (
+            f"last assistant text={assistant_text!r}, observed max_tokens={observed_max_tokens!r}, "
+            f"relay request count={relay_request_count}"
+        )
+        assert accepted_attempt, f"no retry satisfied the API v1 request contract; {attempt_diagnostics}"
+        assert assistant_text, f"assistant response should not be empty; {attempt_diagnostics}"
         assert assistant_text.strip(), "assistant response should not be empty"
         assert assistant_text.lower() != "stub"
         assert assistant_text != "Sorry, I encountered an issue generating a response. Please try again."
@@ -2306,9 +2757,9 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert assistant_text != "Sorry, the relay returned an invalid response. Please try again."
         assert assistant_text not in transient_bridge_errors
         assert "Unknown streaming error" not in assistant_text
-        assert page.evaluate("window.__landingRequestedMaxTokens") == 8192
+        assert observed_max_tokens == 8192, attempt_diagnostics
 
-        assert len(relay_requests) >= 1
+        assert relay_request_count >= 1, attempt_diagnostics
         assert chat_completion_requests == []
         assert v2_requests == []
 

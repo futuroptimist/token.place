@@ -2496,7 +2496,10 @@ def test_api_v1_response_retrieve_returns_pending_for_known_request_id(client):
         json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-pending'},
     )
     assert pending.status_code == 202
-    assert pending.get_json() == {'status': 'pending'}
+    pending_payload = pending.get_json()
+    assert pending_payload['status'] == 'pending'
+    assert 0 < pending_payload['request_deadline_remaining_seconds'] <= queued.get_json()['request_ttl_seconds']
+    assert pending_payload['request_ttl_seconds'] == pending_payload['request_deadline_remaining_seconds']
 
 
 def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(client, monkeypatch):
@@ -2526,7 +2529,7 @@ def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(
         json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-long-running'},
     )
     assert pending.status_code == 202
-    assert pending.get_json() == {'status': 'pending'}
+    assert pending.get_json()['status'] == 'pending'
 
 
 def test_api_v1_response_retrieve_returns_terminal_after_unregistered_server_drops_queue(client):
@@ -2551,7 +2554,7 @@ def test_api_v1_response_retrieve_returns_terminal_after_unregistered_server_dro
         json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
     )
     assert pending.status_code == 202
-    assert pending.get_json() == {'status': 'pending'}
+    assert pending.get_json()['status'] == 'pending'
 
     unregistered = client.post('/api/v1/relay/servers/unregister', json={'server_public_key': DUMMY_SERVER_PUB_KEY, 'control_credential': register.get_json()['control_credential']})
     assert unregistered.status_code == 200

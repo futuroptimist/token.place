@@ -1,10 +1,14 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
+const RELAY_REQUEST_TERMINATED = Object.freeze({ relayRequestTerminated: true });
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
 const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1000;
-// Five seconds beyond the relay-owned 480-second inference deadline lets a
-// completed ciphertext response propagate before the browser aborts.
-const RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000;
+// Legacy relays that omit valid deadline metadata retain the former 480-second
+// inference budget plus five seconds for ciphertext response propagation.
+const LEGACY_RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000;
+const RELAY_RESPONSE_PROPAGATION_GRACE_MS = 5000;
+const RELAY_CANCELLATION_CONFIRMATION_TIMEOUT_MS = 2000;
+const RELAY_CANCELLATION_UNCONFIRMED_MESSAGE = 'The request stopped waiting locally, but cancellation could not be confirmed. Compute may continue briefly.';
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
 const DEFAULT_CONTEXT_TIER = 'auto';
@@ -913,14 +917,28 @@ new Vue({
             return ASSISTANT_GENERIC_FALLBACK_MESSAGE;
         },
 
-        async cancelRelayRequest(reason = 'requester_cancelled') {
+        cancelRelayRequest(reason = 'requester_cancelled') {
             const activeRequest = this.activeRelayRequest;
-            if (!activeRequest || activeRequest.cancelled) {
-                return;
+            if (!activeRequest) {
+                return Promise.resolve({ attempted: false, confirmed: false, failure: null });
             }
+            if (activeRequest.cancellationAttempted) {
+                return activeRequest.cancellationPromise;
+            }
+            activeRequest.cancellationAttempted = true;
             activeRequest.cancelled = true;
+            activeRequest.cancellationPromise = this.sendRelayCancellation(activeRequest, reason);
+            return activeRequest.cancellationPromise;
+        },
+
+        async sendRelayCancellation(activeRequest, reason) {
+            const controller = new AbortController();
+            const confirmationTimeout = setTimeout(
+                () => controller.abort(),
+                RELAY_CANCELLATION_CONFIRMATION_TIMEOUT_MS
+            );
             try {
-                await fetch('/api/v1/relay/requests/cancel', {
+                const response = await fetch('/api/v1/relay/requests/cancel', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -932,15 +950,53 @@ new Vue({
                         status: 'cancelled',
                         reason
                     }),
-                    keepalive: true
+                    keepalive: true,
+                    signal: controller.signal
                 });
-            } catch (error) {
-                console.warn('Unable to cancel API v1 relay request:', error);
+                let payload = null;
+                try {
+                    payload = await response.json();
+                } catch (_jsonError) {
+                    payload = null;
+                }
+                const terminalStatus = payload && typeof payload === 'object' ? payload.status : null;
+                const confirmed = response.ok
+                    && ['cancelled', 'expired'].includes(terminalStatus)
+                    && payload.request_id === activeRequest.requestId;
+                activeRequest.cancellationConfirmed = confirmed;
+                if (!confirmed) {
+                    console.warn('API v1 relay request cancellation was not confirmed.');
+                }
+                return { attempted: true, confirmed, failure: confirmed ? null : 'unconfirmed_response' };
+            } catch (_error) {
+                activeRequest.cancellationConfirmed = false;
+                console.warn('API v1 relay request cancellation was not confirmed.');
+                return { attempted: true, confirmed: false, failure: 'network_failure' };
+            } finally {
+                clearTimeout(confirmationTimeout);
             }
         },
 
         handleRelayPageHide() {
-            this.cancelRelayRequest('requester_cancelled');
+            const activeRequest = this.activeRelayRequest;
+            const requestId = activeRequest && activeRequest.requestId;
+            this.terminateRelayRequestLocally(activeRequest);
+            const cancellationPromise = this.cancelRelayRequest('requester_cancelled');
+            this.clearActiveRelayRequest(requestId);
+            Promise.resolve(cancellationPromise)
+                .catch(() => null)
+                .finally(() => this.clearActiveRelayRequest(requestId));
+        },
+
+        terminateRelayRequestLocally(activeRequest) {
+            if (!activeRequest || activeRequest.terminated) {
+                return;
+            }
+            activeRequest.terminated = true;
+            if (activeRequest.retrievalController) {
+                activeRequest.retrievalController.abort();
+            }
+            activeRequest.resolveTermination(RELAY_REQUEST_TERMINATED);
         },
 
         clearActiveRelayRequest(requestId) {
@@ -974,15 +1030,60 @@ new Vue({
             return 1;
         },
 
-        async retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken) {
-            const timeoutMs = RELAY_RESPONSE_POLL_TIMEOUT_MS;
+        validRelayDeadlineSeconds(value) {
+            return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+        },
+
+        validRelayDeadlineRemainingSeconds(value) {
+            return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+        },
+
+        relayResponseDeadlineFromAdmission(admissionPayload, admittedAtMs) {
+            const ttlSeconds = admissionPayload && typeof admissionPayload === 'object'
+                ? this.validRelayDeadlineSeconds(admissionPayload.request_ttl_seconds)
+                : null;
+            return ttlSeconds === null
+                ? admittedAtMs + LEGACY_RELAY_RESPONSE_POLL_TIMEOUT_MS
+                : admittedAtMs + (ttlSeconds * 1000) + RELAY_RESPONSE_PROPAGATION_GRACE_MS;
+        },
+
+        shortenRelayResponseDeadline(currentDeadlineMs, pendingPayload, observedAtMs) {
+            if (!pendingPayload || typeof pendingPayload !== 'object') {
+                return currentDeadlineMs;
+            }
+            const candidates = [
+                this.validRelayDeadlineRemainingSeconds(pendingPayload.request_deadline_remaining_seconds),
+                this.validRelayDeadlineSeconds(pendingPayload.request_ttl_seconds)
+            ].filter((value) => value !== null);
+            if (!candidates.length) {
+                return currentDeadlineMs;
+            }
+            const relayDeadlineMs = observedAtMs + (Math.min(...candidates) * 1000) + RELAY_RESPONSE_PROPAGATION_GRACE_MS;
+            return Math.min(currentDeadlineMs, relayDeadlineMs);
+        },
+
+        cancellationFailureUserMessage(baseMessage, cancellationResult) {
+            return cancellationResult && cancellationResult.attempted && !cancellationResult.confirmed
+                ? `${baseMessage} ${RELAY_CANCELLATION_UNCONFIRMED_MESSAGE}`
+                : baseMessage;
+        },
+
+        async retrieveRelayResponse(clientPublicKeyB64, requestId, responseDeadlineMs) {
             const pollIntervalMs = 500;
-            const deadline = Date.now() + timeoutMs;
+            let deadline = responseDeadlineMs;
+            const activeRequest = this.activeRelayRequest;
+            const waitForOperation = (operation) => Promise.race([
+                operation,
+                activeRequest.terminationPromise
+            ]);
 
             while (Date.now() < deadline) {
+                if (activeRequest.terminated) {
+                    return RELAY_REQUEST_TERMINATED;
+                }
                 let response;
                 try {
-                    response = await fetch('/api/v1/relay/responses/retrieve', {
+                    response = await waitForOperation(fetch('/api/v1/relay/responses/retrieve', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json'
@@ -990,44 +1091,109 @@ new Vue({
                         body: JSON.stringify({
                             client_public_key: clientPublicKeyB64,
                             request_id: requestId
-                        })
-                    });
+                        }),
+                        signal: activeRequest.retrievalController.signal
+                    }));
                 } catch (error) {
-                    await this.cancelRelayRequest('requester_cancelled');
-                    throw error;
+                    if (activeRequest.terminated) {
+                        return RELAY_REQUEST_TERMINATED;
+                    }
+                    const cancellation = await this.cancelRelayRequest('requester_cancelled');
+                    this.clearActiveRelayRequest(requestId);
+                    return { error: { userMessage: this.cancellationFailureUserMessage(ASSISTANT_GENERIC_FALLBACK_MESSAGE, cancellation) } };
+                }
+                if (response === RELAY_REQUEST_TERMINATED) {
+                    return response;
                 }
 
                 if (response.status === 202) {
-                    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+                    let pendingPayload = null;
+                    try {
+                        pendingPayload = await waitForOperation(response.json());
+                    } catch (_jsonError) {
+                        if (activeRequest.terminated) {
+                            return RELAY_REQUEST_TERMINATED;
+                        }
+                        pendingPayload = null;
+                    }
+                    if (pendingPayload === RELAY_REQUEST_TERMINATED) {
+                        return pendingPayload;
+                    }
+                    deadline = this.shortenRelayResponseDeadline(deadline, pendingPayload, Date.now());
+                    const pollDelay = await waitForOperation(
+                        new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+                    );
+                    if (pollDelay === RELAY_REQUEST_TERMINATED) {
+                        return pollDelay;
+                    }
                     continue;
                 }
 
                 if (!response.ok) {
                     let errorData = null;
                     try {
-                        errorData = await response.json();
+                        errorData = await waitForOperation(response.json());
                     } catch (_jsonError) {
+                        if (activeRequest.terminated) {
+                            return RELAY_REQUEST_TERMINATED;
+                        }
                         errorData = null;
                     }
+                    if (errorData === RELAY_REQUEST_TERMINATED) {
+                        return errorData;
+                    }
                     const userMessage = this.getUserFacingRelayRetrieveError(response.status);
+                    const terminalStatus = errorData && typeof errorData === 'object'
+                        && errorData.error && typeof errorData.error === 'object'
+                        ? errorData.error.status
+                        : null;
+                    const relayConfirmedTerminal = response.status === 410
+                        && ['cancelled', 'expired'].includes(terminalStatus);
+                    let cancellation;
+                    if (relayConfirmedTerminal) {
+                        const activeRequest = this.activeRelayRequest;
+                        if (activeRequest && activeRequest.requestId === requestId) {
+                            activeRequest.cancelled = true;
+                            activeRequest.cancellationConfirmed = true;
+                        }
+                        cancellation = { attempted: false, confirmed: true, failure: null };
+                    } else {
+                        cancellation = await this.cancelRelayRequest('requester_cancelled');
+                    }
                     this.clearActiveRelayRequest(requestId);
                     return {
                         error: {
-                            userMessage,
+                            userMessage: this.cancellationFailureUserMessage(userMessage, cancellation),
                             terminalSelectedServer: this.isTerminalSelectedServerError(response.status, errorData)
                         }
                     };
                 }
 
-                const result = await response.json();
-                this.clearActiveRelayRequest(requestId);
-                return result;
+                try {
+                    return await waitForOperation(response.json());
+                } catch (_jsonError) {
+                    if (activeRequest.terminated) {
+                        return RELAY_REQUEST_TERMINATED;
+                    }
+                    const cancellation = await this.cancelRelayRequest('requester_cancelled');
+                    return {
+                        error: {
+                            userMessage: this.cancellationFailureUserMessage(
+                                ASSISTANT_GENERIC_FALLBACK_MESSAGE,
+                                cancellation
+                            )
+                        }
+                    };
+                } finally {
+                    this.clearActiveRelayRequest(requestId);
+                }
             }
 
-            await this.cancelRelayRequest('client_timeout');
+            const cancellation = await this.cancelRelayRequest('client_timeout');
+            this.clearActiveRelayRequest(requestId);
             return {
                 error: {
-                    userMessage: 'The LLM server took too long to respond. Please try again.'
+                    userMessage: this.cancellationFailureUserMessage('The LLM server took too long to respond. Please try again.', cancellation)
                 }
             };
         },
@@ -1134,14 +1300,40 @@ new Vue({
                     };
                 }
 
-                this.activeRelayRequest = {
+                const admittedAtMs = Date.now();
+                const activeRelayRequest = {
                     clientPublicKey: clientPublicKeyB64,
                     requestId,
                     cancelToken,
-                    cancelled: false
+                    cancelled: false,
+                    cancellationAttempted: false,
+                    cancellationConfirmed: false,
+                    cancellationPromise: null,
+                    terminated: false,
+                    retrievalController: new AbortController(),
+                    terminationPromise: null,
+                    resolveTermination: null
                 };
+                activeRelayRequest.terminationPromise = new Promise((resolve) => {
+                    activeRelayRequest.resolveTermination = resolve;
+                });
+                this.activeRelayRequest = activeRelayRequest;
 
-                const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken);
+                let admissionPayload = null;
+                try {
+                    admissionPayload = await dispatchResponse.json();
+                } catch (_jsonError) {
+                    admissionPayload = null;
+                }
+                if (this.activeRelayRequest !== activeRelayRequest || activeRelayRequest.cancelled) {
+                    return RELAY_REQUEST_TERMINATED;
+                }
+                const responseDeadlineMs = this.relayResponseDeadlineFromAdmission(admissionPayload, admittedAtMs);
+
+                const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, responseDeadlineMs);
+                if (encryptedResponse === RELAY_REQUEST_TERMINATED) {
+                    return encryptedResponse;
+                }
                 if (encryptedResponse && encryptedResponse.error) {
                     return encryptedResponse;
                 }
@@ -1214,6 +1406,9 @@ new Vue({
                     });
                     preserveSelectedServerForDispatch = false;
                     forceReselectForDispatch = false;
+                    if (response === RELAY_REQUEST_TERMINATED) {
+                        return response;
+                    }
                     if (response && response.error && response.error.terminalSelectedServer === true && this.selectedServerPublicKeyB64) {
                         terminallyFailedServerPublicKeysB64.add(this.selectedServerPublicKeyB64);
                     }
@@ -1450,6 +1645,10 @@ new Vue({
                 // Relay-path landing chat in v0.1.0 is API v1-only and non-streaming.
                 let response = await this.sendMessageApi(messageContent);
 
+                if (response === RELAY_REQUEST_TERMINATED) {
+                    return;
+                }
+
                 // Process the response
                 if (response) {
                     const normalizedError = this.normalizeApiV1ResponseError(response);
@@ -1520,7 +1719,11 @@ new Vue({
         if (typeof window !== 'undefined') {
             window.removeEventListener('pagehide', this.handleRelayPageHide);
         }
+        const activeRequest = this.activeRelayRequest;
+        const activeRequestId = activeRequest && activeRequest.requestId;
+        this.terminateRelayRequestLocally(activeRequest);
         this.cancelRelayRequest('requester_cancelled');
+        this.clearActiveRelayRequest(activeRequestId);
         if (!Array.isArray(this.chatHistory)) {
             return;
         }

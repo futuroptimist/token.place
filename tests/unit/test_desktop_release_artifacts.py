@@ -3015,7 +3015,7 @@ def test_windows_metadata_readers_use_environment_path_and_structured_json(monke
 
     def fake_run(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        assert '$args[0]' not in cmd[3]
+        assert '$args[0]' not in cmd[-1]
         assert kwargs['env']['TOKEN_PLACE_ARTIFACT_PATH'] == str(artifact)
         assert str(artifact) not in cmd
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.3.0', 'FileVersion': '0.1.3.0'}), stderr='')
@@ -3025,7 +3025,7 @@ def test_windows_metadata_readers_use_environment_path_and_structured_json(monke
     assert validator._read_pe_version_info(artifact) == {'ProductVersion': '0.1.3.0', 'FileVersion': '0.1.3.0'}
 
     def fake_msi_run(cmd, **kwargs):
-        assert '$args[0]' not in cmd[3]
+        assert '$args[0]' not in cmd[-1]
         assert kwargs['env']['TOKEN_PLACE_ARTIFACT_PATH'] == str(artifact)
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.3.0'}), stderr='')
 
@@ -3126,6 +3126,112 @@ def test_windows_validator_metadata_and_binary_name_failure_edges(tmp_path, monk
     monkeypatch.setattr(validator, 'CARGO_MANIFEST', cargo)
     with pytest.raises(validator.ValidationError, match='unable to determine'):
         validator._expected_tauri_binary_name()
+
+
+def test_powershell_json_retries_once_after_timeout_then_succeeds(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'token.place-desktop-0.1.3-setup.exe'
+    artifact.write_bytes(b'MZ')
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if len(calls) == 1:
+            raise validator.subprocess.TimeoutExpired(cmd, kwargs.get('timeout'))
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({'ProductVersion': '0.1.3.0'}), stderr='')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    data = validator._powershell_json('ConvertTo-Json @{}', artifact, description='metadata')
+    assert data == {'ProductVersion': '0.1.3.0'}
+    assert len(calls) == 2
+
+
+def test_powershell_json_gives_up_after_max_attempts_on_repeated_timeout(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'token.place-desktop-0.1.3-setup.exe'
+    artifact.write_bytes(b'MZ')
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        raise validator.subprocess.TimeoutExpired(cmd, kwargs.get('timeout'))
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    with pytest.raises(validator.ValidationError):
+        validator._powershell_json('ConvertTo-Json @{}', artifact, description='metadata')
+    assert len(calls) == validator.POWERSHELL_READER_MAX_ATTEMPTS == 2
+
+
+def test_powershell_json_timeout_error_message_is_informative_and_sanitized(tmp_path, monkeypatch):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'secret-user-path-installer.exe'
+    artifact.write_bytes(b'MZ')
+    script = 'Get-Item -LiteralPath $env:TOKEN_PLACE_ARTIFACT_PATH | ConvertTo-Json'
+
+    def fake_run(cmd, **kwargs):
+        raise validator.subprocess.TimeoutExpired(cmd, kwargs.get('timeout'))
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    with pytest.raises(validator.ValidationError) as excinfo:
+        validator._powershell_json(script, artifact, description='PE version')
+    message = str(excinfo.value)
+    assert 'PE version' in message
+    assert artifact.name in message
+    assert str(validator.POWERSHELL_READER_TIMEOUT_SECONDS) in message
+    assert str(validator.POWERSHELL_READER_MAX_ATTEMPTS) in message
+    assert str(tmp_path) not in message
+    assert 'Get-Item -LiteralPath' not in message
+
+
+@pytest.mark.parametrize(
+    'returncode,stdout',
+    [
+        (9, '{}'),
+        (0, ''),
+        (0, 'not-json'),
+        (0, '[]'),
+    ],
+)
+def test_powershell_json_deterministic_failures_do_not_retry(tmp_path, monkeypatch, returncode, stdout):
+    validator = _load_windows_release_validator()
+    artifact = tmp_path / 'token.place-desktop-0.1.3-setup.exe'
+    artifact.write_bytes(b'MZ')
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr='')
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_run)
+    with pytest.raises(validator.ValidationError):
+        validator._powershell_json('ConvertTo-Json @{}', artifact, description='metadata')
+    assert len(calls) == 1
+
+
+def test_windows_validator_step_retries_only_on_legacy_thirty_second_timeout_signature():
+    # The legacy (pre-fix) script's __main__ guard catches TimeoutExpired as a
+    # bare Exception and prints only str(exc), which never contains the class
+    # name "subprocess.TimeoutExpired" -- only its __main__ wrapper text plus
+    # the TimeoutExpired message itself. The workflow's retry gate must match
+    # what that old script actually prints, not the exception's class name.
+    validator = _load_windows_release_validator()
+    legacy_message = f'Windows release artifact validation failed: {validator.subprocess.TimeoutExpired(["powershell"], 30)}'
+    assert 'subprocess.TimeoutExpired' not in legacy_message
+    assert 'timed out after 30 seconds' in legacy_message
+
+    text = WORKFLOW.read_text(encoding='utf-8')
+    block = _extract_workflow_job_block(text, 'build')
+    assert 'Windows release artifact validation failed' in block
+    assert 'timed out after 30 seconds' in block
+    assert 'validator_max_attempts=2' in block
+
+
+def test_windows_validator_step_prepares_diagnostics_dir_before_invoking_python_validator():
+    text = WORKFLOW.read_text(encoding='utf-8')
+    block = _extract_workflow_job_block(text, 'build')
+    mkdir_index = block.index('mkdir -p "${installer_artifact_dir}"')
+    python_index = block.index('python ../scripts/validate_windows_desktop_release_artifacts.py')
+    assert mkdir_index < python_index
 
 
 def _load_publish_step(name: str) -> dict:

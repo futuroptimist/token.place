@@ -3944,6 +3944,7 @@ def test_windows_installer_identity_cleanup_polling_reports_residual_categories(
     snapshot = _empty_snapshot(guard)
     times = iter([0.0, 0.2, 0.4, 0.6])
     monkeypatch.setattr(guard, 'residual_authority_categories', lambda before: ['registry', 'processes'])
+    monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: snapshot)
 
     with pytest.raises(guard.InstallerIdentityError, match='registry, processes'):
         guard.wait_for_cleanup_convergence(
@@ -3953,6 +3954,85 @@ def test_windows_installer_identity_cleanup_polling_reports_residual_categories(
             monotonic=lambda: next(times),
             sleeper=lambda _: None,
         )
+
+
+def test_windows_installer_identity_cleanup_can_converge_after_twenty_seconds(monkeypatch) -> None:
+    guard = _load_windows_installer_identity()
+    snapshot = _empty_snapshot(guard)
+    now = {'value': 0.0}
+    monkeypatch.setattr(
+        guard,
+        'residual_authority_categories',
+        lambda before: ['shortcuts'] if now['value'] < 25.0 else [],
+    )
+    monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: snapshot)
+
+    guard.wait_for_cleanup_convergence(
+        snapshot,
+        monotonic=lambda: now['value'],
+        sleeper=lambda seconds: now.__setitem__('value', now['value'] + seconds),
+    )
+
+    assert now['value'] == 25.0
+    assert guard.WINDOWS_UNINSTALL_CLEANUP_TIMEOUT_SECONDS == 90.0
+
+
+def test_windows_installer_identity_cleanup_timeout_has_exact_shortcut_evidence(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    shortcut = guard.Shortcut(tmp_path / 'Token Place.lnk', tmp_path / 'missing-token.place.exe')
+    snapshot = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [], [shortcut.target]), [])
+    now = {'value': 0.0}
+    monkeypatch.setattr(guard, 'residual_authority_categories', lambda before: ['shortcuts'])
+    monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: snapshot)
+
+    with pytest.raises(guard.InstallerIdentityError) as exc_info:
+        guard.wait_for_cleanup_convergence(
+            snapshot,
+            monotonic=lambda: now['value'],
+            sleeper=lambda seconds: now.__setitem__('value', now['value'] + seconds),
+        )
+
+    diagnostic = str(exc_info.value)
+    assert 'after 90.0s' in diagnostic
+    assert f'path={shortcut.path}' in diagnostic
+    assert f'target={shortcut.target}' in diagnostic
+    assert 'target_exists=False' in diagnostic
+    assert 'present_before_uninstall=True' in diagnostic
+
+
+def test_windows_installer_identity_uninstall_reinventory_is_bounded_and_logs_are_distinct(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    nsis = guard.RegistryEntry('nsis-key', 'token.place', r'C:\\app\\uninstall.exe', '', False, '')
+    msi = guard.RegistryEntry('msi-key', 'token.place', '', '', True, '{PRODUCT}')
+    empty = _empty_snapshot(guard)
+    inventories = iter([[nsis], [nsis, msi], [nsis, msi]])
+    calls = []
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: empty)
+    monkeypatch.setattr(guard, 'inventory_registry_entries', lambda: next(inventories))
+    monkeypatch.setattr(guard, 'wait_for_cleanup_convergence', lambda *args, **kwargs: None)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, f'output-{len(calls)}')
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    guard.uninstall_best_effort(tmp_path / 'scenario' / 'uninstall.log')
+
+    assert len(calls) == 2
+    logs = sorted((tmp_path / 'scenario').glob('uninstall-invocation-*.log'))
+    assert len(logs) == 2
+    assert logs[0] != logs[1]
+    contents = {log.read_text(encoding='utf-8').splitlines()[0] for log in logs}
+    assert contents == {'kind=nsis', 'kind=msi'}
+
+
+@pytest.mark.parametrize('category', ['shortcuts', 'registry', 'executables', 'processes'])
+def test_windows_installer_identity_strict_cleanup_postcondition_keeps_every_authority_category(monkeypatch, category) -> None:
+    guard = _load_windows_installer_identity()
+    monkeypatch.setattr(guard, 'residual_authority_categories', lambda before=None: [category])
+    with pytest.raises(guard.InstallerIdentityError, match=category):
+        guard.verify_no_authority_remains()
 
 
 def test_split_uninstall_command_handles_quoted_and_unquoted_forms() -> None:
@@ -5368,6 +5448,7 @@ def test_windows_installer_identity_uninstall_best_effort_rejects_bad_exit(monke
 
     monkeypatch.setattr(guard.sys, 'platform', 'win32')
     monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: snapshot)
+    monkeypatch.setattr(guard, 'inventory_registry_entries', lambda: [entry])
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)

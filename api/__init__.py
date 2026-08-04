@@ -566,6 +566,20 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         if route_limit is None or request.method != "POST":
             return None
 
+        # Progress is the only control-plane request carrying a comparatively
+        # large opaque envelope.  Bound it before JSON parsing (including when
+        # a chunked request has no Content-Length), otherwise get_json() below
+        # would buffer an attacker-controlled body before the route can reject
+        # it.  Cache only the bounded bytes so the route sees the same body.
+        if route == "/api/v1/relay/progress":
+            body_limit = 16 * 1024
+            if request.content_length is not None and request.content_length > body_limit:
+                return jsonify({"error": {"message": "Progress envelope too large", "code": 413}}), 413
+            raw_body = request.stream.read(body_limit + 1)
+            if len(raw_body) > body_limit:
+                return jsonify({"error": {"message": "Progress envelope too large", "code": 413}}), 413
+            request._cached_data = raw_body
+
         remote_address = get_remote_address()
         checks: list[tuple[str, str, Any]] = [
             ("client_ip", remote_address, route_limit["ip"])
@@ -579,7 +593,7 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         identity_kind, identity_value = _control_plane_identity_for_request(route, data)
         allow_identity_bucket = _relay_server_token_boundary_has_configured_token()
         if (
-            route == "/api/v1/relay/servers/control"
+            route in {"/api/v1/relay/servers/control", "/api/v1/relay/progress"}
             and identity_kind != "client_ip"
             and identity_value != remote_address
         ):

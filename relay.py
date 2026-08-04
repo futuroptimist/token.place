@@ -635,6 +635,7 @@ def _normalise_http_route() -> str:
         "api_v1_relay_requests_cancel": "/api/v1/relay/requests/cancel",
         "api_v1_relay_responses": "/api/v1/relay/responses",
         "api_v1_relay_responses_retrieve": "/api/v1/relay/responses/retrieve",
+        "api_v1_relay_progress": "/api/v1/relay/progress",
         "api_v1_relay_servers_register": "/api/v1/relay/servers/register",
         "api_v1_relay_servers_unregister": "/api/v1/relay/servers/unregister",
         "api_v1_relay_servers_poll": "/api/v1/relay/servers/poll",
@@ -3339,18 +3340,9 @@ _API_V1_PROGRESS_CLIENT_FIELDS = {
 @app.route('/api/v1/relay/progress', methods=['POST'])
 def api_v1_relay_progress():
     """Accept one relay-blind, owner-authenticated encrypted progress update."""
-    limit = 16 * 1024
-    if request.content_length is not None and request.content_length > limit:
-        return jsonify({'error': {'message': 'Progress envelope too large', 'code': 413}}), 413
-    # Read at most one byte beyond the cap.  get_data() would buffer an
-    # unbounded chunked body before allowing us to enforce the limit.
-    raw_body = (request.get_data(cache=True) if request.content_length is not None
-                else request.stream.read(limit + 1))
-    if len(raw_body) > limit:
-        return jsonify({'error': {'message': 'Progress envelope too large', 'code': 413}}), 413
-    # Restore the bounded body for the shared authentication helper, which
-    # validates JSON credentials before endpoint-specific schema checks.
-    request._cached_data = raw_body
+    # The control-plane before_request hook has already bounded and cached this
+    # body before its authentication-aware rate-limit identity lookup.
+    raw_body = request.get_data(cache=True)
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
@@ -3359,15 +3351,19 @@ def api_v1_relay_progress():
     except (TypeError, ValueError, UnicodeDecodeError):
         data = None
     if not isinstance(data, dict) or set(data) != _API_V1_PROGRESS_FIELDS:
+        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_schema"})
         return jsonify({'error': {'message': 'Invalid encrypted progress schema', 'code': 400}}), 400
     if _payload_has_plaintext_fields(data):
+        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_schema"})
         return jsonify({'error': {'message': 'Plaintext progress is forbidden', 'code': 400}}), 400
     server_key = data.get('server_public_key')
     client_key = data.get('client_public_key')
     request_id = data.get('request_id')
     if data.get('protocol') != 'tokenplace_api_v1_relay_e2ee' or data.get('version') != 1:
+        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_schema"})
         return jsonify({'error': {'message': 'Invalid encrypted progress protocol', 'code': 400}}), 400
     if not all(isinstance(data.get(key), str) and data[key] for key in _API_V1_PROGRESS_FIELDS - {'version'}):
+        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_schema"})
         return jsonify({'error': {'message': 'Invalid encrypted progress envelope', 'code': 400}}), 400
     now = time.monotonic()
     with api_v1_terminal_transition_lock:
@@ -3375,20 +3371,23 @@ def api_v1_relay_progress():
             server = known_servers.get(server_key)
             if not (isinstance(server, dict) and server.get(API_V1_SERVER_MARKER)
                     and _api_v1_server_control_credential_valid(server, data.get('control_credential'))):
+                LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_auth"})
                 return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
             with api_v1_in_flight_requests_lock:
                 entries = server.get('api_v1_in_flight_requests')
                 entry = entries.get(request_id) if isinstance(entries, dict) else None
                 if not _in_flight_entry_matches_client(entry, client_key):
+                    LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_lifecycle"})
                     return jsonify({'error': {'message': 'Progress request is not active for this owner', 'code': 410}}), 410
                 deadline = _valid_request_deadline_monotonic(entry.get('request_deadline_monotonic'))
                 if deadline is not None and deadline <= now:
+                    LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_lifecycle"})
                     return jsonify({'error': {'message': 'Progress request has expired', 'code': 410}}), 410
         envelope = {key: data[key] for key in _API_V1_PROGRESS_CLIENT_FIELDS}
         with client_progress_lock:
             replaced = (client_key, request_id) in client_progress
             client_progress[(client_key, request_id)] = envelope
-    LOGGER.info("relay.api_v1.progress_accepted", extra={"progress_state": "replaced" if replaced else "accepted"})
+    LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "replaced" if replaced else "accepted"})
     return jsonify({'message': 'Encrypted progress accepted'}), 202
 
 
@@ -3415,15 +3414,22 @@ def api_v1_relay_responses_retrieve():
             status = terminal.get('status', 'cancelled')
             return jsonify({'error': {'message': f'Request {status}', 'code': status, 'status': status, 'reason': terminal.get('reason', status)}}), 410
     if response is None:
-        if _is_request_pending(client_public_key, request_id):
+        # Pending recheck and latest-progress removal are one lifecycle
+        # transition.  Final/cancel paths take this lock before their nested
+        # state locks, so they can never interleave between these operations.
+        with api_v1_terminal_transition_lock:
+            is_pending = _is_request_pending(client_public_key, request_id)
+            deadline = _pending_request_deadline(client_public_key, request_id) if is_pending else None
+            progress = _pop_client_progress(client_public_key, request_id) if is_pending else None
+        if is_pending:
             LOGGER.debug(
                 "relay.api_v1.response_pending",
                 extra={"client_fingerprint": _safe_key_fingerprint(client_public_key)},
             )
             return jsonify({
                 "status": "pending",
-                **_api_v1_deadline_metadata(_pending_request_deadline(client_public_key, request_id)),
-                **({"encrypted_progress": progress} if (progress := _pop_client_progress(client_public_key, request_id)) else {}),
+                **_api_v1_deadline_metadata(deadline),
+                **({"encrypted_progress": progress} if progress else {}),
             }), 202
         terminal = _get_terminal_request(client_public_key, request_id)
         if terminal is not None:

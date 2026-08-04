@@ -83,9 +83,9 @@
             margin-top: 30px;
             min-height: 260px;
         }
-        .inference-progress { display: grid; gap: 8px; margin: 16px 0; color: #ffffff; }
+        .inference-progress { display: grid; gap: 8px; margin: 16px 0; color: inherit; }
         .inference-progress progress { width: 100%; accent-color: #00bfc7; }
-        .inference-progress span { color: #dddddd; }
+        .inference-progress span { color: inherit; opacity: 0.85; }
         .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
         .compute-node-status {
             display: flex;
@@ -570,6 +570,7 @@
                     :max="relayProgress.phase === 'prefill' && relayProgress.total_prompt_tokens > 0 ? relayProgress.total_prompt_tokens : null"
                     :value="relayProgress.phase === 'prefill' && relayProgress.total_prompt_tokens > 0 ? relayProgress.processed_prompt_tokens : null"
                     aria-describedby="landing-progress-status"
+                    aria-labelledby="landing-progress-label"
                 ></progress>
                 <span id="landing-progress-status" data-testid="landing-progress-status" v-text="relayProgressText()"></span>
                 <span class="sr-only" aria-live="polite" aria-atomic="true" v-text="relayProgressAnnouncement"></span>

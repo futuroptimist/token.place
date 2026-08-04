@@ -94,6 +94,8 @@ class _ApiV1ProgressPublisher:
         self._stopped = False
         self._sequence = 0
         self._last_phase = None
+        self._active = threading.Event()
+        self._active.set()
         self._thread = threading.Thread(target=self._run, name="tokenplace-api-v1-progress", daemon=True)
         self._thread.start()
 
@@ -122,6 +124,7 @@ class _ApiV1ProgressPublisher:
     def stop(self) -> None:
         with self._condition:
             self._stopped = True
+            self._active.clear()
             self._pending = None
             self._condition.notify_all()
         # This request-owned worker never performs network I/O itself, so it
@@ -164,7 +167,7 @@ class _ApiV1ProgressPublisher:
                 if headers:
                     kwargs["headers"] = headers
                 url = self.owner._build_api_v1_url(self.relay_url, "/relay/progress")
-                _API_V1_PROGRESS_HTTP_WORKER.submit(url, kwargs)
+                _API_V1_PROGRESS_HTTP_WORKER.submit(url, kwargs, self._active)
             except Exception:
                 pass
             next_allowed = time.monotonic() + _API_V1_PROGRESS_INTERVAL_SECONDS
@@ -172,6 +175,7 @@ class _ApiV1ProgressPublisher:
     def stop_from_worker(self) -> None:
         with self._condition:
             self._stopped = True
+            self._active.clear()
             self._pending = None
 
 
@@ -190,18 +194,24 @@ class _ApiV1ProgressHttpWorker:
         )
         self._thread.start()
 
-    def submit(self, url: str, kwargs: Dict[str, Any]) -> bool:
+    def submit(self, url: str, kwargs: Dict[str, Any], active: threading.Event) -> bool:
         try:
-            self._queue.put_nowait((url, kwargs))
+            self._queue.put_nowait((url, kwargs, active))
             return True
         except queue.Full:
             return False
 
     def _run(self) -> None:
         while True:
-            url, kwargs = self._queue.get()
+            url, kwargs, active = self._queue.get()
             try:
-                requests.post(url, **kwargs)
+                # Request completion/cancellation invalidates queued work.  A
+                # POST already in flight remains the sole bounded transport;
+                # no later event from that request can start afterward.
+                if active.is_set():
+                    response = requests.post(url, **kwargs)
+                    if response.status_code in {400, 401, 403, 404, 405, 410, 413, 422}:
+                        active.clear()
             except Exception:
                 pass
             finally:

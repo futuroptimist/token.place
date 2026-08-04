@@ -3,6 +3,7 @@ import time
 import threading
 import base64
 import json
+import io
 from pathlib import Path
 from flask import Flask
 import sys
@@ -5141,4 +5142,26 @@ def test_api_v1_encrypted_progress_rejects_unknown_plaintext_and_wrong_owner(cli
     assert client.post('/api/v1/relay/progress', json=base).status_code == 410
     assert client.post('/api/v1/relay/progress', json={**base, 'phase': 'prefill'}).status_code == 400
     assert client.post('/api/v1/relay/progress', json={**base, 'control_credential': 'wrong'}).status_code == 403
+    assert relay_module.client_progress == {}
+
+
+def test_api_v1_encrypted_progress_rejects_declared_oversized_body_before_storage(client):
+    response = client.post(
+        '/api/v1/relay/progress',
+        data=b'x' * (16 * 1024 + 1),
+        content_type='application/json',
+    )
+    assert response.status_code == 413
+    assert relay_module.client_progress == {}
+
+
+def test_api_v1_encrypted_progress_rejects_unknown_length_oversized_body_before_storage(client):
+    response = client.open(
+        '/api/v1/relay/progress',
+        method='POST',
+        input_stream=io.BytesIO(b'x' * (16 * 1024 + 1)),
+        content_type='application/json',
+        environ_overrides={'CONTENT_LENGTH': '', 'wsgi.input_terminated': True},
+    )
+    assert response.status_code == 413
     assert relay_module.client_progress == {}

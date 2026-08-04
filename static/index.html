@@ -566,9 +566,11 @@
             >
                 <strong id="landing-progress-label">Inference progress</strong>
                 <progress
+                    :key="relayProgress.phase === 'prefill' && relayProgress.total_prompt_tokens > 0 ? 'determinate' : 'indeterminate'"
                     data-testid="landing-native-progress"
-                    :max="relayProgress.phase === 'prefill' && relayProgress.total_prompt_tokens > 0 ? relayProgress.total_prompt_tokens : null"
-                    :value="relayProgress.phase === 'prefill' && relayProgress.total_prompt_tokens > 0 ? relayProgress.processed_prompt_tokens : null"
+                    v-bind="relayProgress.phase === 'prefill' && relayProgress.total_prompt_tokens > 0
+                        ? { max: relayProgress.total_prompt_tokens, value: relayProgress.processed_prompt_tokens }
+                        : {}"
                     aria-describedby="landing-progress-status"
                     aria-labelledby="landing-progress-label"
                 ></progress>

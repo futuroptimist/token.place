@@ -78,6 +78,8 @@ def route_landing_relay_chat(
     diagnostics_counts: list[int] | None = None,
     admission_payload: dict | None = None,
     pending_payload: dict | None = None,
+    pending_payloads: list[dict] | None = None,
+    final_encrypted_response: dict | None = None,
     retrieve_error_payload: dict | None = None,
     cancel_status: int = 200,
     cancel_payload: dict | None = None,
@@ -187,10 +189,16 @@ def route_landing_relay_chat(
             status = retrieve_statuses[min(len(state["retrieve_requests"]) - 1, len(retrieve_statuses) - 1)]
         if status != 200:
             if status == 202:
+                pending_index = len(state["retrieve_requests"]) - 1
+                selected_pending_payload = pending_payload or {"status": "pending"}
+                if pending_payloads:
+                    selected_pending_payload = pending_payloads[
+                        min(pending_index, len(pending_payloads) - 1)
+                    ]
                 route.fulfill(
                     status=202,
                     headers={"Content-Type": "application/json"},
-                    body=json.dumps(pending_payload or {"status": "pending"}),
+                    body=json.dumps(selected_pending_payload),
                 )
                 return
             route.fulfill(
@@ -209,24 +217,23 @@ def route_landing_relay_chat(
                     "content": assistant_content,
                 }
             }
+        response_body = final_encrypted_response or {
+            "chat_history": json.dumps(
+                {
+                    "protocol": "tokenplace_api_v1_relay_e2ee",
+                    "version": 1,
+                    "request_id": request_id,
+                    "client_public_key": client_public_key,
+                    "api_v1_response": api_v1_response,
+                }
+            ),
+            "cipherkey": "test-cipherkey",
+            "iv": "test-iv",
+        }
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps(
-                {
-                    "chat_history": json.dumps(
-                        {
-                            "protocol": "tokenplace_api_v1_relay_e2ee",
-                            "version": 1,
-                            "request_id": request_id,
-                            "client_public_key": client_public_key,
-                            "api_v1_response": api_v1_response,
-                        }
-                    ),
-                    "cipherkey": "test-cipherkey",
-                    "iv": "test-iv",
-                }
-            ),
+            body=json.dumps(response_body),
         )
 
     page.route("**/api/v1/relay/responses/retrieve", handle_retrieve)
@@ -2905,26 +2912,145 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             bridge_process.kill()
 
 
-def test_encrypted_progress_native_ui_semantics(page: Page, base_url: str, setup_servers):
+def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_native_ui_semantics(
+    page: Page, base_url: str, setup_servers
+):
+    request_id = "progress-browser-request"
     page.goto(base_url)
-    page.wait_for_function("() => Boolean(document.querySelector('#app').__vue__)")
-    page.evaluate("""
-        () => {
-            const vm = document.querySelector('#app').__vue__;
-            vm.relayProgress = {
-                schema_version: 1, sequence: 1, phase: 'prefill',
-                total_prompt_tokens: 55229, cached_prompt_tokens: 0,
-                processed_prompt_tokens: 12345, generated_tokens: 0, elapsed_ms: 1000
-            };
-            vm.relayProgressAnnouncement = vm.relayProgressText();
-        }
-    """)
-    progress = page.get_by_test_id('landing-native-progress')
-    expect(progress).to_have_attribute('max', '55229')
-    expect(progress).to_have_attribute('value', '12345')
-    expect(page.get_by_test_id('landing-progress-status')).to_contain_text('12,345 of 55,229 tokens (22%)')
-    assert progress.get_attribute('role') is None
+    page.wait_for_function("() => Boolean(document.querySelector('#app').__vue__?.clientPublicKey)")
+    page.clock.install()
+    client_key = page.evaluate("btoa(document.querySelector('#app').__vue__.clientPublicKey)")
 
-    page.evaluate("document.querySelector('#app').__vue__.relayProgress = {phase: 'generating', generated_tokens: 12}")
-    expect(progress).not_to_have_attribute('value', re.compile('.+'))
-    expect(page.get_by_test_id('landing-progress-status')).to_contain_text('12 tokens generated')
+    def progress(phase, sequence, *, total=0, processed=0, generated=0, extra=None):
+        value = {
+            "schema_version": 1,
+            "sequence": sequence,
+            "phase": phase,
+            "total_prompt_tokens": total,
+            "cached_prompt_tokens": 0,
+            "processed_prompt_tokens": processed,
+            "generated_tokens": generated,
+            "elapsed_ms": sequence * 100,
+        }
+        if extra:
+            value.update(extra)
+        return value
+
+    def encrypt_envelope(value, *, envelope_request=request_id, envelope_client=client_key):
+        envelope = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": envelope_request,
+            "client_public_key": envelope_client,
+            "api_v1_progress": value,
+        }
+        encrypted = page.evaluate(
+            """async ({plaintext}) => {
+                const vm = document.querySelector('#app').__vue__;
+                return vm.encrypt(plaintext, vm.clientPublicKey);
+            }""",
+            {"plaintext": json.dumps(envelope)},
+        )
+        return {
+            "client_public_key": envelope_client,
+            "request_id": envelope_request,
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            **encrypted,
+        }
+
+    preparing = encrypt_envelope(progress("preparing", 1))
+    determinate = encrypt_envelope(progress("prefill", 2, total=100, processed=25))
+    same_milestone = encrypt_envelope(progress("prefill", 3, total=100, processed=30))
+    zero_total = encrypt_envelope(progress("prefill", 4))
+    generating = encrypt_envelope(progress("generating", 5, generated=12))
+    unknown_field = encrypt_envelope(progress("generating", 6, generated=13, extra={"prompt": "forbidden"}))
+    valid_after_rejections = encrypt_envelope(progress("generating", 6, generated=14))
+    cross_request = encrypt_envelope(progress("generating", 7, generated=99), envelope_request="other-request")
+    cross_client = encrypt_envelope(progress("generating", 7, generated=99), envelope_client="other-client")
+    malformed = {**generating, "ciphertext": "not-valid-base64"}
+
+    final_envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": request_id,
+        "client_public_key": client_key,
+        "api_v1_response": {"message": {"role": "assistant", "content": "Atomic final answer."}},
+    }
+    final_cipher = page.evaluate(
+        """async ({plaintext}) => {
+            const vm = document.querySelector('#app').__vue__;
+            return vm.encrypt(plaintext, vm.clientPublicKey);
+        }""",
+        {"plaintext": json.dumps(final_envelope)},
+    )
+    pending = [
+        {"status": "pending"},
+        *({"status": "pending", "encrypted_progress": item} for item in [
+            preparing, determinate, same_milestone, zero_total, generating, malformed,
+            unknown_field, generating, zero_total, cross_request, cross_client,
+            valid_after_rejections,
+        ]),
+    ]
+    state = route_landing_relay_chat(
+        page,
+        retrieve_statuses=[202] * len(pending) + [200],
+        pending_payloads=pending,
+        final_encrypted_response={"chat_history": final_cipher["ciphertext"], **{
+            key: final_cipher[key] for key in ("cipherkey", "iv")
+        }},
+    )
+    page.evaluate(
+        """requestId => {
+            const vm = document.querySelector('#app').__vue__;
+            const original = vm.createRequestId;
+            let calls = 0;
+            vm.createRequestId = () => calls++ === 0 ? requestId : original.call(vm);
+        }""",
+        request_id,
+    )
+    page.locator("textarea.message-input").fill("Show inference status")
+    wait_for_landing_send_enabled(page).click()
+
+    panel = page.get_by_test_id("landing-inference-progress")
+    progress_bar = page.get_by_test_id("landing-native-progress")
+    status = page.get_by_test_id("landing-progress-status")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    expect(status).to_have_text("Waiting for compute node…")
+    assert progress_bar.get_attribute("value") is None
+    assert progress_bar.get_attribute("role") is None
+    assert progress_bar.get_attribute("aria-labelledby") == "landing-progress-label"
+    assert progress_bar.get_attribute("aria-describedby") == "landing-progress-status"
+    live = panel.locator("[aria-live=polite]")
+    assert live.get_attribute("aria-atomic") == "true"
+
+    def advance(expected):
+        page.clock.fast_forward(500)
+        expect(status).to_have_text(expected)
+
+    advance("Preparing request…")
+    advance("Processing prompt: 25 of 100 tokens (25%)")
+    expect(progress_bar).to_have_attribute("max", "100")
+    expect(progress_bar).to_have_attribute("value", "25")
+    announced = live.text_content()
+    advance("Processing prompt: 30 of 100 tokens (30%)")
+    assert live.text_content() == announced
+    advance("Processing prompt…")
+    assert progress_bar.get_attribute("value") is None
+    advance("Generating response… 12 tokens generated")
+
+    for _ in range(6):
+        advance("Generating response… 12 tokens generated")
+    advance("Generating response… 14 tokens generated")
+    page.clock.fast_forward(500)
+    expect(panel).to_be_hidden()
+    expect(page.locator(".assistant-message")).to_have_count(1)
+    expect(page.locator(".assistant-message")).to_have_text("Atomic final answer.")
+    history = page.evaluate("document.querySelector('#app').__vue__.chatHistory")
+    assert [item["role"] for item in history] == ["user", "assistant"]
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in history)
+    next_messages = page.evaluate(
+        "document.querySelector('#app').__vue__.createApiV1Messages('next question')"
+    )
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in next_messages)
+    assert state["relay_requests"][0]["request_id"] == request_id

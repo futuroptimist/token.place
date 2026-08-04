@@ -21,7 +21,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
 from utils.networking import relay_client as relay_client_module
-from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA, _PostApiV1Outcome
+from utils.networking.relay_client import (
+    RelayClient,
+    MESSAGE_SCHEMA,
+    RELAY_RESPONSE_SCHEMA,
+    _ApiV1SupervisorOutcome,
+    _PostApiV1Outcome,
+)
 
 
 class _ProgressOwner:
@@ -68,6 +74,21 @@ def _stop_test_progress_worker(service, release=None):
     service.shutdown()
     service.join(1)
     assert not service._thread.is_alive()
+
+
+def _progress_request_client(*, capable=True):
+    client = _api_v1_validation_client()
+    client.crypto_manager.decrypt_message.return_value = _api_v1_decrypted_payload(
+        request_id="req-progress-integration"
+    )
+    client._api_v1_relay_capabilities[client.relay_url] = {
+        "encrypted_progress_v1": capable
+    }
+    client._api_v1_local_progress_observer = MagicMock()
+    client._post_api_v1_response = MagicMock(
+        return_value=_PostApiV1Outcome(submitted=True)
+    )
+    return client
 
 
 def test_api_v1_progress_publisher_validates_and_uses_bounded_latest_handoff(monkeypatch):
@@ -310,6 +331,171 @@ def test_api_v1_progress_failure_log_is_privacy_safe(monkeypatch, caplog, failur
     for secret in ("request-secret", "client-secret", "encryption secret",
                    "ciphertext secret", "prefill", "sequence"):
         assert secret not in logged
+
+
+def test_api_v1_request_without_progress_capability_still_submits_final(monkeypatch):
+    client = _progress_request_client(capable=False)
+    final = {"api_v1_response": {"choices": [{"message": {"content": "ok"}}]}}
+
+    def supervise(_payload, *, local_deadline, progress_observer):
+        progress_observer(_progress_event(phase="preparing", total_prompt_tokens=0,
+                                          cached_prompt_tokens=0, processed_prompt_tokens=0))
+        return _ApiV1SupervisorOutcome(response_envelope=final)
+
+    client._supervise_api_v1_inference = MagicMock(side_effect=supervise)
+    publisher_type = MagicMock(side_effect=AssertionError("publisher must not be created"))
+    monkeypatch.setattr(relay_client_module, "_ApiV1ProgressPublisher", publisher_type)
+
+    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert result.inference_succeeded is True
+    assert result.submitted is True
+    publisher_type.assert_not_called()
+    client._api_v1_local_progress_observer.assert_called_once()
+    client._post_api_v1_response.assert_called_once_with(
+        final,
+        client_pub_key_b64=TEST_VALID_RESPONSE["client_public_key"],
+        client_pub_key=base64.b64decode(TEST_VALID_RESPONSE["client_public_key"]),
+        cancel_snapshot=None,
+        local_deadline=client._post_api_v1_response.call_args.kwargs["local_deadline"],
+    )
+
+
+@pytest.mark.parametrize("failure_site", ["encrypt", "handoff"])
+def test_api_v1_request_progress_failure_is_best_effort_for_final(monkeypatch, failure_site):
+    client = _progress_request_client()
+    final = {"api_v1_response": {"choices": [{"message": {"content": "ok"}}]}}
+
+    class FailingHandoff:
+        def submit(self, publisher, event, *, urgent=False):
+            if failure_site == "handoff":
+                raise RuntimeError("handoff failed")
+            relay_client_module._ApiV1ProgressHttpWorker._publish(publisher, event)
+
+        def invalidate(self, _publisher):
+            pass
+
+    if failure_site == "encrypt":
+        client.crypto_manager.encrypt_message.side_effect = RuntimeError("encrypt failed")
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", FailingHandoff())
+
+    def supervise(_payload, *, local_deadline, progress_observer):
+        progress_observer(_progress_event())
+        return _ApiV1SupervisorOutcome(response_envelope=final)
+
+    client._supervise_api_v1_inference = MagicMock(side_effect=supervise)
+
+    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert result.inference_succeeded is True
+    assert result.submitted is True
+    client._api_v1_local_progress_observer.assert_called_once_with(_progress_event())
+    client._post_api_v1_response.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("terminal_code", "recovery_attempted", "recovery_succeeded"),
+    [
+        ("request_cancelled", True, True),
+        ("local_deadline", True, True),
+        ("operator_stop", True, True),
+        ("compute_node_process_failed", True, False),
+    ],
+)
+def test_api_v1_terminal_request_stops_progress_and_discards_queued_work(
+    monkeypatch, terminal_code, recovery_attempted, recovery_succeeded
+):
+    client = _progress_request_client()
+    queued = []
+    invalidated = []
+
+    class ControlledHandoff:
+        def submit(self, publisher, event, *, urgent=False):
+            queued[:] = [(publisher, event)]
+
+        def invalidate(self, publisher):
+            invalidated.append(publisher)
+            queued[:] = [item for item in queued if item[0] is not publisher]
+
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", ControlledHandoff())
+
+    def supervise(_payload, *, local_deadline, progress_observer):
+        progress_observer(_progress_event())
+        return _ApiV1SupervisorOutcome(
+            response_envelope=None,
+            terminal_code=terminal_code,
+            runtime_healthy=recovery_succeeded,
+            recovery_attempted=recovery_attempted,
+            recovery_succeeded=recovery_succeeded,
+            submission_allowed=False,
+        )
+
+    client._supervise_api_v1_inference = MagicMock(side_effect=supervise)
+
+    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert result.safe_error_code == terminal_code
+    assert result.submitted is False
+    assert result.recovery_attempted is recovery_attempted
+    assert result.recovery_succeeded is recovery_succeeded
+    assert len(invalidated) == 1
+    assert queued == []
+    client._post_api_v1_response.assert_not_called()
+
+
+@pytest.mark.parametrize("recovered", [False, True])
+def test_api_v1_final_completion_keeps_one_publisher_and_monotonic_recovery_sequence(
+    monkeypatch, recovered
+):
+    client = _progress_request_client()
+    prepared = []
+    submitted_publishers = []
+    invalidated = []
+
+    class PreparingHandoff:
+        def submit(self, publisher, event, *, urgent=False):
+            submitted_publishers.append(publisher)
+            prepared.append(publisher._prepare(event))
+
+        def invalidate(self, publisher):
+            invalidated.append(publisher)
+
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", PreparingHandoff())
+
+    def encrypt(inner, _recipient):
+        sequence = inner["api_v1_progress"]["sequence"]
+        return {"chat_history": f"cipher-{sequence}", "cipherkey": "key", "iv": "iv"}
+
+    client.crypto_manager.encrypt_message.side_effect = encrypt
+    client._api_v1_control_credential_for_relay = MagicMock(return_value="credential")
+    final = {"api_v1_response": {"choices": [{"message": {"content": "ok"}}]}}
+
+    def supervise(_payload, *, local_deadline, progress_observer):
+        progress_observer(_progress_event(phase="preparing", total_prompt_tokens=0,
+                                          cached_prompt_tokens=0, processed_prompt_tokens=0))
+        progress_observer(_progress_event())
+        if recovered:
+            progress_observer(_progress_event(phase="preparing", total_prompt_tokens=0,
+                                              cached_prompt_tokens=0, processed_prompt_tokens=0))
+        return _ApiV1SupervisorOutcome(
+            response_envelope=final,
+            recovery_attempted=recovered,
+            recovery_succeeded=recovered,
+        )
+
+    client._supervise_api_v1_inference = MagicMock(side_effect=supervise)
+
+    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert result.inference_succeeded is True
+    assert result.submitted is True
+    assert len({id(call.args[0]) for call in client.crypto_manager.encrypt_message.call_args_list}) == len(prepared)
+    assert [payload[1]["json"]["ciphertext"] for payload in prepared] == [
+        f"cipher-{sequence}" for sequence in range(1, len(prepared) + 1)
+    ]
+    assert len(invalidated) == 1
+    assert all(publisher is invalidated[0] for publisher in submitted_publishers)
+    client._post_api_v1_response.assert_called_once()
 
 
 def test_api_v1_models_module_import_failure_does_not_capture_worker_diagnostics(monkeypatch):

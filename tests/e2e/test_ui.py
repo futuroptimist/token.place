@@ -1084,8 +1084,9 @@ def encrypted_landing_progress(
     }
 
 
-def assert_landing_progress_cleared(page: Page):
-    expect(page.get_by_test_id("landing-inference-progress")).to_be_hidden()
+def assert_landing_progress_cleared(page: Page, *, assert_panel_hidden: bool = True):
+    if assert_panel_hidden:
+        expect(page.get_by_test_id("landing-inference-progress")).to_be_hidden()
     state = page.evaluate(
         """() => {
             const vm = window.__progressLifecycleVm || document.querySelector('#app').__vue__;
@@ -3169,6 +3170,7 @@ def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_terminal
             };
             active.resolveTermination = resolveTermination;
             vm.activeRelayRequest = active;
+            window.__progressLifecycleRequest = active;
             vm.relayProgress = {phase: 'waiting'};
             vm.relayProgressAnnouncement = 'Waiting for compute node…';
             window.__progressLifecycleVm = vm;
@@ -3202,4 +3204,15 @@ def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_terminal
         page.evaluate("() => window.__progressLifecycleVm.$destroy()")
 
     page.wait_for_function("() => window.__progressLifecycleVm.relayProgress === null")
-    assert_landing_progress_cleared(page)
+    assert_landing_progress_cleared(page, assert_panel_hidden=exit_kind != "teardown")
+    if exit_kind == "teardown":
+        teardown_state = page.evaluate(
+            """() => ({
+                activeRelayRequest: window.__progressLifecycleVm.activeRelayRequest,
+                requestTerminated: window.__progressLifecycleRequest.terminated
+            })"""
+        )
+        assert teardown_state == {
+            "activeRelayRequest": None,
+            "requestTerminated": True,
+        }

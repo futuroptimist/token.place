@@ -1768,10 +1768,6 @@ new Vue({
         this.clearActiveRelayRequest(activeRequestId);
         this.relayProgress = null;
         this.relayProgressAnnouncement = '';
-        const progressPanel = this.$el && this.$el.querySelector('[data-testid="landing-inference-progress"]');
-        if (progressPanel) {
-            progressPanel.style.display = 'none';
-        }
         if (!Array.isArray(this.chatHistory)) {
             return;
         }

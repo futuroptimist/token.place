@@ -15,7 +15,6 @@ import re
 import sys
 import threading
 import time
-import queue
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
@@ -85,19 +84,15 @@ class _ApiV1SupervisorOutcome(NamedTuple):
 
 
 class _ApiV1ProgressPublisher:
-    """Request-owned bounded latest-value encrypted sideband publisher."""
+    """Request-scoped handle for the process-wide progress service."""
 
     def __init__(self, owner, relay_url: str, client_key: str, request_id: str):
         self.owner, self.relay_url, self.client_key, self.request_id = owner, relay_url, client_key, request_id
-        self._condition = threading.Condition()
-        self._pending = None
+        self._lock = threading.Lock()
         self._stopped = False
         self._sequence = 0
-        self._last_phase = None
         self._active = threading.Event()
         self._active.set()
-        self._thread = threading.Thread(target=self._run, name="tokenplace-api-v1-progress", daemon=True)
-        self._thread.start()
 
     def submit(self, event: Dict[str, Any]) -> None:
         try:
@@ -110,112 +105,102 @@ class _ApiV1ProgressPublisher:
             total, cached, processed = values["total_prompt_tokens"], values["cached_prompt_tokens"], values["processed_prompt_tokens"]
             if total > 0 and not (cached <= processed <= total):
                 return
-            with self._condition:
+            with self._lock:
                 if self._stopped:
                     return
-                self._pending = {"phase": phase, **values}
-                self._last_phase = phase
-                # Wake for counter-only updates too.  The worker still applies
-                # the cadence below, so bursts remain latest-value coalesced.
-                self._condition.notify()
+            _API_V1_PROGRESS_HTTP_WORKER.submit(self, {"phase": phase, **values})
         except Exception:
             return
 
     def stop(self) -> None:
-        with self._condition:
+        with self._lock:
             self._stopped = True
             self._active.clear()
-            self._pending = None
-            self._condition.notify_all()
-        # This request-owned worker never performs network I/O itself, so it
-        # must always quiesce.  Potentially wedged transports are isolated in
-        # the single process-wide best-effort worker below.
-        self._thread.join()
-
-    def _run(self) -> None:
-        next_allowed = 0.0
-        while True:
-            with self._condition:
-                while not self._stopped and self._pending is None:
-                    self._condition.wait()
-                if self._stopped:
-                    return
-                delay = max(0.0, next_allowed - time.monotonic())
-                if delay:
-                    self._condition.wait(delay)
-                    if self._stopped:
-                        return
-                event, self._pending = self._pending, None
-                self._sequence += 1
-                sequence = self._sequence
-            try:
-                inner = {
-                    "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
-                    "request_id": self.request_id, "client_public_key": self.client_key,
-                    "api_v1_progress": {"schema_version": 1, "sequence": sequence, **event},
-                }
-                encrypted = self.owner.crypto_manager.encrypt_message(inner, self.client_key)
-                credential = self.owner._api_v1_control_credential_for_relay(self.relay_url)
-                payload = {
-                    "server_public_key": self.owner.crypto_manager.public_key_b64,
-                    "client_public_key": self.client_key, "request_id": self.request_id,
-                    "control_credential": credential, "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
-                    "ciphertext": encrypted["chat_history"], "cipherkey": encrypted["cipherkey"], "iv": encrypted["iv"],
-                }
-                kwargs = {"json": payload, "timeout": 2.0}
-                headers = self.owner._auth_headers()
-                if headers:
-                    kwargs["headers"] = headers
-                url = self.owner._build_api_v1_url(self.relay_url, "/relay/progress")
-                _API_V1_PROGRESS_HTTP_WORKER.submit(url, kwargs, self._active)
-            except Exception:
-                pass
-            next_allowed = time.monotonic() + _API_V1_PROGRESS_INTERVAL_SECONDS
+        _API_V1_PROGRESS_HTTP_WORKER.invalidate(self)
 
     def stop_from_worker(self) -> None:
-        with self._condition:
+        with self._lock:
             self._stopped = True
             self._active.clear()
-            self._pending = None
+
+    def _prepare(self, event: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Prepare one update on the bounded service worker, never the caller."""
+        with self._lock:
+            if self._stopped:
+                return None
+            self._sequence += 1
+            sequence = self._sequence
+        inner = {
+            "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+            "request_id": self.request_id, "client_public_key": self.client_key,
+            "api_v1_progress": {"schema_version": 1, "sequence": sequence, **event},
+        }
+        encrypted = self.owner.crypto_manager.encrypt_message(inner, self.client_key)
+        credential = self.owner._api_v1_control_credential_for_relay(self.relay_url)
+        payload = {
+            "server_public_key": self.owner.crypto_manager.public_key_b64,
+            "client_public_key": self.client_key, "request_id": self.request_id,
+            "control_credential": credential, "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+            "ciphertext": encrypted["chat_history"], "cipherkey": encrypted["cipherkey"], "iv": encrypted["iv"],
+        }
+        kwargs = {"json": payload, "timeout": 2.0}
+        headers = self.owner._auth_headers()
+        if headers:
+            kwargs["headers"] = headers
+        return self.owner._build_api_v1_url(self.relay_url, "/relay/progress"), kwargs
 
 
 class _ApiV1ProgressHttpWorker:
     """One reusable, bounded worker isolates best-effort progress transport.
 
     Requests timeouts are not wall-clock guarantees.  A singleton daemon and a
-    one-item queue ensure a wedged adapter can retain neither an unbounded set
+    one-item handoff ensure a wedged adapter can retain neither an unbounded set
     of request threads nor their RelayClient owners.
     """
 
     def __init__(self) -> None:
-        self._queue = queue.Queue(maxsize=1)
+        self._condition = threading.Condition()
+        self._pending = None
         self._thread = threading.Thread(
             target=self._run, name="tokenplace-api-v1-progress-http", daemon=True
         )
         self._thread.start()
 
-    def submit(self, url: str, kwargs: Dict[str, Any], active: threading.Event) -> bool:
-        try:
-            self._queue.put_nowait((url, kwargs, active))
-            return True
-        except queue.Full:
-            return False
+    def submit(self, publisher: _ApiV1ProgressPublisher, event: Dict[str, Any]) -> bool:
+        with self._condition:
+            # Globally retain at most the newest not-yet-started update. This is
+            # bounded even when encryption, credential lookup, or HTTP wedges.
+            self._pending = (publisher, event)
+            self._condition.notify()
+        return True
+
+    def invalidate(self, publisher: _ApiV1ProgressPublisher) -> None:
+        with self._condition:
+            if self._pending is not None and self._pending[0] is publisher:
+                self._pending = None
+            self._condition.notify()
 
     def _run(self) -> None:
+        next_allowed = 0.0
         while True:
-            url, kwargs, active = self._queue.get()
+            with self._condition:
+                while self._pending is None or time.monotonic() < next_allowed:
+                    delay = max(0.0, next_allowed - time.monotonic())
+                    self._condition.wait(delay if self._pending is not None else None)
+                publisher, event = self._pending
+                self._pending = None
             try:
-                # Request completion/cancellation invalidates queued work.  A
-                # POST already in flight remains the sole bounded transport;
-                # no later event from that request can start afterward.
-                if active.is_set():
+                prepared = publisher._prepare(event) if publisher._active.is_set() else None
+                if prepared is not None and publisher._active.is_set():
+                    url, kwargs = prepared
                     response = requests.post(url, **kwargs)
                     if response.status_code in {400, 401, 403, 404, 405, 410, 413, 422}:
-                        active.clear()
-            except Exception:
-                pass
-            finally:
-                self._queue.task_done()
+                        publisher.stop_from_worker()
+            except Exception as exc:
+                logger.warning("API v1 progress publish failed; exc_type=%s", type(exc).__name__)
+            # Cadence belongs to the one service worker, so it cannot create a
+            # timer or sleeping thread per completed request.
+            next_allowed = time.monotonic() + _API_V1_PROGRESS_INTERVAL_SECONDS
 
 
 _API_V1_PROGRESS_HTTP_WORKER = _ApiV1ProgressHttpWorker()

@@ -23,6 +23,128 @@ from utils.networking import relay_client as relay_client_module
 from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA, _PostApiV1Outcome
 
 
+class _ProgressOwner:
+    def __init__(self):
+        self.crypto_manager = SimpleNamespace(
+            public_key_b64="server-key", encrypt_message=MagicMock()
+        )
+        self.crypto_manager.encrypt_message.side_effect = lambda inner, _recipient: {
+            "chat_history": f"cipher-{inner['api_v1_progress']['sequence']}",
+            "cipherkey": f"key-{inner['api_v1_progress']['sequence']}",
+            "iv": f"iv-{inner['api_v1_progress']['sequence']}",
+        }
+
+    def _api_v1_control_credential_for_relay(self, relay_url):
+        return "credential"
+
+    def _auth_headers(self):
+        return {"Authorization": "Bearer registration"}
+
+    def _build_api_v1_url(self, relay_url, path):
+        return relay_url + "/api/v1" + path
+
+
+def _progress_event(**overrides):
+    event = {
+        "phase": "prefill", "total_prompt_tokens": 10,
+        "cached_prompt_tokens": 1, "processed_prompt_tokens": 2,
+        "generated_tokens": 0, "elapsed_ms": 3,
+    }
+    event.update(overrides)
+    return event
+
+
+def test_api_v1_progress_publisher_validates_and_uses_bounded_latest_handoff(monkeypatch):
+    service = relay_client_module._ApiV1ProgressHttpWorker.__new__(
+        relay_client_module._ApiV1ProgressHttpWorker
+    )
+    service._condition = threading.Condition()
+    service._pending = None
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        _ProgressOwner(), "https://relay.example", "client-key", "request-id"
+    )
+
+    publisher.submit(_progress_event(processed_prompt_tokens=3))
+    publisher.submit(_progress_event(processed_prompt_tokens=4))
+    assert service._pending[0] is publisher
+    assert service._pending[1]["processed_prompt_tokens"] == 4
+
+    publisher.submit(_progress_event(phase="invalid"))
+    publisher.submit(_progress_event(processed_prompt_tokens=11))
+    assert service._pending[1]["processed_prompt_tokens"] == 4
+    publisher.stop()
+    assert service._pending is None
+
+
+def test_api_v1_progress_preparation_has_fixed_schema_recipient_and_fresh_material(monkeypatch):
+    monkeypatch.setattr(
+        relay_client_module._API_V1_PROGRESS_HTTP_WORKER, "invalidate", lambda publisher: None
+    )
+    owner = _ProgressOwner()
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        owner, "https://relay.example", "client-key", "request-id"
+    )
+
+    first = publisher._prepare(_progress_event())
+    second = publisher._prepare(_progress_event(phase="generating", generated_tokens=1))
+
+    assert [call.args[1] for call in owner.crypto_manager.encrypt_message.call_args_list] == [
+        "client-key", "client-key"
+    ]
+    inner = owner.crypto_manager.encrypt_message.call_args_list[0].args[0]
+    assert set(inner) == {"protocol", "version", "request_id", "client_public_key", "api_v1_progress"}
+    assert set(inner["api_v1_progress"]) == {"schema_version", "sequence", *relay_client_module._API_V1_PROGRESS_FIELDS}
+    assert first[1]["json"]["cipherkey"] != second[1]["json"]["cipherkey"]
+    assert first[1]["json"]["iv"] != second[1]["json"]["iv"]
+    assert second[1]["json"]["ciphertext"] == "cipher-2"
+
+
+def test_api_v1_progress_stop_is_prompt_while_service_preparation_blocks(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    owner = _ProgressOwner()
+
+    def blocked_encrypt(inner, _recipient):
+        entered.set()
+        release.wait()
+        return {"chat_history": "cipher", "cipherkey": "key", "iv": "iv"}
+
+    owner.crypto_manager.encrypt_message.side_effect = blocked_encrypt
+    service = relay_client_module._ApiV1ProgressHttpWorker()
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        owner, "https://relay.example", "client-key", "request-id"
+    )
+    publisher.submit(_progress_event())
+    assert entered.wait(1)
+
+    started = time.monotonic()
+    publisher.stop()
+    assert time.monotonic() - started < 0.1
+    assert not publisher._active.is_set()
+    assert not any(t.name == "tokenplace-api-v1-progress" for t in threading.enumerate())
+    release.set()
+
+
+def test_api_v1_progress_capability_is_exact_relay_and_clears_with_credentials():
+    client = _standalone_relay_client()
+    client._api_v1_relay_capabilities.update({
+        "https://one.example": {"encrypted_progress_v1": True},
+        "https://two.example": {"encrypted_progress_v1": False},
+    })
+    client._store_api_v1_control_credential("https://one.example", "one")
+    client._store_api_v1_control_credential("https://two.example", "two")
+
+    assert client._api_v1_relay_capabilities["https://one.example"]["encrypted_progress_v1"] is True
+    assert client._api_v1_relay_capabilities["https://two.example"]["encrypted_progress_v1"] is False
+    assert client._api_v1_relay_capabilities.get("https://missing.example") is None
+    client._pop_api_v1_control_credential("https://one.example")
+    assert "https://one.example" not in client._api_v1_relay_capabilities
+    client._clear_api_v1_control_credentials()
+    assert client._api_v1_relay_capabilities == {}
+
+
 def test_api_v1_models_module_import_failure_does_not_capture_worker_diagnostics(monkeypatch):
     """Module import probing is separate from request-scoped worker diagnostics."""
 

@@ -508,10 +508,54 @@ jobs:
               exit 1
             fi
           fi
-          python ../scripts/validate_windows_desktop_release_artifacts.py \
-            --windows-nsis "${nsis_path}" \
-            --windows-msi "${msi_path}" \
-            "${validator_version_args[@]}"
+          installer_artifact_dir="${RUNNER_TEMP}/token-place-installer-identity-artifacts"
+          mkdir -p "${installer_artifact_dir}"
+          {
+            printf 'nsis_name=%s\n' "$(basename "${nsis_path}")"
+            printf 'nsis_bytes=%s\n' "$(wc -c < "${nsis_path}" | tr -d '[:space:]')"
+            printf 'msi_name=%s\n' "$(basename "${msi_path}")"
+            printf 'msi_bytes=%s\n' "$(wc -c < "${msi_path}" | tr -d '[:space:]')"
+          } > "${installer_artifact_dir}/static-validator-inventory.txt"
+
+          validator_max_attempts=2
+          validator_attempt=1
+          validator_exit=0
+          validator_output=""
+          while :; do
+            set +e
+            validator_output="$(python ../scripts/validate_windows_desktop_release_artifacts.py \
+              --windows-nsis "${nsis_path}" \
+              --windows-msi "${msi_path}" \
+              "${validator_version_args[@]}" 2>&1)"
+            validator_exit=$?
+            set -e
+
+            printf '%s\n' "${validator_output}"
+
+            validator_log_body="${validator_output//$GITHUB_WORKSPACE/}"
+            validator_log_body="${validator_log_body//$RUNNER_TEMP/}"
+            printf '%s' "${validator_log_body}" | tail -c 4000 \
+              > "${installer_artifact_dir}/static-validator-attempt-${validator_attempt}.log"
+
+            if [ "${validator_exit}" -eq 0 ]; then
+              break
+            fi
+
+            if [ "${validator_attempt}" -lt "${validator_max_attempts}" ] \
+              && printf '%s' "${validator_output}" | grep -q 'subprocess.TimeoutExpired' \
+              && printf '%s' "${validator_output}" | grep -q 'timed out after 30 seconds'; then
+              echo "::warning::Windows static artifact validator hit the legacy pre-fix PowerShell 30s metadata-read timeout; retrying the whole validator invocation once (attempt $((validator_attempt + 1))/${validator_max_attempts})."
+              validator_attempt=$((validator_attempt + 1))
+              continue
+            fi
+
+            break
+          done
+
+          if [ "${validator_exit}" -ne 0 ]; then
+            echo "Windows static artifact validator failed after ${validator_attempt} attempt(s)." >&2
+            exit "${validator_exit}"
+          fi
           current_version="${tag_name#desktop-v}"
           if [ -z "${tag_name}" ]; then
             current_version="$(python -c 'import json; print(json.load(open("package.json"))["version"])')"

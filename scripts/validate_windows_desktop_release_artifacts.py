@@ -40,17 +40,45 @@ def _normalize_windows_version(value: str) -> str:
     return '.'.join(parts)
 
 
+# Large release artifacts + transient hosted-runner slowness can make a single
+# metadata read take longer than the old 30s bound; retry once before failing.
+POWERSHELL_READER_TIMEOUT_SECONDS = 120
+POWERSHELL_READER_MAX_ATTEMPTS = 2
+
+
 def _powershell_json(script: str, path: Path, *, description: str) -> dict:
     env = {**os.environ, 'TOKEN_PLACE_ARTIFACT_PATH': str(path)}
-    result = subprocess.run(
-        ['powershell', '-NoProfile', '-Command', script],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=30,
-        env=env,
-    )
+    result: subprocess.CompletedProcess[str] | None = None
+    timeout_exc: subprocess.TimeoutExpired | None = None
+    for attempt in range(1, POWERSHELL_READER_MAX_ATTEMPTS + 1):
+        print(
+            f'[validate-windows-desktop-release] {description} reader: probing '
+            f'{path.name} (attempt {attempt}/{POWERSHELL_READER_MAX_ATTEMPTS})',
+            flush=True,
+        )
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-NonInteractive', '-Command', script],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=POWERSHELL_READER_TIMEOUT_SECONDS,
+                env=env,
+            )
+            timeout_exc = None
+            break
+        except subprocess.TimeoutExpired as exc:
+            timeout_exc = exc
+            result = None
+            continue
+
+    if result is None:
+        raise ValidationError(
+            f'{description} reader timed out after {POWERSHELL_READER_TIMEOUT_SECONDS} seconds '
+            f'for {path.name} ({POWERSHELL_READER_MAX_ATTEMPTS} attempts)'
+        ) from timeout_exc
+
     if result.returncode != 0:
         raise ValidationError(f'{description} reader failed for {path.name}')
     text = (result.stdout or '').strip()

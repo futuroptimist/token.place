@@ -816,6 +816,73 @@ def test_metrics_failure_logs_do_not_expose_raw_exception_values(relay_client, m
     assert secret not in response.get_data(as_text=True)
 
 
+def test_progress_observability_uses_fixed_outcomes_without_forbidden_data(
+    relay_client, monkeypatch
+) -> None:
+    """Progress logs and metrics remain fixed-cardinality and relay-blind."""
+
+    relay_module.client_progress.clear()
+    server = "progress-server-secret"
+    client = "progress-client-secret"
+    request_id = "progress-request-secret"
+    credential = "progress-credential-secret"
+    ciphertext = "progress-ciphertext-secret"
+    registration = _register_node(relay_client, server).get_json()
+    credential = registration["control_credential"]
+    relay_module._mark_request_pending(client, request_id)
+    known_servers[server]["api_v1_in_flight_requests"] = {
+        request_id: {
+            "client_public_key": client,
+            "request_deadline_monotonic": time.monotonic() + 30,
+        }
+    }
+    payload = {
+        "server_public_key": server,
+        "client_public_key": client,
+        "request_id": request_id,
+        "control_credential": credential,
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "ciphertext": ciphertext,
+        "cipherkey": "progress-cipherkey-secret",
+        "iv": "progress-iv-secret",
+    }
+
+    progress_records = []
+    original_info = relay_module.LOGGER.info
+
+    def capture_info(message, *args, **kwargs):
+        if message == "relay.api_v1.progress":
+            progress_records.append({"message": message, **kwargs.get("extra", {})})
+        return original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(relay_module.LOGGER, "info", capture_info)
+    assert relay_client.post("/api/v1/relay/progress", json=payload).status_code == 202
+    assert relay_client.post("/api/v1/relay/progress", json=payload).status_code == 202
+    assert relay_client.post(
+        "/api/v1/relay/progress", json={**payload, "control_credential": "wrong-secret"}
+    ).status_code == 403
+    assert relay_client.post(
+        "/api/v1/relay/progress", json={**payload, "request_id": "unknown-secret"}
+    ).status_code == 410
+    assert relay_client.post(
+        "/api/v1/relay/progress", json={**payload, "phase": "prefill-secret"}
+    ).status_code == 400
+
+    assert [record["progress_outcome"] for record in progress_records] == [
+        "accepted", "replaced", "rejected_auth", "rejected_lifecycle", "rejected_schema"
+    ]
+    serialized = "\n".join(
+        json.dumps(record, default=str) for record in progress_records
+    ) + relay_client.get("/metrics").get_data(as_text=True)
+    forbidden = (
+        server, client, request_id, credential, ciphertext, "progress-cipherkey-secret",
+        "progress-iv-secret", "wrong-secret", "unknown-secret", "prefill-secret",
+        "prompt-secret", "output-secret", "counter-secret",
+    )
+    assert all(secret not in serialized for secret in forbidden)
+
+
 def test_collector_construction_failure_keeps_instrumentation_down(monkeypatch) -> None:
     """Collector construction failures use no-op metrics and do not mark instrumentation healthy."""
 

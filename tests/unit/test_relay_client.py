@@ -4,6 +4,7 @@ Unit tests for the relay client module.
 import base64
 import builtins
 import json
+import logging
 import math
 import pytest
 import sys
@@ -20,7 +21,481 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
 from utils.networking import relay_client as relay_client_module
-from utils.networking.relay_client import RelayClient, MESSAGE_SCHEMA, RELAY_RESPONSE_SCHEMA, _PostApiV1Outcome
+from utils.networking.relay_client import (
+    RelayClient,
+    MESSAGE_SCHEMA,
+    RELAY_RESPONSE_SCHEMA,
+    _ApiV1SupervisorOutcome,
+    _PostApiV1Outcome,
+)
+
+
+class _ProgressOwner:
+    def __init__(self):
+        self.crypto_manager = SimpleNamespace(
+            public_key_b64="server-key", encrypt_message=MagicMock()
+        )
+        self.crypto_manager.encrypt_message.side_effect = lambda inner, _recipient: {
+            "chat_history": f"cipher-{inner['api_v1_progress']['sequence']}",
+            "cipherkey": f"key-{inner['api_v1_progress']['sequence']}",
+            "iv": f"iv-{inner['api_v1_progress']['sequence']}",
+        }
+
+    def _api_v1_control_credential_for_relay(self, relay_url):
+        return "credential"
+
+    def _auth_headers(self):
+        return {"Authorization": "Bearer registration"}
+
+    def _build_api_v1_url(self, relay_url, path):
+        return relay_url + "/api/v1" + path
+
+
+def _progress_event(**overrides):
+    event = {
+        "phase": "prefill", "total_prompt_tokens": 10,
+        "cached_prompt_tokens": 1, "processed_prompt_tokens": 2,
+        "generated_tokens": 0, "elapsed_ms": 3,
+    }
+    event.update(overrides)
+    return event
+
+
+def _progress_http_thread_count():
+    return sum(
+        thread.name == "tokenplace-api-v1-progress-http"
+        for thread in threading.enumerate()
+    )
+
+
+def _stop_test_progress_worker(service, release=None):
+    if release is not None:
+        release.set()
+    service.shutdown()
+    service.join(1)
+    assert not service._thread.is_alive()
+
+
+def _progress_request_client(*, capable=True):
+    client = _api_v1_validation_client()
+    client.crypto_manager.decrypt_message.return_value = _api_v1_decrypted_payload(
+        request_id="req-progress-integration"
+    )
+    client._api_v1_relay_capabilities[client.relay_url] = {
+        "encrypted_progress_v1": capable
+    }
+    client._api_v1_local_progress_observer = MagicMock()
+    client._post_api_v1_response = MagicMock(
+        return_value=_PostApiV1Outcome(submitted=True)
+    )
+    return client
+
+
+def test_api_v1_progress_publisher_validates_and_uses_bounded_latest_handoff(monkeypatch):
+    service = relay_client_module._ApiV1ProgressHttpWorker.__new__(
+        relay_client_module._ApiV1ProgressHttpWorker
+    )
+    service._condition = threading.Condition()
+    service._pending = None
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        _ProgressOwner(), "https://relay.example", "client-key", "request-id"
+    )
+
+    publisher.submit(_progress_event(processed_prompt_tokens=3))
+    publisher.submit(_progress_event(processed_prompt_tokens=4))
+    assert service._pending[0] is publisher
+    assert service._pending[1]["processed_prompt_tokens"] == 4
+    assert service._pending[2] is True
+
+    publisher.submit(_progress_event(phase="invalid"))
+    publisher.submit(_progress_event(processed_prompt_tokens=11))
+    assert service._pending[1]["processed_prompt_tokens"] == 4
+    publisher.stop()
+    assert service._pending is None
+
+
+def test_api_v1_progress_preparation_has_fixed_schema_recipient_and_fresh_material(monkeypatch):
+    monkeypatch.setattr(
+        relay_client_module._API_V1_PROGRESS_HTTP_WORKER, "invalidate", lambda publisher: None
+    )
+    owner = _ProgressOwner()
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        owner, "https://relay.example", "client-key", "request-id"
+    )
+
+    first = publisher._prepare(_progress_event())
+    second = publisher._prepare(_progress_event(phase="generating", generated_tokens=1))
+
+    assert [call.args[1] for call in owner.crypto_manager.encrypt_message.call_args_list] == [
+        "client-key", "client-key"
+    ]
+    inner = owner.crypto_manager.encrypt_message.call_args_list[0].args[0]
+    assert set(inner) == {"protocol", "version", "request_id", "client_public_key", "api_v1_progress"}
+    assert set(inner["api_v1_progress"]) == {"schema_version", "sequence", *relay_client_module._API_V1_PROGRESS_FIELDS}
+    assert first[1]["json"]["cipherkey"] != second[1]["json"]["cipherkey"]
+    assert first[1]["json"]["iv"] != second[1]["json"]["iv"]
+    assert second[1]["json"]["ciphertext"] == "cipher-2"
+
+
+def test_api_v1_progress_stop_is_prompt_while_service_preparation_blocks(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    owner = _ProgressOwner()
+
+    def blocked_encrypt(inner, _recipient):
+        entered.set()
+        release.wait()
+        return {"chat_history": "cipher", "cipherkey": "key", "iv": "iv"}
+
+    owner.crypto_manager.encrypt_message.side_effect = blocked_encrypt
+    baseline = _progress_http_thread_count()
+    service = relay_client_module._ApiV1ProgressHttpWorker()
+    try:
+        monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+        publisher = relay_client_module._ApiV1ProgressPublisher(
+            owner, "https://relay.example", "client-key", "request-id"
+        )
+        publisher.submit(_progress_event())
+        assert entered.wait(1)
+
+        stopped = threading.Event()
+        threading.Thread(target=lambda: (publisher.stop(), stopped.set())).start()
+        assert stopped.wait(1)
+        assert not publisher._active.is_set()
+    finally:
+        _stop_test_progress_worker(service, release)
+    assert _progress_http_thread_count() == baseline
+
+
+def test_api_v1_progress_capability_is_exact_relay_and_clears_with_credentials():
+    client = _standalone_relay_client()
+    client._api_v1_relay_capabilities.update({
+        "https://one.example": {"encrypted_progress_v1": True},
+        "https://two.example": {"encrypted_progress_v1": False},
+    })
+    client._store_api_v1_control_credential("https://one.example", "one")
+    client._store_api_v1_control_credential("https://two.example", "two")
+
+    assert client._api_v1_relay_capabilities["https://one.example"]["encrypted_progress_v1"] is True
+    assert client._api_v1_relay_capabilities["https://two.example"]["encrypted_progress_v1"] is False
+    assert client._api_v1_relay_capabilities.get("https://missing.example") is None
+    client._pop_api_v1_control_credential("https://one.example")
+    assert "https://one.example" not in client._api_v1_relay_capabilities
+    client._clear_api_v1_control_credentials()
+    assert client._api_v1_relay_capabilities == {}
+
+
+def test_api_v1_progress_phase_transitions_bypass_cadence(monkeypatch):
+    """A phase change is urgent while same-phase counters remain coalesced."""
+    service = relay_client_module._ApiV1ProgressHttpWorker.__new__(
+        relay_client_module._ApiV1ProgressHttpWorker
+    )
+    service._condition = threading.Condition()
+    service._pending = None
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        _ProgressOwner(), "https://relay.example", "client-key", "request-id"
+    )
+
+    publisher.submit(_progress_event(phase="preparing", total_prompt_tokens=0,
+                                     cached_prompt_tokens=0, processed_prompt_tokens=0))
+    assert service._pending[2] is True
+    publisher.submit(_progress_event(processed_prompt_tokens=3))
+    assert service._pending[2] is True
+    publisher.submit(_progress_event(processed_prompt_tokens=4))
+    assert service._pending[2] is True
+    service._pending = None  # Simulate the worker consuming the phase transition.
+    publisher.submit(_progress_event(processed_prompt_tokens=5))
+    assert service._pending[2] is False
+    publisher.submit(_progress_event(phase="generating", processed_prompt_tokens=10,
+                                     generated_tokens=1))
+    assert service._pending[2] is True
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 405, 410, 413, 422])
+def test_api_v1_progress_terminal_http_status_disables_publisher(monkeypatch, status):
+    owner = _ProgressOwner()
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        owner, "https://relay.example", "client-key", "request-id"
+    )
+    monkeypatch.setattr(relay_client_module.requests, "post",
+                        lambda *args, **kwargs: SimpleNamespace(status_code=status))
+    relay_client_module._ApiV1ProgressHttpWorker._publish(publisher, _progress_event())
+    assert not publisher._active.is_set()
+
+
+@pytest.mark.parametrize("status", [429, 500])
+def test_api_v1_progress_transient_http_status_remains_best_effort(monkeypatch, status):
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        _ProgressOwner(), "https://relay.example", "client-key", "request-id"
+    )
+    monkeypatch.setattr(relay_client_module.requests, "post",
+                        lambda *args, **kwargs: SimpleNamespace(status_code=status))
+
+    relay_client_module._ApiV1ProgressHttpWorker._publish(publisher, _progress_event())
+
+    assert publisher._active.is_set()
+
+
+def test_api_v1_progress_blocked_http_keeps_callbacks_and_stop_prompt(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    baseline = _progress_http_thread_count()
+    service = relay_client_module._ApiV1ProgressHttpWorker()
+
+    def blocked_post(*_args, **_kwargs):
+        entered.set()
+        release.wait()
+        return SimpleNamespace(status_code=200)
+
+    try:
+        monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+        monkeypatch.setattr(relay_client_module.requests, "post", blocked_post)
+        publisher = relay_client_module._ApiV1ProgressPublisher(
+            _ProgressOwner(), "https://relay.example", "client-key", "request-id"
+        )
+        publisher.submit(_progress_event())
+        assert entered.wait(1)
+        callback_returned = threading.Event()
+        threading.Thread(target=lambda: (
+            publisher.submit(_progress_event(processed_prompt_tokens=4)),
+            callback_returned.set(),
+        )).start()
+        assert callback_returned.wait(1)
+        stopped = threading.Event()
+        threading.Thread(target=lambda: (publisher.stop(), stopped.set())).start()
+        assert stopped.wait(1)
+        assert service._pending is None
+    finally:
+        _stop_test_progress_worker(service, release)
+    assert _progress_http_thread_count() == baseline
+
+
+def test_api_v1_progress_repeated_requests_reuse_single_service_thread(monkeypatch):
+    baseline = _progress_http_thread_count()
+    service = relay_client_module._ApiV1ProgressHttpWorker()
+    try:
+        monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+        assert _progress_http_thread_count() == baseline + 1
+        for index in range(25):
+            publisher = relay_client_module._ApiV1ProgressPublisher(
+                _ProgressOwner(), "https://relay.example", f"client-{index}", f"request-{index}"
+            )
+            publisher.submit(_progress_event())
+            publisher.stop()
+        assert _progress_http_thread_count() == baseline + 1
+        assert service._pending is None
+    finally:
+        _stop_test_progress_worker(service)
+    assert _progress_http_thread_count() == baseline
+
+
+def test_api_v1_progress_cross_request_identity_and_sequence_isolation(monkeypatch):
+    monkeypatch.setattr(relay_client_module._API_V1_PROGRESS_HTTP_WORKER,
+                        "invalidate", lambda publisher: None)
+    first_owner, second_owner = _ProgressOwner(), _ProgressOwner()
+    first = relay_client_module._ApiV1ProgressPublisher(
+        first_owner, "https://one.example", "client-one", "request-one"
+    )
+    second = relay_client_module._ApiV1ProgressPublisher(
+        second_owner, "https://two.example", "client-two", "request-two"
+    )
+    first._prepare(_progress_event())
+    first._prepare(_progress_event(processed_prompt_tokens=3))
+    second._prepare(_progress_event())
+
+    first_inner = first_owner.crypto_manager.encrypt_message.call_args_list[-1].args[0]
+    second_inner = second_owner.crypto_manager.encrypt_message.call_args_list[-1].args[0]
+    assert (first_inner["request_id"], first_inner["client_public_key"]) == (
+        "request-one", "client-one"
+    )
+    assert (second_inner["request_id"], second_inner["client_public_key"]) == (
+        "request-two", "client-two"
+    )
+    assert first_inner["api_v1_progress"]["sequence"] == 2
+    assert second_inner["api_v1_progress"]["sequence"] == 1
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("encryption secret"), ValueError("ciphertext secret")])
+def test_api_v1_progress_failure_log_is_privacy_safe(monkeypatch, caplog, failure):
+    owner = _ProgressOwner()
+    owner.crypto_manager.encrypt_message.side_effect = failure
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        owner, "https://relay.example", "client-secret", "request-secret"
+    )
+    with caplog.at_level(logging.WARNING, logger="relay_client"):
+        relay_client_module._ApiV1ProgressHttpWorker._publish(publisher, _progress_event())
+    logged = caplog.text
+    assert type(failure).__name__ in logged
+    for secret in ("request-secret", "client-secret", "encryption secret",
+                   "ciphertext secret", "prefill", "sequence"):
+        assert secret not in logged
+
+
+def test_api_v1_request_without_progress_capability_still_submits_final(monkeypatch):
+    client = _progress_request_client(capable=False)
+    final = {"api_v1_response": {"choices": [{"message": {"content": "ok"}}]}}
+
+    def supervise(_payload, *, local_deadline, progress_observer):
+        progress_observer(_progress_event(phase="preparing", total_prompt_tokens=0,
+                                          cached_prompt_tokens=0, processed_prompt_tokens=0))
+        return _ApiV1SupervisorOutcome(response_envelope=final)
+
+    client._supervise_api_v1_inference = MagicMock(side_effect=supervise)
+    publisher_type = MagicMock(side_effect=AssertionError("publisher must not be created"))
+    monkeypatch.setattr(relay_client_module, "_ApiV1ProgressPublisher", publisher_type)
+
+    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert result.inference_succeeded is True
+    assert result.submitted is True
+    publisher_type.assert_not_called()
+    client._api_v1_local_progress_observer.assert_called_once()
+    client._post_api_v1_response.assert_called_once_with(
+        final,
+        client_pub_key_b64=TEST_VALID_RESPONSE["client_public_key"],
+        client_pub_key=base64.b64decode(TEST_VALID_RESPONSE["client_public_key"]),
+        cancel_snapshot=None,
+        local_deadline=client._post_api_v1_response.call_args.kwargs["local_deadline"],
+    )
+
+
+@pytest.mark.parametrize("failure_site", ["encrypt", "handoff"])
+def test_api_v1_request_progress_failure_is_best_effort_for_final(monkeypatch, failure_site):
+    client = _progress_request_client()
+    final = {"api_v1_response": {"choices": [{"message": {"content": "ok"}}]}}
+
+    class FailingHandoff:
+        def submit(self, publisher, event, *, urgent=False):
+            if failure_site == "handoff":
+                raise RuntimeError("handoff failed")
+            relay_client_module._ApiV1ProgressHttpWorker._publish(publisher, event)
+
+        def invalidate(self, _publisher):
+            pass
+
+    if failure_site == "encrypt":
+        client.crypto_manager.encrypt_message.side_effect = RuntimeError("encrypt failed")
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", FailingHandoff())
+
+    def supervise(_payload, *, local_deadline, progress_observer):
+        progress_observer(_progress_event())
+        return _ApiV1SupervisorOutcome(response_envelope=final)
+
+    client._supervise_api_v1_inference = MagicMock(side_effect=supervise)
+
+    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert result.inference_succeeded is True
+    assert result.submitted is True
+    client._api_v1_local_progress_observer.assert_called_once_with(_progress_event())
+    client._post_api_v1_response.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("terminal_code", "recovery_attempted", "recovery_succeeded"),
+    [
+        ("request_cancelled", True, True),
+        ("local_deadline", True, True),
+        ("operator_stop", True, True),
+        ("compute_node_process_failed", True, False),
+    ],
+)
+def test_api_v1_terminal_request_stops_progress_and_discards_queued_work(
+    monkeypatch, terminal_code, recovery_attempted, recovery_succeeded
+):
+    client = _progress_request_client()
+    queued = []
+    invalidated = []
+
+    class ControlledHandoff:
+        def submit(self, publisher, event, *, urgent=False):
+            queued[:] = [(publisher, event)]
+
+        def invalidate(self, publisher):
+            invalidated.append(publisher)
+            queued[:] = [item for item in queued if item[0] is not publisher]
+
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", ControlledHandoff())
+
+    def supervise(_payload, *, local_deadline, progress_observer):
+        progress_observer(_progress_event())
+        return _ApiV1SupervisorOutcome(
+            response_envelope=None,
+            terminal_code=terminal_code,
+            runtime_healthy=recovery_succeeded,
+            recovery_attempted=recovery_attempted,
+            recovery_succeeded=recovery_succeeded,
+            submission_allowed=False,
+        )
+
+    client._supervise_api_v1_inference = MagicMock(side_effect=supervise)
+
+    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert result.safe_error_code == terminal_code
+    assert result.submitted is False
+    assert result.recovery_attempted is recovery_attempted
+    assert result.recovery_succeeded is recovery_succeeded
+    assert len(invalidated) == 1
+    assert queued == []
+    client._post_api_v1_response.assert_not_called()
+
+
+@pytest.mark.parametrize("recovered", [False, True])
+def test_api_v1_final_completion_keeps_one_publisher_and_monotonic_recovery_sequence(
+    monkeypatch, recovered
+):
+    client = _progress_request_client()
+    prepared = []
+    submitted_publishers = []
+    invalidated = []
+
+    class PreparingHandoff:
+        def submit(self, publisher, event, *, urgent=False):
+            submitted_publishers.append(publisher)
+            prepared.append(publisher._prepare(event))
+
+        def invalidate(self, publisher):
+            invalidated.append(publisher)
+
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", PreparingHandoff())
+
+    def encrypt(inner, _recipient):
+        sequence = inner["api_v1_progress"]["sequence"]
+        return {"chat_history": f"cipher-{sequence}", "cipherkey": "key", "iv": "iv"}
+
+    client.crypto_manager.encrypt_message.side_effect = encrypt
+    client._api_v1_control_credential_for_relay = MagicMock(return_value="credential")
+    final = {"api_v1_response": {"choices": [{"message": {"content": "ok"}}]}}
+
+    def supervise(_payload, *, local_deadline, progress_observer):
+        progress_observer(_progress_event(phase="preparing", total_prompt_tokens=0,
+                                          cached_prompt_tokens=0, processed_prompt_tokens=0))
+        progress_observer(_progress_event())
+        if recovered:
+            progress_observer(_progress_event(phase="preparing", total_prompt_tokens=0,
+                                              cached_prompt_tokens=0, processed_prompt_tokens=0))
+        return _ApiV1SupervisorOutcome(
+            response_envelope=final,
+            recovery_attempted=recovered,
+            recovery_succeeded=recovered,
+        )
+
+    client._supervise_api_v1_inference = MagicMock(side_effect=supervise)
+
+    result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+    assert result.inference_succeeded is True
+    assert result.submitted is True
+    assert len({id(call.args[0]) for call in client.crypto_manager.encrypt_message.call_args_list}) == len(prepared)
+    assert [payload[1]["json"]["ciphertext"] for payload in prepared] == [
+        f"cipher-{sequence}" for sequence in range(1, len(prepared) + 1)
+    ]
+    assert len(invalidated) == 1
+    assert all(publisher is invalidated[0] for publisher in submitted_publishers)
+    client._post_api_v1_response.assert_called_once()
 
 
 def test_api_v1_models_module_import_failure_does_not_capture_worker_diagnostics(monkeypatch):

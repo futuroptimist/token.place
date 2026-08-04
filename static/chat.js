@@ -56,7 +56,9 @@ new Vue({
         computeNodeCountQueuedRefreshActive: false,
         computeNodeCountFetchController: null,
         computeNodeCountDestroyed: false,
-        activeRelayRequest: null
+        activeRelayRequest: null,
+        relayProgress: null,
+        relayProgressAnnouncement: ''
     },
     mounted() {
         this.detectTouchInput();
@@ -1002,6 +1004,40 @@ new Vue({
         clearActiveRelayRequest(requestId) {
             if (this.activeRelayRequest && this.activeRelayRequest.requestId === requestId) {
                 this.activeRelayRequest = null;
+                this.relayProgress = null;
+                this.relayProgressAnnouncement = '';
+            }
+        },
+
+        relayProgressText(progress = this.relayProgress) {
+            return window.TokenPlaceProgress.relayProgressText(progress);
+        },
+
+        async applyEncryptedRelayProgress(outer, activeRequest) {
+            try {
+                if (this.activeRelayRequest !== activeRequest || activeRequest.terminated || !outer
+                    || outer.client_public_key !== activeRequest.clientPublicKey
+                    || outer.request_id !== activeRequest.requestId
+                    || outer.protocol !== 'tokenplace_api_v1_relay_e2ee' || outer.version !== 1) return;
+                const plaintext = await this.decrypt(outer.ciphertext, outer.cipherkey, outer.iv);
+                if (this.activeRelayRequest !== activeRequest || activeRequest.terminated || !plaintext) return;
+                const envelope = JSON.parse(plaintext);
+                const progress = envelope && envelope.api_v1_progress;
+                if (!window.TokenPlaceProgress.validProgressEnvelope(envelope, activeRequest.requestId,
+                    activeRequest.clientPublicKey, activeRequest.lastProgressSequence)) return;
+                if (this.activeRelayRequest !== activeRequest || activeRequest.terminated) return;
+                const old = this.relayProgress;
+                const oldMilestone = old && old.total_prompt_tokens > 0
+                    ? Math.floor((old.processed_prompt_tokens / old.total_prompt_tokens) * 4) : -1;
+                const milestone = progress.total_prompt_tokens > 0
+                    ? Math.floor((progress.processed_prompt_tokens / progress.total_prompt_tokens) * 4) : -1;
+                activeRequest.lastProgressSequence = progress.sequence;
+                this.relayProgress = { ...progress };
+                if (!old || old.phase !== progress.phase || milestone !== oldMilestone) {
+                    this.relayProgressAnnouncement = this.relayProgressText(progress);
+                }
+            } catch (_error) {
+                // Progress is best-effort and never changes the completion lifecycle.
             }
         },
 
@@ -1118,6 +1154,9 @@ new Vue({
                     }
                     if (pendingPayload === RELAY_REQUEST_TERMINATED) {
                         return pendingPayload;
+                    }
+                    if (pendingPayload && pendingPayload.encrypted_progress) {
+                        await this.applyEncryptedRelayProgress(pendingPayload.encrypted_progress, activeRequest);
                     }
                     deadline = this.shortenRelayResponseDeadline(deadline, pendingPayload, Date.now());
                     const pollDelay = await waitForOperation(
@@ -1312,12 +1351,15 @@ new Vue({
                     terminated: false,
                     retrievalController: new AbortController(),
                     terminationPromise: null,
-                    resolveTermination: null
+                    resolveTermination: null,
+                    lastProgressSequence: 0
                 };
                 activeRelayRequest.terminationPromise = new Promise((resolve) => {
                     activeRelayRequest.resolveTermination = resolve;
                 });
                 this.activeRelayRequest = activeRelayRequest;
+                this.relayProgress = { phase: 'waiting' };
+                this.relayProgressAnnouncement = 'Waiting for compute node…';
 
                 let admissionPayload = null;
                 try {
@@ -1724,6 +1766,8 @@ new Vue({
         this.terminateRelayRequestLocally(activeRequest);
         this.cancelRelayRequest('requester_cancelled');
         this.clearActiveRelayRequest(activeRequestId);
+        this.relayProgress = null;
+        this.relayProgressAnnouncement = '';
         if (!Array.isArray(this.chatHistory)) {
             return;
         }

@@ -74,6 +74,11 @@ jobs:
           TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
           RUN_RELAY_REGISTRATION_TESTS: '1'
         run: python -m pytest -q tests/e2e/test_ui.py -k 'landing_chat_real_inference_with_desktop_bridge_api_v1'
+      - name: Verify encrypted progress landing-page lifecycle
+        if: steps.prep.outputs.rc != '2'
+        env:
+          RUN_E2E: '1'
+        run: python -m pytest -q tests/e2e/test_ui.py -k 'landing_chat_uses_api_v1_only_non_streaming' -x
       - name: Run tests
         if: steps.prep.outputs.rc != '2'
         run: ./run_all_tests.sh

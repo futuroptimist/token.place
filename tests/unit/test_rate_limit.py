@@ -552,6 +552,76 @@ def test_control_server_owner_identity_requires_matching_bound_credential(monkey
             "/api/v1/relay/servers/unregister", valid_control_payload
         ) == ("server_public_key", "server-a")
 
+    with app.test_request_context("/api/v1/relay/progress", method="POST"):
+        assert _control_plane_identity_for_request(
+            "/api/v1/relay/progress", valid_control_payload
+        ) == ("server_public_key", "server-a")
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"server_public_key": "victim"},
+                                      {"server_public_key": "victim", "control_credential": "wrong"}])
+def test_progress_identity_spoof_falls_back_to_ip(monkeypatch, payload):
+    monkeypatch.setitem(
+        sys.modules,
+        "relay",
+        SimpleNamespace(
+            known_servers={"victim": {"api_v1_control_credential_digest": "secret"}},
+            _api_v1_control_credential_digest=lambda value: value,
+        ),
+    )
+    app = Flask(__name__)
+    with app.test_request_context(
+        "/api/v1/relay/progress", method="POST",
+        environ_base={"REMOTE_ADDR": "203.0.113.17"},
+    ):
+        assert _control_plane_identity_for_request(
+            "/api/v1/relay/progress", payload
+        ) == ("client_ip", "203.0.113.17")
+
+
+@pytest.mark.parametrize("configured_token", [False, True])
+def test_progress_exact_owners_have_independent_dedicated_buckets(configured_token):
+    env = {
+        "API_RATE_LIMIT": "100/hour",
+        "API_DAILY_QUOTA": "1000/day",
+        "API_RELAY_CONTROL_PLANE_PROGRESS_RATE_LIMIT": "1/hour",
+        "API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT": "10/hour",
+    }
+    if configured_token:
+        env["TOKEN_PLACE_RELAY_SERVER_TOKEN"] = "registration-token"
+    digest = lambda value: f"digest:{value}"
+    relay_module = SimpleNamespace(
+        SERVER_REGISTRATION_TOKENS=["registration-token"] if configured_token else [],
+        known_servers={
+            "server-a": {"api_v1_control_credential_digest": digest("secret-a")},
+            "server-b": {"api_v1_control_credential_digest": digest("secret-b")},
+        },
+        _api_v1_control_credential_digest=digest,
+    )
+    with patch.dict(os.environ, env, clear=True), patch.dict(
+        sys.modules, {"relay": relay_module, "__main__": relay_module}
+    ):
+        app = Flask(__name__)
+        init_app(app)
+
+        @app.post("/api/v1/relay/progress")
+        def progress():
+            return {"status": "ok"}
+
+        headers = {"X-Relay-Server-Token": "registration-token"} if configured_token else {}
+        with app.test_client() as client:
+            def submit(server, credential):
+                return client.post(
+                    "/api/v1/relay/progress",
+                    json={"server_public_key": server, "control_credential": credential},
+                    headers=headers,
+                    environ_overrides={"REMOTE_ADDR": "198.51.100.9"},
+                )
+
+            assert submit("server-a", "secret-a").status_code == 200
+            assert submit("server-a", "secret-a").status_code == 429
+            assert submit("server-b", "secret-b").status_code == 200
+
 
 def test_control_route_rate_limit_identity_falls_back_to_ip_without_owner_proof(
     monkeypatch,

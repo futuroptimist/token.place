@@ -35,6 +35,7 @@ CONTROL_PLANE_ROUTE_LIMIT_ENVS = {
     "/api/v1/relay/servers/poll": "API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT",
     "/api/v1/relay/servers/control": "API_RELAY_CONTROL_PLANE_CONTROL_RATE_LIMIT",
     "/api/v1/relay/responses": "API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT",
+    "/api/v1/relay/progress": "API_RELAY_CONTROL_PLANE_PROGRESS_RATE_LIMIT",
 }
 CONTROL_PLANE_ROUTE_DEFAULT_LIMITS = {
     "/api/v1/relay/servers/register": "240/hour",
@@ -42,6 +43,7 @@ CONTROL_PLANE_ROUTE_DEFAULT_LIMITS = {
     "/api/v1/relay/servers/poll": "1200/hour",
     "/api/v1/relay/servers/control": "1200/hour",
     "/api/v1/relay/responses": "1200/hour",
+    "/api/v1/relay/progress": "7200/hour",
 }
 CONTROL_PLANE_IP_DEFAULT_LIMIT = "10000/hour"
 
@@ -75,6 +77,7 @@ PUBLIC_API_V1_CORS_EXCLUDED_PATHS = frozenset(
     {
         "/api/v1/public-key/rotate",
         "/api/v1/relay/responses",
+        "/api/v1/relay/progress",
         "/api/v1/relay/servers/control",
         "/api/v1/relay/servers/poll",
         "/api/v1/relay/servers/register",
@@ -417,7 +420,7 @@ def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]
             return identity
         return "client_ip", get_remote_address()
 
-    if path in {"/api/v1/relay/servers/control", "/api/v1/relay/servers/unregister"}:
+    if path in {"/api/v1/relay/servers/control", "/api/v1/relay/servers/unregister", "/api/v1/relay/progress"}:
         identity = _control_server_owner_identity(data)
         if identity is not None:
             return identity
@@ -563,6 +566,20 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         if route_limit is None or request.method != "POST":
             return None
 
+        # Progress is the only control-plane request carrying a comparatively
+        # large opaque envelope.  Bound it before JSON parsing (including when
+        # a chunked request has no Content-Length), otherwise get_json() below
+        # would buffer an attacker-controlled body before the route can reject
+        # it.  Cache only the bounded bytes so the route sees the same body.
+        if route == "/api/v1/relay/progress":
+            body_limit = 16 * 1024
+            if request.content_length is not None and request.content_length > body_limit:
+                return jsonify({"error": {"message": "Progress envelope too large", "code": 413}}), 413
+            raw_body = request.stream.read(body_limit + 1)
+            if len(raw_body) > body_limit:
+                return jsonify({"error": {"message": "Progress envelope too large", "code": 413}}), 413
+            request._cached_data = raw_body
+
         remote_address = get_remote_address()
         checks: list[tuple[str, str, Any]] = [
             ("client_ip", remote_address, route_limit["ip"])
@@ -576,7 +593,7 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         identity_kind, identity_value = _control_plane_identity_for_request(route, data)
         allow_identity_bucket = _relay_server_token_boundary_has_configured_token()
         if (
-            route == "/api/v1/relay/servers/control"
+            route in {"/api/v1/relay/servers/control", "/api/v1/relay/progress"}
             and identity_kind != "client_ip"
             and identity_value != remote_address
         ):

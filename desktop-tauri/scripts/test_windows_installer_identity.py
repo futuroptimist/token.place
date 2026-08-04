@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-EXPECTED_VERSION = "0.1.10"
+EXPECTED_VERSION = "0.1.11"
 EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 EXPECTED_TARGET_TRIPLE = "x86_64-pc-windows-msvc"
@@ -31,6 +31,8 @@ CONFIG_NAME = "desktop_tauri_config.json"
 TAURI_IDENTIFIER = "place.token.desktop"
 APP_PROCESS_NAMES = ("token.place", "tokenplace", "token-place")
 ACCEPTABLE_UNINSTALL_EXIT_CODES = frozenset({0, 1605, 1614, 3010})
+WINDOWS_UNINSTALL_CLEANUP_TIMEOUT_SECONDS = 90.0
+WINDOWS_UNINSTALL_REINVENTORY_PASSES = 3
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 EXPECTED_LLAMA_CPP_VERSION = "0.3.32"
 EXPECTED_LLAMA_CPP_WHEEL = "llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
@@ -551,18 +553,83 @@ def build_uninstall_invocation(entry: RegistryEntry) -> list[str]:
     return [exe, *args]
 
 
+def _uninstaller_identity(entry: RegistryEntry) -> str:
+    value = entry.product_code or entry.key_path or entry.uninstall_string or entry.display_name
+    return hashlib.sha256(value.casefold().encode("utf-8")).hexdigest()[:12]
+
+
+def _uninstaller_kind(entry: RegistryEntry) -> str:
+    command = (entry.quiet_uninstall_string or entry.uninstall_string).casefold()
+    return "msi" if entry.windows_installer or "msiexec" in command else "nsis"
+
+
+def _write_uninstall_log(path: Path, entry: RegistryEntry, invocation: list[str], result: subprocess.CompletedProcess[str]) -> None:
+    """Write useful uninstall evidence without leaking machine-specific command paths."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    safe_invocation = [Path(invocation[0]).name, *invocation[1:]]
+    path.write_text(
+        f"kind={_uninstaller_kind(entry)}\nidentity={_uninstaller_identity(entry)}\n"
+        f"invocation={json.dumps(safe_invocation)}\nexit={result.returncode}\noutput:\n{result.stdout}",
+        encoding="utf-8",
+    )
+
+
+def _snapshot_payload(snapshot: AuthoritySnapshot) -> dict[str, object]:
+    return {
+        "shortcuts": [
+            {"path": str(item.path), "target": str(item.target), "target_exists": item.target.exists()}
+            for item in snapshot.shortcuts.shortcuts
+        ],
+        "registry": [
+            {
+                "kind": _uninstaller_kind(item),
+                "identity": _uninstaller_identity(item),
+                "display_name": item.display_name,
+            }
+            for item in snapshot.registry
+        ],
+    }
+
+
+def _persist_snapshot(directory: Path | None, name: str, snapshot: AuthoritySnapshot) -> None:
+    if directory is not None:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"authority-{name}.json").write_text(
+            json.dumps(_snapshot_payload(snapshot), indent=2, sort_keys=True), encoding="utf-8"
+        )
+
+
 def uninstall_best_effort(log_path: Path | None = None) -> None:
     if sys.platform != "win32":
         return
     snapshot = capture_authority_snapshot()
-    for entry in snapshot.registry:
-        invocation = build_uninstall_invocation(entry)
-        result = _run(invocation, timeout=180, check=False, log_path=log_path)
-        if result.returncode not in ACCEPTABLE_UNINSTALL_EXIT_CODES:
-            raise InstallerIdentityError(
-                f"uninstaller exit {result.returncode} for {entry.display_name!r}: {result.stdout[-1000:]}"
-            )
-    wait_for_cleanup_convergence(snapshot)
+    artifact_directory = log_path.parent if log_path is not None else None
+    _persist_snapshot(artifact_directory, "before", snapshot)
+    invoked: set[str] = set()
+    invocation_number = 0
+    for _pass in range(WINDOWS_UNINSTALL_REINVENTORY_PASSES):
+        entries = sorted(inventory_registry_entries(), key=lambda item: (_uninstaller_kind(item), _uninstaller_identity(item)))
+        pending = [entry for entry in entries if _uninstaller_identity(entry) not in invoked]
+        if not pending:
+            break
+        for entry in pending:
+            identity = _uninstaller_identity(entry)
+            invoked.add(identity)
+            invocation_number += 1
+            invocation = build_uninstall_invocation(entry)
+            result = _run(invocation, timeout=180, check=False)
+            if artifact_directory is not None:
+                invocation_log = artifact_directory / (
+                    f"{log_path.stem}-invocation-{invocation_number:02d}-{_uninstaller_kind(entry)}-{identity}.log"
+                )
+                _write_uninstall_log(invocation_log, entry, invocation, result)
+            if result.returncode not in ACCEPTABLE_UNINSTALL_EXIT_CODES:
+                raise InstallerIdentityError(
+                    f"uninstaller exit {result.returncode} for {entry.display_name!r}: {result.stdout[-1000:]}"
+                )
+    after = capture_authority_snapshot()
+    _persist_snapshot(artifact_directory, "after", after)
+    wait_for_cleanup_convergence(snapshot, artifact_directory=artifact_directory)
 
 
 def _parse_process_inventory(raw: str) -> list[dict[str, str]]:
@@ -644,19 +711,43 @@ def verify_authority_removed(before: AuthoritySnapshot) -> None:
 def wait_for_cleanup_convergence(
     before: AuthoritySnapshot,
     *,
-    deadline_seconds: float = 20.0,
+    deadline_seconds: float = WINDOWS_UNINSTALL_CLEANUP_TIMEOUT_SECONDS,
     poll_seconds: float = 0.5,
     monotonic: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
+    artifact_directory: Path | None = None,
 ) -> None:
-    deadline = monotonic() + deadline_seconds
+    started = monotonic()
+    deadline = started + deadline_seconds
     last_categories: list[str] = []
+    reported_milestones: set[int] = set()
     while True:
         last_categories = residual_authority_categories(before)
         if not last_categories:
+            if artifact_directory is not None:
+                _persist_snapshot(artifact_directory, "final", capture_authority_snapshot())
+            print(f"cleanup converged after {monotonic() - started:.1f}s; residual authority: none")
             return
-        if monotonic() >= deadline:
-            raise InstallerIdentityError(f"cleanup did not converge; residual authority: {', '.join(last_categories)}")
+        now = monotonic()
+        elapsed = now - started
+        for milestone in (0, 20, 60, 90):
+            if elapsed >= milestone and milestone not in reported_milestones:
+                reported_milestones.add(milestone)
+                print(f"cleanup elapsed {elapsed:.1f}s; residual authority: {', '.join(last_categories)}")
+        if now >= deadline:
+            final = capture_authority_snapshot()
+            _persist_snapshot(artifact_directory, "final", final)
+            before_paths = {_canonical_path(item.path) for item in before.shortcuts.shortcuts}
+            shortcut_details = [
+                f"path={item.path}; target={item.target}; target_exists={item.target.exists()}; "
+                f"present_before_uninstall={_canonical_path(item.path) in before_paths}"
+                for item in final.shortcuts.shortcuts
+            ]
+            detail = " | ".join(shortcut_details) if shortcut_details else "none"
+            raise InstallerIdentityError(
+                f"cleanup did not converge after {elapsed:.1f}s; residual authority: {', '.join(last_categories)}; "
+                f"remaining shortcuts: {detail}"
+            )
         sleeper(poll_seconds)
 
 

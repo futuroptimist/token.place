@@ -3,6 +3,7 @@ import time
 import threading
 import base64
 import json
+import io
 from pathlib import Path
 from flask import Flask
 import sys
@@ -52,6 +53,7 @@ def client():
     relay_module.client_pending_request_deadlines.clear()
     client_terminal_request_ids.clear()
     client_responses.clear()
+    relay_module.client_progress.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
     relay_module.api_v1_recently_unregistered_servers.clear()
@@ -88,6 +90,7 @@ def client():
     relay_module.client_pending_request_deadlines.clear()
     client_terminal_request_ids.clear()
     client_responses.clear()
+    relay_module.client_progress.clear()
     streaming_sessions.clear()
     streaming_sessions_by_client.clear()
     relay_module.api_v1_recently_unregistered_servers.clear()
@@ -5077,3 +5080,329 @@ def test_api_v1_terminal_registry_queue_inflight_deadlock_regression(client, mon
     assert DUMMY_CLIENT_PUB_KEY not in relay_module.client_pending_request_deadlines
     assert server not in client_inference_requests
     assert server not in known_servers
+
+
+def test_api_v1_encrypted_progress_exact_owner_latest_value_and_pop(client):
+    registration = client.post('/api/v1/relay/servers/register', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'capabilities': _capabilities(),
+    })
+    assert registration.status_code == 200
+    assert registration.get_json()['relay_capabilities'] == {'encrypted_progress_v1': True}
+    credential = registration.get_json()['control_credential']
+    request_id = 'req-progress'
+    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, request_id)
+    known_servers[DUMMY_SERVER_PUB_KEY]['api_v1_in_flight_requests'] = {
+        request_id: {'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_deadline_monotonic': time.monotonic() + 30}
+    }
+
+    def payload(ciphertext):
+        return {
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': request_id,
+            'control_credential': credential,
+            'protocol': 'tokenplace_api_v1_relay_e2ee',
+            'version': 1,
+            'ciphertext': ciphertext,
+            'cipherkey': 'encrypted-key',
+            'iv': 'fresh-iv',
+        }
+
+    assert client.post('/api/v1/relay/progress', json=payload('old')).status_code == 202
+    assert client.post('/api/v1/relay/progress', json=payload('new')).status_code == 202
+    pending = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': request_id,
+    })
+    assert pending.status_code == 202
+    encrypted_progress = pending.get_json()['encrypted_progress']
+    assert encrypted_progress['ciphertext'] == 'new'
+    assert 'server_public_key' not in encrypted_progress
+    assert 'control_credential' not in encrypted_progress
+    second = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': request_id,
+    })
+    assert second.status_code == 202
+    assert 'encrypted_progress' not in second.get_json()
+
+
+def test_api_v1_encrypted_progress_rejects_unknown_plaintext_and_wrong_owner(client):
+    registration = client.post('/api/v1/relay/servers/register', json={
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'capabilities': _capabilities(),
+    }).get_json()
+    base = {
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'unknown-request',
+        'control_credential': registration['control_credential'],
+        'protocol': 'tokenplace_api_v1_relay_e2ee', 'version': 1,
+        'ciphertext': 'opaque', 'cipherkey': 'key', 'iv': 'iv',
+    }
+    assert client.post('/api/v1/relay/progress', json=base).status_code == 410
+    assert client.post('/api/v1/relay/progress', json={**base, 'phase': 'prefill'}).status_code == 400
+    assert client.post('/api/v1/relay/progress', json={**base, 'control_credential': 'wrong'}).status_code == 403
+    assert relay_module.client_progress == {}
+
+
+def test_api_v1_encrypted_progress_rejects_declared_oversized_body_before_storage(client):
+    response = client.post(
+        '/api/v1/relay/progress',
+        data=b'x' * (16 * 1024 + 1),
+        content_type='application/json',
+    )
+    assert response.status_code == 413
+    assert relay_module.client_progress == {}
+
+
+def test_api_v1_encrypted_progress_rejects_unknown_length_oversized_body_before_storage(client):
+    response = client.open(
+        '/api/v1/relay/progress',
+        method='POST',
+        input_stream=io.BytesIO(b'x' * (16 * 1024 + 1)),
+        content_type='application/json',
+        environ_overrides={'CONTENT_LENGTH': '', 'wsgi.input_terminated': True},
+    )
+    assert response.status_code == 413
+    assert relay_module.client_progress == {}
+
+
+def _active_progress_request(client, suffix='contract'):
+    server = _server_key(f'progress-{suffix}')
+    client_key = f'{DUMMY_CLIENT_PUB_KEY}-{suffix}'
+    request_id = f'req-progress-{suffix}'
+    registration = client.post('/api/v1/relay/servers/register', json={
+        'server_public_key': server, 'capabilities': _capabilities(),
+    }).get_json()
+    deadline = time.monotonic() + 30
+    relay_module._mark_request_pending(
+        client_key, request_id, cancel_token='cancel-proof', deadline_monotonic=deadline
+    )
+    known_servers[server]['api_v1_in_flight_requests'] = {
+        request_id: {
+            'client_public_key': client_key,
+            'request_deadline_monotonic': deadline,
+            'expires_at': deadline,
+            'started_at_monotonic': time.monotonic(),
+            'cancel_token': 'cancel-proof',
+        }
+    }
+    payload = {
+        'server_public_key': server, 'client_public_key': client_key,
+        'request_id': request_id,
+        'control_credential': registration['control_credential'],
+        'protocol': 'tokenplace_api_v1_relay_e2ee', 'version': 1,
+        'ciphertext': f'ciphertext-{suffix}', 'cipherkey': f'key-{suffix}',
+        'iv': f'iv-{suffix}',
+    }
+    return server, client_key, request_id, deadline, payload
+
+
+def _buffer_active_progress(client, suffix):
+    request = _active_progress_request(client, suffix)
+    _, client_key, request_id, _, payload = request
+    response = client.post('/api/v1/relay/progress', json=payload)
+    progress_key = (client_key, request_id)
+    assert response.status_code == 202
+    assert progress_key in relay_module.client_progress
+    return request, progress_key
+
+
+def _assert_progress_cleared_with_terminal_retrieval(
+    client, progress_key, *, status, reason
+):
+    client_key, request_id = progress_key
+    assert progress_key not in relay_module.client_progress
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': client_key, 'request_id': request_id,
+    })
+    assert retrieved.status_code == 410
+    body = retrieved.get_json()
+    assert body['error']['status'] == status
+    assert body['error']['reason'] == reason
+    assert 'encrypted_progress' not in body
+
+
+def test_api_v1_buffered_progress_is_cleared_by_requester_cancellation(client):
+    (_, client_key, request_id, _, _), progress_key = _buffer_active_progress(
+        client, 'cleanup-cancel'
+    )
+
+    cancelled = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': client_key,
+        'request_id': request_id,
+        'status': 'cancelled',
+        'reason': 'requester_cancelled',
+        'cancel_token': 'cancel-proof',
+    })
+
+    assert cancelled.status_code == 200
+    _assert_progress_cleared_with_terminal_retrieval(
+        client, progress_key, status='cancelled', reason='requester_cancelled'
+    )
+
+
+def test_api_v1_buffered_progress_is_cleared_by_authoritative_deadline_pruning(client):
+    (server, _, _, deadline, _), progress_key = _buffer_active_progress(
+        client, 'cleanup-expiry'
+    )
+    entry = next(iter(known_servers[server]['api_v1_in_flight_requests'].values()))
+    entry['expires_at'] = deadline
+
+    removed = relay_module._prune_api_v1_stale_in_flight_entries(
+        known_servers[server], now_monotonic=deadline + 1
+    )
+
+    assert removed == 1
+    _assert_progress_cleared_with_terminal_retrieval(
+        client, progress_key, status='expired', reason='provider_timeout'
+    )
+
+
+def test_api_v1_buffered_progress_is_cleared_by_exact_owner_unregister(client):
+    (server, _, _, _, payload), progress_key = _buffer_active_progress(
+        client, 'cleanup-unregister'
+    )
+
+    unregistered = client.post('/api/v1/relay/servers/unregister', json={
+        'server_public_key': server,
+        'control_credential': payload['control_credential'],
+    })
+
+    assert unregistered.status_code == 200
+    assert unregistered.get_json()['removed'] is True
+    _assert_progress_cleared_with_terminal_retrieval(
+        client, progress_key, status='cancelled', reason='server_unregistered'
+    )
+
+
+def test_api_v1_buffered_progress_is_cleared_by_stale_server_eviction(client):
+    (server, _, _, _, _), progress_key = _buffer_active_progress(
+        client, 'cleanup-stale-eviction'
+    )
+    known_servers[server]['last_ping'] = datetime.now() - timedelta(seconds=120)
+    known_servers[server]['last_ping_duration'] = 1
+    entry = next(iter(known_servers[server]['api_v1_in_flight_requests'].values()))
+    entry['expires_at'] = time.monotonic() - 1
+
+    evicted = relay_module._evict_stale_servers()
+
+    assert server in evicted
+    _assert_progress_cleared_with_terminal_retrieval(
+        client, progress_key, status='cancelled', reason='server_unregistered'
+    )
+
+
+def test_api_v1_progress_rejects_each_independent_ownership_and_lifecycle_failure(client):
+    server, client_key, request_id, _, payload = _active_progress_request(client, 'reject')
+    other_server = _server_key('progress-wrong-server')
+    other_registration = client.post('/api/v1/relay/servers/register', json={
+        'server_public_key': other_server, 'capabilities': _capabilities(),
+    }).get_json()
+
+    cases = [
+        ({**payload, 'server_public_key': other_server,
+          'control_credential': other_registration['control_credential']}, 410),
+        ({**payload, 'control_credential': 'wrong-credential'}, 403),
+        ({**payload, 'client_public_key': 'wrong-client'}, 410),
+        ({**payload, 'request_id': 'wrong-request'}, 410),
+    ]
+    for candidate, expected in cases:
+        assert client.post('/api/v1/relay/progress', json=candidate).status_code == expected
+        assert relay_module.client_progress == {}
+
+    replacement_credential = 'replacement-control-credential'
+    known_servers[server] = {
+        **known_servers[server],
+        'api_v1_control_credential_digest': relay_module._api_v1_control_credential_digest(
+            replacement_credential
+        ),
+    }
+    assert client.post('/api/v1/relay/progress', json=payload).status_code == 403
+
+    payload['control_credential'] = replacement_credential
+    known_servers[server]['api_v1_in_flight_requests'][request_id][
+        'request_deadline_monotonic'
+    ] = time.monotonic() - 1
+    assert client.post('/api/v1/relay/progress', json=payload).status_code == 410
+
+    for status in ('completed', 'cancelled'):
+        _, terminal_client, terminal_request, _, terminal_payload = _active_progress_request(
+            client, status
+        )
+        relay_module._cancel_api_v1_request(
+            terminal_client, terminal_request, status=status
+        )
+        assert client.post('/api/v1/relay/progress', json=terminal_payload).status_code == 410
+
+
+def test_api_v1_progress_preserves_deadline_lease_capacity_and_final_response(client):
+    server, client_key, request_id, deadline, payload = _active_progress_request(client, 'invariants')
+    server_payload = known_servers[server]
+    entry = server_payload['api_v1_in_flight_requests'][request_id]
+    before = {
+        'pending_deadline': relay_module.client_pending_request_deadlines[client_key][request_id],
+        'request_deadline': entry['request_deadline_monotonic'],
+        'lease': entry['expires_at'],
+        'capacity': relay_module._api_v1_active_in_flight_count(server_payload),
+    }
+
+    assert client.post('/api/v1/relay/progress', json=payload).status_code == 202
+    assert relay_module.client_pending_request_deadlines[client_key][request_id] == before['pending_deadline'] == deadline
+    assert entry['request_deadline_monotonic'] == before['request_deadline']
+    assert entry['expires_at'] == before['lease']
+    assert relay_module._api_v1_active_in_flight_count(server_payload) == before['capacity']
+
+    final = client.post('/api/v1/relay/responses', json={
+        **_api_v1_response_payload(request_id, client_public_key=client_key),
+    })
+    assert final.status_code == 200
+    assert (client_key, request_id) not in relay_module.client_progress
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': client_key, 'request_id': request_id,
+    })
+    assert retrieved.status_code == 200
+    assert 'encrypted_progress' not in retrieved.get_json()
+
+
+@pytest.mark.parametrize('transition', ['final', 'cancel'])
+def test_api_v1_progress_terminal_race_has_one_lifecycle_consistent_winner(client, transition):
+    server, client_key, request_id, _, payload = _active_progress_request(client, f'race-{transition}')
+    barrier = threading.Barrier(3)
+    results = {}
+
+    def progress():
+        with app.test_client() as race_client:
+            barrier.wait(timeout=5)
+            response = race_client.post('/api/v1/relay/progress', json=payload)
+            results['progress'] = response.status_code
+
+    def terminal():
+        with app.test_client() as race_client:
+            barrier.wait(timeout=5)
+            if transition == 'final':
+                response = race_client.post('/api/v1/relay/responses', json={
+                    **_api_v1_response_payload(request_id, client_public_key=client_key),
+                })
+            else:
+                response = race_client.post('/api/v1/relay/requests/cancel', json={
+                    'client_public_key': client_key, 'request_id': request_id,
+                    'cancel_token': 'cancel-proof',
+                })
+            results['terminal'] = response.status_code
+
+    threads = [threading.Thread(target=progress), threading.Thread(target=terminal)]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert results['terminal'] == 200
+    assert results['progress'] in {202, 410}
+    assert (client_key, request_id) not in relay_module.client_progress
+    retrieve = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': client_key, 'request_id': request_id,
+    })
+    assert retrieve.status_code == (200 if transition == 'final' else 410)
+    assert 'encrypted_progress' not in (retrieve.get_json() or {})

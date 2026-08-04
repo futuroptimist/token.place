@@ -78,6 +78,8 @@ def route_landing_relay_chat(
     diagnostics_counts: list[int] | None = None,
     admission_payload: dict | None = None,
     pending_payload: dict | None = None,
+    pending_payloads: list[dict] | None = None,
+    final_encrypted_response: dict | None = None,
     retrieve_error_payload: dict | None = None,
     cancel_status: int = 200,
     cancel_payload: dict | None = None,
@@ -187,10 +189,16 @@ def route_landing_relay_chat(
             status = retrieve_statuses[min(len(state["retrieve_requests"]) - 1, len(retrieve_statuses) - 1)]
         if status != 200:
             if status == 202:
+                pending_index = len(state["retrieve_requests"]) - 1
+                selected_pending_payload = pending_payload or {"status": "pending"}
+                if pending_payloads:
+                    selected_pending_payload = pending_payloads[
+                        min(pending_index, len(pending_payloads) - 1)
+                    ]
                 route.fulfill(
                     status=202,
                     headers={"Content-Type": "application/json"},
-                    body=json.dumps(pending_payload or {"status": "pending"}),
+                    body=json.dumps(selected_pending_payload),
                 )
                 return
             route.fulfill(
@@ -209,24 +217,23 @@ def route_landing_relay_chat(
                     "content": assistant_content,
                 }
             }
+        response_body = final_encrypted_response or {
+            "chat_history": json.dumps(
+                {
+                    "protocol": "tokenplace_api_v1_relay_e2ee",
+                    "version": 1,
+                    "request_id": request_id,
+                    "client_public_key": client_public_key,
+                    "api_v1_response": api_v1_response,
+                }
+            ),
+            "cipherkey": "test-cipherkey",
+            "iv": "test-iv",
+        }
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps(
-                {
-                    "chat_history": json.dumps(
-                        {
-                            "protocol": "tokenplace_api_v1_relay_e2ee",
-                            "version": 1,
-                            "request_id": request_id,
-                            "client_public_key": client_public_key,
-                            "api_v1_response": api_v1_response,
-                        }
-                    ),
-                    "cipherkey": "test-cipherkey",
-                    "iv": "test-iv",
-                }
-            ),
+            body=json.dumps(response_body),
         )
 
     page.route("**/api/v1/relay/responses/retrieve", handle_retrieve)
@@ -1032,6 +1039,69 @@ def wait_for_landing_send_enabled(page: Page):
         """
     )
     return send_button
+
+
+def encrypted_landing_progress(
+    page: Page,
+    *,
+    request_id: str,
+    client_public_key: str,
+    sequence: int = 1,
+    phase: str = "preparing",
+    inner_request_id: str | None = None,
+    inner_client_public_key: str | None = None,
+):
+    """Encrypt progress while allowing outer and decrypted identities to differ."""
+    envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": inner_request_id or request_id,
+        "client_public_key": inner_client_public_key or client_public_key,
+        "api_v1_progress": {
+            "schema_version": 1,
+            "sequence": sequence,
+            "phase": phase,
+            "total_prompt_tokens": 0,
+            "cached_prompt_tokens": 0,
+            "processed_prompt_tokens": 0,
+            "generated_tokens": 0,
+            "elapsed_ms": sequence * 100,
+        },
+    }
+    encrypted = page.evaluate(
+        """async plaintext => {
+            const vm = document.querySelector('#app').__vue__;
+            return vm.encrypt(plaintext, vm.clientPublicKey);
+        }""",
+        json.dumps(envelope),
+    )
+    return {
+        "client_public_key": client_public_key,
+        "request_id": request_id,
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        **encrypted,
+    }
+
+
+def assert_landing_progress_cleared(page: Page, *, assert_panel_hidden: bool = True):
+    if assert_panel_hidden:
+        expect(page.get_by_test_id("landing-inference-progress")).to_be_hidden()
+    state = page.evaluate(
+        """() => {
+            const vm = window.__progressLifecycleVm || document.querySelector('#app').__vue__;
+            return {
+                relayProgress: vm.relayProgress,
+                relayProgressAnnouncement: vm.relayProgressAnnouncement,
+                chatHistory: vm.chatHistory,
+                messages: vm.createApiV1Messages('subsequent request')
+            };
+        }"""
+    )
+    assert state["relayProgress"] is None
+    assert state["relayProgressAnnouncement"] == ""
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in state["chatHistory"])
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in state["messages"])
 
 
 def assert_cancel_payload_is_routing_metadata_only(payload: dict):
@@ -2903,3 +2973,246 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             bridge_process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             bridge_process.kill()
+
+
+def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_native_ui_semantics(
+    page: Page, base_url: str, setup_servers
+):
+    request_id = "progress-browser-request"
+    page.goto(base_url)
+    page.wait_for_function("() => Boolean(document.querySelector('#app').__vue__?.clientPublicKey)")
+    page.clock.install()
+    client_key = page.evaluate("btoa(document.querySelector('#app').__vue__.clientPublicKey)")
+
+    def progress(phase, sequence, *, total=0, processed=0, generated=0, extra=None):
+        value = {
+            "schema_version": 1,
+            "sequence": sequence,
+            "phase": phase,
+            "total_prompt_tokens": total,
+            "cached_prompt_tokens": 0,
+            "processed_prompt_tokens": processed,
+            "generated_tokens": generated,
+            "elapsed_ms": sequence * 100,
+        }
+        if extra:
+            value.update(extra)
+        return value
+
+    def encrypt_envelope(
+        value,
+        *,
+        envelope_request=request_id,
+        envelope_client=client_key,
+        inner_request=None,
+        inner_client=None,
+    ):
+        envelope = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": inner_request or envelope_request,
+            "client_public_key": inner_client or envelope_client,
+            "api_v1_progress": value,
+        }
+        encrypted = page.evaluate(
+            """async ({plaintext}) => {
+                const vm = document.querySelector('#app').__vue__;
+                return vm.encrypt(plaintext, vm.clientPublicKey);
+            }""",
+            {"plaintext": json.dumps(envelope)},
+        )
+        return {
+            "client_public_key": envelope_client,
+            "request_id": envelope_request,
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            **encrypted,
+        }
+
+    preparing = encrypt_envelope(progress("preparing", 1))
+    determinate = encrypt_envelope(progress("prefill", 2, total=100, processed=25))
+    same_milestone = encrypt_envelope(progress("prefill", 3, total=100, processed=30))
+    zero_total = encrypt_envelope(progress("prefill", 4))
+    generating = encrypt_envelope(progress("generating", 5, generated=12))
+    unknown_field = encrypt_envelope(progress("generating", 6, generated=13, extra={"prompt": "forbidden"}))
+    valid_after_rejections = encrypt_envelope(progress("generating", 6, generated=14))
+    cross_request = encrypt_envelope(progress("generating", 7, generated=99), envelope_request="other-request")
+    cross_client = encrypt_envelope(progress("generating", 7, generated=99), envelope_client="other-client")
+    wrong_inner_request = encrypt_envelope(progress("generating", 7, generated=99), inner_request="other-request")
+    wrong_inner_client = encrypt_envelope(progress("generating", 7, generated=99), inner_client="other-client")
+    malformed = {**generating, "ciphertext": "not-valid-base64"}
+
+    final_envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": request_id,
+        "client_public_key": client_key,
+        "api_v1_response": {"message": {"role": "assistant", "content": "Atomic final answer."}},
+    }
+    final_cipher = page.evaluate(
+        """async ({plaintext}) => {
+            const vm = document.querySelector('#app').__vue__;
+            return vm.encrypt(plaintext, vm.clientPublicKey);
+        }""",
+        {"plaintext": json.dumps(final_envelope)},
+    )
+    pending = [
+        {"status": "pending"},
+        *({"status": "pending", "encrypted_progress": item} for item in [
+            preparing, determinate, same_milestone, zero_total, generating, malformed,
+            unknown_field, generating, zero_total, cross_request, cross_client,
+            wrong_inner_request, wrong_inner_client,
+            valid_after_rejections,
+        ]),
+    ]
+    state = route_landing_relay_chat(
+        page,
+        retrieve_statuses=[202] * len(pending) + [200],
+        pending_payloads=pending,
+        final_encrypted_response={"chat_history": final_cipher["ciphertext"], **{
+            key: final_cipher[key] for key in ("cipherkey", "iv")
+        }},
+    )
+    page.evaluate(
+        """requestId => {
+            const vm = document.querySelector('#app').__vue__;
+            const original = vm.createRequestId;
+            let calls = 0;
+            vm.createRequestId = () => calls++ === 0 ? requestId : original.call(vm);
+        }""",
+        request_id,
+    )
+    page.locator("textarea.message-input").fill("Show inference status")
+    wait_for_landing_send_enabled(page).click()
+
+    panel = page.get_by_test_id("landing-inference-progress")
+    progress_bar = page.get_by_test_id("landing-native-progress")
+    status = page.get_by_test_id("landing-progress-status")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    expect(status).to_have_text("Waiting for compute node…")
+    assert progress_bar.get_attribute("value") is None
+    assert progress_bar.get_attribute("role") is None
+    assert progress_bar.get_attribute("aria-labelledby") == "landing-progress-label"
+    assert progress_bar.get_attribute("aria-describedby") == "landing-progress-status"
+    live = panel.locator("[aria-live=polite]")
+    assert live.get_attribute("aria-atomic") == "true"
+
+    def advance(expected):
+        page.clock.fast_forward(500)
+        expect(status).to_have_text(expected)
+
+    advance("Preparing request…")
+    advance("Processing prompt: 25 of 100 tokens (25%)")
+    expect(progress_bar).to_have_attribute("max", "100")
+    expect(progress_bar).to_have_attribute("value", "25")
+    announced = live.text_content()
+    advance("Processing prompt: 30 of 100 tokens (30%)")
+    assert live.text_content() == announced
+    advance("Processing prompt…")
+    assert progress_bar.get_attribute("value") is None
+    advance("Generating response… 12 tokens generated")
+
+    for _ in range(8):
+        advance("Generating response… 12 tokens generated")
+    advance("Generating response… 14 tokens generated")
+    page.clock.fast_forward(500)
+    expect(panel).to_be_hidden()
+    expect(page.locator(".assistant-message")).to_have_count(1)
+    expect(page.locator(".assistant-message")).to_have_text("Atomic final answer.")
+    history = page.evaluate("document.querySelector('#app').__vue__.chatHistory")
+    assert [item["role"] for item in history] == ["user", "assistant"]
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in history)
+    next_messages = page.evaluate(
+        "document.querySelector('#app').__vue__.createApiV1Messages('next question')"
+    )
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in next_messages)
+    assert state["relay_requests"][0]["request_id"] == request_id
+
+
+@pytest.mark.parametrize(
+    "exit_kind",
+    ["structured_failure", "cancellation", "timeout", "failover", "pagehide", "teardown"],
+)
+def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_terminal_lifecycle_cleanup(
+    page: Page, base_url: str, setup_servers, exit_kind: str
+):
+    """Every terminal browser lifecycle clears decrypted progress state."""
+    request_id = f"progress-{exit_kind}"
+    page.goto(base_url)
+    page.wait_for_function("() => Boolean(document.querySelector('#app').__vue__?.clientPublicKey)")
+    page.clock.install()
+    client_key = page.evaluate("btoa(document.querySelector('#app').__vue__.clientPublicKey)")
+    update = encrypted_landing_progress(
+        page, request_id=request_id, client_public_key=client_key
+    )
+    terminal_status = 404 if exit_kind == "failover" else 400
+    retrieve_statuses = [202] if exit_kind in {"cancellation", "timeout", "pagehide", "teardown"} else [202, terminal_status]
+    pending = {"status": "pending", "encrypted_progress": update}
+    if exit_kind == "timeout":
+        pending["request_deadline_remaining_seconds"] = 0
+    route_landing_relay_chat(
+        page,
+        retrieve_statuses=retrieve_statuses,
+        pending_payload=pending,
+        retrieve_error_payload={"error": {"code": "selected_server_terminal"}},
+    )
+    page.evaluate(
+        """({requestId, clientKey}) => {
+            const vm = document.querySelector('#app').__vue__;
+            let resolveTermination;
+            const active = {
+                clientPublicKey: clientKey, requestId, cancelToken: 'cancel-proof',
+                cancelled: false, cancellationAttempted: false,
+                cancellationConfirmed: false, cancellationPromise: null,
+                terminated: false, retrievalController: new AbortController(),
+                terminationPromise: new Promise(resolve => { resolveTermination = resolve; }),
+                resolveTermination: null, lastProgressSequence: 0
+            };
+            active.resolveTermination = resolveTermination;
+            vm.activeRelayRequest = active;
+            window.__progressLifecycleRequest = active;
+            vm.relayProgress = {phase: 'waiting'};
+            vm.relayProgressAnnouncement = 'Waiting for compute node…';
+            window.__progressLifecycleVm = vm;
+            window.__progressLifecyclePromise = vm.retrieveRelayResponse(
+                clientKey, requestId, Date.now() + 480000
+            );
+        }""",
+        {"requestId": request_id, "clientKey": client_key},
+    )
+    page.wait_for_function(
+        "() => window.__progressLifecycleVm.relayProgress?.phase === 'preparing'"
+    )
+
+    if exit_kind in {"structured_failure", "failover"}:
+        page.clock.fast_forward(500)
+    elif exit_kind == "timeout":
+        page.clock.fast_forward(6_000)
+    elif exit_kind == "cancellation":
+        page.evaluate(
+            """() => {
+                const vm = window.__progressLifecycleVm;
+                const active = vm.activeRelayRequest;
+                vm.terminateRelayRequestLocally(active);
+                vm.cancelRelayRequest('requester_cancelled');
+                vm.clearActiveRelayRequest(active.requestId);
+            }"""
+        )
+    elif exit_kind == "pagehide":
+        page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
+    else:
+        page.evaluate("() => window.__progressLifecycleVm.$destroy()")
+
+    page.wait_for_function("() => window.__progressLifecycleVm.relayProgress === null")
+    assert_landing_progress_cleared(page, assert_panel_hidden=exit_kind != "teardown")
+    if exit_kind == "teardown":
+        teardown_state = page.evaluate(
+            """() => ({
+                activeRelayRequest: window.__progressLifecycleVm.activeRelayRequest,
+                requestTerminated: window.__progressLifecycleRequest.terminated
+            })"""
+        )
+        assert teardown_state == {
+            "activeRelayRequest": None,
+            "requestTerminated": True,
+        }

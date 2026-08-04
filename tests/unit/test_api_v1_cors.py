@@ -195,6 +195,7 @@ def test_repeated_preflights_do_not_consume_public_api_quota(client):
         ("options", "/api/v1/relay/servers/poll"),
         ("options", "/api/v1/relay/servers/control"),
         ("options", "/api/v1/relay/servers/unregister"),
+        ("options", "/api/v1/relay/progress"),
         ("options", "/api/v1/relay/responses"),
         ("options", "/api/v1/relay/unregister"),
         ("options", "/v1/relay/unregister"),
@@ -217,3 +218,13 @@ def test_cors_policy_does_not_apply_outside_public_api_v1_prefixes(client, metho
 
     assert "Access-Control-Allow-Origin" not in response.headers
     assert "Access-Control-Allow-Credentials" not in response.headers
+
+
+def test_progress_is_compute_only_while_response_retrieval_is_browser_accessible(client):
+    origin = "https://cors-smoke.invalid"
+
+    progress = _preflight(client, "/api/v1/relay/progress", origin)
+    retrieve = _preflight(client, "/api/v1/relay/responses/retrieve", origin)
+
+    assert "Access-Control-Allow-Origin" not in progress.headers
+    assert retrieve.headers["Access-Control-Allow-Origin"] == "*"

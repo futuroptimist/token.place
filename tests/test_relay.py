@@ -5198,6 +5198,101 @@ def _active_progress_request(client, suffix='contract'):
     return server, client_key, request_id, deadline, payload
 
 
+def _buffer_active_progress(client, suffix):
+    request = _active_progress_request(client, suffix)
+    _, client_key, request_id, _, payload = request
+    response = client.post('/api/v1/relay/progress', json=payload)
+    progress_key = (client_key, request_id)
+    assert response.status_code == 202
+    assert progress_key in relay_module.client_progress
+    return request, progress_key
+
+
+def _assert_progress_cleared_with_terminal_retrieval(
+    client, progress_key, *, status, reason
+):
+    client_key, request_id = progress_key
+    assert progress_key not in relay_module.client_progress
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': client_key, 'request_id': request_id,
+    })
+    assert retrieved.status_code == 410
+    body = retrieved.get_json()
+    assert body['error']['status'] == status
+    assert body['error']['reason'] == reason
+    assert 'encrypted_progress' not in body
+
+
+def test_api_v1_buffered_progress_is_cleared_by_requester_cancellation(client):
+    (_, client_key, request_id, _, _), progress_key = _buffer_active_progress(
+        client, 'cleanup-cancel'
+    )
+
+    cancelled = client.post('/api/v1/relay/requests/cancel', json={
+        'client_public_key': client_key,
+        'request_id': request_id,
+        'status': 'cancelled',
+        'reason': 'requester_cancelled',
+        'cancel_token': 'cancel-proof',
+    })
+
+    assert cancelled.status_code == 200
+    _assert_progress_cleared_with_terminal_retrieval(
+        client, progress_key, status='cancelled', reason='requester_cancelled'
+    )
+
+
+def test_api_v1_buffered_progress_is_cleared_by_authoritative_deadline_pruning(client):
+    (server, _, _, deadline, _), progress_key = _buffer_active_progress(
+        client, 'cleanup-expiry'
+    )
+    entry = next(iter(known_servers[server]['api_v1_in_flight_requests'].values()))
+    entry['expires_at'] = deadline
+
+    removed = relay_module._prune_api_v1_stale_in_flight_entries(
+        known_servers[server], now_monotonic=deadline + 1
+    )
+
+    assert removed == 1
+    _assert_progress_cleared_with_terminal_retrieval(
+        client, progress_key, status='expired', reason='provider_timeout'
+    )
+
+
+def test_api_v1_buffered_progress_is_cleared_by_exact_owner_unregister(client):
+    (server, _, _, _, payload), progress_key = _buffer_active_progress(
+        client, 'cleanup-unregister'
+    )
+
+    unregistered = client.post('/api/v1/relay/servers/unregister', json={
+        'server_public_key': server,
+        'control_credential': payload['control_credential'],
+    })
+
+    assert unregistered.status_code == 200
+    assert unregistered.get_json()['removed'] is True
+    _assert_progress_cleared_with_terminal_retrieval(
+        client, progress_key, status='cancelled', reason='server_unregistered'
+    )
+
+
+def test_api_v1_buffered_progress_is_cleared_by_stale_server_eviction(client):
+    (server, _, _, _, _), progress_key = _buffer_active_progress(
+        client, 'cleanup-stale-eviction'
+    )
+    known_servers[server]['last_ping'] = datetime.now() - timedelta(seconds=120)
+    known_servers[server]['last_ping_duration'] = 1
+    entry = next(iter(known_servers[server]['api_v1_in_flight_requests'].values()))
+    entry['expires_at'] = time.monotonic() - 1
+
+    evicted = relay_module._evict_stale_servers()
+
+    assert server in evicted
+    _assert_progress_cleared_with_terminal_retrieval(
+        client, progress_key, status='cancelled', reason='server_unregistered'
+    )
+
+
 def test_api_v1_progress_rejects_each_independent_ownership_and_lifecycle_failure(client):
     server, client_key, request_id, _, payload = _active_progress_request(client, 'reject')
     other_server = _server_key('progress-wrong-server')

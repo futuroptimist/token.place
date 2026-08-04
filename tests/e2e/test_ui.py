@@ -1041,6 +1041,68 @@ def wait_for_landing_send_enabled(page: Page):
     return send_button
 
 
+def encrypted_landing_progress(
+    page: Page,
+    *,
+    request_id: str,
+    client_public_key: str,
+    sequence: int = 1,
+    phase: str = "preparing",
+    inner_request_id: str | None = None,
+    inner_client_public_key: str | None = None,
+):
+    """Encrypt progress while allowing outer and decrypted identities to differ."""
+    envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": inner_request_id or request_id,
+        "client_public_key": inner_client_public_key or client_public_key,
+        "api_v1_progress": {
+            "schema_version": 1,
+            "sequence": sequence,
+            "phase": phase,
+            "total_prompt_tokens": 0,
+            "cached_prompt_tokens": 0,
+            "processed_prompt_tokens": 0,
+            "generated_tokens": 0,
+            "elapsed_ms": sequence * 100,
+        },
+    }
+    encrypted = page.evaluate(
+        """async plaintext => {
+            const vm = document.querySelector('#app').__vue__;
+            return vm.encrypt(plaintext, vm.clientPublicKey);
+        }""",
+        json.dumps(envelope),
+    )
+    return {
+        "client_public_key": client_public_key,
+        "request_id": request_id,
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        **encrypted,
+    }
+
+
+def assert_landing_progress_cleared(page: Page):
+    expect(page.get_by_test_id("landing-inference-progress")).to_be_hidden()
+    state = page.evaluate(
+        """() => {
+            const vm = window.__progressLifecycleVm || document.querySelector('#app').__vue__;
+            return {
+                relayProgress: vm.relayProgress,
+                relayProgressAnnouncement: vm.relayProgressAnnouncement,
+                chatHistory: vm.chatHistory,
+                messages: vm.createApiV1Messages('subsequent request')
+            };
+        }"""
+    )
+    assert state["relayProgress"] is None
+    assert state["relayProgressAnnouncement"] == ""
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in state["chatHistory"])
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in state["messages"])
+
+
 def assert_cancel_payload_is_routing_metadata_only(payload: dict):
     assert set(payload) == {
         "client_public_key", "request_id", "cancel_token", "status", "reason"
@@ -2936,12 +2998,19 @@ def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_native_u
             value.update(extra)
         return value
 
-    def encrypt_envelope(value, *, envelope_request=request_id, envelope_client=client_key):
+    def encrypt_envelope(
+        value,
+        *,
+        envelope_request=request_id,
+        envelope_client=client_key,
+        inner_request=None,
+        inner_client=None,
+    ):
         envelope = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
-            "request_id": envelope_request,
-            "client_public_key": envelope_client,
+            "request_id": inner_request or envelope_request,
+            "client_public_key": inner_client or envelope_client,
             "api_v1_progress": value,
         }
         encrypted = page.evaluate(
@@ -2968,6 +3037,8 @@ def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_native_u
     valid_after_rejections = encrypt_envelope(progress("generating", 6, generated=14))
     cross_request = encrypt_envelope(progress("generating", 7, generated=99), envelope_request="other-request")
     cross_client = encrypt_envelope(progress("generating", 7, generated=99), envelope_client="other-client")
+    wrong_inner_request = encrypt_envelope(progress("generating", 7, generated=99), inner_request="other-request")
+    wrong_inner_client = encrypt_envelope(progress("generating", 7, generated=99), inner_client="other-client")
     malformed = {**generating, "ciphertext": "not-valid-base64"}
 
     final_envelope = {
@@ -2989,6 +3060,7 @@ def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_native_u
         *({"status": "pending", "encrypted_progress": item} for item in [
             preparing, determinate, same_milestone, zero_total, generating, malformed,
             unknown_field, generating, zero_total, cross_request, cross_client,
+            wrong_inner_request, wrong_inner_client,
             valid_after_rejections,
         ]),
     ]
@@ -3039,7 +3111,7 @@ def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_native_u
     assert progress_bar.get_attribute("value") is None
     advance("Generating response… 12 tokens generated")
 
-    for _ in range(6):
+    for _ in range(8):
         advance("Generating response… 12 tokens generated")
     advance("Generating response… 14 tokens generated")
     page.clock.fast_forward(500)
@@ -3054,3 +3126,80 @@ def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_native_u
     )
     assert all("relayProgress" not in item and "api_v1_progress" not in item for item in next_messages)
     assert state["relay_requests"][0]["request_id"] == request_id
+
+
+@pytest.mark.parametrize(
+    "exit_kind",
+    ["structured_failure", "cancellation", "timeout", "failover", "pagehide", "teardown"],
+)
+def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_terminal_lifecycle_cleanup(
+    page: Page, base_url: str, setup_servers, exit_kind: str
+):
+    """Every terminal browser lifecycle clears decrypted progress state."""
+    request_id = f"progress-{exit_kind}"
+    page.goto(base_url)
+    page.wait_for_function("() => Boolean(document.querySelector('#app').__vue__?.clientPublicKey)")
+    page.clock.install()
+    client_key = page.evaluate("btoa(document.querySelector('#app').__vue__.clientPublicKey)")
+    update = encrypted_landing_progress(
+        page, request_id=request_id, client_public_key=client_key
+    )
+    terminal_status = 404 if exit_kind == "failover" else 400
+    retrieve_statuses = [202] if exit_kind in {"cancellation", "timeout", "pagehide", "teardown"} else [202, terminal_status]
+    pending = {"status": "pending", "encrypted_progress": update}
+    if exit_kind == "timeout":
+        pending["request_deadline_remaining_seconds"] = 0
+    route_landing_relay_chat(
+        page,
+        retrieve_statuses=retrieve_statuses,
+        pending_payload=pending,
+        retrieve_error_payload={"error": {"code": "selected_server_terminal"}},
+    )
+    page.evaluate(
+        """({requestId, clientKey}) => {
+            const vm = document.querySelector('#app').__vue__;
+            let resolveTermination;
+            const active = {
+                clientPublicKey: clientKey, requestId, cancelToken: 'cancel-proof',
+                cancelled: false, cancellationAttempted: false,
+                cancellationConfirmed: false, cancellationPromise: null,
+                terminated: false, retrievalController: new AbortController(),
+                terminationPromise: new Promise(resolve => { resolveTermination = resolve; }),
+                resolveTermination: null, lastProgressSequence: 0
+            };
+            active.resolveTermination = resolveTermination;
+            vm.activeRelayRequest = active;
+            vm.relayProgress = {phase: 'waiting'};
+            vm.relayProgressAnnouncement = 'Waiting for compute node…';
+            window.__progressLifecycleVm = vm;
+            window.__progressLifecyclePromise = vm.retrieveRelayResponse(
+                clientKey, requestId, Date.now() + 480000
+            );
+        }""",
+        {"requestId": request_id, "clientKey": client_key},
+    )
+    page.wait_for_function(
+        "() => window.__progressLifecycleVm.relayProgress?.phase === 'preparing'"
+    )
+
+    if exit_kind in {"structured_failure", "failover"}:
+        page.clock.fast_forward(500)
+    elif exit_kind == "timeout":
+        page.clock.fast_forward(6_000)
+    elif exit_kind == "cancellation":
+        page.evaluate(
+            """() => {
+                const vm = window.__progressLifecycleVm;
+                const active = vm.activeRelayRequest;
+                vm.terminateRelayRequestLocally(active);
+                vm.cancelRelayRequest('requester_cancelled');
+                vm.clearActiveRelayRequest(active.requestId);
+            }"""
+        )
+    elif exit_kind == "pagehide":
+        page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
+    else:
+        page.evaluate("() => window.__progressLifecycleVm.$destroy()")
+
+    page.wait_for_function("() => window.__progressLifecycleVm.relayProgress === null")
+    assert_landing_progress_cleared(page)

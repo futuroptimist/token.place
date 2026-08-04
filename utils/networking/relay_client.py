@@ -166,15 +166,34 @@ class _ApiV1ProgressHttpWorker:
     def __init__(self) -> None:
         self._condition = threading.Condition()
         self._pending = None
+        self._shutdown = False
         self._thread = threading.Thread(
             target=self._run, name="tokenplace-api-v1-progress-http", daemon=True
         )
         self._thread.start()
 
+    def shutdown(self) -> None:
+        """Stop this worker after any in-flight operation returns.
+
+        Production uses the module singleton for the process lifetime.  This
+        hook exists so independently constructed test workers can be quiesced
+        without changing that lifecycle.
+        """
+        with self._condition:
+            self._pending = None
+            self._shutdown = True
+            self._condition.notify_all()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        """Join a worker that has first been shut down."""
+        self._thread.join(timeout)
+
     def submit(
         self, publisher: _ApiV1ProgressPublisher, event: Dict[str, Any], *, urgent: bool = False
     ) -> bool:
         with self._condition:
+            if getattr(self, "_shutdown", False):
+                return False
             # Globally retain at most the newest not-yet-started update. This is
             # bounded even when encryption, credential lookup, or HTTP wedges.
             if self._pending is not None and self._pending[0] is publisher:
@@ -193,11 +212,13 @@ class _ApiV1ProgressHttpWorker:
         next_allowed = 0.0
         while True:
             with self._condition:
-                while self._pending is None or (
+                while not self._shutdown and (self._pending is None or (
                     not self._pending[2] and time.monotonic() < next_allowed
-                ):
+                )):
                     delay = max(0.0, next_allowed - time.monotonic())
                     self._condition.wait(delay if self._pending is not None else None)
+                if self._shutdown:
+                    return
                 publisher, event, _urgent = self._pending
                 self._pending = None
             self._publish(publisher, event)

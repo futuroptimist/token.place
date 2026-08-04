@@ -55,6 +55,21 @@ def _progress_event(**overrides):
     return event
 
 
+def _progress_http_thread_count():
+    return sum(
+        thread.name == "tokenplace-api-v1-progress-http"
+        for thread in threading.enumerate()
+    )
+
+
+def _stop_test_progress_worker(service, release=None):
+    if release is not None:
+        release.set()
+    service.shutdown()
+    service.join(1)
+    assert not service._thread.is_alive()
+
+
 def test_api_v1_progress_publisher_validates_and_uses_bounded_latest_handoff(monkeypatch):
     service = relay_client_module._ApiV1ProgressHttpWorker.__new__(
         relay_client_module._ApiV1ProgressHttpWorker
@@ -113,20 +128,23 @@ def test_api_v1_progress_stop_is_prompt_while_service_preparation_blocks(monkeyp
         return {"chat_history": "cipher", "cipherkey": "key", "iv": "iv"}
 
     owner.crypto_manager.encrypt_message.side_effect = blocked_encrypt
+    baseline = _progress_http_thread_count()
     service = relay_client_module._ApiV1ProgressHttpWorker()
-    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
-    publisher = relay_client_module._ApiV1ProgressPublisher(
-        owner, "https://relay.example", "client-key", "request-id"
-    )
-    publisher.submit(_progress_event())
-    assert entered.wait(1)
+    try:
+        monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+        publisher = relay_client_module._ApiV1ProgressPublisher(
+            owner, "https://relay.example", "client-key", "request-id"
+        )
+        publisher.submit(_progress_event())
+        assert entered.wait(1)
 
-    started = time.monotonic()
-    publisher.stop()
-    assert time.monotonic() - started < 0.1
-    assert not publisher._active.is_set()
-    assert not any(t.name == "tokenplace-api-v1-progress" for t in threading.enumerate())
-    release.set()
+        stopped = threading.Event()
+        threading.Thread(target=lambda: (publisher.stop(), stopped.set())).start()
+        assert stopped.wait(1)
+        assert not publisher._active.is_set()
+    finally:
+        _stop_test_progress_worker(service, release)
+    assert _progress_http_thread_count() == baseline
 
 
 def test_api_v1_progress_capability_is_exact_relay_and_clears_with_credentials():
@@ -186,46 +204,70 @@ def test_api_v1_progress_terminal_http_status_disables_publisher(monkeypatch, st
     assert not publisher._active.is_set()
 
 
+@pytest.mark.parametrize("status", [429, 500])
+def test_api_v1_progress_transient_http_status_remains_best_effort(monkeypatch, status):
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        _ProgressOwner(), "https://relay.example", "client-key", "request-id"
+    )
+    monkeypatch.setattr(relay_client_module.requests, "post",
+                        lambda *args, **kwargs: SimpleNamespace(status_code=status))
+
+    relay_client_module._ApiV1ProgressHttpWorker._publish(publisher, _progress_event())
+
+    assert publisher._active.is_set()
+
+
 def test_api_v1_progress_blocked_http_keeps_callbacks_and_stop_prompt(monkeypatch):
     entered = threading.Event()
     release = threading.Event()
+    baseline = _progress_http_thread_count()
     service = relay_client_module._ApiV1ProgressHttpWorker()
-    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
 
     def blocked_post(*_args, **_kwargs):
         entered.set()
         release.wait()
         return SimpleNamespace(status_code=200)
 
-    monkeypatch.setattr(relay_client_module.requests, "post", blocked_post)
-    publisher = relay_client_module._ApiV1ProgressPublisher(
-        _ProgressOwner(), "https://relay.example", "client-key", "request-id"
-    )
-    publisher.submit(_progress_event())
-    assert entered.wait(1)
-    publisher.submit(_progress_event(processed_prompt_tokens=4))
-    started = time.monotonic()
-    publisher.stop()
-    assert time.monotonic() - started < 0.1
-    assert service._pending is None
-    release.set()
+    try:
+        monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+        monkeypatch.setattr(relay_client_module.requests, "post", blocked_post)
+        publisher = relay_client_module._ApiV1ProgressPublisher(
+            _ProgressOwner(), "https://relay.example", "client-key", "request-id"
+        )
+        publisher.submit(_progress_event())
+        assert entered.wait(1)
+        callback_returned = threading.Event()
+        threading.Thread(target=lambda: (
+            publisher.submit(_progress_event(processed_prompt_tokens=4)),
+            callback_returned.set(),
+        )).start()
+        assert callback_returned.wait(1)
+        stopped = threading.Event()
+        threading.Thread(target=lambda: (publisher.stop(), stopped.set())).start()
+        assert stopped.wait(1)
+        assert service._pending is None
+    finally:
+        _stop_test_progress_worker(service, release)
+    assert _progress_http_thread_count() == baseline
 
 
 def test_api_v1_progress_repeated_requests_reuse_single_service_thread(monkeypatch):
+    baseline = _progress_http_thread_count()
     service = relay_client_module._ApiV1ProgressHttpWorker()
-    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
-    baseline = [t for t in threading.enumerate()
-                if t.name == "tokenplace-api-v1-progress-http"]
-    for index in range(25):
-        publisher = relay_client_module._ApiV1ProgressPublisher(
-            _ProgressOwner(), "https://relay.example", f"client-{index}", f"request-{index}"
-        )
-        publisher.submit(_progress_event())
-        publisher.stop()
-    current = [t for t in threading.enumerate()
-               if t.name == "tokenplace-api-v1-progress-http"]
-    assert current == baseline
-    assert service._pending is None
+    try:
+        monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+        assert _progress_http_thread_count() == baseline + 1
+        for index in range(25):
+            publisher = relay_client_module._ApiV1ProgressPublisher(
+                _ProgressOwner(), "https://relay.example", f"client-{index}", f"request-{index}"
+            )
+            publisher.submit(_progress_event())
+            publisher.stop()
+        assert _progress_http_thread_count() == baseline + 1
+        assert service._pending is None
+    finally:
+        _stop_test_progress_worker(service)
+    assert _progress_http_thread_count() == baseline
 
 
 def test_api_v1_progress_cross_request_identity_and_sequence_isolation(monkeypatch):

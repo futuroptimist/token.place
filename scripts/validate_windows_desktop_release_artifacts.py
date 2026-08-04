@@ -74,9 +74,11 @@ def _powershell_json(script: str, path: Path, *, description: str) -> dict:
             continue
 
     if result is None:
+        max_total_seconds = POWERSHELL_READER_TIMEOUT_SECONDS * POWERSHELL_READER_MAX_ATTEMPTS
         raise ValidationError(
-            f'{description} reader timed out after {POWERSHELL_READER_TIMEOUT_SECONDS} seconds '
-            f'for {path.name} ({POWERSHELL_READER_MAX_ATTEMPTS} attempts)'
+            f'{description} reader timed out after {POWERSHELL_READER_TIMEOUT_SECONDS} seconds per '
+            f'attempt for {path.name} ({POWERSHELL_READER_MAX_ATTEMPTS} attempts, '
+            f'{max_total_seconds} seconds max total)'
         ) from timeout_exc
 
     if result.returncode != 0:

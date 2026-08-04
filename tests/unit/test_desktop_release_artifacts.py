@@ -3209,9 +3209,19 @@ def test_powershell_json_deterministic_failures_do_not_retry(tmp_path, monkeypat
 
 
 def test_windows_validator_step_retries_only_on_legacy_thirty_second_timeout_signature():
+    # The legacy (pre-fix) script's __main__ guard catches TimeoutExpired as a
+    # bare Exception and prints only str(exc), which never contains the class
+    # name "subprocess.TimeoutExpired" -- only its __main__ wrapper text plus
+    # the TimeoutExpired message itself. The workflow's retry gate must match
+    # what that old script actually prints, not the exception's class name.
+    validator = _load_windows_release_validator()
+    legacy_message = f'Windows release artifact validation failed: {validator.subprocess.TimeoutExpired(["powershell"], 30)}'
+    assert 'subprocess.TimeoutExpired' not in legacy_message
+    assert 'timed out after 30 seconds' in legacy_message
+
     text = WORKFLOW.read_text(encoding='utf-8')
     block = _extract_workflow_job_block(text, 'build')
-    assert 'subprocess.TimeoutExpired' in block
+    assert 'Windows release artifact validation failed' in block
     assert 'timed out after 30 seconds' in block
     assert 'validator_max_attempts=2' in block
 

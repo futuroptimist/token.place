@@ -542,7 +542,7 @@ jobs:
             fi
 
             if [ "${validator_attempt}" -lt "${validator_max_attempts}" ] \
-              && printf '%s' "${validator_output}" | grep -q 'subprocess.TimeoutExpired' \
+              && printf '%s' "${validator_output}" | grep -q 'Windows release artifact validation failed' \
               && printf '%s' "${validator_output}" | grep -q 'timed out after 30 seconds'; then
               echo "::warning::Windows static artifact validator hit the legacy pre-fix PowerShell 30s metadata-read timeout; retrying the whole validator invocation once (attempt $((validator_attempt + 1))/${validator_max_attempts})."
               validator_attempt=$((validator_attempt + 1))

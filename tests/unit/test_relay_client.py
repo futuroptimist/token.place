@@ -4,6 +4,7 @@ Unit tests for the relay client module.
 import base64
 import builtins
 import json
+import logging
 import math
 import pytest
 import sys
@@ -69,6 +70,7 @@ def test_api_v1_progress_publisher_validates_and_uses_bounded_latest_handoff(mon
     publisher.submit(_progress_event(processed_prompt_tokens=4))
     assert service._pending[0] is publisher
     assert service._pending[1]["processed_prompt_tokens"] == 4
+    assert service._pending[2] is True
 
     publisher.submit(_progress_event(phase="invalid"))
     publisher.submit(_progress_event(processed_prompt_tokens=11))
@@ -143,6 +145,129 @@ def test_api_v1_progress_capability_is_exact_relay_and_clears_with_credentials()
     assert "https://one.example" not in client._api_v1_relay_capabilities
     client._clear_api_v1_control_credentials()
     assert client._api_v1_relay_capabilities == {}
+
+
+def test_api_v1_progress_phase_transitions_bypass_cadence(monkeypatch):
+    """A phase change is urgent while same-phase counters remain coalesced."""
+    service = relay_client_module._ApiV1ProgressHttpWorker.__new__(
+        relay_client_module._ApiV1ProgressHttpWorker
+    )
+    service._condition = threading.Condition()
+    service._pending = None
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        _ProgressOwner(), "https://relay.example", "client-key", "request-id"
+    )
+
+    publisher.submit(_progress_event(phase="preparing", total_prompt_tokens=0,
+                                     cached_prompt_tokens=0, processed_prompt_tokens=0))
+    assert service._pending[2] is True
+    publisher.submit(_progress_event(processed_prompt_tokens=3))
+    assert service._pending[2] is True
+    publisher.submit(_progress_event(processed_prompt_tokens=4))
+    assert service._pending[2] is True
+    service._pending = None  # Simulate the worker consuming the phase transition.
+    publisher.submit(_progress_event(processed_prompt_tokens=5))
+    assert service._pending[2] is False
+    publisher.submit(_progress_event(phase="generating", processed_prompt_tokens=10,
+                                     generated_tokens=1))
+    assert service._pending[2] is True
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 405, 410, 413, 422])
+def test_api_v1_progress_terminal_http_status_disables_publisher(monkeypatch, status):
+    owner = _ProgressOwner()
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        owner, "https://relay.example", "client-key", "request-id"
+    )
+    monkeypatch.setattr(relay_client_module.requests, "post",
+                        lambda *args, **kwargs: SimpleNamespace(status_code=status))
+    relay_client_module._ApiV1ProgressHttpWorker._publish(publisher, _progress_event())
+    assert not publisher._active.is_set()
+
+
+def test_api_v1_progress_blocked_http_keeps_callbacks_and_stop_prompt(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    service = relay_client_module._ApiV1ProgressHttpWorker()
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+
+    def blocked_post(*_args, **_kwargs):
+        entered.set()
+        release.wait()
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(relay_client_module.requests, "post", blocked_post)
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        _ProgressOwner(), "https://relay.example", "client-key", "request-id"
+    )
+    publisher.submit(_progress_event())
+    assert entered.wait(1)
+    publisher.submit(_progress_event(processed_prompt_tokens=4))
+    started = time.monotonic()
+    publisher.stop()
+    assert time.monotonic() - started < 0.1
+    assert service._pending is None
+    release.set()
+
+
+def test_api_v1_progress_repeated_requests_reuse_single_service_thread(monkeypatch):
+    service = relay_client_module._ApiV1ProgressHttpWorker()
+    monkeypatch.setattr(relay_client_module, "_API_V1_PROGRESS_HTTP_WORKER", service)
+    baseline = [t for t in threading.enumerate()
+                if t.name == "tokenplace-api-v1-progress-http"]
+    for index in range(25):
+        publisher = relay_client_module._ApiV1ProgressPublisher(
+            _ProgressOwner(), "https://relay.example", f"client-{index}", f"request-{index}"
+        )
+        publisher.submit(_progress_event())
+        publisher.stop()
+    current = [t for t in threading.enumerate()
+               if t.name == "tokenplace-api-v1-progress-http"]
+    assert current == baseline
+    assert service._pending is None
+
+
+def test_api_v1_progress_cross_request_identity_and_sequence_isolation(monkeypatch):
+    monkeypatch.setattr(relay_client_module._API_V1_PROGRESS_HTTP_WORKER,
+                        "invalidate", lambda publisher: None)
+    first_owner, second_owner = _ProgressOwner(), _ProgressOwner()
+    first = relay_client_module._ApiV1ProgressPublisher(
+        first_owner, "https://one.example", "client-one", "request-one"
+    )
+    second = relay_client_module._ApiV1ProgressPublisher(
+        second_owner, "https://two.example", "client-two", "request-two"
+    )
+    first._prepare(_progress_event())
+    first._prepare(_progress_event(processed_prompt_tokens=3))
+    second._prepare(_progress_event())
+
+    first_inner = first_owner.crypto_manager.encrypt_message.call_args_list[-1].args[0]
+    second_inner = second_owner.crypto_manager.encrypt_message.call_args_list[-1].args[0]
+    assert (first_inner["request_id"], first_inner["client_public_key"]) == (
+        "request-one", "client-one"
+    )
+    assert (second_inner["request_id"], second_inner["client_public_key"]) == (
+        "request-two", "client-two"
+    )
+    assert first_inner["api_v1_progress"]["sequence"] == 2
+    assert second_inner["api_v1_progress"]["sequence"] == 1
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("encryption secret"), ValueError("ciphertext secret")])
+def test_api_v1_progress_failure_log_is_privacy_safe(monkeypatch, caplog, failure):
+    owner = _ProgressOwner()
+    owner.crypto_manager.encrypt_message.side_effect = failure
+    publisher = relay_client_module._ApiV1ProgressPublisher(
+        owner, "https://relay.example", "client-secret", "request-secret"
+    )
+    with caplog.at_level(logging.WARNING, logger="relay_client"):
+        relay_client_module._ApiV1ProgressHttpWorker._publish(publisher, _progress_event())
+    logged = caplog.text
+    assert type(failure).__name__ in logged
+    for secret in ("request-secret", "client-secret", "encryption secret",
+                   "ciphertext secret", "prefill", "sequence"):
+        assert secret not in logged
 
 
 def test_api_v1_models_module_import_failure_does_not_capture_worker_diagnostics(monkeypatch):

@@ -91,6 +91,7 @@ class _ApiV1ProgressPublisher:
         self._lock = threading.Lock()
         self._stopped = False
         self._sequence = 0
+        self._last_phase = None
         self._active = threading.Event()
         self._active.set()
 
@@ -108,7 +109,11 @@ class _ApiV1ProgressPublisher:
             with self._lock:
                 if self._stopped:
                     return
-            _API_V1_PROGRESS_HTTP_WORKER.submit(self, {"phase": phase, **values})
+                phase_changed = phase != self._last_phase
+                self._last_phase = phase
+            _API_V1_PROGRESS_HTTP_WORKER.submit(
+                self, {"phase": phase, **values}, urgent=phase_changed
+            )
         except Exception:
             return
 
@@ -166,11 +171,15 @@ class _ApiV1ProgressHttpWorker:
         )
         self._thread.start()
 
-    def submit(self, publisher: _ApiV1ProgressPublisher, event: Dict[str, Any]) -> bool:
+    def submit(
+        self, publisher: _ApiV1ProgressPublisher, event: Dict[str, Any], *, urgent: bool = False
+    ) -> bool:
         with self._condition:
             # Globally retain at most the newest not-yet-started update. This is
             # bounded even when encryption, credential lookup, or HTTP wedges.
-            self._pending = (publisher, event)
+            if self._pending is not None and self._pending[0] is publisher:
+                urgent = urgent or self._pending[2]
+            self._pending = (publisher, event, urgent)
             self._condition.notify()
         return True
 
@@ -184,23 +193,30 @@ class _ApiV1ProgressHttpWorker:
         next_allowed = 0.0
         while True:
             with self._condition:
-                while self._pending is None or time.monotonic() < next_allowed:
+                while self._pending is None or (
+                    not self._pending[2] and time.monotonic() < next_allowed
+                ):
                     delay = max(0.0, next_allowed - time.monotonic())
                     self._condition.wait(delay if self._pending is not None else None)
-                publisher, event = self._pending
+                publisher, event, _urgent = self._pending
                 self._pending = None
-            try:
-                prepared = publisher._prepare(event) if publisher._active.is_set() else None
-                if prepared is not None and publisher._active.is_set():
-                    url, kwargs = prepared
-                    response = requests.post(url, **kwargs)
-                    if response.status_code in {400, 401, 403, 404, 405, 410, 413, 422}:
-                        publisher.stop_from_worker()
-            except Exception as exc:
-                logger.warning("API v1 progress publish failed; exc_type=%s", type(exc).__name__)
+            self._publish(publisher, event)
             # Cadence belongs to the one service worker, so it cannot create a
             # timer or sleeping thread per completed request.
             next_allowed = time.monotonic() + _API_V1_PROGRESS_INTERVAL_SECONDS
+
+    @staticmethod
+    def _publish(publisher: _ApiV1ProgressPublisher, event: Dict[str, Any]) -> None:
+        """Prepare and send one best-effort update on the service thread."""
+        try:
+            prepared = publisher._prepare(event) if publisher._active.is_set() else None
+            if prepared is not None and publisher._active.is_set():
+                url, kwargs = prepared
+                response = requests.post(url, **kwargs)
+                if response.status_code in {400, 401, 403, 404, 405, 410, 413, 422}:
+                    publisher.stop_from_worker()
+        except Exception as exc:
+            logger.warning("API v1 progress publish failed; exc_type=%s", type(exc).__name__)
 
 
 _API_V1_PROGRESS_HTTP_WORKER = _ApiV1ProgressHttpWorker()

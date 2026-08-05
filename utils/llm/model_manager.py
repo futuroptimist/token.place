@@ -469,22 +469,219 @@ def _qwen_64k_runtime_capabilities(llama_cpp_module: Any, llama_cls: Any) -> Dic
     }
 
 
+GGML_KV_TYPE_LAYOUTS = {
+    # llama.cpp/GGML storage type sizes are block payload sizes, not nominal
+    # bytes-per-element. Q8_0 stores 32 quants plus a 16-bit scale (34 bytes),
+    # and Q4_0 stores 32 4-bit quants plus a 16-bit scale (18 bytes).
+    'f16': {'block_size': 1, 'type_size': 2, 'ggml_type': 'F16'},
+    'q8': {'block_size': 32, 'type_size': 34, 'ggml_type': 'Q8_0'},
+    'q4': {'block_size': 32, 'type_size': 18, 'ggml_type': 'Q4_0'},
+}
+GGML_KV_TENSOR_ALIGNMENT_BYTES = 32
+QWEN_64K_LEGACY_BYTES_PER_TOKEN = {'f16': 524288, 'q8': 262144, 'q4': 131072}
+
+
+def _checked_positive_int(value: Any, name: str, *, maximum: int = 1 << 40) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f'{name}_invalid')
+    result = int(value)
+    if result <= 0 or result > maximum:
+        raise ValueError(f'{name}_invalid')
+    return result
+
+
+def _align_up(value: int, alignment: int = GGML_KV_TENSOR_ALIGNMENT_BYTES) -> int:
+    value = _checked_positive_int(value, 'value', maximum=1 << 62)
+    alignment = _checked_positive_int(alignment, 'alignment', maximum=1 << 20)
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _ggml_row_size_bytes(element_count: int, ggml_type: str) -> int:
+    element_count = _checked_positive_int(element_count, 'element_count')
+    layout = GGML_KV_TYPE_LAYOUTS.get(str(ggml_type).lower())
+    if layout is None:
+        raise ValueError('ggml_type_unsupported')
+    blocks = (element_count + layout['block_size'] - 1) // layout['block_size']
+    return blocks * layout['type_size']
+
+
+def _ggml_tensor_2d_allocation_bytes(rows: int, columns: int, ggml_type: str) -> int:
+    # Matches the llama.cpp KV-cache tensor shape per layer: one 2-D K tensor
+    # [n_embd_k_gqa, n_ctx] and one V tensor [n_embd_v_gqa, n_ctx]. Quantized
+    # GGML rows are rounded to full quantization blocks; allocator starts each
+    # tensor on GGML_MEM_ALIGN-compatible boundaries. The previous P4/P5 formula
+    # was effectively ``n_ctx * {f16:524288,q8:262144,q4:131072}``, which encoded
+    # a Qwen3-8B-shaped 32-layer 4096-wide F16 cache and then divided by nominal
+    # bytes/element for Q8/Q4. That was intentionally conservative for F16 but
+    # wrong for quantized GGML block storage and for non-Qwen3-8B architectures.
+    row_size = _ggml_row_size_bytes(rows, ggml_type)
+    payload = row_size * _checked_positive_int(columns, 'columns')
+    return _align_up(payload)
+
+
+def _read_gguf_metadata(model_path: Any, *, max_kv: int = 4096) -> Dict[str, Any]:
+    def read_string(f):
+        length = int.from_bytes(f.read(8), 'little', signed=False)
+        if length > (1 << 20):
+            raise ValueError('gguf_string_too_large')
+        return f.read(length).decode('utf-8', errors='replace')
+
+    with open(model_path, 'rb') as f:
+        if f.read(4) != GGUF_MAGIC:
+            raise ValueError('gguf_magic_missing')
+        version = int.from_bytes(f.read(4), 'little', signed=False)
+        if version not in (2, 3):
+            raise ValueError('gguf_version_unsupported')
+        _tensor_count = int.from_bytes(f.read(8), 'little', signed=False)
+        kv_count = int.from_bytes(f.read(8), 'little', signed=False)
+        if kv_count > max_kv:
+            raise ValueError('gguf_kv_count_too_large')
+        metadata: Dict[str, Any] = {}
+        for _ in range(kv_count):
+            key = read_string(f)
+            value_type = int.from_bytes(f.read(4), 'little', signed=False)
+            if value_type == 4:
+                value = int.from_bytes(f.read(4), 'little', signed=False)
+            elif value_type == 5:
+                value = int.from_bytes(f.read(4), 'little', signed=True)
+            elif value_type == 10:
+                value = int.from_bytes(f.read(8), 'little', signed=False)
+            elif value_type == 11:
+                value = int.from_bytes(f.read(8), 'little', signed=True)
+            elif value_type == 8:
+                value = read_string(f)
+            elif value_type == 7:
+                value = bool(int.from_bytes(f.read(1), 'little'))
+            else:
+                raise ValueError('gguf_metadata_type_unsupported')
+            metadata[key] = value
+        return metadata
+
+
+def _derive_kv_cache_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    arch = str(metadata.get('general.architecture') or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}', arch):
+        raise ValueError('architecture_missing_or_invalid')
+    prefix = arch
+
+    def meta_int(suffixes: tuple[str, ...], name: str, default: Optional[int] = None) -> int:
+        for suffix in suffixes:
+            key = f'{prefix}.{suffix}'
+            if key in metadata:
+                return _checked_positive_int(metadata[key], name, maximum=1 << 30)
+        if default is not None:
+            return default
+        raise ValueError(f'{name}_missing')
+
+    layers = meta_int(('block_count',), 'layer_count')
+    head_count = meta_int(('attention.head_count',), 'attention_head_count')
+    kv_heads = meta_int(('attention.head_count_kv',), 'attention_head_count_kv', head_count)
+    key_dim = meta_int(('attention.key_length',), 'key_length', None) if f'{prefix}.attention.key_length' in metadata else None
+    value_dim = meta_int(('attention.value_length',), 'value_length', None) if f'{prefix}.attention.value_length' in metadata else None
+    if key_dim is None or value_dim is None:
+        embd = meta_int(('embedding_length',), 'embedding_length')
+        if embd % head_count != 0:
+            raise ValueError('embedding_length_not_divisible_by_head_count')
+        key_dim = key_dim or embd // head_count
+        value_dim = value_dim or embd // head_count
+    return {
+        'architecture': arch,
+        'layer_count': layers,
+        'attention_head_count': head_count,
+        'attention_head_count_kv': kv_heads,
+        'gqa_groups': head_count // kv_heads if head_count % kv_heads == 0 else None,
+        'key_length': key_dim,
+        'value_length': value_dim,
+        'n_embd_k_gqa': kv_heads * key_dim,
+        'n_embd_v_gqa': kv_heads * value_dim,
+    }
+
+
+def _estimate_kv_cache_bytes_from_metadata(metadata: Dict[str, Any], n_ctx: int, type_k: str, type_v: str) -> Dict[str, Any]:
+    n_ctx = _checked_positive_int(n_ctx, 'context_size_tokens', maximum=1 << 30)
+    arch = _derive_kv_cache_metadata(metadata)
+    k_rows = arch['n_embd_k_gqa']
+    v_rows = arch['n_embd_v_gqa']
+    layers = arch['layer_count']
+    k_per_layer = _ggml_tensor_2d_allocation_bytes(k_rows, n_ctx, type_k)
+    v_per_layer = _ggml_tensor_2d_allocation_bytes(v_rows, n_ctx, type_v)
+    kv_bytes = (k_per_layer + v_per_layer) * layers
+    if kv_bytes > (1 << 63) - 1:
+        raise OverflowError('kv_cache_bytes_overflow')
+    return {
+        **arch,
+        'context_size_tokens': n_ctx,
+        'type_k': type_k,
+        'type_v': type_v,
+        'k_row_size_bytes': _ggml_row_size_bytes(k_rows, type_k),
+        'v_row_size_bytes': _ggml_row_size_bytes(v_rows, type_v),
+        'k_bytes_per_layer': k_per_layer,
+        'v_bytes_per_layer': v_per_layer,
+        'kv_cache_bytes': kv_bytes,
+        'ggml_tensor_alignment_bytes': GGML_KV_TENSOR_ALIGNMENT_BYTES,
+    }
+
+
+def _fallback_qwen3_8b_kv_metadata() -> Dict[str, Any]:
+    return {
+        'general.architecture': 'qwen3',
+        'qwen3.block_count': 36,
+        'qwen3.attention.head_count': 32,
+        'qwen3.attention.head_count_kv': 8,
+        'qwen3.attention.key_length': 128,
+        'qwen3.attention.value_length': 128,
+        'qwen3.embedding_length': 4096,
+    }
+
+
 def _qwen_64k_memory_estimate(model_path: Any, n_ctx: int, kv_precision: str, backend: str) -> Dict[str, Any]:
     model_size = None
     try:
         model_size = os.path.getsize(str(model_path))
     except OSError:
         pass
-    bytes_per_token_by_precision = {'f16': 524288, 'q8': 262144, 'q4': 131072}
-    kv_bytes = int(n_ctx) * bytes_per_token_by_precision.get(kv_precision, bytes_per_token_by_precision['f16'])
-    total = (model_size or 0) + kv_bytes
+    fallback_used = False
+    metadata_source = 'gguf_header'
+    fallback_reason = None
+    try:
+        metadata = _read_gguf_metadata(model_path)
+    except Exception as exc:
+        metadata = _fallback_qwen3_8b_kv_metadata()
+        fallback_used = True
+        metadata_source = 'conservative_qwen3_8b_compatibility_fallback'
+        fallback_reason = type(exc).__name__
+    try:
+        kv_breakdown = _estimate_kv_cache_bytes_from_metadata(metadata, n_ctx, kv_precision, kv_precision)
+    except Exception as exc:
+        metadata = _fallback_qwen3_8b_kv_metadata()
+        fallback_used = True
+        metadata_source = 'conservative_qwen3_8b_compatibility_fallback'
+        fallback_reason = type(exc).__name__
+        kv_breakdown = _estimate_kv_cache_bytes_from_metadata(metadata, n_ctx, kv_precision, kv_precision)
+    kv_bytes = kv_breakdown['kv_cache_bytes']
+    non_kv_runtime_bytes = max(512 * 1024 * 1024, int((model_size or 0) * 0.08)) if model_size is not None else None
+    safety_reserve_bytes = max(1024 * 1024 * 1024, int(kv_bytes * 0.10))
+    total = None
+    if model_size is not None:
+        total = model_size + kv_bytes + int(non_kv_runtime_bytes or 0) + safety_reserve_bytes
     return {
         'model_file_size_bytes': model_size,
         'estimated_kv_cache_bytes': kv_bytes,
-        'estimated_total_model_plus_kv_bytes': total if model_size is not None else None,
+        'exact_kv_cache_bytes': kv_bytes,
+        'estimated_non_kv_runtime_bytes': non_kv_runtime_bytes,
+        'safety_reserve_bytes': safety_reserve_bytes,
+        'estimated_total_runtime_bytes': total,
+        'estimated_total_model_plus_kv_bytes': (model_size + kv_bytes) if model_size is not None else None,
         'context_size_tokens': int(n_ctx),
         'backend': backend or 'unknown',
         'kv_precision': kv_precision,
+        'type_k': kv_precision,
+        'type_v': kv_precision,
+        'metadata_source': metadata_source,
+        'conservative_fallback_used': fallback_used,
+        'conservative_fallback_reason': fallback_reason,
+        'kv_cache_breakdown': kv_breakdown,
+        'legacy_effective_formula': 'n_ctx * {f16:524288,q8:262144,q4:131072}',
     }
 
 

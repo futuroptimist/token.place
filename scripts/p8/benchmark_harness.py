@@ -16,8 +16,8 @@ import re
 import subprocess
 import sys
 import tempfile
-import urllib.error
-import urllib.request
+import math
+import socket
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
@@ -229,29 +229,53 @@ def platform_memory_probe(command: list[str], timeout_s: float = 2.0) -> dict[st
     except Exception: return {"available": False, "code": "probe_malformed", "stdout_tail": sanitize(stdout[-200:])}
     return sanitize({"available": cp.returncode == 0, "code": "ok" if cp.returncode == 0 else "probe_failed", "payload": payload})
 
-def invoke_packaged_runtime_adapter(adapter_url: str, *, fixture_id: str = "small-8k", timeout_s: float = 30.0, model: str | None = None, backend: str | None = None, relay_url: str | None = None, cleanup_timeout_s: float | None = None) -> dict[str, Any]:
-    """Invoke a local packaged-runtime adapter and validate its evidence envelope."""
+def _is_loopback_url(value: str) -> bool:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        return False
+    try:
+        return all(addr[4][0] in {"127.0.0.1", "::1"} for addr in socket.getaddrinfo(parsed.hostname, parsed.port))
+    except (OSError, ValueError):
+        return False
+
+
+def invoke_packaged_runtime_adapter(adapter_url: str | None = None, *, fixture_id: str = "small-8k", timeout_s: float = 30.0, model: str | None = None, backend: str | None = None, relay_url: str | None = None, cleanup_timeout_s: float | None = None, runner: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Validate orchestration around an injected, repository-owned runner.
+
+    ``runner`` is deliberately injectable only through the Python API for unit
+    tests.  The production CLI cannot select a fake or opaque HTTP service.
+    """
     missing = [name for name, value in {"model": model, "backend": backend, "relay_url": relay_url, "timeout_s": timeout_s, "cleanup_timeout_s": cleanup_timeout_s}.items() if value in (None, "")]
     if missing:
         return {"pass": False, "code": "packaged_prerequisites_missing", "missing": missing}
-    parsed_url = urlparse(adapter_url)
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-        return {"pass": False, "code": "adapter_url_invalid"}
+    if adapter_url:
+        return {"pass": False, "code": "opaque_adapter_forbidden"}
+    model_path = Path(str(model))
+    if not model_path.is_file() or not os.access(model_path, os.R_OK):
+        return {"pass": False, "code": "model_artifact_invalid"}
+    if backend not in {"cpu", "metal", "cuda", "auto", "gpu", "hybrid"}:
+        return {"pass": False, "code": "backend_unsupported"}
+    if not _is_loopback_url(str(relay_url)):
+        return {"pass": False, "code": "relay_url_not_loopback"}
+    if not all(isinstance(value, (int, float)) and math.isfinite(value) and value > 0 for value in (timeout_s, cleanup_timeout_s)):
+        return {"pass": False, "code": "timeout_invalid"}
+    if runner is None:
+        return {
+            "pass": False,
+            "code": "packaged_runner_unavailable",
+            "detail": "installed desktop exposes no external benchmark control seam",
+        }
     prompt, manifest = generate_fixture(fixture_id)
-    body = _canonical_json({"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest, "model": model, "backend": backend, "relay_url": relay_url, "request_timeout_s": timeout_s, "cleanup_timeout_s": cleanup_timeout_s}).encode()
-    req = urllib.request.Request(adapter_url, data=body, headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310
-            raw = resp.read(1048576).decode("utf-8", errors="replace")
-            status = resp.status
-    except urllib.error.URLError as exc:
-        return {"pass": False, "code": "adapter_unreachable", "error": sanitize(str(exc))}
-    try:
-        payload = json.loads(raw)
+        payload = runner({"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest, "model": str(model_path), "backend": backend, "relay_url": relay_url, "request_timeout_s": timeout_s, "cleanup_timeout_s": cleanup_timeout_s})
     except Exception:
-        return {"pass": False, "code": "adapter_malformed", "stdout_tail": sanitize(raw[-200:])}
-    if status >= 400 or not isinstance(payload, dict):
-        return {"pass": False, "code": "adapter_failed", "status_code": status, "payload": sanitize(payload)}
+        return {"pass": False, "code": "packaged_runner_failed"}
+    if not isinstance(payload, dict):
+        return {"pass": False, "code": "packaged_evidence_malformed"}
+    required = {"app_identity", "runtime_identity", "build_identity", "backend_used", "model_fingerprint", "authoritative_prompt_tokens", "progress_events", "terminal", "response_text", "start_s", "first_token_s", "end_s", "output_tokens"}
+    missing_evidence = sorted(key for key in required if payload.get(key) in (None, "", [], {}))
+    if missing_evidence:
+        return {"pass": False, "code": "packaged_evidence_missing", "missing": missing_evidence}
     progress = analyze_progress(payload.get("progress_events", []), payload.get("terminal", "completed"))
     semantic = evaluate_semantic(payload.get("response_text", ""), manifest)
     metrics = summarize_metrics(
@@ -262,13 +286,13 @@ def invoke_packaged_runtime_adapter(adapter_url: str, *, fixture_id: str = "smal
         int(payload.get("output_tokens", 0)),
     )
     evidence = {
-        "adapter_invoked": True,
-        "status_code": status,
+        "runner_kind": "injected_test_runner",
         "fixture": {"id": fixture_id, "sha256": manifest.get("fixture_sha256"), "actual_tokens": manifest.get("actual_tokens")},
         "semantic": semantic,
         "progress": progress,
         "metrics": metrics,
         "memory": payload.get("memory", {}),
+        "runtime": {key: payload[key] for key in ("app_identity", "runtime_identity", "build_identity", "backend_used", "model_fingerprint", "authoritative_prompt_tokens")},
     }
     if "kv_estimate" in payload or "kv_runtime" in payload:
         evidence["kv_compare"] = compare_kv_estimate(payload.get("kv_estimate", {}), payload.get("kv_runtime", {}))
@@ -276,7 +300,7 @@ def invoke_packaged_runtime_adapter(adapter_url: str, *, fixture_id: str = "smal
     if "kv_compare" in evidence:
         passed = passed and bool(evidence["kv_compare"].get("pass"))
     evidence["pass"] = passed
-    evidence["code"] = "ok" if passed else "adapter_contract_failed"
+    evidence["code"] = "ok" if passed else "packaged_contract_failed"
     return sanitize(evidence)
 
 def cancellation_recovery_result(events: list[dict[str, Any]], *, phase: str, threshold: int, followup_ok: bool, cleanup_s: float, cleanup_budget_s: float = 30.0, late_result: bool = False, stale_progress: bool = False) -> dict[str, Any]:
@@ -304,14 +328,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("generate-fixture"); g.add_argument("--fixture", choices=FIXTURES, required=True); g.add_argument("--out-dir", required=True); g.add_argument("--seed", default=DEFAULT_SEED)
     e = sub.add_parser("evaluate"); e.add_argument("--manifest", required=True); e.add_argument("--response", required=True); e.add_argument("--strict", action="store_true"); e.add_argument("--out-dir", required=True)
-    r = sub.add_parser("packaged-runtime"); r.add_argument("--out-dir", required=True); r.add_argument("--adapter-url"); r.add_argument("--fixture", choices=FIXTURES, default="small-8k"); r.add_argument("--model"); r.add_argument("--backend"); r.add_argument("--relay-url"); r.add_argument("--request-timeout", type=float, default=30.0); r.add_argument("--cleanup-timeout", type=float); r.add_argument("--report-only", action="store_true")
+    r = sub.add_parser("packaged-runtime"); r.add_argument("--out-dir", required=True); r.add_argument("--adapter-url", help=argparse.SUPPRESS); r.add_argument("--fixture", choices=FIXTURES, default="small-8k"); r.add_argument("--model"); r.add_argument("--backend"); r.add_argument("--relay-url"); r.add_argument("--request-timeout", type=float, default=30.0); r.add_argument("--cleanup-timeout", type=float); r.add_argument("--report-only", action="store_true")
     args = p.parse_args(argv)
     if args.cmd == "generate-fixture":
         prompt, manifest = generate_fixture(args.fixture, args.seed); out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True); (out/f"{args.fixture}.prompt.txt").write_text(prompt); (out/f"{args.fixture}.manifest.json").write_text(_canonical_json(manifest)+"\n"); print(f"generated {args.fixture}: requested={manifest['requested_tokens']} actual={manifest['actual_tokens']} sha256={manifest['fixture_sha256']}"); return 0
     if args.cmd == "evaluate":
         manifest=json.loads(Path(args.manifest).read_text()); response=Path(args.response).read_text(); score=evaluate_semantic(response, manifest); path=write_report_atomic(Path(args.out_dir), {"mode":"semantic-evaluation","semantic":score,"fixture":{"id":manifest.get("fixture_id"),"sha256":manifest.get("fixture_sha256"),"actual_tokens":manifest.get("actual_tokens")}}); print(f"semantic_pass={score.get('semantic_pass', False)} report={path}"); return 1 if args.strict and not score.get("semantic_pass") else 0
     if args.cmd == "packaged-runtime":
-        if not args.adapter_url: print("packaged-runtime prerequisites missing: --adapter-url is required; no fake runtime substituted", file=sys.stderr); return 2
         evidence = invoke_packaged_runtime_adapter(args.adapter_url, fixture_id=args.fixture, timeout_s=args.request_timeout, model=args.model, backend=args.backend, relay_url=args.relay_url, cleanup_timeout_s=args.cleanup_timeout)
         path=write_report_atomic(Path(args.out_dir), {"mode":"packaged-runtime","runtime":{"adapter_url":"provided","platform":platform.system().lower()},"adapter":evidence}); print(f"adapter_pass={evidence.get('pass', False)} report={path}"); return 0 if evidence.get("pass") else 1
     return 2

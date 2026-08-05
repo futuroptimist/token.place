@@ -16,13 +16,27 @@ Physical packaged-runtime mode is intentionally fail-closed. Run it only on a ma
   the desktop runtime already supports it;
 - API v1 E2EE relay request, encrypted progress, cancellation, and response paths configured.
 
-The harness never silently substitutes a fake runtime for packaged-runtime mode:
+The harness never silently substitutes a fake runtime or trusts an HTTP adapter for
+packaged-runtime mode:
 
 ```bash
 python scripts/p8_benchmark.py packaged-runtime --out-dir .tmp/p8
 ```
 
-Without a real adapter URL this exits nonzero and reports that prerequisites are missing. With an adapter URL, packaged mode still requires explicit `--model`, `--backend`, `--relay-url`, `--request-timeout`, and `--cleanup-timeout` inputs before launch so a report cannot be marked successful without a real packaged inference attempt.
+This currently exits nonzero. The installed desktop exposes operator Start/Stop only through its
+in-process Tauri command surface; it has no authenticated external benchmark-control seam that can
+select a model, observe the API v1 encrypted progress lifecycle, trigger cancellation, and return
+bounded evidence to this Python harness. Directly running the bridge with system Python would not
+exercise the installed package, while accepting a caller-provided HTTP endpoint would send the
+plaintext fixture and model path to an unverifiable process. Both substitutes are therefore
+rejected. A physical command must not be documented as successful until the desktop owns such a
+control seam (which is outside this task's allowed production-code scope).
+
+Before that seam can be connected, inputs are still validated fail closed: the model must be a
+readable regular file, the backend must be recognized, relay/control HTTP endpoints must resolve to
+loopback, and request/cleanup timeouts must be finite and positive. Unit tests may inject a callable
+runner directly into the Python API to verify orchestration and evidence validation, but that hook
+is intentionally unavailable from the production CLI and is not physical evidence.
 
 ## Fixture generation
 
@@ -120,7 +134,6 @@ Cancellation scenarios must be progress-triggered, not sleep-only:
 
 ```bash
 python scripts/p8_benchmark.py packaged-runtime \
-  --adapter-url http://127.0.0.1:17345/run \
   --model /path/to/local-model.gguf \
   --backend metal \
   --relay-url http://127.0.0.1:8000 \
@@ -130,7 +143,7 @@ python scripts/p8_benchmark.py packaged-runtime \
   --report-only
 ```
 
-A physical adapter run should trigger cancellation during prefill after a configured processed-token
+A future repository-owned physical runner should trigger cancellation during prefill after a configured processed-token
 threshold or percentage, then trigger cancellation during generation after a configured generated-token
 threshold. Each scenario must assert cancellation acknowledgement, prompt progress termination,
 bounded cleanup, late-result suppression, stale-progress rejection, a successful small follow-up

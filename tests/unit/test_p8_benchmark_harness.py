@@ -121,7 +121,8 @@ def test_atomic_report_schema_and_redaction(tmp_path):
 
 def test_cli_validation_and_evaluate(tmp_path):
     proc = subprocess.run([sys.executable, "scripts/p8_benchmark.py", "packaged-runtime", "--out-dir", str(tmp_path)], text=True, capture_output=True)
-    assert proc.returncode == 2
+    assert proc.returncode == 1
+    assert json.loads((tmp_path / "p8_benchmark_report.json").read_text())["adapter"]["code"] == "packaged_prerequisites_missing"
     prompt, manifest = h.generate_fixture("small-8k")
     mf = tmp_path/"m.json"; mf.write_text(json.dumps(manifest))
     resp = tmp_path/"r.json"; resp.write_text(json.dumps(manifest["expected_answers"]))
@@ -192,8 +193,10 @@ def test_report_redacts_authorization_and_message_like_payloads(tmp_path):
     assert data["adapter"]["safe"] == "<redacted>"
 
 
-def test_packaged_runtime_adapter_invoked_and_sanitized(monkeypatch):
+def test_packaged_runtime_injected_runner_is_orchestration_only(tmp_path):
     _, manifest = h.generate_fixture("small-8k")
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"test artifact")
     payload = {
         "response_text": json.dumps(manifest["expected_answers"]),
         "progress_events": [
@@ -207,46 +210,48 @@ def test_packaged_runtime_adapter_invoked_and_sanitized(monkeypatch):
         "output_tokens": 4,
         "messages": [{"content": "plaintext"}],
         "memory": {"diagnostic": "Authorization: Bearer sk-runtime"},
+        "app_identity": "token.place-test",
+        "runtime_identity": "bundled-test",
+        "build_identity": "unit-test",
+        "backend_used": "cpu",
+        "model_fingerprint": "sha256:test",
+        "authoritative_prompt_tokens": manifest["actual_tokens"],
     }
-
-    class FakeResponse:
-        status = 200
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            return False
-        def read(self, _size):
-            return json.dumps(payload).encode()
-
     seen = {}
-    def fake_urlopen(req, timeout):
-        seen["url"] = req.full_url
-        seen["timeout"] = timeout
-        seen["body"] = json.loads(req.data.decode())
-        return FakeResponse()
+    def runner(request):
+        seen.update(request)
+        return payload
 
-    monkeypatch.setattr(h.urllib.request, "urlopen", fake_urlopen)
-    result = h.invoke_packaged_runtime_adapter("http://127.0.0.1:9/run", timeout_s=1.5, model="/safe/model.gguf", backend="metal", relay_url="http://127.0.0.1:8000", cleanup_timeout_s=3.0)
-    assert seen["url"] == "http://127.0.0.1:9/run"
-    assert seen["body"]["fixture_id"] == "small-8k"
-    assert result["adapter_invoked"] is True
+    result = h.invoke_packaged_runtime_adapter(timeout_s=1.5, model=str(model), backend="cpu", relay_url="http://127.0.0.1:8000", cleanup_timeout_s=3.0, runner=runner)
+    assert seen["fixture_id"] == "small-8k"
+    assert seen["prompt"] not in json.dumps(result)
+    assert result["runner_kind"] == "injected_test_runner"
     assert result["pass"] is True
     assert result["memory"]["diagnostic"] == "<redacted>"
     assert "messages" not in result
 
 
 def test_packaged_runtime_requires_physical_prerequisites():
-    result = h.invoke_packaged_runtime_adapter("http://127.0.0.1:9/run", timeout_s=1.5)
+    result = h.invoke_packaged_runtime_adapter(timeout_s=1.5)
     assert result["pass"] is False
     assert result["code"] == "packaged_prerequisites_missing"
     assert set(result["missing"]) == {"model", "backend", "relay_url", "cleanup_timeout_s"}
+
+
+def test_packaged_runtime_rejects_opaque_adapter_and_missing_model(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"x")
+    common = dict(timeout_s=1, model=str(model), backend="cpu", relay_url="http://127.0.0.1:8000", cleanup_timeout_s=1)
+    assert h.invoke_packaged_runtime_adapter("https://example.com/run", **common)["code"] == "opaque_adapter_forbidden"
+    assert h.invoke_packaged_runtime_adapter(**{**common, "model": str(tmp_path / "absent.gguf")})["code"] == "model_artifact_invalid"
+    assert h.invoke_packaged_runtime_adapter(**common)["code"] == "packaged_runner_unavailable"
 
 
 def test_report_only_does_not_suppress_runtime_failure(tmp_path):
     proc = subprocess.run([
         sys.executable, "scripts/p8_benchmark.py", "packaged-runtime",
         "--out-dir", str(tmp_path), "--adapter-url", "http://127.0.0.1:9/run",
-        "--model", "/safe/model.gguf", "--backend", "metal",
+        "--model", str(tmp_path / "missing.gguf"), "--backend", "metal",
         "--relay-url", "http://127.0.0.1:8000", "--cleanup-timeout", "1",
         "--report-only",
     ], text=True, capture_output=True)

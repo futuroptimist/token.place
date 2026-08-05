@@ -2,6 +2,8 @@ import json
 import subprocess
 import sys
 
+import pytest
+
 from scripts.p8 import benchmark_harness as h
 
 
@@ -49,6 +51,80 @@ def test_semantic_known_p7_failures_detected():
     assert score["semantic_pass"] is False
 
 
+@pytest.mark.parametrize("payload", [[], 7, None])
+def test_semantic_valid_non_object_json_has_complete_closed_score(payload):
+    _, manifest = h.generate_fixture("small-8k")
+    score = h.evaluate_semantic(json.dumps(payload), manifest)
+    assert score["json_only"] is True
+    assert all(score[key] is False for key in manifest["scoring_rules"] if key != "json_only")
+
+
+@pytest.mark.parametrize("response", ["not json", "```json\n{}\n```", '{"VII": "x"} commentary'])
+def test_semantic_rejects_invalid_json_fences_and_commentary(response):
+    _, manifest = h.generate_fixture("small-8k")
+    score = h.evaluate_semantic(response, manifest)
+    assert score["json_only"] is False
+    assert score["semantic_pass"] is False
+
+
+@pytest.mark.parametrize("bad_value", [None, 3, [], {}])
+def test_semantic_missing_and_non_string_values_fail_closed(bad_value):
+    _, manifest = h.generate_fixture("small-8k")
+    payload = dict(manifest["expected_answers"])
+    payload["VII"] = bad_value
+    score = h.evaluate_semantic(json.dumps(payload), manifest)
+    for key in ("target_selection", "prose_not_heading", "word_count", "capitalization", "trailing_punctuation", "exact_match", "semantic_pass"):
+        assert score[key] is False
+    del payload["VII"]
+    assert h.evaluate_semantic(json.dumps(payload), manifest)["word_count"] is False
+
+
+def test_semantic_categories_remain_independent():
+    _, manifest = h.generate_fixture("small-8k")
+    expected = manifest["expected_answers"]
+
+    internal_case = {**expected, "XIV": "You will Remember there was"}
+    score = h.evaluate_semantic(json.dumps(internal_case), manifest)
+    assert score["target_selection"] is True
+    assert score["capitalization"] is False
+
+    punctuated = {**expected, "XXI": expected["XXI"] + "."}
+    score = h.evaluate_semantic(json.dumps(punctuated), manifest)
+    assert score["target_selection"] is True
+    assert score["trailing_punctuation"] is False
+
+    spaced = {**expected, "VII": "They  were obliged to camp"}
+    score = h.evaluate_semantic(json.dumps(spaced), manifest)
+    assert score["target_selection"] is True
+    assert score["word_count"] is True
+    assert score["exact_match"] is False
+
+    wrong_five_words = {**expected, "VII": "These words are quite wrong"}
+    score = h.evaluate_semantic(json.dumps(wrong_five_words), manifest)
+    assert score["word_count"] is True
+    assert score["target_selection"] is False
+
+
+def test_semantic_wrong_missing_canary_and_key_sets():
+    _, manifest = h.generate_fixture("small-8k")
+    expected = manifest["expected_answers"]
+    assert h.evaluate_semantic(json.dumps({**expected, "canary": "wrong"}), manifest)["canary_exact"] is False
+    missing = dict(expected); del missing["canary"]
+    score = h.evaluate_semantic(json.dumps(missing), manifest)
+    assert score["canary_exact"] is False and score["exact_key_set"] is False
+    assert h.evaluate_semantic(json.dumps({**expected, "extra": "x"}), manifest)["exact_key_set"] is False
+
+
+def test_semantic_score_shape_is_stable_boolean_and_errors_deduplicated():
+    _, manifest = h.generate_fixture("small-8k")
+    fields = set(manifest["scoring_rules"]) | {"semantic_pass"}
+    for response in (json.dumps(manifest["expected_answers"]), "null", "bad"):
+        score = h.evaluate_semantic(response, manifest)
+        assert fields <= score.keys()
+        assert all(type(score[key]) is bool for key in fields)
+        assert len(score["errors"]) == len(set(score["errors"]))
+
+
 def test_semantic_json_key_canary_format_failures():
     _, manifest = h.generate_fixture("small-8k")
     assert h.evaluate_semantic("```json\n{}\n```", manifest)["json_only"] is False
@@ -68,7 +144,7 @@ def test_repeated_trial_scoring():
     assert scores["trial_count"] == 2
     assert scores["exact_match_count"] == 1
     assert scores["pass_rate"] == 0.5
-    assert scores["failure_categories"]["not_json_only"] == 1
+    assert scores["failure_categories"]["json_only"] == 1
 
 
 def test_progress_invariants_success_and_failures():

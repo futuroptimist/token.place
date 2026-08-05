@@ -115,41 +115,50 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED, tokenizer: Calla
         "requested_tokens": spec.requested_tokens, "actual_tokens": actual, "tokenizer": "adapter" if tokenizer else "whitespace-ci",
         "fixture_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "target_depths_tokens": target_markers,
         "expected_answers": {"VII": targets["VII"], "XIV": targets["XIV"], "XXI": targets["XXI"], "canary": canary},
-        "scoring_rules": ["json_only", "exact_key_set", "canary_exact", "target_selection", "prose_not_heading", "word_count", "capitalization", "trailing_punctuation", "exact_match"],
+        "semantic_oracle": {
+            "prose_keys": ["VII", "XIV", "XXI"],
+            "heading_decoys": ["They were obliged to camp out", "The Winged Monkeys", "The Lion Becomes the King"],
+        },
+        "scoring_rules": ["json_only", "exact_key_set", "canary_exact", "target_selection", "prose_not_heading", "word_count", "capitalization", "trailing_punctuation", "exact_match", "semantic_pass"],
     }
     return prompt, manifest
 
 def evaluate_semantic(response_text: str, manifest: dict[str, Any]) -> dict[str, Any]:
     expected = manifest["expected_answers"]
-    result = {k: False for k in ["json_only", "exact_key_set", "canary_exact", "target_selection", "prose_not_heading", "word_count", "capitalization", "trailing_punctuation", "exact_match"]}
-    result["errors"] = []
+    fields = ["json_only", "exact_key_set", "canary_exact", "target_selection", "prose_not_heading", "word_count", "capitalization", "trailing_punctuation", "exact_match", "semantic_pass"]
+    result = {key: False for key in fields}
+    parse_error: str | None = None
     stripped = response_text.strip()
-    if stripped.startswith("```") or not (stripped.startswith("{") and stripped.endswith("}")):
-        result["errors"].append("not_json_only")
-        return result
     try:
         parsed = json.loads(stripped)
-    except Exception:
-        result["errors"].append("invalid_json")
+        result["json_only"] = True
+    except (TypeError, json.JSONDecodeError):
+        parsed = None
+        parse_error = "invalid_json"
+    if not isinstance(parsed, dict):
+        result["errors"] = ([parse_error] if parse_error else []) + [key for key in fields if not result[key]]
         return result
-    result["json_only"] = True
+
+    prose_keys = manifest.get("semantic_oracle", {}).get("prose_keys", [key for key in expected if key != "canary"])
+    heading_decoys = set(manifest.get("semantic_oracle", {}).get("heading_decoys", []))
+    required_strings = all(isinstance(parsed.get(key), str) for key in expected)
     result["exact_key_set"] = set(parsed) == set(expected)
-    if not result["exact_key_set"]: result["errors"].append("key_set_mismatch")
     result["canary_exact"] = parsed.get("canary") == expected.get("canary")
-    title_values = {"The Winged Monkeys", "The Lion Becomes the King", "They were obliged to camp out"}
-    prose = True; target = True; wc = True; cap = True; punct = True; exact = True
-    for key, exp in expected.items():
-        val = parsed.get(key)
-        if val != exp: exact = False
-        if key == "canary": continue
-        if val in title_values: prose = False; target = False
-        if isinstance(val, str) and len(val.split()) != len(exp.split()): wc = False
-        if isinstance(val, str) and val[:1] != exp[:1]: cap = False
-        if isinstance(val, str) and val[-1:] in ".,;:!?": punct = False
-        if val != exp: target = False
-    result.update({"target_selection": target, "prose_not_heading": prose, "word_count": wc, "capitalization": cap, "trailing_punctuation": punct, "exact_match": exact and result["exact_key_set"] and result["json_only"]})
+
+    def normalized(value: str) -> str:
+        return " ".join(value.split()).rstrip(".,;:!?")
+
+    if required_strings:
+        prose_values = [parsed[key] for key in prose_keys]
+        result["target_selection"] = all(normalized(parsed[key]).casefold() == normalized(expected[key]).casefold() for key in prose_keys)
+        result["prose_not_heading"] = all(value not in heading_decoys for value in prose_values)
+        result["word_count"] = all(len(parsed[key].split()) == len(expected[key].split()) for key in prose_keys)
+        result["capitalization"] = all(normalized(parsed[key]) == normalized(expected[key]) for key in prose_keys)
+        result["trailing_punctuation"] = all(not parsed[key].rstrip().endswith(tuple(".,;:!?")) for key in prose_keys)
+
+    result["exact_match"] = result["exact_key_set"] and parsed == expected
     result["semantic_pass"] = result["exact_match"]
-    result["errors"] += [k for k, v in result.items() if isinstance(v, bool) and not v]
+    result["errors"] = [key for key in fields if not result[key]]
     return result
 
 def score_trials(responses: list[str], manifest: dict[str, Any]) -> dict[str, Any]:

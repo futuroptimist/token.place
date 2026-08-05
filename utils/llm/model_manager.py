@@ -70,6 +70,187 @@ QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_kv_q8_fa_balanced_batch'
 GGUF_MAGIC = b'GGUF'
 
 
+GGML_KV_TYPE_LAYOUTS = {
+    # GGML stores quantized rows in fixed-size blocks. Q8_0 is 32 values plus
+    # one fp16 scale (34 bytes/block); Q4_0 is 32 values packed into 16 bytes
+    # plus one fp16 scale (18 bytes/block). F16 is unblocked for KV purposes.
+    'f16': {'block_size': 1, 'type_size': 2},
+    'q8': {'block_size': 32, 'type_size': 34},
+    'q4': {'block_size': 32, 'type_size': 18},
+}
+GGML_KV_ROW_ALIGNMENT_BYTES = 32
+GGML_KV_ESTIMATE_OVERFLOW_LIMIT = (1 << 63) - 1
+
+
+def _checked_positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f'{name}_invalid')
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{name}_invalid') from exc
+    if result <= 0 or result > GGML_KV_ESTIMATE_OVERFLOW_LIMIT:
+        raise ValueError(f'{name}_invalid')
+    return result
+
+
+def _align_up(value: int, alignment: int) -> int:
+    value = _checked_positive_int(value, 'value')
+    alignment = _checked_positive_int(alignment, 'alignment')
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _ggml_kv_row_bytes(elements: Any, kv_precision: str, *, alignment: int = GGML_KV_ROW_ALIGNMENT_BYTES) -> int:
+    elements = _checked_positive_int(elements, 'elements')
+    layout = GGML_KV_TYPE_LAYOUTS.get(str(kv_precision))
+    if not layout:
+        raise ValueError('kv_precision_unsupported')
+    blocks = (elements + layout['block_size'] - 1) // layout['block_size']
+    raw = blocks * layout['type_size']
+    if raw > GGML_KV_ESTIMATE_OVERFLOW_LIMIT:
+        raise OverflowError('ggml_kv_row_bytes_overflow')
+    return _align_up(raw, alignment)
+
+
+def _read_gguf_metadata(model_path: Any) -> Dict[str, Any]:
+    # Minimal metadata reader: parse only the GGUF key/value table, never tensor
+    # payloads. This avoids a heavyweight dependency and keeps estimates cached by
+    # the OS page cache instead of reparsing model tensors.
+    import struct
+
+    type_names = {
+        0: 'uint8', 1: 'int8', 2: 'uint16', 3: 'int16', 4: 'uint32',
+        5: 'int32', 6: 'float32', 7: 'bool', 8: 'string', 9: 'array',
+        10: 'uint64', 11: 'int64', 12: 'float64',
+    }
+
+    def read(fmt, fh):
+        size = struct.calcsize(fmt)
+        data = fh.read(size)
+        if len(data) != size:
+            raise ValueError('gguf_metadata_truncated')
+        return struct.unpack(fmt, data)[0]
+
+    def read_value(fh, typ):
+        if typ == 4:
+            return read('<I', fh)
+        if typ == 5:
+            return read('<i', fh)
+        if typ == 6:
+            return read('<f', fh)
+        if typ == 7:
+            return bool(read('<?', fh))
+        if typ == 8:
+            n = read('<Q', fh)
+            if n > 1_000_000:
+                raise ValueError('gguf_string_too_large')
+            data = fh.read(n)
+            if len(data) != n:
+                raise ValueError('gguf_metadata_truncated')
+            return data.decode('utf-8', 'replace')
+        if typ == 9:
+            elem = read('<I', fh)
+            count = read('<Q', fh)
+            if count > 4096:
+                raise ValueError('gguf_array_too_large')
+            return [read_value(fh, elem) for _ in range(count)]
+        if typ == 10:
+            return read('<Q', fh)
+        if typ == 11:
+            return read('<q', fh)
+        raise ValueError(f'gguf_metadata_type_unsupported:{type_names.get(typ, typ)}')
+
+    with open(str(model_path), 'rb') as fh:
+        if fh.read(4) != GGUF_MAGIC:
+            raise ValueError('gguf_magic_invalid')
+        version = read('<I', fh)
+        if version not in (2, 3):
+            raise ValueError('gguf_version_unsupported')
+        read('<Q', fh)
+        kv_count = read('<Q', fh)
+        if kv_count > 10000:
+            raise ValueError('gguf_metadata_too_many_keys')
+        metadata = {}
+        for _ in range(kv_count):
+            key_len = read('<Q', fh)
+            if key_len > 4096:
+                raise ValueError('gguf_key_too_large')
+            key_data = fh.read(key_len)
+            if len(key_data) != key_len:
+                raise ValueError('gguf_metadata_truncated')
+            key = key_data.decode('utf-8', 'replace')
+            metadata[key] = read_value(fh, read('<I', fh))
+        return metadata
+
+
+def _qwen_64k_architecture_metadata_from_gguf(model_path: Any) -> Dict[str, Any]:
+    md = _read_gguf_metadata(model_path)
+    arch = md.get('general.architecture')
+    if not isinstance(arch, str) or not arch:
+        raise ValueError('gguf_architecture_missing')
+
+    def pick(*suffixes):
+        for suffix in suffixes:
+            key = f'{arch}.{suffix}'
+            if key in md:
+                return md[key]
+        return None
+
+    layers = _checked_positive_int(pick('block_count'), 'layer_count')
+    heads = _checked_positive_int(pick('attention.head_count'), 'attention_head_count')
+    kv_heads = _checked_positive_int(pick('attention.head_count_kv') or heads, 'attention_head_count_kv')
+    embd = _checked_positive_int(pick('embedding_length'), 'embedding_length')
+    key_length = pick('attention.key_length')
+    value_length = pick('attention.value_length')
+    if key_length is None and embd % heads:
+        raise ValueError('key_head_dim_not_derivable')
+    if value_length is None and embd % heads:
+        raise ValueError('value_head_dim_not_derivable')
+    head_dim_k = _checked_positive_int(key_length if key_length is not None else embd // heads, 'key_head_dim')
+    head_dim_v = _checked_positive_int(value_length if value_length is not None else embd // heads, 'value_head_dim')
+    return {
+        'architecture': arch,
+        'layer_count': layers,
+        'attention_head_count': heads,
+        'attention_head_count_kv': kv_heads,
+        'gqa_group_count': heads // kv_heads if heads % kv_heads == 0 else None,
+        'key_head_dim': head_dim_k,
+        'value_head_dim': head_dim_v,
+        'key_embedding_gqa': kv_heads * head_dim_k,
+        'value_embedding_gqa': kv_heads * head_dim_v,
+        'source': 'gguf_metadata',
+    }
+
+
+def _estimate_ggml_kv_cache_bytes(arch: Dict[str, Any], n_ctx: Any, type_k: str, type_v: Optional[str] = None) -> Dict[str, Any]:
+    n_ctx_i = _checked_positive_int(n_ctx, 'context_size_tokens')
+    layers = _checked_positive_int(arch.get('layer_count'), 'layer_count')
+    k_dim = _checked_positive_int(arch.get('key_embedding_gqa'), 'key_embedding_gqa')
+    v_dim = _checked_positive_int(arch.get('value_embedding_gqa'), 'value_embedding_gqa')
+    type_v = type_v or type_k
+    k_row = _ggml_kv_row_bytes(k_dim, type_k)
+    v_row = _ggml_kv_row_bytes(v_dim, type_v)
+    k_total = k_row * n_ctx_i * layers
+    v_total = v_row * n_ctx_i * layers
+    total = k_total + v_total
+    if total > GGML_KV_ESTIMATE_OVERFLOW_LIMIT:
+        raise OverflowError('ggml_kv_cache_bytes_overflow')
+    return {
+        'exact_kv_cache_bytes': total,
+        'key_cache_bytes': k_total,
+        'value_cache_bytes': v_total,
+        'key_row_bytes': k_row,
+        'value_row_bytes': v_row,
+        'context_size_tokens': n_ctx_i,
+        'layer_count': layers,
+        'key_embedding_gqa': k_dim,
+        'value_embedding_gqa': v_dim,
+        'type_k': type_k,
+        'type_v': type_v,
+        'row_alignment_bytes': GGML_KV_ROW_ALIGNMENT_BYTES,
+    }
+
+
 def normalize_qwen_64k_batch_profile(value: Any) -> str:
     """Normalize persisted/operator input without ever implicitly opting into experimental."""
     return value if isinstance(value, str) and value in QWEN_64K_BATCH_PROFILES else QWEN_64K_BATCH_PROFILE_DEFAULT
@@ -475,16 +656,65 @@ def _qwen_64k_memory_estimate(model_path: Any, n_ctx: int, kv_precision: str, ba
         model_size = os.path.getsize(str(model_path))
     except OSError:
         pass
-    bytes_per_token_by_precision = {'f16': 524288, 'q8': 262144, 'q4': 131072}
-    kv_bytes = int(n_ctx) * bytes_per_token_by_precision.get(kv_precision, bytes_per_token_by_precision['f16'])
-    total = (model_size or 0) + kv_bytes
+
+    # P4/P5 callers consumed only model_file_size_bytes, estimated_kv_cache_bytes,
+    # estimated_total_model_plus_kv_bytes, context_size_tokens, backend, and
+    # kv_precision. The previous effective formula was:
+    #   kv = n_ctx * {f16: 524288, q8: 262144, q4: 131072}
+    #   total = model_file_size + kv
+    # Those constants matched Qwen-ish dimensions only by name and treated Q8_0
+    # and Q4_0 as nominal 1.0/0.5 byte elements. The replacement below keeps
+    # the public fields but derives K and V allocations from GGUF architecture
+    # metadata and GGML block row storage.
+    fallback_used = False
+    fallback_reason = None
+    try:
+        arch = _qwen_64k_architecture_metadata_from_gguf(model_path)
+        kv = _estimate_ggml_kv_cache_bytes(arch, n_ctx, kv_precision, kv_precision)
+        metadata_source = arch.get('source')
+    except (OSError, ValueError, OverflowError) as exc:
+        fallback_used = True
+        fallback_reason = str(exc).split(':', 1)[0] or type(exc).__name__
+        conservative_bytes_per_token = {'f16': 524288, 'q8': 524288, 'q4': 262144}
+        kv_bytes = int(n_ctx) * conservative_bytes_per_token.get(kv_precision, conservative_bytes_per_token['f16'])
+        arch = {'source': 'conservative_compatibility_fallback'}
+        kv = {
+            'exact_kv_cache_bytes': kv_bytes,
+            'key_cache_bytes': None,
+            'value_cache_bytes': None,
+            'key_row_bytes': None,
+            'value_row_bytes': None,
+            'context_size_tokens': int(n_ctx),
+            'type_k': kv_precision,
+            'type_v': kv_precision,
+        }
+        metadata_source = arch['source']
+
+    runtime_batch = max(0, int(QWEN_64K_BATCH_PROFILES.get('safe', {}).get('n_batch', 0)))
+    non_kv_runtime_bytes = 512 * 1024 * 1024 + runtime_batch * 1024 * 1024
+    safety_reserve_bytes = max(1024 * 1024 * 1024, kv['exact_kv_cache_bytes'] // 8)
+    total = (model_size or 0) + kv['exact_kv_cache_bytes'] + non_kv_runtime_bytes + safety_reserve_bytes
     return {
         'model_file_size_bytes': model_size,
-        'estimated_kv_cache_bytes': kv_bytes,
-        'estimated_total_model_plus_kv_bytes': total if model_size is not None else None,
+        'estimated_kv_cache_bytes': kv['exact_kv_cache_bytes'],
+        'estimated_total_model_plus_kv_bytes': ((model_size or 0) + kv['exact_kv_cache_bytes']) if model_size is not None else None,
+        'estimated_non_kv_runtime_bytes': non_kv_runtime_bytes,
+        'safety_reserve_bytes': safety_reserve_bytes,
+        'estimated_total_runtime_bytes': total if model_size is not None else None,
         'context_size_tokens': int(n_ctx),
         'backend': backend or 'unknown',
         'kv_precision': kv_precision,
+        'metadata_source': metadata_source,
+        'conservative_fallback_used': fallback_used,
+        'conservative_fallback_reason': fallback_reason,
+        'kv_cache_breakdown': kv,
+        'architecture_metadata': {
+            k: arch.get(k) for k in (
+                'architecture', 'layer_count', 'attention_head_count',
+                'attention_head_count_kv', 'gqa_group_count', 'key_head_dim',
+                'value_head_dim', 'key_embedding_gqa', 'value_embedding_gqa',
+            ) if k in arch
+        },
     }
 
 

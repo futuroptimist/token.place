@@ -1,7 +1,7 @@
 {
   "provenance": {
     "llama_cpp_python_version": "0.3.32",
-    "llama_cpp_commit": "b3fed31b9afe00ae6418ccbe81fdc0bf62c5e24",
+    "llama_cpp_commit": "b3fed31b99f9bd37725833674252bccb429bb183",
     "evidence_kind": "source-derived",
     "source_paths": {
       "context_padding": "src/llama-context.cpp",

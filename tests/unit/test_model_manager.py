@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -14005,12 +14006,12 @@ def test_qwen_64k_estimate_uses_separate_k_v_dimensions_types_and_gqa():
     from utils.llm import model_manager as model_manager_module
 
     metadata = {
-        'general.architecture': 'toy',
-        'toy.block_count': 3,
-        'toy.attention.head_count': 12,
-        'toy.attention.head_count_kv': 4,
-        'toy.attention.key_length': 80,
-        'toy.attention.value_length': 96,
+        'general.architecture': 'qwen3',
+        'qwen3.block_count': 3,
+        'qwen3.attention.head_count': 12,
+        'qwen3.attention.head_count_kv': 4,
+        'qwen3.attention.key_length': 80,
+        'qwen3.attention.value_length': 96,
     }
     result = model_manager_module._estimate_kv_cache_bytes_from_metadata(metadata, 17, 'q8', 'q4', 'metal')
 
@@ -14072,6 +14073,58 @@ def test_qwen_64k_gguf_metadata_parser_skips_common_non_required_types(tmp_path)
     assert estimate['metadata_source'] == 'gguf_header'
     assert estimate['conservative_fallback_used'] is False
     assert estimate['exact_kv_cache_bytes'] == 641728512
+
+
+def test_llama_cpp_kv_fixture_provenance_pin_is_exact_full_sha():
+    fixture = _llama_cpp_kv_fixture()
+    commit = fixture['provenance']['llama_cpp_commit']
+
+    assert commit == 'b3fed31b99f9bd37725833674252bccb429bb183'
+    assert re.fullmatch(r'[0-9a-f]{40}', commit)
+
+
+@pytest.mark.parametrize('required_key', [
+    'qwen3.attention.head_count_kv',
+    'qwen3.attention.key_length',
+    'qwen3.attention.value_length',
+])
+def test_qwen_64k_required_array_metadata_fails_closed_without_exact_fields(tmp_path, required_key):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'required_array.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata[required_key] = [8 if required_key.endswith('head_count_kv') else 128]
+    _write_minimal_gguf(model, metadata)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'metal')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+    assert estimate['estimated_kv_cache_bytes'] >= 2147483648
+    assert estimate['exact_kv_cache_bytes'] is None
+    assert estimate['exact_kv_payload_bytes'] is None
+    assert estimate['exact_kv_allocation_bytes'] is None
+    assert estimate['kv_cache_breakdown']['exact_allocation_available'] is False
+
+
+def test_toy_architecture_is_not_in_production_exact_layout_allowlist():
+    from utils.llm import model_manager as model_manager_module
+
+    assert 'toy' not in model_manager_module.SUPPORTED_STANDARD_KV_ARCHITECTURES
+    with pytest.raises(ValueError, match='kv_layout_architecture_unsupported'):
+        model_manager_module._estimate_kv_cache_bytes_from_metadata(
+            {
+                'general.architecture': 'toy',
+                'toy.block_count': 1,
+                'toy.attention.head_count': 1,
+                'toy.attention.head_count_kv': 1,
+                'toy.attention.key_length': 32,
+                'toy.attention.value_length': 32,
+            },
+            256,
+            'q8',
+            'q8',
+        )
 
 def test_qwen_64k_profile_diagnostics_include_breakdown_and_preserve_order(tmp_path):
     from utils.llm import model_manager as model_manager_module
@@ -14163,12 +14216,12 @@ def test_qwen_64k_incomplete_metadata_uses_visible_conservative_fallback(tmp_pat
 
 
 @pytest.mark.parametrize('bad_metadata', [
-    {'general.architecture': 'toy', 'toy.block_count': 0, 'toy.attention.head_count': 1},
-    {'general.architecture': 'toy', 'toy.block_count': True, 'toy.attention.head_count': 1},
-    {'general.architecture': 'toy', 'toy.block_count': 1.5, 'toy.attention.head_count': 1},
-    {'general.architecture': 'toy', 'toy.block_count': '1', 'toy.attention.head_count': 1},
-    {'general.architecture': 'toy', 'toy.block_count': 1, 'toy.attention.head_count': 3, 'toy.attention.head_count_kv': 2, 'toy.embedding_length': 12},
-    {'general.architecture': 'toy', 'toy.block_count': 1, 'toy.attention.head_count': 3, 'toy.embedding_length': 10},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 0, 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': True, 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 1.5, 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': '1', 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 1, 'qwen3.attention.head_count': 3, 'qwen3.attention.head_count_kv': 2, 'qwen3.embedding_length': 12},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 1, 'qwen3.attention.head_count': 3, 'qwen3.embedding_length': 10},
 ])
 def test_qwen_64k_invalid_metadata_is_rejected_by_exact_estimator(bad_metadata):
     from utils.llm import model_manager as model_manager_module

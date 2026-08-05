@@ -482,7 +482,7 @@ GGML_KV_TENSOR_ALIGNMENT_BYTES = 32
 GGML_KV_BACKEND_ALIGNMENT_BYTES = {'cpu': 32, 'metal': 32, 'cuda': 128}
 GGML_KV_CONTEXT_ALLOCATION_ALIGNMENT_TOKENS = 256
 GGML_CUDA_QUANTIZED_MATRIX_ROW_PADDING = 512
-SUPPORTED_STANDARD_KV_ARCHITECTURES = {'qwen3', 'toy'}
+SUPPORTED_STANDARD_KV_ARCHITECTURES = {'qwen3'}
 UNSUPPORTED_KV_LAYOUT_SUFFIXES = (
     'attention.sliding_window', 'attention.layer_types', 'attention.recurrent',
     'attention.mla', 'attention.no_v', 'attention.shared_layers',
@@ -653,6 +653,8 @@ def _read_gguf_metadata(model_path: Any, *, max_kv: int = 4096) -> Dict[str, Any
                     _ = read_string(f)
             else:
                 raise ValueError('gguf_metadata_type_unsupported')
+            if store:
+                raise ValueError('gguf_required_metadata_array_unsupported')
             return None
         raise ValueError('gguf_metadata_type_unsupported')
 

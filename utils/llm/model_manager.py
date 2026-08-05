@@ -469,24 +469,236 @@ def _qwen_64k_runtime_capabilities(llama_cpp_module: Any, llama_cls: Any) -> Dic
     }
 
 
-def _qwen_64k_memory_estimate(model_path: Any, n_ctx: int, kv_precision: str, backend: str) -> Dict[str, Any]:
+
+_GGML_KV_TYPE_LAYOUTS = {
+    # GGML stores quantized cache rows in fixed-size blocks rather than using
+    # nominal bytes/element.  F16 is one element per block; Q8_0 stores a f16
+    # scale plus 32 int8 values (34 bytes/block); Q4_0 stores a f16 scale plus
+    # 16 packed bytes for 32 values (18 bytes/block).
+    'f16': {'block_size': 1, 'type_size': 2, 'ggml_type': 'F16'},
+    'q8': {'block_size': 32, 'type_size': 34, 'ggml_type': 'Q8_0'},
+    'q4': {'block_size': 32, 'type_size': 18, 'ggml_type': 'Q4_0'},
+}
+_GGML_KV_TENSOR_ALIGNMENT_BYTES = 32
+_QWEN3_8B_ARCH_FALLBACK = {
+    'architecture': 'qwen3',
+    'block_count': 36,
+    'attention_head_count': 32,
+    'attention_head_count_kv': 8,
+    'attention_key_length': 128,
+    'attention_value_length': 128,
+    'source': 'conservative_qwen3_8b_profile_fallback',
+}
+_GGUF_METADATA_CACHE: Dict[str, tuple[Optional[int], Optional[int], Dict[str, Any]]] = {}
+
+
+def _checked_positive_int(value: Any, field: str, *, maximum: int = 2**31 - 1) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f'{field}_invalid')
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{field}_invalid') from exc
+    if number <= 0 or number > maximum:
+        raise ValueError(f'{field}_invalid')
+    return number
+
+
+def _round_up_checked(value: int, multiple: int) -> int:
+    value = _checked_positive_int(value, 'value', maximum=2**63 - 1)
+    multiple = _checked_positive_int(multiple, 'multiple', maximum=2**31 - 1)
+    result = ((value + multiple - 1) // multiple) * multiple
+    if result > 2**63 - 1:
+        raise OverflowError('memory_estimate_overflow')
+    return result
+
+
+def _ggml_row_bytes(element_count: Any, precision: str, *, alignment: int = _GGML_KV_TENSOR_ALIGNMENT_BYTES) -> int:
+    elements = _checked_positive_int(element_count, 'element_count', maximum=2**62)
+    layout = _GGML_KV_TYPE_LAYOUTS.get(str(precision))
+    if layout is None:
+        raise ValueError('kv_precision_unsupported')
+    blocks = (elements + layout['block_size'] - 1) // layout['block_size']
+    raw = blocks * layout['type_size']
+    if raw > 2**63 - 1:
+        raise OverflowError('memory_estimate_overflow')
+    return _round_up_checked(raw, alignment)
+
+
+def _read_gguf_metadata(model_path: Any, *, max_entries: int = 4096) -> Dict[str, Any]:
+    path = str(model_path or '')
+    if not path:
+        return {}
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return {}
+    cache_key = path
+    cached = _GGUF_METADATA_CACHE.get(cache_key)
+    if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return dict(cached[2])
+    metadata: Dict[str, Any] = {}
+    try:
+        import struct
+        with open(path, 'rb') as handle:
+            if handle.read(4) != GGUF_MAGIC:
+                return {}
+            _version, _tensor_count, kv_count = struct.unpack('<IQQ', handle.read(20))
+            if kv_count < 0 or kv_count > max_entries:
+                return {}
+            def read_exact(n: int) -> bytes:
+                data = handle.read(n)
+                if len(data) != n:
+                    raise EOFError
+                return data
+            def read_string() -> str:
+                (length,) = struct.unpack('<Q', read_exact(8))
+                if length > 1_000_000:
+                    raise ValueError
+                return read_exact(length).decode('utf-8', 'replace')
+            def read_scalar(kind: int) -> Any:
+                fmts = {0: '<B', 1: '<b', 2: '<H', 3: '<h', 4: '<I', 5: '<i', 6: '<f', 7: '<?', 10: '<Q', 11: '<q', 12: '<d'}
+                if kind == 8:
+                    return read_string()
+                fmt = fmts.get(kind)
+                if fmt is None:
+                    raise ValueError
+                return struct.unpack(fmt, read_exact(struct.calcsize(fmt)))[0]
+            for _ in range(kv_count):
+                key = read_string()
+                (kind,) = struct.unpack('<I', read_exact(4))
+                if kind == 9:
+                    (item_kind,) = struct.unpack('<I', read_exact(4))
+                    (length,) = struct.unpack('<Q', read_exact(8))
+                    if length > 100_000:
+                        raise ValueError
+                    value = [read_scalar(item_kind) for _ in range(length)]
+                else:
+                    value = read_scalar(kind)
+                metadata[key] = value
+    except (OSError, EOFError, ValueError, struct.error):
+        metadata = {}
+    _GGUF_METADATA_CACHE[cache_key] = (stat.st_mtime_ns, stat.st_size, dict(metadata))
+    return metadata
+
+
+def _first_metadata_int(metadata: Dict[str, Any], keys: Iterable[str]) -> Optional[int]:
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return int(value)
+    return None
+
+
+def _architecture_kv_metadata(model_path: Any) -> tuple[Dict[str, Any], bool, str]:
+    metadata = _read_gguf_metadata(model_path)
+    architecture = str(metadata.get('general.architecture') or '').strip()
+    prefixes = [architecture] if architecture else []
+    if 'qwen3' not in prefixes:
+        prefixes.append('qwen3')
+    for prefix in prefixes:
+        arch = architecture or prefix
+        block_count = _first_metadata_int(metadata, (f'{prefix}.block_count',))
+        head_count = _first_metadata_int(metadata, (f'{prefix}.attention.head_count',))
+        kv_heads = _first_metadata_int(metadata, (f'{prefix}.attention.head_count_kv', f'{prefix}.attention.key_value_head_count'))
+        embedding = _first_metadata_int(metadata, (f'{prefix}.embedding_length',))
+        key_length = _first_metadata_int(metadata, (f'{prefix}.attention.key_length',))
+        value_length = _first_metadata_int(metadata, (f'{prefix}.attention.value_length',))
+        if key_length is None and embedding and head_count:
+            key_length = embedding // head_count
+        if value_length is None:
+            value_length = key_length
+        if all(v is not None for v in (block_count, kv_heads, key_length, value_length)):
+            return ({
+                'architecture': arch,
+                'block_count': block_count,
+                'attention_head_count': head_count,
+                'attention_head_count_kv': kv_heads,
+                'attention_key_length': key_length,
+                'attention_value_length': value_length,
+                'gqa_group_count': (head_count // kv_heads) if head_count and kv_heads and head_count % kv_heads == 0 else None,
+                'metadata_source': 'gguf_metadata',
+            }, False, 'gguf_metadata')
+    # Compatibility fallback is explicit and intentionally conservative for the
+    # currently supported packaged Qwen3 8B profile.  It replaces the old formula
+    # of n_ctx * {F16:524288, Q8_0:262144, Q4_0:131072}, which assumed nominal
+    # bytes/element and embedded Qwen-specific dimensions without reading GGUF.
+    return (dict(_QWEN3_8B_ARCH_FALLBACK), True, 'conservative_qwen3_8b_profile_fallback')
+
+
+def _kv_cache_bytes_from_architecture(architecture: Dict[str, Any], n_ctx: int, type_k: str, type_v: str) -> Dict[str, Any]:
+    ctx = _checked_positive_int(n_ctx, 'context_size_tokens', maximum=2**31 - 1)
+    layers = _checked_positive_int(architecture.get('block_count'), 'block_count')
+    kv_heads = _checked_positive_int(architecture.get('attention_head_count_kv'), 'attention_head_count_kv')
+    key_dim = _checked_positive_int(architecture.get('attention_key_length'), 'attention_key_length')
+    value_dim = _checked_positive_int(architecture.get('attention_value_length'), 'attention_value_length')
+    k_elements = kv_heads * key_dim * ctx
+    v_elements = kv_heads * value_dim * ctx
+    k_layer_bytes = _ggml_row_bytes(k_elements, type_k)
+    v_layer_bytes = _ggml_row_bytes(v_elements, type_v)
+    total = (k_layer_bytes + v_layer_bytes) * layers
+    if total > 2**63 - 1:
+        raise OverflowError('memory_estimate_overflow')
+    return {
+        'k_bytes': k_layer_bytes * layers,
+        'v_bytes': v_layer_bytes * layers,
+        'total_kv_bytes': total,
+        'k_bytes_per_layer': k_layer_bytes,
+        'v_bytes_per_layer': v_layer_bytes,
+        'k_elements_per_layer': k_elements,
+        'v_elements_per_layer': v_elements,
+        'alignment_bytes': _GGML_KV_TENSOR_ALIGNMENT_BYTES,
+    }
+
+
+def _qwen_64k_memory_estimate(model_path: Any, n_ctx: int, kv_precision: str, backend: str, batch_profile: str = QWEN_64K_BATCH_PROFILE_DEFAULT) -> Dict[str, Any]:
     model_size = None
     try:
         model_size = os.path.getsize(str(model_path))
     except OSError:
         pass
-    bytes_per_token_by_precision = {'f16': 524288, 'q8': 262144, 'q4': 131072}
-    kv_bytes = int(n_ctx) * bytes_per_token_by_precision.get(kv_precision, bytes_per_token_by_precision['f16'])
-    total = (model_size or 0) + kv_bytes
+    requested_batch_profile = normalize_qwen_64k_batch_profile(batch_profile)
+    architecture, fallback_used, source = _architecture_kv_metadata(model_path)
+    batch = QWEN_64K_BATCH_PROFILES[requested_batch_profile]
+    try:
+        kv = _kv_cache_bytes_from_architecture(architecture, int(n_ctx), kv_precision, kv_precision)
+        non_kv_runtime_bytes = int(batch['n_batch']) * int(batch['n_ubatch']) * 64
+        allocator_headroom_bytes = _round_up_checked(max(kv['total_kv_bytes'] // 10, 256 * 1024 * 1024), 1024 * 1024)
+        model_component = model_size if model_size is not None else 0
+        total_without_reserve = model_component + kv['total_kv_bytes'] + non_kv_runtime_bytes + allocator_headroom_bytes
+        safety_reserve_bytes = _round_up_checked(max(total_without_reserve // 20, 512 * 1024 * 1024), 1024 * 1024)
+        estimated_total = total_without_reserve + safety_reserve_bytes
+    except (ValueError, OverflowError) as exc:
+        return {
+            'model_file_size_bytes': model_size,
+            'estimated_kv_cache_bytes': None,
+            'estimated_total_model_plus_kv_bytes': None,
+            'context_size_tokens': int(n_ctx) if str(n_ctx).isdigit() else None,
+            'backend': backend or 'unknown',
+            'kv_precision': kv_precision,
+            'metadata_source': source,
+            'conservative_fallback_used': bool(fallback_used),
+            'estimate_error': str(exc),
+        }
     return {
         'model_file_size_bytes': model_size,
-        'estimated_kv_cache_bytes': kv_bytes,
-        'estimated_total_model_plus_kv_bytes': total if model_size is not None else None,
+        'estimated_kv_cache_bytes': kv['total_kv_bytes'],
+        'estimated_non_kv_runtime_bytes': non_kv_runtime_bytes,
+        'allocator_headroom_bytes': allocator_headroom_bytes,
+        'safety_reserve_bytes': safety_reserve_bytes,
+        'estimated_total_model_plus_kv_bytes': (model_size + kv['total_kv_bytes']) if model_size is not None else None,
+        'estimated_total_runtime_bytes': estimated_total if model_size is not None else None,
         'context_size_tokens': int(n_ctx),
         'backend': backend or 'unknown',
         'kv_precision': kv_precision,
+        'type_k': kv_precision,
+        'type_v': kv_precision,
+        'batch_profile': requested_batch_profile,
+        'metadata_source': source,
+        'conservative_fallback_used': bool(fallback_used),
+        'architecture': architecture,
+        'kv_breakdown': kv,
     }
-
 
 def _build_qwen_64k_runtime_profiles(
     llama_cpp_module: Any,
@@ -565,7 +777,9 @@ def _build_qwen_64k_runtime_profiles(
             'constructor_kwarg_support': support,
             'capability_source': capabilities['capability_source'],
             'llama_cpp_python_version': capabilities.get('llama_cpp_python_version'),
-            'memory_estimate': _qwen_64k_memory_estimate(model_path, n_ctx, precision, capabilities.get('backend') or ''),
+            'memory_estimate': _qwen_64k_memory_estimate(
+                model_path, n_ctx, precision, capabilities.get('backend') or '', selected_batch_profile
+            ),
             'kqv_offload_allowed': bool(enable_kqv_offload),
             'backend': backend or 'unknown',
         }

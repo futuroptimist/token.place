@@ -1,0 +1,43 @@
+{
+  "provenance": {
+    "llama_cpp_python_version": "0.3.32",
+    "llama_cpp_commit": "b3fed31b99f9bd37725833674252bccb429bb183",
+    "evidence_kind": "source-derived",
+    "source_paths": {
+      "context_padding": "src/llama-context.cpp",
+      "kv_tensor_shapes": "src/llama-kv-cache.cpp",
+      "tensor_allocation": "ggml/src/ggml-alloc.c",
+      "cpu_alignment": "ggml/src/ggml-backend.cpp",
+      "metal_alignment": "ggml/src/ggml-metal/ggml-metal.cpp",
+      "cuda_alignment_and_padding": "ggml/src/ggml-cuda/ggml-cuda.cu"
+    }
+  },
+  "qwen3_8b_metadata": {
+    "general.architecture": "qwen3",
+    "qwen3.block_count": 36,
+    "qwen3.attention.head_count": 32,
+    "qwen3.attention.head_count_kv": 8,
+    "qwen3.attention.key_length": 128,
+    "qwen3.attention.value_length": 128,
+    "qwen3.embedding_length": 4096
+  },
+  "qwen3_8b_metal": [
+    {"requested_context_tokens": 8192, "allocated_context_tokens": 8192, "type_k": "f16", "type_v": "f16", "k_rows": 1024, "v_rows": 1024, "logical_k_bytes_total": 603979776, "logical_v_bytes_total": 603979776, "backend_tail_padding_bytes_total": 0, "backend_buffer_bytes": 1207959552},
+    {"requested_context_tokens": 32768, "allocated_context_tokens": 32768, "type_k": "f16", "type_v": "f16", "k_rows": 1024, "v_rows": 1024, "logical_k_bytes_total": 2415919104, "logical_v_bytes_total": 2415919104, "backend_tail_padding_bytes_total": 0, "backend_buffer_bytes": 4831838208},
+    {"requested_context_tokens": 65536, "allocated_context_tokens": 65536, "type_k": "f16", "type_v": "f16", "k_rows": 1024, "v_rows": 1024, "logical_k_bytes_total": 4831838208, "logical_v_bytes_total": 4831838208, "backend_tail_padding_bytes_total": 0, "backend_buffer_bytes": 9663676416},
+    {"requested_context_tokens": 8192, "allocated_context_tokens": 8192, "type_k": "q8", "type_v": "q8", "k_rows": 1024, "v_rows": 1024, "logical_k_bytes_total": 320864256, "logical_v_bytes_total": 320864256, "backend_tail_padding_bytes_total": 0, "backend_buffer_bytes": 641728512},
+    {"requested_context_tokens": 32768, "allocated_context_tokens": 32768, "type_k": "q8", "type_v": "q8", "k_rows": 1024, "v_rows": 1024, "logical_k_bytes_total": 1283457024, "logical_v_bytes_total": 1283457024, "backend_tail_padding_bytes_total": 0, "backend_buffer_bytes": 2566914048},
+    {"requested_context_tokens": 65536, "allocated_context_tokens": 65536, "type_k": "q8", "type_v": "q8", "k_rows": 1024, "v_rows": 1024, "logical_k_bytes_total": 2566914048, "logical_v_bytes_total": 2566914048, "backend_tail_padding_bytes_total": 0, "backend_buffer_bytes": 5133828096},
+    {"requested_context_tokens": 8192, "allocated_context_tokens": 8192, "type_k": "q4", "type_v": "q4", "k_rows": 1024, "v_rows": 1024, "logical_k_bytes_total": 169869312, "logical_v_bytes_total": 169869312, "backend_tail_padding_bytes_total": 0, "backend_buffer_bytes": 339738624},
+    {"requested_context_tokens": 32768, "allocated_context_tokens": 32768, "type_k": "q4", "type_v": "q4", "k_rows": 1024, "v_rows": 1024, "logical_k_bytes_total": 679477248, "logical_v_bytes_total": 679477248, "backend_tail_padding_bytes_total": 0, "backend_buffer_bytes": 1358954496},
+    {"requested_context_tokens": 65536, "allocated_context_tokens": 65536, "type_k": "q4", "type_v": "q4", "k_rows": 1024, "v_rows": 1024, "logical_k_bytes_total": 1358954496, "logical_v_bytes_total": 1358954496, "backend_tail_padding_bytes_total": 0, "backend_buffer_bytes": 2717908992}
+  ],
+  "boundary_cases": [
+    {"name": "q8_rows_320_columns_17_cpu", "backend": "cpu", "type": "q8", "rows": 320, "columns": 17, "logical_payload_bytes": 5780, "backend_tail_padding_bytes": 0, "allocator_alignment_padding_bytes": 12, "allocation_bytes": 5792},
+    {"name": "q8_rows_320_columns_17_metal", "backend": "metal", "type": "q8", "rows": 320, "columns": 17, "logical_payload_bytes": 5780, "backend_tail_padding_bytes": 0, "allocator_alignment_padding_bytes": 12, "allocation_bytes": 5792},
+    {"name": "q8_rows_320_columns_17_cuda", "backend": "cuda", "type": "q8", "rows": 320, "columns": 17, "logical_payload_bytes": 5780, "backend_tail_padding_bytes": 204, "allocator_alignment_padding_bytes": 32, "allocation_bytes": 6016},
+    {"name": "q4_rows_384_columns_17_cpu", "backend": "cpu", "type": "q4", "rows": 384, "columns": 17, "logical_payload_bytes": 3672, "backend_tail_padding_bytes": 0, "allocator_alignment_padding_bytes": 8, "allocation_bytes": 3680},
+    {"name": "q4_rows_384_columns_17_metal", "backend": "metal", "type": "q4", "rows": 384, "columns": 17, "logical_payload_bytes": 3672, "backend_tail_padding_bytes": 0, "allocator_alignment_padding_bytes": 8, "allocation_bytes": 3680},
+    {"name": "q4_rows_384_columns_17_cuda", "backend": "cuda", "type": "q4", "rows": 384, "columns": 17, "logical_payload_bytes": 3672, "backend_tail_padding_bytes": 72, "allocator_alignment_padding_bytes": 96, "allocation_bytes": 3840}
+  ]
+}

@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -13900,3 +13901,421 @@ def test_qwen_64k_q8_compatibility_fallback_stays_in_same_batch_without_q4(batch
     assert model_manager_module._next_qwen_64k_runtime_profile_index(
         profiles, "qwen64k_unknown_profile", "runtime_context_create_cuda_memory"
     ) is None
+
+
+def _write_minimal_gguf(path, metadata):
+    def s(value):
+        data = value.encode('utf-8')
+        return len(data).to_bytes(8, 'little') + data
+    payload = bytearray(b'GGUF')
+    payload += (3).to_bytes(4, 'little')
+    payload += (0).to_bytes(8, 'little')
+    payload += len(metadata).to_bytes(8, 'little')
+    for key, value in metadata.items():
+        payload += s(key)
+        if isinstance(value, str):
+            payload += (8).to_bytes(4, 'little') + s(value)
+        elif isinstance(value, bool):
+            payload += (7).to_bytes(4, 'little') + int(value).to_bytes(1, 'little')
+        elif isinstance(value, int):
+            payload += (4).to_bytes(4, 'little') + value.to_bytes(4, 'little')
+        elif isinstance(value, float):
+            import struct
+
+            payload += (6).to_bytes(4, 'little') + struct.pack('<f', value)
+        elif isinstance(value, list):
+            payload += (9).to_bytes(4, 'little')
+            if all(isinstance(item, str) for item in value):
+                payload += (8).to_bytes(4, 'little')
+                payload += len(value).to_bytes(8, 'little')
+                for item in value:
+                    payload += s(item)
+            elif all(isinstance(item, int) for item in value):
+                payload += (4).to_bytes(4, 'little')
+                payload += len(value).to_bytes(8, 'little')
+                for item in value:
+                    payload += item.to_bytes(4, 'little')
+            else:
+                raise TypeError(value)
+        else:
+            raise TypeError(value)
+    path.write_bytes(bytes(payload))
+
+
+
+
+def _llama_cpp_kv_fixture():
+    return json.loads((Path(__file__).parent.parent / 'fixtures' / 'llama_cpp_kv_allocation_b3fed31b9.json').read_text())
+
+def _qwen3_8b_metadata():
+    return {
+        'general.architecture': 'qwen3',
+        'qwen3.block_count': 36,
+        'qwen3.attention.head_count': 32,
+        'qwen3.attention.head_count_kv': 8,
+        'qwen3.attention.key_length': 128,
+        'qwen3.attention.value_length': 128,
+        'qwen3.embedding_length': 4096,
+    }
+
+
+@pytest.mark.parametrize(
+    ('ggml_type', 'elements', 'expected'),
+    [
+        ('f16', 31, 62),
+        ('f16', 32, 64),
+        ('q8', 32, 34),
+        ('q4', 32, 18),
+    ],
+)
+def test_qwen_64k_ggml_block_row_accounting_rejects_naive_quantized_bytes(ggml_type, elements, expected):
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._ggml_row_size_bytes(elements, ggml_type) == expected
+
+
+@pytest.mark.parametrize(('ggml_type', 'elements'), [('q8', 31), ('q8', 33), ('q4', 31), ('q4', 33)])
+def test_qwen_64k_ggml_quantized_rows_reject_invalid_block_widths(ggml_type, elements):
+    from utils.llm import model_manager as model_manager_module
+
+    with pytest.raises(ValueError, match='ggml_row_width_not_block_divisible'):
+        model_manager_module._ggml_row_size_bytes(elements, ggml_type)
+
+
+def test_qwen_64k_tensor_allocation_aligns_each_kv_tensor():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._ggml_tensor_2d_allocation_bytes(1, 1, 'f16') == 32
+    assert model_manager_module._ggml_tensor_2d_allocation_bytes(32, 1, 'q4') == 32
+    assert model_manager_module._ggml_tensor_2d_allocation_bytes(64, 1, 'q8') == 96
+    for case in _llama_cpp_kv_fixture()['boundary_cases']:
+        assert model_manager_module._ggml_tensor_2d_allocation_bytes(
+            case['rows'], case['columns'], case['type'], case['backend']
+        ) == case['allocation_bytes']
+        breakdown = model_manager_module._ggml_tensor_2d_allocation_breakdown(
+            case['rows'], case['columns'], case['type'], case['backend']
+        )
+        assert breakdown['logical_payload_bytes'] == case['logical_payload_bytes']
+        assert breakdown['backend_tail_padding_bytes'] == case['backend_tail_padding_bytes']
+        assert breakdown['allocator_alignment_padding_bytes'] == case['allocator_alignment_padding_bytes']
+    with pytest.raises(ValueError, match='ggml_row_width_not_block_divisible'):
+        model_manager_module._ggml_tensor_2d_allocation_bytes(33, 1, 'q8')
+
+
+def test_qwen_64k_estimate_uses_separate_k_v_dimensions_types_and_gqa():
+    from utils.llm import model_manager as model_manager_module
+
+    metadata = {
+        'general.architecture': 'qwen3',
+        'qwen3.block_count': 3,
+        'qwen3.attention.head_count': 12,
+        'qwen3.attention.head_count_kv': 4,
+        'qwen3.attention.key_length': 80,
+        'qwen3.attention.value_length': 96,
+    }
+    result = model_manager_module._estimate_kv_cache_bytes_from_metadata(metadata, 17, 'q8', 'q4', 'metal')
+
+    assert result['gqa_groups'] == 3
+    assert result['n_embd_k_gqa'] == 320
+    assert result['n_embd_v_gqa'] == 384
+    assert result['k_row_size_bytes'] == 340
+    assert result['v_row_size_bytes'] == 216
+    assert result['requested_context_size_tokens'] == 17
+    assert result['allocated_context_size_tokens'] == 256
+    assert result['kv_cache_bytes'] == (87040 + 55296) * 3
+
+
+@pytest.mark.parametrize('case', _llama_cpp_kv_fixture()['qwen3_8b_metal'])
+def test_qwen3_8b_reference_kv_bytes_match_ggml_block_evidence(tmp_path, case):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    estimate = model_manager_module._qwen_64k_memory_estimate(
+        model, case['requested_context_tokens'], case['type_k'], 'metal'
+    )
+
+    assert estimate['exact_kv_cache_bytes'] == case['backend_buffer_bytes']
+    assert estimate['kv_cache_breakdown']['allocated_context_size_tokens'] == case['allocated_context_tokens']
+    assert estimate['kv_cache_breakdown']['k_tensor_payload_bytes_total'] == case['logical_k_bytes_total']
+    assert estimate['kv_cache_breakdown']['v_tensor_payload_bytes_total'] == case['logical_v_bytes_total']
+    assert estimate['metadata_source'] == 'gguf_header'
+    assert estimate['conservative_fallback_used'] is False
+
+
+def test_qwen_64k_gguf_metadata_parser_skips_common_non_required_types(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3_with_tokenizer_arrays.gguf'
+    metadata = {
+        'general.architecture': 'qwen3',
+        'general.alignment': 32,
+        'tokenizer.ggml.tokens': ['<unk>'] * 5000,
+        'tokenizer.ggml.scores': [1, 2, 3],
+        'tokenizer.ggml.add_bos_token': True,
+        'qwen3.block_count': 36,
+        'qwen3.attention.head_count': 32,
+        'qwen3.attention.head_count_kv': 8,
+        'qwen3.attention.key_length': 128,
+        'qwen3.attention.value_length': 128,
+        'qwen3.embedding_length': 4096,
+        'qwen3.rope.freq_base': 1000000.0,
+        'tokenizer.ggml.merges': ['a b'] * 5000,
+    }
+    _write_minimal_gguf(model, metadata)
+
+    parsed = model_manager_module._read_gguf_metadata(model)
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'cuda')
+
+    assert parsed['general.architecture'] == 'qwen3'
+    assert parsed['qwen3.block_count'] == 36
+    assert 'tokenizer.ggml.tokens' not in parsed
+    assert estimate['metadata_source'] == 'gguf_header'
+    assert estimate['conservative_fallback_used'] is False
+    assert estimate['exact_kv_cache_bytes'] == 641728512
+
+
+def test_llama_cpp_kv_fixture_provenance_pin_is_exact_full_sha():
+    fixture = _llama_cpp_kv_fixture()
+    commit = fixture['provenance']['llama_cpp_commit']
+
+    assert commit == 'b3fed31b99f9bd37725833674252bccb429bb183'
+    assert re.fullmatch(r'[0-9a-f]{40}', commit)
+
+
+@pytest.mark.parametrize('required_key', [
+    'qwen3.attention.head_count_kv',
+    'qwen3.attention.key_length',
+    'qwen3.attention.value_length',
+])
+def test_qwen_64k_required_array_metadata_fails_closed_without_exact_fields(tmp_path, required_key):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'required_array.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata[required_key] = [8 if required_key.endswith('head_count_kv') else 128]
+    _write_minimal_gguf(model, metadata)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'metal')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+    assert estimate['estimated_kv_cache_bytes'] >= 2147483648
+    assert estimate['exact_kv_cache_bytes'] is None
+    assert estimate['exact_kv_payload_bytes'] is None
+    assert estimate['exact_kv_allocation_bytes'] is None
+    assert estimate['kv_cache_breakdown']['exact_allocation_available'] is False
+
+
+def test_toy_architecture_is_not_in_production_exact_layout_allowlist():
+    from utils.llm import model_manager as model_manager_module
+
+    assert 'toy' not in model_manager_module.SUPPORTED_STANDARD_KV_ARCHITECTURES
+    with pytest.raises(ValueError, match='kv_layout_architecture_unsupported'):
+        model_manager_module._estimate_kv_cache_bytes_from_metadata(
+            {
+                'general.architecture': 'toy',
+                'toy.block_count': 1,
+                'toy.attention.head_count': 1,
+                'toy.attention.head_count_kv': 1,
+                'toy.attention.key_length': 32,
+                'toy.attention.value_length': 32,
+            },
+            256,
+            'q8',
+            'q8',
+        )
+
+def test_qwen_64k_profile_diagnostics_include_breakdown_and_preserve_order(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    class Llama:
+        def __init__(self, *, type_k=None, type_v=None, flash_attn=None, offload_kqv=None, n_batch=None, n_ubatch=None):
+            pass
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    module = SimpleNamespace(Llama=Llama, GGML_TYPE_Q8_0=8, GGML_TYPE_Q4_0=2, GGML_TYPE_F16=1, __version__='0.3.32', __token_place_worker_capabilities__={'backend': 'metal'})
+
+    profiles = model_manager_module._build_qwen_64k_runtime_profiles(module, Llama, model_path=model, n_ctx=65536, batch_profile='experimental')
+
+    assert [(p['diagnostics']['kv_precision'], p['diagnostics']['batch_profile']) for p in profiles] == [
+        ('q8', 'experimental'), ('f16', 'experimental'),
+        ('q8', 'balanced'), ('f16', 'balanced'),
+        ('q8', 'safe'), ('f16', 'safe'), ('q4', 'safe'),
+    ]
+    assert profiles[0]['diagnostics']['memory_estimate']['exact_kv_cache_bytes'] == 5133828096
+    assert profiles[-1]['diagnostics']['memory_estimate']['exact_kv_cache_bytes'] == 2717908992
+
+
+
+def test_qwen_64k_memory_estimate_uses_batch_profile_without_changing_exact_kv(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    safe = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'safe')
+    balanced = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'balanced')
+    experimental = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'experimental')
+
+    assert safe['exact_kv_cache_bytes'] == balanced['exact_kv_cache_bytes'] == experimental['exact_kv_cache_bytes']
+    assert safe['batch_dependent_buffer_bytes'] < balanced['batch_dependent_buffer_bytes'] < experimental['batch_dependent_buffer_bytes']
+    assert safe['estimated_total_runtime_bytes'] < balanced['estimated_total_runtime_bytes'] < experimental['estimated_total_runtime_bytes']
+    assert balanced['model_weights_bytes'] == balanced['model_file_size_bytes']
+    assert balanced['exact_kv_payload_bytes'] <= balanced['exact_kv_allocation_bytes']
+
+
+def test_qwen_64k_gguf_metadata_cache_reuses_stable_file_identity(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    model_manager_module.GGUF_METADATA_CACHE.clear()
+    first = model_manager_module._read_gguf_metadata(model)
+
+    def fail_open(*args, **kwargs):
+        raise AssertionError('cached metadata should avoid reparsing')
+
+    monkeypatch.setattr(model_manager_module, 'open', fail_open, raising=False)
+    second = model_manager_module._read_gguf_metadata(model)
+
+    assert first == second
+
+
+def test_qwen_64k_checked_math_rejects_int64_boundary_overflow():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._checked_add((2 ** 63) - 2, 1, 'boundary') == (2 ** 63) - 1
+    with pytest.raises(OverflowError, match='boundary_overflow'):
+        model_manager_module._checked_add((2 ** 63) - 1, 1, 'boundary')
+    with pytest.raises(OverflowError, match='boundary_overflow'):
+        model_manager_module._checked_mul(2 ** 62, 2, 'boundary')
+
+@pytest.mark.parametrize(
+    ('precision', 'floor'),
+    [('f16', 4294967296), ('q8', 2147483648), ('q4', 1073741824)],
+)
+def test_qwen_64k_incomplete_metadata_uses_visible_conservative_fallback(tmp_path, precision, floor):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'bad.gguf'
+    _write_minimal_gguf(model, {'general.architecture': 'qwen3'})
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, precision, 'cuda')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['metadata_source'] == 'conservative_qwen3_8b_compatibility_fallback'
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+    assert estimate['estimated_kv_cache_bytes'] >= floor
+    assert estimate['estimated_kv_cache_bytes'] == estimate['legacy_compatibility_floor_bytes']
+    assert estimate['fallback_assumed_shape_kv_cache_bytes'] < estimate['estimated_kv_cache_bytes']
+    assert estimate['exact_kv_cache_bytes'] is None
+    assert estimate['exact_kv_payload_bytes'] is None
+    assert estimate['exact_kv_allocation_bytes'] is None
+    assert estimate['kv_cache_breakdown']['exact_allocation_available'] is False
+
+
+@pytest.mark.parametrize('bad_metadata', [
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 0, 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': True, 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 1.5, 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': '1', 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 1, 'qwen3.attention.head_count': 3, 'qwen3.attention.head_count_kv': 2, 'qwen3.embedding_length': 12},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 1, 'qwen3.attention.head_count': 3, 'qwen3.embedding_length': 10},
+])
+def test_qwen_64k_invalid_metadata_is_rejected_by_exact_estimator(bad_metadata):
+    from utils.llm import model_manager as model_manager_module
+
+    with pytest.raises(ValueError):
+        model_manager_module._estimate_kv_cache_bytes_from_metadata(bad_metadata, 8192, 'q8', 'q8')
+
+
+
+def test_qwen_64k_gguf_metadata_rejects_non_integral_architecture_values(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'float_layers.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata['qwen3.block_count'] = 36.5
+    _write_minimal_gguf(model, metadata)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'cuda')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+    assert estimate['estimated_kv_cache_bytes'] >= 2147483648
+    assert estimate['exact_kv_cache_bytes'] is None
+
+
+def test_qwen_64k_gguf_metadata_rejects_truncated_skipped_array_after_required_keys(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'truncated_array.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata['tokenizer.ggml.token_type'] = [1] * 16
+    _write_minimal_gguf(model, metadata)
+    model.write_bytes(model.read_bytes()[:-3])
+
+    with pytest.raises(ValueError, match='gguf_metadata_truncated'):
+        model_manager_module._read_gguf_metadata(model)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'cuda')
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['estimated_kv_cache_bytes'] >= 2147483648
+    assert estimate['exact_kv_cache_bytes'] is None
+
+
+def test_qwen_64k_unknown_backend_is_conservative_non_exact(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 17, 'q8', 'unknown')
+
+    assert estimate['exact_kv_cache_bytes'] is None
+    assert estimate['kv_cache_breakdown']['backend_allocation_mode'] == 'conservative_max_supported_backend'
+    assert estimate['estimated_kv_cache_bytes'] >= 36 * (6016 + 6016)
+
+
+def test_qwen_64k_unsupported_layout_fails_closed_to_non_exact_fallback(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'hybrid.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata['qwen3.attention.sliding_window'] = 4096
+    _write_minimal_gguf(model, metadata)
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'metal')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['exact_kv_cache_bytes'] is None
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+
+
+def test_qwen3_8b_64k_balanced_q8_metal_viability_uses_profile_artifact_size(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+    from utils.llm.model_profiles import MODEL_PROFILES, QWEN3_8B_PROFILE_ID
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    artifact_size = MODEL_PROFILES[QWEN3_8B_PROFILE_ID]['artifact_size_bytes']
+    monkeypatch.setattr(model_manager_module.os.path, 'getsize', lambda path: artifact_size)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'balanced')
+
+    assert artifact_size == 5027783488
+    assert estimate['exact_kv_cache_bytes'] == 5133828096
+    assert estimate['conservative_fallback_used'] is False
+    assert estimate['estimated_total_runtime_bytes'] < 24 * 1024 ** 3
+
+def test_qwen_64k_estimates_are_monotonic_for_context_and_quantization(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    q8_8k = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'metal')['exact_kv_cache_bytes']
+    q8_32k = model_manager_module._qwen_64k_memory_estimate(model, 32768, 'q8', 'metal')['exact_kv_cache_bytes']
+    f16_32k = model_manager_module._qwen_64k_memory_estimate(model, 32768, 'f16', 'metal')['exact_kv_cache_bytes']
+    q4_32k = model_manager_module._qwen_64k_memory_estimate(model, 32768, 'q4', 'metal')['exact_kv_cache_bytes']
+
+    assert q8_8k < q8_32k
+    assert q4_32k < q8_32k < f16_32k

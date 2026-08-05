@@ -13900,3 +13900,110 @@ def test_qwen_64k_q8_compatibility_fallback_stays_in_same_batch_without_q4(batch
     assert model_manager_module._next_qwen_64k_runtime_profile_index(
         profiles, "qwen64k_unknown_profile", "runtime_context_create_cuda_memory"
     ) is None
+
+
+def test_qwen_64k_ggml_block_accounting_rejects_naive_quantized_bytes():
+    from utils.llm import model_manager as m
+
+    assert m._ggml_row_bytes(31, 'q8') == 64
+    assert m._ggml_row_bytes(32, 'q8') == 64
+    assert m._ggml_row_bytes(33, 'q8') == 96
+    assert m._ggml_row_bytes(31, 'q4') == 32
+    assert m._ggml_row_bytes(32, 'q4') == 32
+    assert m._ggml_row_bytes(33, 'q4') == 64
+    assert m._ggml_row_bytes(33, 'f16') == 96
+
+
+def test_qwen_64k_kv_bytes_separate_key_value_types_and_dimensions():
+    from utils.llm import model_manager as m
+
+    arch = {'layer_count': 2, 'key_embedding_per_layer': 33, 'value_embedding_per_layer': 65}
+    estimate = m._kv_cache_bytes_for_architecture(arch, 10, 'q4', 'q8')
+
+    assert estimate['key_row_bytes'] == 64
+    assert estimate['value_row_bytes'] == 128
+    assert estimate['key_cache_bytes'] == 10 * 2 * 64
+    assert estimate['value_cache_bytes'] == 10 * 2 * 128
+    assert estimate['exact_kv_cache_bytes'] == 3840
+
+
+def test_qwen_64k_architecture_metadata_supports_gqa_and_head_dimensions():
+    from utils.llm import model_manager as m
+
+    metadata = {
+        'general.architecture': 'qwen3',
+        'qwen3.block_count': 36,
+        'qwen3.embedding_length': 4096,
+        'qwen3.attention.head_count': 32,
+        'qwen3.attention.head_count_kv': 8,
+        'qwen3.attention.key_length': 128,
+        'qwen3.attention.value_length': 128,
+    }
+    arch, source = m._kv_architecture_from_metadata(metadata)
+
+    assert source == 'gguf_metadata'
+    assert arch['layer_count'] == 36
+    assert arch['gqa_groups'] == 4
+    assert arch['key_embedding_per_layer'] == 1024
+    assert arch['value_embedding_per_layer'] == 1024
+
+
+def test_qwen_64k_representative_qwen3_8b_context_kv_bytes_match_ggml_reference():
+    from utils.llm import model_manager as m
+
+    arch = {'layer_count': 36, 'key_embedding_per_layer': 1024, 'value_embedding_per_layer': 1024}
+    expected = {
+        'f16': {8192: 1207959552, 32768: 4831838208, 65536: 9663676416},
+        'q8': {8192: 641728512, 32768: 2566914048, 65536: 5133828096},
+        'q4': {8192: 339738624, 32768: 1358954496, 65536: 2717908992},
+    }
+
+    for precision, by_ctx in expected.items():
+        for n_ctx, exact_bytes in by_ctx.items():
+            assert m._kv_cache_bytes_for_architecture(arch, n_ctx, precision, precision)['exact_kv_cache_bytes'] == exact_bytes
+
+
+def test_qwen_64k_memory_estimate_fallback_is_visible_and_conservative(tmp_path):
+    from utils.llm import model_manager as m
+
+    model = tmp_path / 'not-real.gguf'
+    model.write_bytes(b'GGUFtiny')
+    estimate = m._qwen_64k_memory_estimate(model, 8192, 'q8', 'metal')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['metadata_source'] == 'conservative_fallback'
+    assert estimate['fallback_reason'] in {'missing_architecture', 'missing_or_invalid_attention_metadata'}
+    assert estimate['exact_kv_cache_bytes'] == 641728512
+    assert estimate['estimated_total_runtime_bytes'] > estimate['exact_kv_cache_bytes']
+
+
+def test_qwen_64k_profile_estimates_preserve_ordering_and_batch_profiles(tmp_path):
+    from utils.llm import model_manager as m
+
+    class Llama:
+        __token_place_supported_constructor_kwargs__ = ('type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch')
+
+    module = SimpleNamespace(GGML_TYPE_Q8_0=8, GGML_TYPE_Q4_0=2, GGML_TYPE_F16=1, __version__='0.3.32')
+    model = tmp_path / 'mock.gguf'
+    model.write_bytes(b'GGUFtiny')
+    profiles = m._build_qwen_64k_runtime_profiles(module, Llama, model_path=model, n_ctx=65536, batch_profile='experimental')
+
+    assert [p['diagnostics']['kv_precision'] for p in profiles[:3]] == ['q8', 'f16', 'q8']
+    assert {p['diagnostics']['batch_profile'] for p in profiles} >= {'experimental', 'balanced', 'safe'}
+    q8 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q8')
+    f16 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'f16')
+    q4 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q4')
+    assert q4['diagnostics']['memory_estimate']['exact_kv_cache_bytes'] < q8['diagnostics']['memory_estimate']['exact_kv_cache_bytes'] < f16['diagnostics']['memory_estimate']['exact_kv_cache_bytes']
+    assert q8['profile_id'] == 'qwen64k_kv_q8_fa_experimental_batch'
+
+
+def test_qwen_64k_invalid_and_overflow_metadata_fail_closed():
+    from utils.llm import model_manager as m
+
+    arch, reason = m._kv_architecture_from_metadata({'general.architecture': 'x', 'x.block_count': 0})
+    assert arch is None
+    assert reason == 'missing_or_invalid_attention_metadata'
+    with pytest.raises(ValueError):
+        m._kv_cache_bytes_for_architecture({'layer_count': 1, 'key_embedding_per_layer': 0, 'value_embedding_per_layer': 1}, 1, 'q8', 'q8')
+    with pytest.raises(OverflowError):
+        m._kv_cache_bytes_for_architecture({'layer_count': 2 ** 31, 'key_embedding_per_layer': 2 ** 31, 'value_embedding_per_layer': 2 ** 31}, 2 ** 31, 'f16', 'f16')

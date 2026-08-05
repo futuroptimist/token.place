@@ -6,6 +6,7 @@ import ntpath
 import time
 import logging
 import math
+import struct
 import hashlib
 import uuid
 from utils.llm.llama_module_identity import (
@@ -469,22 +470,204 @@ def _qwen_64k_runtime_capabilities(llama_cpp_module: Any, llama_cls: Any) -> Dic
     }
 
 
+_GGML_KV_CACHE_TYPES = {
+    # llama.cpp stores KV tensors as per-layer rows with n_ctx rows and the
+    # architecture-derived K/V embedding width as columns. Block-quantized GGML
+    # types charge whole blocks per row: Q8_0 is 32 values + 2-byte scale per
+    # block (34 bytes), and Q4_0 is 32 four-bit values + 2-byte scale per block
+    # (18 bytes). F16 is unblocked two bytes per value. The previous P4 formula
+    # documented for compatibility tests was:
+    #     kv_bytes = n_ctx * {f16: 524288, q8: 262144, q4: 131072}[precision]
+    # which encoded a Qwen-specific bytes/token guess and treated Q8/Q4 as
+    # nominal 1/0.5 bytes per element. The estimator below instead mirrors the
+    # GGML row/block accounting used by llama.cpp KV-cache allocation.
+    'f16': {'block_size': 1, 'type_size': 2, 'alignment': 32},
+    'q8': {'block_size': 32, 'type_size': 34, 'alignment': 32},
+    'q4': {'block_size': 32, 'type_size': 18, 'alignment': 32},
+}
+_MAX_ESTIMATE_INPUT = 2 ** 31
+_MAX_ESTIMATE_BYTES = 2 ** 63 - 1
+
+
+def _checked_positive_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value > _MAX_ESTIMATE_INPUT:
+        raise ValueError(f'invalid_{field}')
+    return value
+
+
+def _align_up(value: int, alignment: int) -> int:
+    if alignment <= 0:
+        raise ValueError('invalid_alignment')
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _ggml_row_bytes(element_count: int, ggml_type: str, *, alignment: int | None = None) -> int:
+    element_count = _checked_positive_int(element_count, 'element_count')
+    type_info = _GGML_KV_CACHE_TYPES.get(str(ggml_type))
+    if type_info is None:
+        raise ValueError('unsupported_ggml_type')
+    block_size = type_info['block_size']
+    row = ((element_count + block_size - 1) // block_size) * type_info['type_size']
+    return _align_up(row, int(alignment if alignment is not None else type_info['alignment']))
+
+
+def _safe_int_metadata(metadata: Dict[str, Any], key: str) -> Optional[int]:
+    value = metadata.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip(), 10)
+    return None
+
+
+def _read_gguf_metadata_prefix(model_path: Any, *, max_kv: int = 256) -> Dict[str, Any]:
+    """Read only scalar GGUF metadata needed for KV sizing; never reads tensors."""
+    metadata: Dict[str, Any] = {}
+    try:
+        with open(str(model_path), 'rb') as fh:
+            if fh.read(4) != GGUF_MAGIC:
+                return metadata
+            version = int.from_bytes(fh.read(4), 'little')
+            if version not in (2, 3):
+                return metadata
+            fh.read(8)  # tensor_count
+            kv_count = int.from_bytes(fh.read(8), 'little')
+            if kv_count < 0 or kv_count > 1000000:
+                return metadata
+            scalar_sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+            signed = {1, 3, 5, 11}
+            for _ in range(min(kv_count, max_kv)):
+                key_len = int.from_bytes(fh.read(8), 'little')
+                if key_len <= 0 or key_len > 4096:
+                    return metadata
+                key = fh.read(key_len).decode('utf-8', 'replace')
+                value_type = int.from_bytes(fh.read(4), 'little')
+                if value_type == 8:
+                    length = int.from_bytes(fh.read(8), 'little')
+                    value = fh.read(length).decode('utf-8', 'replace') if length <= 65536 else None
+                elif value_type in scalar_sizes:
+                    raw = fh.read(scalar_sizes[value_type])
+                    if value_type == 6:
+                        value = struct.unpack('<f', raw)[0]
+                    elif value_type == 7:
+                        value = bool(raw[0])
+                    else:
+                        value = int.from_bytes(raw, 'little', signed=value_type in signed)
+                elif value_type == 9:  # array: skip bounded scalar/string arrays
+                    item_type = int.from_bytes(fh.read(4), 'little')
+                    count = int.from_bytes(fh.read(8), 'little')
+                    if item_type == 8:
+                        for _item in range(min(count, 4096)):
+                            length = int.from_bytes(fh.read(8), 'little')
+                            fh.seek(length, os.SEEK_CUR)
+                    elif item_type in scalar_sizes:
+                        fh.seek(count * scalar_sizes[item_type], os.SEEK_CUR)
+                    value = None
+                else:
+                    return metadata
+                if value is not None:
+                    metadata[key] = value
+    except (OSError, ValueError, OverflowError):
+        return {}
+    return metadata
+
+
+def _kv_architecture_from_metadata(metadata: Dict[str, Any]) -> tuple[Optional[Dict[str, int]], str]:
+    arch = metadata.get('general.architecture')
+    if not isinstance(arch, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', arch):
+        return None, 'missing_architecture'
+    prefix = arch
+    block_count = _safe_int_metadata(metadata, f'{prefix}.block_count')
+    head_count = _safe_int_metadata(metadata, f'{prefix}.attention.head_count')
+    head_kv = _safe_int_metadata(metadata, f'{prefix}.attention.head_count_kv') or head_count
+    embd = _safe_int_metadata(metadata, f'{prefix}.embedding_length')
+    key_len = _safe_int_metadata(metadata, f'{prefix}.attention.key_length')
+    value_len = _safe_int_metadata(metadata, f'{prefix}.attention.value_length')
+    if key_len is None and embd and head_count:
+        key_len = embd // head_count
+    if value_len is None:
+        value_len = key_len
+    values = {'layer_count': block_count, 'head_count': head_count, 'head_count_kv': head_kv, 'key_head_dim': key_len, 'value_head_dim': value_len}
+    if any(not isinstance(v, int) or v <= 0 for v in values.values()):
+        return None, 'missing_or_invalid_attention_metadata'
+    if embd and embd % head_count != 0:
+        return None, 'invalid_gqa_metadata'
+    values['key_embedding_per_layer'] = head_kv * key_len
+    values['value_embedding_per_layer'] = head_kv * value_len
+    values['gqa_groups'] = head_count // head_kv if head_kv and head_count % head_kv == 0 else 1
+    return values, 'gguf_metadata'
+
+
+def _kv_cache_bytes_for_architecture(architecture: Dict[str, int], n_ctx: int, type_k: str, type_v: str) -> Dict[str, Any]:
+    n_ctx = _checked_positive_int(int(n_ctx), 'context_size_tokens')
+    layer_count = _checked_positive_int(architecture.get('layer_count'), 'layer_count')
+    key_dim = _checked_positive_int(architecture.get('key_embedding_per_layer'), 'key_embedding_per_layer')
+    value_dim = _checked_positive_int(architecture.get('value_embedding_per_layer'), 'value_embedding_per_layer')
+    key_row = _ggml_row_bytes(key_dim, type_k)
+    value_row = _ggml_row_bytes(value_dim, type_v)
+    per_token = layer_count * (key_row + value_row)
+    total = n_ctx * per_token
+    if total > _MAX_ESTIMATE_BYTES:
+        raise OverflowError('kv_cache_estimate_overflow')
+    return {
+        'exact_kv_cache_bytes': total,
+        'key_cache_bytes': n_ctx * layer_count * key_row,
+        'value_cache_bytes': n_ctx * layer_count * value_row,
+        'key_row_bytes': key_row,
+        'value_row_bytes': value_row,
+        'kv_bytes_per_token': per_token,
+    }
+
+
 def _qwen_64k_memory_estimate(model_path: Any, n_ctx: int, kv_precision: str, backend: str) -> Dict[str, Any]:
     model_size = None
     try:
         model_size = os.path.getsize(str(model_path))
     except OSError:
         pass
-    bytes_per_token_by_precision = {'f16': 524288, 'q8': 262144, 'q4': 131072}
-    kv_bytes = int(n_ctx) * bytes_per_token_by_precision.get(kv_precision, bytes_per_token_by_precision['f16'])
-    total = (model_size or 0) + kv_bytes
+    metadata = _read_gguf_metadata_prefix(model_path)
+    architecture, source = _kv_architecture_from_metadata(metadata)
+    fallback_used = architecture is None
+    fallback_reason = source if fallback_used else None
+    # Conservative compatibility fallback: Qwen3 8B GGUF architecture values
+    # (36 layers, 32 query heads, 8 KV heads, 128 K/V dims) with F16-sized KV
+    # dimensions plus GGML block accounting for requested precision. It is used
+    # only when GGUF metadata is incomplete/unreadable and surfaced in diagnostics.
+    if architecture is None:
+        architecture = {'layer_count': 36, 'head_count': 32, 'head_count_kv': 8, 'key_head_dim': 128, 'value_head_dim': 128, 'key_embedding_per_layer': 1024, 'value_embedding_per_layer': 1024, 'gqa_groups': 4}
+    try:
+        kv = _kv_cache_bytes_for_architecture(architecture, n_ctx, kv_precision, kv_precision)
+    except (ValueError, OverflowError) as exc:
+        fallback_used = True
+        fallback_reason = str(exc)
+        architecture = {'layer_count': 40, 'head_count': 40, 'head_count_kv': 40, 'key_head_dim': 128, 'value_head_dim': 128, 'key_embedding_per_layer': 5120, 'value_embedding_per_layer': 5120, 'gqa_groups': 1}
+        kv = _kv_cache_bytes_for_architecture(architecture, n_ctx, 'f16', 'f16')
+    runtime_bytes = max(int((model_size or 0) * 0.08), 512 * 1024 * 1024)
+    batch_values = QWEN_64K_BATCH_PROFILES[QWEN_64K_BATCH_PROFILE_DEFAULT]
+    batch_bytes = batch_values['n_batch'] * batch_values['n_ubatch'] * 64
+    safety = max(int(kv['exact_kv_cache_bytes'] * 0.10), 512 * 1024 * 1024)
+    non_kv = (model_size or 0) + runtime_bytes + batch_bytes
+    total = non_kv + kv['exact_kv_cache_bytes'] + safety
     return {
         'model_file_size_bytes': model_size,
-        'estimated_kv_cache_bytes': kv_bytes,
-        'estimated_total_model_plus_kv_bytes': total if model_size is not None else None,
+        'estimated_kv_cache_bytes': kv['exact_kv_cache_bytes'],
+        'exact_kv_cache_bytes': kv['exact_kv_cache_bytes'],
+        'estimated_non_kv_runtime_bytes': non_kv if model_size is not None else None,
+        'estimated_safety_reserve_bytes': safety,
+        'estimated_total_runtime_bytes': total if model_size is not None else None,
+        'estimated_total_model_plus_kv_bytes': (model_size + kv['exact_kv_cache_bytes']) if model_size is not None else None,
         'context_size_tokens': int(n_ctx),
         'backend': backend or 'unknown',
         'kv_precision': kv_precision,
+        'kv_type_k': kv_precision,
+        'kv_type_v': kv_precision,
+        'metadata_source': source if not fallback_used else 'conservative_fallback',
+        'conservative_fallback_used': bool(fallback_used),
+        'fallback_reason': fallback_reason,
+        'architecture': architecture,
+        **kv,
     }
 
 

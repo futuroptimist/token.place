@@ -484,9 +484,9 @@ QWEN_64K_LEGACY_BYTES_PER_TOKEN = {'f16': 524288, 'q8': 262144, 'q4': 131072}
 
 
 def _checked_positive_int(value: Any, name: str, *, maximum: int = 1 << 40) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f'{name}_invalid')
-    result = int(value)
+    result = value
     if result <= 0 or result > maximum:
         raise ValueError(f'{name}_invalid')
     return result
@@ -528,12 +528,14 @@ def _ggml_row_size_bytes(element_count: int, ggml_type: str) -> int:
 def _ggml_tensor_2d_allocation_bytes(rows: int, columns: int, ggml_type: str) -> int:
     # Matches the llama.cpp KV-cache tensor shape per layer: one 2-D K tensor
     # [n_embd_k_gqa, n_ctx] and one V tensor [n_embd_v_gqa, n_ctx]. Quantized
-    # GGML rows are rounded to full quantization blocks; allocator starts each
-    # tensor on GGML_MEM_ALIGN-compatible boundaries. The previous P4/P5 formula
-    # was effectively ``n_ctx * {f16:524288,q8:262144,q4:131072}``, which encoded
-    # a Qwen3-8B-shaped 36-layer 4096-wide F16 cache and then divided by nominal
-    # bytes/element for Q8/Q4. That was intentionally conservative for F16 but
-    # wrong for quantized GGML block storage and for non-Qwen3-8B architectures.
+    # GGML rows must be full quantization blocks; allocator starts each tensor
+    # on GGML_MEM_ALIGN-compatible boundaries. The legacy compatibility formula
+    # is fixed as ``n_ctx * {f16:524288,q8:262144,q4:131072}``: 524288 is
+    # ``32 layers * 2 tensors * 4096 elements * 2 F16 bytes`` per token, with
+    # Q8/Q4 floors derived by halving/quartering that fixed F16 heuristic. These
+    # estimates are currently attached to runtime profile/failure diagnostics;
+    # profile selection and recovery are driven by runtime capability checks and
+    # initialization-failure categories, not by this estimate as an admission gate.
     row_size = _ggml_row_size_bytes(rows, ggml_type)
     payload = _checked_mul(row_size, _checked_positive_int(columns, 'columns'), 'ggml_tensor_payload_bytes')
     return _align_up(payload)
@@ -572,7 +574,12 @@ def _read_gguf_metadata(model_path: Any, *, max_kv: int = 4096) -> Dict[str, Any
         if length < 0 or length > (1 << 34):
             raise ValueError('gguf_metadata_value_too_large')
         if f.seekable():
-            f.seek(length, os.SEEK_CUR)
+            current = f.tell()
+            end = f.seek(0, os.SEEK_END)
+            target = current + length
+            if target > end:
+                raise ValueError('gguf_metadata_truncated')
+            f.seek(target, os.SEEK_SET)
             return
         read_exact(f, length)
 
@@ -646,6 +653,8 @@ def _derive_kv_cache_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     kv_heads = meta_int(('attention.head_count_kv',), 'attention_head_count_kv', head_count)
     key_dim = meta_int(('attention.key_length',), 'key_length', None) if f'{prefix}.attention.key_length' in metadata else None
     value_dim = meta_int(('attention.value_length',), 'value_length', None) if f'{prefix}.attention.value_length' in metadata else None
+    if head_count % kv_heads != 0:
+        raise ValueError('attention_head_count_not_divisible_by_kv_heads')
     if key_dim is None or value_dim is None:
         embd = meta_int(('embedding_length',), 'embedding_length')
         if embd % head_count != 0:
@@ -657,7 +666,7 @@ def _derive_kv_cache_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
         'layer_count': layers,
         'attention_head_count': head_count,
         'attention_head_count_kv': kv_heads,
-        'gqa_groups': head_count // kv_heads if head_count % kv_heads == 0 else None,
+        'gqa_groups': head_count // kv_heads,
         'key_length': key_dim,
         'value_length': value_dim,
         'n_embd_k_gqa': kv_heads * key_dim,
@@ -737,7 +746,21 @@ def _qwen_64k_memory_estimate(
         metadata_source = 'conservative_qwen3_8b_compatibility_fallback'
         fallback_reason = type(exc).__name__
         kv_breakdown = _estimate_kv_cache_bytes_from_metadata(metadata, n_ctx, kv_precision, kv_precision)
-    kv_bytes = kv_breakdown['kv_cache_bytes']
+    assumed_shape_kv_bytes = kv_breakdown['kv_cache_bytes']
+    legacy_floor = _checked_mul(
+        _checked_positive_int(n_ctx, 'context_size_tokens', maximum=1 << 30),
+        QWEN_64K_LEGACY_BYTES_PER_TOKEN[kv_precision],
+        'legacy_kv_cache_floor_bytes',
+    )
+    kv_bytes = max(assumed_shape_kv_bytes, legacy_floor) if fallback_used else assumed_shape_kv_bytes
+    if fallback_used:
+        kv_breakdown = {
+            **kv_breakdown,
+            'kv_cache_bytes': kv_bytes,
+            'assumed_shape_kv_cache_bytes': assumed_shape_kv_bytes,
+            'legacy_compatibility_floor_bytes': legacy_floor,
+            'exact_allocation_available': False,
+        }
     selected_batch = normalize_qwen_64k_batch_profile(batch_profile)
     batch_values = QWEN_64K_BATCH_PROFILES[selected_batch]
     batch_dependent_buffer_bytes = int(batch_values['n_batch']) * int(batch_values['n_ubatch']) * 2048
@@ -754,10 +777,12 @@ def _qwen_64k_memory_estimate(
     return {
         'model_file_size_bytes': model_size,
         'estimated_kv_cache_bytes': kv_bytes,
-        'exact_kv_cache_bytes': kv_bytes,
+        'exact_kv_cache_bytes': None if fallback_used else kv_bytes,
         'model_weights_bytes': model_size,
-        'exact_kv_payload_bytes': kv_breakdown['k_tensor_payload_bytes_total'] + kv_breakdown['v_tensor_payload_bytes_total'],
-        'exact_kv_allocation_bytes': kv_bytes,
+        'exact_kv_payload_bytes': None if fallback_used else kv_breakdown['k_tensor_payload_bytes_total'] + kv_breakdown['v_tensor_payload_bytes_total'],
+        'exact_kv_allocation_bytes': None if fallback_used else kv_bytes,
+        'fallback_assumed_shape_kv_cache_bytes': assumed_shape_kv_bytes if fallback_used else None,
+        'legacy_compatibility_floor_bytes': legacy_floor if fallback_used else None,
         'estimated_non_kv_runtime_bytes': non_kv_runtime_bytes,
         'compute_scratch_estimate_bytes': compute_scratch_estimate_bytes,
         'batch_dependent_buffer_bytes': batch_dependent_buffer_bytes,

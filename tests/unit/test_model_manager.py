@@ -14129,21 +14129,36 @@ def test_qwen_64k_checked_math_rejects_int64_boundary_overflow():
     with pytest.raises(OverflowError, match='boundary_overflow'):
         model_manager_module._checked_mul(2 ** 62, 2, 'boundary')
 
-def test_qwen_64k_incomplete_metadata_uses_visible_conservative_fallback(tmp_path):
+@pytest.mark.parametrize(
+    ('precision', 'floor'),
+    [('f16', 4294967296), ('q8', 2147483648), ('q4', 1073741824)],
+)
+def test_qwen_64k_incomplete_metadata_uses_visible_conservative_fallback(tmp_path, precision, floor):
     from utils.llm import model_manager as model_manager_module
 
     model = tmp_path / 'bad.gguf'
     _write_minimal_gguf(model, {'general.architecture': 'qwen3'})
 
-    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'cuda')
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, precision, 'cuda')
 
     assert estimate['conservative_fallback_used'] is True
     assert estimate['metadata_source'] == 'conservative_qwen3_8b_compatibility_fallback'
-    assert estimate['exact_kv_cache_bytes'] == 641728512
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+    assert estimate['estimated_kv_cache_bytes'] >= floor
+    assert estimate['estimated_kv_cache_bytes'] == estimate['legacy_compatibility_floor_bytes']
+    assert estimate['fallback_assumed_shape_kv_cache_bytes'] < estimate['estimated_kv_cache_bytes']
+    assert estimate['exact_kv_cache_bytes'] is None
+    assert estimate['exact_kv_payload_bytes'] is None
+    assert estimate['exact_kv_allocation_bytes'] is None
+    assert estimate['kv_cache_breakdown']['exact_allocation_available'] is False
 
 
 @pytest.mark.parametrize('bad_metadata', [
     {'general.architecture': 'toy', 'toy.block_count': 0, 'toy.attention.head_count': 1},
+    {'general.architecture': 'toy', 'toy.block_count': True, 'toy.attention.head_count': 1},
+    {'general.architecture': 'toy', 'toy.block_count': 1.5, 'toy.attention.head_count': 1},
+    {'general.architecture': 'toy', 'toy.block_count': '1', 'toy.attention.head_count': 1},
+    {'general.architecture': 'toy', 'toy.block_count': 1, 'toy.attention.head_count': 3, 'toy.attention.head_count_kv': 2, 'toy.embedding_length': 12},
     {'general.architecture': 'toy', 'toy.block_count': 1, 'toy.attention.head_count': 3, 'toy.embedding_length': 10},
 ])
 def test_qwen_64k_invalid_metadata_is_rejected_by_exact_estimator(bad_metadata):
@@ -14152,6 +14167,40 @@ def test_qwen_64k_invalid_metadata_is_rejected_by_exact_estimator(bad_metadata):
     with pytest.raises(ValueError):
         model_manager_module._estimate_kv_cache_bytes_from_metadata(bad_metadata, 8192, 'q8', 'q8')
 
+
+
+def test_qwen_64k_gguf_metadata_rejects_non_integral_architecture_values(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'float_layers.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata['qwen3.block_count'] = 36.5
+    _write_minimal_gguf(model, metadata)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'cuda')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+    assert estimate['estimated_kv_cache_bytes'] >= 2147483648
+    assert estimate['exact_kv_cache_bytes'] is None
+
+
+def test_qwen_64k_gguf_metadata_rejects_truncated_skipped_array_after_required_keys(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'truncated_array.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata['tokenizer.ggml.token_type'] = [1] * 16
+    _write_minimal_gguf(model, metadata)
+    model.write_bytes(model.read_bytes()[:-3])
+
+    with pytest.raises(ValueError, match='gguf_metadata_truncated'):
+        model_manager_module._read_gguf_metadata(model)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'cuda')
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['estimated_kv_cache_bytes'] >= 2147483648
+    assert estimate['exact_kv_cache_bytes'] is None
 
 def test_qwen_64k_estimates_are_monotonic_for_context_and_quantization(tmp_path):
     from utils.llm import model_manager as model_manager_module

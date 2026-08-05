@@ -51,6 +51,35 @@ def test_semantic_known_p7_failures_detected():
     assert score["semantic_pass"] is False
 
 
+@pytest.mark.parametrize(
+    ("key", "heading"),
+    [
+        ("XIV", "The Winged Monkeys"),
+        ("XXI", "The Lion Becomes the King"),
+        ("XIV", "the winged monkeys"),
+        ("XXI", "the lion becomes the king"),
+        ("XIV", "The Winged Monkeys."),
+        ("XXI", "The Lion Becomes the King!"),
+        ("XIV", "The   Winged  Monkeys"),
+        ("XXI", "The  Lion   Becomes the  King"),
+    ],
+)
+def test_semantic_heading_variants_are_not_prose(key, heading):
+    _, manifest = h.generate_fixture("small-8k")
+    payload = {**manifest["expected_answers"], key: heading}
+    score = h.evaluate_semantic(json.dumps(payload), manifest)
+    assert score["prose_not_heading"] is False
+    assert "prose_not_heading" in score["errors"]
+
+
+def test_semantic_arbitrary_wrong_prose_is_not_a_heading():
+    _, manifest = h.generate_fixture("small-8k")
+    payload = {**manifest["expected_answers"], "VII": "These words are quite wrong"}
+    score = h.evaluate_semantic(json.dumps(payload), manifest)
+    assert score["prose_not_heading"] is True
+    assert score["target_selection"] is False
+
+
 @pytest.mark.parametrize("payload", [[], 7, None])
 def test_semantic_valid_non_object_json_has_complete_closed_score(payload):
     _, manifest = h.generate_fixture("small-8k")

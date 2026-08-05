@@ -140,7 +140,6 @@ def evaluate_semantic(response_text: str, manifest: dict[str, Any]) -> dict[str,
         return result
 
     prose_keys = manifest.get("semantic_oracle", {}).get("prose_keys", [key for key in expected if key != "canary"])
-    heading_decoys = set(manifest.get("semantic_oracle", {}).get("heading_decoys", []))
     required_strings = all(isinstance(parsed.get(key), str) for key in expected)
     result["exact_key_set"] = set(parsed) == set(expected)
     result["canary_exact"] = parsed.get("canary") == expected.get("canary")
@@ -148,10 +147,15 @@ def evaluate_semantic(response_text: str, manifest: dict[str, Any]) -> dict[str,
     def normalized(value: str) -> str:
         return " ".join(value.split()).rstrip(".,;:!?")
 
+    heading_decoys = {
+        normalized(value).casefold()
+        for value in manifest.get("semantic_oracle", {}).get("heading_decoys", [])
+        if isinstance(value, str)
+    }
     if required_strings:
         prose_values = [parsed[key] for key in prose_keys]
         result["target_selection"] = all(normalized(parsed[key]).casefold() == normalized(expected[key]).casefold() for key in prose_keys)
-        result["prose_not_heading"] = all(value not in heading_decoys for value in prose_values)
+        result["prose_not_heading"] = all(normalized(value).casefold() not in heading_decoys for value in prose_values)
         result["word_count"] = all(len(parsed[key].split()) == len(expected[key].split()) for key in prose_keys)
         result["capitalization"] = all(normalized(parsed[key]) == normalized(expected[key]) for key in prose_keys)
         result["trailing_punctuation"] = all(not parsed[key].rstrip().endswith(tuple(".,;:!?")) for key in prose_keys)

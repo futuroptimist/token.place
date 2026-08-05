@@ -22,7 +22,7 @@ The harness never silently substitutes a fake runtime for packaged-runtime mode:
 python scripts/p8_benchmark.py packaged-runtime --out-dir .tmp/p8
 ```
 
-Without a real adapter URL this exits nonzero and reports that prerequisites are missing.
+Without a real adapter URL this exits nonzero and reports that prerequisites are missing. With an adapter URL, packaged mode still requires explicit `--model`, `--backend`, `--relay-url`, `--request-timeout`, and `--cleanup-timeout` inputs before launch so a report cannot be marked successful without a real packaged inference attempt.
 
 ## Fixture generation
 
@@ -114,15 +114,18 @@ python -m json.tool .tmp/p8-report/p8_benchmark_report.json >/dev/null
 
 ## Progress, cancellation, and recovery invariants
 
-Progress contract checks reject decreasing sequence numbers, decreasing processed/generated counts,
-changing prompt totals, processed counts above total, invalid phase transitions, progress after a
-terminal state, and late results after cancellation.
+Progress contract checks use the production phases `preparing`, `prefill`, and `generating`. Completion, cancellation, and failure are derived from the response/control lifecycle rather than from a required terminal progress event. Checks reject decreasing sequence numbers, decreasing processed/generated/elapsed counters, changing prompt totals, cached counts above processed counts, processed counts above total, invalid phase transitions, post-terminal/stale progress reported by the adapter lifecycle, and late results after cancellation.
 
 Cancellation scenarios must be progress-triggered, not sleep-only:
 
 ```bash
 python scripts/p8_benchmark.py packaged-runtime \
-  --adapter-url http://127.0.0.1:17345 \
+  --adapter-url http://127.0.0.1:17345/run \
+  --model /path/to/local-model.gguf \
+  --backend metal \
+  --relay-url http://127.0.0.1:8000 \
+  --request-timeout 600 \
+  --cleanup-timeout 30 \
   --out-dir .tmp/p8-prefill-cancel \
   --report-only
 ```
@@ -145,10 +148,11 @@ methodology rather than byte-for-byte assertions.
 
 ## Exit codes
 
-- `0`: requested CI-safe operation passed, or packaged report-only invocation wrote a report.
-- `1`: strict semantic, packaged-runtime invariant, cancellation, recovery, or adapter contract
-  failure.
-- `2`: invalid CLI input or packaged-runtime prerequisites missing.
+- `0`: requested CI-safe operation passed, or packaged-runtime produced passing runtime evidence.
+- `1`: strict semantic, packaged-runtime invariant, cancellation, recovery, telemetry, privacy, or
+  adapter contract failure. `--report-only` may preserve semantic-failure reports but does not
+  suppress runtime, telemetry, cancellation, recovery, privacy, or invariant failures.
+- `2`: invalid CLI input or missing `--adapter-url` before packaged-runtime prerequisite checks.
 
 ## CI versus hardware validation
 

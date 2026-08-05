@@ -28,7 +28,7 @@ from utils.context_profiles import get_context_profile
 SCHEMA_VERSION = "p8-benchmark-report-v1"
 FIXTURE_VERSION = "p8-semantic-haystack-v1"
 DEFAULT_SEED = "p8-1566"
-PHASES = {"preparing": 0, "prefill": 1, "generating": 2, "completed": 3, "cancelled": 3, "error": 3}
+PHASES = {"preparing": 0, "prefill": 1, "generating": 2}
 SECRET_PATTERNS = [
     re.compile(r"(?i)\b(authorization|api[_-]?key|secret|token)\b\s*[:=]\s*(?:bearer\s+)?[^\s,}\]\)]+"),
     re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+"),
@@ -161,27 +161,29 @@ def score_trials(responses: list[str], manifest: dict[str, Any]) -> dict[str, An
     return {"trial_count": len(trials), "exact_match_count": exact, "pass_rate": exact / len(trials) if trials else 0.0, "failure_categories": cats, "trials": trials}
 
 def analyze_progress(events: Iterable[dict[str, Any]], terminal: str | None = None) -> dict[str, Any]:
-    last_seq = -1; last_processed = 0; last_generated = 0; total = None; last_phase = -1; terminal_seen = False; errors=[]; count=0; first=None; final=None
+    last_seq = -1; last_processed = 0; last_generated = 0; last_elapsed = 0; total = None; last_phase = -1; errors=[]; count=0; first=None; final=None
     for ev in events:
         count += 1; first = first or ev; final = ev
         phase = ev.get("phase")
-        if terminal_seen: errors.append("progress_after_terminal")
         if phase not in PHASES: errors.append("invalid_phase"); continue
         if PHASES[phase] < last_phase: errors.append("invalid_phase_transition")
         last_phase = max(last_phase, PHASES[phase])
         seq = ev.get("sequence")
         if not isinstance(seq, int) or seq <= last_seq: errors.append("decreasing_sequence")
         last_seq = seq if isinstance(seq, int) else last_seq
-        p = ev.get("processed_prompt_tokens"); g = ev.get("generated_tokens"); t = ev.get("total_prompt_tokens")
-        if not all(isinstance(x, int) and x >= 0 for x in (p,g,t)): errors.append("malformed_telemetry"); continue
+        p = ev.get("processed_prompt_tokens"); c = ev.get("cached_prompt_tokens"); g = ev.get("generated_tokens"); t = ev.get("total_prompt_tokens"); elapsed = ev.get("elapsed_ms")
+        if not all(isinstance(x, int) and x >= 0 for x in (p,c,g,t,elapsed)): errors.append("malformed_telemetry"); continue
         if total is None: total = t
         elif total != t: errors.append("changing_prompt_total")
         if p < last_processed: errors.append("decreasing_processed")
         if g < last_generated: errors.append("decreasing_generated")
+        if elapsed < last_elapsed: errors.append("decreasing_elapsed")
+        if c > p: errors.append("cached_exceeds_processed")
         if p > t: errors.append("processed_exceeds_total")
-        last_processed, last_generated = p, g
-        if phase in {"completed", "cancelled", "error"}: terminal_seen = True
-    if terminal and final and final.get("phase") != terminal: errors.append("terminal_mismatch")
+        last_processed, last_generated, last_elapsed = p, g, elapsed
+    if terminal not in {None, "completed", "cancelled", "error"}: errors.append("invalid_terminal_state")
+    if terminal == "completed" and final and final.get("phase") != "generating": errors.append("terminal_lifecycle_without_generation")
+    if terminal == "cancelled" and not final: errors.append("terminal_lifecycle_without_progress")
     return {"pass": not errors, "errors": errors, "progress_event_count": count, "first_progress": first, "final_progress": final}
 
 def summarize_metrics(start: float, first_token: float | None, end: float, prompt_tokens: int, output_tokens: int) -> dict[str, Any]:
@@ -227,13 +229,16 @@ def platform_memory_probe(command: list[str], timeout_s: float = 2.0) -> dict[st
     except Exception: return {"available": False, "code": "probe_malformed", "stdout_tail": sanitize(stdout[-200:])}
     return sanitize({"available": cp.returncode == 0, "code": "ok" if cp.returncode == 0 else "probe_failed", "payload": payload})
 
-def invoke_packaged_runtime_adapter(adapter_url: str, *, fixture_id: str = "small-8k", timeout_s: float = 30.0) -> dict[str, Any]:
+def invoke_packaged_runtime_adapter(adapter_url: str, *, fixture_id: str = "small-8k", timeout_s: float = 30.0, model: str | None = None, backend: str | None = None, relay_url: str | None = None, cleanup_timeout_s: float | None = None) -> dict[str, Any]:
     """Invoke a local packaged-runtime adapter and validate its evidence envelope."""
+    missing = [name for name, value in {"model": model, "backend": backend, "relay_url": relay_url, "timeout_s": timeout_s, "cleanup_timeout_s": cleanup_timeout_s}.items() if value in (None, "")]
+    if missing:
+        return {"pass": False, "code": "packaged_prerequisites_missing", "missing": missing}
     parsed_url = urlparse(adapter_url)
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
         return {"pass": False, "code": "adapter_url_invalid"}
     prompt, manifest = generate_fixture(fixture_id)
-    body = _canonical_json({"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest}).encode()
+    body = _canonical_json({"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest, "model": model, "backend": backend, "relay_url": relay_url, "request_timeout_s": timeout_s, "cleanup_timeout_s": cleanup_timeout_s}).encode()
     req = urllib.request.Request(adapter_url, data=body, headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310
@@ -299,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("generate-fixture"); g.add_argument("--fixture", choices=FIXTURES, required=True); g.add_argument("--out-dir", required=True); g.add_argument("--seed", default=DEFAULT_SEED)
     e = sub.add_parser("evaluate"); e.add_argument("--manifest", required=True); e.add_argument("--response", required=True); e.add_argument("--strict", action="store_true"); e.add_argument("--out-dir", required=True)
-    r = sub.add_parser("packaged-runtime"); r.add_argument("--out-dir", required=True); r.add_argument("--adapter-url"); r.add_argument("--report-only", action="store_true")
+    r = sub.add_parser("packaged-runtime"); r.add_argument("--out-dir", required=True); r.add_argument("--adapter-url"); r.add_argument("--fixture", choices=FIXTURES, default="small-8k"); r.add_argument("--model"); r.add_argument("--backend"); r.add_argument("--relay-url"); r.add_argument("--request-timeout", type=float, default=30.0); r.add_argument("--cleanup-timeout", type=float); r.add_argument("--report-only", action="store_true")
     args = p.parse_args(argv)
     if args.cmd == "generate-fixture":
         prompt, manifest = generate_fixture(args.fixture, args.seed); out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True); (out/f"{args.fixture}.prompt.txt").write_text(prompt); (out/f"{args.fixture}.manifest.json").write_text(_canonical_json(manifest)+"\n"); print(f"generated {args.fixture}: requested={manifest['requested_tokens']} actual={manifest['actual_tokens']} sha256={manifest['fixture_sha256']}"); return 0
@@ -307,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest=json.loads(Path(args.manifest).read_text()); response=Path(args.response).read_text(); score=evaluate_semantic(response, manifest); path=write_report_atomic(Path(args.out_dir), {"mode":"semantic-evaluation","semantic":score,"fixture":{"id":manifest.get("fixture_id"),"sha256":manifest.get("fixture_sha256"),"actual_tokens":manifest.get("actual_tokens")}}); print(f"semantic_pass={score.get('semantic_pass', False)} report={path}"); return 1 if args.strict and not score.get("semantic_pass") else 0
     if args.cmd == "packaged-runtime":
         if not args.adapter_url: print("packaged-runtime prerequisites missing: --adapter-url is required; no fake runtime substituted", file=sys.stderr); return 2
-        evidence = invoke_packaged_runtime_adapter(args.adapter_url)
-        path=write_report_atomic(Path(args.out_dir), {"mode":"packaged-runtime","runtime":{"adapter_url":"provided","platform":platform.system().lower()},"adapter":evidence}); print(f"adapter_pass={evidence.get('pass', False)} report={path}"); return 0 if args.report_only and evidence.get("adapter_invoked") else (0 if evidence.get("pass") else 1)
+        evidence = invoke_packaged_runtime_adapter(args.adapter_url, fixture_id=args.fixture, timeout_s=args.request_timeout, model=args.model, backend=args.backend, relay_url=args.relay_url, cleanup_timeout_s=args.cleanup_timeout)
+        path=write_report_atomic(Path(args.out_dir), {"mode":"packaged-runtime","runtime":{"adapter_url":"provided","platform":platform.system().lower()},"adapter":evidence}); print(f"adapter_pass={evidence.get('pass', False)} report={path}"); return 0 if evidence.get("pass") else 1
     return 2
 if __name__ == "__main__": raise SystemExit(main())

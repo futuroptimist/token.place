@@ -73,16 +73,18 @@ def test_repeated_trial_scoring():
 
 def test_progress_invariants_success_and_failures():
     ok = [
-        {"sequence":1,"phase":"preparing","total_prompt_tokens":10,"processed_prompt_tokens":0,"generated_tokens":0},
-        {"sequence":2,"phase":"prefill","total_prompt_tokens":10,"processed_prompt_tokens":5,"generated_tokens":0},
-        {"sequence":3,"phase":"generating","total_prompt_tokens":10,"processed_prompt_tokens":10,"generated_tokens":1},
-        {"sequence":4,"phase":"completed","total_prompt_tokens":10,"processed_prompt_tokens":10,"generated_tokens":2},
+        {"sequence":1,"phase":"preparing","total_prompt_tokens":10,"cached_prompt_tokens":0,"processed_prompt_tokens":0,"generated_tokens":0,"elapsed_ms":0},
+        {"sequence":2,"phase":"prefill","total_prompt_tokens":10,"cached_prompt_tokens":2,"processed_prompt_tokens":5,"generated_tokens":0,"elapsed_ms":1},
+        {"sequence":3,"phase":"generating","total_prompt_tokens":10,"cached_prompt_tokens":2,"processed_prompt_tokens":10,"generated_tokens":1,"elapsed_ms":2},
     ]
     assert h.analyze_progress(ok, "completed")["pass"] is True
-    bad = ok + [{"sequence":3,"phase":"prefill","total_prompt_tokens":11,"processed_prompt_tokens":12,"generated_tokens":0}]
+    bad = ok + [{"sequence":3,"phase":"prefill","total_prompt_tokens":11,"cached_prompt_tokens":13,"processed_prompt_tokens":12,"generated_tokens":0,"elapsed_ms":1}]
     result = h.analyze_progress(bad)
     assert result["pass"] is False
-    assert "progress_after_terminal" in result["errors"]
+    assert "decreasing_sequence" in result["errors"]
+    assert "cached_exceeds_processed" in result["errors"]
+    assert "decreasing_elapsed" in result["errors"]
+    assert "changing_prompt_total" in result["errors"]
 
 
 def test_phase_timing_throughput():
@@ -133,9 +135,8 @@ def test_platform_context_behavior():
 
 def test_progress_triggered_cancellation_and_recovery_contracts():
     events = [
-        {"sequence":1,"phase":"prefill","total_prompt_tokens":100,"processed_prompt_tokens":10,"generated_tokens":0},
-        {"sequence":2,"phase":"prefill","total_prompt_tokens":100,"processed_prompt_tokens":50,"generated_tokens":0},
-        {"sequence":3,"phase":"cancelled","total_prompt_tokens":100,"processed_prompt_tokens":50,"generated_tokens":0},
+        {"sequence":1,"phase":"prefill","total_prompt_tokens":100,"cached_prompt_tokens":0,"processed_prompt_tokens":10,"generated_tokens":0,"elapsed_ms":0},
+        {"sequence":2,"phase":"prefill","total_prompt_tokens":100,"cached_prompt_tokens":0,"processed_prompt_tokens":50,"generated_tokens":0,"elapsed_ms":1},
     ]
     ok = h.cancellation_recovery_result(events, phase="prefill", threshold=50, followup_ok=True, cleanup_s=2)
     assert ok["pass"] is True
@@ -196,8 +197,8 @@ def test_packaged_runtime_adapter_invoked_and_sanitized(monkeypatch):
     payload = {
         "response_text": json.dumps(manifest["expected_answers"]),
         "progress_events": [
-            {"sequence": 1, "phase": "preparing", "total_prompt_tokens": manifest["actual_tokens"], "processed_prompt_tokens": 0, "generated_tokens": 0},
-            {"sequence": 2, "phase": "completed", "total_prompt_tokens": manifest["actual_tokens"], "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4},
+            {"sequence": 1, "phase": "preparing", "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0, "processed_prompt_tokens": 0, "generated_tokens": 0, "elapsed_ms": 0},
+            {"sequence": 2, "phase": "generating", "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0, "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4, "elapsed_ms": 2000},
         ],
         "terminal": "completed",
         "start_s": 0.0,
@@ -225,10 +226,28 @@ def test_packaged_runtime_adapter_invoked_and_sanitized(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(h.urllib.request, "urlopen", fake_urlopen)
-    result = h.invoke_packaged_runtime_adapter("http://127.0.0.1:9/run", timeout_s=1.5)
+    result = h.invoke_packaged_runtime_adapter("http://127.0.0.1:9/run", timeout_s=1.5, model="/safe/model.gguf", backend="metal", relay_url="http://127.0.0.1:8000", cleanup_timeout_s=3.0)
     assert seen["url"] == "http://127.0.0.1:9/run"
     assert seen["body"]["fixture_id"] == "small-8k"
     assert result["adapter_invoked"] is True
     assert result["pass"] is True
     assert result["memory"]["diagnostic"] == "<redacted>"
     assert "messages" not in result
+
+
+def test_packaged_runtime_requires_physical_prerequisites():
+    result = h.invoke_packaged_runtime_adapter("http://127.0.0.1:9/run", timeout_s=1.5)
+    assert result["pass"] is False
+    assert result["code"] == "packaged_prerequisites_missing"
+    assert set(result["missing"]) == {"model", "backend", "relay_url", "cleanup_timeout_s"}
+
+
+def test_report_only_does_not_suppress_runtime_failure(tmp_path):
+    proc = subprocess.run([
+        sys.executable, "scripts/p8_benchmark.py", "packaged-runtime",
+        "--out-dir", str(tmp_path), "--adapter-url", "http://127.0.0.1:9/run",
+        "--model", "/safe/model.gguf", "--backend", "metal",
+        "--relay-url", "http://127.0.0.1:8000", "--cleanup-timeout", "1",
+        "--report-only",
+    ], text=True, capture_output=True)
+    assert proc.returncode == 1

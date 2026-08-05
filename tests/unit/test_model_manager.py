@@ -13900,3 +13900,140 @@ def test_qwen_64k_q8_compatibility_fallback_stays_in_same_batch_without_q4(batch
     assert model_manager_module._next_qwen_64k_runtime_profile_index(
         profiles, "qwen64k_unknown_profile", "runtime_context_create_cuda_memory"
     ) is None
+
+# GGUF writer limited to scalar metadata used by estimator tests.
+def _write_minimal_gguf(path, metadata):
+    import struct
+    def enc_str(text):
+        data = text.encode('utf-8')
+        return struct.pack('<Q', len(data)) + data
+    blob = bytearray(b'GGUF')
+    blob += struct.pack('<IQQ', 3, 0, len(metadata))
+    for key, value in metadata.items():
+        blob += enc_str(key)
+        if isinstance(value, str):
+            blob += struct.pack('<I', 8) + enc_str(value)
+        elif isinstance(value, int):
+            blob += struct.pack('<I', 4) + struct.pack('<I', value)
+        else:
+            raise TypeError(value)
+    path.write_bytes(bytes(blob))
+
+
+def _qwen3_metadata(**overrides):
+    metadata = {
+        'general.architecture': 'qwen3',
+        'qwen3.block_count': 36,
+        'qwen3.attention.head_count': 32,
+        'qwen3.attention.head_count_kv': 8,
+        'qwen3.attention.key_length': 128,
+        'qwen3.attention.value_length': 128,
+        'qwen3.embedding_length': 4096,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+@pytest.mark.parametrize(
+    ('precision', 'elements', 'expected'),
+    [('f16', 31, 64), ('f16', 32, 64), ('q8', 31, 64), ('q8', 32, 64), ('q8', 33, 96), ('q4', 32, 32), ('q4', 33, 64)],
+)
+def test_qwen_64k_ggml_row_bytes_block_and_alignment_accounting(precision, elements, expected):
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._ggml_row_bytes(elements, precision) == expected
+
+
+def test_qwen_64k_kv_accounting_separates_key_value_dimensions_and_types():
+    from utils.llm import model_manager as model_manager_module
+
+    arch = {'block_count': 2, 'attention_head_count_kv': 3, 'attention_key_length': 33, 'attention_value_length': 17}
+    breakdown = model_manager_module._kv_cache_bytes_from_architecture(arch, 5, 'q8', 'q4')
+
+    assert breakdown['k_elements_per_layer'] == 3 * 33 * 5
+    assert breakdown['v_elements_per_layer'] == 3 * 17 * 5
+    assert breakdown['k_bytes_per_layer'] == model_manager_module._ggml_row_bytes(495, 'q8')
+    assert breakdown['v_bytes_per_layer'] == model_manager_module._ggml_row_bytes(255, 'q4')
+    assert breakdown['total_kv_bytes'] == 2 * (544 + 160)
+
+
+@pytest.mark.parametrize('ctx', [8192, 32768, 65536])
+@pytest.mark.parametrize('precision', ['f16', 'q8', 'q4'])
+def test_qwen_64k_estimate_uses_gguf_architecture_for_supported_contexts(tmp_path, ctx, precision):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_metadata())
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, ctx, precision, 'metal', 'balanced')
+    per_layer_elements = 8 * 128 * ctx
+    expected = 36 * 2 * model_manager_module._ggml_row_bytes(per_layer_elements, precision)
+
+    assert estimate['metadata_source'] == 'gguf_metadata'
+    assert estimate['conservative_fallback_used'] is False
+    assert estimate['estimated_kv_cache_bytes'] == expected
+    assert estimate['architecture']['gqa_group_count'] == 4
+    assert estimate['estimated_non_kv_runtime_bytes'] == 512 * 256 * 64
+
+
+def test_qwen_64k_estimates_match_maintained_llamacpp_kv_evidence_for_qwen3_8b(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_metadata())
+    # Maintained llama.cpp/GGML evidence: Qwen3 8B has 36 layers, 8 KV heads,
+    # 128-d K/V heads.  llama.cpp allocates one K tensor and one V tensor per
+    # layer, each with n_ctx * n_embd_{k,v}_gqa elements using ggml_nbytes row
+    # block rounding (Q8_0 34/32, Q4_0 18/32, F16 2/1) and 32-byte alignment.
+    expected = {
+        8192: {'f16': 1207959552, 'q8': 641728512, 'q4': 339738624},
+        32768: {'f16': 4831838208, 'q8': 2566914048, 'q4': 1358954496},
+        65536: {'f16': 9663676416, 'q8': 5133828096, 'q4': 2717908992},
+    }
+    for ctx, precisions in expected.items():
+        for precision, bytes_expected in precisions.items():
+            estimate = model_manager_module._qwen_64k_memory_estimate(model, ctx, precision, 'metal')
+            assert estimate['estimated_kv_cache_bytes'] == bytes_expected
+
+
+def test_qwen_64k_memory_fallback_is_visible_and_not_missing_metadata_silent(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    missing = tmp_path / 'missing.gguf'
+    estimate = model_manager_module._qwen_64k_memory_estimate(missing, 65536, 'q8', 'metal')
+
+    assert estimate['metadata_source'] == 'conservative_qwen3_8b_profile_fallback'
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['estimated_kv_cache_bytes'] == 5133828096
+
+
+@pytest.mark.parametrize('bad_arch', [
+    {'block_count': 0, 'attention_head_count_kv': 8, 'attention_key_length': 128, 'attention_value_length': 128},
+    {'block_count': 36, 'attention_head_count_kv': 0, 'attention_key_length': 128, 'attention_value_length': 128},
+])
+def test_qwen_64k_kv_accounting_rejects_invalid_metadata(bad_arch):
+    from utils.llm import model_manager as model_manager_module
+
+    with pytest.raises(ValueError):
+        model_manager_module._kv_cache_bytes_from_architecture(bad_arch, 8192, 'q8', 'q8')
+
+
+def test_qwen_64k_runtime_profiles_preserve_precision_ordering_with_breakdowns(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    class Llama:
+        def __init__(self, *, type_k=None, type_v=None, flash_attn=None, offload_kqv=None, n_batch=None, n_ubatch=None):
+            pass
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_metadata())
+    module = SimpleNamespace(Llama=Llama, GGML_TYPE_Q8_0=8, GGML_TYPE_Q4_0=2, GGML_TYPE_F16=1)
+    profiles = model_manager_module._build_qwen_64k_runtime_profiles(module, Llama, model_path=model, n_ctx=65536, batch_profile='experimental')
+
+    assert [(p['diagnostics']['kv_precision'], p['diagnostics']['batch_profile']) for p in profiles] == [
+        ('q8', 'experimental'), ('f16', 'experimental'), ('q8', 'balanced'), ('f16', 'balanced'), ('q8', 'safe'), ('f16', 'safe'), ('q4', 'safe')
+    ]
+    q4 = profiles[-1]['diagnostics']['memory_estimate']['estimated_kv_cache_bytes']
+    q8 = profiles[0]['diagnostics']['memory_estimate']['estimated_kv_cache_bytes']
+    f16 = profiles[1]['diagnostics']['memory_estimate']['estimated_kv_cache_bytes']
+    assert q4 < q8 < f16
+    assert profiles[0]['diagnostics']['memory_estimate']['kv_breakdown']['alignment_bytes'] == 32

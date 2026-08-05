@@ -366,6 +366,64 @@ def test_packaged_runtime_validates_app_model_backend_and_relay(tmp_path):
     assert h._valid_relay_url("https://relay.example")
 
 
+@pytest.mark.parametrize(
+    ("runner_outcome", "expected_code"),
+    [
+        ("timeout", "packaged_runner_timeout"),
+        ("failed", "packaged_runner_failed"),
+        ("invalid-json", "packaged_evidence_malformed"),
+        ("non-object", "packaged_evidence_malformed"),
+        ("missing", "packaged_evidence_missing"),
+    ],
+)
+def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_outcome, expected_code):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"x")
+    app = tmp_path / "app"
+    app.write_text("x")
+    app.chmod(0o700)
+
+    def fake_run(command, **kwargs):
+        if runner_outcome == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        if runner_outcome == "failed":
+            return subprocess.CompletedProcess(command, 1, "", "")
+        evidence_path = command[command.index("--p8-evidence") + 1]
+        evidence = {"invalid-json": "not json", "non-object": "[]", "missing": "{}"}[runner_outcome]
+        h.Path(evidence_path).write_text(evidence)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = h.invoke_packaged_runtime_adapter(
+        timeout_s=1,
+        app_binary=str(app),
+        model=str(model),
+        backend="metal",
+        relay_url="https://relay.example",
+        cleanup_timeout_s=1,
+        subprocess_run=fake_run,
+    )
+    assert result["pass"] is False
+    assert result["code"] == expected_code
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), "1"])
+def test_packaged_runtime_rejects_invalid_timeouts(tmp_path, timeout):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"x")
+    app = tmp_path / "app"
+    app.write_text("x")
+    app.chmod(0o700)
+    result = h.invoke_packaged_runtime_adapter(
+        timeout_s=timeout,
+        app_binary=str(app),
+        model=str(model),
+        backend="metal",
+        relay_url="https://relay.example",
+        cleanup_timeout_s=1,
+    )
+    assert result == {"pass": False, "code": "timeout_invalid"}
+
+
 def test_report_only_does_not_suppress_runtime_failure(tmp_path):
     proc = subprocess.run([
         sys.executable, "scripts/p8_benchmark.py", "packaged-runtime",

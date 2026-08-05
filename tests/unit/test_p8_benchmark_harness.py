@@ -146,3 +146,89 @@ def test_progress_triggered_cancellation_and_recovery_contracts():
     assert "late_result_after_cancel" in bad["errors"]
     assert "stale_progress_after_cancel" in bad["errors"]
     assert "followup_worker_failed" in bad["errors"]
+
+
+def test_manifest_scoring_rules_match_score_keys():
+    _, manifest = h.generate_fixture("small-8k")
+    score = h.evaluate_semantic(json.dumps(manifest["expected_answers"]), manifest)
+    assert set(manifest["scoring_rules"]).issubset(score.keys())
+
+
+def test_phase_timing_allows_zero_first_token():
+    m = h.summarize_metrics(0.0, 0.0, 5.0, 100, 6)
+    assert m["prefill_duration_s"] == 0.0
+    assert m["decode_duration_s"] == 5.0
+    assert m["decode_tokens_per_s"] == 1.2
+
+
+def test_memory_probe_parses_before_sanitizing_long_json(tmp_path):
+    probe = tmp_path / "long_probe.py"
+    probe.write_text('import json; print(json.dumps({"padding":"' + ('x' * 700) + '", "rss_bytes": 9}))')
+    result = h.platform_memory_probe([sys.executable, str(probe)])
+    assert result["available"] is True
+    assert result["payload"]["rss_bytes"] == 9
+    assert len(result["payload"]["padding"]) == 512
+
+
+def test_report_redacts_authorization_and_message_like_payloads(tmp_path):
+    path = h.write_report_atomic(tmp_path, {
+        "diagnostics": "Authorization: Bearer sk-secret api_key = sk-other",
+        "adapter": {
+            "messages": [{"content": "plain prompt"}],
+            "tool_arguments": {"secret": "plain args"},
+            "model_output": "plain output",
+            "safe": "Authorization: Bearer sk-nested",
+        },
+    })
+    text = path.read_text()
+    data = json.loads(text)
+    assert "sk-secret" not in text
+    assert "sk-other" not in text
+    assert "plain prompt" not in text
+    assert "plain args" not in text
+    assert "plain output" not in text
+    assert "messages" not in data["adapter"]
+    assert data["adapter"]["safe"] == "<redacted>"
+
+
+def test_packaged_runtime_adapter_invoked_and_sanitized(monkeypatch):
+    _, manifest = h.generate_fixture("small-8k")
+    payload = {
+        "response_text": json.dumps(manifest["expected_answers"]),
+        "progress_events": [
+            {"sequence": 1, "phase": "preparing", "total_prompt_tokens": manifest["actual_tokens"], "processed_prompt_tokens": 0, "generated_tokens": 0},
+            {"sequence": 2, "phase": "completed", "total_prompt_tokens": manifest["actual_tokens"], "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4},
+        ],
+        "terminal": "completed",
+        "start_s": 0.0,
+        "first_token_s": 0.0,
+        "end_s": 2.0,
+        "output_tokens": 4,
+        "messages": [{"content": "plaintext"}],
+        "memory": {"diagnostic": "Authorization: Bearer sk-runtime"},
+    }
+
+    class FakeResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, _size):
+            return json.dumps(payload).encode()
+
+    seen = {}
+    def fake_urlopen(req, timeout):
+        seen["url"] = req.full_url
+        seen["timeout"] = timeout
+        seen["body"] = json.loads(req.data.decode())
+        return FakeResponse()
+
+    monkeypatch.setattr(h.urllib.request, "urlopen", fake_urlopen)
+    result = h.invoke_packaged_runtime_adapter("http://127.0.0.1:9/run", timeout_s=1.5)
+    assert seen["url"] == "http://127.0.0.1:9/run"
+    assert seen["body"]["fixture_id"] == "small-8k"
+    assert result["adapter_invoked"] is True
+    assert result["pass"] is True
+    assert result["memory"]["diagnostic"] == "<redacted>"
+    assert "messages" not in result

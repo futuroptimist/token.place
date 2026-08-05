@@ -16,6 +16,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -26,7 +29,19 @@ SCHEMA_VERSION = "p8-benchmark-report-v1"
 FIXTURE_VERSION = "p8-semantic-haystack-v1"
 DEFAULT_SEED = "p8-1566"
 PHASES = {"preparing": 0, "prefill": 1, "generating": 2, "completed": 3, "cancelled": 3, "error": 3}
-SECRET_PATTERNS = [re.compile(r"(?i)(authorization|api[_-]?key|secret|token)[:=][^\s,}]+"), re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+"), re.compile(r"/Users/[^/\s]+"), re.compile(r"/home/[^/\s]+")]
+SECRET_PATTERNS = [
+    re.compile(r"(?i)\b(authorization|api[_-]?key|secret|token)\b\s*[:=]\s*(?:bearer\s+)?[^\s,}\]\)]+"),
+    re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+"),
+    re.compile(r"/Users/[^/\s]+"),
+    re.compile(r"/home/[^/\s]+"),
+]
+SENSITIVE_KEYS = {
+    "prompt", "prompts", "response", "responses", "response_text", "content",
+    "message", "messages", "tool_argument", "tool_arguments", "model_output",
+    "completion", "completions", "plaintext", "ciphertext", "iv", "key",
+    "authorization", "api_key", "apikey", "secret", "token", "cancel_token",
+    "request_id", "client_id", "session_id",
+}
 
 @dataclass(frozen=True)
 class FixtureSpec:
@@ -73,8 +88,11 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED, tokenizer: Calla
     target_markers: dict[str, int] = {}
     positions = {"VII": 0.18, "XIV": 0.52, "XXI": 0.84}
     filler_i = 0
-    while _count_tokens("\n".join(prompt_parts), tokenizer) < spec.requested_tokens + 20:
-        cur = _count_tokens("\n".join(prompt_parts), tokenizer)
+    while True:
+        joined = "\n".join(prompt_parts)
+        cur = _count_tokens(joined, tokenizer)
+        if cur >= spec.requested_tokens + 20:
+            break
         ratio = cur / max(spec.requested_tokens, 1)
         inserted = False
         for chap, pos in positions.items():
@@ -97,7 +115,7 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED, tokenizer: Calla
         "requested_tokens": spec.requested_tokens, "actual_tokens": actual, "tokenizer": "adapter" if tokenizer else "whitespace-ci",
         "fixture_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "target_depths_tokens": target_markers,
         "expected_answers": {"VII": targets["VII"], "XIV": targets["XIV"], "XXI": targets["XXI"], "canary": canary},
-        "scoring_rules": ["json_only", "exact_key_set", "canary_exact", "target_selection", "prose_not_heading", "five_words", "capitalization", "no_trailing_punctuation", "exact_match"],
+        "scoring_rules": ["json_only", "exact_key_set", "canary_exact", "target_selection", "prose_not_heading", "word_count", "capitalization", "trailing_punctuation", "exact_match"],
     }
     return prompt, manifest
 
@@ -167,7 +185,7 @@ def analyze_progress(events: Iterable[dict[str, Any]], terminal: str | None = No
     return {"pass": not errors, "errors": errors, "progress_event_count": count, "first_progress": first, "final_progress": final}
 
 def summarize_metrics(start: float, first_token: float | None, end: float, prompt_tokens: int, output_tokens: int) -> dict[str, Any]:
-    total = max(end-start, 0.0); prefill = (first_token-start) if first_token else None; decode = (end-first_token) if first_token else None
+    total = max(end-start, 0.0); prefill = (first_token-start) if first_token is not None else None; decode = (end-first_token) if first_token is not None else None
     return {"total_duration_s": total, "prefill_duration_s": prefill, "decode_duration_s": decode, "prompt_tokens_per_s": (prompt_tokens/prefill if prefill and prefill>0 else None), "decode_tokens_per_s": (output_tokens/decode if decode and decode>0 else None)}
 
 def compare_kv_estimate(estimate: dict[str, Any], runtime: dict[str, Any], exact_required: bool = True, tolerance_bytes: int = 4096) -> dict[str, Any]:
@@ -181,7 +199,7 @@ def compare_kv_estimate(estimate: dict[str, Any], runtime: dict[str, Any], exact
     return {"pass": delta <= tolerance_bytes, "estimated_bytes": est, "observed_bytes": obs, "delta_bytes": delta, "tolerance_bytes": tolerance_bytes, "alignment_rule": "exact GGML allocation bytes must match runtime diagnostics within one 4KiB page"}
 
 def sanitize(value: Any) -> Any:
-    if isinstance(value, dict): return {str(k)[:64]: sanitize(v) for k,v in value.items() if str(k).lower() not in {"prompt","response","ciphertext","iv","key","cancel_token","request_id","client_id","session_id"}}
+    if isinstance(value, dict): return {str(k)[:64]: sanitize(v) for k,v in value.items() if str(k).lower() not in SENSITIVE_KEYS}
     if isinstance(value, list): return [sanitize(v) for v in value[:100]]
     if isinstance(value, str):
         s = value[:512]
@@ -204,10 +222,57 @@ def platform_memory_probe(command: list[str], timeout_s: float = 2.0) -> dict[st
         cp = subprocess.run(command, capture_output=True, text=True, timeout=timeout_s, check=False)
     except FileNotFoundError: return {"available": False, "code": "probe_absent"}
     except subprocess.TimeoutExpired: return {"available": False, "code": "probe_timeout"}
-    stdout = sanitize(cp.stdout)
+    stdout = cp.stdout[:1048576]
     try: payload = json.loads(stdout)
-    except Exception: return {"available": False, "code": "probe_malformed", "stdout_tail": stdout[-200:]}
+    except Exception: return {"available": False, "code": "probe_malformed", "stdout_tail": sanitize(stdout[-200:])}
     return sanitize({"available": cp.returncode == 0, "code": "ok" if cp.returncode == 0 else "probe_failed", "payload": payload})
+
+def invoke_packaged_runtime_adapter(adapter_url: str, *, fixture_id: str = "small-8k", timeout_s: float = 30.0) -> dict[str, Any]:
+    """Invoke a local packaged-runtime adapter and validate its evidence envelope."""
+    parsed_url = urlparse(adapter_url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        return {"pass": False, "code": "adapter_url_invalid"}
+    prompt, manifest = generate_fixture(fixture_id)
+    body = _canonical_json({"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest}).encode()
+    req = urllib.request.Request(adapter_url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310
+            raw = resp.read(1048576).decode("utf-8", errors="replace")
+            status = resp.status
+    except urllib.error.URLError as exc:
+        return {"pass": False, "code": "adapter_unreachable", "error": sanitize(str(exc))}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {"pass": False, "code": "adapter_malformed", "stdout_tail": sanitize(raw[-200:])}
+    if status >= 400 or not isinstance(payload, dict):
+        return {"pass": False, "code": "adapter_failed", "status_code": status, "payload": sanitize(payload)}
+    progress = analyze_progress(payload.get("progress_events", []), payload.get("terminal", "completed"))
+    semantic = evaluate_semantic(payload.get("response_text", ""), manifest)
+    metrics = summarize_metrics(
+        float(payload.get("start_s", 0.0)),
+        payload.get("first_token_s"),
+        float(payload.get("end_s", 0.0)),
+        int(manifest.get("actual_tokens", 0)),
+        int(payload.get("output_tokens", 0)),
+    )
+    evidence = {
+        "adapter_invoked": True,
+        "status_code": status,
+        "fixture": {"id": fixture_id, "sha256": manifest.get("fixture_sha256"), "actual_tokens": manifest.get("actual_tokens")},
+        "semantic": semantic,
+        "progress": progress,
+        "metrics": metrics,
+        "memory": payload.get("memory", {}),
+    }
+    if "kv_estimate" in payload or "kv_runtime" in payload:
+        evidence["kv_compare"] = compare_kv_estimate(payload.get("kv_estimate", {}), payload.get("kv_runtime", {}))
+    passed = bool(semantic.get("semantic_pass") and progress.get("pass"))
+    if "kv_compare" in evidence:
+        passed = passed and bool(evidence["kv_compare"].get("pass"))
+    evidence["pass"] = passed
+    evidence["code"] = "ok" if passed else "adapter_contract_failed"
+    return sanitize(evidence)
 
 def cancellation_recovery_result(events: list[dict[str, Any]], *, phase: str, threshold: int, followup_ok: bool, cleanup_s: float, cleanup_budget_s: float = 30.0, late_result: bool = False, stale_progress: bool = False) -> dict[str, Any]:
     """Evaluate canned progress-triggered cancellation and clean-worker recovery."""
@@ -242,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest=json.loads(Path(args.manifest).read_text()); response=Path(args.response).read_text(); score=evaluate_semantic(response, manifest); path=write_report_atomic(Path(args.out_dir), {"mode":"semantic-evaluation","semantic":score,"fixture":{"id":manifest.get("fixture_id"),"sha256":manifest.get("fixture_sha256"),"actual_tokens":manifest.get("actual_tokens")}}); print(f"semantic_pass={score.get('semantic_pass', False)} report={path}"); return 1 if args.strict and not score.get("semantic_pass") else 0
     if args.cmd == "packaged-runtime":
         if not args.adapter_url: print("packaged-runtime prerequisites missing: --adapter-url is required; no fake runtime substituted", file=sys.stderr); return 2
-        path=write_report_atomic(Path(args.out_dir), {"mode":"packaged-runtime","runtime":{"adapter_url":"provided","platform":platform.system().lower()},"status":"not_implemented_adapter_contract"}); print(f"report={path}"); return 0 if args.report_only else 1
+        evidence = invoke_packaged_runtime_adapter(args.adapter_url)
+        path=write_report_atomic(Path(args.out_dir), {"mode":"packaged-runtime","runtime":{"adapter_url":"provided","platform":platform.system().lower()},"adapter":evidence}); print(f"adapter_pass={evidence.get('pass', False)} report={path}"); return 0 if args.report_only and evidence.get("adapter_invoked") else (0 if evidence.get("pass") else 1)
     return 2
 if __name__ == "__main__": raise SystemExit(main())

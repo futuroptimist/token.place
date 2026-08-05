@@ -13958,12 +13958,8 @@ def _qwen3_8b_metadata():
     [
         ('f16', 31, 62),
         ('f16', 32, 64),
-        ('q8', 31, 34),
         ('q8', 32, 34),
-        ('q8', 33, 68),
-        ('q4', 31, 18),
         ('q4', 32, 18),
-        ('q4', 33, 36),
     ],
 )
 def test_qwen_64k_ggml_block_row_accounting_rejects_naive_quantized_bytes(ggml_type, elements, expected):
@@ -13972,11 +13968,22 @@ def test_qwen_64k_ggml_block_row_accounting_rejects_naive_quantized_bytes(ggml_t
     assert model_manager_module._ggml_row_size_bytes(elements, ggml_type) == expected
 
 
+@pytest.mark.parametrize(('ggml_type', 'elements'), [('q8', 31), ('q8', 33), ('q4', 31), ('q4', 33)])
+def test_qwen_64k_ggml_quantized_rows_reject_invalid_block_widths(ggml_type, elements):
+    from utils.llm import model_manager as model_manager_module
+
+    with pytest.raises(ValueError, match='ggml_row_width_not_block_divisible'):
+        model_manager_module._ggml_row_size_bytes(elements, ggml_type)
+
+
 def test_qwen_64k_tensor_allocation_aligns_each_kv_tensor():
     from utils.llm import model_manager as model_manager_module
 
-    assert model_manager_module._ggml_tensor_2d_allocation_bytes(1, 1, 'q4') == 32
-    assert model_manager_module._ggml_tensor_2d_allocation_bytes(33, 1, 'q8') == 96
+    assert model_manager_module._ggml_tensor_2d_allocation_bytes(1, 1, 'f16') == 32
+    assert model_manager_module._ggml_tensor_2d_allocation_bytes(32, 1, 'q4') == 32
+    assert model_manager_module._ggml_tensor_2d_allocation_bytes(64, 1, 'q8') == 96
+    with pytest.raises(ValueError, match='ggml_row_width_not_block_divisible'):
+        model_manager_module._ggml_tensor_2d_allocation_bytes(33, 1, 'q8')
 
 
 def test_qwen_64k_estimate_uses_separate_k_v_dimensions_types_and_gqa():
@@ -14033,7 +14040,7 @@ def test_qwen_64k_gguf_metadata_parser_skips_common_non_required_types(tmp_path)
     metadata = {
         'general.architecture': 'qwen3',
         'general.alignment': 32,
-        'tokenizer.ggml.tokens': ['<unk>', '<s>', '</s>'],
+        'tokenizer.ggml.tokens': ['<unk>'] * 5000,
         'tokenizer.ggml.scores': [1, 2, 3],
         'tokenizer.ggml.add_bos_token': True,
         'qwen3.block_count': 36,
@@ -14043,6 +14050,7 @@ def test_qwen_64k_gguf_metadata_parser_skips_common_non_required_types(tmp_path)
         'qwen3.attention.value_length': 128,
         'qwen3.embedding_length': 4096,
         'qwen3.rope.freq_base': 1000000.0,
+        'tokenizer.ggml.merges': ['a b'] * 5000,
     }
     _write_minimal_gguf(model, metadata)
 
@@ -14077,6 +14085,49 @@ def test_qwen_64k_profile_diagnostics_include_breakdown_and_preserve_order(tmp_p
     assert profiles[0]['diagnostics']['memory_estimate']['exact_kv_cache_bytes'] == 5133828096
     assert profiles[-1]['diagnostics']['memory_estimate']['exact_kv_cache_bytes'] == 2717908992
 
+
+
+def test_qwen_64k_memory_estimate_uses_batch_profile_without_changing_exact_kv(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    safe = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'safe')
+    balanced = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'balanced')
+    experimental = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'experimental')
+
+    assert safe['exact_kv_cache_bytes'] == balanced['exact_kv_cache_bytes'] == experimental['exact_kv_cache_bytes']
+    assert safe['batch_dependent_buffer_bytes'] < balanced['batch_dependent_buffer_bytes'] < experimental['batch_dependent_buffer_bytes']
+    assert safe['estimated_total_runtime_bytes'] < balanced['estimated_total_runtime_bytes'] < experimental['estimated_total_runtime_bytes']
+    assert balanced['model_weights_bytes'] == balanced['model_file_size_bytes']
+    assert balanced['exact_kv_payload_bytes'] <= balanced['exact_kv_allocation_bytes']
+
+
+def test_qwen_64k_gguf_metadata_cache_reuses_stable_file_identity(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    model_manager_module.GGUF_METADATA_CACHE.clear()
+    first = model_manager_module._read_gguf_metadata(model)
+
+    def fail_open(*args, **kwargs):
+        raise AssertionError('cached metadata should avoid reparsing')
+
+    monkeypatch.setattr(model_manager_module, 'open', fail_open, raising=False)
+    second = model_manager_module._read_gguf_metadata(model)
+
+    assert first == second
+
+
+def test_qwen_64k_checked_math_rejects_int64_boundary_overflow():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._checked_add((2 ** 63) - 2, 1, 'boundary') == (2 ** 63) - 1
+    with pytest.raises(OverflowError, match='boundary_overflow'):
+        model_manager_module._checked_add((2 ** 63) - 1, 1, 'boundary')
+    with pytest.raises(OverflowError, match='boundary_overflow'):
+        model_manager_module._checked_mul(2 ** 62, 2, 'boundary')
 
 def test_qwen_64k_incomplete_metadata_uses_visible_conservative_fallback(tmp_path):
     from utils.llm import model_manager as model_manager_module

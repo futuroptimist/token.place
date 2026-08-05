@@ -6,6 +6,7 @@ import ntpath
 import time
 import logging
 import math
+import struct
 import hashlib
 import uuid
 from utils.llm.llama_module_identity import (
@@ -478,6 +479,7 @@ GGML_KV_TYPE_LAYOUTS = {
     'q4': {'block_size': 32, 'type_size': 18, 'ggml_type': 'Q4_0'},
 }
 GGML_KV_TENSOR_ALIGNMENT_BYTES = 32
+GGUF_METADATA_CACHE: Dict[tuple[str, int, int, int], Dict[str, Any]] = {}
 QWEN_64K_LEGACY_BYTES_PER_TOKEN = {'f16': 524288, 'q8': 262144, 'q4': 131072}
 
 
@@ -490,10 +492,25 @@ def _checked_positive_int(value: Any, name: str, *, maximum: int = 1 << 40) -> i
     return result
 
 
-def _align_up(value: int, alignment: int = GGML_KV_TENSOR_ALIGNMENT_BYTES) -> int:
-    value = _checked_positive_int(value, 'value', maximum=1 << 62)
+def _checked_add(left: int, right: int, name: str, *, maximum: int = (1 << 63) - 1) -> int:
+    result = int(left) + int(right)
+    if result > maximum:
+        raise OverflowError(f'{name}_overflow')
+    return result
+
+
+def _checked_mul(left: int, right: int, name: str, *, maximum: int = (1 << 63) - 1) -> int:
+    result = int(left) * int(right)
+    if result > maximum:
+        raise OverflowError(f'{name}_overflow')
+    return result
+
+
+def _align_up(value: int, alignment: int = GGML_KV_TENSOR_ALIGNMENT_BYTES, *, maximum: int = (1 << 63) - 1) -> int:
+    value = _checked_positive_int(value, 'value', maximum=maximum)
     alignment = _checked_positive_int(alignment, 'alignment', maximum=1 << 20)
-    return ((value + alignment - 1) // alignment) * alignment
+    padded = _checked_add(value, alignment - 1, 'aligned_value', maximum=maximum)
+    return (padded // alignment) * alignment
 
 
 def _ggml_row_size_bytes(element_count: int, ggml_type: str) -> int:
@@ -501,8 +518,11 @@ def _ggml_row_size_bytes(element_count: int, ggml_type: str) -> int:
     layout = GGML_KV_TYPE_LAYOUTS.get(str(ggml_type).lower())
     if layout is None:
         raise ValueError('ggml_type_unsupported')
-    blocks = (element_count + layout['block_size'] - 1) // layout['block_size']
-    return blocks * layout['type_size']
+    block_size = layout['block_size']
+    if element_count % block_size != 0:
+        raise ValueError('ggml_row_width_not_block_divisible')
+    blocks = element_count // block_size
+    return _checked_mul(blocks, layout['type_size'], 'ggml_row_size_bytes')
 
 
 def _ggml_tensor_2d_allocation_bytes(rows: int, columns: int, ggml_type: str) -> int:
@@ -515,21 +535,26 @@ def _ggml_tensor_2d_allocation_bytes(rows: int, columns: int, ggml_type: str) ->
     # bytes/element for Q8/Q4. That was intentionally conservative for F16 but
     # wrong for quantized GGML block storage and for non-Qwen3-8B architectures.
     row_size = _ggml_row_size_bytes(rows, ggml_type)
-    payload = row_size * _checked_positive_int(columns, 'columns')
+    payload = _checked_mul(row_size, _checked_positive_int(columns, 'columns'), 'ggml_tensor_payload_bytes')
     return _align_up(payload)
 
 
 def _read_gguf_metadata(model_path: Any, *, max_kv: int = 4096) -> Dict[str, Any]:
-    GGUF_SCALAR_VALUE_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
-    GGUF_REQUIRED_METADATA_KEYS = {
-        'general.architecture',
-        'block_count',
-        'attention.head_count',
-        'attention.head_count_kv',
-        'attention.key_length',
-        'attention.value_length',
-        'embedding_length',
+    scalar_formats = {
+        0: ('<B', 1), 1: ('<b', 1), 2: ('<H', 2), 3: ('<h', 2),
+        4: ('<I', 4), 5: ('<i', 4), 6: ('<f', 4), 7: ('?', 1),
+        10: ('<Q', 8), 11: ('<q', 8), 12: ('<d', 8),
     }
+    required_suffixes = {
+        'block_count', 'attention.head_count', 'attention.head_count_kv',
+        'attention.key_length', 'attention.value_length', 'embedding_length',
+    }
+    path = Path(model_path)
+    stat = path.stat()
+    cache_key = (str(path.resolve()), int(stat.st_size), int(stat.st_mtime_ns), int(max_kv))
+    cached = GGUF_METADATA_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
 
     def read_exact(f, length: int) -> bytes:
         data = f.read(length)
@@ -551,23 +576,14 @@ def _read_gguf_metadata(model_path: Any, *, max_kv: int = 4096) -> Dict[str, Any
             return
         read_exact(f, length)
 
+    def read_scalar(f, value_type: int) -> Any:
+        fmt, size = scalar_formats[value_type]
+        return struct.unpack(fmt, read_exact(f, size))[0]
+
     def read_or_skip_value(f, value_type: int, *, store: bool) -> Any:
-        if value_type in GGUF_SCALAR_VALUE_SIZES:
-            size = GGUF_SCALAR_VALUE_SIZES[value_type]
-            data = read_exact(f, size)
-            if not store:
-                return None
-            if value_type == 4:
-                return int.from_bytes(data, 'little', signed=False)
-            if value_type == 5:
-                return int.from_bytes(data, 'little', signed=True)
-            if value_type == 10:
-                return int.from_bytes(data, 'little', signed=False)
-            if value_type == 11:
-                return int.from_bytes(data, 'little', signed=True)
-            if value_type == 7:
-                return bool(int.from_bytes(data, 'little'))
-            return None
+        if value_type in scalar_formats:
+            value = read_scalar(f, value_type)
+            return value if store else None
         if value_type == 8:
             value = read_string(f)
             return value if store else None
@@ -576,20 +592,17 @@ def _read_gguf_metadata(model_path: Any, *, max_kv: int = 4096) -> Dict[str, Any
             array_length = int.from_bytes(read_exact(f, 8), 'little', signed=False)
             if array_length > (1 << 24):
                 raise ValueError('gguf_array_too_large')
-            if array_type in GGUF_SCALAR_VALUE_SIZES:
-                skip_bytes(f, GGUF_SCALAR_VALUE_SIZES[array_type] * array_length)
+            if array_type in scalar_formats:
+                skip_bytes(f, scalar_formats[array_type][1] * array_length)
             elif array_type == 8:
                 for _ in range(array_length):
-                    read_string(f)
-            elif array_type == 9:
-                for _ in range(array_length):
-                    read_or_skip_value(f, array_type, store=False)
+                    _ = read_string(f)
             else:
                 raise ValueError('gguf_metadata_type_unsupported')
             return None
         raise ValueError('gguf_metadata_type_unsupported')
 
-    with open(model_path, 'rb') as f:
+    with open(path, 'rb') as f:
         if read_exact(f, 4) != GGUF_MAGIC:
             raise ValueError('gguf_magic_missing')
         version = int.from_bytes(read_exact(f, 4), 'little', signed=False)
@@ -604,10 +617,12 @@ def _read_gguf_metadata(model_path: Any, *, max_kv: int = 4096) -> Dict[str, Any
             key = read_string(f)
             value_type = int.from_bytes(read_exact(f, 4), 'little', signed=False)
             suffix = key.split('.', 1)[1] if '.' in key else key
-            should_store = key == 'general.architecture' or suffix in GGUF_REQUIRED_METADATA_KEYS
+            should_store = key == 'general.architecture' or suffix in required_suffixes
             value = read_or_skip_value(f, value_type, store=should_store)
             if should_store and value is not None:
                 metadata[key] = value
+        GGUF_METADATA_CACHE.clear()
+        GGUF_METADATA_CACHE[cache_key] = dict(metadata)
         return metadata
 
 
@@ -656,9 +671,14 @@ def _estimate_kv_cache_bytes_from_metadata(metadata: Dict[str, Any], n_ctx: int,
     k_rows = arch['n_embd_k_gqa']
     v_rows = arch['n_embd_v_gqa']
     layers = arch['layer_count']
-    k_per_layer = _ggml_tensor_2d_allocation_bytes(k_rows, n_ctx, type_k)
-    v_per_layer = _ggml_tensor_2d_allocation_bytes(v_rows, n_ctx, type_v)
-    kv_bytes = (k_per_layer + v_per_layer) * layers
+    k_row_payload = _ggml_row_size_bytes(k_rows, type_k)
+    v_row_payload = _ggml_row_size_bytes(v_rows, type_v)
+    k_payload_per_layer = _checked_mul(k_row_payload, n_ctx, 'k_tensor_payload_bytes')
+    v_payload_per_layer = _checked_mul(v_row_payload, n_ctx, 'v_tensor_payload_bytes')
+    k_per_layer = _align_up(k_payload_per_layer)
+    v_per_layer = _align_up(v_payload_per_layer)
+    kv_per_layer = _checked_add(k_per_layer, v_per_layer, 'kv_cache_bytes_per_layer')
+    kv_bytes = _checked_mul(kv_per_layer, layers, 'kv_cache_bytes')
     if kv_bytes > (1 << 63) - 1:
         raise OverflowError('kv_cache_bytes_overflow')
     return {
@@ -666,8 +686,12 @@ def _estimate_kv_cache_bytes_from_metadata(metadata: Dict[str, Any], n_ctx: int,
         'context_size_tokens': n_ctx,
         'type_k': type_k,
         'type_v': type_v,
-        'k_row_size_bytes': _ggml_row_size_bytes(k_rows, type_k),
-        'v_row_size_bytes': _ggml_row_size_bytes(v_rows, type_v),
+        'k_row_size_bytes': k_row_payload,
+        'v_row_size_bytes': v_row_payload,
+        'k_tensor_payload_bytes_per_layer': k_payload_per_layer,
+        'v_tensor_payload_bytes_per_layer': v_payload_per_layer,
+        'k_tensor_payload_bytes_total': _checked_mul(k_payload_per_layer, layers, 'k_tensor_payload_bytes_total'),
+        'v_tensor_payload_bytes_total': _checked_mul(v_payload_per_layer, layers, 'v_tensor_payload_bytes_total'),
         'k_bytes_per_layer': k_per_layer,
         'v_bytes_per_layer': v_per_layer,
         'kv_cache_bytes': kv_bytes,
@@ -687,7 +711,9 @@ def _fallback_qwen3_8b_kv_metadata() -> Dict[str, Any]:
     }
 
 
-def _qwen_64k_memory_estimate(model_path: Any, n_ctx: int, kv_precision: str, backend: str) -> Dict[str, Any]:
+def _qwen_64k_memory_estimate(
+    model_path: Any, n_ctx: int, kv_precision: str, backend: str, batch_profile: str = QWEN_64K_BATCH_PROFILE_DEFAULT
+) -> Dict[str, Any]:
     model_size = None
     try:
         model_size = os.path.getsize(str(model_path))
@@ -712,17 +738,32 @@ def _qwen_64k_memory_estimate(model_path: Any, n_ctx: int, kv_precision: str, ba
         fallback_reason = type(exc).__name__
         kv_breakdown = _estimate_kv_cache_bytes_from_metadata(metadata, n_ctx, kv_precision, kv_precision)
     kv_bytes = kv_breakdown['kv_cache_bytes']
-    non_kv_runtime_bytes = max(512 * 1024 * 1024, int((model_size or 0) * 0.08)) if model_size is not None else None
+    selected_batch = normalize_qwen_64k_batch_profile(batch_profile)
+    batch_values = QWEN_64K_BATCH_PROFILES[selected_batch]
+    batch_dependent_buffer_bytes = int(batch_values['n_batch']) * int(batch_values['n_ubatch']) * 2048
+    compute_scratch_estimate_bytes = max(256 * 1024 * 1024, batch_dependent_buffer_bytes)
+    allocator_headroom_bytes = max(256 * 1024 * 1024, int(kv_bytes * 0.04))
+    non_kv_runtime_bytes = (
+        max(512 * 1024 * 1024, int((model_size or 0) * 0.08)) + batch_dependent_buffer_bytes
+        if model_size is not None else None
+    )
     safety_reserve_bytes = max(1024 * 1024 * 1024, int(kv_bytes * 0.10))
     total = None
     if model_size is not None:
-        total = model_size + kv_bytes + int(non_kv_runtime_bytes or 0) + safety_reserve_bytes
+        total = model_size + kv_bytes + int(non_kv_runtime_bytes or 0) + compute_scratch_estimate_bytes + allocator_headroom_bytes + safety_reserve_bytes
     return {
         'model_file_size_bytes': model_size,
         'estimated_kv_cache_bytes': kv_bytes,
         'exact_kv_cache_bytes': kv_bytes,
+        'model_weights_bytes': model_size,
+        'exact_kv_payload_bytes': kv_breakdown['k_tensor_payload_bytes_total'] + kv_breakdown['v_tensor_payload_bytes_total'],
+        'exact_kv_allocation_bytes': kv_bytes,
         'estimated_non_kv_runtime_bytes': non_kv_runtime_bytes,
+        'compute_scratch_estimate_bytes': compute_scratch_estimate_bytes,
+        'batch_dependent_buffer_bytes': batch_dependent_buffer_bytes,
+        'allocator_headroom_bytes': allocator_headroom_bytes,
         'safety_reserve_bytes': safety_reserve_bytes,
+        'batch_profile': selected_batch,
         'estimated_total_runtime_bytes': total,
         'estimated_total_model_plus_kv_bytes': (model_size + kv_bytes) if model_size is not None else None,
         'context_size_tokens': int(n_ctx),
@@ -815,7 +856,9 @@ def _build_qwen_64k_runtime_profiles(
             'constructor_kwarg_support': support,
             'capability_source': capabilities['capability_source'],
             'llama_cpp_python_version': capabilities.get('llama_cpp_python_version'),
-            'memory_estimate': _qwen_64k_memory_estimate(model_path, n_ctx, precision, capabilities.get('backend') or ''),
+            'memory_estimate': _qwen_64k_memory_estimate(
+                model_path, n_ctx, precision, capabilities.get('backend') or '', selected_batch_profile
+            ),
             'kqv_offload_allowed': bool(enable_kqv_offload),
             'backend': backend or 'unknown',
         }

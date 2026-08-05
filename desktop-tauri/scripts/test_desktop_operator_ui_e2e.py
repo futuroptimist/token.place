@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -640,13 +641,116 @@ def assert_packaged_windows_nvidia_status(
         raise AssertionError(f"hardware status reports KV cache device is not CUDA: {kv_cache_device!r}")
 
 
+def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Path) -> int:
+    """Drive a packaged app and the existing landing-page API v1 E2EE client."""
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    cleanup_timeout = float(request["cleanup_timeout_s"])
+    driver_log = Path(tempfile.mkstemp(prefix="p8-tauri-driver-", suffix=".log")[1])
+    isolated_home = Path(tempfile.mkdtemp(prefix="p8-desktop-home-"))
+    env = os.environ.copy()
+    for key in ("USE_MOCK_LLM", "TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON", "PYTHONPATH"):
+        env.pop(key, None)
+    env.update({"HOME": str(isolated_home), "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+                "XDG_DATA_HOME": str(isolated_home / ".local/share"),
+                "APPDATA": str(isolated_home / "AppData/Roaming")})
+    process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
+        stdout=driver_log.open("w", encoding="utf-8"), stderr=subprocess.STDOUT, text=True)  # noqa: S603
+    driver: webdriver.Remote | None = None
+    browser: webdriver.Chrome | None = None
+    cleanup_ok = True
+    try:
+        wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log, 90)
+        driver = start_driver(app_binary.resolve(strict=True))
+        wait_for_ui_ready(driver)
+        fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
+        fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
+        mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
+        driver.execute_script("arguments[0].value='gpu'; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", mode)
+        tier = driver.find_element(By.XPATH, "//select[@aria-label='Context tier']")
+        driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", tier, request["context_tier"])
+        wait_for_start_operator_enabled(driver, driver_log, driver_log)
+        driver.find_element(By.XPATH, "//button[.='Start operator']").click()
+        wait_for_running_stability(driver, "yes", stable_seconds=3)
+        WebDriverWait(driver, 60).until(lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+
+        runtime = {label: _status_value(driver, label) for label in
+            ("App version", "Build ID", "Runtime ID", "Bundled runtime ID", "Launcher source",
+             "Requested mode", "Backend selected", "Backend used", "Context tier")}
+        if (runtime["Launcher source"].lower() != "bundled"):
+            raise RuntimeError("packaged launcher attestation failed")
+        if runtime["Backend selected"].lower() != request["backend"] or runtime["Backend used"].lower() != request["backend"]:
+            raise RuntimeError("packaged backend attestation failed")
+
+        browser = start_landing_driver()
+        browser.get(request["relay_url"])
+        wait = WebDriverWait(browser, float(request["request_timeout_s"]), poll_frequency=0.05)
+        wait.until(lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
+        field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+        field.send_keys(request["prompt"])
+        started = time.monotonic()
+        browser.find_element(By.CSS_SELECTOR, ".send-button").click()
+        progress: list[dict[str, object]] = []
+        while time.monotonic() - started < float(request["request_timeout_s"]):
+            state = browser.execute_script("const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,b:v.isGeneratingResponse};")
+            event = state.get("p")
+            if isinstance(event, dict) and (not progress or event.get("sequence") != progress[-1].get("sequence")):
+                progress.append(event)
+            assistants = [m for m in state.get("h", []) if isinstance(m, dict) and m.get("role") == "assistant"]
+            if assistants and not state.get("b"):
+                response_text = assistants[-1].get("content")
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("packaged request timeout")
+        ended = time.monotonic()
+        if not progress or not isinstance(response_text, str):
+            raise RuntimeError("required encrypted progress or response evidence missing")
+        first_generated = next((event for event in progress if int(event.get("generated_tokens", 0)) > 0), None)
+        first_s = started + (float(first_generated["elapsed_ms"]) / 1000) if first_generated else None
+        digest = hashlib.sha256()
+        with Path(request["model"]).open("rb") as model_handle:
+            for chunk in iter(lambda: model_handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        evidence = {"app_identity": runtime["App version"], "build_identity": runtime["Build ID"],
+            "runtime_identity": runtime["Runtime ID"], "bundled_runtime_identity": runtime["Bundled runtime ID"],
+            "backend_used": runtime["Backend used"].lower(), "model_fingerprint": digest.hexdigest(),
+            "authoritative_prompt_tokens": progress[-1]["total_prompt_tokens"], "progress_events": progress,
+            "terminal": "completed", "response_text": response_text, "start_s": started,
+            "first_token_s": first_s, "end_s": ended, "output_tokens": progress[-1]["generated_tokens"]}
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        os.chmod(evidence_path, 0o600)
+        return 0
+    finally:
+        if browser is not None:
+            with contextlib.suppress(Exception): browser.quit()
+        if driver is not None:
+            with contextlib.suppress(Exception): driver.quit()
+        if process.poll() is None:
+            process.terminate()
+            try: process.wait(timeout=cleanup_timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try: process.wait(timeout=min(cleanup_timeout, 5))
+                except subprocess.TimeoutExpired: cleanup_ok = False
+        shutil.rmtree(isolated_home, ignore_errors=True)
+        driver_log.unlink(missing_ok=True)
+        if not cleanup_ok:
+            raise RuntimeError("owned process cleanup failed")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packaged-windows-nvidia-hardware", action="store_true")
     parser.add_argument("--app-binary", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
+    parser.add_argument("--p8-request", type=Path)
+    parser.add_argument("--p8-evidence", type=Path)
     args = parser.parse_args(argv)
+    if args.p8_request or args.p8_evidence:
+        if not (args.p8_request and args.p8_evidence and args.app_binary):
+            parser.error("P8 mode requires --p8-request, --p8-evidence, and --app-binary")
+        return run_p8_packaged_mode(args.p8_request, args.p8_evidence, args.app_binary)
     hardware_mode = args.packaged_windows_nvidia_hardware
     if hardware_mode and (args.app_binary is None or args.model is None):
         parser.error("packaged Windows NVIDIA mode requires --app-binary and --model")

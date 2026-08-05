@@ -16,27 +16,35 @@ Physical packaged-runtime mode is intentionally fail-closed. Run it only on a ma
   the desktop runtime already supports it;
 - API v1 E2EE relay request, encrypted progress, cancellation, and response paths configured.
 
-The harness never silently substitutes a fake runtime or trusts an HTTP adapter for
-packaged-runtime mode:
+The harness never substitutes a fake runtime or trusts an opaque HTTP adapter. It invokes the
+repository-owned desktop WebDriver runner with explicit arguments and bounded execution. The runner
+launches the selected installed/package-built application, configures its operator, and sends the
+fixture with the existing landing-page API v1 E2EE browser flow:
 
 ```bash
-python scripts/p8_benchmark.py packaged-runtime --out-dir .tmp/p8
+python scripts/p8_benchmark.py packaged-runtime \
+  --app-binary "$P8_APP_BINARY" \
+  --model "$P8_MODEL" \
+  --backend metal \
+  --relay-url "$P8_RELAY_URL" \
+  --fixture small-8k \
+  --request-timeout 600 \
+  --cleanup-timeout 30 \
+  --out-dir .tmp/p8
 ```
 
-This currently exits nonzero. The installed desktop exposes operator Start/Stop only through its
-in-process Tauri command surface; it has no authenticated external benchmark-control seam that can
-select a model, observe the API v1 encrypted progress lifecycle, trigger cancellation, and return
-bounded evidence to this Python harness. Directly running the bridge with system Python would not
-exercise the installed package, while accepting a caller-provided HTTP endpoint would send the
-plaintext fixture and model path to an unverifiable process. Both substitutes are therefore
-rejected. A physical command must not be documented as successful until the desktop owns such a
-control seam (which is outside this task's allowed production-code scope).
+On Windows/NVIDIA use the same command with `--backend cuda` and the installed `.exe`. On macOS use
+the installed `.app` executable under `Contents/MacOS` and `--backend metal`. The runner attests that
+the launcher source is bundled, active and bundled runtime IDs agree, and selected/used backend
+matches the requested backend. It fails closed for mock/dev substitution, absent progress, an
+incomplete response lifecycle, or cleanup failure.
 
-Before that seam can be connected, inputs are still validated fail closed: the model must be a
-readable regular file, the backend must be recognized, relay/control HTTP endpoints must resolve to
-loopback, and request/cleanup timeouts must be finite and positive. Unit tests may inject a callable
-runner directly into the Python API to verify orchestration and evidence validation, but that hook
-is intentionally unavailable from the production CLI and is not physical evidence.
+Before launch, inputs are validated fail closed: the model must be a
+readable regular file, the app must be an executable regular file, and request/cleanup timeouts must
+be finite and positive. External E2EE relays require HTTPS; loopback relays may use HTTP or HTTPS.
+Credentials, fragments, malformed ports, and other schemes are rejected. Temporary request and
+evidence files are owner-only and deleted after each run. Unit tests replace only the subprocess
+boundary and are orchestration evidence, never physical Metal/CUDA evidence.
 
 ## Fixture generation
 
@@ -165,7 +173,7 @@ methodology rather than byte-for-byte assertions.
 - `1`: strict semantic, packaged-runtime invariant, cancellation, recovery, telemetry, privacy, or
   adapter contract failure. `--report-only` may preserve semantic-failure reports but does not
   suppress runtime, telemetry, cancellation, recovery, privacy, or invariant failures.
-- `2`: invalid CLI input or missing `--adapter-url` before packaged-runtime prerequisite checks.
+- `2`: invalid CLI input or missing required packaged-runtime arguments.
 
 ## CI versus hardware validation
 

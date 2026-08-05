@@ -3,7 +3,7 @@
 The module is intentionally dependency-light so ordinary CI can validate fixture,
 semantic, progress, cancellation, memory-comparison, and report contracts without
 model downloads, GPUs, or a packaged desktop app. The ``packaged-runtime`` CLI
-mode fails closed unless an explicit adapter endpoint is provided.
+mode invokes the repository-owned packaged desktop WebDriver runner.
 """
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ import subprocess
 import sys
 import tempfile
 import math
-import socket
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
@@ -242,50 +241,77 @@ def platform_memory_probe(command: list[str], timeout_s: float = 2.0) -> dict[st
     except Exception: return {"available": False, "code": "probe_malformed", "stdout_tail": sanitize(stdout[-200:])}
     return sanitize({"available": cp.returncode == 0, "code": "ok" if cp.returncode == 0 else "probe_failed", "payload": payload})
 
-def _is_loopback_url(value: str) -> bool:
+def _valid_relay_url(value: str) -> bool:
     parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname or
+            parsed.username or parsed.password or parsed.fragment):
         return False
     try:
-        return all(addr[4][0] in {"127.0.0.1", "::1"} for addr in socket.getaddrinfo(parsed.hostname, parsed.port))
-    except (OSError, ValueError):
+        parsed.port
+    except ValueError:
         return False
+    loopback = parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}
+    return parsed.scheme == "https" or loopback
 
 
-def invoke_packaged_runtime_adapter(adapter_url: str | None = None, *, fixture_id: str = "small-8k", timeout_s: float = 30.0, model: str | None = None, backend: str | None = None, relay_url: str | None = None, cleanup_timeout_s: float | None = None, runner: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Validate orchestration around an injected, repository-owned runner.
-
-    ``runner`` is deliberately injectable only through the Python API for unit
-    tests.  The production CLI cannot select a fake or opaque HTTP service.
-    """
-    missing = [name for name, value in {"model": model, "backend": backend, "relay_url": relay_url, "timeout_s": timeout_s, "cleanup_timeout_s": cleanup_timeout_s}.items() if value in (None, "")]
+def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", timeout_s: float = 30.0,
+        model: str | None = None, backend: str | None = None, relay_url: str | None = None,
+        cleanup_timeout_s: float | None = None, app_binary: str | None = None,
+        context_tier: str = "8k-fast", subprocess_run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
+    """Run the repository-owned packaged desktop E2E runner and validate its evidence."""
+    missing = [name for name, value in {"app_binary": app_binary, "model": model, "backend": backend,
+        "relay_url": relay_url, "timeout_s": timeout_s, "cleanup_timeout_s": cleanup_timeout_s}.items()
+        if value in (None, "")]
     if missing:
         return {"pass": False, "code": "packaged_prerequisites_missing", "missing": missing}
-    if adapter_url:
-        return {"pass": False, "code": "opaque_adapter_forbidden"}
     model_path = Path(str(model))
     if not model_path.is_file() or not os.access(model_path, os.R_OK):
         return {"pass": False, "code": "model_artifact_invalid"}
-    if backend not in {"cpu", "metal", "cuda", "auto", "gpu", "hybrid"}:
+    app_path = Path(str(app_binary))
+    if not app_path.is_file() or not os.access(app_path, os.X_OK):
+        return {"pass": False, "code": "packaged_app_invalid"}
+    if backend not in {"metal", "cuda"}:
         return {"pass": False, "code": "backend_unsupported"}
-    if not _is_loopback_url(str(relay_url)):
-        return {"pass": False, "code": "relay_url_not_loopback"}
+    if not _valid_relay_url(str(relay_url)):
+        return {"pass": False, "code": "relay_url_invalid"}
     if not all(isinstance(value, (int, float)) and math.isfinite(value) and value > 0 for value in (timeout_s, cleanup_timeout_s)):
         return {"pass": False, "code": "timeout_invalid"}
-    if runner is None:
-        return {
-            "pass": False,
-            "code": "packaged_runner_unavailable",
-            "detail": "installed desktop exposes no external benchmark control seam",
-        }
     prompt, manifest = generate_fixture(fixture_id)
+    request = {"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest,
+        "model": str(model_path), "backend": backend, "relay_url": relay_url,
+        "context_tier": context_tier, "request_timeout_s": timeout_s,
+        "cleanup_timeout_s": cleanup_timeout_s}
+    request_name = evidence_name = None
     try:
-        payload = runner({"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest, "model": str(model_path), "backend": backend, "relay_url": relay_url, "request_timeout_s": timeout_s, "cleanup_timeout_s": cleanup_timeout_s})
-    except Exception:
-        return {"pass": False, "code": "packaged_runner_failed"}
+        request_fd, request_name = tempfile.mkstemp(prefix="p8-request-", suffix=".json")
+        evidence_fd, evidence_name = tempfile.mkstemp(prefix="p8-evidence-", suffix=".json")
+        os.fchmod(request_fd, 0o600); os.fchmod(evidence_fd, 0o600)
+        with os.fdopen(request_fd, "w", encoding="utf-8") as handle:
+            json.dump(request, handle)
+        os.close(evidence_fd)
+        command = [sys.executable, str(Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
+            "test_desktop_operator_ui_e2e.py"), "--p8-request", request_name,
+            "--p8-evidence", evidence_name, "--app-binary", str(app_path)]
+        try:
+            completed = subprocess_run(command, capture_output=True, text=True,
+                timeout=timeout_s + cleanup_timeout_s, check=False)
+        except subprocess.TimeoutExpired:
+            return {"pass": False, "code": "packaged_runner_timeout"}
+        if completed.returncode != 0:
+            return {"pass": False, "code": "packaged_runner_failed"}
+        try:
+            payload = json.loads(Path(evidence_name).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"pass": False, "code": "packaged_evidence_malformed"}
+    finally:
+        for name in (request_name, evidence_name):
+            if name:
+                Path(name).unlink(missing_ok=True)
     if not isinstance(payload, dict):
         return {"pass": False, "code": "packaged_evidence_malformed"}
-    required = {"app_identity", "runtime_identity", "build_identity", "backend_used", "model_fingerprint", "authoritative_prompt_tokens", "progress_events", "terminal", "response_text", "start_s", "first_token_s", "end_s", "output_tokens"}
+    required = {"app_identity", "runtime_identity", "bundled_runtime_identity", "build_identity",
+        "backend_used", "model_fingerprint", "authoritative_prompt_tokens", "progress_events",
+        "terminal", "response_text", "start_s", "first_token_s", "end_s", "output_tokens"}
     missing_evidence = sorted(key for key in required if payload.get(key) in (None, "", [], {}))
     if missing_evidence:
         return {"pass": False, "code": "packaged_evidence_missing", "missing": missing_evidence}
@@ -299,17 +325,23 @@ def invoke_packaged_runtime_adapter(adapter_url: str | None = None, *, fixture_i
         int(payload.get("output_tokens", 0)),
     )
     evidence = {
-        "runner_kind": "injected_test_runner",
+        "runner_kind": "repository_packaged_desktop_webdriver",
         "fixture": {"id": fixture_id, "sha256": manifest.get("fixture_sha256"), "actual_tokens": manifest.get("actual_tokens")},
         "semantic": semantic,
         "progress": progress,
         "metrics": metrics,
         "memory": payload.get("memory", {}),
-        "runtime": {key: payload[key] for key in ("app_identity", "runtime_identity", "build_identity", "backend_used", "model_fingerprint", "authoritative_prompt_tokens")},
+        "runtime": {key: payload[key] for key in ("app_identity", "runtime_identity",
+            "bundled_runtime_identity", "build_identity", "backend_used", "model_fingerprint",
+            "authoritative_prompt_tokens")},
     }
     if "kv_estimate" in payload or "kv_runtime" in payload:
         evidence["kv_compare"] = compare_kv_estimate(payload.get("kv_estimate", {}), payload.get("kv_runtime", {}))
-    passed = bool(semantic.get("semantic_pass") and progress.get("pass"))
+    runtime = evidence["runtime"]
+    identity_ok = (runtime["app_identity"] not in {"dev", "mock", "unknown"} and
+        runtime["runtime_identity"] == runtime.get("bundled_runtime_identity") and
+        runtime["backend_used"] == backend)
+    passed = bool(semantic.get("semantic_pass") and progress.get("pass") and identity_ok)
     if "kv_compare" in evidence:
         passed = passed and bool(evidence["kv_compare"].get("pass"))
     evidence["pass"] = passed
@@ -341,14 +373,25 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("generate-fixture"); g.add_argument("--fixture", choices=FIXTURES, required=True); g.add_argument("--out-dir", required=True); g.add_argument("--seed", default=DEFAULT_SEED)
     e = sub.add_parser("evaluate"); e.add_argument("--manifest", required=True); e.add_argument("--response", required=True); e.add_argument("--strict", action="store_true"); e.add_argument("--out-dir", required=True)
-    r = sub.add_parser("packaged-runtime"); r.add_argument("--out-dir", required=True); r.add_argument("--adapter-url", help=argparse.SUPPRESS); r.add_argument("--fixture", choices=FIXTURES, default="small-8k"); r.add_argument("--model"); r.add_argument("--backend"); r.add_argument("--relay-url"); r.add_argument("--request-timeout", type=float, default=30.0); r.add_argument("--cleanup-timeout", type=float); r.add_argument("--report-only", action="store_true")
+    r = sub.add_parser("packaged-runtime", help="run the installed desktop through repository WebDriver control")
+    r.add_argument("--out-dir", required=True); r.add_argument("--fixture", choices=FIXTURES, default="small-8k")
+    r.add_argument("--app-binary", required=True); r.add_argument("--model", required=True)
+    r.add_argument("--backend", choices=("metal", "cuda"), required=True); r.add_argument("--relay-url", required=True)
+    r.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
+    r.add_argument("--request-timeout", type=float, default=600.0); r.add_argument("--cleanup-timeout", type=float, default=30.0)
+    r.add_argument("--report-only", action="store_true", help="preserve semantic failures; runtime failures remain nonzero")
     args = p.parse_args(argv)
     if args.cmd == "generate-fixture":
         prompt, manifest = generate_fixture(args.fixture, args.seed); out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True); (out/f"{args.fixture}.prompt.txt").write_text(prompt); (out/f"{args.fixture}.manifest.json").write_text(_canonical_json(manifest)+"\n"); print(f"generated {args.fixture}: requested={manifest['requested_tokens']} actual={manifest['actual_tokens']} sha256={manifest['fixture_sha256']}"); return 0
     if args.cmd == "evaluate":
         manifest=json.loads(Path(args.manifest).read_text()); response=Path(args.response).read_text(); score=evaluate_semantic(response, manifest); path=write_report_atomic(Path(args.out_dir), {"mode":"semantic-evaluation","semantic":score,"fixture":{"id":manifest.get("fixture_id"),"sha256":manifest.get("fixture_sha256"),"actual_tokens":manifest.get("actual_tokens")}}); print(f"semantic_pass={score.get('semantic_pass', False)} report={path}"); return 1 if args.strict and not score.get("semantic_pass") else 0
     if args.cmd == "packaged-runtime":
-        evidence = invoke_packaged_runtime_adapter(args.adapter_url, fixture_id=args.fixture, timeout_s=args.request_timeout, model=args.model, backend=args.backend, relay_url=args.relay_url, cleanup_timeout_s=args.cleanup_timeout)
-        path=write_report_atomic(Path(args.out_dir), {"mode":"packaged-runtime","runtime":{"adapter_url":"provided","platform":platform.system().lower()},"adapter":evidence}); print(f"adapter_pass={evidence.get('pass', False)} report={path}"); return 0 if evidence.get("pass") else 1
+        evidence = invoke_packaged_runtime_adapter(fixture_id=args.fixture, timeout_s=args.request_timeout,
+            app_binary=args.app_binary, model=args.model, backend=args.backend, relay_url=args.relay_url,
+            cleanup_timeout_s=args.cleanup_timeout, context_tier=args.context_tier)
+        path=write_report_atomic(Path(args.out_dir), {"mode":"packaged-runtime",
+            "runtime":{"platform":platform.system().lower()},"evidence":evidence})
+        print(f"packaged_runtime_pass={evidence.get('pass', False)} report={path}")
+        return 0 if evidence.get("pass") else 1
     return 2
 if __name__ == "__main__": raise SystemExit(main())

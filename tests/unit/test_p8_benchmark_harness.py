@@ -226,8 +226,7 @@ def test_atomic_report_schema_and_redaction(tmp_path):
 
 def test_cli_validation_and_evaluate(tmp_path):
     proc = subprocess.run([sys.executable, "scripts/p8_benchmark.py", "packaged-runtime", "--out-dir", str(tmp_path)], text=True, capture_output=True)
-    assert proc.returncode == 1
-    assert json.loads((tmp_path / "p8_benchmark_report.json").read_text())["adapter"]["code"] == "packaged_prerequisites_missing"
+    assert proc.returncode == 2
     prompt, manifest = h.generate_fixture("small-8k")
     mf = tmp_path/"m.json"; mf.write_text(json.dumps(manifest))
     resp = tmp_path/"r.json"; resp.write_text(json.dumps(manifest["expected_answers"]))
@@ -298,7 +297,7 @@ def test_report_redacts_authorization_and_message_like_payloads(tmp_path):
     assert data["adapter"]["safe"] == "<redacted>"
 
 
-def test_packaged_runtime_injected_runner_is_orchestration_only(tmp_path):
+def test_packaged_runtime_invokes_repository_runner_and_cleans_files(tmp_path):
     _, manifest = h.generate_fixture("small-8k")
     model = tmp_path / "model.gguf"
     model.write_bytes(b"test artifact")
@@ -317,45 +316,60 @@ def test_packaged_runtime_injected_runner_is_orchestration_only(tmp_path):
         "memory": {"diagnostic": "Authorization: Bearer sk-runtime"},
         "app_identity": "token.place-test",
         "runtime_identity": "bundled-test",
+        "bundled_runtime_identity": "bundled-test",
         "build_identity": "unit-test",
-        "backend_used": "cpu",
+        "backend_used": "metal",
         "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": manifest["actual_tokens"],
     }
+    app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
     seen = {}
-    def runner(request):
-        seen.update(request)
-        return payload
+    def fake_run(command, **kwargs):
+        seen.update(command=command, kwargs=kwargs)
+        request_path = command[command.index("--p8-request") + 1]
+        evidence_path = command[command.index("--p8-evidence") + 1]
+        seen["request"] = json.loads(h.Path(request_path).read_text())
+        h.Path(evidence_path).write_text(json.dumps(payload))
+        return subprocess.CompletedProcess(command, 0, "", "")
 
-    result = h.invoke_packaged_runtime_adapter(timeout_s=1.5, model=str(model), backend="cpu", relay_url="http://127.0.0.1:8000", cleanup_timeout_s=3.0, runner=runner)
-    assert seen["fixture_id"] == "small-8k"
-    assert seen["prompt"] not in json.dumps(result)
-    assert result["runner_kind"] == "injected_test_runner"
+    result = h.invoke_packaged_runtime_adapter(timeout_s=1.5, app_binary=str(app), model=str(model),
+        backend="metal", relay_url="https://relay.example", cleanup_timeout_s=3.0,
+        subprocess_run=fake_run)
+    assert seen["request"]["fixture_id"] == "small-8k"
+    assert seen["request"]["prompt"] not in json.dumps(result)
+    assert result["runner_kind"] == "repository_packaged_desktop_webdriver"
     assert result["pass"] is True
     assert result["memory"]["diagnostic"] == "<redacted>"
     assert "messages" not in result
+    assert not h.Path(seen["command"][seen["command"].index("--p8-request") + 1]).exists()
+    assert not h.Path(seen["command"][seen["command"].index("--p8-evidence") + 1]).exists()
 
 
 def test_packaged_runtime_requires_physical_prerequisites():
     result = h.invoke_packaged_runtime_adapter(timeout_s=1.5)
     assert result["pass"] is False
     assert result["code"] == "packaged_prerequisites_missing"
-    assert set(result["missing"]) == {"model", "backend", "relay_url", "cleanup_timeout_s"}
+    assert set(result["missing"]) == {"app_binary", "model", "backend", "relay_url", "cleanup_timeout_s"}
 
 
-def test_packaged_runtime_rejects_opaque_adapter_and_missing_model(tmp_path):
+def test_packaged_runtime_validates_app_model_backend_and_relay(tmp_path):
     model = tmp_path / "model.gguf"
     model.write_bytes(b"x")
-    common = dict(timeout_s=1, model=str(model), backend="cpu", relay_url="http://127.0.0.1:8000", cleanup_timeout_s=1)
-    assert h.invoke_packaged_runtime_adapter("https://example.com/run", **common)["code"] == "opaque_adapter_forbidden"
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    common = dict(timeout_s=1, app_binary=str(app), model=str(model), backend="metal", relay_url="https://relay.example", cleanup_timeout_s=1)
     assert h.invoke_packaged_runtime_adapter(**{**common, "model": str(tmp_path / "absent.gguf")})["code"] == "model_artifact_invalid"
-    assert h.invoke_packaged_runtime_adapter(**common)["code"] == "packaged_runner_unavailable"
+    assert h.invoke_packaged_runtime_adapter(**{**common, "app_binary": str(tmp_path / "absent")})["code"] == "packaged_app_invalid"
+    assert h.invoke_packaged_runtime_adapter(**{**common, "backend": "cpu"})["code"] == "backend_unsupported"
+    for url in ("http://relay.example", "ftp://relay.example", "https://user:pw@relay.example", "https://relay.example/#fragment", "https://relay.example:bad"):
+        assert h.invoke_packaged_runtime_adapter(**{**common, "relay_url": url})["code"] == "relay_url_invalid"
+    assert h._valid_relay_url("http://127.0.0.1:8000")
+    assert h._valid_relay_url("https://relay.example")
 
 
 def test_report_only_does_not_suppress_runtime_failure(tmp_path):
     proc = subprocess.run([
         sys.executable, "scripts/p8_benchmark.py", "packaged-runtime",
-        "--out-dir", str(tmp_path), "--adapter-url", "http://127.0.0.1:9/run",
+        "--out-dir", str(tmp_path), "--app-binary", str(tmp_path / "missing-app"),
         "--model", str(tmp_path / "missing.gguf"), "--backend", "metal",
         "--relay-url", "http://127.0.0.1:8000", "--cleanup-timeout", "1",
         "--report-only",

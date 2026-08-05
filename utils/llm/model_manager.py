@@ -511,7 +511,7 @@ def _ggml_tensor_2d_allocation_bytes(rows: int, columns: int, ggml_type: str) ->
     # GGML rows are rounded to full quantization blocks; allocator starts each
     # tensor on GGML_MEM_ALIGN-compatible boundaries. The previous P4/P5 formula
     # was effectively ``n_ctx * {f16:524288,q8:262144,q4:131072}``, which encoded
-    # a Qwen3-8B-shaped 32-layer 4096-wide F16 cache and then divided by nominal
+    # a Qwen3-8B-shaped 36-layer 4096-wide F16 cache and then divided by nominal
     # bytes/element for Q8/Q4. That was intentionally conservative for F16 but
     # wrong for quantized GGML block storage and for non-Qwen3-8B architectures.
     row_size = _ggml_row_size_bytes(rows, ggml_type)
@@ -520,41 +520,94 @@ def _ggml_tensor_2d_allocation_bytes(rows: int, columns: int, ggml_type: str) ->
 
 
 def _read_gguf_metadata(model_path: Any, *, max_kv: int = 4096) -> Dict[str, Any]:
+    GGUF_SCALAR_VALUE_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    GGUF_REQUIRED_METADATA_KEYS = {
+        'general.architecture',
+        'block_count',
+        'attention.head_count',
+        'attention.head_count_kv',
+        'attention.key_length',
+        'attention.value_length',
+        'embedding_length',
+    }
+
+    def read_exact(f, length: int) -> bytes:
+        data = f.read(length)
+        if len(data) != length:
+            raise ValueError('gguf_metadata_truncated')
+        return data
+
     def read_string(f):
-        length = int.from_bytes(f.read(8), 'little', signed=False)
+        length = int.from_bytes(read_exact(f, 8), 'little', signed=False)
         if length > (1 << 20):
             raise ValueError('gguf_string_too_large')
-        return f.read(length).decode('utf-8', errors='replace')
+        return read_exact(f, length).decode('utf-8', errors='replace')
+
+    def skip_bytes(f, length: int) -> None:
+        if length < 0 or length > (1 << 34):
+            raise ValueError('gguf_metadata_value_too_large')
+        if f.seekable():
+            f.seek(length, os.SEEK_CUR)
+            return
+        read_exact(f, length)
+
+    def read_or_skip_value(f, value_type: int, *, store: bool) -> Any:
+        if value_type in GGUF_SCALAR_VALUE_SIZES:
+            size = GGUF_SCALAR_VALUE_SIZES[value_type]
+            data = read_exact(f, size)
+            if not store:
+                return None
+            if value_type == 4:
+                return int.from_bytes(data, 'little', signed=False)
+            if value_type == 5:
+                return int.from_bytes(data, 'little', signed=True)
+            if value_type == 10:
+                return int.from_bytes(data, 'little', signed=False)
+            if value_type == 11:
+                return int.from_bytes(data, 'little', signed=True)
+            if value_type == 7:
+                return bool(int.from_bytes(data, 'little'))
+            return None
+        if value_type == 8:
+            value = read_string(f)
+            return value if store else None
+        if value_type == 9:
+            array_type = int.from_bytes(read_exact(f, 4), 'little', signed=False)
+            array_length = int.from_bytes(read_exact(f, 8), 'little', signed=False)
+            if array_length > (1 << 24):
+                raise ValueError('gguf_array_too_large')
+            if array_type in GGUF_SCALAR_VALUE_SIZES:
+                skip_bytes(f, GGUF_SCALAR_VALUE_SIZES[array_type] * array_length)
+            elif array_type == 8:
+                for _ in range(array_length):
+                    read_string(f)
+            elif array_type == 9:
+                for _ in range(array_length):
+                    read_or_skip_value(f, array_type, store=False)
+            else:
+                raise ValueError('gguf_metadata_type_unsupported')
+            return None
+        raise ValueError('gguf_metadata_type_unsupported')
 
     with open(model_path, 'rb') as f:
-        if f.read(4) != GGUF_MAGIC:
+        if read_exact(f, 4) != GGUF_MAGIC:
             raise ValueError('gguf_magic_missing')
-        version = int.from_bytes(f.read(4), 'little', signed=False)
+        version = int.from_bytes(read_exact(f, 4), 'little', signed=False)
         if version not in (2, 3):
             raise ValueError('gguf_version_unsupported')
-        _tensor_count = int.from_bytes(f.read(8), 'little', signed=False)
-        kv_count = int.from_bytes(f.read(8), 'little', signed=False)
+        _tensor_count = int.from_bytes(read_exact(f, 8), 'little', signed=False)
+        kv_count = int.from_bytes(read_exact(f, 8), 'little', signed=False)
         if kv_count > max_kv:
             raise ValueError('gguf_kv_count_too_large')
         metadata: Dict[str, Any] = {}
         for _ in range(kv_count):
             key = read_string(f)
-            value_type = int.from_bytes(f.read(4), 'little', signed=False)
-            if value_type == 4:
-                value = int.from_bytes(f.read(4), 'little', signed=False)
-            elif value_type == 5:
-                value = int.from_bytes(f.read(4), 'little', signed=True)
-            elif value_type == 10:
-                value = int.from_bytes(f.read(8), 'little', signed=False)
-            elif value_type == 11:
-                value = int.from_bytes(f.read(8), 'little', signed=True)
-            elif value_type == 8:
-                value = read_string(f)
-            elif value_type == 7:
-                value = bool(int.from_bytes(f.read(1), 'little'))
-            else:
-                raise ValueError('gguf_metadata_type_unsupported')
-            metadata[key] = value
+            value_type = int.from_bytes(read_exact(f, 4), 'little', signed=False)
+            suffix = key.split('.', 1)[1] if '.' in key else key
+            should_store = key == 'general.architecture' or suffix in GGUF_REQUIRED_METADATA_KEYS
+            value = read_or_skip_value(f, value_type, store=should_store)
+            if should_store and value is not None:
+                metadata[key] = value
         return metadata
 
 

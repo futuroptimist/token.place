@@ -13914,8 +13914,28 @@ def _write_minimal_gguf(path, metadata):
         payload += s(key)
         if isinstance(value, str):
             payload += (8).to_bytes(4, 'little') + s(value)
+        elif isinstance(value, bool):
+            payload += (7).to_bytes(4, 'little') + int(value).to_bytes(1, 'little')
         elif isinstance(value, int):
             payload += (4).to_bytes(4, 'little') + value.to_bytes(4, 'little')
+        elif isinstance(value, float):
+            import struct
+
+            payload += (6).to_bytes(4, 'little') + struct.pack('<f', value)
+        elif isinstance(value, list):
+            payload += (9).to_bytes(4, 'little')
+            if all(isinstance(item, str) for item in value):
+                payload += (8).to_bytes(4, 'little')
+                payload += len(value).to_bytes(8, 'little')
+                for item in value:
+                    payload += s(item)
+            elif all(isinstance(item, int) for item in value):
+                payload += (4).to_bytes(4, 'little')
+                payload += len(value).to_bytes(8, 'little')
+                for item in value:
+                    payload += item.to_bytes(4, 'little')
+            else:
+                raise TypeError(value)
         else:
             raise TypeError(value)
     path.write_bytes(bytes(payload))
@@ -14005,6 +14025,36 @@ def test_qwen3_8b_reference_kv_bytes_match_ggml_block_evidence(tmp_path, ctx, pr
     assert estimate['metadata_source'] == 'gguf_header'
     assert estimate['conservative_fallback_used'] is False
 
+
+def test_qwen_64k_gguf_metadata_parser_skips_common_non_required_types(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3_with_tokenizer_arrays.gguf'
+    metadata = {
+        'general.architecture': 'qwen3',
+        'general.alignment': 32,
+        'tokenizer.ggml.tokens': ['<unk>', '<s>', '</s>'],
+        'tokenizer.ggml.scores': [1, 2, 3],
+        'tokenizer.ggml.add_bos_token': True,
+        'qwen3.block_count': 36,
+        'qwen3.attention.head_count': 32,
+        'qwen3.attention.head_count_kv': 8,
+        'qwen3.attention.key_length': 128,
+        'qwen3.attention.value_length': 128,
+        'qwen3.embedding_length': 4096,
+        'qwen3.rope.freq_base': 1000000.0,
+    }
+    _write_minimal_gguf(model, metadata)
+
+    parsed = model_manager_module._read_gguf_metadata(model)
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'cuda')
+
+    assert parsed['general.architecture'] == 'qwen3'
+    assert parsed['qwen3.block_count'] == 36
+    assert 'tokenizer.ggml.tokens' not in parsed
+    assert estimate['metadata_source'] == 'gguf_header'
+    assert estimate['conservative_fallback_used'] is False
+    assert estimate['exact_kv_cache_bytes'] == 641728512
 
 def test_qwen_64k_profile_diagnostics_include_breakdown_and_preserve_order(tmp_path):
     from utils.llm import model_manager as model_manager_module

@@ -27,6 +27,20 @@ def test_fixture_generation_sizes_with_ci_tokenizer():
         assert manifest["actual_tokens"] > manifest["requested_tokens"] - 500
 
 
+@pytest.mark.parametrize("scenario", ["single-needle", "structured-extraction"])
+def test_small_fixture_fits_8k_fast_effective_prompt_budget(scenario):
+    first_prompt, first = h.generate_fixture("small-8k", scenario=scenario)
+    second_prompt, second = h.generate_fixture("small-8k", scenario=scenario)
+    profile = h.get_context_profile("8k-fast")
+    prompt_budget = profile.total_context_tokens - profile.default_output_reservation_tokens
+
+    assert profile.total_context_tokens == 8192
+    assert profile.default_output_reservation_tokens == 1024
+    assert first["requested_tokens"] == prompt_budget == 7168
+    assert 0.90 * prompt_budget <= first["actual_tokens"] <= prompt_budget
+    assert (first_prompt, first["fixture_sha256"]) == (second_prompt, second["fixture_sha256"])
+
+
 @pytest.mark.parametrize(("fixture", "depth"), [
     ("small-8k", 0.18), ("intermediate-32k", 0.50), ("long-55k", 0.82),
 ])
@@ -71,7 +85,7 @@ def test_supplied_tokenizer_hook_used_without_claiming_authority():
     _, manifest = h.generate_fixture("small-8k", tokenizer=lambda text: len(text.split()) + 7)
     assert manifest["tokenizer"] == "supplied-callback"
     assert manifest["token_count_provenance"]["authoritative"] is False
-    assert manifest["actual_tokens"] >= 8192
+    assert 0.90 * 7168 <= manifest["actual_tokens"] <= 7168
 
 
 def test_semantic_exact_success():
@@ -673,15 +687,19 @@ def test_report_only_does_not_suppress_runtime_failure(tmp_path):
     assert proc.returncode == 1
 
 
-def test_incompatible_fixture_rejected_before_tempfiles_or_runner(tmp_path, monkeypatch):
+@pytest.mark.parametrize("scenario", ["single-needle", "structured-extraction"])
+def test_small_fixture_passes_8k_fast_context_preflight(tmp_path, scenario):
     model = tmp_path / "model.gguf"; model.write_bytes(b"x")
     app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
-    monkeypatch.setattr(h.tempfile, "mkstemp", lambda **kwargs: pytest.fail("temporary file created"))
+    launched = []
+    def fake_run(command, **kwargs):
+        launched.append(command)
+        return subprocess.CompletedProcess(command, 1, "runner stopped", "")
     result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model),
         backend="cpu", relay_url="https://relay.example", cleanup_timeout_s=1,
-        context_tier="8k-fast")
-    assert result["code"] == "fixture_context_incompatible"
-    assert result["fixture_tokens"] > result["prompt_budget_tokens"]
+        context_tier="8k-fast", scenario=scenario, subprocess_run=fake_run)
+    assert launched
+    assert result["code"] == "packaged_runner_failed"
 
 
 @pytest.mark.parametrize(("report_only", "semantic_ok", "accepted"), [

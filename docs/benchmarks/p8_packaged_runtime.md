@@ -29,16 +29,18 @@ python scripts/p8_benchmark.py packaged-runtime \
   --relay-url "$P8_RELAY_URL" \
   --fixture small-8k \
   --scenario structured-extraction \
-  --context-tier 64k-full \
+  --context-tier 8k-fast \
   --request-timeout 600 \
   --cleanup-timeout 30 \
   --out-dir .tmp/p8
 ```
 
-The fixture's authoritative token count plus the selected tier's 1,024-token output reservation
-must fit before any temporary file or runner process is created. In particular, `small-8k` is
-slightly larger than 8,192 tokens by construction and therefore requires the explicit
-`--context-tier 64k-full` shown above; the harness never truncates it or silently switches tiers.
+The `8k-fast` context window is 8,192 tokens and retains its 1,024-token output reservation, leaving
+an effective prompt budget of 7,168 tokens. The `small-8k` fixture therefore requests 7,168 prompt
+tokens, and its manifest reports that request separately from the bounded actual CI estimate. Both
+small-fixture scenarios remain close to the request without exceeding the effective prompt budget.
+The harness validates this accounting before creating temporary files or launching the runner; it
+never truncates a prompt, lowers the output reservation, or silently switches tiers.
 
 On Windows/NVIDIA use the same command with `--backend cuda` and the installed `.exe`. On macOS use
 the installed `.app` executable under `Contents/MacOS` and `--backend metal`. For existing packaged
@@ -81,7 +83,7 @@ The current synthetic fixture IDs are:
 
 | Fixture | Requested size | Purpose |
 | --- | ---: | --- |
-| `small-8k` | 8,192 tokens | fast unit/contract validation |
+| `small-8k` | 7,168 prompt tokens in an 8,192-token window | `8k-fast` validation with a 1,024-token output reservation |
 | `intermediate-32k` | 32,768 tokens | mid-depth haystack validation |
 | `long-55k` | 55,254 tokens | approximate `64k-full` benchmark comparable to #1566 |
 
@@ -106,7 +108,7 @@ not infer an oracle from model output):
 ```bash
 python scripts/p8_benchmark.py packaged-runtime \
   --app-binary "$P8_APP_BINARY" --model "$P8_MODEL" --backend metal \
-  --relay-url "$P8_RELAY_URL" --context-tier 64k-full \
+  --relay-url "$P8_RELAY_URL" --context-tier 8k-fast \
   --scenario structured-extraction \
   --prompt /path/to/small-8k.prompt.txt \
   --manifest /path/to/small-8k.manifest.json \

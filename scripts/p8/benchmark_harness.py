@@ -30,7 +30,7 @@ from typing import Any, Callable, Iterable
 from utils.context_profiles import get_context_profile
 
 SCHEMA_VERSION = "p8-benchmark-report-v1"
-FIXTURE_VERSION = "p8-semantic-haystack-v3"
+FIXTURE_VERSION = "p8-semantic-haystack-v4"
 DEFAULT_SEED = "p8-1566"
 PHASES = {"preparing": 0, "prefill": 1, "generating": 2}
 SECRET_PATTERNS = [
@@ -54,7 +54,7 @@ class FixtureSpec:
     approximate: bool = False
 
 FIXTURES = {
-    "small-8k": FixtureSpec("small-8k", 8192),
+    "small-8k": FixtureSpec("small-8k", 8192 - 1024),
     "intermediate-32k": FixtureSpec("intermediate-32k", 32768),
     "long-55k": FixtureSpec("long-55k", 55254, True),
 }
@@ -143,7 +143,7 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
     while True:
         joined = "\n".join(prompt_parts)
         cur = _count_tokens(joined, tokenizer)
-        if cur >= spec.requested_tokens + 20:
+        if cur >= spec.requested_tokens:
             break
         ratio = cur / max(spec.requested_tokens, 1)
         inserted = False
@@ -156,12 +156,18 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
                 else:
                     addition = f"RECORD CANARY: {canary}"
                 prefix = "\n".join(prompt_parts) + "\n" + addition.split(targets[chap], 1)[0]
+                candidate = "\n".join([*prompt_parts, addition])
+                if _count_tokens(candidate, tokenizer) > spec.requested_tokens:
+                    break
                 prompt_parts.append(addition)
                 target_markers[chap] = _count_tokens(prefix, tokenizer)
                 inserted = True
         if not inserted:
             decoy = hashlib.sha256(f"{seed}:{fixture_id}:{filler_i}".encode()).hexdigest()[:16]
-            prompt_parts.append(f"Decoy paragraph {filler_i:05d} repeats chapter-title-like text but contains no answer. Similar marker needle-{decoy} is not the requested fact.")
+            addition = f"Decoy paragraph {filler_i:05d} repeats chapter-title-like text but contains no answer. Similar marker needle-{decoy} is not the requested fact."
+            if _count_tokens("\n".join([*prompt_parts, addition]), tokenizer) > spec.requested_tokens:
+                break
+            prompt_parts.append(addition)
             filler_i += 1
     for chap in (() if scenario == "single-needle" else ("VII", "XIV", "XXI")):
         if chap not in target_markers:
@@ -746,6 +752,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     evidence = {
         "runner_kind": "repository_packaged_desktop_webdriver",
         "fixture": {"id": fixture_id, "sha256": manifest.get("fixture_sha256"),
+            "requested_prompt_tokens": manifest.get("requested_tokens"),
             "estimated_prompt_tokens": manifest.get("actual_tokens"),
             "estimated_tokenizer": manifest.get("token_count_provenance"),
             "authoritative_prompt_tokens": payload.get("authoritative_prompt_tokens"),

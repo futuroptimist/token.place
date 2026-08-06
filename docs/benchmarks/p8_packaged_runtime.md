@@ -74,7 +74,10 @@ python scripts/p8_benchmark.py generate-fixture --fixture long-55k --scenario st
 The fixture manifest records the fixture version, deterministic seed, requested token count, actual
 estimated CI-tokenizer count, prompt SHA-256, expected answers, scoring rules, and requested and
 actual token offsets/ratios plus UTF-8-safe target-prefix cut points for every target. The cut
-points are bound to the prompt SHA-256 and validated before a packaged launch. Generator callbacks and the deterministic
+points identify the start of answer-bearing prose or record values, never a table-of-contents or
+chapter-heading decoy. Structured cuts follow the complete `Chapter <key>: <heading>` line;
+needle and canary cuts follow `NEEDLE FACT: ` and `RECORD CANARY: ` respectively. They are bound to
+the prompt SHA-256 and validated before a packaged launch. Generator callbacks and the deterministic
 `whitespace-ci` counter are always labeled non-authoritative estimates. A packaged report records
 that estimate separately from the runtime admission/progress count, and uses only the latter for
 physical throughput. Missing or inconsistent authoritative totals or target-offset evidence fails

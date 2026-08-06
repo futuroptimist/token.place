@@ -59,6 +59,42 @@ def test_structured_canary_is_hidden_and_single_occurrence():
     assert canary not in prompt.split("Table of Contents", 1)[0]
 
 
+def test_fixture_target_prefixes_use_structural_value_anchors():
+    prompt, manifest = h.generate_fixture("small-8k", scenario="structured-extraction")
+    prompt_bytes = prompt.encode("utf-8")
+
+    for key in ("VII", "XIV", "XXI"):
+        cut = manifest["targets"][key]["target_prefix_utf8_bytes"]
+        prefix = prompt_bytes[:cut].decode("utf-8")
+        suffix = prompt_bytes[cut:].decode("utf-8")
+        assert prefix.endswith(f"Chapter {key}: {h.STRUCTURED_HEADINGS[key]}\n")
+        assert suffix.startswith(manifest["expected_answers"][key])
+    vii_cut = manifest["targets"]["VII"]["target_prefix_utf8_bytes"]
+    assert prompt_bytes[:vii_cut].decode("utf-8").endswith(
+        "VII. They were obliged to camp out\n"
+    )
+
+    canary_cut = manifest["targets"]["canary"]["target_prefix_utf8_bytes"]
+    assert prompt_bytes[:canary_cut].decode("utf-8").endswith("RECORD CANARY: ")
+
+
+def test_single_needle_prefix_uses_record_anchor():
+    prompt, manifest = h.generate_fixture("small-8k", scenario="single-needle")
+    cut = manifest["targets"]["needle"]["target_prefix_utf8_bytes"]
+    assert prompt.encode("utf-8")[:cut].decode("utf-8").endswith("NEEDLE FACT: ")
+
+
+def test_manifest_rejects_structured_heading_decoy_cut():
+    prompt, manifest = h.generate_fixture("small-8k", scenario="structured-extraction")
+    candidate = json.loads(json.dumps(manifest))
+    heading_prefix = "Chapter VII: VII. "
+    heading_cut = prompt.index(heading_prefix) + len(heading_prefix)
+    candidate["targets"]["VII"]["target_prefix_utf8_bytes"] = heading_cut
+    candidate["target_prefix_utf8_bytes"]["VII"] = heading_cut
+    with pytest.raises(ValueError, match="manifest_target_prefix_invalid"):
+        h.validate_manifest(candidate, prompt)
+
+
 def test_fixture_seed_changes_bytes_but_remains_deterministic():
     first = h.generate_fixture("small-8k", "one")
     second = h.generate_fixture("small-8k", "two")

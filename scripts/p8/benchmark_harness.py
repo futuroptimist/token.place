@@ -30,7 +30,7 @@ from typing import Any, Callable, Iterable
 from utils.context_profiles import get_context_profile
 
 SCHEMA_VERSION = "p8-benchmark-report-v1"
-FIXTURE_VERSION = "p8-semantic-haystack-v5"
+FIXTURE_VERSION = "p8-semantic-haystack-v6"
 DEFAULT_SEED = "p8-1566"
 PHASES = {"preparing": 0, "prefill": 1, "generating": 2}
 SECRET_PATTERNS = [
@@ -57,6 +57,11 @@ FIXTURES = {
     "small-8k": FixtureSpec("small-8k", 8192 - 1024),
     "intermediate-32k": FixtureSpec("intermediate-32k", 32768),
     "long-55k": FixtureSpec("long-55k", 55254, True),
+}
+STRUCTURED_HEADINGS = {
+    "VII": "VII. They were obliged to camp out",
+    "XIV": "XIV. The Winged Monkeys",
+    "XXI": "XXI. The Lion Becomes the King",
 }
 
 def _canonical_json(data: Any) -> str:
@@ -115,7 +120,7 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
         "canary": canary,
         "needle": f"needle-{hashlib.sha256(f'{FIXTURE_VERSION}:{seed}:{fixture_id}'.encode()).hexdigest()[:16]}",
     }
-    toc = "\n".join(["Table of Contents", "VII. They were obliged to camp out", "XIV. The Winged Monkeys", "XXI. The Lion Becomes the King"])
+    toc = "\n".join(["Table of Contents", *STRUCTURED_HEADINGS.values()])
     needle = targets["needle"]
     if scenario == "single-needle":
         prompt_parts = [
@@ -161,12 +166,17 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
         for chap, pos in positions.items():
             if chap not in target_markers and ratio >= pos:
                 if chap in chapter_sentences:
-                    addition = f"\nChapter {chap}: {toc.splitlines()[['VII','XIV','XXI'].index(chap)+1]}\n{chapter_sentences[chap]}"
+                    addition = f"\nChapter {chap}: {STRUCTURED_HEADINGS[chap]}\n{chapter_sentences[chap]}"
                 elif chap == "needle":
                     addition = f"NEEDLE FACT: {targets['needle']}"
                 else:
                     addition = f"RECORD CANARY: {canary}"
-                prefix = "\n".join(prompt_parts) + "\n" + addition.split(targets[chap], 1)[0]
+                if chap in chapter_sentences:
+                    prefix = "\n".join(prompt_parts) + "\n" + addition[:addition.rfind("\n") + 1]
+                elif chap == "needle":
+                    prefix = "\n".join(prompt_parts) + "\nNEEDLE FACT: "
+                else:
+                    prefix = "\n".join(prompt_parts) + "\nRECORD CANARY: "
                 candidate = "\n".join([*prompt_parts, addition])
                 if _count_tokens(candidate, tokenizer) > spec.requested_tokens:
                     break
@@ -183,8 +193,8 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
             filler_i += 1
     for chap in (() if scenario == "single-needle" else ("VII", "XIV", "XXI")):
         if chap not in target_markers:
-            addition = f"\nChapter {chap}: decoy heading\n{chapter_sentences[chap]}"
-            prefix = "\n".join(prompt_parts) + "\n" + addition.split(targets[chap], 1)[0]
+            addition = f"\nChapter {chap}: {STRUCTURED_HEADINGS[chap]}\n{chapter_sentences[chap]}"
+            prefix = "\n".join(prompt_parts) + "\n" + addition[:addition.rfind("\n") + 1]
             target_markers[chap] = _count_tokens(prefix, tokenizer)
             target_prefix_utf8_bytes[chap] = len(prefix.encode("utf-8"))
             prompt_parts.append(addition)
@@ -196,6 +206,7 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
         "requested_tokens": spec.requested_tokens, "actual_tokens": actual, "tokenizer": "supplied-callback" if tokenizer else "whitespace-ci",
         "token_count_provenance": {"kind": "estimate", "tokenizer_id": "supplied-callback" if tokenizer else "whitespace-ci", "authoritative": False, "units": "tokens"},
         "fixture_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "target_depths_tokens": target_markers,
+        "target_prefix_utf8_bytes": target_prefix_utf8_bytes,
         "targets": {name: {"value": targets[name], "requested_offset_tokens": round(spec.requested_tokens * positions[name]),
             "requested_ratio": positions[name], "actual_offset_tokens": offset,
             "actual_ratio": offset / actual,
@@ -213,7 +224,8 @@ def validate_manifest(manifest: Any, prompt: str | None = None) -> dict[str, Any
         raise ValueError("manifest_not_object")
     required = {"fixture_version", "fixture_id", "scenario", "seed", "requested_tokens",
         "actual_tokens", "fixture_sha256", "expected_answers", "scoring_rules",
-        "token_count_provenance", "target_depths_tokens", "targets", "semantic_oracle"}
+        "token_count_provenance", "target_depths_tokens", "target_prefix_utf8_bytes",
+        "targets", "semantic_oracle"}
     if not required.issubset(manifest):
         raise ValueError("manifest_missing_fields")
     if manifest["fixture_version"] != FIXTURE_VERSION or manifest["fixture_id"] not in FIXTURES:
@@ -276,19 +288,31 @@ def validate_manifest(manifest: Any, prompt: str | None = None) -> dict[str, Any
     if manifest["target_depths_tokens"] != {
             name: metadata["actual_offset_tokens"] for name, metadata in targets.items()}:
         raise ValueError("manifest_targets_invalid")
+    if manifest.get("target_prefix_utf8_bytes") != {
+            name: metadata["target_prefix_utf8_bytes"] for name, metadata in targets.items()}:
+        raise ValueError("manifest_targets_invalid")
     if prompt is not None:
         if len(prompt.encode("utf-8")) > 4 * 1024 * 1024:
             raise ValueError("fixture_too_large")
         if hashlib.sha256(prompt.encode()).hexdigest() != manifest["fixture_sha256"]:
             raise ValueError("fixture_hash_mismatch")
         prompt_bytes = prompt.encode("utf-8")
-        for metadata in targets.values():
+        for name, metadata in targets.items():
             cut = metadata["target_prefix_utf8_bytes"]
             try:
                 prefix = prompt_bytes[:cut].decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError("manifest_target_prefix_invalid") from exc
-            if not prompt.startswith(prefix) or not prompt_bytes[cut:].decode("utf-8").startswith(metadata["value"]):
+            suffix = prompt_bytes[cut:].decode("utf-8")
+            if not prompt.startswith(prefix) or not suffix.startswith(metadata["value"]):
+                raise ValueError("manifest_target_prefix_invalid")
+            if scenario == "structured-extraction" and name in {"VII", "XIV", "XXI"}:
+                heading = f"Chapter {name}: {STRUCTURED_HEADINGS[name]}\n"
+                if not prefix.endswith(heading):
+                    raise ValueError("manifest_target_prefix_invalid")
+            elif name == "needle" and not prefix.endswith("NEEDLE FACT: "):
+                raise ValueError("manifest_target_prefix_invalid")
+            elif name == "canary" and not prefix.endswith("RECORD CANARY: "):
                 raise ValueError("manifest_target_prefix_invalid")
         unique_targets = targets.values() if scenario == "single-needle" else (targets["canary"],)
         if any(prompt.count(metadata["value"]) != 1 for metadata in unique_targets):

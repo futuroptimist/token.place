@@ -283,7 +283,11 @@ invocation, independently of `--trials`. Specify exactly one prefill trigger: a 
 `--prefill-cancel-tokens` count, or a strict fraction between zero and one with
 `--prefill-cancel-fraction`. `--generation-cancel-tokens` is a positive bounded generated-token
 threshold. The runner waits for an observed, nonterminal progress event in the requested phase; it
-does not use elapsed sleep as the trigger and fails if the phase or threshold is missed.
+does not use elapsed sleep as the trigger and fails if the phase or threshold is missed. A
+mid-prefill trigger additionally requires authoritative, positive `total_prompt_tokens` evidence
+and the strict relationship `0 < threshold <= trigger_count < total_prompt_tokens`. A telemetry
+jump directly to completed prefill fails closed rather than being labeled mid-prefill, and both
+cancellation scenarios must report the same total as the packaged request.
 
 For both prefill and generation, the installed landing page's existing `cancelRelayRequest()` and
 `terminateRelayRequestLocally()` paths perform the cancellation. The evidence requires a real

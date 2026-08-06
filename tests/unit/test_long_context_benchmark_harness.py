@@ -363,10 +363,11 @@ def test_platform_context_behavior():
     assert h.get_context_profile("8k-fast").total_context_tokens == 8192
     assert h.platform.system().lower() in {"linux", "darwin", "windows"}
 
-def _physical_cancellation_evidence():
+def _physical_cancellation_evidence(total_prompt_tokens=100):
     def scenario(phase):
         return {"phase": phase, "trigger_observed": True, "trigger_count": 50,
-            "threshold": 50, "attempted": True, "acknowledged": True, "cleanup_s": 0.2,
+            "threshold": 50, "total_prompt_tokens": total_prompt_tokens,
+            "attempted": True, "acknowledged": True, "cleanup_s": 0.2,
             "quiescence_s": 0.5, "stale_progress_count": 0, "late_result_count": 0,
             "active_after_quiescence": False, "followup_ok": True, "followup_s": 1.0}
     return {"scenarios": [scenario("prefill"), scenario("generating")],
@@ -377,10 +378,11 @@ def _physical_cancellation_evidence():
 
 def test_physical_cancellation_recovery_evidence_success_and_privacy():
     result = h.validate_cancellation_recovery(_physical_cancellation_evidence(),
-        cleanup_budget_s=3, observation_window_s=0.5, recovery_timeout_s=3)
+        cleanup_budget_s=3, observation_window_s=0.5, recovery_timeout_s=3,
+        total_prompt_tokens=100)
     assert result["pass"] is True
     serialized = json.dumps(result).lower()
-    assert all(term not in serialized for term in ("request_id", "session_id", "prompt",
+    assert all(term not in serialized for term in ("request_id", "session_id",
         "response", "ciphertext", "credential", "cancel_token"))
 
 
@@ -404,14 +406,39 @@ def test_physical_cancellation_recovery_evidence_fails_closed(mutate, code):
     mutate(value)
     with pytest.raises(ValueError, match=code):
         h.validate_cancellation_recovery(value, cleanup_budget_s=3,
-            observation_window_s=0.5, recovery_timeout_s=3)
+            observation_window_s=0.5, recovery_timeout_s=3, total_prompt_tokens=100)
 
 
 def test_physical_cancellation_threshold_mismatch_fails_closed():
     with pytest.raises(ValueError, match="cancellation_threshold_mismatched"):
         h.validate_cancellation_recovery(_physical_cancellation_evidence(),
             cleanup_budget_s=3, observation_window_s=0.5, recovery_timeout_s=3,
-            prefill_threshold=49, generation_threshold=50)
+            total_prompt_tokens=100, prefill_threshold=49, generation_threshold=50)
+
+
+@pytest.mark.parametrize(("count", "threshold", "total", "state"), [
+    (50, 50, 100, "trigger"),
+    (100, 50, 100, "completed"),
+    (101, 50, 100, "completed"),
+    (0, 1, 1, "completed"),
+])
+def test_prefill_cancellation_requires_interior_progress(count, threshold, total, state):
+    assert h.prefill_cancellation_trigger_state(count, threshold, total) == state
+
+
+@pytest.mark.parametrize(("mutate", "code"), [
+    (lambda value: value["scenarios"][0].pop("total_prompt_tokens"), "cancellation_evidence_malformed"),
+    (lambda value: value["scenarios"][0].update(total_prompt_tokens="100"), "cancellation_evidence_malformed"),
+    (lambda value: value["scenarios"][0].update(total_prompt_tokens=99), "cancellation_prompt_total_mismatched"),
+    (lambda value: value["scenarios"][0].update(trigger_count=100), "cancellation_trigger_missed"),
+    (lambda value: value["scenarios"][0].update(trigger_count=101), "cancellation_trigger_missed"),
+])
+def test_cancellation_prompt_total_evidence_fails_closed(mutate, code):
+    value = _physical_cancellation_evidence()
+    mutate(value)
+    with pytest.raises(ValueError, match=code):
+        h.validate_cancellation_recovery(value, cleanup_budget_s=3,
+            observation_window_s=0.5, recovery_timeout_s=3, total_prompt_tokens=100)
 
 
 def test_manifest_scoring_rules_match_score_keys():
@@ -621,7 +648,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": authoritative_total,
         "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled-test", "fixture_sha256": manifest["fixture_sha256"], "total_prompt_tokens": authoritative_total, "target_offsets_tokens": authoritative_offsets},
-        "cancellation_recovery": _physical_cancellation_evidence(),
+        "cancellation_recovery": _physical_cancellation_evidence(authoritative_total),
     }
     app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
     payload["cancellation_recovery"]["scenarios"][0].update(
@@ -654,6 +681,16 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
     assert "messages" not in result
     assert not h.Path(seen["command"][seen["command"].index("--benchmark-request") + 1]).exists()
     assert not h.Path(seen["command"][seen["command"].index("--benchmark-evidence") + 1]).exists()
+
+    payload["cancellation_recovery"]["scenarios"][0]["trigger_count"] = authoritative_total
+    failed = h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app), model=str(model),
+        backend="metal", relay_url="https://relay.example", cleanup_timeout_s=3.0,
+        external_prompt=prompt, external_manifest=manifest, subprocess_run=fake_run,
+        cancellation_validation=True, prefill_cancel_fraction=0.5,
+        generation_cancel_tokens=8, observation_window_s=0.5, recovery_timeout_s=3,
+        report_only=True)
+    assert failed["code"] == "cancellation_trigger_missed"
+    assert failed["runtime_contract_pass"] is False
 
 
 def test_packaged_runtime_external_fixture_pair_and_hash_fail_closed(tmp_path):

@@ -49,6 +49,7 @@ try:
         classify_benchmark_landing_state,
         observe_post_terminal,
         benchmark_operator_mode,
+        prefill_cancellation_trigger_state,
     )
 except Exception as exc:
     BOOTSTRAP_LOG.write_text(
@@ -888,23 +889,35 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
         threshold = int(config["generation_tokens"]) if phase == "generating" else config.get("prefill_tokens")
         trigger_count = -1
         last_sequence = -1
+        authoritative_total = None
         while time.monotonic() < deadline:
             state = browser.execute_script(
                 "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,b:v.isGeneratingResponse};")
             event = state.get("p") if isinstance(state, dict) else None
             if isinstance(event, dict):
                 total = event.get("total_prompt_tokens")
+                if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
+                    raise RuntimeError("cancellation_trigger_missed")
+                if authoritative_total is None:
+                    authoritative_total = total
+                elif total != authoritative_total:
+                    raise RuntimeError("cancellation_trigger_missed")
                 if phase == "prefill" and threshold is None and isinstance(total, int):
                     threshold = max(1, int(total * float(config["prefill_fraction"])))
                 count = event.get("processed_prompt_tokens") if phase == "prefill" else event.get("generated_tokens")
-                if event.get("phase") == phase and isinstance(count, int) and isinstance(threshold, int) and count >= threshold:
+                trigger_state = (prefill_cancellation_trigger_state(count, threshold, total)
+                    if phase == "prefill" and event.get("phase") == phase else None)
+                if trigger_state in {"completed", "invalid"}:
+                    raise RuntimeError("cancellation_trigger_missed")
+                if event.get("phase") == phase and isinstance(count, int) and isinstance(threshold, int) and (
+                        trigger_state == "trigger" if phase == "prefill" else count >= threshold):
                     trigger_count = count
                     last_sequence = int(event.get("sequence", -1))
                     break
                 if (phase == "prefill" and event.get("phase") == "generating") or state.get("b") is False:
                     raise RuntimeError("cancellation_trigger_missed")
             time.sleep(0.01)
-        if trigger_count < 0 or not isinstance(threshold, int):
+        if trigger_count < 0 or not isinstance(threshold, int) or authoritative_total is None:
             raise RuntimeError("cancellation_trigger_missed")
         triggered = time.monotonic()
         acknowledgement = browser.execute_async_script("""
@@ -934,7 +947,8 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
         cleanup_s = time.monotonic() - triggered
         followup_ok, followup_s = _long_context_followup_request(browser, recovery_s)
         scenarios.append({"phase": phase, "trigger_observed": True, "trigger_count": trigger_count,
-            "threshold": threshold, "attempted": attempted, "acknowledged": acknowledged,
+            "threshold": threshold, "total_prompt_tokens": authoritative_total,
+            "attempted": attempted, "acknowledged": acknowledged,
             "cleanup_s": cleanup_s, "quiescence_s": quiescence_s,
             "stale_progress_count": stale, "late_result_count": late,
             "active_after_quiescence": active_after, "followup_ok": followup_ok,

@@ -420,7 +420,8 @@ def validate_generation_settings(value: Any) -> dict[str, Any]:
 
 def validate_cancellation_recovery(value: Any, *, cleanup_budget_s: float,
         observation_window_s: float, recovery_timeout_s: float,
-        prefill_threshold: int | None = None, generation_threshold: int | None = None) -> dict[str, Any]:
+        total_prompt_tokens: int, prefill_threshold: int | None = None,
+        generation_threshold: int | None = None) -> dict[str, Any]:
     """Validate privacy-safe evidence produced by the physical cancellation sequence."""
     if not isinstance(value, dict) or set(value) != {"scenarios", "operator_lifecycle"}:
         raise ValueError("cancellation_evidence_malformed")
@@ -428,7 +429,10 @@ def validate_cancellation_recovery(value: Any, *, cleanup_budget_s: float,
     if not isinstance(scenarios, list) or len(scenarios) != 2:
         raise ValueError("cancellation_evidence_malformed")
     safe: list[dict[str, Any]] = []
-    required = {"phase", "trigger_observed", "trigger_count", "threshold", "attempted",
+    if (not isinstance(total_prompt_tokens, int) or isinstance(total_prompt_tokens, bool)
+            or total_prompt_tokens <= 0):
+        raise ValueError("cancellation_prompt_total_invalid")
+    required = {"phase", "trigger_observed", "trigger_count", "threshold", "total_prompt_tokens", "attempted",
         "acknowledged", "cleanup_s", "quiescence_s", "stale_progress_count",
         "late_result_count", "active_after_quiescence", "followup_ok", "followup_s"}
     for expected_phase, item in zip(CANCELLATION_PHASES, scenarios):
@@ -438,13 +442,15 @@ def validate_cancellation_recovery(value: Any, *, cleanup_budget_s: float,
             "active_after_quiescence", "followup_ok")
         if any(not isinstance(item[key], bool) for key in bool_keys):
             raise ValueError("cancellation_evidence_malformed")
-        int_keys = ("trigger_count", "threshold", "stale_progress_count", "late_result_count")
+        int_keys = ("trigger_count", "threshold", "total_prompt_tokens", "stale_progress_count", "late_result_count")
         if any(not isinstance(item[key], int) or isinstance(item[key], bool) or item[key] < 0
                 for key in int_keys) or item["threshold"] <= 0:
             raise ValueError("cancellation_evidence_malformed")
         configured_threshold = prefill_threshold if expected_phase == "prefill" else generation_threshold
         if configured_threshold is not None and item["threshold"] != configured_threshold:
             raise ValueError("cancellation_threshold_mismatched")
+        if item["total_prompt_tokens"] != total_prompt_tokens:
+            raise ValueError("cancellation_prompt_total_mismatched")
         for key, bound in (("cleanup_s", cleanup_budget_s),
                 ("quiescence_s", observation_window_s + 1), ("followup_s", recovery_timeout_s)):
             if (not isinstance(item[key], (int, float)) or isinstance(item[key], bool)
@@ -454,6 +460,9 @@ def validate_cancellation_recovery(value: Any, *, cleanup_budget_s: float,
         if item["quiescence_s"] < observation_window_s:
             raise ValueError("cancellation_evidence_malformed")
         if not item["trigger_observed"] or item["trigger_count"] < item["threshold"]:
+            raise ValueError("cancellation_trigger_missed")
+        if expected_phase == "prefill" and not (
+                0 < item["threshold"] <= item["trigger_count"] < total_prompt_tokens):
             raise ValueError("cancellation_trigger_missed")
         if not item["attempted"] or not item["acknowledged"]:
             raise ValueError("cancellation_unconfirmed")
@@ -484,6 +493,19 @@ def validate_cancellation_recovery(value: Any, *, cleanup_budget_s: float,
     if not lifecycle["post_restart_followup_ok"]:
         raise ValueError("operator_followup_failed")
     return {"scenarios": safe, "operator_lifecycle": dict(lifecycle), "pass": True}
+
+
+def prefill_cancellation_trigger_state(processed_prompt_tokens: Any, threshold: Any,
+        total_prompt_tokens: Any) -> str:
+    """Classify whether observed prefill progress is an interior cancellation point."""
+    values = (processed_prompt_tokens, threshold, total_prompt_tokens)
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
+        return "invalid"
+    if total_prompt_tokens <= 0 or threshold <= 0 or processed_prompt_tokens < 0:
+        return "invalid"
+    if threshold >= total_prompt_tokens or processed_prompt_tokens >= total_prompt_tokens:
+        return "completed"
+    return "trigger" if processed_prompt_tokens >= threshold else "waiting"
 
 def analyze_progress(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Validate the ordered progress/result/terminal lifecycle, returning stable errors."""
@@ -966,6 +988,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
             evidence["cancellation_recovery"] = validate_cancellation_recovery(
                 payload.get("cancellation_recovery"), cleanup_budget_s=float(cleanup_timeout_s),
                 observation_window_s=observation_window_s, recovery_timeout_s=recovery_timeout_s,
+                total_prompt_tokens=payload["authoritative_prompt_tokens"],
                 prefill_threshold=prefill_cancel_tokens or max(1, int(
                     payload["authoritative_prompt_tokens"] * float(prefill_cancel_fraction))),
                 generation_threshold=generation_cancel_tokens)

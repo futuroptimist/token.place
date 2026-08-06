@@ -14,7 +14,8 @@ def test_fixture_generation_stable_hash_and_depths():
     assert p1 == p2
     assert m1 == m2
     assert m1["fixture_sha256"] == h.hashlib.sha256(p1.encode()).hexdigest()
-    assert set(m1["target_depths_tokens"]) == {"VII", "needle", "XIV", "XXI", "canary"}
+    assert m1["scenario"] == "structured-extraction"
+    assert set(m1["target_depths_tokens"]) == {"VII", "XIV", "XXI", "canary"}
     h.validate_manifest(m1, p1)
     assert "The Winged Monkeys" in p1 and "Table of Contents" in p1
 
@@ -30,14 +31,18 @@ def test_fixture_generation_sizes_with_ci_tokenizer():
     ("small-8k", 0.18), ("intermediate-32k", 0.50), ("long-55k", 0.82),
 ])
 def test_single_needle_and_hidden_canary_have_controlled_depth(fixture, depth):
-    prompt, manifest = h.generate_fixture(fixture)
+    prompt, manifest = h.generate_fixture(fixture, scenario="single-needle")
     needle = prompt.split("NEEDLE FACT: ", 1)[1].splitlines()[0]
-    canary = manifest["expected_answers"]["canary"]
     assert prompt.count(needle) == 1
+    assert manifest["expected_answers"] == {"needle": needle}
+    assert manifest["targets"]["needle"]["actual_ratio"] == pytest.approx(depth, abs=0.015)
+
+
+def test_structured_canary_is_hidden_and_single_occurrence():
+    prompt, manifest = h.generate_fixture("small-8k", scenario="structured-extraction")
+    canary = manifest["expected_answers"]["canary"]
     assert prompt.count(canary) == 1
     assert canary not in prompt.split("Table of Contents", 1)[0]
-    assert manifest["targets"]["needle"]["actual_ratio"] == pytest.approx(depth, abs=0.015)
-    assert manifest["targets"]["canary"]["actual_ratio"] == pytest.approx(0.90, abs=0.015)
 
 
 def test_fixture_seed_changes_bytes_but_remains_deterministic():
@@ -54,7 +59,7 @@ def test_manifest_validation_rejects_tampering():
         (lambda value: value.update(fixture_sha256="0" * 64), "fixture_hash_mismatch"),
         (lambda value: value["expected_answers"].pop("VII"), "manifest_oracle_invalid"),
         (lambda value: value["token_count_provenance"].update(authoritative=True), "manifest_token_provenance_invalid"),
-        (lambda value: value["targets"].pop("needle"), "manifest_targets_invalid"),
+        (lambda value: value["targets"].pop("VII"), "manifest_targets_invalid"),
     ]:
         candidate = json.loads(json.dumps(manifest))
         mutate(candidate)
@@ -75,6 +80,25 @@ def test_semantic_exact_success():
     score = h.evaluate_semantic(response, manifest)
     assert score["semantic_pass"] is True
     assert score["exact_match"] is True
+
+
+@pytest.mark.parametrize(("payload", "failed"), [
+    ({"needle": "wrong"}, "needle_exact"),
+    ({}, "exact_key_set"),
+    ({"needle": "wrong", "extra": "value"}, "exact_key_set"),
+])
+def test_single_needle_oracle_scores_retrieval(payload, failed):
+    _, manifest = h.generate_fixture("small-8k", scenario="single-needle")
+    score = h.evaluate_semantic(json.dumps(payload), manifest)
+    assert score[failed] is False
+    assert score["semantic_pass"] is False
+    assert failed in score["errors"]
+
+
+def test_single_needle_oracle_is_deterministic_across_trials():
+    _, manifest = h.generate_fixture("small-8k", scenario="single-needle")
+    response = json.dumps(manifest["expected_answers"])
+    assert h.score_trials([response, response, response], manifest)["exact_match_count"] == 3
 
 
 def test_semantic_known_p7_failures_detected():
@@ -337,13 +361,16 @@ def test_report_redacts_authorization_and_message_like_payloads(tmp_path):
 
 def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path):
     prompt, manifest = h.generate_fixture("small-8k")
+    authoritative_total = manifest["actual_tokens"] + 17
+    authoritative_offsets = {key: round(value["actual_ratio"] * authoritative_total)
+        for key, value in manifest["targets"].items()}
     model = tmp_path / "model.gguf"
     model.write_bytes(b"test artifact")
     payload = {
         "response_text": json.dumps(manifest["expected_answers"]),
         "progress_events": [
-            {"sequence": 1, "phase": "preparing", "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0, "processed_prompt_tokens": 0, "generated_tokens": 0, "elapsed_ms": 0},
-            {"sequence": 2, "phase": "generating", "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0, "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4, "elapsed_ms": 2000},
+            {"sequence": 1, "phase": "preparing", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": 0, "generated_tokens": 0, "elapsed_ms": 0},
+            {"sequence": 2, "phase": "generating", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": authoritative_total, "generated_tokens": 4, "elapsed_ms": 2000},
         ],
         "terminal": "completed",
         "start_s": 0.0,
@@ -358,8 +385,8 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         "build_identity": "unit-test",
         "backend_used": "metal",
         "model_fingerprint": "sha256:test",
-        "authoritative_prompt_tokens": manifest["actual_tokens"],
-        "authoritative_target_offsets_tokens": {key: value["actual_offset_tokens"] for key, value in manifest["targets"].items()},
+        "authoritative_prompt_tokens": authoritative_total,
+        "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled-test", "total_prompt_tokens": authoritative_total, "target_offsets_tokens": authoritative_offsets},
     }
     app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
     seen = {}
@@ -378,6 +405,8 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
     assert seen["request"]["prompt"] not in json.dumps(result)
     assert result["runner_kind"] == "repository_packaged_desktop_webdriver"
     assert result["pass"] is True
+    assert result["fixture"]["estimated_prompt_tokens"] != result["fixture"]["authoritative_prompt_tokens"]
+    assert result["fixture"]["authoritative_target_offsets_tokens"] == authoritative_offsets
     assert result["memory"]["diagnostic"] == "<redacted>"
     assert "messages" not in result
     assert not h.Path(seen["command"][seen["command"].index("--p8-request") + 1]).exists()
@@ -393,6 +422,26 @@ def test_packaged_runtime_external_fixture_pair_and_hash_fail_closed(tmp_path):
     assert h.invoke_packaged_runtime_adapter(**common, external_prompt=prompt)["code"] == "external_fixture_pair_required"
     assert h.invoke_packaged_runtime_adapter(**common, external_prompt=prompt + "tampered",
         external_manifest=manifest)["code"] == "fixture_hash_mismatch"
+
+
+@pytest.mark.parametrize(("mutation", "code"), [
+    (lambda value: value.update(method="whitespace-ci"), "authoritative_target_depth_malformed"),
+    (lambda value: value.update(runtime_identity="other"), "authoritative_target_depth_mismatched"),
+    (lambda value: value.update(total_prompt_tokens=99), "authoritative_target_depth_mismatched"),
+    (lambda value: value.update(target_offsets_tokens={}), "authoritative_target_depth_malformed"),
+    (lambda value: value["target_offsets_tokens"].update(XIV=value["target_offsets_tokens"]["VII"]),
+     "authoritative_target_depth_ambiguous"),
+])
+def test_authoritative_target_depth_evidence_fails_categorically(mutation, code):
+    _, manifest = h.generate_fixture("small-8k")
+    evidence = {"method": "packaged_admission_render_and_tokenize_chat",
+        "runtime_identity": "bundled", "total_prompt_tokens": manifest["actual_tokens"],
+        "target_offsets_tokens": {key: value["actual_offset_tokens"]
+            for key, value in manifest["targets"].items()}}
+    mutation(evidence)
+    _, error = h._validate_authoritative_tokenizer_evidence(
+        evidence, manifest, "bundled", manifest["actual_tokens"])
+    assert error == code
 
 
 def test_packaged_runtime_requires_physical_prerequisites():
@@ -423,7 +472,7 @@ def test_packaged_runtime_validates_app_model_backend_and_relay(tmp_path):
         ("failed", "packaged_runner_failed"),
         ("invalid-json", "packaged_evidence_malformed"),
         ("non-object", "packaged_evidence_malformed"),
-        ("missing", "packaged_evidence_missing"),
+        ("missing", "authoritative_target_depth_unavailable"),
     ],
 )
 def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_outcome, expected_code):
@@ -511,7 +560,7 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
         "bundled_runtime_identity": "bundled", "build_identity": "build",
         "backend_used": "cpu", "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": manifest["actual_tokens"],
-        "authoritative_target_offsets_tokens": {key: value["actual_offset_tokens"] for key, value in manifest["targets"].items()},
+        "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled", "total_prompt_tokens": manifest["actual_tokens"], "target_offsets_tokens": {key: value["actual_offset_tokens"] for key, value in manifest["targets"].items()}},
         "progress_events": [{"sequence": 1, "phase": "generating",
             "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0,
             "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4,
@@ -629,7 +678,7 @@ def test_owned_runner_windows_cleans_exact_pid_and_reaps(cleanup_outcome):
 
 def test_main_generate_and_evaluate_commands(tmp_path):
     fixture_dir = tmp_path / "fixture"
-    assert h.main(["generate-fixture", "--fixture", "small-8k", "--out-dir", str(fixture_dir)]) == 0
+    assert h.main(["generate-fixture", "--fixture", "small-8k", "--scenario", "structured-extraction", "--out-dir", str(fixture_dir)]) == 0
     manifest_path = fixture_dir / "small-8k.manifest.json"
     manifest = json.loads(manifest_path.read_text())
     response_path = tmp_path / "response.json"

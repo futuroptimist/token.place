@@ -28,6 +28,7 @@ python scripts/p8_benchmark.py packaged-runtime \
   --backend metal \
   --relay-url "$P8_RELAY_URL" \
   --fixture small-8k \
+  --scenario structured-extraction \
   --context-tier 64k-full \
   --request-timeout 600 \
   --cleanup-timeout 30 \
@@ -62,9 +63,10 @@ boundary and are orchestration evidence, never physical Metal/CUDA evidence.
 Generate deterministic, synthetic, privacy-safe fixtures instead of committing large prompt blobs:
 
 ```bash
-python scripts/p8_benchmark.py generate-fixture --fixture small-8k --out-dir .tmp/p8-fixtures
-python scripts/p8_benchmark.py generate-fixture --fixture intermediate-32k --out-dir .tmp/p8-fixtures
-python scripts/p8_benchmark.py generate-fixture --fixture long-55k --out-dir .tmp/p8-fixtures
+python scripts/p8_benchmark.py generate-fixture --fixture small-8k --scenario single-needle --out-dir .tmp/p8-needle-small
+python scripts/p8_benchmark.py generate-fixture --fixture intermediate-32k --scenario single-needle --out-dir .tmp/p8-needle-middle
+python scripts/p8_benchmark.py generate-fixture --fixture long-55k --scenario single-needle --out-dir .tmp/p8-needle-late
+python scripts/p8_benchmark.py generate-fixture --fixture long-55k --scenario structured-extraction --out-dir .tmp/p8-structured
 ```
 
 The fixture manifest records the fixture version, deterministic seed, requested token count, actual
@@ -83,11 +85,20 @@ The current synthetic fixture IDs are:
 | `intermediate-32k` | 32,768 tokens | mid-depth haystack validation |
 | `long-55k` | 55,254 tokens | approximate `64k-full` benchmark comparable to #1566 |
 
-The 8K, 32K, and 55K fixtures respectively plant one simple needle near the early, middle, and late
-depth. The exact needle occurs once; deterministic similar-but-distinct markers are decoys. Each
-also contains a separate structured VII/XIV/XXI/canary extraction task with table-of-contents and
-heading/prose ambiguity. The canary literal is not disclosed by the instructions and occurs once at
-its recorded depth.
+The `single-needle` scenario plants one simple needle near the early, middle, or late depth for the
+8K, 32K, or 55K tier respectively. Its exact one-key JSON oracle scores the needle value; the exact
+needle occurs once and deterministic similar-but-distinct markers are decoys. The separate
+`structured-extraction` scenario asks only for VII/XIV/XXI/canary, retaining table-of-contents and
+heading/prose ambiguity. Its canary literal is not disclosed by the instructions and occurs once.
+
+The packaged runner currently reports the admission total through encrypted progress, but the
+installed desktop exposes no reusable control seam for applying that identical admission tokenizer
+to each target prefix. Consequently physical target-depth validation fails closed with
+`authoritative_target_depth_unavailable` and names the missing
+`packaged_admission_render_and_tokenize_chat_prefix_counts` seam. Fixture whitespace/callback
+estimates are never relabeled as physical evidence. A successful evidence envelope must eventually
+record the packaged tokenizer method and runtime identity plus independently measured total and
+target-prefix counts; documentation does not claim that evidence has been produced yet.
 
 To run a separately stored golden prompt, supply its manifest as a required pair (the harness does
 not infer an oracle from model output):
@@ -96,6 +107,7 @@ not infer an oracle from model output):
 python scripts/p8_benchmark.py packaged-runtime \
   --app-binary "$P8_APP_BINARY" --model "$P8_MODEL" --backend metal \
   --relay-url "$P8_RELAY_URL" --context-tier 64k-full \
+  --scenario structured-extraction \
   --prompt /path/to/small-8k.prompt.txt \
   --manifest /path/to/small-8k.manifest.json \
   --out-dir .tmp/p8-external

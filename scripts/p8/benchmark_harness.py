@@ -29,7 +29,7 @@ from typing import Any, Callable, Iterable
 from utils.context_profiles import get_context_profile
 
 SCHEMA_VERSION = "p8-benchmark-report-v1"
-FIXTURE_VERSION = "p8-semantic-haystack-v2"
+FIXTURE_VERSION = "p8-semantic-haystack-v3"
 DEFAULT_SEED = "p8-1566"
 PHASES = {"preparing": 0, "prefill": 1, "generating": 2}
 SECRET_PATTERNS = [
@@ -74,7 +74,27 @@ def _read_bounded_text(path: str, limit: int = 4 * 1024 * 1024) -> str:
         raise ValueError("fixture_too_large")
     return value
 
-def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED, tokenizer: Callable[[str], int] | None = None) -> tuple[str, dict[str, Any]]:
+
+def _validate_authoritative_tokenizer_evidence(evidence: Any, manifest: dict[str, Any],
+        runtime_identity: str, total_prompt_tokens: int) -> tuple[dict[str, int] | None, str | None]:
+    """Validate counts produced by the packaged admission tokenizer, never fixture estimates."""
+    if not isinstance(evidence, dict) or evidence.get("method") != "packaged_admission_render_and_tokenize_chat":
+        return None, "authoritative_target_depth_malformed"
+    if evidence.get("runtime_identity") != runtime_identity or evidence.get("total_prompt_tokens") != total_prompt_tokens:
+        return None, "authoritative_target_depth_mismatched"
+    offsets = evidence.get("target_offsets_tokens")
+    if (not isinstance(offsets, dict) or set(offsets) != set(manifest["targets"])
+            or not all(isinstance(value, int) and 0 <= value < total_prompt_tokens for value in offsets.values())):
+        return None, "authoritative_target_depth_malformed"
+    if len(set(offsets.values())) != len(offsets):
+        return None, "authoritative_target_depth_ambiguous"
+    return offsets, None
+
+def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
+        tokenizer: Callable[[str], int] | None = None,
+        scenario: str = "structured-extraction") -> tuple[str, dict[str, Any]]:
+    if scenario not in {"single-needle", "structured-extraction"}:
+        raise ValueError("fixture_scenario_invalid")
     spec = FIXTURES[fixture_id]
     canary = "lunar-maple-508163"
     targets = {
@@ -85,21 +105,39 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED, tokenizer: Calla
         "needle": f"needle-{hashlib.sha256(f'{FIXTURE_VERSION}:{seed}:{fixture_id}'.encode()).hexdigest()[:16]}",
     }
     toc = "\n".join(["Table of Contents", "VII. They were obliged to camp out", "XIV. The Winged Monkeys", "XXI. The Lion Becomes the King"])
-    prompt_parts = [
+    needle = targets["needle"]
+    if scenario == "single-needle":
+        prompt_parts = [
+            "You must answer with JSON only, no Markdown, no commentary, and exactly the key needle.",
+            "Return the exact value on the single NEEDLE FACT line.",
+        ]
+        expected_answers = {"needle": needle}
+        positions = {"needle": {"small-8k": 0.18, "intermediate-32k": 0.50,
+            "long-55k": 0.82}[fixture_id]}
+        semantic_oracle: dict[str, Any] = {"value_key": "needle"}
+        scoring_rules = ["json_only", "exact_key_set", "needle_exact", "exact_match", "semantic_pass"]
+    else:
+        prompt_parts = [
         "You must answer with JSON only, no Markdown, no commentary, and exactly the keys VII, XIV, XXI, canary.",
         "For VII, XIV, and XXI return exactly the first five whitespace-separated words of the first prose sentence in that chapter, preserving capitalization and omitting trailing punctuation.",
         "For canary return the exact value on the single RECORD CANARY line.",
-        "Also retrieve the exact value on the single NEEDLE FACT line; it is scored as a simple retrieval case.",
         toc,
-    ]
+        ]
+        expected_answers = {"VII": targets["VII"], "XIV": targets["XIV"],
+            "XXI": targets["XXI"], "canary": canary}
+        positions = {"VII": 0.12, "XIV": 0.42, "XXI": 0.70, "canary": 0.90}
+        semantic_oracle = {"prose_keys": ["VII", "XIV", "XXI"],
+            "heading_decoys": ["They were obliged to camp out", "The Winged Monkeys",
+                "The Lion Becomes the King"]}
+        scoring_rules = ["json_only", "exact_key_set", "canary_exact", "target_selection",
+            "prose_not_heading", "word_count", "capitalization", "trailing_punctuation",
+            "exact_match", "semantic_pass"]
     chapter_sentences = {
         "VII": "They were obliged to camp beside the road before sunrise. This prose sentence is not the heading.",
         "XIV": "You will remember there was no road--not even a pathway--between the castle and the city. This prose sentence is not the title.",
         "XXI": "After climbing down from the China wall the travelers found themselves in a disagreeable country. This prose sentence is not the title.",
     }
     target_markers: dict[str, int] = {}
-    needle_ratio = {"small-8k": 0.18, "intermediate-32k": 0.50, "long-55k": 0.82}[fixture_id]
-    positions = {"VII": 0.12, "needle": needle_ratio, "XIV": 0.42, "XXI": 0.70, "canary": 0.90}
     filler_i = 0
     while True:
         joined = "\n".join(prompt_parts)
@@ -124,7 +162,7 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED, tokenizer: Calla
             decoy = hashlib.sha256(f"{seed}:{fixture_id}:{filler_i}".encode()).hexdigest()[:16]
             prompt_parts.append(f"Decoy paragraph {filler_i:05d} repeats chapter-title-like text but contains no answer. Similar marker needle-{decoy} is not the requested fact.")
             filler_i += 1
-    for chap in ("VII", "XIV", "XXI"):
+    for chap in (() if scenario == "single-needle" else ("VII", "XIV", "XXI")):
         if chap not in target_markers:
             target_markers[chap] = _count_tokens("\n".join(prompt_parts), tokenizer)
             prompt_parts.append(f"\nChapter {chap}: decoy heading\n{chapter_sentences[chap]}")
@@ -132,19 +170,15 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED, tokenizer: Calla
     actual = _count_tokens(prompt, tokenizer)
     manifest = {
         "fixture_version": FIXTURE_VERSION, "fixture_id": fixture_id, "seed": seed,
-        "scenario": f"single-needle-{('early', 'middle', 'late')[list(FIXTURES).index(fixture_id)]}-plus-structured",
+        "scenario": scenario,
         "requested_tokens": spec.requested_tokens, "actual_tokens": actual, "tokenizer": "supplied-callback" if tokenizer else "whitespace-ci",
         "token_count_provenance": {"kind": "estimate", "tokenizer_id": "supplied-callback" if tokenizer else "whitespace-ci", "authoritative": False, "units": "tokens"},
         "fixture_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "target_depths_tokens": target_markers,
         "targets": {name: {"value": targets[name], "requested_offset_tokens": round(spec.requested_tokens * positions[name]),
             "requested_ratio": positions[name], "actual_offset_tokens": offset,
             "actual_ratio": offset / actual} for name, offset in target_markers.items()},
-        "expected_answers": {"VII": targets["VII"], "XIV": targets["XIV"], "XXI": targets["XXI"], "canary": canary},
-        "semantic_oracle": {
-            "prose_keys": ["VII", "XIV", "XXI"],
-            "heading_decoys": ["They were obliged to camp out", "The Winged Monkeys", "The Lion Becomes the King"],
-        },
-        "scoring_rules": ["json_only", "exact_key_set", "canary_exact", "target_selection", "prose_not_heading", "word_count", "capitalization", "trailing_punctuation", "exact_match", "semantic_pass"],
+        "expected_answers": expected_answers, "semantic_oracle": semantic_oracle,
+        "scoring_rules": scoring_rules,
     }
     return prompt, manifest
 
@@ -155,15 +189,15 @@ def validate_manifest(manifest: Any, prompt: str | None = None) -> dict[str, Any
         raise ValueError("manifest_not_object")
     required = {"fixture_version", "fixture_id", "scenario", "seed", "requested_tokens",
         "actual_tokens", "fixture_sha256", "expected_answers", "scoring_rules",
-        "token_count_provenance", "target_depths_tokens", "targets"}
+        "token_count_provenance", "target_depths_tokens", "targets", "semantic_oracle"}
     if not required.issubset(manifest):
         raise ValueError("manifest_missing_fields")
     if manifest["fixture_version"] != FIXTURE_VERSION or manifest["fixture_id"] not in FIXTURES:
         raise ValueError("manifest_identity_invalid")
     if not isinstance(manifest["seed"], str) or not manifest["seed"] or not isinstance(manifest["scenario"], str):
         raise ValueError("manifest_identity_invalid")
-    expected_depth = {"small-8k": "early", "intermediate-32k": "middle", "long-55k": "late"}[manifest["fixture_id"]]
-    if manifest["scenario"] != f"single-needle-{expected_depth}-plus-structured":
+    scenario = manifest["scenario"]
+    if scenario not in {"single-needle", "structured-extraction"}:
         raise ValueError("manifest_identity_invalid")
     if (manifest["requested_tokens"] != FIXTURES[manifest["fixture_id"]].requested_tokens or
             not all(isinstance(manifest[key], int) and manifest[key] > 0 for key in ("requested_tokens", "actual_tokens"))):
@@ -171,17 +205,29 @@ def validate_manifest(manifest: Any, prompt: str | None = None) -> dict[str, Any
     if not isinstance(manifest["fixture_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", manifest["fixture_sha256"]):
         raise ValueError("manifest_hash_invalid")
     expected = manifest["expected_answers"]
-    if not isinstance(expected, dict) or set(expected) != {"VII", "XIV", "XXI", "canary"} or not all(isinstance(v, str) and v for v in expected.values()):
+    expected_keys = {"needle"} if scenario == "single-needle" else {"VII", "XIV", "XXI", "canary"}
+    if not isinstance(expected, dict) or set(expected) != expected_keys or not all(isinstance(v, str) and v for v in expected.values()):
         raise ValueError("manifest_oracle_invalid")
-    if manifest["scoring_rules"] != ["json_only", "exact_key_set", "canary_exact", "target_selection", "prose_not_heading", "word_count", "capitalization", "trailing_punctuation", "exact_match", "semantic_pass"]:
+    expected_rules = (["json_only", "exact_key_set", "needle_exact", "exact_match", "semantic_pass"]
+        if scenario == "single-needle" else
+        ["json_only", "exact_key_set", "canary_exact", "target_selection", "prose_not_heading",
+         "word_count", "capitalization", "trailing_punctuation", "exact_match", "semantic_pass"])
+    if manifest["scoring_rules"] != expected_rules:
         raise ValueError("manifest_scoring_invalid")
+    oracle = manifest["semantic_oracle"]
+    if ((scenario == "single-needle" and oracle != {"value_key": "needle"}) or
+            (scenario == "structured-extraction" and
+             (not isinstance(oracle, dict) or oracle.get("prose_keys") != ["VII", "XIV", "XXI"]
+              or not isinstance(oracle.get("heading_decoys"), list)
+              or not all(isinstance(value, str) and value for value in oracle["heading_decoys"])))):
+        raise ValueError("manifest_oracle_invalid")
     provenance = manifest["token_count_provenance"]
     if (not isinstance(provenance, dict) or provenance.get("kind") != "estimate" or
             provenance.get("authoritative") is not False or provenance.get("units") != "tokens" or
             not isinstance(provenance.get("tokenizer_id"), str)):
         raise ValueError("manifest_token_provenance_invalid")
     targets = manifest["targets"]
-    if not isinstance(targets, dict) or set(targets) != {"VII", "needle", "XIV", "XXI", "canary"}:
+    if not isinstance(targets, dict) or set(targets) != expected_keys:
         raise ValueError("manifest_targets_invalid")
     offsets = []
     for metadata in targets.values():
@@ -195,6 +241,8 @@ def validate_manifest(manifest: Any, prompt: str | None = None) -> dict[str, Any
                 or metadata["actual_ratio"] != metadata["actual_offset_tokens"] / manifest["actual_tokens"]):
             raise ValueError("manifest_targets_invalid")
         offsets.append(metadata["actual_offset_tokens"])
+    if any(targets[key]["value"] != expected[key] for key in expected):
+        raise ValueError("manifest_targets_invalid")
     requested_order = sorted(targets, key=lambda name: targets[name]["requested_offset_tokens"])
     actual_order = sorted(targets, key=lambda name: targets[name]["actual_offset_tokens"])
     if requested_order != actual_order or len(set(offsets)) != len(offsets):
@@ -207,12 +255,28 @@ def validate_manifest(manifest: Any, prompt: str | None = None) -> dict[str, Any
             raise ValueError("fixture_too_large")
         if hashlib.sha256(prompt.encode()).hexdigest() != manifest["fixture_sha256"]:
             raise ValueError("fixture_hash_mismatch")
-        if prompt.count(targets["needle"]["value"]) != 1 or prompt.count(targets["canary"]["value"]) != 1:
+        unique_targets = targets.values() if scenario == "single-needle" else (targets["canary"],)
+        if any(prompt.count(metadata["value"]) != 1 for metadata in unique_targets):
             raise ValueError("fixture_target_occurrence_invalid")
     return manifest
 
 def evaluate_semantic(response_text: str, manifest: dict[str, Any]) -> dict[str, Any]:
     expected = manifest["expected_answers"]
+    if manifest.get("scenario") == "single-needle":
+        stripped = response_text.strip()
+        try:
+            parsed = json.loads(stripped)
+            json_only = True
+        except (TypeError, json.JSONDecodeError):
+            parsed, json_only = None, False
+        exact_keys = isinstance(parsed, dict) and set(parsed) == {"needle"}
+        needle_exact = exact_keys and isinstance(parsed["needle"], str) and parsed["needle"] == expected["needle"]
+        exact_match = parsed == expected
+        result = {"json_only": json_only, "exact_key_set": exact_keys,
+            "needle_exact": needle_exact, "exact_match": exact_match,
+            "semantic_pass": exact_match}
+        result["errors"] = [rule for rule in manifest["scoring_rules"] if not result[rule]]
+        return result
     fields = ["json_only", "exact_key_set", "canary_exact", "target_selection", "prose_not_heading", "word_count", "capitalization", "trailing_punctuation", "exact_match", "semantic_pass"]
     result = {key: False for key in fields}
     parse_error: str | None = None
@@ -428,7 +492,7 @@ def _run_owned_runner(command: list[str], timeout_s: float,
     return subprocess.CompletedProcess(command, returncode, stdout=tail)
 
 
-def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", timeout_s: float = 30.0,
+def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: str = "structured-extraction", timeout_s: float = 30.0,
         model: str | None = None, backend: str | None = None, relay_url: str | None = None,
         cleanup_timeout_s: float | None = None, app_binary: str | None = None,
         context_tier: str = "64k-full", report_only: bool = False,
@@ -455,7 +519,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", timeout_s: 
     if (external_prompt is None) != (external_manifest is None):
         return {"pass": False, "code": "external_fixture_pair_required"}
     if external_prompt is None:
-        prompt, manifest = generate_fixture(fixture_id)
+        prompt, manifest = generate_fixture(fixture_id, scenario=scenario)
     else:
         prompt, manifest = external_prompt, external_manifest
     try:
@@ -464,6 +528,8 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", timeout_s: 
         return {"pass": False, "code": str(exc)}
     if manifest["fixture_id"] != fixture_id:
         return {"pass": False, "code": "manifest_fixture_mismatch"}
+    if manifest["scenario"] != scenario:
+        return {"pass": False, "code": "manifest_scenario_mismatch"}
     profile = get_context_profile(context_tier)
     prompt_budget = profile.total_context_tokens - profile.default_output_reservation_tokens
     if manifest["actual_tokens"] > prompt_budget:
@@ -513,10 +579,18 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", timeout_s: 
         return {"pass": False, "code": "packaged_evidence_malformed"}
     required = {"app_identity", "runtime_identity", "bundled_runtime_identity", "build_identity",
         "backend_used", "model_fingerprint", "authoritative_prompt_tokens", "progress_events",
-        "authoritative_target_offsets_tokens", "terminal", "response_text", "start_s", "first_token_s", "end_s", "output_tokens"}
+        "authoritative_tokenizer_evidence", "terminal", "response_text", "start_s", "first_token_s", "end_s", "output_tokens"}
     missing_evidence = sorted(key for key in required if payload.get(key) in (None, "", [], {}))
     if missing_evidence:
+        if "authoritative_tokenizer_evidence" in missing_evidence:
+            return {"pass": False, "code": "authoritative_target_depth_unavailable",
+                "missing_seam": "packaged_admission_render_and_tokenize_chat_prefix_counts"}
         return {"pass": False, "code": "packaged_evidence_missing", "missing": missing_evidence}
+    authoritative_offsets, depth_error = _validate_authoritative_tokenizer_evidence(
+        payload["authoritative_tokenizer_evidence"], manifest,
+        payload["runtime_identity"], payload["authoritative_prompt_tokens"])
+    if depth_error:
+        return {"pass": False, "code": depth_error}
     progress = analyze_progress(payload.get("progress_events", []), payload.get("terminal", "completed"))
     semantic = evaluate_semantic(payload.get("response_text", ""), manifest)
     metrics = summarize_metrics(
@@ -531,7 +605,10 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", timeout_s: 
         "fixture": {"id": fixture_id, "sha256": manifest.get("fixture_sha256"),
             "estimated_prompt_tokens": manifest.get("actual_tokens"),
             "estimated_tokenizer": manifest.get("token_count_provenance"),
-            "authoritative_prompt_tokens": payload.get("authoritative_prompt_tokens")},
+            "authoritative_prompt_tokens": payload.get("authoritative_prompt_tokens"),
+            "authoritative_target_offsets_tokens": authoritative_offsets,
+            "authoritative_target_ratios": {key: value / payload["authoritative_prompt_tokens"]
+                for key, value in authoritative_offsets.items()}},
         "semantic": semantic,
         "progress": progress,
         "metrics": metrics,
@@ -547,13 +624,8 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", timeout_s: 
         runtime["runtime_identity"] == runtime.get("bundled_runtime_identity") and
         runtime["backend_used"] == backend)
     final_total = (progress.get("final_progress") or {}).get("total_prompt_tokens")
-    authoritative_offsets = payload.get("authoritative_target_offsets_tokens")
-    target_provenance_ok = (isinstance(authoritative_offsets, dict)
-        and set(authoritative_offsets) == set(manifest["targets"])
-        and all(isinstance(value, int) and 0 <= value < payload["authoritative_prompt_tokens"]
-            for value in authoritative_offsets.values()))
     runtime_contract_pass = bool(progress.get("pass") and identity_ok
-        and payload["authoritative_prompt_tokens"] == final_total and target_provenance_ok)
+        and payload["authoritative_prompt_tokens"] == final_total)
     if "kv_compare" in evidence:
         runtime_contract_pass = runtime_contract_pass and bool(evidence["kv_compare"].get("pass"))
     passed = bool(runtime_contract_pass and semantic.get("semantic_pass"))
@@ -586,10 +658,11 @@ def cancellation_recovery_result(events: list[dict[str, Any]], *, phase: str, th
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="P8 packaged-runtime benchmark harness")
     sub = p.add_subparsers(dest="cmd", required=True)
-    g = sub.add_parser("generate-fixture"); g.add_argument("--fixture", choices=FIXTURES, required=True); g.add_argument("--out-dir", required=True); g.add_argument("--seed", default=DEFAULT_SEED)
+    g = sub.add_parser("generate-fixture"); g.add_argument("--fixture", choices=FIXTURES, required=True); g.add_argument("--scenario", choices=("single-needle", "structured-extraction"), required=True); g.add_argument("--out-dir", required=True); g.add_argument("--seed", default=DEFAULT_SEED)
     e = sub.add_parser("evaluate"); e.add_argument("--manifest", required=True); e.add_argument("--response", required=True); e.add_argument("--strict", action="store_true"); e.add_argument("--out-dir", required=True)
     r = sub.add_parser("packaged-runtime", help="run the installed desktop through repository WebDriver control")
     r.add_argument("--out-dir", required=True); r.add_argument("--fixture", choices=FIXTURES, default="small-8k")
+    r.add_argument("--scenario", choices=("single-needle", "structured-extraction"), default="structured-extraction")
     r.add_argument("--app-binary", required=True); r.add_argument("--model", required=True)
     r.add_argument("--backend", choices=("metal", "cuda", "cpu"), required=True); r.add_argument("--relay-url", required=True)
     r.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="64k-full")
@@ -599,7 +672,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--report-only", action="store_true", help="preserve semantic failures; runtime failures remain nonzero")
     args = p.parse_args(argv)
     if args.cmd == "generate-fixture":
-        prompt, manifest = generate_fixture(args.fixture, args.seed); validate_manifest(manifest, prompt); out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True); (out/f"{args.fixture}.prompt.txt").write_text(prompt); (out/f"{args.fixture}.manifest.json").write_text(_canonical_json(manifest)+"\n"); print(f"generated {args.fixture}: requested={manifest['requested_tokens']} actual={manifest['actual_tokens']} sha256={manifest['fixture_sha256']}"); return 0
+        prompt, manifest = generate_fixture(args.fixture, args.seed, scenario=args.scenario); validate_manifest(manifest, prompt); out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True); (out/f"{args.fixture}.prompt.txt").write_text(prompt); (out/f"{args.fixture}.manifest.json").write_text(_canonical_json(manifest)+"\n"); print(f"generated {args.fixture}: scenario={args.scenario} requested={manifest['requested_tokens']} actual={manifest['actual_tokens']} sha256={manifest['fixture_sha256']}"); return 0
     if args.cmd == "evaluate":
         manifest=json.loads(Path(args.manifest).read_text()); validate_manifest(manifest); response=Path(args.response).read_text(); score=evaluate_semantic(response, manifest); path=write_report_atomic(Path(args.out_dir), {"mode":"semantic-evaluation","semantic":score,"fixture":{"id":manifest.get("fixture_id"),"sha256":manifest.get("fixture_sha256"),"actual_tokens":manifest.get("actual_tokens")}}); print(f"semantic_pass={score.get('semantic_pass', False)} report={path}"); return 1 if args.strict and not score.get("semantic_pass") else 0
     if args.cmd == "packaged-runtime":
@@ -607,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
             p.error("--prompt and --manifest are mutually required")
         external_prompt = _read_bounded_text(args.prompt) if args.prompt else None
         external_manifest = json.loads(_read_bounded_text(args.manifest, 1024 * 1024)) if args.manifest else None
-        evidence = invoke_packaged_runtime_adapter(fixture_id=args.fixture, timeout_s=args.request_timeout,
+        evidence = invoke_packaged_runtime_adapter(fixture_id=args.fixture, scenario=args.scenario, timeout_s=args.request_timeout,
             app_binary=args.app_binary, model=args.model, backend=args.backend, relay_url=args.relay_url,
             cleanup_timeout_s=args.cleanup_timeout, context_tier=args.context_tier,
             report_only=args.report_only, external_prompt=external_prompt,

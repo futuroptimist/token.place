@@ -32,8 +32,15 @@ python scripts/p8_benchmark.py packaged-runtime \
   --context-tier 8k-fast \
   --request-timeout 600 \
   --cleanup-timeout 30 \
+  --trials 3 \
   --out-dir .tmp/p8
 ```
+
+`--trials` defaults to `1` and accepts `1` through `10`. Trials run sequentially with the same
+validated fixture, manifest, app, model, backend, tier, relay, and timeout configuration. Each
+invocation retains its own protected temporary files, WebDriver/app resources, timeout budget, and
+bounded cleanup; trials are never concurrent. The command stops at the first runtime-contract
+failure and never labels a partial run as a completed aggregate.
 
 The `8k-fast` context window is 8,192 tokens and retains its 1,024-token output reservation, leaving
 an effective prompt budget of 7,168 tokens. The `small-8k` fixture therefore requests 7,168 prompt
@@ -180,6 +187,24 @@ score. A successful packaged-runtime contract requires:
 - the validated progress summary and ordered terminal/result evidence;
 - every timing, throughput, request-budget, and completion-margin field;
 - the complete semantic score and aggregate trial count, exact-match count, and pass rate.
+- requested/completed trial counts, per-category failure counts, and bounded per-trial boolean/error
+  summaries (never response text).
+- the generation settings observed from the plaintext API v1 request immediately before browser
+  encryption.
+
+Generation evidence is an allowlisted object. `supplied` records only bounded scalar request
+options (`max_tokens`, and `temperature`, `top_p`, or `seed` when actually present).
+`omitted_runtime_default` names relevant options absent from the request; the harness does not
+invent or infer their runtime defaults. The current landing-page request supplies `max_tokens` and
+omits `temperature`, `top_p`, and `seed`. Missing, malformed, non-finite, out-of-range, unsupported,
+or cross-trial-inconsistent evidence fails the runtime contract. The capture never retains
+messages, prompt/response content, request identifiers, ciphertext, credentials, or keys.
+
+The aggregate is computed only after every requested trial completes its runtime contract. Overall
+success requires every trial to be semantically exact. `--report-only` can return zero for mixed
+semantic outcomes only after all requested runtime trials completed; exact-match count, pass rate,
+failure-category counts, and `overall_pass=false` remain truthful in the report. Each trial receives
+the full `--request-timeout`; cleanup remains bounded separately by `--cleanup-timeout`.
 
 Failed or `not_run` packaged reports require a stable categorical failure code. Report validation
 does not fill absent telemetry with zero and does not allow `NaN` or infinity.

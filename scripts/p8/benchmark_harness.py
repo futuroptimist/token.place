@@ -376,13 +376,45 @@ def evaluate_semantic(response_text: str, manifest: dict[str, Any]) -> dict[str,
     result["errors"] = [key for key in fields if not result[key]]
     return result
 
-def score_trials(responses: list[str], manifest: dict[str, Any]) -> dict[str, Any]:
-    trials = [evaluate_semantic(r, manifest) for r in responses]
+def _aggregate_trial_scores(trials: list[dict[str, Any]]) -> dict[str, Any]:
     exact = sum(1 for t in trials if t.get("exact_match"))
     cats: dict[str, int] = {}
     for t in trials:
         for e in t.get("errors", []): cats[e] = cats.get(e, 0) + 1
     return {"trial_count": len(trials), "exact_match_count": exact, "pass_rate": exact / len(trials) if trials else 0.0, "failure_categories": cats, "trials": trials}
+
+def score_trials(responses: list[str], manifest: dict[str, Any]) -> dict[str, Any]:
+    return _aggregate_trial_scores([evaluate_semantic(r, manifest) for r in responses])
+
+
+GENERATION_OPTION_LIMITS = {
+    "max_tokens": (1, 65536),
+    "temperature": (0, 2),
+    "top_p": (0, 1),
+    "seed": (-(2 ** 63), 2 ** 63 - 1),
+}
+MAX_PACKAGED_TRIALS = 10
+
+
+def validate_generation_settings(value: Any) -> dict[str, Any]:
+    """Validate bounded settings observed at the plaintext envelope boundary."""
+    if not isinstance(value, dict) or set(value) != {"supplied", "omitted_runtime_default"}:
+        raise ValueError("generation_settings_malformed")
+    supplied, omitted = value["supplied"], value["omitted_runtime_default"]
+    if not isinstance(supplied, dict) or not isinstance(omitted, list) or not supplied:
+        raise ValueError("generation_settings_malformed")
+    if not set(supplied) <= set(GENERATION_OPTION_LIMITS) or "max_tokens" not in supplied:
+        raise ValueError("generation_settings_unsupported")
+    expected_omitted = sorted(set(GENERATION_OPTION_LIMITS) - set(supplied))
+    if omitted != expected_omitted:
+        raise ValueError("generation_settings_omissions_invalid")
+    for key, setting in supplied.items():
+        low, high = GENERATION_OPTION_LIMITS[key]
+        if (not isinstance(setting, (int, float)) or isinstance(setting, bool)
+                or not math.isfinite(setting) or setting < low or setting > high
+                or key in {"max_tokens", "seed"} and not isinstance(setting, int)):
+            raise ValueError("generation_settings_value_invalid")
+    return {"supplied": dict(supplied), "omitted_runtime_default": list(omitted)}
 
 def analyze_progress(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Validate the ordered progress/result/terminal lifecycle, returning stable errors."""
@@ -552,6 +584,16 @@ def validate_report(report: Any) -> None:
     if not isinstance(aggregate, dict) or not isinstance(aggregate.get("trial_count"), int) or \
             not isinstance(aggregate.get("exact_match_count"), int) or not finite(aggregate.get("pass_rate")):
         raise ValueError("report_semantic_aggregate_invalid")
+    requested, completed = report.get("requested_trial_count"), report.get("completed_trial_count")
+    if (not isinstance(requested, int) or not 1 <= requested <= MAX_PACKAGED_TRIALS
+            or completed != requested or aggregate["trial_count"] != completed
+            or not 0 <= aggregate["exact_match_count"] <= completed
+            or aggregate["pass_rate"] != aggregate["exact_match_count"] / completed
+            or not isinstance(aggregate.get("failure_categories"), dict)
+            or not isinstance(aggregate.get("trials"), list)
+            or len(aggregate["trials"]) != completed):
+        raise ValueError("report_trial_aggregate_invalid")
+    validate_generation_settings(report.get("generation_settings"))
 
 def write_report_atomic(out_dir: Path, report: dict[str, Any]) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -774,7 +816,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         "authoritative_prompt_tokens", "progress_events",
         "authoritative_tokenizer_evidence", "terminal_observation", "result_observation",
         "response_text", "start_s", "preparing_end_s", "prefill_end_s", "first_token_s", "end_s",
-        "output_tokens", "post_terminal_observations"}
+        "output_tokens", "post_terminal_observations", "generation_settings"}
     missing_evidence = sorted(key for key in required if key not in payload or payload.get(key) in (None, "", {}))
     if missing_evidence:
         if "authoritative_tokenizer_evidence" in missing_evidence:
@@ -788,6 +830,10 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
             payload["output_tokens"] < 0 or not isinstance(payload["progress_events"], list) or
             not isinstance(payload["post_terminal_observations"], list)):
         return {"pass": False, "code": "packaged_evidence_malformed"}
+    try:
+        generation_settings = validate_generation_settings(payload["generation_settings"])
+    except ValueError as exc:
+        return {"pass": False, "code": str(exc)}
     authoritative_offsets, depth_error = _validate_authoritative_tokenizer_evidence(
         payload["authoritative_tokenizer_evidence"], manifest,
         payload["runtime_identity"], payload["authoritative_prompt_tokens"])
@@ -812,6 +858,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
             "authoritative_target_ratios": {key: value / payload["authoritative_prompt_tokens"]
                 for key, value in authoritative_offsets.items()}},
         "semantic": semantic,
+        "generation_settings": generation_settings,
         "progress": progress,
         "metrics": metrics,
         "memory": payload.get("memory", {}),
@@ -878,26 +925,49 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--manifest", help="external validated manifest (requires --prompt)")
     r.add_argument("--request-timeout", type=float, default=600.0); r.add_argument("--cleanup-timeout", type=float, default=30.0)
     r.add_argument("--report-only", action="store_true", help="preserve semantic failures; runtime failures remain nonzero")
+    r.add_argument("--trials", type=int, default=1,
+        help=f"number of sequential physical trials (1-{MAX_PACKAGED_TRIALS}; default: 1)")
     args = p.parse_args(argv)
     if args.cmd == "generate-fixture":
         prompt, manifest = generate_fixture(args.fixture, args.seed, scenario=args.scenario); validate_manifest(manifest, prompt); out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True); (out/f"{args.fixture}.prompt.txt").write_text(prompt); (out/f"{args.fixture}.manifest.json").write_text(_canonical_json(manifest)+"\n"); print(f"generated {args.fixture}: scenario={args.scenario} requested={manifest['requested_tokens']} actual={manifest['actual_tokens']} sha256={manifest['fixture_sha256']}"); return 0
     if args.cmd == "evaluate":
         manifest=json.loads(Path(args.manifest).read_text()); validate_manifest(manifest); response=Path(args.response).read_text(); score=evaluate_semantic(response, manifest); path=write_report_atomic(Path(args.out_dir), {"mode":"semantic-evaluation", "status":"passed" if score["semantic_pass"] else "failed", "semantic":score,"fixture":{"id":manifest["fixture_id"], "version":manifest["fixture_version"], "scenario":manifest["scenario"], "sha256":manifest["fixture_sha256"]}}); print(f"semantic_pass={score.get('semantic_pass', False)} report={path}"); return 1 if args.strict and not score.get("semantic_pass") else 0
     if args.cmd == "packaged-runtime":
+        if isinstance(args.trials, bool) or not 1 <= args.trials <= MAX_PACKAGED_TRIALS:
+            p.error(f"--trials must be between 1 and {MAX_PACKAGED_TRIALS}")
         if bool(args.prompt) != bool(args.manifest):
             p.error("--prompt and --manifest are mutually required")
         external_prompt = _read_bounded_text(args.prompt) if args.prompt else None
         external_manifest = json.loads(_read_bounded_text(args.manifest, 1024 * 1024)) if args.manifest else None
-        evidence = invoke_packaged_runtime_adapter(fixture_id=args.fixture, scenario=args.scenario, timeout_s=args.request_timeout,
-            app_binary=args.app_binary, model=args.model, backend=args.backend, relay_url=args.relay_url,
-            cleanup_timeout_s=args.cleanup_timeout, context_tier=args.context_tier,
-            report_only=args.report_only, external_prompt=external_prompt,
-            external_manifest=external_manifest)
-        if evidence.get("runtime_contract_pass"):
+        completed: list[dict[str, Any]] = []
+        evidence: dict[str, Any] = {"pass": False, "code": "packaged_contract_failed"}
+        settings: dict[str, Any] | None = None
+        for _ in range(args.trials):
+            evidence = invoke_packaged_runtime_adapter(fixture_id=args.fixture, scenario=args.scenario, timeout_s=args.request_timeout,
+                app_binary=args.app_binary, model=args.model, backend=args.backend, relay_url=args.relay_url,
+                cleanup_timeout_s=args.cleanup_timeout, context_tier=args.context_tier,
+                report_only=args.report_only, external_prompt=external_prompt,
+                external_manifest=external_manifest)
+            if not evidence.get("runtime_contract_pass"):
+                break
+            if settings is None:
+                settings = evidence.get("generation_settings")
+            elif evidence.get("generation_settings") != settings:
+                evidence = {"pass": False, "runtime_contract_pass": False,
+                    "code": "generation_settings_inconsistent"}
+                break
+            completed.append(evidence)
+        all_runtime_complete = len(completed) == args.trials
+        if all_runtime_complete:
+            aggregate = _aggregate_trial_scores([trial["semantic"] for trial in completed])
+            all_semantic_pass = aggregate["exact_match_count"] == args.trials
+            evidence = completed[-1]
             profile = get_context_profile(args.context_tier)
-            report = {"mode":"packaged-runtime", "status":"passed" if evidence.get("pass") else "failed",
-                "code":"ok" if evidence.get("pass") else "semantic_failure", "overall_pass":bool(evidence.get("pass")),
-                "report_only_accepted":bool(evidence.get("report_only_accepted")), "fixture":{
+            report_only_accepted = bool(args.report_only and not all_semantic_pass)
+            report = {"mode":"packaged-runtime", "status":"passed" if all_semantic_pass else "failed",
+                "code":"ok" if all_semantic_pass else "semantic_failure", "overall_pass":all_semantic_pass,
+                "report_only_accepted":report_only_accepted, "requested_trial_count":args.trials,
+                "completed_trial_count":len(completed), "generation_settings":settings, "fixture":{
                 "id":args.fixture, "version":FIXTURE_VERSION, "scenario":args.scenario,
                 "sha256":evidence["fixture"]["sha256"]}, "runtime":evidence["runtime"],
                 "backend":{"requested":evidence["runtime"]["backend_requested"],
@@ -907,15 +977,14 @@ def main(argv: list[str] | None = None) -> int:
                     "prompt_tokens":evidence["fixture"]["authoritative_prompt_tokens"],
                     "output_tokens":evidence["metrics"]["output_tokens"]},
                 "progress":evidence["progress"], "metrics":evidence["metrics"],
-                "semantic":evidence["semantic"], "aggregate_semantic":{"trial_count":1,
-                    "exact_match_count":int(evidence["semantic"]["semantic_pass"]),
-                    "pass_rate":float(evidence["semantic"]["semantic_pass"])}}
+                "semantic":evidence["semantic"], "aggregate_semantic":aggregate}
         else:
             report = {"mode":"packaged-runtime", "status":"not_run", "code":evidence.get("code", "packaged_contract_failed"),
+                "requested_trial_count":args.trials, "completed_trial_count":len(completed),
                 "fixture":{"id":args.fixture, "version":FIXTURE_VERSION, "scenario":args.scenario,
                     "sha256":"unavailable"}}
         path=write_report_atomic(Path(args.out_dir), report)
         print(f"packaged_runtime_pass={evidence.get('pass', False)} report={path}")
-        return 0 if evidence.get("pass") or evidence.get("report_only_accepted") else 1
+        return 0 if all_runtime_complete and (all_semantic_pass or report_only_accepted) else 1
     return 2
 if __name__ == "__main__": raise SystemExit(main())

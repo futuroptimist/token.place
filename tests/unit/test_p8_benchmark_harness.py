@@ -566,6 +566,8 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         "post_terminal_observations": [], "start_s": 0.0, "preparing_end_s": 0.0,
         "prefill_end_s": 1.0, "first_token_s": 1.0, "end_s": 2.0,
         "output_tokens": 4,
+        "generation_settings": {"supplied": {"max_tokens": 1024},
+            "omitted_runtime_default": ["seed", "temperature", "top_p"]},
         "messages": [{"content": "plaintext"}],
         "memory": {"diagnostic": "Authorization: Bearer sk-runtime"},
         "app_identity": "token.place-test",
@@ -755,6 +757,8 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
     response = manifest["expected_answers"] if semantic_ok else {**manifest["expected_answers"], "canary": "wrong"}
     payload = {
         "response_text": json.dumps(response), "start_s": 0.0, "preparing_end_s": 0.0,
+        "generation_settings":{"supplied":{"max_tokens":1024},
+            "omitted_runtime_default":["seed", "temperature", "top_p"]},
         "prefill_end_s": 1.0, "first_token_s": 1.0, "end_s": 2.0, "output_tokens": 4,
         "result_observation":{"kind":"result", "status":"success", "sequence":3, "elapsed_ms":2001},
         "terminal_observation":{"kind":"terminal", "state":"completed", "sequence":4, "elapsed_ms":2002},
@@ -916,7 +920,9 @@ def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
             "time_to_first_token_s":1, "decode_duration_s":1, "total_duration_s":2,
             "prompt_tokens":10, "output_tokens":1, "prompt_tokens_per_s":10,
             "decode_tokens_per_s":1, "request_budget_s":600, "completion_margin_s":598},
-        "semantic":{"semantic_pass":False}}
+        "semantic":{"semantic_pass":False, "exact_match":False, "errors":["exact_match"]},
+        "generation_settings":{"supplied":{"max_tokens":1024},
+            "omitted_runtime_default":["seed", "temperature", "top_p"]}}
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: evidence)
     args = ["packaged-runtime", "--out-dir", str(tmp_path), "--app-binary", "app",
         "--model", "model", "--backend", "cpu", "--relay-url", "https://relay.example",
@@ -928,4 +934,91 @@ def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
     assert report["report_only_accepted"] is True
 
     evidence["report_only_accepted"] = False
-    assert h.main(args) == 1
+    assert h.main(args) == 0
+
+
+def _packaged_main_evidence(semantic_pass=True, *, max_tokens=1024):
+    return {"pass": semantic_pass, "report_only_accepted": False, "runtime_contract_pass": True,
+        "fixture":{"sha256":"abc", "authoritative_prompt_tokens":10},
+        "runtime":{"app_identity":"token.place", "runtime_identity":"bundled",
+            "build_identity":"build", "backend_requested":"cpu", "backend_selected":"cpu",
+            "model_fingerprint":"sha256:model", "backend_used":"cpu"},
+        "progress":{"pass":True, "progress_event_count":1},
+        "metrics":{"pass":True, "preparing_duration_s":0, "prefill_duration_s":1,
+            "time_to_first_token_s":1, "decode_duration_s":1, "total_duration_s":2,
+            "prompt_tokens":10, "output_tokens":1, "prompt_tokens_per_s":10,
+            "decode_tokens_per_s":1, "request_budget_s":600, "completion_margin_s":598},
+        "semantic":{"semantic_pass":semantic_pass, "exact_match":semantic_pass,
+            "errors":[] if semantic_pass else ["exact_match", "target_selection"]},
+        "generation_settings":{"supplied":{"max_tokens":max_tokens},
+            "omitted_runtime_default":["seed", "temperature", "top_p"]}}
+
+
+def _packaged_main_args(tmp_path, *extra):
+    return ["packaged-runtime", "--out-dir", str(tmp_path), "--app-binary", "app",
+        "--model", "model", "--backend", "cpu", "--relay-url", "https://relay.example", *extra]
+
+
+def test_packaged_trials_default_and_multiple_are_sequential(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter",
+        lambda **kwargs: calls.append(len(calls)) or _packaged_main_evidence())
+    assert h.main(_packaged_main_args(tmp_path)) == 0
+    assert calls == [0]
+    assert h.main(_packaged_main_args(tmp_path, "--trials", "3")) == 0
+    assert calls == [0, 1, 2, 3]
+    report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
+    assert report["requested_trial_count"] == report["completed_trial_count"] == 3
+    assert report["aggregate_semantic"]["trial_count"] == 3
+
+
+def test_packaged_trials_aggregate_mixed_semantics_and_report_only(tmp_path, monkeypatch):
+    outcomes = iter([True, False, True])
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter",
+        lambda **kwargs: _packaged_main_evidence(next(outcomes)))
+    assert h.main(_packaged_main_args(tmp_path, "--trials", "3", "--report-only")) == 0
+    report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
+    aggregate = report["aggregate_semantic"]
+    assert report["overall_pass"] is False and report["report_only_accepted"] is True
+    assert aggregate["exact_match_count"] == 2 and aggregate["pass_rate"] == pytest.approx(2 / 3)
+    assert aggregate["failure_categories"] == {"exact_match": 1, "target_selection": 1}
+    serialized = json.dumps(report).lower()
+    assert all(word not in serialized for word in ("response_text", "messages", "ciphertext", "request_id"))
+
+
+def test_packaged_trials_fail_closed_on_runtime_failure_and_settings_drift(tmp_path, monkeypatch):
+    runtime_failure = {"pass":False, "runtime_contract_pass":False, "code":"telemetry_failed"}
+    outcomes = iter([_packaged_main_evidence(), runtime_failure, _packaged_main_evidence()])
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: next(outcomes))
+    assert h.main(_packaged_main_args(tmp_path, "--trials", "3", "--report-only")) == 1
+    report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
+    assert report["requested_trial_count"] == 3 and report["completed_trial_count"] == 1
+    assert report["code"] == "telemetry_failed"
+
+    outcomes = iter([_packaged_main_evidence(), _packaged_main_evidence(max_tokens=512)])
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: next(outcomes))
+    assert h.main(_packaged_main_args(tmp_path, "--trials", "2", "--report-only")) == 1
+    assert json.loads((tmp_path / "p8_benchmark_report.json").read_text())["code"] == "generation_settings_inconsistent"
+
+
+@pytest.mark.parametrize("trials", ["0", "-1", str(h.MAX_PACKAGED_TRIALS + 1)])
+def test_packaged_trials_argument_is_bounded(tmp_path, trials):
+    with pytest.raises(SystemExit, match="2"):
+        h.main(_packaged_main_args(tmp_path, "--trials", trials))
+
+
+@pytest.mark.parametrize(("settings", "code"), [
+    (None, "generation_settings_malformed"),
+    ({"supplied":{}, "omitted_runtime_default":[]}, "generation_settings_malformed"),
+    ({"supplied":{"temperature":1}, "omitted_runtime_default":["max_tokens", "seed", "top_p"]},
+     "generation_settings_unsupported"),
+    ({"supplied":{"max_tokens":float("nan")}, "omitted_runtime_default":["seed", "temperature", "top_p"]},
+     "generation_settings_value_invalid"),
+    ({"supplied":{"max_tokens":1024, "unknown":1}, "omitted_runtime_default":["seed", "temperature", "top_p"]},
+     "generation_settings_unsupported"),
+    ({"supplied":{"max_tokens":1024}, "omitted_runtime_default":[]},
+     "generation_settings_omissions_invalid"),
+])
+def test_generation_settings_validation_fails_closed(settings, code):
+    with pytest.raises(ValueError, match=code):
+        h.validate_generation_settings(settings)

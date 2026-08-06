@@ -712,6 +712,31 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         if selected_tier != request["context_tier"]:
             raise RuntimeError("landing context selection failed")
         wait.until(lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
+        browser.execute_script("""
+            const v = document.querySelector('#app').__vue__;
+            const original = v.encrypt.bind(v);
+            v.encrypt = async function(plaintext, ...args) {
+                const envelope = JSON.parse(plaintext);
+                if (envelope.protocol === 'tokenplace_api_v1_relay_e2ee') {
+                    const options = envelope.api_v1_request?.options;
+                    const allowed = ['max_tokens', 'temperature', 'top_p', 'seed'];
+                    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+                        this.__p8GenerationSettings = null;
+                    } else {
+                        const supplied = {};
+                        for (const key of Object.keys(options)) {
+                            if (allowed.includes(key)) supplied[key] = options[key];
+                            else supplied.__unsupported__ = key;
+                        }
+                        this.__p8GenerationSettings = {
+                            supplied,
+                            omitted_runtime_default: allowed.filter(key => !(key in options)).sort()
+                        };
+                    }
+                }
+                return original(plaintext, ...args);
+            };
+        """)
         field = browser.find_element(By.CSS_SELECTOR, ".message-input")
         field.send_keys(request["prompt"])
         started = time.monotonic()
@@ -735,6 +760,10 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         ended = time.monotonic()
         if not progress or not isinstance(response_text, str):
             raise RuntimeError("required encrypted progress or response evidence missing")
+        generation_settings = browser.execute_script(
+            "return document.querySelector('#app').__vue__.__p8GenerationSettings;")
+        if not isinstance(generation_settings, dict):
+            raise RuntimeError("generation_settings_unavailable")
         last_sequence = int(progress[-1]["sequence"])
         last_elapsed = int(progress[-1]["elapsed_ms"])
         result_observation = {"kind": "result", "status": "success",
@@ -793,6 +822,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
             "authoritative_tokenizer_evidence": tokenizer_observation,
             "result_observation": result_observation, "terminal_observation": terminal_observation,
             "post_terminal_observations": post_terminal, "response_text": response_text, "start_s": started,
+            "generation_settings": generation_settings,
             "preparing_end_s": preparing_end_s, "prefill_end_s": prefill_end_s,
             "first_token_s": first_s, "end_s": ended, "output_tokens": progress[-1]["generated_tokens"]}
         evidence_path.write_text(json.dumps(evidence), encoding="utf-8")

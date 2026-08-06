@@ -502,3 +502,30 @@ def test_owned_runner_keeps_only_bounded_diagnostic_tail():
     assert completed.returncode == 0
     assert len(completed.stdout) <= 2048
     assert completed.stdout.endswith("TAIL")
+
+
+def test_main_generate_and_evaluate_commands(tmp_path):
+    fixture_dir = tmp_path / "fixture"
+    assert h.main(["generate-fixture", "--fixture", "small-8k", "--out-dir", str(fixture_dir)]) == 0
+    manifest_path = fixture_dir / "small-8k.manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    response_path = tmp_path / "response.json"
+    response_path.write_text(json.dumps(manifest["expected_answers"]))
+    report_dir = tmp_path / "report"
+    assert h.main(["evaluate", "--manifest", str(manifest_path), "--response",
+        str(response_path), "--strict", "--out-dir", str(report_dir)]) == 0
+    assert json.loads((report_dir / "p8_benchmark_report.json").read_text())["semantic"]["semantic_pass"]
+
+
+def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
+    evidence = {"pass": False, "report_only_accepted": True}
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: evidence)
+    args = ["packaged-runtime", "--out-dir", str(tmp_path), "--app-binary", "app",
+        "--model", "model", "--backend", "cpu", "--relay-url", "https://relay.example",
+        "--report-only"]
+    assert h.main(args) == 0
+    report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
+    assert report["evidence"]["report_only_accepted"] is True
+
+    evidence["report_only_accepted"] = False
+    assert h.main(args) == 1

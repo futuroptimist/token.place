@@ -897,6 +897,15 @@ def test_main_generate_and_evaluate_commands(tmp_path):
     assert json.loads((report_dir / "p8_benchmark_report.json").read_text())["semantic"]["semantic_pass"]
 
 
+def test_bounded_external_fixture_reader_rejects_oversized_utf8(tmp_path):
+    fixture = tmp_path / "fixture.txt"
+    fixture.write_text("éé", encoding="utf-8")
+
+    assert h._read_bounded_text(str(fixture), limit=4) == "éé"
+    with pytest.raises(ValueError, match="fixture_too_large"):
+        h._read_bounded_text(str(fixture), limit=3)
+
+
 def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
     evidence = {"pass": False, "report_only_accepted": True, "runtime_contract_pass":True,
         "fixture":{"sha256":"abc", "authoritative_prompt_tokens":10},

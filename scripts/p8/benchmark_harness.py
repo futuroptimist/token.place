@@ -21,6 +21,7 @@ import tempfile
 import math
 import signal
 import threading
+import time
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
@@ -325,35 +326,93 @@ def score_trials(responses: list[str], manifest: dict[str, Any]) -> dict[str, An
         for e in t.get("errors", []): cats[e] = cats.get(e, 0) + 1
     return {"trial_count": len(trials), "exact_match_count": exact, "pass_rate": exact / len(trials) if trials else 0.0, "failure_categories": cats, "trials": trials}
 
-def analyze_progress(events: Iterable[dict[str, Any]], terminal: str | None = None) -> dict[str, Any]:
-    last_seq = -1; last_processed = 0; last_generated = 0; last_elapsed = 0; total = None; last_phase = -1; errors=[]; count=0; first=None; final=None
-    for ev in events:
-        count += 1; first = first or ev; final = ev
-        phase = ev.get("phase")
+def analyze_progress(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Validate the ordered progress/result/terminal lifecycle, returning stable errors."""
+    errors: list[str] = []
+    progress: list[dict[str, Any]] = []
+    terminals: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    last_seq = -1; last_elapsed = -1; last_processed = 0; last_generated = 0
+    last_phase = -1; total: int | None = None; terminal_seen = False
+    for item in observations:
+        if not isinstance(item, dict):
+            errors.append("malformed_observation"); continue
+        kind = item.get("kind", "progress")
+        seq, elapsed = item.get("sequence"), item.get("elapsed_ms")
+        if not isinstance(seq, int) or isinstance(seq, bool): errors.append("malformed_sequence")
+        elif seq <= last_seq: errors.append("decreasing_sequence")
+        else: last_seq = seq
+        if not isinstance(elapsed, int) or isinstance(elapsed, bool) or elapsed < 0: errors.append("malformed_elapsed")
+        elif elapsed <= last_elapsed: errors.append("decreasing_elapsed")
+        else: last_elapsed = elapsed
+        if kind == "terminal":
+            terminals.append(item); terminal_seen = True
+            if item.get("state") not in {"completed", "cancelled", "failed"}: errors.append("invalid_terminal_state")
+            if len(terminals) > 1: errors.append("duplicate_terminal")
+            continue
+        if kind == "result":
+            results.append(item)
+            if terminal_seen: errors.append("result_after_terminal")
+            if item.get("status") != "success": errors.append("invalid_result")
+            continue
+        if kind != "progress": errors.append("invalid_observation_kind"); continue
+        if terminal_seen: errors.append("progress_after_terminal")
+        progress.append(item)
+        phase = item.get("phase")
         if phase not in PHASES: errors.append("invalid_phase"); continue
-        if PHASES[phase] < last_phase: errors.append("invalid_phase_transition")
+        if PHASES[phase] < last_phase or (last_phase >= 0 and PHASES[phase] > last_phase + 1): errors.append("invalid_phase_transition")
         last_phase = max(last_phase, PHASES[phase])
-        seq = ev.get("sequence")
-        if not isinstance(seq, int) or seq <= last_seq: errors.append("decreasing_sequence")
-        last_seq = seq if isinstance(seq, int) else last_seq
-        p = ev.get("processed_prompt_tokens"); c = ev.get("cached_prompt_tokens"); g = ev.get("generated_tokens"); t = ev.get("total_prompt_tokens"); elapsed = ev.get("elapsed_ms")
-        if not all(isinstance(x, int) and x >= 0 for x in (p,c,g,t,elapsed)): errors.append("malformed_telemetry"); continue
-        if total is None: total = t
-        elif total != t: errors.append("changing_prompt_total")
+        p, c, g, current_total = (item.get(key) for key in ("processed_prompt_tokens",
+            "cached_prompt_tokens", "generated_tokens", "total_prompt_tokens"))
+        if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                for value in (p, c, g, current_total)):
+            errors.append("malformed_telemetry"); continue
+        if current_total <= 0: errors.append("invalid_prompt_total")
+        if total is None: total = current_total
+        elif total != current_total: errors.append("changing_prompt_total")
         if p < last_processed: errors.append("decreasing_processed")
         if g < last_generated: errors.append("decreasing_generated")
-        if elapsed < last_elapsed: errors.append("decreasing_elapsed")
         if c > p: errors.append("cached_exceeds_processed")
-        if p > t: errors.append("processed_exceeds_total")
-        last_processed, last_generated, last_elapsed = p, g, elapsed
-    if terminal not in {None, "completed", "cancelled", "error"}: errors.append("invalid_terminal_state")
-    if terminal == "completed" and final and final.get("phase") != "generating": errors.append("terminal_lifecycle_without_generation")
-    if terminal == "cancelled" and not final: errors.append("terminal_lifecycle_without_progress")
-    return {"pass": not errors, "errors": errors, "progress_event_count": count, "first_progress": first, "final_progress": final}
+        if p > current_total: errors.append("processed_exceeds_total")
+        last_processed, last_generated = p, g
+    if not progress: errors.append("progress_missing")
+    if len(terminals) != 1: errors.append("terminal_missing" if not terminals else "terminal_conflict")
+    terminal_state = terminals[0].get("state") if len(terminals) == 1 else None
+    if terminal_state == "cancelled" and results: errors.append("result_after_cancellation")
+    if terminal_state == "completed":
+        if len(results) != 1: errors.append("successful_result_missing")
+        if total is None or last_processed != total: errors.append("incomplete_prefill")
+        if last_phase != PHASES["generating"]: errors.append("terminal_lifecycle_without_generation")
+    return {"pass": not errors, "errors": list(dict.fromkeys(errors)),
+        "progress_event_count": len(progress), "first_progress": progress[0] if progress else None,
+        "final_progress": progress[-1] if progress else None, "terminal_state": terminal_state,
+        "terminal_observation": terminals[0] if len(terminals) == 1 else None,
+        "result_observed": len(results) == 1}
 
-def summarize_metrics(start: float, first_token: float | None, end: float, prompt_tokens: int, output_tokens: int) -> dict[str, Any]:
-    total = max(end-start, 0.0); prefill = (first_token-start) if first_token is not None else None; decode = (end-first_token) if first_token is not None else None
-    return {"total_duration_s": total, "prefill_duration_s": prefill, "decode_duration_s": decode, "prompt_tokens_per_s": (prompt_tokens/prefill if prefill and prefill>0 else None), "decode_tokens_per_s": (output_tokens/decode if decode and decode>0 else None)}
+
+def summarize_metrics(*, start_s: float, preparing_end_s: float, prefill_end_s: float,
+        first_token_s: float, end_s: float, prompt_tokens: int, output_tokens: int,
+        request_budget_s: float) -> dict[str, Any]:
+    """Calculate all P8 timings, failing closed for missing or unordered evidence."""
+    numeric = (start_s, preparing_end_s, prefill_end_s, first_token_s, end_s, request_budget_s)
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+            for value in numeric):
+        return {"pass": False, "code": "timing_non_finite"}
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (prompt_tokens, output_tokens)):
+        return {"pass": False, "code": "token_count_invalid"}
+    if request_budget_s <= 0 or not (start_s <= preparing_end_s <= prefill_end_s <= first_token_s <= end_s):
+        return {"pass": False, "code": "timing_order_invalid"}
+    total = end_s - start_s; prefill = prefill_end_s - preparing_end_s
+    decode = end_s - first_token_s
+    if total > request_budget_s: return {"pass": False, "code": "request_budget_exceeded"}
+    return {"pass": True, "preparing_duration_s": preparing_end_s - start_s,
+        "prefill_duration_s": prefill, "time_to_first_token_s": first_token_s - start_s,
+        "decode_duration_s": decode, "total_duration_s": total,
+        "prompt_tokens": prompt_tokens, "output_tokens": output_tokens,
+        "prompt_tokens_per_s": prompt_tokens / prefill if prefill > 0 else None,
+        "decode_tokens_per_s": output_tokens / decode if decode > 0 else None,
+        "request_budget_s": request_budget_s, "completion_margin_s": request_budget_s - total}
 
 def compare_kv_estimate(estimate: dict[str, Any], runtime: dict[str, Any], exact_required: bool = True, tolerance_bytes: int = 4096) -> dict[str, Any]:
     est = estimate.get("exact_kv_allocation_bytes") or estimate.get("exact_kv_cache_bytes")
@@ -374,9 +433,69 @@ def sanitize(value: Any) -> Any:
         return s
     return value
 
+def validate_report(report: Any) -> None:
+    """Validate the stable, privacy-safe v1 report envelope before replacement."""
+    if not isinstance(report, dict): raise ValueError("report_schema_invalid")
+    required = {"schema_version", "mode", "status", "fixture"}
+    if not required.issubset(report): raise ValueError("report_schema_missing")
+    if report["schema_version"] != SCHEMA_VERSION: raise ValueError("report_schema_version_invalid")
+    if report["mode"] not in {"semantic-evaluation", "packaged-runtime"}: raise ValueError("report_mode_invalid")
+    if report["status"] not in {"passed", "failed", "not_run"}: raise ValueError("report_status_invalid")
+    fixture = report["fixture"]
+    if not isinstance(fixture, dict) or not all(isinstance(fixture.get(key), str) and fixture[key]
+            for key in ("id", "version", "scenario", "sha256")):
+        raise ValueError("report_fixture_invalid")
+    if fixture["version"] != FIXTURE_VERSION: raise ValueError("report_fixture_version_invalid")
+    def finite(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    def reject_non_finite(value: Any) -> None:
+        if isinstance(value, dict):
+            for child in value.values(): reject_non_finite(child)
+        elif isinstance(value, list):
+            for child in value: reject_non_finite(child)
+        elif isinstance(value, float) and not math.isfinite(value): raise ValueError("report_non_finite")
+    reject_non_finite(report)
+    if report["mode"] == "semantic-evaluation":
+        semantic = report.get("semantic")
+        if not isinstance(semantic, dict) or not isinstance(semantic.get("semantic_pass"), bool):
+            raise ValueError("report_semantic_invalid")
+        return
+    if report["status"] != "passed" and "runtime" not in report:
+        if not isinstance(report.get("code"), str) or not report["code"]: raise ValueError("report_failure_code_invalid")
+        return
+    runtime, backend, context = report.get("runtime"), report.get("backend"), report.get("context")
+    if not isinstance(runtime, dict) or not all(isinstance(runtime.get(key), str) and runtime[key]
+            for key in ("app_identity", "runtime_identity", "build_identity", "model_fingerprint")):
+        raise ValueError("report_runtime_invalid")
+    if not isinstance(backend, dict) or set(backend) != {"requested", "selected", "used"} or \
+            any(value not in {"cpu", "metal", "cuda"} for value in backend.values()):
+        raise ValueError("report_backend_invalid")
+    if not isinstance(context, dict) or context.get("tier") not in {"8k-fast", "64k-full"} or not all(
+            isinstance(context.get(key), int) and context[key] >= 0 for key in
+            ("window_tokens", "output_reservation_tokens", "prompt_tokens", "output_tokens")):
+        raise ValueError("report_context_invalid")
+    progress, metrics, semantic = report.get("progress"), report.get("metrics"), report.get("semantic")
+    if not isinstance(progress, dict) or progress.get("pass") is not True or not isinstance(progress.get("progress_event_count"), int):
+        raise ValueError("report_progress_invalid")
+    metric_keys = ("preparing_duration_s", "prefill_duration_s", "time_to_first_token_s",
+        "decode_duration_s", "total_duration_s", "prompt_tokens", "output_tokens",
+        "request_budget_s", "completion_margin_s")
+    if not isinstance(metrics, dict) or metrics.get("pass") is not True or not all(finite(metrics.get(key)) for key in metric_keys):
+        raise ValueError("report_metrics_invalid")
+    for key in ("prompt_tokens_per_s", "decode_tokens_per_s"):
+        if key not in metrics or (metrics[key] is not None and not finite(metrics[key])):
+            raise ValueError("report_metrics_invalid")
+    if not isinstance(semantic, dict) or not isinstance(semantic.get("semantic_pass"), bool):
+        raise ValueError("report_semantic_invalid")
+    aggregate = report.get("aggregate_semantic")
+    if not isinstance(aggregate, dict) or not isinstance(aggregate.get("trial_count"), int) or \
+            not isinstance(aggregate.get("exact_match_count"), int) or not finite(aggregate.get("pass_rate")):
+        raise ValueError("report_semantic_aggregate_invalid")
+
 def write_report_atomic(out_dir: Path, report: dict[str, Any]) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     report = sanitize({"schema_version": SCHEMA_VERSION, **report})
+    validate_report(report)
     text = _canonical_json(report) + "\n"
     fd, name = tempfile.mkstemp(prefix=".p8-report-", suffix=".json", dir=out_dir)
     with os.fdopen(fd, "w", encoding="utf-8") as f: f.write(text)
@@ -440,6 +559,18 @@ def classify_p8_landing_state(state: object) -> tuple[str, str | None]:
             and isinstance(response, str)):
         return "completed", response
     return "failed", None
+
+
+def observe_post_terminal(poller: Callable[[], object], *, clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep, window_s: float = 0.1,
+        interval_s: float = 0.01) -> list[object]:
+    """Collect a short bounded post-terminal window without a fixed long sleep."""
+    if not math.isfinite(window_s) or window_s < 0: raise ValueError("post_terminal_window_invalid")
+    deadline = clock() + window_s; observed: list[object] = []
+    while clock() < deadline:
+        observed.append(poller())
+        sleeper(min(interval_s, max(0.0, deadline - clock())))
+    return observed
 
 
 def _run_owned_runner(command: list[str], timeout_s: float,
@@ -578,28 +709,37 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     if not isinstance(payload, dict):
         return {"pass": False, "code": "packaged_evidence_malformed"}
     required = {"app_identity", "runtime_identity", "bundled_runtime_identity", "build_identity",
-        "backend_used", "model_fingerprint", "authoritative_prompt_tokens", "progress_events",
-        "authoritative_tokenizer_evidence", "terminal", "response_text", "start_s", "first_token_s", "end_s", "output_tokens"}
-    missing_evidence = sorted(key for key in required if payload.get(key) in (None, "", [], {}))
+        "backend_requested", "backend_selected", "backend_used", "model_fingerprint",
+        "authoritative_prompt_tokens", "progress_events",
+        "authoritative_tokenizer_evidence", "terminal_observation", "result_observation",
+        "response_text", "start_s", "preparing_end_s", "prefill_end_s", "first_token_s", "end_s",
+        "output_tokens", "post_terminal_observations"}
+    missing_evidence = sorted(key for key in required if key not in payload or payload.get(key) in (None, "", {}))
     if missing_evidence:
         if "authoritative_tokenizer_evidence" in missing_evidence:
             return {"pass": False, "code": "authoritative_target_depth_unavailable",
                 "missing_seam": "packaged_admission_render_and_tokenize_chat_prefix_counts"}
         return {"pass": False, "code": "packaged_evidence_missing", "missing": missing_evidence}
+    if (not isinstance(payload["authoritative_prompt_tokens"], int) or
+            isinstance(payload["authoritative_prompt_tokens"], bool) or
+            payload["authoritative_prompt_tokens"] <= 0 or
+            not isinstance(payload["output_tokens"], int) or isinstance(payload["output_tokens"], bool) or
+            payload["output_tokens"] < 0 or not isinstance(payload["progress_events"], list) or
+            not isinstance(payload["post_terminal_observations"], list)):
+        return {"pass": False, "code": "packaged_evidence_malformed"}
     authoritative_offsets, depth_error = _validate_authoritative_tokenizer_evidence(
         payload["authoritative_tokenizer_evidence"], manifest,
         payload["runtime_identity"], payload["authoritative_prompt_tokens"])
     if depth_error:
         return {"pass": False, "code": depth_error}
-    progress = analyze_progress(payload.get("progress_events", []), payload.get("terminal", "completed"))
+    observations = [*payload.get("progress_events", []), payload["result_observation"],
+        payload["terminal_observation"], *payload["post_terminal_observations"]]
+    progress = analyze_progress(observations)
     semantic = evaluate_semantic(payload.get("response_text", ""), manifest)
-    metrics = summarize_metrics(
-        float(payload.get("start_s", 0.0)),
-        payload.get("first_token_s"),
-        float(payload.get("end_s", 0.0)),
-        int(payload.get("authoritative_prompt_tokens", 0)),
-        int(payload.get("output_tokens", 0)),
-    )
+    metrics = summarize_metrics(start_s=payload["start_s"], preparing_end_s=payload["preparing_end_s"],
+        prefill_end_s=payload["prefill_end_s"], first_token_s=payload["first_token_s"],
+        end_s=payload["end_s"], prompt_tokens=payload["authoritative_prompt_tokens"],
+        output_tokens=payload["output_tokens"], request_budget_s=timeout_s)
     evidence = {
         "runner_kind": "repository_packaged_desktop_webdriver",
         "fixture": {"id": fixture_id, "sha256": manifest.get("fixture_sha256"),
@@ -614,7 +754,8 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         "metrics": metrics,
         "memory": payload.get("memory", {}),
         "runtime": {key: payload[key] for key in ("app_identity", "runtime_identity",
-            "bundled_runtime_identity", "build_identity", "backend_used", "model_fingerprint",
+            "bundled_runtime_identity", "build_identity", "backend_requested", "backend_selected",
+            "backend_used", "model_fingerprint",
             "authoritative_prompt_tokens")},
     }
     if "kv_estimate" in payload or "kv_runtime" in payload:
@@ -622,9 +763,10 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     runtime = evidence["runtime"]
     identity_ok = (runtime["app_identity"] not in {"dev", "mock", "unknown"} and
         runtime["runtime_identity"] == runtime.get("bundled_runtime_identity") and
+        runtime["backend_requested"] == backend and runtime["backend_selected"] == backend and
         runtime["backend_used"] == backend)
     final_total = (progress.get("final_progress") or {}).get("total_prompt_tokens")
-    runtime_contract_pass = bool(progress.get("pass") and identity_ok
+    runtime_contract_pass = bool(progress.get("pass") and metrics.get("pass") and identity_ok
         and payload["authoritative_prompt_tokens"] == final_total)
     if "kv_compare" in evidence:
         runtime_contract_pass = runtime_contract_pass and bool(evidence["kv_compare"].get("pass"))
@@ -644,7 +786,11 @@ def cancellation_recovery_result(events: list[dict[str, Any]], *, phase: str, th
             if isinstance(count, int) and count >= threshold:
                 ack = True
                 break
-    progress = analyze_progress(events, "cancelled")
+    if events:
+        last = events[-1]
+        events = [*events, {"kind": "terminal", "state": "cancelled",
+            "sequence": last.get("sequence", 0) + 1, "elapsed_ms": last.get("elapsed_ms", 0) + 1}]
+    progress = analyze_progress(events)
     errors = []
     if not ack: errors.append("cancel_not_triggered")
     if not progress["pass"]: errors.extend(progress["errors"])
@@ -674,7 +820,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "generate-fixture":
         prompt, manifest = generate_fixture(args.fixture, args.seed, scenario=args.scenario); validate_manifest(manifest, prompt); out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True); (out/f"{args.fixture}.prompt.txt").write_text(prompt); (out/f"{args.fixture}.manifest.json").write_text(_canonical_json(manifest)+"\n"); print(f"generated {args.fixture}: scenario={args.scenario} requested={manifest['requested_tokens']} actual={manifest['actual_tokens']} sha256={manifest['fixture_sha256']}"); return 0
     if args.cmd == "evaluate":
-        manifest=json.loads(Path(args.manifest).read_text()); validate_manifest(manifest); response=Path(args.response).read_text(); score=evaluate_semantic(response, manifest); path=write_report_atomic(Path(args.out_dir), {"mode":"semantic-evaluation","semantic":score,"fixture":{"id":manifest.get("fixture_id"),"sha256":manifest.get("fixture_sha256"),"actual_tokens":manifest.get("actual_tokens")}}); print(f"semantic_pass={score.get('semantic_pass', False)} report={path}"); return 1 if args.strict and not score.get("semantic_pass") else 0
+        manifest=json.loads(Path(args.manifest).read_text()); validate_manifest(manifest); response=Path(args.response).read_text(); score=evaluate_semantic(response, manifest); path=write_report_atomic(Path(args.out_dir), {"mode":"semantic-evaluation", "status":"passed" if score["semantic_pass"] else "failed", "semantic":score,"fixture":{"id":manifest["fixture_id"], "version":manifest["fixture_version"], "scenario":manifest["scenario"], "sha256":manifest["fixture_sha256"]}}); print(f"semantic_pass={score.get('semantic_pass', False)} report={path}"); return 1 if args.strict and not score.get("semantic_pass") else 0
     if args.cmd == "packaged-runtime":
         if bool(args.prompt) != bool(args.manifest):
             p.error("--prompt and --manifest are mutually required")
@@ -685,8 +831,28 @@ def main(argv: list[str] | None = None) -> int:
             cleanup_timeout_s=args.cleanup_timeout, context_tier=args.context_tier,
             report_only=args.report_only, external_prompt=external_prompt,
             external_manifest=external_manifest)
-        path=write_report_atomic(Path(args.out_dir), {"mode":"packaged-runtime",
-            "runtime":{"platform":platform.system().lower()},"evidence":evidence})
+        if evidence.get("runtime_contract_pass"):
+            profile = get_context_profile(args.context_tier)
+            report = {"mode":"packaged-runtime", "status":"passed" if evidence.get("pass") else "failed",
+                "code":"ok" if evidence.get("pass") else "semantic_failure", "overall_pass":bool(evidence.get("pass")),
+                "report_only_accepted":bool(evidence.get("report_only_accepted")), "fixture":{
+                "id":args.fixture, "version":FIXTURE_VERSION, "scenario":args.scenario,
+                "sha256":evidence["fixture"]["sha256"]}, "runtime":evidence["runtime"],
+                "backend":{"requested":evidence["runtime"]["backend_requested"],
+                    "selected":evidence["runtime"]["backend_selected"], "used":evidence["runtime"]["backend_used"]},
+                "context":{"tier":args.context_tier, "window_tokens":profile.total_context_tokens,
+                    "output_reservation_tokens":profile.default_output_reservation_tokens,
+                    "prompt_tokens":evidence["fixture"]["authoritative_prompt_tokens"],
+                    "output_tokens":evidence["metrics"]["output_tokens"]},
+                "progress":evidence["progress"], "metrics":evidence["metrics"],
+                "semantic":evidence["semantic"], "aggregate_semantic":{"trial_count":1,
+                    "exact_match_count":int(evidence["semantic"]["semantic_pass"]),
+                    "pass_rate":float(evidence["semantic"]["semantic_pass"])}}
+        else:
+            report = {"mode":"packaged-runtime", "status":"not_run", "code":evidence.get("code", "packaged_contract_failed"),
+                "fixture":{"id":args.fixture, "version":FIXTURE_VERSION, "scenario":args.scenario,
+                    "sha256":"unavailable"}}
+        path=write_report_atomic(Path(args.out_dir), report)
         print(f"packaged_runtime_pass={evidence.get('pass', False)} report={path}")
         return 0 if evidence.get("pass") or evidence.get("report_only_accepted") else 1
     return 2

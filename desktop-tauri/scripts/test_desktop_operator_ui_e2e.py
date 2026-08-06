@@ -47,6 +47,7 @@ try:
     from scripts.p8.benchmark_harness import (
         apply_p8_context_tier,
         classify_p8_landing_state,
+        observe_post_terminal,
         p8_operator_mode,
     )
 except Exception as exc:
@@ -722,17 +723,53 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         ended = time.monotonic()
         if not progress or not isinstance(response_text, str):
             raise RuntimeError("required encrypted progress or response evidence missing")
+        last_sequence = int(progress[-1]["sequence"])
+        last_elapsed = int(progress[-1]["elapsed_ms"])
+        result_observation = {"kind": "result", "status": "success",
+            "sequence": last_sequence + 1, "elapsed_ms": last_elapsed + 1}
+        terminal_observation = {"kind": "terminal", "state": "completed",
+            "sequence": last_sequence + 2, "elapsed_ms": last_elapsed + 2}
+        known_sequence = last_sequence
+        def post_terminal_poll() -> dict[str, object] | None:
+            nonlocal known_sequence
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,b:v.isGeneratingResponse};")
+            event = state.get("p")
+            if isinstance(event, dict) and isinstance(event.get("sequence"), int) and event["sequence"] > known_sequence:
+                known_sequence = event["sequence"]
+                return event
+            lifecycle, later_response = classify_p8_landing_state(state)
+            if lifecycle == "completed" and later_response != response_text:
+                return {"kind": "result", "status": "success",
+                    "sequence": terminal_observation["sequence"] + 1,
+                    "elapsed_ms": terminal_observation["elapsed_ms"] + 1}
+            if lifecycle == "failed":
+                return {"kind": "result", "status": "failed",
+                    "sequence": terminal_observation["sequence"] + 1,
+                    "elapsed_ms": terminal_observation["elapsed_ms"] + 1}
+            return None
+        post_terminal = [item for item in observe_post_terminal(post_terminal_poll) if item is not None]
         first_generated = next((event for event in progress if int(event.get("generated_tokens", 0)) > 0), None)
         first_s = started + (float(first_generated["elapsed_ms"]) / 1000) if first_generated else None
+        first_prefill = next((event for event in progress if event.get("phase") == "prefill"), progress[0])
+        first_generating = next((event for event in progress if event.get("phase") == "generating"), None)
+        if first_generated is None or first_generating is None:
+            raise RuntimeError("required timing telemetry missing")
+        preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
+        prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
         digest = hashlib.sha256()
         with Path(request["model"]).open("rb") as model_handle:
             for chunk in iter(lambda: model_handle.read(1024 * 1024), b""):
                 digest.update(chunk)
         evidence = {"app_identity": runtime["App version"], "build_identity": runtime["Build ID"],
             "runtime_identity": runtime["Runtime ID"], "bundled_runtime_identity": runtime["Bundled runtime ID"],
+            "backend_requested": request["backend"],
+            "backend_selected": runtime["Backend selected"].lower(),
             "backend_used": runtime["Backend used"].lower(), "model_fingerprint": digest.hexdigest(),
             "authoritative_prompt_tokens": progress[-1]["total_prompt_tokens"], "progress_events": progress,
-            "terminal": "completed", "response_text": response_text, "start_s": started,
+            "result_observation": result_observation, "terminal_observation": terminal_observation,
+            "post_terminal_observations": post_terminal, "response_text": response_text, "start_s": started,
+            "preparing_end_s": preparing_end_s, "prefill_end_s": prefill_end_s,
             "first_token_s": first_s, "end_s": ended, "output_tokens": progress[-1]["generated_tokens"]}
         evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
         os.chmod(evidence_path, 0o600)

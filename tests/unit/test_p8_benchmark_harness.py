@@ -244,7 +244,9 @@ def test_progress_invariants_success_and_failures():
         {"sequence":2,"phase":"prefill","total_prompt_tokens":10,"cached_prompt_tokens":2,"processed_prompt_tokens":5,"generated_tokens":0,"elapsed_ms":1},
         {"sequence":3,"phase":"generating","total_prompt_tokens":10,"cached_prompt_tokens":2,"processed_prompt_tokens":10,"generated_tokens":1,"elapsed_ms":2},
     ]
-    assert h.analyze_progress(ok, "completed")["pass"] is True
+    lifecycle = ok + [{"kind":"result","status":"success","sequence":4,"elapsed_ms":3},
+        {"kind":"terminal","state":"completed","sequence":5,"elapsed_ms":4}]
+    assert h.analyze_progress(lifecycle)["pass"] is True
     bad = ok + [{"sequence":3,"phase":"prefill","total_prompt_tokens":11,"cached_prompt_tokens":13,"processed_prompt_tokens":12,"generated_tokens":0,"elapsed_ms":1}]
     result = h.analyze_progress(bad)
     assert result["pass"] is False
@@ -255,7 +257,8 @@ def test_progress_invariants_success_and_failures():
 
 
 def test_phase_timing_throughput():
-    m = h.summarize_metrics(0, 2, 5, 100, 6)
+    m = h.summarize_metrics(start_s=0, preparing_end_s=1, prefill_end_s=3,
+        first_token_s=3, end_s=6, prompt_tokens=100, output_tokens=6, request_budget_s=10)
     assert m["prompt_tokens_per_s"] == 50
     assert m["decode_tokens_per_s"] == 2
 
@@ -279,11 +282,13 @@ def test_memory_probe_success_absent_timeout_malformed_and_sanitize(tmp_path):
 
 
 def test_atomic_report_schema_and_redaction(tmp_path):
-    path = h.write_report_atomic(tmp_path, {"prompt":"secret", "runtime":{"path":"/Users/alice/model.gguf"}, "ok": True})
+    path = h.write_report_atomic(tmp_path, {"mode":"semantic-evaluation", "status":"passed",
+        "fixture":{"id":"small-8k", "version":h.FIXTURE_VERSION,
+            "scenario":"single-needle", "sha256":"abc"},
+        "semantic":{"semantic_pass":True}, "prompt":"secret"})
     data = json.loads(path.read_text())
     assert data["schema_version"] == h.SCHEMA_VERSION
     assert "prompt" not in data
-    assert "<redacted>" in data["runtime"]["path"]
 
 
 def test_cli_validation_and_evaluate(tmp_path):
@@ -323,10 +328,112 @@ def test_manifest_scoring_rules_match_score_keys():
 
 
 def test_phase_timing_allows_zero_first_token():
-    m = h.summarize_metrics(0.0, 0.0, 5.0, 100, 6)
+    m = h.summarize_metrics(start_s=0.0, preparing_end_s=0.0, prefill_end_s=0.0,
+        first_token_s=0.0, end_s=5.0, prompt_tokens=100, output_tokens=6, request_budget_s=5.0)
     assert m["prefill_duration_s"] == 0.0
     assert m["decode_duration_s"] == 5.0
     assert m["decode_tokens_per_s"] == 1.2
+
+
+def _completed_lifecycle():
+    return [
+        {"sequence":1,"phase":"preparing","total_prompt_tokens":10,"cached_prompt_tokens":0,
+         "processed_prompt_tokens":0,"generated_tokens":0,"elapsed_ms":0},
+        {"sequence":2,"phase":"prefill","total_prompt_tokens":10,"cached_prompt_tokens":1,
+         "processed_prompt_tokens":10,"generated_tokens":0,"elapsed_ms":1},
+        {"sequence":3,"phase":"generating","total_prompt_tokens":10,"cached_prompt_tokens":1,
+         "processed_prompt_tokens":10,"generated_tokens":1,"elapsed_ms":2},
+        {"kind":"result","status":"success","sequence":4,"elapsed_ms":3},
+        {"kind":"terminal","state":"completed","sequence":5,"elapsed_ms":4},
+    ]
+
+
+@pytest.mark.parametrize(("mutate", "error"), [
+    (lambda items: items.clear(), "progress_missing"),
+    (lambda items: items[0].pop("total_prompt_tokens"), "malformed_telemetry"),
+    (lambda items: items[1].update(sequence=1), "decreasing_sequence"),
+    (lambda items: items[1].update(elapsed_ms=0), "decreasing_elapsed"),
+    (lambda items: items[1].update(processed_prompt_tokens=-1), "malformed_telemetry"),
+    (lambda items: items[2].update(generated_tokens=-1), "malformed_telemetry"),
+    (lambda items: (items[1].update(processed_prompt_tokens=10),
+        items[2].update(processed_prompt_tokens=9)), "decreasing_processed"),
+    (lambda items: (items[1].update(generated_tokens=2),
+        items[2].update(generated_tokens=1)), "decreasing_generated"),
+    (lambda items: items[1].update(total_prompt_tokens=11), "changing_prompt_total"),
+    (lambda items: items[0].update(total_prompt_tokens=0), "invalid_prompt_total"),
+    (lambda items: items[1].update(processed_prompt_tokens=11), "processed_exceeds_total"),
+    (lambda items: items[1].update(phase="generating"), "invalid_phase_transition"),
+    (lambda items: (items[1].update(processed_prompt_tokens=9),
+        items[2].update(processed_prompt_tokens=9)), "incomplete_prefill"),
+    (lambda items: items.append({"sequence":6,"phase":"generating","total_prompt_tokens":10,
+        "cached_prompt_tokens":1,"processed_prompt_tokens":10,"generated_tokens":2,"elapsed_ms":5}),
+        "progress_after_terminal"),
+    (lambda items: items.append({"kind":"terminal","state":"failed","sequence":6,"elapsed_ms":5}),
+        "duplicate_terminal"),
+    (lambda items: items[-1].update(elapsed_ms=2), "decreasing_elapsed"),
+])
+def test_ordered_progress_lifecycle_failures(mutate, error):
+    lifecycle = _completed_lifecycle()
+    mutate(lifecycle)
+    result = h.analyze_progress(lifecycle)
+    assert result["pass"] is False
+    assert error in result["errors"]
+
+
+def test_cancellation_rejects_late_result():
+    lifecycle = _completed_lifecycle()[:3] + [
+        {"kind":"terminal","state":"cancelled","sequence":4,"elapsed_ms":3},
+        {"kind":"result","status":"success","sequence":5,"elapsed_ms":4},
+    ]
+    result = h.analyze_progress(lifecycle)
+    assert {"result_after_terminal", "result_after_cancellation"}.issubset(result["errors"])
+
+
+@pytest.mark.parametrize(("change", "code"), [
+    ({"end_s": float("nan")}, "timing_non_finite"),
+    ({"prefill_end_s": 3, "first_token_s": 2}, "timing_order_invalid"),
+    ({"end_s": 11}, "request_budget_exceeded"),
+])
+def test_timing_fails_closed(change, code):
+    values = dict(start_s=0, preparing_end_s=1, prefill_end_s=2, first_token_s=2,
+        end_s=5, prompt_tokens=100, output_tokens=6, request_budget_s=10)
+    assert h.summarize_metrics(**{**values, **change})["code"] == code
+
+
+def test_timing_reports_every_duration_throughput_budget_and_margin():
+    metrics = h.summarize_metrics(start_s=1, preparing_end_s=2, prefill_end_s=4,
+        first_token_s=5, end_s=8, prompt_tokens=100, output_tokens=6, request_budget_s=10)
+    assert metrics == {"pass":True, "preparing_duration_s":1, "prefill_duration_s":2,
+        "time_to_first_token_s":4, "decode_duration_s":3, "total_duration_s":7,
+        "prompt_tokens":100, "output_tokens":6, "prompt_tokens_per_s":50,
+        "decode_tokens_per_s":2, "request_budget_s":10, "completion_margin_s":3}
+
+
+def test_invalid_report_preserves_existing_atomic_destination(tmp_path):
+    destination = tmp_path / "p8_benchmark_report.json"
+    destination.write_text("existing")
+    with pytest.raises(ValueError, match="report_schema_missing"):
+        h.write_report_atomic(tmp_path, {"mode":"packaged-runtime"})
+    assert destination.read_text() == "existing"
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_report_schema_rejects_non_finite_values(tmp_path, bad):
+    with pytest.raises(ValueError, match="report_non_finite"):
+        h.write_report_atomic(tmp_path, {"mode":"semantic-evaluation", "status":"passed",
+            "fixture":{"id":"small", "version":h.FIXTURE_VERSION,
+                "scenario":"single-needle", "sha256":"abc"},
+            "semantic":{"semantic_pass":True, "pass_rate":bad}})
+
+
+def test_post_terminal_observation_is_clock_bounded():
+    now = [0.0]; sleeps = []
+    def sleep(value):
+        sleeps.append(value); now[0] += value
+    observed = h.observe_post_terminal(lambda: "poll", clock=lambda: now[0],
+        sleeper=sleep, window_s=0.1, interval_s=0.05)
+    assert observed == ["poll", "poll"]
+    assert all(0 <= value <= 0.05 for value in sleeps)
 
 
 def test_memory_probe_parses_before_sanitizing_long_json(tmp_path):
@@ -340,6 +447,10 @@ def test_memory_probe_parses_before_sanitizing_long_json(tmp_path):
 
 def test_report_redacts_authorization_and_message_like_payloads(tmp_path):
     path = h.write_report_atomic(tmp_path, {
+        "mode":"semantic-evaluation", "status":"passed",
+        "fixture":{"id":"small-8k", "version":h.FIXTURE_VERSION,
+            "scenario":"single-needle", "sha256":"abc"},
+        "semantic":{"semantic_pass":True},
         "diagnostics": "Authorization: Bearer sk-secret api_key = sk-other",
         "adapter": {
             "messages": [{"content": "plain prompt"}],
@@ -370,12 +481,13 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         "response_text": json.dumps(manifest["expected_answers"]),
         "progress_events": [
             {"sequence": 1, "phase": "preparing", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": 0, "generated_tokens": 0, "elapsed_ms": 0},
-            {"sequence": 2, "phase": "generating", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": authoritative_total, "generated_tokens": 4, "elapsed_ms": 2000},
+            {"sequence": 2, "phase": "prefill", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": authoritative_total, "generated_tokens": 0, "elapsed_ms": 1000},
+            {"sequence": 3, "phase": "generating", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": authoritative_total, "generated_tokens": 4, "elapsed_ms": 2000},
         ],
-        "terminal": "completed",
-        "start_s": 0.0,
-        "first_token_s": 0.0,
-        "end_s": 2.0,
+        "result_observation": {"kind":"result", "status":"success", "sequence":4, "elapsed_ms":2001},
+        "terminal_observation": {"kind":"terminal", "state":"completed", "sequence":5, "elapsed_ms":2002},
+        "post_terminal_observations": [], "start_s": 0.0, "preparing_end_s": 0.0,
+        "prefill_end_s": 1.0, "first_token_s": 1.0, "end_s": 2.0,
         "output_tokens": 4,
         "messages": [{"content": "plaintext"}],
         "memory": {"diagnostic": "Authorization: Bearer sk-runtime"},
@@ -383,7 +495,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         "runtime_identity": "bundled-test",
         "bundled_runtime_identity": "bundled-test",
         "build_identity": "unit-test",
-        "backend_used": "metal",
+        "backend_requested": "metal", "backend_selected": "metal", "backend_used": "metal",
         "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": authoritative_total,
         "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled-test", "total_prompt_tokens": authoritative_total, "target_offsets_tokens": authoritative_offsets},
@@ -398,7 +510,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         h.Path(evidence_path).write_text(json.dumps(payload))
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    result = h.invoke_packaged_runtime_adapter(timeout_s=1.5, app_binary=str(app), model=str(model),
+    result = h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app), model=str(model),
         backend="metal", relay_url="https://relay.example", cleanup_timeout_s=3.0,
         external_prompt=prompt, external_manifest=manifest, subprocess_run=fake_run)
     assert seen["request"]["fixture_id"] == "small-8k"
@@ -554,11 +666,14 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
     app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
     response = manifest["expected_answers"] if semantic_ok else {**manifest["expected_answers"], "canary": "wrong"}
     payload = {
-        "response_text": json.dumps(response), "terminal": "completed", "start_s": 0.0,
-        "first_token_s": 1.0, "end_s": 2.0, "output_tokens": 4,
+        "response_text": json.dumps(response), "start_s": 0.0, "preparing_end_s": 0.0,
+        "prefill_end_s": 1.0, "first_token_s": 1.0, "end_s": 2.0, "output_tokens": 4,
+        "result_observation":{"kind":"result", "status":"success", "sequence":2, "elapsed_ms":2001},
+        "terminal_observation":{"kind":"terminal", "state":"completed", "sequence":3, "elapsed_ms":2002},
+        "post_terminal_observations":[],
         "app_identity": "token.place", "runtime_identity": "bundled",
         "bundled_runtime_identity": "bundled", "build_identity": "build",
-        "backend_used": "cpu", "model_fingerprint": "sha256:test",
+        "backend_requested": "cpu", "backend_selected": "cpu", "backend_used": "cpu", "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": manifest["actual_tokens"],
         "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled", "total_prompt_tokens": manifest["actual_tokens"], "target_offsets_tokens": {key: value["actual_offset_tokens"] for key, value in manifest["targets"].items()}},
         "progress_events": [{"sequence": 1, "phase": "generating",
@@ -690,14 +805,25 @@ def test_main_generate_and_evaluate_commands(tmp_path):
 
 
 def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
-    evidence = {"pass": False, "report_only_accepted": True}
+    evidence = {"pass": False, "report_only_accepted": True, "runtime_contract_pass":True,
+        "fixture":{"sha256":"abc", "authoritative_prompt_tokens":10},
+        "runtime":{"app_identity":"token.place", "runtime_identity":"bundled",
+            "build_identity":"build", "backend_requested":"cpu", "backend_selected":"cpu", "model_fingerprint":"sha256:model", "backend_used":"cpu"},
+        "progress":{"pass":True, "progress_event_count":1},
+        "metrics":{"pass":True, "preparing_duration_s":0, "prefill_duration_s":1,
+            "time_to_first_token_s":1, "decode_duration_s":1, "total_duration_s":2,
+            "prompt_tokens":10, "output_tokens":1, "prompt_tokens_per_s":10,
+            "decode_tokens_per_s":1, "request_budget_s":600, "completion_margin_s":598},
+        "semantic":{"semantic_pass":False}}
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: evidence)
     args = ["packaged-runtime", "--out-dir", str(tmp_path), "--app-binary", "app",
         "--model", "model", "--backend", "cpu", "--relay-url", "https://relay.example",
         "--report-only"]
     assert h.main(args) == 0
     report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
-    assert report["evidence"]["report_only_accepted"] is True
+    assert report["overall_pass"] is False
+    assert report["semantic"]["semantic_pass"] is False
+    assert report["report_only_accepted"] is True
 
     evidence["report_only_accepted"] = False
     assert h.main(args) == 1

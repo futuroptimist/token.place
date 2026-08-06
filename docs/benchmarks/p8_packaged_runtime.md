@@ -154,9 +154,25 @@ Reports use schema `p8-benchmark-report-v1` and are written atomically as
 `p8_benchmark_report.json` in the selected output directory. Reports are sanitized for GitHub issue
 attachment: prompt/response bodies, ciphertext, IVs, keys, cancellation tokens, high-cardinality
 request/client/session IDs, absolute user paths, secrets, and unbounded subprocess output are
-removed or redacted.
+removed or redacted. The sanitized document is validated before atomic replacement. A missing key,
+wrong type or enum, non-finite number, inconsistent mode-specific field, or unsupported schema or
+fixture version fails the command; an existing destination report remains untouched.
 
-Physical run adapters should populate these low-cardinality fields when available:
+Every report has `schema_version`, `mode`, categorical `status`, and a fixture identity containing
+`id`, `version`, `scenario`, and SHA-256. Semantic reports additionally require the complete semantic
+score. A successful packaged-runtime contract requires:
+
+- packaged app, build, bundled runtime, and safe model-fingerprint identity;
+- requested, selected, and used backend (`cpu`, `metal`, or `cuda`);
+- context tier, context window, output reservation, authoritative prompt count, and output count;
+- the validated progress summary and ordered terminal/result evidence;
+- every timing, throughput, request-budget, and completion-margin field;
+- the complete semantic score and aggregate trial count, exact-match count, and pass rate.
+
+Failed or `not_run` packaged reports require a stable categorical failure code. Report validation
+does not fill absent telemetry with zero and does not allow `NaN` or infinity.
+
+Physical runs report these low-cardinality fields:
 
 - runtime/app version and build ID;
 - benchmark and fixture versions;
@@ -179,7 +195,33 @@ python -m json.tool .tmp/p8-report/p8_benchmark_report.json >/dev/null
 
 ## Progress, cancellation, and recovery invariants
 
-Progress contract checks use the production phases `preparing`, `prefill`, and `generating`. Completion, cancellation, and failure are derived from the response/control lifecycle rather than from a required terminal progress event. Checks reject decreasing sequence numbers, decreasing processed/generated/elapsed counters, changing prompt totals, cached counts above processed counts, processed counts above total, invalid phase transitions, post-terminal/stale progress reported by the adapter lifecycle, and late results after cancellation.
+The evidence stream is ordered. Each observation has a strictly increasing integer `sequence` and
+strictly increasing non-negative integer `elapsed_ms` in the request's monotonic clock domain.
+Progress observations use only the production phases `preparing`, `prefill`, and `generating`;
+phases may repeat or advance one step and never regress or skip a phase after observation begins.
+Every progress observation contains a positive, stable `total_prompt_tokens` plus non-negative
+`cached_prompt_tokens`, `processed_prompt_tokens`, and `generated_tokens`. Processed and generated
+counts are monotonic, cached never exceeds processed, and processed never exceeds total.
+
+The successful API response is an ordered `result` observation followed by exactly one ordered
+`terminal` observation with state `completed`. Cancellation and failure instead use `cancelled` or
+`failed`. Completion requires at least one progress observation, a generating phase, exactly one
+successful result, and full prompt processing. Duplicate or conflicting terminal observations,
+terminal timestamps preceding prior progress, results after cancellation, and any result or
+progress after terminal are categorical failures. The desktop runner continues polling for a short
+monotonic-deadline-bounded window after completion so late progress or a conflicting result is
+observable; it does not use a multi-second fixed sleep. Missing or malformed lifecycle telemetry
+returns stable errors such as `progress_missing`, `malformed_telemetry`, `incomplete_prefill`, or
+`progress_after_terminal` rather than passing or raising an uncaught exception.
+
+Timings use five ordered monotonic boundaries: request start, end of preparing, end of prefill,
+first generated token, and request end. They produce preparing duration, prefill duration,
+time-to-first-token, decode duration, and total duration. Prompt throughput is authoritative prompt
+tokens divided by prefill duration; decode throughput is authoritative output tokens divided by
+decode duration. The report also records the request budget and `budget - total duration` completion
+margin. Zero-duration boundaries are valid and retain a zero duration (their division-based
+throughput is `null`); absent, non-finite, reversed, or over-budget timing fails closed and is never
+coerced to zero.
 
 Cancellation scenarios must be progress-triggered, not sleep-only:
 

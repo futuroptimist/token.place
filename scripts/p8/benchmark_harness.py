@@ -334,6 +334,7 @@ def analyze_progress(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     last_seq = -1; last_elapsed = -1; last_processed = 0; last_generated = 0
     last_phase = -1; total: int | None = None; terminal_seen = False
+    observed_phases: set[str] = set()
     for item in observations:
         if not isinstance(item, dict):
             errors.append("malformed_observation"); continue
@@ -360,6 +361,7 @@ def analyze_progress(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
         progress.append(item)
         phase = item.get("phase")
         if phase not in PHASES: errors.append("invalid_phase"); continue
+        observed_phases.add(phase)
         if PHASES[phase] < last_phase or (last_phase >= 0 and PHASES[phase] > last_phase + 1): errors.append("invalid_phase_transition")
         last_phase = max(last_phase, PHASES[phase])
         p, c, g, current_total = (item.get(key) for key in ("processed_prompt_tokens",
@@ -382,6 +384,7 @@ def analyze_progress(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
     if terminal_state == "completed":
         if len(results) != 1: errors.append("successful_result_missing")
         if total is None or last_processed != total: errors.append("incomplete_prefill")
+        if "prefill" not in observed_phases: errors.append("prefill_phase_missing")
         if last_phase != PHASES["generating"]: errors.append("terminal_lifecycle_without_generation")
     return {"pass": not errors, "errors": list(dict.fromkeys(errors)),
         "progress_event_count": len(progress), "first_progress": progress[0] if progress else None,

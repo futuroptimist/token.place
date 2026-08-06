@@ -389,6 +389,33 @@ def test_cancellation_rejects_late_result():
     assert {"result_after_terminal", "result_after_cancellation"}.issubset(result["errors"])
 
 
+def test_completed_generating_only_lifecycle_requires_prefill():
+    lifecycle = [
+        {"sequence":1,"phase":"generating","total_prompt_tokens":10,
+         "cached_prompt_tokens":0,"processed_prompt_tokens":10,"generated_tokens":1,"elapsed_ms":0},
+        {"kind":"result","status":"success","sequence":2,"elapsed_ms":1},
+        {"kind":"terminal","state":"completed","sequence":3,"elapsed_ms":2},
+    ]
+    result = h.analyze_progress(lifecycle)
+    assert result["pass"] is False
+    assert "prefill_phase_missing" in result["errors"]
+
+
+def test_completed_lifecycle_may_begin_with_prefill():
+    lifecycle = _completed_lifecycle()[1:]
+    for sequence, observation in enumerate(lifecycle, start=1):
+        observation["sequence"] = sequence
+    assert h.analyze_progress(lifecycle)["pass"] is True
+
+
+def test_missing_prefill_cannot_become_zero_duration_passing_metrics():
+    lifecycle = _completed_lifecycle()
+    lifecycle.pop(1)
+    result = h.analyze_progress(lifecycle)
+    assert result["pass"] is False
+    assert "prefill_phase_missing" in result["errors"]
+
+
 @pytest.mark.parametrize(("change", "code"), [
     ({"end_s": float("nan")}, "timing_non_finite"),
     ({"prefill_end_s": 3, "first_token_s": 2}, "timing_order_invalid"),
@@ -668,18 +695,23 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
     payload = {
         "response_text": json.dumps(response), "start_s": 0.0, "preparing_end_s": 0.0,
         "prefill_end_s": 1.0, "first_token_s": 1.0, "end_s": 2.0, "output_tokens": 4,
-        "result_observation":{"kind":"result", "status":"success", "sequence":2, "elapsed_ms":2001},
-        "terminal_observation":{"kind":"terminal", "state":"completed", "sequence":3, "elapsed_ms":2002},
+        "result_observation":{"kind":"result", "status":"success", "sequence":3, "elapsed_ms":2001},
+        "terminal_observation":{"kind":"terminal", "state":"completed", "sequence":4, "elapsed_ms":2002},
         "post_terminal_observations":[],
         "app_identity": "token.place", "runtime_identity": "bundled",
         "bundled_runtime_identity": "bundled", "build_identity": "build",
         "backend_requested": "cpu", "backend_selected": "cpu", "backend_used": "cpu", "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": manifest["actual_tokens"],
         "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled", "total_prompt_tokens": manifest["actual_tokens"], "target_offsets_tokens": {key: value["actual_offset_tokens"] for key, value in manifest["targets"].items()}},
-        "progress_events": [{"sequence": 1, "phase": "generating",
-            "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0,
-            "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4,
-            "elapsed_ms": 2000}],
+        "progress_events": [
+            {"sequence": 1, "phase": "prefill",
+             "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0,
+             "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 0,
+             "elapsed_ms": 1000},
+            {"sequence": 2, "phase": "generating",
+             "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0,
+             "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4,
+             "elapsed_ms": 2000}],
     }
     def fake_run(command, **kwargs):
         h.Path(command[command.index("--p8-evidence") + 1]).write_text(json.dumps(payload))

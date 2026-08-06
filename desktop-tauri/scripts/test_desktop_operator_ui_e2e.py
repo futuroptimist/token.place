@@ -751,8 +751,10 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         post_terminal = [item for item in observe_post_terminal(post_terminal_poll) if item is not None]
         first_generated = next((event for event in progress if int(event.get("generated_tokens", 0)) > 0), None)
         first_s = started + (float(first_generated["elapsed_ms"]) / 1000) if first_generated else None
-        first_prefill = next((event for event in progress if event.get("phase") == "prefill"), progress[0])
+        first_prefill = next((event for event in progress if event.get("phase") == "prefill"), None)
         first_generating = next((event for event in progress if event.get("phase") == "generating"), None)
+        if first_prefill is None:
+            raise RuntimeError("prefill_phase_missing")
         if first_generated is None or first_generating is None:
             raise RuntimeError("required timing telemetry missing")
         preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000

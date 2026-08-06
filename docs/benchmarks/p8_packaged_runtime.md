@@ -269,15 +269,41 @@ python scripts/p8_benchmark.py packaged-runtime \
   --relay-url http://127.0.0.1:8000 \
   --request-timeout 600 \
   --cleanup-timeout 30 \
+  --cancellation-validation \
+  --prefill-cancel-fraction 0.5 \
+  --generation-cancel-tokens 8 \
+  --cancellation-observation-window 0.5 \
+  --cancellation-recovery-timeout 30 \
   --out-dir .tmp/p8-prefill-cancel \
   --report-only
 ```
 
-A future repository-owned physical runner should trigger cancellation during prefill after a configured processed-token
-threshold or percentage, then trigger cancellation during generation after a configured generated-token
-threshold. Each scenario must assert cancellation acknowledgement, prompt progress termination,
-bounded cleanup, late-result suppression, stale-progress rejection, a successful small follow-up
-request on a clean worker, and operator Stop/Start functionality afterward.
+`--cancellation-validation` is opt-in and executes exactly one validation sequence per packaged CLI
+invocation, independently of `--trials`. Specify exactly one prefill trigger: a positive
+`--prefill-cancel-tokens` count, or a strict fraction between zero and one with
+`--prefill-cancel-fraction`. `--generation-cancel-tokens` is a positive bounded generated-token
+threshold. The runner waits for an observed, nonterminal progress event in the requested phase; it
+does not use elapsed sleep as the trigger and fails if the phase or threshold is missed.
+
+For both prefill and generation, the installed landing page's existing `cancelRelayRequest()` and
+`terminateRelayRequestLocally()` paths perform the cancellation. The evidence requires a real
+attempt, relay acknowledgement, cleanup within `--cleanup-timeout`, and a bounded quiescence window
+with no later progress, successful result, or active generation. A small ordinary encrypted
+follow-up request must then complete on the recovered worker. After both scenarios, the runner
+clicks **Stop operator** and **Start operator**, requires bounded readiness and a changed operator
+session, and confirms the restarted worker with another small encrypted request.
+
+The `cancellation_recovery` report section contains only phases, configured/observed counters,
+booleans, bounded durations, stale/late-event counts, and `session_changed`. It never contains a
+prompt, response, request/session identifier, cancellation token, credential, key, ciphertext, or
+relay payload. Interrupted cancellation requests are not semantic trials. Missed thresholds,
+unconfirmed cancellation, late results, stale progress, cleanup/recovery timeout, failed follow-up,
+unchanged worker session, restart failure, and malformed evidence are runtime-contract failures;
+`--report-only` cannot suppress them.
+
+The command above is the genuine-hardware procedure. It was not executed during development of
+this harness change; a packaged 0.1.13 application, model, relay, and supported hardware are
+required before recording physical evidence.
 
 ## P7 memory-estimator comparison
 

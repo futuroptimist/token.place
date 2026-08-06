@@ -203,10 +203,11 @@ def resolve_real_e2e_model_path() -> Path:
 
 
 def wait_for_running_stability(
-    driver: webdriver.Remote, expected: str, stable_seconds: float = 2.0
+    driver: webdriver.Remote, expected: str, stable_seconds: float = 2.0,
+    timeout_seconds: float = 45,
 ) -> None:
     status_xpath = "//p[contains(.,'Running:')]//strong"
-    wait = WebDriverWait(driver, 45, poll_frequency=0.25)
+    wait = WebDriverWait(driver, timeout_seconds, poll_frequency=0.25)
     wait.until(
         lambda d: d.find_element(By.XPATH, status_xpath).text.strip().lower() == expected.lower()
     )
@@ -807,6 +808,9 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
                 or tokenizer_observation.get("fixture_sha256") != request["manifest"]["fixture_sha256"]
                 or tokenizer_observation.get("total_prompt_tokens") != progress[-1]["total_prompt_tokens"]):
             raise RuntimeError("authoritative_target_depth_mismatched")
+        cancellation_recovery = None
+        if request.get("cancellation_validation"):
+            cancellation_recovery = run_p8_cancellation_recovery(browser, driver, request)
         preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
         prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
         digest = hashlib.sha256()
@@ -825,6 +829,8 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
             "generation_settings": generation_settings,
             "preparing_end_s": preparing_end_s, "prefill_end_s": prefill_end_s,
             "first_token_s": first_s, "end_s": ended, "output_tokens": progress[-1]["generated_tokens"]}
+        if cancellation_recovery is not None:
+            evidence["cancellation_recovery"] = cancellation_recovery
         evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
         os.chmod(evidence_path, 0o600)
         return 0
@@ -846,6 +852,109 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         driver_log.unlink(missing_ok=True)
         if not cleanup_ok:
             raise RuntimeError("owned process cleanup failed")
+
+
+def _p8_followup_request(browser: webdriver.Chrome, timeout_s: float) -> tuple[bool, float]:
+    """Exercise the ordinary encrypted request lifecycle without retaining its plaintext result."""
+    browser.execute_script("const v=document.querySelector('#app').__vue__; v.chatHistory=[];")
+    field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+    field.clear()
+    field.send_keys("Reply with exactly OK")
+    started = time.monotonic()
+    browser.find_element(By.CSS_SELECTOR, ".send-button").click()
+    wait = WebDriverWait(browser, timeout_s, poll_frequency=0.05)
+    state = wait.until(lambda d: (lambda s: s if classify_p8_landing_state(s)[0] != "running" else False)(
+        d.execute_script("const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,b:v.isGeneratingResponse};")))
+    lifecycle, _response = classify_p8_landing_state(state)
+    return lifecycle == "completed", time.monotonic() - started
+
+
+def run_p8_cancellation_recovery(browser: webdriver.Chrome, driver: webdriver.Remote,
+        request: dict[str, object]) -> dict[str, object]:
+    """Physically cancel prefill/generation requests, recover, then restart the operator."""
+    config = request["cancellation"]
+    assert isinstance(config, dict)
+    timeout_s = float(request["request_timeout_s"])
+    observation_s = float(config["observation_window_s"])
+    recovery_s = float(config["recovery_timeout_s"])
+    scenarios: list[dict[str, object]] = []
+    for phase in ("prefill", "generating"):
+        browser.execute_script("const v=document.querySelector('#app').__vue__; v.chatHistory=[];")
+        field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+        field.clear()
+        field.send_keys(str(request["prompt"]))
+        browser.find_element(By.CSS_SELECTOR, ".send-button").click()
+        deadline = time.monotonic() + timeout_s
+        threshold = int(config["generation_tokens"]) if phase == "generating" else config.get("prefill_tokens")
+        trigger_count = -1
+        last_sequence = -1
+        while time.monotonic() < deadline:
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,b:v.isGeneratingResponse};")
+            event = state.get("p") if isinstance(state, dict) else None
+            if isinstance(event, dict):
+                total = event.get("total_prompt_tokens")
+                if phase == "prefill" and threshold is None and isinstance(total, int):
+                    threshold = max(1, int(total * float(config["prefill_fraction"])))
+                count = event.get("processed_prompt_tokens") if phase == "prefill" else event.get("generated_tokens")
+                if event.get("phase") == phase and isinstance(count, int) and isinstance(threshold, int) and count >= threshold:
+                    trigger_count = count
+                    last_sequence = int(event.get("sequence", -1))
+                    break
+                if (phase == "prefill" and event.get("phase") == "generating") or state.get("b") is False:
+                    raise RuntimeError("cancellation_trigger_missed")
+            time.sleep(0.01)
+        if trigger_count < 0 or not isinstance(threshold, int):
+            raise RuntimeError("cancellation_trigger_missed")
+        triggered = time.monotonic()
+        acknowledgement = browser.execute_async_script("""
+            const done=arguments[arguments.length-1]; const v=document.querySelector('#app').__vue__;
+            const active=v.activeRelayRequest; const pending=v.cancelRelayRequest('requester_cancelled');
+            v.terminateRelayRequestLocally(active);
+            Promise.resolve(pending).then((result) => { v.clearActiveRelayRequest(active?.requestId); done(result); })
+                .catch(() => { v.clearActiveRelayRequest(active?.requestId); done(null); });
+        """)
+        attempted = isinstance(acknowledgement, dict) and acknowledgement.get("attempted") is True
+        acknowledged = isinstance(acknowledgement, dict) and acknowledgement.get("confirmed") is True
+        stale = late = 0
+        active_after = False
+        quiet_started = time.monotonic()
+        quiet_deadline = quiet_started + observation_s
+        while time.monotonic() < quiet_deadline:
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,b:v.isGeneratingResponse,a:Boolean(v.activeRelayRequest),h:v.chatHistory};")
+            event = state.get("p") if isinstance(state, dict) else None
+            if isinstance(event, dict) and int(event.get("sequence", -1)) > last_sequence:
+                stale += 1
+            lifecycle, _response = classify_p8_landing_state(state)
+            if lifecycle == "completed": late += 1
+            active_after = bool(state.get("a") or state.get("b"))
+            time.sleep(0.01)
+        quiescence_s = time.monotonic() - quiet_started
+        cleanup_s = time.monotonic() - triggered
+        followup_ok, followup_s = _p8_followup_request(browser, recovery_s)
+        scenarios.append({"phase": phase, "trigger_observed": True, "trigger_count": trigger_count,
+            "threshold": threshold, "attempted": attempted, "acknowledged": acknowledged,
+            "cleanup_s": cleanup_s, "quiescence_s": quiescence_s,
+            "stale_progress_count": stale, "late_result_count": late,
+            "active_after_quiescence": active_after, "followup_ok": followup_ok,
+            "followup_s": followup_s})
+    old_session = _status_value(driver, "Operator session ID")
+    restarted = time.monotonic()
+    driver.find_element(By.XPATH, "//button[.='Stop operator']").click()
+    WebDriverWait(driver, recovery_s).until(
+        lambda d: d.find_element(By.XPATH, "//button[.='Start operator']").is_enabled())
+    stop_confirmed = _status_value(driver, "Worker alive").lower() != "yes"
+    driver.find_element(By.XPATH, "//button[.='Start operator']").click()
+    wait_for_running_stability(driver, "yes", stable_seconds=1, timeout_seconds=recovery_s)
+    WebDriverWait(driver, recovery_s).until(lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+    new_session = _status_value(driver, "Operator session ID")
+    restart_s = time.monotonic() - restarted
+    followup_ok, followup_s = _p8_followup_request(browser, recovery_s)
+    return {"scenarios": scenarios, "operator_lifecycle": {"stop_confirmed": stop_confirmed,
+        "restart_ready": True, "session_changed": bool(old_session and new_session != old_session),
+        "restart_s": restart_s, "post_restart_followup_ok": followup_ok,
+        "post_restart_followup_s": followup_s}}
 
 
 def main(argv: list[str] | None = None) -> int:

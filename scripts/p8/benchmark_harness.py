@@ -394,6 +394,7 @@ GENERATION_OPTION_LIMITS = {
     "seed": (-(2 ** 63), 2 ** 63 - 1),
 }
 MAX_PACKAGED_TRIALS = 10
+P8_CANCELLATION_PHASES = ("prefill", "generating")
 
 
 def validate_generation_settings(value: Any) -> dict[str, Any]:
@@ -415,6 +416,74 @@ def validate_generation_settings(value: Any) -> dict[str, Any]:
                 or key in {"max_tokens", "seed"} and not isinstance(setting, int)):
             raise ValueError("generation_settings_value_invalid")
     return {"supplied": dict(supplied), "omitted_runtime_default": list(omitted)}
+
+
+def validate_cancellation_recovery(value: Any, *, cleanup_budget_s: float,
+        observation_window_s: float, recovery_timeout_s: float,
+        prefill_threshold: int | None = None, generation_threshold: int | None = None) -> dict[str, Any]:
+    """Validate privacy-safe evidence produced by the physical cancellation sequence."""
+    if not isinstance(value, dict) or set(value) != {"scenarios", "operator_lifecycle"}:
+        raise ValueError("cancellation_evidence_malformed")
+    scenarios = value["scenarios"]
+    if not isinstance(scenarios, list) or len(scenarios) != 2:
+        raise ValueError("cancellation_evidence_malformed")
+    safe: list[dict[str, Any]] = []
+    required = {"phase", "trigger_observed", "trigger_count", "threshold", "attempted",
+        "acknowledged", "cleanup_s", "quiescence_s", "stale_progress_count",
+        "late_result_count", "active_after_quiescence", "followup_ok", "followup_s"}
+    for expected_phase, item in zip(P8_CANCELLATION_PHASES, scenarios):
+        if not isinstance(item, dict) or set(item) != required or item.get("phase") != expected_phase:
+            raise ValueError("cancellation_evidence_malformed")
+        bool_keys = ("trigger_observed", "attempted", "acknowledged",
+            "active_after_quiescence", "followup_ok")
+        if any(not isinstance(item[key], bool) for key in bool_keys):
+            raise ValueError("cancellation_evidence_malformed")
+        int_keys = ("trigger_count", "threshold", "stale_progress_count", "late_result_count")
+        if any(not isinstance(item[key], int) or isinstance(item[key], bool) or item[key] < 0
+                for key in int_keys) or item["threshold"] <= 0:
+            raise ValueError("cancellation_evidence_malformed")
+        configured_threshold = prefill_threshold if expected_phase == "prefill" else generation_threshold
+        if configured_threshold is not None and item["threshold"] != configured_threshold:
+            raise ValueError("cancellation_threshold_mismatched")
+        for key, bound in (("cleanup_s", cleanup_budget_s),
+                ("quiescence_s", observation_window_s + 1), ("followup_s", recovery_timeout_s)):
+            if (not isinstance(item[key], (int, float)) or isinstance(item[key], bool)
+                    or not math.isfinite(item[key]) or item[key] < 0 or item[key] > bound):
+                raise ValueError("cancellation_cleanup_timeout" if key == "cleanup_s"
+                    else "cancellation_recovery_timeout")
+        if item["quiescence_s"] < observation_window_s:
+            raise ValueError("cancellation_evidence_malformed")
+        if not item["trigger_observed"] or item["trigger_count"] < item["threshold"]:
+            raise ValueError("cancellation_trigger_missed")
+        if not item["attempted"] or not item["acknowledged"]:
+            raise ValueError("cancellation_unconfirmed")
+        if item["late_result_count"]:
+            raise ValueError("cancellation_late_result")
+        if item["stale_progress_count"] or item["active_after_quiescence"]:
+            raise ValueError("cancellation_stale_progress")
+        if not item["followup_ok"]:
+            raise ValueError("cancellation_followup_failed")
+        safe.append(dict(item))
+    lifecycle = value["operator_lifecycle"]
+    lifecycle_keys = {"stop_confirmed", "restart_ready", "session_changed", "restart_s",
+        "post_restart_followup_ok", "post_restart_followup_s"}
+    if not isinstance(lifecycle, dict) or set(lifecycle) != lifecycle_keys:
+        raise ValueError("cancellation_evidence_malformed")
+    if any(not isinstance(lifecycle[key], bool) for key in
+            ("stop_confirmed", "restart_ready", "session_changed", "post_restart_followup_ok")):
+        raise ValueError("cancellation_evidence_malformed")
+    for key in ("restart_s", "post_restart_followup_s"):
+        if (not isinstance(lifecycle[key], (int, float)) or isinstance(lifecycle[key], bool)
+                or not math.isfinite(lifecycle[key]) or lifecycle[key] < 0
+                or lifecycle[key] > recovery_timeout_s):
+            raise ValueError("operator_restart_timeout")
+    if not lifecycle["stop_confirmed"]:
+        raise ValueError("operator_stop_failed")
+    if not lifecycle["restart_ready"] or not lifecycle["session_changed"]:
+        raise ValueError("operator_restart_failed")
+    if not lifecycle["post_restart_followup_ok"]:
+        raise ValueError("operator_followup_failed")
+    return {"scenarios": safe, "operator_lifecycle": dict(lifecycle), "pass": True}
 
 def analyze_progress(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Validate the ordered progress/result/terminal lifecycle, returning stable errors."""
@@ -594,6 +663,13 @@ def validate_report(report: Any) -> None:
             or len(aggregate["trials"]) != completed):
         raise ValueError("report_trial_aggregate_invalid")
     validate_generation_settings(report.get("generation_settings"))
+    if "cancellation_recovery" in report:
+        cancellation = report["cancellation_recovery"]
+        if (not isinstance(cancellation, dict) or cancellation.get("pass") is not True
+                or not isinstance(cancellation.get("scenarios"), list)
+                or len(cancellation["scenarios"]) != 2
+                or not isinstance(cancellation.get("operator_lifecycle"), dict)):
+            raise ValueError("report_cancellation_recovery_invalid")
 
 def write_report_atomic(out_dir: Path, report: dict[str, Any]) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -731,7 +807,10 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         cleanup_timeout_s: float | None = None, app_binary: str | None = None,
         context_tier: str = "64k-full", report_only: bool = False,
         external_prompt: str | None = None, external_manifest: dict[str, Any] | None = None,
-        subprocess_run: Callable[..., Any] | None = None) -> dict[str, Any]:
+        subprocess_run: Callable[..., Any] | None = None, cancellation_validation: bool = False,
+        prefill_cancel_tokens: int | None = None, prefill_cancel_fraction: float | None = None,
+        generation_cancel_tokens: int = 1, observation_window_s: float = 0.5,
+        recovery_timeout_s: float = 30.0) -> dict[str, Any]:
     """Run the repository-owned packaged desktop E2E runner and validate its evidence."""
     missing = [name for name, value in {"app_binary": app_binary, "model": model, "backend": backend,
         "relay_url": relay_url, "timeout_s": timeout_s, "cleanup_timeout_s": cleanup_timeout_s}.items()
@@ -750,6 +829,18 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         return {"pass": False, "code": "relay_url_invalid"}
     if not all(isinstance(value, (int, float)) and math.isfinite(value) and value > 0 for value in (timeout_s, cleanup_timeout_s)):
         return {"pass": False, "code": "timeout_invalid"}
+    if cancellation_validation:
+        cancel_numbers = (generation_cancel_tokens, observation_window_s, recovery_timeout_s)
+        if (not isinstance(generation_cancel_tokens, int) or isinstance(generation_cancel_tokens, bool)
+                or not 1 <= generation_cancel_tokens <= 65536
+                or any(not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(v) or v <= 0 or v > 300 for v in cancel_numbers[1:])
+                or (prefill_cancel_tokens is None) == (prefill_cancel_fraction is None)
+                or prefill_cancel_tokens is not None and (not isinstance(prefill_cancel_tokens, int)
+                    or isinstance(prefill_cancel_tokens, bool) or prefill_cancel_tokens <= 0)
+                or prefill_cancel_fraction is not None and (not isinstance(prefill_cancel_fraction, float)
+                    or not math.isfinite(prefill_cancel_fraction) or not 0 < prefill_cancel_fraction < 1)):
+            return {"pass": False, "code": "cancellation_configuration_invalid"}
     if (external_prompt is None) != (external_manifest is None):
         return {"pass": False, "code": "external_fixture_pair_required"}
     if external_prompt is None:
@@ -773,7 +864,10 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     request = {"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest,
         "model": str(model_path), "backend": backend, "relay_url": relay_url,
         "context_tier": context_tier, "request_timeout_s": timeout_s,
-        "cleanup_timeout_s": cleanup_timeout_s}
+        "cleanup_timeout_s": cleanup_timeout_s, "cancellation_validation": cancellation_validation,
+        "cancellation": {"prefill_tokens": prefill_cancel_tokens,
+            "prefill_fraction": prefill_cancel_fraction, "generation_tokens": generation_cancel_tokens,
+            "observation_window_s": observation_window_s, "recovery_timeout_s": recovery_timeout_s}}
     request_name = evidence_name = diagnostic_name = None
     try:
         request_fd, request_name = tempfile.mkstemp(prefix="p8-request-", suffix=".json")
@@ -867,6 +961,16 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
             "backend_used", "model_fingerprint",
             "authoritative_prompt_tokens")},
     }
+    if cancellation_validation:
+        try:
+            evidence["cancellation_recovery"] = validate_cancellation_recovery(
+                payload.get("cancellation_recovery"), cleanup_budget_s=float(cleanup_timeout_s),
+                observation_window_s=observation_window_s, recovery_timeout_s=recovery_timeout_s,
+                prefill_threshold=prefill_cancel_tokens or max(1, int(
+                    payload["authoritative_prompt_tokens"] * float(prefill_cancel_fraction))),
+                generation_threshold=generation_cancel_tokens)
+        except ValueError as exc:
+            return {"pass": False, "runtime_contract_pass": False, "code": str(exc)}
     if "kv_estimate" in payload or "kv_runtime" in payload:
         evidence["kv_compare"] = compare_kv_estimate(payload.get("kv_estimate", {}), payload.get("kv_runtime", {}))
     runtime = evidence["runtime"]
@@ -877,6 +981,9 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     final_total = (progress.get("final_progress") or {}).get("total_prompt_tokens")
     runtime_contract_pass = bool(progress.get("pass") and metrics.get("pass") and identity_ok
         and payload["authoritative_prompt_tokens"] == final_total)
+    if cancellation_validation:
+        runtime_contract_pass = runtime_contract_pass and bool(
+            evidence.get("cancellation_recovery", {}).get("pass"))
     if "kv_compare" in evidence:
         runtime_contract_pass = runtime_contract_pass and bool(evidence["kv_compare"].get("pass"))
     passed = bool(runtime_contract_pass and semantic.get("semantic_pass"))
@@ -885,30 +992,6 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     evidence["pass"] = passed
     evidence["code"] = "ok" if passed else "packaged_contract_failed"
     return sanitize(evidence)
-
-def cancellation_recovery_result(events: list[dict[str, Any]], *, phase: str, threshold: int, followup_ok: bool, cleanup_s: float, cleanup_budget_s: float = 30.0, late_result: bool = False, stale_progress: bool = False) -> dict[str, Any]:
-    """Evaluate canned progress-triggered cancellation and clean-worker recovery."""
-    ack = False
-    for ev in events:
-        if ev.get("phase") == phase:
-            count = ev.get("processed_prompt_tokens") if phase == "prefill" else ev.get("generated_tokens")
-            if isinstance(count, int) and count >= threshold:
-                ack = True
-                break
-    if events:
-        last = events[-1]
-        events = [*events, {"kind": "terminal", "state": "cancelled",
-            "sequence": last.get("sequence", 0) + 1, "elapsed_ms": last.get("elapsed_ms", 0) + 1}]
-    progress = analyze_progress(events)
-    errors = []
-    if not ack: errors.append("cancel_not_triggered")
-    if not progress["pass"]: errors.extend(progress["errors"])
-    if cleanup_s > cleanup_budget_s: errors.append("cleanup_timeout")
-    if late_result: errors.append("late_result_after_cancel")
-    if stale_progress: errors.append("stale_progress_after_cancel")
-    if not followup_ok: errors.append("followup_worker_failed")
-    return {"pass": not errors, "errors": errors, "trigger_phase": phase, "trigger_threshold": threshold, "cleanup_s": cleanup_s, "followup_ok": followup_ok}
-
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="P8 packaged-runtime benchmark harness")
@@ -927,6 +1010,14 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--report-only", action="store_true", help="preserve semantic failures; runtime failures remain nonzero")
     r.add_argument("--trials", type=int, default=1,
         help=f"number of sequential physical trials (1-{MAX_PACKAGED_TRIALS}; default: 1)")
+    r.add_argument("--cancellation-validation", action="store_true",
+        help="run one physical prefill/generation cancellation and recovery sequence")
+    prefill = r.add_mutually_exclusive_group()
+    prefill.add_argument("--prefill-cancel-tokens", type=int)
+    prefill.add_argument("--prefill-cancel-fraction", type=float)
+    r.add_argument("--generation-cancel-tokens", type=int, default=1)
+    r.add_argument("--cancellation-observation-window", type=float, default=0.5)
+    r.add_argument("--cancellation-recovery-timeout", type=float, default=30.0)
     args = p.parse_args(argv)
     if args.cmd == "generate-fixture":
         prompt, manifest = generate_fixture(args.fixture, args.seed, scenario=args.scenario); validate_manifest(manifest, prompt); out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True); (out/f"{args.fixture}.prompt.txt").write_text(prompt); (out/f"{args.fixture}.manifest.json").write_text(_canonical_json(manifest)+"\n"); print(f"generated {args.fixture}: scenario={args.scenario} requested={manifest['requested_tokens']} actual={manifest['actual_tokens']} sha256={manifest['fixture_sha256']}"); return 0
@@ -937,19 +1028,36 @@ def main(argv: list[str] | None = None) -> int:
             p.error(f"--trials must be between 1 and {MAX_PACKAGED_TRIALS}")
         if bool(args.prompt) != bool(args.manifest):
             p.error("--prompt and --manifest are mutually required")
+        if args.cancellation_validation and (
+                (args.prefill_cancel_tokens is None) == (args.prefill_cancel_fraction is None)
+                or args.prefill_cancel_tokens is not None and args.prefill_cancel_tokens <= 0
+                or args.prefill_cancel_fraction is not None and not 0 < args.prefill_cancel_fraction < 1
+                or not 1 <= args.generation_cancel_tokens <= 65536
+                or not 0 < args.cancellation_observation_window <= 300
+                or not 0 < args.cancellation_recovery_timeout <= 300):
+            p.error("cancellation validation requires one bounded prefill trigger and bounded timeouts")
         external_prompt = _read_bounded_text(args.prompt) if args.prompt else None
         external_manifest = json.loads(_read_bounded_text(args.manifest, 1024 * 1024)) if args.manifest else None
         completed: list[dict[str, Any]] = []
         evidence: dict[str, Any] = {"pass": False, "code": "packaged_contract_failed"}
         settings: dict[str, Any] | None = None
-        for _ in range(args.trials):
+        cancellation_evidence = None
+        for trial_index in range(args.trials):
             evidence = invoke_packaged_runtime_adapter(fixture_id=args.fixture, scenario=args.scenario, timeout_s=args.request_timeout,
                 app_binary=args.app_binary, model=args.model, backend=args.backend, relay_url=args.relay_url,
                 cleanup_timeout_s=args.cleanup_timeout, context_tier=args.context_tier,
                 report_only=args.report_only, external_prompt=external_prompt,
-                external_manifest=external_manifest)
+                external_manifest=external_manifest,
+                cancellation_validation=args.cancellation_validation and trial_index == 0,
+                prefill_cancel_tokens=args.prefill_cancel_tokens,
+                prefill_cancel_fraction=args.prefill_cancel_fraction,
+                generation_cancel_tokens=args.generation_cancel_tokens,
+                observation_window_s=args.cancellation_observation_window,
+                recovery_timeout_s=args.cancellation_recovery_timeout)
             if not evidence.get("runtime_contract_pass"):
                 break
+            if trial_index == 0 and args.cancellation_validation:
+                cancellation_evidence = evidence.get("cancellation_recovery")
             if settings is None:
                 settings = evidence.get("generation_settings")
             elif evidence.get("generation_settings") != settings:
@@ -978,6 +1086,8 @@ def main(argv: list[str] | None = None) -> int:
                     "output_tokens":evidence["metrics"]["output_tokens"]},
                 "progress":evidence["progress"], "metrics":evidence["metrics"],
                 "semantic":evidence["semantic"], "aggregate_semantic":aggregate}
+            if args.cancellation_validation:
+                report["cancellation_recovery"] = cancellation_evidence
         else:
             report = {"mode":"packaged-runtime", "status":"not_run", "code":evidence.get("code", "packaged_contract_failed"),
                 "requested_trial_count":args.trials, "completed_trial_count":len(completed),

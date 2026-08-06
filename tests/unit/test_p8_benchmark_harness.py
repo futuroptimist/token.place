@@ -355,20 +355,55 @@ def test_platform_context_behavior():
     assert h.get_context_profile("8k-fast").total_context_tokens == 8192
     assert h.platform.system().lower() in {"linux", "darwin", "windows"}
 
-def test_progress_triggered_cancellation_and_recovery_contracts():
-    events = [
-        {"sequence":1,"phase":"prefill","total_prompt_tokens":100,"cached_prompt_tokens":0,"processed_prompt_tokens":10,"generated_tokens":0,"elapsed_ms":0},
-        {"sequence":2,"phase":"prefill","total_prompt_tokens":100,"cached_prompt_tokens":0,"processed_prompt_tokens":50,"generated_tokens":0,"elapsed_ms":1},
-    ]
-    ok = h.cancellation_recovery_result(events, phase="prefill", threshold=50, followup_ok=True, cleanup_s=2)
-    assert ok["pass"] is True
-    bad = h.cancellation_recovery_result(events, phase="generating", threshold=1, followup_ok=False, cleanup_s=31, late_result=True, stale_progress=True)
-    assert bad["pass"] is False
-    assert "cancel_not_triggered" in bad["errors"]
-    assert "cleanup_timeout" in bad["errors"]
-    assert "late_result_after_cancel" in bad["errors"]
-    assert "stale_progress_after_cancel" in bad["errors"]
-    assert "followup_worker_failed" in bad["errors"]
+def _physical_cancellation_evidence():
+    def scenario(phase):
+        return {"phase": phase, "trigger_observed": True, "trigger_count": 50,
+            "threshold": 50, "attempted": True, "acknowledged": True, "cleanup_s": 0.2,
+            "quiescence_s": 0.5, "stale_progress_count": 0, "late_result_count": 0,
+            "active_after_quiescence": False, "followup_ok": True, "followup_s": 1.0}
+    return {"scenarios": [scenario("prefill"), scenario("generating")],
+        "operator_lifecycle": {"stop_confirmed": True, "restart_ready": True,
+            "session_changed": True, "restart_s": 2.0, "post_restart_followup_ok": True,
+            "post_restart_followup_s": 1.0}}
+
+
+def test_physical_cancellation_recovery_evidence_success_and_privacy():
+    result = h.validate_cancellation_recovery(_physical_cancellation_evidence(),
+        cleanup_budget_s=3, observation_window_s=0.5, recovery_timeout_s=3)
+    assert result["pass"] is True
+    serialized = json.dumps(result).lower()
+    assert all(term not in serialized for term in ("request_id", "session_id", "prompt",
+        "response", "ciphertext", "credential", "cancel_token"))
+
+
+@pytest.mark.parametrize(("mutate", "code"), [
+    (lambda v: v["scenarios"][0].update(trigger_observed=False), "cancellation_trigger_missed"),
+    (lambda v: v["scenarios"][0].update(acknowledged=False), "cancellation_unconfirmed"),
+    (lambda v: v["scenarios"][0].update(late_result_count=1), "cancellation_late_result"),
+    (lambda v: v["scenarios"][0].update(stale_progress_count=1), "cancellation_stale_progress"),
+    (lambda v: v["scenarios"][0].update(active_after_quiescence=True), "cancellation_stale_progress"),
+    (lambda v: v["scenarios"][0].update(cleanup_s=4), "cancellation_cleanup_timeout"),
+    (lambda v: v["scenarios"][0].update(followup_ok=False), "cancellation_followup_failed"),
+    (lambda v: v["operator_lifecycle"].update(stop_confirmed=False), "operator_stop_failed"),
+    (lambda v: v["operator_lifecycle"].update(session_changed=False), "operator_restart_failed"),
+    (lambda v: v["operator_lifecycle"].update(restart_ready=False), "operator_restart_failed"),
+    (lambda v: v["operator_lifecycle"].update(post_restart_followup_ok=False), "operator_followup_failed"),
+    (lambda v: v["operator_lifecycle"].update(restart_s=4), "operator_restart_timeout"),
+    (lambda v: v["scenarios"][0].pop("attempted"), "cancellation_evidence_malformed"),
+])
+def test_physical_cancellation_recovery_evidence_fails_closed(mutate, code):
+    value = _physical_cancellation_evidence()
+    mutate(value)
+    with pytest.raises(ValueError, match=code):
+        h.validate_cancellation_recovery(value, cleanup_budget_s=3,
+            observation_window_s=0.5, recovery_timeout_s=3)
+
+
+def test_physical_cancellation_threshold_mismatch_fails_closed():
+    with pytest.raises(ValueError, match="cancellation_threshold_mismatched"):
+        h.validate_cancellation_recovery(_physical_cancellation_evidence(),
+            cleanup_budget_s=3, observation_window_s=0.5, recovery_timeout_s=3,
+            prefill_threshold=49, generation_threshold=50)
 
 
 def test_manifest_scoring_rules_match_score_keys():
@@ -578,8 +613,13 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": authoritative_total,
         "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled-test", "fixture_sha256": manifest["fixture_sha256"], "total_prompt_tokens": authoritative_total, "target_offsets_tokens": authoritative_offsets},
+        "cancellation_recovery": _physical_cancellation_evidence(),
     }
     app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
+    payload["cancellation_recovery"]["scenarios"][0].update(
+        threshold=max(1, int(authoritative_total * 0.5)),
+        trigger_count=max(1, int(authoritative_total * 0.5)))
+    payload["cancellation_recovery"]["scenarios"][1].update(threshold=8, trigger_count=8)
     seen = {}
     def fake_run(command, **kwargs):
         seen.update(command=command, kwargs=kwargs)
@@ -591,13 +631,17 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
 
     result = h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app), model=str(model),
         backend="metal", relay_url="https://relay.example", cleanup_timeout_s=3.0,
-        external_prompt=prompt, external_manifest=manifest, subprocess_run=fake_run)
+        external_prompt=prompt, external_manifest=manifest, subprocess_run=fake_run,
+        cancellation_validation=True, prefill_cancel_fraction=0.5,
+        generation_cancel_tokens=8, observation_window_s=0.5, recovery_timeout_s=3)
     assert seen["request"]["fixture_id"] == "small-8k"
     assert seen["request"]["prompt"] not in json.dumps(result)
     assert result["runner_kind"] == "repository_packaged_desktop_webdriver"
     assert result["pass"] is True
     assert result["fixture"]["estimated_prompt_tokens"] != result["fixture"]["authoritative_prompt_tokens"]
     assert result["fixture"]["authoritative_target_offsets_tokens"] == authoritative_offsets
+    assert seen["request"]["cancellation_validation"] is True
+    assert result["cancellation_recovery"]["pass"] is True
     assert result["memory"]["diagnostic"] == "<redacted>"
     assert "messages" not in result
     assert not h.Path(seen["command"][seen["command"].index("--p8-request") + 1]).exists()
@@ -970,6 +1014,37 @@ def test_packaged_trials_default_and_multiple_are_sequential(tmp_path, monkeypat
     report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
     assert report["requested_trial_count"] == report["completed_trial_count"] == 3
     assert report["aggregate_semantic"]["trial_count"] == 3
+
+
+def test_cancellation_sequence_runs_once_outside_semantic_trial_count(tmp_path, monkeypatch):
+    calls = []
+    def fake_invoke(**kwargs):
+        calls.append(kwargs["cancellation_validation"])
+        result = _packaged_main_evidence()
+        if kwargs["cancellation_validation"]:
+            result["cancellation_recovery"] = {
+                **_physical_cancellation_evidence(), "pass": True}
+        return result
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", fake_invoke)
+    args = _packaged_main_args(tmp_path, "--trials", "3", "--cancellation-validation",
+        "--prefill-cancel-tokens", "50", "--generation-cancel-tokens", "8")
+    assert h.main(args) == 0
+    assert calls == [True, False, False]
+    report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
+    assert report["aggregate_semantic"]["trial_count"] == 3
+    assert report["cancellation_recovery"]["pass"] is True
+
+
+@pytest.mark.parametrize("extra", [
+    ("--cancellation-validation",),
+    ("--cancellation-validation", "--prefill-cancel-tokens", "0"),
+    ("--cancellation-validation", "--prefill-cancel-fraction", "1"),
+    ("--cancellation-validation", "--prefill-cancel-tokens", "1",
+        "--generation-cancel-tokens", "0"),
+])
+def test_cancellation_cli_configuration_is_bounded(tmp_path, extra):
+    with pytest.raises(SystemExit, match="2"):
+        h.main(_packaged_main_args(tmp_path, *extra))
 
 
 def test_packaged_trials_aggregate_mixed_semantics_and_report_only(tmp_path, monkeypatch):

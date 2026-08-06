@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from scripts.p8 import benchmark_harness as h
+from scripts.long_context_benchmark import benchmark_harness as h
 
 
 def test_fixture_generation_stable_hash_and_depths():
@@ -342,12 +342,12 @@ def test_atomic_report_schema_and_redaction(tmp_path):
 
 
 def test_cli_validation_and_evaluate(tmp_path):
-    proc = subprocess.run([sys.executable, "scripts/p8_benchmark.py", "packaged-runtime", "--out-dir", str(tmp_path)], text=True, capture_output=True)
+    proc = subprocess.run([sys.executable, "scripts/long_context_benchmark.py", "packaged-runtime", "--out-dir", str(tmp_path)], text=True, capture_output=True)
     assert proc.returncode == 2
     prompt, manifest = h.generate_fixture("small-8k")
     mf = tmp_path/"m.json"; mf.write_text(json.dumps(manifest))
     resp = tmp_path/"r.json"; resp.write_text(json.dumps(manifest["expected_answers"]))
-    proc = subprocess.run([sys.executable, "scripts/p8_benchmark.py", "evaluate", "--manifest", str(mf), "--response", str(resp), "--strict", "--out-dir", str(tmp_path)], text=True, capture_output=True)
+    proc = subprocess.run([sys.executable, "scripts/long_context_benchmark.py", "evaluate", "--manifest", str(mf), "--response", str(resp), "--strict", "--out-dir", str(tmp_path)], text=True, capture_output=True)
     assert proc.returncode == 0
 
 
@@ -522,7 +522,7 @@ def test_timing_reports_every_duration_throughput_budget_and_margin():
 
 
 def test_invalid_report_preserves_existing_atomic_destination(tmp_path):
-    destination = tmp_path / "p8_benchmark_report.json"
+    destination = tmp_path / "long_context_benchmark_report.json"
     destination.write_text("existing")
     with pytest.raises(ValueError, match="report_schema_missing"):
         h.write_report_atomic(tmp_path, {"mode":"packaged-runtime"})
@@ -623,8 +623,8 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
     seen = {}
     def fake_run(command, **kwargs):
         seen.update(command=command, kwargs=kwargs)
-        request_path = command[command.index("--p8-request") + 1]
-        evidence_path = command[command.index("--p8-evidence") + 1]
+        request_path = command[command.index("--benchmark-request") + 1]
+        evidence_path = command[command.index("--benchmark-evidence") + 1]
         seen["request"] = json.loads(h.Path(request_path).read_text())
         h.Path(evidence_path).write_text(json.dumps(payload))
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -644,8 +644,8 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
     assert result["cancellation_recovery"]["pass"] is True
     assert result["memory"]["diagnostic"] == "<redacted>"
     assert "messages" not in result
-    assert not h.Path(seen["command"][seen["command"].index("--p8-request") + 1]).exists()
-    assert not h.Path(seen["command"][seen["command"].index("--p8-evidence") + 1]).exists()
+    assert not h.Path(seen["command"][seen["command"].index("--benchmark-request") + 1]).exists()
+    assert not h.Path(seen["command"][seen["command"].index("--benchmark-evidence") + 1]).exists()
 
 
 def test_packaged_runtime_external_fixture_pair_and_hash_fail_closed(tmp_path):
@@ -729,7 +729,7 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if runner_outcome == "failed":
             return subprocess.CompletedProcess(command, 1, "", "")
-        evidence_path = command[command.index("--p8-evidence") + 1]
+        evidence_path = command[command.index("--benchmark-evidence") + 1]
         evidence = {"invalid-json": "not json", "non-object": "[]", "missing": "{}"}[runner_outcome]
         h.Path(evidence_path).write_text(evidence)
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -767,7 +767,7 @@ def test_packaged_runtime_rejects_invalid_timeouts(tmp_path, timeout):
 
 def test_report_only_does_not_suppress_runtime_failure(tmp_path):
     proc = subprocess.run([
-        sys.executable, "scripts/p8_benchmark.py", "packaged-runtime",
+        sys.executable, "scripts/long_context_benchmark.py", "packaged-runtime",
         "--out-dir", str(tmp_path), "--app-binary", str(tmp_path / "missing-app"),
         "--model", str(tmp_path / "missing.gguf"), "--backend", "metal",
         "--relay-url", "http://127.0.0.1:8000", "--cleanup-timeout", "1",
@@ -823,7 +823,7 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
              "elapsed_ms": 2000}],
     }
     def fake_run(command, **kwargs):
-        h.Path(command[command.index("--p8-evidence") + 1]).write_text(json.dumps(payload))
+        h.Path(command[command.index("--benchmark-evidence") + 1]).write_text(json.dumps(payload))
         return subprocess.CompletedProcess(command, 0)
     result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model), backend="cpu",
         relay_url="https://relay.example", cleanup_timeout_s=1, report_only=report_only,
@@ -855,7 +855,7 @@ def test_packaged_temp_permissions_do_not_require_fchmod(tmp_path, monkeypatch):
     ({"h": [{"role": "assistant", "content": "missing lifecycle"}], "b": False}, ("failed", None)),
 ])
 def test_desktop_runner_requires_success_lifecycle(state, expected):
-    assert h.classify_p8_landing_state(state) == expected
+    assert h.classify_benchmark_landing_state(state) == expected
 
 
 def test_desktop_runner_applies_tier_and_maps_operator_mode():
@@ -865,13 +865,13 @@ def test_desktop_runner_applies_tier_and_maps_operator_mode():
             self.tier = tier
             return tier
     browser = Browser()
-    assert h.apply_p8_context_tier(browser, "64k-full") == "64k-full"
+    assert h.apply_benchmark_context_tier(browser, "64k-full") == "64k-full"
     assert browser.tier == "64k-full"
-    assert h.p8_operator_mode("cpu") == "cpu"
-    assert h.p8_operator_mode("metal") == "gpu"
-    assert h.p8_operator_mode("cuda") == "gpu"
+    assert h.benchmark_operator_mode("cpu") == "cpu"
+    assert h.benchmark_operator_mode("metal") == "gpu"
+    assert h.benchmark_operator_mode("cuda") == "gpu"
     with pytest.raises(ValueError):
-        h.p8_operator_mode("mock")
+        h.benchmark_operator_mode("mock")
 
 
 def test_owned_runner_keeps_only_bounded_diagnostic_tail():
@@ -942,7 +942,7 @@ def test_main_generate_and_evaluate_commands(tmp_path):
     report_dir = tmp_path / "report"
     assert h.main(["evaluate", "--manifest", str(manifest_path), "--response",
         str(response_path), "--strict", "--out-dir", str(report_dir)]) == 0
-    assert json.loads((report_dir / "p8_benchmark_report.json").read_text())["semantic"]["semantic_pass"]
+    assert json.loads((report_dir / "long_context_benchmark_report.json").read_text())["semantic"]["semantic_pass"]
 
 
 def test_bounded_external_fixture_reader_rejects_oversized_utf8(tmp_path):
@@ -972,7 +972,7 @@ def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
         "--model", "model", "--backend", "cpu", "--relay-url", "https://relay.example",
         "--report-only"]
     assert h.main(args) == 0
-    report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
     assert report["overall_pass"] is False
     assert report["semantic"]["semantic_pass"] is False
     assert report["report_only_accepted"] is True
@@ -1011,7 +1011,7 @@ def test_packaged_trials_default_and_multiple_are_sequential(tmp_path, monkeypat
     assert calls == [0]
     assert h.main(_packaged_main_args(tmp_path, "--trials", "3")) == 0
     assert calls == [0, 1, 2, 3]
-    report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
     assert report["requested_trial_count"] == report["completed_trial_count"] == 3
     assert report["aggregate_semantic"]["trial_count"] == 3
 
@@ -1030,7 +1030,7 @@ def test_cancellation_sequence_runs_once_outside_semantic_trial_count(tmp_path, 
         "--prefill-cancel-tokens", "50", "--generation-cancel-tokens", "8")
     assert h.main(args) == 0
     assert calls == [True, False, False]
-    report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
     assert report["aggregate_semantic"]["trial_count"] == 3
     assert report["cancellation_recovery"]["pass"] is True
 
@@ -1052,7 +1052,7 @@ def test_packaged_trials_aggregate_mixed_semantics_and_report_only(tmp_path, mon
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter",
         lambda **kwargs: _packaged_main_evidence(next(outcomes)))
     assert h.main(_packaged_main_args(tmp_path, "--trials", "3", "--report-only")) == 0
-    report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
     aggregate = report["aggregate_semantic"]
     assert report["overall_pass"] is False and report["report_only_accepted"] is True
     assert aggregate["exact_match_count"] == 2 and aggregate["pass_rate"] == pytest.approx(2 / 3)
@@ -1066,14 +1066,14 @@ def test_packaged_trials_fail_closed_on_runtime_failure_and_settings_drift(tmp_p
     outcomes = iter([_packaged_main_evidence(), runtime_failure, _packaged_main_evidence()])
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: next(outcomes))
     assert h.main(_packaged_main_args(tmp_path, "--trials", "3", "--report-only")) == 1
-    report = json.loads((tmp_path / "p8_benchmark_report.json").read_text())
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
     assert report["requested_trial_count"] == 3 and report["completed_trial_count"] == 1
     assert report["code"] == "telemetry_failed"
 
     outcomes = iter([_packaged_main_evidence(), _packaged_main_evidence(max_tokens=512)])
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: next(outcomes))
     assert h.main(_packaged_main_args(tmp_path, "--trials", "2", "--report-only")) == 1
-    assert json.loads((tmp_path / "p8_benchmark_report.json").read_text())["code"] == "generation_settings_inconsistent"
+    assert json.loads((tmp_path / "long_context_benchmark_report.json").read_text())["code"] == "generation_settings_inconsistent"
 
 
 @pytest.mark.parametrize("trials", ["0", "-1", str(h.MAX_PACKAGED_TRIALS + 1)])

@@ -1,4 +1,4 @@
-"""P8 packaged-runtime benchmark harness utilities.
+"""Long-context packaged-runtime benchmark harness utilities.
 
 The module is intentionally dependency-light so ordinary CI can validate fixture,
 semantic, progress, cancellation, memory-comparison, and report contracts without
@@ -29,9 +29,9 @@ from typing import Any, Callable, Iterable
 
 from utils.context_profiles import get_context_profile
 
-SCHEMA_VERSION = "p8-benchmark-report-v1"
-FIXTURE_VERSION = "p8-semantic-haystack-v6"
-DEFAULT_SEED = "p8-1566"
+SCHEMA_VERSION = "long-context-benchmark-report-v1"
+FIXTURE_VERSION = "long-context-semantic-haystack-v6"
+DEFAULT_SEED = "long-context-benchmark-default"
 PHASES = {"preparing": 0, "prefill": 1, "generating": 2}
 SECRET_PATTERNS = [
     re.compile(r"(?i)\b(authorization|api[_-]?key|secret|token)\b\s*[:=]\s*(?:bearer\s+)?[^\s,}\]\)]+"),
@@ -394,7 +394,7 @@ GENERATION_OPTION_LIMITS = {
     "seed": (-(2 ** 63), 2 ** 63 - 1),
 }
 MAX_PACKAGED_TRIALS = 10
-P8_CANCELLATION_PHASES = ("prefill", "generating")
+CANCELLATION_PHASES = ("prefill", "generating")
 
 
 def validate_generation_settings(value: Any) -> dict[str, Any]:
@@ -431,7 +431,7 @@ def validate_cancellation_recovery(value: Any, *, cleanup_budget_s: float,
     required = {"phase", "trigger_observed", "trigger_count", "threshold", "attempted",
         "acknowledged", "cleanup_s", "quiescence_s", "stale_progress_count",
         "late_result_count", "active_after_quiescence", "followup_ok", "followup_s"}
-    for expected_phase, item in zip(P8_CANCELLATION_PHASES, scenarios):
+    for expected_phase, item in zip(CANCELLATION_PHASES, scenarios):
         if not isinstance(item, dict) or set(item) != required or item.get("phase") != expected_phase:
             raise ValueError("cancellation_evidence_malformed")
         bool_keys = ("trigger_observed", "attempted", "acknowledged",
@@ -555,7 +555,7 @@ def analyze_progress(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
 def summarize_metrics(*, start_s: float, preparing_end_s: float, prefill_end_s: float,
         first_token_s: float, end_s: float, prompt_tokens: int, output_tokens: int,
         request_budget_s: float) -> dict[str, Any]:
-    """Calculate all P8 timings, failing closed for missing or unordered evidence."""
+    """Calculate all long-context benchmark timings, failing closed for missing or unordered evidence."""
     numeric = (start_s, preparing_end_s, prefill_end_s, first_token_s, end_s, request_budget_s)
     if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
             for value in numeric):
@@ -676,9 +676,9 @@ def write_report_atomic(out_dir: Path, report: dict[str, Any]) -> Path:
     report = sanitize({"schema_version": SCHEMA_VERSION, **report})
     validate_report(report)
     text = _canonical_json(report) + "\n"
-    fd, name = tempfile.mkstemp(prefix=".p8-report-", suffix=".json", dir=out_dir)
+    fd, name = tempfile.mkstemp(prefix=".long-context-report-", suffix=".json", dir=out_dir)
     with os.fdopen(fd, "w", encoding="utf-8") as f: f.write(text)
-    dest = out_dir / "p8_benchmark_report.json"
+    dest = out_dir / "long_context_benchmark_report.json"
     os.replace(name, dest)
     return dest
 
@@ -705,23 +705,23 @@ def _valid_relay_url(value: str) -> bool:
     return parsed.scheme == "https" or loopback
 
 
-def p8_operator_mode(backend: str) -> str:
+def benchmark_operator_mode(backend: str) -> str:
     """Map an attested backend to the operator control value."""
     if backend == "cpu":
         return "cpu"
     if backend in {"metal", "cuda"}:
         return "gpu"
-    raise ValueError("unsupported P8 backend")
+    raise ValueError("unsupported long-context benchmark backend")
 
 
-def apply_p8_context_tier(driver: object, context_tier: str) -> str:
+def apply_benchmark_context_tier(driver: object, context_tier: str) -> str:
     """Set and read back the landing-page tier through the browser boundary."""
     return driver.execute_script(
         "const v=document.querySelector('#app').__vue__; v.selectedContextTier=arguments[0]; "
         "v.persistContextTier(arguments[0]); return v.selectedContextTier;", context_tier)
 
 
-def classify_p8_landing_state(state: object) -> tuple[str, str | None]:
+def classify_benchmark_landing_state(state: object) -> tuple[str, str | None]:
     """Classify the landing-page API response lifecycle without trusting UI prose."""
     if not isinstance(state, dict):
         return "failed", None
@@ -870,17 +870,17 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
             "observation_window_s": observation_window_s, "recovery_timeout_s": recovery_timeout_s}}
     request_name = evidence_name = diagnostic_name = None
     try:
-        request_fd, request_name = tempfile.mkstemp(prefix="p8-request-", suffix=".json")
-        evidence_fd, evidence_name = tempfile.mkstemp(prefix="p8-evidence-", suffix=".json")
+        request_fd, request_name = tempfile.mkstemp(prefix="long-context-request-", suffix=".json")
+        evidence_fd, evidence_name = tempfile.mkstemp(prefix="long-context-evidence-", suffix=".json")
         if hasattr(os, "fchmod"):
             os.fchmod(request_fd, 0o600); os.fchmod(evidence_fd, 0o600)
         with os.fdopen(request_fd, "w", encoding="utf-8") as handle:
             json.dump(request, handle)
         os.close(evidence_fd)
         command = [sys.executable, str(Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
-            "test_desktop_operator_ui_e2e.py"), "--p8-request", request_name,
-            "--p8-evidence", evidence_name, "--app-binary", str(app_path)]
-        diagnostic_fd, diagnostic_name = tempfile.mkstemp(prefix="p8-runner-", suffix=".log")
+            "test_desktop_operator_ui_e2e.py"), "--benchmark-request", request_name,
+            "--benchmark-evidence", evidence_name, "--app-binary", str(app_path)]
+        diagnostic_fd, diagnostic_name = tempfile.mkstemp(prefix="long-context-runner-", suffix=".log")
         try:
             with os.fdopen(diagnostic_fd, "w+", encoding="utf-8") as diagnostic_handle:
                 if subprocess_run is None:
@@ -994,7 +994,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     return sanitize(evidence)
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="P8 packaged-runtime benchmark harness")
+    p = argparse.ArgumentParser(description="Long-context packaged-runtime benchmark harness")
     sub = p.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("generate-fixture"); g.add_argument("--fixture", choices=FIXTURES, required=True); g.add_argument("--scenario", choices=("single-needle", "structured-extraction"), required=True); g.add_argument("--out-dir", required=True); g.add_argument("--seed", default=DEFAULT_SEED)
     e = sub.add_parser("evaluate"); e.add_argument("--manifest", required=True); e.add_argument("--response", required=True); e.add_argument("--strict", action="store_true"); e.add_argument("--out-dir", required=True)

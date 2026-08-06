@@ -1,7 +1,7 @@
-# P8 packaged-runtime benchmark harness
+# Long-context packaged-runtime benchmark harness
 
-The P8 harness turns the long-context macOS Metal evidence from #1566 into a repeatable,
-privacy-safe benchmark surface for P9 comparisons. Ordinary CI runs only deterministic unit and
+The long-context harness turns the long-context macOS Metal evidence from #1566 into a repeatable,
+privacy-safe benchmark surface for downstream comparisons. Ordinary CI runs only deterministic unit and
 contract tests; it does **not** download a model, require a GPU, launch a packaged desktop app, or
 run multi-minute inference.
 
@@ -22,18 +22,18 @@ launches the selected installed/package-built application, configures its operat
 fixture with the existing landing-page API v1 E2EE browser flow:
 
 ```bash
-python scripts/p8_benchmark.py packaged-runtime \
-  --app-binary "$P8_APP_BINARY" \
-  --model "$P8_MODEL" \
+python scripts/long_context_benchmark.py packaged-runtime \
+  --app-binary "$BENCHMARK_APP_BINARY" \
+  --model "$BENCHMARK_MODEL" \
   --backend metal \
-  --relay-url "$P8_RELAY_URL" \
+  --relay-url "$BENCHMARK_RELAY_URL" \
   --fixture small-8k \
   --scenario structured-extraction \
   --context-tier 8k-fast \
   --request-timeout 600 \
   --cleanup-timeout 30 \
   --trials 3 \
-  --out-dir .tmp/p8
+  --out-dir .tmp/long-context
 ```
 
 `--trials` defaults to `1` and accepts `1` through `10`. Trials run sequentially with the same
@@ -72,10 +72,10 @@ boundary and are orchestration evidence, never physical Metal/CUDA evidence.
 Generate deterministic, synthetic, privacy-safe fixtures instead of committing large prompt blobs:
 
 ```bash
-python scripts/p8_benchmark.py generate-fixture --fixture small-8k --scenario single-needle --out-dir .tmp/p8-needle-small
-python scripts/p8_benchmark.py generate-fixture --fixture intermediate-32k --scenario single-needle --out-dir .tmp/p8-needle-middle
-python scripts/p8_benchmark.py generate-fixture --fixture long-55k --scenario single-needle --out-dir .tmp/p8-needle-late
-python scripts/p8_benchmark.py generate-fixture --fixture long-55k --scenario structured-extraction --out-dir .tmp/p8-structured
+python scripts/long_context_benchmark.py generate-fixture --fixture small-8k --scenario single-needle --out-dir .tmp/long-context-needle-small
+python scripts/long_context_benchmark.py generate-fixture --fixture intermediate-32k --scenario single-needle --out-dir .tmp/long-context-needle-middle
+python scripts/long_context_benchmark.py generate-fixture --fixture long-55k --scenario single-needle --out-dir .tmp/long-context-needle-late
+python scripts/long_context_benchmark.py generate-fixture --fixture long-55k --scenario structured-extraction --out-dir .tmp/long-context-structured
 ```
 
 The fixture manifest records the fixture version, deterministic seed, requested token count, actual
@@ -104,13 +104,13 @@ needle occurs once and deterministic similar-but-distinct markers are decoys. Th
 `structured-extraction` scenario asks only for VII/XIV/XXI/canary, retaining table-of-contents and
 heading/prose ambiguity. Its canary literal is not disclosed by the instructions and occurs once.
 
-In explicit P8 mode, the packaged runner passes only the fixture hash, validated UTF-8 prefix cut
+In explicit long-context benchmark mode, the packaged runner passes only the fixture hash, validated UTF-8 prefix cut
 points, and an owner-only evidence location to the bundled sidecar. During normal authoritative
 admission, the sidecar verifies the actual final user message against that hash and sends the full
 message and every prefix through the same loaded `llm_instance`, `render_and_tokenize_chat` bridge,
 chat-template policy, and thinking option. It atomically writes bounded counts and runtime identity;
 it never writes prompt text, target values, ciphertext, credentials, or request identifiers. The
-seam is inert unless the manual P8 runner explicitly supplies both environment variables.
+seam is inert unless the manual long-context benchmark runner explicitly supplies both environment variables.
 
 The harness requires method `packaged_admission_render_and_tokenize_chat`, matching bundled runtime
 identity and total/progress counts, the exact target key set, unique ordered positive prefix counts,
@@ -123,13 +123,13 @@ To run a separately stored golden prompt, supply its manifest as a required pair
 not infer an oracle from model output):
 
 ```bash
-python scripts/p8_benchmark.py packaged-runtime \
-  --app-binary "$P8_APP_BINARY" --model "$P8_MODEL" --backend metal \
-  --relay-url "$P8_RELAY_URL" --context-tier 8k-fast \
+python scripts/long_context_benchmark.py packaged-runtime \
+  --app-binary "$BENCHMARK_APP_BINARY" --model "$BENCHMARK_MODEL" --backend metal \
+  --relay-url "$BENCHMARK_RELAY_URL" --context-tier 8k-fast \
   --scenario structured-extraction \
   --prompt /path/to/small-8k.prompt.txt \
   --manifest /path/to/small-8k.manifest.json \
-  --out-dir .tmp/p8-external
+  --out-dir .tmp/long-context-external
 ```
 
 The pair is rejected before runner launch if either file is absent, the prompt exceeds the bounded
@@ -141,11 +141,11 @@ or target metadata is missing, malformed, out of bounds, or unordered.
 Evaluate a response against a manifest:
 
 ```bash
-python scripts/p8_benchmark.py evaluate \
-  --manifest .tmp/p8-fixtures/small-8k.manifest.json \
-  --response .tmp/p8-fixtures/response.json \
+python scripts/long_context_benchmark.py evaluate \
+  --manifest .tmp/long-context-fixtures/small-8k.manifest.json \
+  --response .tmp/long-context-fixtures/response.json \
   --strict \
-  --out-dir .tmp/p8-report
+  --out-dir .tmp/long-context-report
 ```
 
 Strict mode exits nonzero unless the complete exact-match result passes. Report-only baselines can
@@ -163,14 +163,14 @@ Semantic sub-scores are reported separately for:
 - trailing-punctuation rules;
 - complete exact match.
 
-The known P7 failure shape is intentionally rejected: `VII` with six words (`They were obliged to
+The known estimator-validation failure shape is intentionally rejected: `VII` with six words (`They were obliged to
 camp out`) fails word count and exact match, while `XIV`/`XXI` chapter-title substitutions fail
 prose and target selection even though JSON shape and canary can still pass.
 
 ## Metrics and report schema
 
-Reports use schema `p8-benchmark-report-v1` and are written atomically as
-`p8_benchmark_report.json` in the selected output directory. Reports are sanitized for GitHub issue
+Reports use schema `long-context-benchmark-report-v1` and are written atomically as
+`long_context_benchmark_report.json` in the selected output directory. Reports are sanitized for GitHub issue
 attachment: prompt/response bodies, ciphertext, IVs, keys, cancellation tokens, high-cardinality
 request/client/session IDs, absolute user paths, secrets, and unbounded subprocess output are
 removed or redacted. The sanitized document is validated before atomic replacement. A missing key,
@@ -227,7 +227,7 @@ Physical runs report these low-cardinality fields:
 Validate JSON syntax before attachment:
 
 ```bash
-python -m json.tool .tmp/p8-report/p8_benchmark_report.json >/dev/null
+python -m json.tool .tmp/long-context-report/long_context_benchmark_report.json >/dev/null
 ```
 
 ## Progress, cancellation, and recovery invariants
@@ -263,7 +263,7 @@ coerced to zero.
 Cancellation scenarios must be progress-triggered, not sleep-only:
 
 ```bash
-python scripts/p8_benchmark.py packaged-runtime \
+python scripts/long_context_benchmark.py packaged-runtime \
   --model /path/to/local-model.gguf \
   --backend metal \
   --relay-url http://127.0.0.1:8000 \
@@ -274,7 +274,7 @@ python scripts/p8_benchmark.py packaged-runtime \
   --generation-cancel-tokens 8 \
   --cancellation-observation-window 0.5 \
   --cancellation-recovery-timeout 30 \
-  --out-dir .tmp/p8-prefill-cancel \
+  --out-dir .tmp/long-context-prefill-cancel \
   --report-only
 ```
 
@@ -305,9 +305,9 @@ The command above is the genuine-hardware procedure. It was not executed during 
 this harness change; a packaged 0.1.13 application, model, relay, and supported hardware are
 required before recording physical evidence.
 
-## P7 memory-estimator comparison
+## Memory-estimator comparison
 
-The harness consumes P7 estimator output; it does not duplicate the estimator formulas. Exact KV
+The harness consumes the shared memory-estimator output; it does not duplicate the estimator formulas. Exact KV
 comparison uses the estimator's `exact_kv_allocation_bytes` (or stable exact KV cache byte surface)
 and compares it to llama.cpp/GGML runtime diagnostics such as `kv_allocation_bytes`. The default
 alignment rule allows at most one 4 KiB page of difference. If exact comparison is requested and the
@@ -333,7 +333,7 @@ only failure. Strict/default mode and every runtime-contract failure exit nonzer
 Ordinary CI should run:
 
 ```bash
-python -m pytest -q tests/unit/test_p8_benchmark_harness.py
+python -m pytest -q tests/unit/test_long_context_benchmark_harness.py
 python -m pytest -q tests/unit
 pre-commit run --all-files
 git diff --check
@@ -341,5 +341,5 @@ git diff --check
 ```
 
 Physical Metal/CUDA validation is manual and should attach only sanitized reports to #1566, #1608,
-or P9. Do not claim 0.1.13 release validation or general semantic correctness from a report-only
+or downstream validation. Do not claim 0.1.13 release validation or general semantic correctness from a report-only
 baseline.

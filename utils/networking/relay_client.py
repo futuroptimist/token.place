@@ -3948,7 +3948,7 @@ class RelayClient:
         return None
 
     @classmethod
-    def _api_v1_record_p8_tokenizer_observation(
+    def _api_v1_record_benchmark_tokenizer_observation(
         cls,
         llm_instance: Any,
         messages: List[Dict[str, Any]],
@@ -3957,9 +3957,9 @@ class RelayClient:
         enable_thinking: Optional[bool],
         model_profile: Dict[str, Any],
     ) -> None:
-        """Record bounded local P8 prefix counts through the admission bridge."""
-        config_name = os.getenv("TOKEN_PLACE_P8_TOKENIZER_REQUEST")
-        evidence_name = os.getenv("TOKEN_PLACE_P8_TOKENIZER_EVIDENCE")
+        """Record bounded local long-context benchmark prefix counts through the admission bridge."""
+        config_name = os.getenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST")
+        evidence_name = os.getenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
         if not config_name or not evidence_name:
             return
         try:
@@ -4006,7 +4006,7 @@ class RelayClient:
                 "target_offsets_tokens": counts}
             output = Path(evidence_name)
             output.parent.mkdir(parents=True, exist_ok=True)
-            fd, temporary = tempfile.mkstemp(prefix=".p8-tokenizer-", dir=output.parent)
+            fd, temporary = tempfile.mkstemp(prefix=".long-context-tokenizer-", dir=output.parent)
             try:
                 if hasattr(os, "fchmod"):
                     os.fchmod(fd, 0o600)
@@ -4338,7 +4338,7 @@ class RelayClient:
                 else None
             )
         if admission_bridge_used and prompt_tokens is not None:
-            self._api_v1_record_p8_tokenizer_observation(
+            self._api_v1_record_benchmark_tokenizer_observation(
                 llm_instance, messages, full_prompt_tokens=prompt_tokens,
                 enable_thinking=admission_enable_thinking, model_profile=model_profile)
         if prompt_tokens is None:

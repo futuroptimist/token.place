@@ -44,11 +44,11 @@ try:
     from selenium.webdriver.support.ui import WebDriverWait
 
     from utils.crypto_helpers import CryptoClient
-    from scripts.p8.benchmark_harness import (
-        apply_p8_context_tier,
-        classify_p8_landing_state,
+    from scripts.long_context_benchmark.benchmark_harness import (
+        apply_benchmark_context_tier,
+        classify_benchmark_landing_state,
         observe_post_terminal,
-        p8_operator_mode,
+        benchmark_operator_mode,
     )
 except Exception as exc:
     BOOTSTRAP_LOG.write_text(
@@ -648,15 +648,15 @@ def assert_packaged_windows_nvidia_status(
         raise AssertionError(f"hardware status reports KV cache device is not CUDA: {kv_cache_device!r}")
 
 
-def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Path) -> int:
+def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Path) -> int:
     """Drive a packaged app and the existing landing-page API v1 E2EE client."""
     request = json.loads(request_path.read_text(encoding="utf-8"))
     cleanup_timeout = float(request["cleanup_timeout_s"])
-    driver_log_fd, driver_log_name = tempfile.mkstemp(prefix="p8-tauri-driver-", suffix=".log")
+    driver_log_fd, driver_log_name = tempfile.mkstemp(prefix="long-context-tauri-driver-", suffix=".log")
     os.close(driver_log_fd)
     driver_log = Path(driver_log_name)
-    isolated_home = Path(tempfile.mkdtemp(prefix="p8-desktop-home-"))
-    tokenizer_dir = Path(tempfile.mkdtemp(prefix="p8-tokenizer-observation-"))
+    isolated_home = Path(tempfile.mkdtemp(prefix="long-context-desktop-home-"))
+    tokenizer_dir = Path(tempfile.mkdtemp(prefix="long-context-tokenizer-observation-"))
     tokenizer_request = tokenizer_dir / "request.json"
     tokenizer_evidence = tokenizer_dir / "evidence.json"
     tokenizer_request.write_text(json.dumps({
@@ -672,8 +672,8 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
     env.update({"HOME": str(isolated_home), "XDG_CONFIG_HOME": str(isolated_home / ".config"),
                 "XDG_DATA_HOME": str(isolated_home / ".local/share"),
                 "APPDATA": str(isolated_home / "AppData/Roaming"),
-                "TOKEN_PLACE_P8_TOKENIZER_REQUEST": str(tokenizer_request),
-                "TOKEN_PLACE_P8_TOKENIZER_EVIDENCE": str(tokenizer_evidence)})
+                "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST": str(tokenizer_request),
+                "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE": str(tokenizer_evidence)})
     driver_log_handle = driver_log.open("w", encoding="utf-8")
     process: subprocess.Popen[str] | None = None
     driver: webdriver.Remote | None = None
@@ -688,7 +688,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
         fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
         mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
-        compute_mode = p8_operator_mode(request["backend"])
+        compute_mode = benchmark_operator_mode(request["backend"])
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", mode, compute_mode)
         tier = driver.find_element(By.XPATH, "//select[@aria-label='Context tier']")
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", tier, request["context_tier"])
@@ -709,7 +709,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         browser.get(request["relay_url"])
         wait = WebDriverWait(browser, float(request["request_timeout_s"]), poll_frequency=0.05)
         wait.until(lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
-        selected_tier = apply_p8_context_tier(browser, request["context_tier"])
+        selected_tier = apply_benchmark_context_tier(browser, request["context_tier"])
         if selected_tier != request["context_tier"]:
             raise RuntimeError("landing context selection failed")
         wait.until(lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
@@ -750,7 +750,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
             event = state.get("p")
             if isinstance(event, dict) and (not progress or event.get("sequence") != progress[-1].get("sequence")):
                 progress.append(event)
-            lifecycle, response_text = classify_p8_landing_state(state)
+            lifecycle, response_text = classify_benchmark_landing_state(state)
             if lifecycle == "completed":
                 break
             if lifecycle == "failed":
@@ -780,7 +780,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
             if isinstance(event, dict) and isinstance(event.get("sequence"), int) and event["sequence"] > known_sequence:
                 known_sequence = event["sequence"]
                 return event
-            lifecycle, later_response = classify_p8_landing_state(state)
+            lifecycle, later_response = classify_benchmark_landing_state(state)
             if lifecycle == "completed" and later_response != response_text:
                 return {"kind": "result", "status": "success",
                     "sequence": terminal_observation["sequence"] + 1,
@@ -810,7 +810,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
             raise RuntimeError("authoritative_target_depth_mismatched")
         cancellation_recovery = None
         if request.get("cancellation_validation"):
-            cancellation_recovery = run_p8_cancellation_recovery(browser, driver, request)
+            cancellation_recovery = run_long_context_cancellation_recovery(browser, driver, request)
         preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
         prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
         digest = hashlib.sha256()
@@ -854,7 +854,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
             raise RuntimeError("owned process cleanup failed")
 
 
-def _p8_followup_request(browser: webdriver.Chrome, timeout_s: float) -> tuple[bool, float]:
+def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float) -> tuple[bool, float]:
     """Exercise the ordinary encrypted request lifecycle without retaining its plaintext result."""
     browser.execute_script("const v=document.querySelector('#app').__vue__; v.chatHistory=[];")
     field = browser.find_element(By.CSS_SELECTOR, ".message-input")
@@ -863,13 +863,13 @@ def _p8_followup_request(browser: webdriver.Chrome, timeout_s: float) -> tuple[b
     started = time.monotonic()
     browser.find_element(By.CSS_SELECTOR, ".send-button").click()
     wait = WebDriverWait(browser, timeout_s, poll_frequency=0.05)
-    state = wait.until(lambda d: (lambda s: s if classify_p8_landing_state(s)[0] != "running" else False)(
+    state = wait.until(lambda d: (lambda s: s if classify_benchmark_landing_state(s)[0] != "running" else False)(
         d.execute_script("const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,b:v.isGeneratingResponse};")))
-    lifecycle, _response = classify_p8_landing_state(state)
+    lifecycle, _response = classify_benchmark_landing_state(state)
     return lifecycle == "completed", time.monotonic() - started
 
 
-def run_p8_cancellation_recovery(browser: webdriver.Chrome, driver: webdriver.Remote,
+def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: webdriver.Remote,
         request: dict[str, object]) -> dict[str, object]:
     """Physically cancel prefill/generation requests, recover, then restart the operator."""
     config = request["cancellation"]
@@ -926,13 +926,13 @@ def run_p8_cancellation_recovery(browser: webdriver.Chrome, driver: webdriver.Re
             event = state.get("p") if isinstance(state, dict) else None
             if isinstance(event, dict) and int(event.get("sequence", -1)) > last_sequence:
                 stale += 1
-            lifecycle, _response = classify_p8_landing_state(state)
+            lifecycle, _response = classify_benchmark_landing_state(state)
             if lifecycle == "completed": late += 1
             active_after = bool(state.get("a") or state.get("b"))
             time.sleep(0.01)
         quiescence_s = time.monotonic() - quiet_started
         cleanup_s = time.monotonic() - triggered
-        followup_ok, followup_s = _p8_followup_request(browser, recovery_s)
+        followup_ok, followup_s = _long_context_followup_request(browser, recovery_s)
         scenarios.append({"phase": phase, "trigger_observed": True, "trigger_count": trigger_count,
             "threshold": threshold, "attempted": attempted, "acknowledged": acknowledged,
             "cleanup_s": cleanup_s, "quiescence_s": quiescence_s,
@@ -950,7 +950,7 @@ def run_p8_cancellation_recovery(browser: webdriver.Chrome, driver: webdriver.Re
     WebDriverWait(driver, recovery_s).until(lambda d: _status_value(d, "Registered").lower().startswith("yes"))
     new_session = _status_value(driver, "Operator session ID")
     restart_s = time.monotonic() - restarted
-    followup_ok, followup_s = _p8_followup_request(browser, recovery_s)
+    followup_ok, followup_s = _long_context_followup_request(browser, recovery_s)
     return {"scenarios": scenarios, "operator_lifecycle": {"stop_confirmed": stop_confirmed,
         "restart_ready": True, "session_changed": bool(old_session and new_session != old_session),
         "restart_s": restart_s, "post_restart_followup_ok": followup_ok,
@@ -963,13 +963,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--app-binary", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
-    parser.add_argument("--p8-request", type=Path)
-    parser.add_argument("--p8-evidence", type=Path)
+    parser.add_argument("--benchmark-request", type=Path)
+    parser.add_argument("--benchmark-evidence", type=Path)
     args = parser.parse_args(argv)
-    if args.p8_request or args.p8_evidence:
-        if not (args.p8_request and args.p8_evidence and args.app_binary):
-            parser.error("P8 mode requires --p8-request, --p8-evidence, and --app-binary")
-        return run_p8_packaged_mode(args.p8_request, args.p8_evidence, args.app_binary)
+    if args.benchmark_request or args.benchmark_evidence:
+        if not (args.benchmark_request and args.benchmark_evidence and args.app_binary):
+            parser.error("long-context benchmark mode requires --benchmark-request, --benchmark-evidence, and --app-binary")
+        return run_long_context_packaged_mode(args.benchmark_request, args.benchmark_evidence, args.app_binary)
     hardware_mode = args.packaged_windows_nvidia_hardware
     if hardware_mode and (args.app_binary is None or args.model is None):
         parser.error("packaged Windows NVIDIA mode requires --app-binary and --model")

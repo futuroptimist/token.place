@@ -5408,7 +5408,7 @@ def test_api_v1_progress_terminal_race_has_one_lifecycle_consistent_winner(clien
     assert 'encrypted_progress' not in (retrieve.get_json() or {})
 
 
-def test_p8_tokenizer_observation_uses_same_render_bridge_options(tmp_path, monkeypatch):
+def test_long_context_tokenizer_observation_uses_same_render_bridge_options(tmp_path, monkeypatch):
     content = "alpha café target omega"
     calls = []
 
@@ -5422,15 +5422,15 @@ def test_p8_tokenizer_observation_uses_same_render_bridge_options(tmp_path, monk
     cut = len("alpha café ".encode("utf-8"))
     request.write_text(json.dumps({"fixture_sha256": __import__("hashlib").sha256(
         content.encode("utf-8")).hexdigest(), "target_prefix_utf8_bytes": {"needle": cut}}))
-    monkeypatch.setenv("TOKEN_PLACE_P8_TOKENIZER_REQUEST", str(request))
-    monkeypatch.setenv("TOKEN_PLACE_P8_TOKENIZER_EVIDENCE", str(evidence))
+    monkeypatch.setenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", str(request))
+    monkeypatch.setenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", str(evidence))
     monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "bundled-test")
     messages = [{"role": "user", "content": content}]
     profile = {"provider": "qwen", "chat_template_policy": "qwen"}
     runtime = Runtime()
     total = RelayClient._api_v1_render_and_tokenize_chat_prompt(
         runtime, messages, enable_thinking=False, model_profile=profile)
-    RelayClient._api_v1_record_p8_tokenizer_observation(
+    RelayClient._api_v1_record_benchmark_tokenizer_observation(
         runtime, messages, full_prompt_tokens=total, enable_thinking=False,
         model_profile=profile)
 
@@ -5446,9 +5446,9 @@ def test_p8_tokenizer_observation_uses_same_render_bridge_options(tmp_path, monk
     assert content not in evidence.read_text()
 
 
-def test_p8_tokenizer_observation_is_inert_without_explicit_environment(tmp_path, monkeypatch):
-    monkeypatch.delenv("TOKEN_PLACE_P8_TOKENIZER_REQUEST", raising=False)
-    monkeypatch.delenv("TOKEN_PLACE_P8_TOKENIZER_EVIDENCE", raising=False)
+def test_long_context_tokenizer_observation_is_inert_without_explicit_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", raising=False)
+    monkeypatch.delenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", raising=False)
     called = False
 
     class Runtime:
@@ -5457,7 +5457,7 @@ def test_p8_tokenizer_observation_is_inert_without_explicit_environment(tmp_path
             called = True
             return 1
 
-    RelayClient._api_v1_record_p8_tokenizer_observation(
+    RelayClient._api_v1_record_benchmark_tokenizer_observation(
         Runtime(), [{"role": "user", "content": "private"}], full_prompt_tokens=1,
         enable_thinking=None, model_profile={})
     assert called is False

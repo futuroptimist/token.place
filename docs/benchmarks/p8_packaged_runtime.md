@@ -68,10 +68,12 @@ python scripts/p8_benchmark.py generate-fixture --fixture long-55k --out-dir .tm
 ```
 
 The fixture manifest records the fixture version, deterministic seed, requested token count, actual
-CI-tokenizer count or adapter-tokenizer count, prompt SHA-256, target depths, expected answers, and
-scoring rules. When a packaged-runtime tokenizer adapter is available, use it to verify admission
-counts; otherwise ordinary CI uses the deterministic whitespace tokenizer and clearly labels it as
-`whitespace-ci`.
+estimated CI-tokenizer count, prompt SHA-256, expected answers, scoring rules, and requested and
+actual token offsets/ratios for every target. Generator callbacks and the deterministic
+`whitespace-ci` counter are always labeled non-authoritative estimates. A packaged report records
+that estimate separately from the runtime admission/progress count, and uses only the latter for
+physical throughput. Missing or inconsistent authoritative totals or target-offset evidence fails
+the packaged contract closed.
 
 The current synthetic fixture IDs are:
 
@@ -81,9 +83,27 @@ The current synthetic fixture IDs are:
 | `intermediate-32k` | 32,768 tokens | mid-depth haystack validation |
 | `long-55k` | 55,254 tokens | approximate `64k-full` benchmark comparable to #1566 |
 
-Each fixture plants early, middle, and late chapter targets, repeated decoys, table-of-contents
-ambiguity, prose-versus-title traps, exact canary retrieval, JSON-only output, exact-key-set,
-capitalization, punctuation, and five-word extraction rules.
+The 8K, 32K, and 55K fixtures respectively plant one simple needle near the early, middle, and late
+depth. The exact needle occurs once; deterministic similar-but-distinct markers are decoys. Each
+also contains a separate structured VII/XIV/XXI/canary extraction task with table-of-contents and
+heading/prose ambiguity. The canary literal is not disclosed by the instructions and occurs once at
+its recorded depth.
+
+To run a separately stored golden prompt, supply its manifest as a required pair (the harness does
+not infer an oracle from model output):
+
+```bash
+python scripts/p8_benchmark.py packaged-runtime \
+  --app-binary "$P8_APP_BINARY" --model "$P8_MODEL" --backend metal \
+  --relay-url "$P8_RELAY_URL" --context-tier 64k-full \
+  --prompt /path/to/small-8k.prompt.txt \
+  --manifest /path/to/small-8k.manifest.json \
+  --out-dir .tmp/p8-external
+```
+
+The pair is rejected before runner launch if either file is absent, the prompt exceeds the bounded
+size, the SHA-256 differs, or fixture identity, scenario, seed, oracle, scoring, token provenance,
+or target metadata is missing, malformed, out of bounds, or unordered.
 
 ## Semantic evaluation
 

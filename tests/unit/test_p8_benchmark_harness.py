@@ -14,8 +14,8 @@ def test_fixture_generation_stable_hash_and_depths():
     assert p1 == p2
     assert m1 == m2
     assert m1["fixture_sha256"] == h.hashlib.sha256(p1.encode()).hexdigest()
-    assert set(m1["target_depths_tokens"]) == {"VII", "XIV", "XXI"}
-    assert m1["target_depths_tokens"]["VII"] < m1["target_depths_tokens"]["XIV"] < m1["target_depths_tokens"]["XXI"]
+    assert set(m1["target_depths_tokens"]) == {"VII", "needle", "XIV", "XXI", "canary"}
+    h.validate_manifest(m1, p1)
     assert "The Winged Monkeys" in p1 and "Table of Contents" in p1
 
 
@@ -26,9 +26,46 @@ def test_fixture_generation_sizes_with_ci_tokenizer():
         assert manifest["actual_tokens"] > manifest["requested_tokens"] - 500
 
 
-def test_authoritative_tokenizer_hook_used():
+@pytest.mark.parametrize(("fixture", "depth"), [
+    ("small-8k", 0.18), ("intermediate-32k", 0.50), ("long-55k", 0.82),
+])
+def test_single_needle_and_hidden_canary_have_controlled_depth(fixture, depth):
+    prompt, manifest = h.generate_fixture(fixture)
+    needle = prompt.split("NEEDLE FACT: ", 1)[1].splitlines()[0]
+    canary = manifest["expected_answers"]["canary"]
+    assert prompt.count(needle) == 1
+    assert prompt.count(canary) == 1
+    assert canary not in prompt.split("Table of Contents", 1)[0]
+    assert manifest["targets"]["needle"]["actual_ratio"] == pytest.approx(depth, abs=0.015)
+    assert manifest["targets"]["canary"]["actual_ratio"] == pytest.approx(0.90, abs=0.015)
+
+
+def test_fixture_seed_changes_bytes_but_remains_deterministic():
+    first = h.generate_fixture("small-8k", "one")
+    second = h.generate_fixture("small-8k", "two")
+    assert first[0] != second[0]
+    assert first[1]["fixture_sha256"] != second[1]["fixture_sha256"]
+
+
+def test_manifest_validation_rejects_tampering():
+    prompt, manifest = h.generate_fixture("small-8k")
+    for mutate, code in [
+        (lambda value: value.update(fixture_version="old"), "manifest_identity_invalid"),
+        (lambda value: value.update(fixture_sha256="0" * 64), "fixture_hash_mismatch"),
+        (lambda value: value["expected_answers"].pop("VII"), "manifest_oracle_invalid"),
+        (lambda value: value["token_count_provenance"].update(authoritative=True), "manifest_token_provenance_invalid"),
+        (lambda value: value["targets"].pop("needle"), "manifest_targets_invalid"),
+    ]:
+        candidate = json.loads(json.dumps(manifest))
+        mutate(candidate)
+        with pytest.raises(ValueError, match=code):
+            h.validate_manifest(candidate, prompt)
+
+
+def test_supplied_tokenizer_hook_used_without_claiming_authority():
     _, manifest = h.generate_fixture("small-8k", tokenizer=lambda text: len(text.split()) + 7)
-    assert manifest["tokenizer"] == "adapter"
+    assert manifest["tokenizer"] == "supplied-callback"
+    assert manifest["token_count_provenance"]["authoritative"] is False
     assert manifest["actual_tokens"] >= 8192
 
 
@@ -298,8 +335,8 @@ def test_report_redacts_authorization_and_message_like_payloads(tmp_path):
     assert data["adapter"]["safe"] == "<redacted>"
 
 
-def test_packaged_runtime_invokes_repository_runner_and_cleans_files(tmp_path):
-    _, manifest = h.generate_fixture("small-8k")
+def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path):
+    prompt, manifest = h.generate_fixture("small-8k")
     model = tmp_path / "model.gguf"
     model.write_bytes(b"test artifact")
     payload = {
@@ -322,6 +359,7 @@ def test_packaged_runtime_invokes_repository_runner_and_cleans_files(tmp_path):
         "backend_used": "metal",
         "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": manifest["actual_tokens"],
+        "authoritative_target_offsets_tokens": {key: value["actual_offset_tokens"] for key, value in manifest["targets"].items()},
     }
     app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
     seen = {}
@@ -335,7 +373,7 @@ def test_packaged_runtime_invokes_repository_runner_and_cleans_files(tmp_path):
 
     result = h.invoke_packaged_runtime_adapter(timeout_s=1.5, app_binary=str(app), model=str(model),
         backend="metal", relay_url="https://relay.example", cleanup_timeout_s=3.0,
-        subprocess_run=fake_run)
+        external_prompt=prompt, external_manifest=manifest, subprocess_run=fake_run)
     assert seen["request"]["fixture_id"] == "small-8k"
     assert seen["request"]["prompt"] not in json.dumps(result)
     assert result["runner_kind"] == "repository_packaged_desktop_webdriver"
@@ -344,6 +382,17 @@ def test_packaged_runtime_invokes_repository_runner_and_cleans_files(tmp_path):
     assert "messages" not in result
     assert not h.Path(seen["command"][seen["command"].index("--p8-request") + 1]).exists()
     assert not h.Path(seen["command"][seen["command"].index("--p8-evidence") + 1]).exists()
+
+
+def test_packaged_runtime_external_fixture_pair_and_hash_fail_closed(tmp_path):
+    prompt, manifest = h.generate_fixture("small-8k")
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    common = dict(app_binary=str(app), model=str(model), backend="cpu",
+        relay_url="https://relay.example", cleanup_timeout_s=1)
+    assert h.invoke_packaged_runtime_adapter(**common, external_prompt=prompt)["code"] == "external_fixture_pair_required"
+    assert h.invoke_packaged_runtime_adapter(**common, external_prompt=prompt + "tampered",
+        external_manifest=manifest)["code"] == "fixture_hash_mismatch"
 
 
 def test_packaged_runtime_requires_physical_prerequisites():
@@ -462,6 +511,7 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
         "bundled_runtime_identity": "bundled", "build_identity": "build",
         "backend_used": "cpu", "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": manifest["actual_tokens"],
+        "authoritative_target_offsets_tokens": {key: value["actual_offset_tokens"] for key, value in manifest["targets"].items()},
         "progress_events": [{"sequence": 1, "phase": "generating",
             "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0,
             "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4,

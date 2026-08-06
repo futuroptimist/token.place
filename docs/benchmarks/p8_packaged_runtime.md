@@ -9,7 +9,7 @@ run multi-minute inference.
 
 Physical packaged-runtime mode is intentionally fail-closed. Run it only on a machine with:
 
-- a built or installed token.place desktop application at version `0.1.12`;
+- a built or installed token.place desktop application at version `0.1.13`;
 - the existing pinned `llama-cpp-python==0.3.32` packaged runtime;
 - Qwen3 8B Q4_K_M or another explicitly recorded local model artifact;
 - macOS Apple Silicon with Metal or Windows with NVIDIA/CUDA for GPU validation, with CPU only where
@@ -290,5 +290,5 @@ git diff --check
 ```
 
 Physical Metal/CUDA validation is manual and should attach only sanitized reports to #1566, #1608,
-or P9. Do not claim 0.1.12 release validation or general semantic correctness from a report-only
+or P9. Do not claim 0.1.13 release validation or general semantic correctness from a report-only
 baseline.

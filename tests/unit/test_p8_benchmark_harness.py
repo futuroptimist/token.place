@@ -359,7 +359,7 @@ def test_packaged_runtime_validates_app_model_backend_and_relay(tmp_path):
     common = dict(timeout_s=1, app_binary=str(app), model=str(model), backend="metal", relay_url="https://relay.example", cleanup_timeout_s=1)
     assert h.invoke_packaged_runtime_adapter(**{**common, "model": str(tmp_path / "absent.gguf")})["code"] == "model_artifact_invalid"
     assert h.invoke_packaged_runtime_adapter(**{**common, "app_binary": str(tmp_path / "absent")})["code"] == "packaged_app_invalid"
-    assert h.invoke_packaged_runtime_adapter(**{**common, "backend": "cpu"})["code"] == "backend_unsupported"
+    assert h.invoke_packaged_runtime_adapter(**{**common, "backend": "rocm"})["code"] == "backend_unsupported"
     for url in ("http://relay.example", "ftp://relay.example", "https://user:pw@relay.example", "https://relay.example/#fragment", "https://relay.example:bad"):
         assert h.invoke_packaged_runtime_adapter(**{**common, "relay_url": url})["code"] == "relay_url_invalid"
     assert h._valid_relay_url("http://127.0.0.1:8000")
@@ -433,3 +433,72 @@ def test_report_only_does_not_suppress_runtime_failure(tmp_path):
         "--report-only",
     ], text=True, capture_output=True)
     assert proc.returncode == 1
+
+
+def test_incompatible_fixture_rejected_before_tempfiles_or_runner(tmp_path, monkeypatch):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    monkeypatch.setattr(h.tempfile, "mkstemp", lambda **kwargs: pytest.fail("temporary file created"))
+    result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model),
+        backend="cpu", relay_url="https://relay.example", cleanup_timeout_s=1,
+        context_tier="8k-fast")
+    assert result["code"] == "fixture_context_incompatible"
+    assert result["fixture_tokens"] > result["prompt_budget_tokens"]
+
+
+@pytest.mark.parametrize(("report_only", "semantic_ok", "accepted"), [
+    (False, False, False), (True, False, True), (True, True, False),
+])
+def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semantic_ok, accepted):
+    _, manifest = h.generate_fixture("small-8k")
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    response = manifest["expected_answers"] if semantic_ok else {**manifest["expected_answers"], "canary": "wrong"}
+    payload = {
+        "response_text": json.dumps(response), "terminal": "completed", "start_s": 0.0,
+        "first_token_s": 1.0, "end_s": 2.0, "output_tokens": 4,
+        "app_identity": "token.place", "runtime_identity": "bundled",
+        "bundled_runtime_identity": "bundled", "build_identity": "build",
+        "backend_used": "cpu", "model_fingerprint": "sha256:test",
+        "authoritative_prompt_tokens": manifest["actual_tokens"],
+        "progress_events": [{"sequence": 1, "phase": "generating",
+            "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0,
+            "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4,
+            "elapsed_ms": 2000}],
+    }
+    def fake_run(command, **kwargs):
+        h.Path(command[command.index("--p8-evidence") + 1]).write_text(json.dumps(payload))
+        return subprocess.CompletedProcess(command, 0)
+    result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model), backend="cpu",
+        relay_url="https://relay.example", cleanup_timeout_s=1, report_only=report_only,
+        subprocess_run=fake_run)
+    assert result["runtime_contract_pass"] is True
+    assert result["pass"] is semantic_ok
+    assert result["report_only_accepted"] is accepted
+
+
+def test_packaged_temp_permissions_do_not_require_fchmod(tmp_path, monkeypatch):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    monkeypatch.delattr(h.os, "fchmod")
+    def failed_runner(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1)
+    result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model), backend="cpu",
+        relay_url="https://relay.example", cleanup_timeout_s=1, subprocess_run=failed_runner)
+    assert result["code"] == "packaged_runner_failed"
+
+
+def test_desktop_runner_selects_landing_tier_and_requires_success_lifecycle():
+    source = h.Path("desktop-tauri/scripts/test_desktop_operator_ui_e2e.py").read_text()
+    assert "v.selectedContextTier=arguments[0]" in source
+    assert 'assistant.get("isTyping") is False and "finishReason" in assistant' in source
+    assert 'raise RuntimeError("packaged_response_error")' in source
+    assert 'compute_mode = "cpu" if request["backend"] == "cpu" else "gpu"' in source
+
+
+def test_owned_runner_keeps_only_bounded_diagnostic_tail():
+    completed = h._run_owned_runner(
+        [sys.executable, "-c", "import sys; sys.stdout.write('x' * 10000 + 'TAIL')"], 2, 1)
+    assert completed.returncode == 0
+    assert len(completed.stdout) <= 2048
+    assert completed.stdout.endswith("TAIL")

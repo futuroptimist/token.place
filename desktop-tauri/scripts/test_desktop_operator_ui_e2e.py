@@ -645,7 +645,9 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
     """Drive a packaged app and the existing landing-page API v1 E2EE client."""
     request = json.loads(request_path.read_text(encoding="utf-8"))
     cleanup_timeout = float(request["cleanup_timeout_s"])
-    driver_log = Path(tempfile.mkstemp(prefix="p8-tauri-driver-", suffix=".log")[1])
+    driver_log_fd, driver_log_name = tempfile.mkstemp(prefix="p8-tauri-driver-", suffix=".log")
+    os.close(driver_log_fd)
+    driver_log = Path(driver_log_name)
     isolated_home = Path(tempfile.mkdtemp(prefix="p8-desktop-home-"))
     env = os.environ.copy()
     for key in ("USE_MOCK_LLM", "TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON", "PYTHONPATH"):
@@ -653,19 +655,22 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
     env.update({"HOME": str(isolated_home), "XDG_CONFIG_HOME": str(isolated_home / ".config"),
                 "XDG_DATA_HOME": str(isolated_home / ".local/share"),
                 "APPDATA": str(isolated_home / "AppData/Roaming")})
-    process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
-        stdout=driver_log.open("w", encoding="utf-8"), stderr=subprocess.STDOUT, text=True)  # noqa: S603
+    driver_log_handle = driver_log.open("w", encoding="utf-8")
+    process: subprocess.Popen[str] | None = None
     driver: webdriver.Remote | None = None
     browser: webdriver.Chrome | None = None
     cleanup_ok = True
     try:
+        process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
+            stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
         wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log, 90)
         driver = start_driver(app_binary.resolve(strict=True))
         wait_for_ui_ready(driver)
         fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
         fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
         mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
-        driver.execute_script("arguments[0].value='gpu'; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", mode)
+        compute_mode = "cpu" if request["backend"] == "cpu" else "gpu"
+        driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", mode, compute_mode)
         tier = driver.find_element(By.XPATH, "//select[@aria-label='Context tier']")
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", tier, request["context_tier"])
         wait_for_start_operator_enabled(driver, driver_log, driver_log)
@@ -684,6 +689,12 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         browser = start_landing_driver()
         browser.get(request["relay_url"])
         wait = WebDriverWait(browser, float(request["request_timeout_s"]), poll_frequency=0.05)
+        wait.until(lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
+        selected_tier = browser.execute_script(
+            "const v=document.querySelector('#app').__vue__; v.selectedContextTier=arguments[0]; "
+            "v.persistContextTier(arguments[0]); return v.selectedContextTier;", request["context_tier"])
+        if selected_tier != request["context_tier"]:
+            raise RuntimeError("landing context selection failed")
         wait.until(lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
         field = browser.find_element(By.CSS_SELECTOR, ".message-input")
         field.send_keys(request["prompt"])
@@ -691,14 +702,22 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         browser.find_element(By.CSS_SELECTOR, ".send-button").click()
         progress: list[dict[str, object]] = []
         while time.monotonic() - started < float(request["request_timeout_s"]):
-            state = browser.execute_script("const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,b:v.isGeneratingResponse};")
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,"
+                "b:v.isGeneratingResponse,t:v.selectedContextTier};")
             event = state.get("p")
             if isinstance(event, dict) and (not progress or event.get("sequence") != progress[-1].get("sequence")):
                 progress.append(event)
             assistants = [m for m in state.get("h", []) if isinstance(m, dict) and m.get("role") == "assistant"]
             if assistants and not state.get("b"):
-                response_text = assistants[-1].get("content")
-                break
+                assistant = assistants[-1]
+                # appendAssistantMessage adds both fields only for a successfully
+                # decoded API v1 message/choices envelope. Error and fallback
+                # assistant-shaped UI entries deliberately lack this lifecycle shape.
+                if assistant.get("isTyping") is False and "finishReason" in assistant:
+                    response_text = assistant.get("content")
+                    break
+                raise RuntimeError("packaged_response_error")
             time.sleep(0.05)
         else:
             raise RuntimeError("packaged request timeout")
@@ -725,13 +744,14 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
             with contextlib.suppress(Exception): browser.quit()
         if driver is not None:
             with contextlib.suppress(Exception): driver.quit()
-        if process.poll() is None:
+        if process is not None and process.poll() is None:
             process.terminate()
             try: process.wait(timeout=cleanup_timeout)
             except subprocess.TimeoutExpired:
                 process.kill()
                 try: process.wait(timeout=min(cleanup_timeout, 5))
                 except subprocess.TimeoutExpired: cleanup_ok = False
+        driver_log_handle.close()
         shutil.rmtree(isolated_home, ignore_errors=True)
         driver_log.unlink(missing_ok=True)
         if not cleanup_ok:

@@ -28,13 +28,21 @@ python scripts/p8_benchmark.py packaged-runtime \
   --backend metal \
   --relay-url "$P8_RELAY_URL" \
   --fixture small-8k \
+  --context-tier 64k-full \
   --request-timeout 600 \
   --cleanup-timeout 30 \
   --out-dir .tmp/p8
 ```
 
+The fixture's authoritative token count plus the selected tier's 1,024-token output reservation
+must fit before any temporary file or runner process is created. In particular, `small-8k` is
+slightly larger than 8,192 tokens by construction and therefore requires the explicit
+`--context-tier 64k-full` shown above; the harness never truncates it or silently switches tiers.
+
 On Windows/NVIDIA use the same command with `--backend cuda` and the installed `.exe`. On macOS use
-the installed `.app` executable under `Contents/MacOS` and `--backend metal`. The runner attests that
+the installed `.app` executable under `Contents/MacOS` and `--backend metal`. For existing packaged
+CPU support use `--backend cpu`; the runner selects operator CPU mode and requires
+`Backend selected=cpu` and `Backend used=cpu`. The runner attests that
 the launcher source is bundled, active and bundled runtime IDs agree, and selected/used backend
 matches the requested backend. It fails closed for mock/dev substitution, absent progress, an
 incomplete response lifecycle, or cleanup failure.
@@ -42,8 +50,11 @@ incomplete response lifecycle, or cleanup failure.
 Before launch, inputs are validated fail closed: the model must be a
 readable regular file, the app must be an executable regular file, and request/cleanup timeouts must
 be finite and positive. External E2EE relays require HTTPS; loopback relays may use HTTP or HTTPS.
-Credentials, fragments, malformed ports, and other schemes are rejected. Temporary request and
-evidence files are owner-only and deleted after each run. Unit tests replace only the subprocess
+Credentials, fragments, malformed ports, and other schemes are rejected. Temporary request,
+evidence, and diagnostic files are owner-only on POSIX, portable to Windows Python 3.11, and closed
+and deleted after each run. Runner output is written to a temporary bounded diagnostic tail rather
+than buffered without limit. On timeout the harness targets only the process tree it created after
+the runner's bounded cleanup opportunity; it never matches broad process names. Unit tests replace only the subprocess
 boundary and are orchestration evidence, never physical Metal/CUDA evidence.
 
 ## Fixture generation
@@ -174,6 +185,11 @@ methodology rather than byte-for-byte assertions.
   adapter contract failure. `--report-only` may preserve semantic-failure reports but does not
   suppress runtime, telemetry, cancellation, recovery, privacy, or invariant failures.
 - `2`: invalid CLI input or missing required packaged-runtime arguments.
+
+For packaged mode, `--report-only` records semantic failure without changing `semantic_pass` or the
+overall benchmark `pass` to true. It exits zero only when the separate runtime-contract result
+(identity, backend, progress, cleanup, timing, and telemetry) passed and semantic exactness was the
+only failure. Strict/default mode and every runtime-contract failure exit nonzero.
 
 ## CI versus hardware validation
 

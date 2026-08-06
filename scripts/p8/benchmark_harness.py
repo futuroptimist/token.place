@@ -8,6 +8,8 @@ mode invokes the repository-owned packaged desktop WebDriver runner.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 import math
+import signal
+import threading
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
@@ -254,10 +258,49 @@ def _valid_relay_url(value: str) -> bool:
     return parsed.scheme == "https" or loopback
 
 
+def _run_owned_runner(command: list[str], timeout_s: float,
+        cleanup_timeout_s: float) -> subprocess.CompletedProcess[str]:
+    """Run one owned process group without buffering output or killing by name."""
+    kwargs: dict[str, Any] = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    process = subprocess.Popen(command, **kwargs)  # noqa: S603
+    chunks: deque[bytes] = deque(maxlen=8)
+    def drain_output() -> None:
+        assert process.stdout is not None
+        for chunk in iter(lambda: process.stdout.read(256), b""):
+            chunks.append(chunk)
+    drain = threading.Thread(target=drain_output, daemon=True)
+    drain.start()
+    try:
+        returncode = process.wait(timeout=timeout_s + cleanup_timeout_s)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=cleanup_timeout_s, check=False)  # noqa: S603
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=cleanup_timeout_s)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=cleanup_timeout_s)
+        raise
+    drain.join(timeout=cleanup_timeout_s)
+    tail = b"".join(chunks)[-2048:].decode("utf-8", errors="replace")
+    return subprocess.CompletedProcess(command, returncode, stdout=tail)
+
+
 def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", timeout_s: float = 30.0,
         model: str | None = None, backend: str | None = None, relay_url: str | None = None,
         cleanup_timeout_s: float | None = None, app_binary: str | None = None,
-        context_tier: str = "8k-fast", subprocess_run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
+        context_tier: str = "64k-full", report_only: bool = False,
+        subprocess_run: Callable[..., Any] | None = None) -> dict[str, Any]:
     """Run the repository-owned packaged desktop E2E runner and validate its evidence."""
     missing = [name for name, value in {"app_binary": app_binary, "model": model, "backend": backend,
         "relay_url": relay_url, "timeout_s": timeout_s, "cleanup_timeout_s": cleanup_timeout_s}.items()
@@ -270,41 +313,56 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", timeout_s: 
     app_path = Path(str(app_binary))
     if not app_path.is_file() or not os.access(app_path, os.X_OK):
         return {"pass": False, "code": "packaged_app_invalid"}
-    if backend not in {"metal", "cuda"}:
+    if backend not in {"metal", "cuda", "cpu"}:
         return {"pass": False, "code": "backend_unsupported"}
     if not _valid_relay_url(str(relay_url)):
         return {"pass": False, "code": "relay_url_invalid"}
     if not all(isinstance(value, (int, float)) and math.isfinite(value) and value > 0 for value in (timeout_s, cleanup_timeout_s)):
         return {"pass": False, "code": "timeout_invalid"}
     prompt, manifest = generate_fixture(fixture_id)
+    profile = get_context_profile(context_tier)
+    prompt_budget = profile.total_context_tokens - profile.default_output_reservation_tokens
+    if manifest["actual_tokens"] > prompt_budget:
+        return {"pass": False, "runtime_contract_pass": False,
+            "code": "fixture_context_incompatible", "fixture_tokens": manifest["actual_tokens"],
+            "prompt_budget_tokens": prompt_budget, "context_tier": context_tier}
     request = {"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest,
         "model": str(model_path), "backend": backend, "relay_url": relay_url,
         "context_tier": context_tier, "request_timeout_s": timeout_s,
         "cleanup_timeout_s": cleanup_timeout_s}
-    request_name = evidence_name = None
+    request_name = evidence_name = diagnostic_name = None
     try:
         request_fd, request_name = tempfile.mkstemp(prefix="p8-request-", suffix=".json")
         evidence_fd, evidence_name = tempfile.mkstemp(prefix="p8-evidence-", suffix=".json")
-        os.fchmod(request_fd, 0o600); os.fchmod(evidence_fd, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(request_fd, 0o600); os.fchmod(evidence_fd, 0o600)
         with os.fdopen(request_fd, "w", encoding="utf-8") as handle:
             json.dump(request, handle)
         os.close(evidence_fd)
         command = [sys.executable, str(Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
             "test_desktop_operator_ui_e2e.py"), "--p8-request", request_name,
             "--p8-evidence", evidence_name, "--app-binary", str(app_path)]
+        diagnostic_fd, diagnostic_name = tempfile.mkstemp(prefix="p8-runner-", suffix=".log")
         try:
-            completed = subprocess_run(command, capture_output=True, text=True,
-                timeout=timeout_s + cleanup_timeout_s, check=False)
+            with os.fdopen(diagnostic_fd, "w+", encoding="utf-8") as diagnostic_handle:
+                if subprocess_run is None:
+                    completed = _run_owned_runner(command, timeout_s, cleanup_timeout_s)
+                else:
+                    completed = subprocess_run(command, stdout=diagnostic_handle,
+                        stderr=subprocess.STDOUT, text=True,
+                        timeout=timeout_s + cleanup_timeout_s, check=False)
         except subprocess.TimeoutExpired:
             return {"pass": False, "code": "packaged_runner_timeout"}
         if completed.returncode != 0:
-            return {"pass": False, "code": "packaged_runner_failed"}
+            tail = (completed.stdout or Path(diagnostic_name).read_text(
+                encoding="utf-8", errors="replace"))[-2048:]
+            return {"pass": False, "code": "packaged_runner_failed", "diagnostic_tail": sanitize(tail)}
         try:
             payload = json.loads(Path(evidence_name).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {"pass": False, "code": "packaged_evidence_malformed"}
     finally:
-        for name in (request_name, evidence_name):
+        for name in (request_name, evidence_name, diagnostic_name):
             if name:
                 Path(name).unlink(missing_ok=True)
     if not isinstance(payload, dict):
@@ -341,9 +399,12 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", timeout_s: 
     identity_ok = (runtime["app_identity"] not in {"dev", "mock", "unknown"} and
         runtime["runtime_identity"] == runtime.get("bundled_runtime_identity") and
         runtime["backend_used"] == backend)
-    passed = bool(semantic.get("semantic_pass") and progress.get("pass") and identity_ok)
+    runtime_contract_pass = bool(progress.get("pass") and identity_ok)
     if "kv_compare" in evidence:
-        passed = passed and bool(evidence["kv_compare"].get("pass"))
+        runtime_contract_pass = runtime_contract_pass and bool(evidence["kv_compare"].get("pass"))
+    passed = bool(runtime_contract_pass and semantic.get("semantic_pass"))
+    evidence["runtime_contract_pass"] = runtime_contract_pass
+    evidence["report_only_accepted"] = bool(report_only and runtime_contract_pass and not semantic.get("semantic_pass"))
     evidence["pass"] = passed
     evidence["code"] = "ok" if passed else "packaged_contract_failed"
     return sanitize(evidence)
@@ -376,8 +437,8 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("packaged-runtime", help="run the installed desktop through repository WebDriver control")
     r.add_argument("--out-dir", required=True); r.add_argument("--fixture", choices=FIXTURES, default="small-8k")
     r.add_argument("--app-binary", required=True); r.add_argument("--model", required=True)
-    r.add_argument("--backend", choices=("metal", "cuda"), required=True); r.add_argument("--relay-url", required=True)
-    r.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
+    r.add_argument("--backend", choices=("metal", "cuda", "cpu"), required=True); r.add_argument("--relay-url", required=True)
+    r.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="64k-full")
     r.add_argument("--request-timeout", type=float, default=600.0); r.add_argument("--cleanup-timeout", type=float, default=30.0)
     r.add_argument("--report-only", action="store_true", help="preserve semantic failures; runtime failures remain nonzero")
     args = p.parse_args(argv)
@@ -388,10 +449,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "packaged-runtime":
         evidence = invoke_packaged_runtime_adapter(fixture_id=args.fixture, timeout_s=args.request_timeout,
             app_binary=args.app_binary, model=args.model, backend=args.backend, relay_url=args.relay_url,
-            cleanup_timeout_s=args.cleanup_timeout, context_tier=args.context_tier)
+            cleanup_timeout_s=args.cleanup_timeout, context_tier=args.context_tier,
+            report_only=args.report_only)
         path=write_report_atomic(Path(args.out_dir), {"mode":"packaged-runtime",
             "runtime":{"platform":platform.system().lower()},"evidence":evidence})
         print(f"packaged_runtime_pass={evidence.get('pass', False)} report={path}")
-        return 0 if evidence.get("pass") else 1
+        return 0 if evidence.get("pass") or evidence.get("report_only_accepted") else 1
     return 2
 if __name__ == "__main__": raise SystemExit(main())

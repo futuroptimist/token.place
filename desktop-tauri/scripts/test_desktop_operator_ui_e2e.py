@@ -44,6 +44,11 @@ try:
     from selenium.webdriver.support.ui import WebDriverWait
 
     from utils.crypto_helpers import CryptoClient
+    from scripts.p8.benchmark_harness import (
+        apply_p8_context_tier,
+        classify_p8_landing_state,
+        p8_operator_mode,
+    )
 except Exception as exc:
     BOOTSTRAP_LOG.write_text(
         "desktop ui e2e bootstrap failure\n"
@@ -669,7 +674,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
         fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
         mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
-        compute_mode = "cpu" if request["backend"] == "cpu" else "gpu"
+        compute_mode = p8_operator_mode(request["backend"])
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", mode, compute_mode)
         tier = driver.find_element(By.XPATH, "//select[@aria-label='Context tier']")
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", tier, request["context_tier"])
@@ -690,9 +695,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
         browser.get(request["relay_url"])
         wait = WebDriverWait(browser, float(request["request_timeout_s"]), poll_frequency=0.05)
         wait.until(lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
-        selected_tier = browser.execute_script(
-            "const v=document.querySelector('#app').__vue__; v.selectedContextTier=arguments[0]; "
-            "v.persistContextTier(arguments[0]); return v.selectedContextTier;", request["context_tier"])
+        selected_tier = apply_p8_context_tier(browser, request["context_tier"])
         if selected_tier != request["context_tier"]:
             raise RuntimeError("landing context selection failed")
         wait.until(lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
@@ -708,15 +711,10 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
             event = state.get("p")
             if isinstance(event, dict) and (not progress or event.get("sequence") != progress[-1].get("sequence")):
                 progress.append(event)
-            assistants = [m for m in state.get("h", []) if isinstance(m, dict) and m.get("role") == "assistant"]
-            if assistants and not state.get("b"):
-                assistant = assistants[-1]
-                # appendAssistantMessage adds both fields only for a successfully
-                # decoded API v1 message/choices envelope. Error and fallback
-                # assistant-shaped UI entries deliberately lack this lifecycle shape.
-                if assistant.get("isTyping") is False and "finishReason" in assistant:
-                    response_text = assistant.get("content")
-                    break
+            lifecycle, response_text = classify_p8_landing_state(state)
+            if lifecycle == "completed":
+                break
+            if lifecycle == "failed":
                 raise RuntimeError("packaged_response_error")
             time.sleep(0.05)
         else:

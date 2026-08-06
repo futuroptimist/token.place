@@ -258,15 +258,54 @@ def _valid_relay_url(value: str) -> bool:
     return parsed.scheme == "https" or loopback
 
 
+def p8_operator_mode(backend: str) -> str:
+    """Map an attested backend to the operator control value."""
+    if backend == "cpu":
+        return "cpu"
+    if backend in {"metal", "cuda"}:
+        return "gpu"
+    raise ValueError("unsupported P8 backend")
+
+
+def apply_p8_context_tier(driver: object, context_tier: str) -> str:
+    """Set and read back the landing-page tier through the browser boundary."""
+    return driver.execute_script(
+        "const v=document.querySelector('#app').__vue__; v.selectedContextTier=arguments[0]; "
+        "v.persistContextTier(arguments[0]); return v.selectedContextTier;", context_tier)
+
+
+def classify_p8_landing_state(state: object) -> tuple[str, str | None]:
+    """Classify the landing-page API response lifecycle without trusting UI prose."""
+    if not isinstance(state, dict):
+        return "failed", None
+    history = state.get("h")
+    if not isinstance(history, list):
+        return "failed", None
+    assistants = [entry for entry in history
+        if isinstance(entry, dict) and entry.get("role") == "assistant"]
+    if state.get("b") is True or not assistants:
+        return "running", None
+    assistant = assistants[-1]
+    response = assistant.get("content")
+    if (assistant.get("isTyping") is False and "finishReason" in assistant
+            and isinstance(response, str)):
+        return "completed", response
+    return "failed", None
+
+
 def _run_owned_runner(command: list[str], timeout_s: float,
-        cleanup_timeout_s: float) -> subprocess.CompletedProcess[str]:
+        cleanup_timeout_s: float, *, popen: Callable[..., Any] = subprocess.Popen,
+        cleanup_run: Callable[..., Any] = subprocess.run,
+        killpg: Callable[[int, int], Any] = os.killpg,
+        platform_name: str | None = None) -> subprocess.CompletedProcess[str]:
     """Run one owned process group without buffering output or killing by name."""
     kwargs: dict[str, Any] = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    owned_platform = os.name if platform_name is None else platform_name
+    if owned_platform == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     else:
         kwargs["start_new_session"] = True
-    process = subprocess.Popen(command, **kwargs)  # noqa: S603
+    process = popen(command, **kwargs)  # noqa: S603
     chunks: deque[bytes] = deque(maxlen=8)
     def drain_output() -> None:
         assert process.stdout is not None
@@ -277,18 +316,26 @@ def _run_owned_runner(command: list[str], timeout_s: float,
     try:
         returncode = process.wait(timeout=timeout_s + cleanup_timeout_s)
     except subprocess.TimeoutExpired:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=cleanup_timeout_s, check=False)  # noqa: S603
+        if owned_platform == "nt":
+            try:
+                cleanup_run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=cleanup_timeout_s, check=False)  # noqa: S603
+            except (OSError, subprocess.TimeoutExpired):
+                process.kill()
+            try:
+                process.wait(timeout=cleanup_timeout_s)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=cleanup_timeout_s)
         else:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
+                killpg(process.pid, signal.SIGTERM)
             try:
                 process.wait(timeout=cleanup_timeout_s)
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
+                    killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=cleanup_timeout_s)
         raise
     drain.join(timeout=cleanup_timeout_s)

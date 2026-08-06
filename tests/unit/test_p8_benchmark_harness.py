@@ -1,4 +1,5 @@
 import json
+import signal
 import subprocess
 import sys
 
@@ -488,12 +489,34 @@ def test_packaged_temp_permissions_do_not_require_fchmod(tmp_path, monkeypatch):
     assert result["code"] == "packaged_runner_failed"
 
 
-def test_desktop_runner_selects_landing_tier_and_requires_success_lifecycle():
-    source = h.Path("desktop-tauri/scripts/test_desktop_operator_ui_e2e.py").read_text()
-    assert "v.selectedContextTier=arguments[0]" in source
-    assert 'assistant.get("isTyping") is False and "finishReason" in assistant' in source
-    assert 'raise RuntimeError("packaged_response_error")' in source
-    assert 'compute_mode = "cpu" if request["backend"] == "cpu" else "gpu"' in source
+@pytest.mark.parametrize(("state", "expected"), [
+    ({"h": [], "b": True}, ("running", None)),
+    ({"h": [], "b": False}, ("running", None)),
+    ({"h": [{"role": "assistant", "content": "ok", "isTyping": False,
+              "finishReason": "stop"}], "b": False}, ("completed", "ok")),
+    ({"h": [{"role": "assistant", "content": "fallback"}], "b": False}, ("failed", None)),
+    ({"h": [{"role": "assistant", "content": {"error": "bad"}, "isTyping": False,
+              "finishReason": "error"}], "b": False}, ("failed", None)),
+    ({"h": [{"role": "assistant", "content": "missing lifecycle"}], "b": False}, ("failed", None)),
+])
+def test_desktop_runner_requires_success_lifecycle(state, expected):
+    assert h.classify_p8_landing_state(state) == expected
+
+
+def test_desktop_runner_applies_tier_and_maps_operator_mode():
+    class Browser:
+        def execute_script(self, script, tier):
+            assert "selectedContextTier" in script
+            self.tier = tier
+            return tier
+    browser = Browser()
+    assert h.apply_p8_context_tier(browser, "64k-full") == "64k-full"
+    assert browser.tier == "64k-full"
+    assert h.p8_operator_mode("cpu") == "cpu"
+    assert h.p8_operator_mode("metal") == "gpu"
+    assert h.p8_operator_mode("cuda") == "gpu"
+    with pytest.raises(ValueError):
+        h.p8_operator_mode("mock")
 
 
 def test_owned_runner_keeps_only_bounded_diagnostic_tail():
@@ -502,6 +525,56 @@ def test_owned_runner_keeps_only_bounded_diagnostic_tail():
     assert completed.returncode == 0
     assert len(completed.stdout) <= 2048
     assert completed.stdout.endswith("TAIL")
+
+
+class _TimedOutProcess:
+    pid = 731
+    stdout = None
+
+    def __init__(self, waits):
+        self.waits = iter(waits)
+        self.killed = False
+
+    def wait(self, timeout):
+        outcome = next(self.waits)
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired("runner", timeout)
+        return outcome
+
+    def kill(self):
+        self.killed = True
+
+
+def test_owned_runner_posix_terminates_exact_process_group(monkeypatch):
+    process = _TimedOutProcess(["timeout", "timeout", -9])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    launched = {}
+    signals = []
+    with pytest.raises(subprocess.TimeoutExpired):
+        h._run_owned_runner(["runner"], 1, 2,
+            popen=lambda command, **kwargs: launched.update(kwargs) or process,
+            killpg=lambda pid, sig: signals.append((pid, sig)), platform_name="posix")
+    assert launched["start_new_session"] is True
+    assert signals == [(731, signal.SIGTERM), (731, signal.SIGKILL)]
+
+
+@pytest.mark.parametrize("cleanup_outcome", ["failed", "timeout"])
+def test_owned_runner_windows_cleans_exact_pid_and_reaps(cleanup_outcome):
+    process = _TimedOutProcess(["timeout", 1] if cleanup_outcome == "failed" else ["timeout", 1])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    launched = {}; cleanup = []
+    def cleanup_run(command, **kwargs):
+        cleanup.append((command, kwargs))
+        if cleanup_outcome == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 1)
+    with pytest.raises(subprocess.TimeoutExpired):
+        h._run_owned_runner(["runner"], 1, 2,
+            popen=lambda command, **kwargs: launched.update(kwargs) or process,
+            cleanup_run=cleanup_run, platform_name="nt")
+    assert launched["creationflags"] == getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    assert cleanup[0][0] == ["taskkill", "/PID", "731", "/T", "/F"]
+    assert process.killed is (cleanup_outcome == "timeout")
 
 
 def test_main_generate_and_evaluate_commands(tmp_path):

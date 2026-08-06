@@ -655,12 +655,24 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
     os.close(driver_log_fd)
     driver_log = Path(driver_log_name)
     isolated_home = Path(tempfile.mkdtemp(prefix="p8-desktop-home-"))
+    tokenizer_dir = Path(tempfile.mkdtemp(prefix="p8-tokenizer-observation-"))
+    tokenizer_request = tokenizer_dir / "request.json"
+    tokenizer_evidence = tokenizer_dir / "evidence.json"
+    tokenizer_request.write_text(json.dumps({
+        "fixture_sha256": request["manifest"]["fixture_sha256"],
+        "target_prefix_utf8_bytes": {name: target["target_prefix_utf8_bytes"]
+            for name, target in request["manifest"]["targets"].items()},
+    }), encoding="utf-8")
+    if hasattr(os, "chmod"):
+        os.chmod(tokenizer_request, 0o600)
     env = os.environ.copy()
     for key in ("USE_MOCK_LLM", "TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON", "PYTHONPATH"):
         env.pop(key, None)
     env.update({"HOME": str(isolated_home), "XDG_CONFIG_HOME": str(isolated_home / ".config"),
                 "XDG_DATA_HOME": str(isolated_home / ".local/share"),
-                "APPDATA": str(isolated_home / "AppData/Roaming")})
+                "APPDATA": str(isolated_home / "AppData/Roaming"),
+                "TOKEN_PLACE_P8_TOKENIZER_REQUEST": str(tokenizer_request),
+                "TOKEN_PLACE_P8_TOKENIZER_EVIDENCE": str(tokenizer_evidence)})
     driver_log_handle = driver_log.open("w", encoding="utf-8")
     process: subprocess.Popen[str] | None = None
     driver: webdriver.Remote | None = None
@@ -757,6 +769,15 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
             raise RuntimeError("prefill_phase_missing")
         if first_generated is None or first_generating is None:
             raise RuntimeError("required timing telemetry missing")
+        try:
+            tokenizer_observation = json.loads(tokenizer_evidence.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("authoritative_target_depth_unavailable") from exc
+        if (not isinstance(tokenizer_observation, dict)
+                or tokenizer_observation.get("runtime_identity") != runtime["Runtime ID"]
+                or tokenizer_observation.get("fixture_sha256") != request["manifest"]["fixture_sha256"]
+                or tokenizer_observation.get("total_prompt_tokens") != progress[-1]["total_prompt_tokens"]):
+            raise RuntimeError("authoritative_target_depth_mismatched")
         preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
         prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
         digest = hashlib.sha256()
@@ -769,6 +790,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
             "backend_selected": runtime["Backend selected"].lower(),
             "backend_used": runtime["Backend used"].lower(), "model_fingerprint": digest.hexdigest(),
             "authoritative_prompt_tokens": progress[-1]["total_prompt_tokens"], "progress_events": progress,
+            "authoritative_tokenizer_evidence": tokenizer_observation,
             "result_observation": result_observation, "terminal_observation": terminal_observation,
             "post_terminal_observations": post_terminal, "response_text": response_text, "start_s": started,
             "preparing_end_s": preparing_end_s, "prefill_end_s": prefill_end_s,
@@ -790,6 +812,7 @@ def run_p8_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Pa
                 except subprocess.TimeoutExpired: cleanup_ok = False
         driver_log_handle.close()
         shutil.rmtree(isolated_home, ignore_errors=True)
+        shutil.rmtree(tokenizer_dir, ignore_errors=True)
         driver_log.unlink(missing_ok=True)
         if not cleanup_ok:
             raise RuntimeError("owned process cleanup failed")

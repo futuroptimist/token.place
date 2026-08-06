@@ -30,7 +30,7 @@ from typing import Any, Callable, Iterable
 from utils.context_profiles import get_context_profile
 
 SCHEMA_VERSION = "p8-benchmark-report-v1"
-FIXTURE_VERSION = "p8-semantic-haystack-v4"
+FIXTURE_VERSION = "p8-semantic-haystack-v5"
 DEFAULT_SEED = "p8-1566"
 PHASES = {"preparing": 0, "prefill": 1, "generating": 2}
 SECRET_PATTERNS = [
@@ -83,12 +83,22 @@ def _validate_authoritative_tokenizer_evidence(evidence: Any, manifest: dict[str
         return None, "authoritative_target_depth_malformed"
     if evidence.get("runtime_identity") != runtime_identity or evidence.get("total_prompt_tokens") != total_prompt_tokens:
         return None, "authoritative_target_depth_mismatched"
+    if evidence.get("fixture_sha256") != manifest.get("fixture_sha256"):
+        return None, "authoritative_target_depth_stale"
     offsets = evidence.get("target_offsets_tokens")
     if (not isinstance(offsets, dict) or set(offsets) != set(manifest["targets"])
-            or not all(isinstance(value, int) and 0 <= value < total_prompt_tokens for value in offsets.values())):
+            or not all(isinstance(value, int) and not isinstance(value, bool)
+                and 0 < value < total_prompt_tokens for value in offsets.values())):
         return None, "authoritative_target_depth_malformed"
     if len(set(offsets.values())) != len(offsets):
         return None, "authoritative_target_depth_ambiguous"
+    expected_order = sorted(manifest["targets"],
+        key=lambda key: manifest["targets"][key]["requested_ratio"])
+    if sorted(offsets, key=offsets.get) != expected_order:
+        return None, "authoritative_target_depth_ordering"
+    if any(abs(offsets[key] / total_prompt_tokens
+            - manifest["targets"][key]["requested_ratio"]) > 0.03 for key in offsets):
+        return None, "authoritative_target_depth_ratio"
     return offsets, None
 
 def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
@@ -139,6 +149,7 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
         "XXI": "After climbing down from the China wall the travelers found themselves in a disagreeable country. This prose sentence is not the title.",
     }
     target_markers: dict[str, int] = {}
+    target_prefix_utf8_bytes: dict[str, int] = {}
     filler_i = 0
     while True:
         joined = "\n".join(prompt_parts)
@@ -161,6 +172,7 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
                     break
                 prompt_parts.append(addition)
                 target_markers[chap] = _count_tokens(prefix, tokenizer)
+                target_prefix_utf8_bytes[chap] = len(prefix.encode("utf-8"))
                 inserted = True
         if not inserted:
             decoy = hashlib.sha256(f"{seed}:{fixture_id}:{filler_i}".encode()).hexdigest()[:16]
@@ -171,8 +183,11 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
             filler_i += 1
     for chap in (() if scenario == "single-needle" else ("VII", "XIV", "XXI")):
         if chap not in target_markers:
-            target_markers[chap] = _count_tokens("\n".join(prompt_parts), tokenizer)
-            prompt_parts.append(f"\nChapter {chap}: decoy heading\n{chapter_sentences[chap]}")
+            addition = f"\nChapter {chap}: decoy heading\n{chapter_sentences[chap]}"
+            prefix = "\n".join(prompt_parts) + "\n" + addition.split(targets[chap], 1)[0]
+            target_markers[chap] = _count_tokens(prefix, tokenizer)
+            target_prefix_utf8_bytes[chap] = len(prefix.encode("utf-8"))
+            prompt_parts.append(addition)
     prompt = "\n".join(prompt_parts).rstrip() + "\n"
     actual = _count_tokens(prompt, tokenizer)
     manifest = {
@@ -183,7 +198,9 @@ def generate_fixture(fixture_id: str, seed: str = DEFAULT_SEED,
         "fixture_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "target_depths_tokens": target_markers,
         "targets": {name: {"value": targets[name], "requested_offset_tokens": round(spec.requested_tokens * positions[name]),
             "requested_ratio": positions[name], "actual_offset_tokens": offset,
-            "actual_ratio": offset / actual} for name, offset in target_markers.items()},
+            "actual_ratio": offset / actual,
+            "target_prefix_utf8_bytes": target_prefix_utf8_bytes[name]}
+            for name, offset in target_markers.items()},
         "expected_answers": expected_answers, "semantic_oracle": semantic_oracle,
         "scoring_rules": scoring_rules,
     }
@@ -241,9 +258,11 @@ def validate_manifest(manifest: Any, prompt: str | None = None) -> dict[str, Any
         if (not isinstance(metadata, dict) or not isinstance(metadata.get("value"), str) or not metadata["value"]
                 or not isinstance(metadata.get("requested_offset_tokens"), int)
                 or not isinstance(metadata.get("actual_offset_tokens"), int)
+                or not isinstance(metadata.get("target_prefix_utf8_bytes"), int)
                 or not isinstance(metadata.get("requested_ratio"), (int, float))
                 or not isinstance(metadata.get("actual_ratio"), (int, float))
                 or not 0 <= metadata["actual_offset_tokens"] < manifest["actual_tokens"]
+                or metadata["target_prefix_utf8_bytes"] <= 0
                 or not 0 <= metadata["actual_ratio"] <= 1
                 or metadata["actual_ratio"] != metadata["actual_offset_tokens"] / manifest["actual_tokens"]):
             raise ValueError("manifest_targets_invalid")
@@ -262,6 +281,15 @@ def validate_manifest(manifest: Any, prompt: str | None = None) -> dict[str, Any
             raise ValueError("fixture_too_large")
         if hashlib.sha256(prompt.encode()).hexdigest() != manifest["fixture_sha256"]:
             raise ValueError("fixture_hash_mismatch")
+        prompt_bytes = prompt.encode("utf-8")
+        for metadata in targets.values():
+            cut = metadata["target_prefix_utf8_bytes"]
+            try:
+                prefix = prompt_bytes[:cut].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("manifest_target_prefix_invalid") from exc
+            if not prompt.startswith(prefix) or not prompt_bytes[cut:].decode("utf-8").startswith(metadata["value"]):
+                raise ValueError("manifest_target_prefix_invalid")
         unique_targets = targets.values() if scenario == "single-needle" else (targets["canary"],)
         if any(prompt.count(metadata["value"]) != 1 for metadata in unique_targets):
             raise ValueError("fixture_target_occurrence_invalid")

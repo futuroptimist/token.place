@@ -73,7 +73,8 @@ python scripts/p8_benchmark.py generate-fixture --fixture long-55k --scenario st
 
 The fixture manifest records the fixture version, deterministic seed, requested token count, actual
 estimated CI-tokenizer count, prompt SHA-256, expected answers, scoring rules, and requested and
-actual token offsets/ratios for every target. Generator callbacks and the deterministic
+actual token offsets/ratios plus UTF-8-safe target-prefix cut points for every target. The cut
+points are bound to the prompt SHA-256 and validated before a packaged launch. Generator callbacks and the deterministic
 `whitespace-ci` counter are always labeled non-authoritative estimates. A packaged report records
 that estimate separately from the runtime admission/progress count, and uses only the latter for
 physical throughput. Missing or inconsistent authoritative totals or target-offset evidence fails
@@ -93,14 +94,20 @@ needle occurs once and deterministic similar-but-distinct markers are decoys. Th
 `structured-extraction` scenario asks only for VII/XIV/XXI/canary, retaining table-of-contents and
 heading/prose ambiguity. Its canary literal is not disclosed by the instructions and occurs once.
 
-The packaged runner currently reports the admission total through encrypted progress, but the
-installed desktop exposes no reusable control seam for applying that identical admission tokenizer
-to each target prefix. Consequently physical target-depth validation fails closed with
-`authoritative_target_depth_unavailable` and names the missing
-`packaged_admission_render_and_tokenize_chat_prefix_counts` seam. Fixture whitespace/callback
-estimates are never relabeled as physical evidence. A successful evidence envelope must eventually
-record the packaged tokenizer method and runtime identity plus independently measured total and
-target-prefix counts; documentation does not claim that evidence has been produced yet.
+In explicit P8 mode, the packaged runner passes only the fixture hash, validated UTF-8 prefix cut
+points, and an owner-only evidence location to the bundled sidecar. During normal authoritative
+admission, the sidecar verifies the actual final user message against that hash and sends the full
+message and every prefix through the same loaded `llm_instance`, `render_and_tokenize_chat` bridge,
+chat-template policy, and thinking option. It atomically writes bounded counts and runtime identity;
+it never writes prompt text, target values, ciphertext, credentials, or request identifiers. The
+seam is inert unless the manual P8 runner explicitly supplies both environment variables.
+
+The harness requires method `packaged_admission_render_and_tokenize_chat`, matching bundled runtime
+identity and total/progress counts, the exact target key set, unique ordered positive prefix counts,
+and ratios within an absolute 0.03 tolerance of the controlled fixture placements. Missing,
+malformed, stale-hash, identity/total mismatch, ambiguous ordering, or out-of-tolerance evidence
+fails closed. Fixture whitespace/callback estimates are never relabeled as physical evidence. No
+Metal, CUDA, or CPU tokenizer run is claimed by this documentation.
 
 To run a separately stored golden prompt, supply its manifest as a required pair (the harness does
 not infer an oracle from model output):

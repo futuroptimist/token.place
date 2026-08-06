@@ -539,7 +539,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         "backend_requested": "metal", "backend_selected": "metal", "backend_used": "metal",
         "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": authoritative_total,
-        "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled-test", "total_prompt_tokens": authoritative_total, "target_offsets_tokens": authoritative_offsets},
+        "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled-test", "fixture_sha256": manifest["fixture_sha256"], "total_prompt_tokens": authoritative_total, "target_offsets_tokens": authoritative_offsets},
     }
     app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
     seen = {}
@@ -581,14 +581,21 @@ def test_packaged_runtime_external_fixture_pair_and_hash_fail_closed(tmp_path):
     (lambda value: value.update(method="whitespace-ci"), "authoritative_target_depth_malformed"),
     (lambda value: value.update(runtime_identity="other"), "authoritative_target_depth_mismatched"),
     (lambda value: value.update(total_prompt_tokens=99), "authoritative_target_depth_mismatched"),
+    (lambda value: value.update(fixture_sha256="0" * 64), "authoritative_target_depth_stale"),
     (lambda value: value.update(target_offsets_tokens={}), "authoritative_target_depth_malformed"),
     (lambda value: value["target_offsets_tokens"].update(XIV=value["target_offsets_tokens"]["VII"]),
      "authoritative_target_depth_ambiguous"),
+    (lambda value: value["target_offsets_tokens"].update(
+        VII=value["target_offsets_tokens"]["XXI"] - 1),
+     "authoritative_target_depth_ordering"),
+    (lambda value: value["target_offsets_tokens"].update(VII=1),
+     "authoritative_target_depth_ratio"),
 ])
 def test_authoritative_target_depth_evidence_fails_categorically(mutation, code):
     _, manifest = h.generate_fixture("small-8k")
     evidence = {"method": "packaged_admission_render_and_tokenize_chat",
         "runtime_identity": "bundled", "total_prompt_tokens": manifest["actual_tokens"],
+        "fixture_sha256": manifest["fixture_sha256"],
         "target_offsets_tokens": {key: value["actual_offset_tokens"]
             for key, value in manifest["targets"].items()}}
     mutation(evidence)
@@ -720,7 +727,7 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
         "bundled_runtime_identity": "bundled", "build_identity": "build",
         "backend_requested": "cpu", "backend_selected": "cpu", "backend_used": "cpu", "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": manifest["actual_tokens"],
-        "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled", "total_prompt_tokens": manifest["actual_tokens"], "target_offsets_tokens": {key: value["actual_offset_tokens"] for key, value in manifest["targets"].items()}},
+        "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled", "fixture_sha256": manifest["fixture_sha256"], "total_prompt_tokens": manifest["actual_tokens"], "target_offsets_tokens": {key: value["actual_offset_tokens"] for key, value in manifest["targets"].items()}},
         "progress_events": [
             {"sequence": 1, "phase": "prefill",
              "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0,

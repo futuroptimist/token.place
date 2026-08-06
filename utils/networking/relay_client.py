@@ -15,8 +15,10 @@ import re
 import sys
 import threading
 import time
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from pathlib import Path
 
 from utils.processing_result import RelayProcessingResult
 from urllib.parse import urlparse, urlunparse
@@ -3945,6 +3947,77 @@ class RelayClient:
             return prompt_tokens
         return None
 
+    @classmethod
+    def _api_v1_record_p8_tokenizer_observation(
+        cls,
+        llm_instance: Any,
+        messages: List[Dict[str, Any]],
+        *,
+        full_prompt_tokens: int,
+        enable_thinking: Optional[bool],
+        model_profile: Dict[str, Any],
+    ) -> None:
+        """Record bounded local P8 prefix counts through the admission bridge."""
+        config_name = os.getenv("TOKEN_PLACE_P8_TOKENIZER_REQUEST")
+        evidence_name = os.getenv("TOKEN_PLACE_P8_TOKENIZER_EVIDENCE")
+        if not config_name or not evidence_name:
+            return
+        try:
+            raw = Path(config_name).read_text(encoding="utf-8")
+            if len(raw.encode("utf-8")) > 16384:
+                return
+            config = json.loads(raw)
+            target_offsets = config.get("target_prefix_utf8_bytes")
+            if (not isinstance(config, dict) or not isinstance(target_offsets, dict)
+                    or not target_offsets or not all(isinstance(k, str) and isinstance(v, int)
+                    for k, v in target_offsets.items())):
+                return
+            user_indexes = [index for index, message in enumerate(messages)
+                if isinstance(message, dict) and message.get("role") == "user"]
+            if not user_indexes:
+                return
+            user_index = user_indexes[-1]
+            content = messages[user_index].get("content")
+            if not isinstance(content, str):
+                return
+            content_bytes = content.encode("utf-8")
+            if hashlib.sha256(content_bytes).hexdigest() != config.get("fixture_sha256"):
+                return
+            counts: Dict[str, int] = {}
+            for key, offset in sorted(target_offsets.items(), key=lambda item: item[1]):
+                if offset <= 0 or offset >= len(content_bytes):
+                    return
+                prefix = content_bytes[:offset].decode("utf-8")
+                prefix_messages = [dict(message) for message in messages]
+                prefix_messages[user_index]["content"] = prefix
+                count = cls._api_v1_render_and_tokenize_chat_prompt(
+                    llm_instance, prefix_messages, enable_thinking=enable_thinking,
+                    model_profile=model_profile)
+                if count is None:
+                    return
+                counts[key] = count
+            runtime_identity = os.getenv("TOKENPLACE_RUNTIME_ID", "")
+            if not runtime_identity:
+                return
+            evidence = {"method": "packaged_admission_render_and_tokenize_chat",
+                "runtime_identity": runtime_identity,
+                "fixture_sha256": config["fixture_sha256"],
+                "total_prompt_tokens": full_prompt_tokens,
+                "target_offsets_tokens": counts}
+            output = Path(evidence_name)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=".p8-tokenizer-", dir=output.parent)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(evidence, handle, sort_keys=True, separators=(",", ":"))
+                os.replace(temporary, output)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return
+
     @staticmethod
     def _api_v1_tokenize_rendered_prompt(llm_instance: Any, rendered_prompt: str) -> Optional[int]:
         """Count prompt tokens with the active llama.cpp runtime tokenizer."""
@@ -4251,6 +4324,7 @@ class RelayClient:
             enable_thinking=admission_enable_thinking,
             model_profile=model_profile,
         )
+        admission_bridge_used = prompt_tokens is not None
         if prompt_tokens is None:
             rendered_prompt = self._api_v1_render_chat_prompt(
                 llm_instance,
@@ -4263,6 +4337,10 @@ class RelayClient:
                 if rendered_prompt is not None
                 else None
             )
+        if admission_bridge_used and prompt_tokens is not None:
+            self._api_v1_record_p8_tokenizer_observation(
+                llm_instance, messages, full_prompt_tokens=prompt_tokens,
+                enable_thinking=admission_enable_thinking, model_profile=model_profile)
         if prompt_tokens is None:
             worker_diagnostics = getattr(llm_instance, "_token_place_last_render_tokenize_error", None)
             internal_reason = "runtime_template_tokenizer_bridge_unavailable"

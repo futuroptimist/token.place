@@ -2,10 +2,18 @@ import json
 import signal
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from scripts.long_context_benchmark import benchmark_harness as h
+
+
+def test_desktop_runner_uses_evergreen_generation_settings_probe_name():
+    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
+        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
+    assert "__p8" not in source
+    assert source.count("__longContextBenchmarkGenerationSettings") == 3
 
 
 def test_fixture_generation_stable_hash_and_depths():

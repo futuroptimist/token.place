@@ -722,14 +722,14 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
                     const options = envelope.api_v1_request?.options;
                     const allowed = ['max_tokens', 'temperature', 'top_p', 'seed'];
                     if (!options || typeof options !== 'object' || Array.isArray(options)) {
-                        this.__p8GenerationSettings = null;
+                        this.__longContextBenchmarkGenerationSettings = null;
                     } else {
                         const supplied = {};
                         for (const key of Object.keys(options)) {
                             if (allowed.includes(key)) supplied[key] = options[key];
                             else supplied.__unsupported__ = key;
                         }
-                        this.__p8GenerationSettings = {
+                        this.__longContextBenchmarkGenerationSettings = {
                             supplied,
                             omitted_runtime_default: allowed.filter(key => !(key in options)).sort()
                         };
@@ -762,7 +762,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
         if not progress or not isinstance(response_text, str):
             raise RuntimeError("required encrypted progress or response evidence missing")
         generation_settings = browser.execute_script(
-            "return document.querySelector('#app').__vue__.__p8GenerationSettings;")
+            "return document.querySelector('#app').__vue__.__longContextBenchmarkGenerationSettings;")
         if not isinstance(generation_settings, dict):
             raise RuntimeError("generation_settings_unavailable")
         last_sequence = int(progress[-1]["sequence"])

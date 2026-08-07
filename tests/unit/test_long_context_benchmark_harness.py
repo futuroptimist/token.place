@@ -29,7 +29,7 @@ def _runtime_configuration(backend="cpu", tier="64k-full", window=65536, qwen=Fa
                 "selected": "qwen64k_kv_q8_fa_balanced_batch",
                 "preferred": "qwen64k_kv_q8_fa_balanced_batch",
                 "attempted": ["qwen64k_kv_q8_fa_balanced_batch"], "recovery_count": 0,
-                "result": "constructed", "fallback_reason": "none"},
+                "result": "passed", "fallback_reason": "none"},
             "batch_profile": {"requested": "balanced", "selected": "balanced",
                 "n_batch": 512, "n_ubatch": 128},
             "kv_cache": {"precision": "q8", "type_k": 8, "type_v": 8,
@@ -55,6 +55,56 @@ def _qwen_kv_summary(backend="metal"):
         "record_count":1, "decimal_places":2,
         "estimator_provenance":"qwen_selected_profile_gguf_header",
         "runtime_provenance":"pinned_llama_cpp_kv_buffer_diagnostic", "attestation":attestation}
+
+
+def _packaged_configuration_builder():
+    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
+        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {"_diagnostic_bool", "_diagnostic_int", "_diagnostic_float",
+        "_normalize_profile_fallback_reason", "packaged_runtime_configuration"}
+    nodes = [item for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name in names]
+    namespace = {"__builtins__": __builtins__, "math": __import__("math")}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<packaged-configuration>", "exec"),
+        namespace)
+    return namespace["packaged_runtime_configuration"]
+
+
+def _packaged_runtime_labels(backend="metal", *, tier="64k-full", window=65536):
+    return {"Requested mode": "GPU" if backend != "cpu" else "CPU",
+        "Effective mode": backend, "Backend available": backend,
+        "Backend selected": backend, "Backend used": backend, "Fallback reason": "none",
+        "Context tier": tier, "Context window": f"{window} tokens"}
+
+
+def _qwen_readiness_diagnostics(*, result="passed", fallback="null"):
+    return {"api_v1_readiness_qwen_64k_runtime_profile_id":
+            "qwen64k_kv_q8_fa_balanced_batch",
+        "api_v1_readiness_qwen_64k_runtime_preferred_profile_id":
+            "qwen64k_kv_q8_fa_balanced_batch",
+        "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids":
+            "qwen64k_kv_q8_fa_balanced_batch",
+        "api_v1_readiness_qwen_64k_runtime_profile_recovery_count": "0",
+        "api_v1_readiness_qwen_64k_runtime_profile_result": result,
+        "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason": fallback,
+        "api_v1_readiness_qwen_64k_batch_profile_requested": "balanced",
+        "api_v1_readiness_qwen_64k_batch_profile_selected": "balanced",
+        "api_v1_readiness_qwen_64k_runtime_profile_n_batch": "512",
+        "api_v1_readiness_qwen_64k_runtime_profile_n_ubatch": "128",
+        "api_v1_readiness_qwen_64k_runtime_profile_kv_precision": "q8",
+        "api_v1_readiness_qwen_64k_runtime_profile_type_k": "8",
+        "api_v1_readiness_qwen_64k_runtime_profile_type_v": "8",
+        "api_v1_readiness_qwen_64k_runtime_profile_flash_attn": "true",
+        "api_v1_readiness_qwen_64k_runtime_profile_offload_kqv": "true",
+        "kv_cache_device": "metal", "offloaded_layers": "all_supported_layers",
+        "api_v1_readiness_yarn_requested_context_tokens": "65536",
+        "api_v1_readiness_yarn_original_context_tokens": "32768",
+        "api_v1_readiness_yarn_context_multiplier": "2.0",
+        "api_v1_readiness_yarn_rope_freq_scale": "0.5",
+        "api_v1_readiness_yarn_ext_factor_overridden": "false",
+        "api_v1_readiness_yarn_rope_scaling_type_source": "top_level_enum",
+        "api_v1_readiness_yarn_configuration_valid": "true"}
 
 
 def test_desktop_runner_uses_evergreen_generation_settings_probe_name():
@@ -1405,7 +1455,8 @@ def test_production_shaped_qwen_report_validates_and_writes_atomically(tmp_path,
     evidence = _packaged_main_evidence()
     evidence["runtime"].update(backend_requested="metal", backend_selected="metal",
         backend_used="metal")
-    evidence["runtime_configuration"] = _runtime_configuration("metal", qwen=True)
+    evidence["runtime_configuration"] = _packaged_configuration_builder()(
+        _packaged_runtime_labels(), _qwen_readiness_diagnostics(), "metal")
     evidence["kv_compare"] = _qwen_kv_summary()
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: evidence)
     args = ["packaged-runtime", "--out-dir", str(tmp_path), "--app-binary", "app",
@@ -1423,6 +1474,10 @@ def test_production_shaped_qwen_report_validates_and_writes_atomically(tmp_path,
 
     mutations = (
         lambda item: item["runtime_configuration"]["trials"][0]["mode"].update(effective="gpu"),
+        lambda item: item["runtime_configuration"]["trials"][0]["backend"].update(
+            available="cpu"),
+        lambda item: item["runtime_configuration"]["trials"][0]["backend"].update(
+            fallback_reason="automatic_cpu_fallback"),
         lambda item: item["runtime_configuration"]["trials"][0]["runtime_profile"].update(
             fallback_reason="null"),
         lambda item: item["runtime_configuration"]["trials"][0]["runtime_profile"].update(
@@ -1438,6 +1493,46 @@ def test_production_shaped_qwen_report_validates_and_writes_atomically(tmp_path,
         malformed = json.loads(json.dumps(report)); mutate(malformed)
         with pytest.raises(ValueError):
             h.validate_report(malformed)
+
+
+@pytest.mark.parametrize("result", ["constructed", "failed"])
+def test_completed_qwen_runtime_rejects_nonfinal_profile_results(result):
+    configuration = _packaged_configuration_builder()(
+        _packaged_runtime_labels(), _qwen_readiness_diagnostics(result=result), "metal")
+    with pytest.raises(ValueError, match="runtime_configuration_invalid"):
+        h.validate_runtime_configuration(configuration, backend="metal",
+            context_tier="64k-full", context_tokens=65536,
+            kv_attestation=_qwen_kv_summary())
+
+
+@pytest.mark.parametrize(("architecture", "tier", "window", "reason"), [
+    ("llama", "64k-full", 65536, "not_applicable_verified_non_qwen"),
+    ("qwen3", "8k-fast", 8192, "not_applicable_context_tier"),
+])
+def test_rendered_null_profile_diagnostics_validate_end_to_end(tmp_path, monkeypatch,
+        architecture, tier, window, reason):
+    diagnostics = {key: "null" for key in _qwen_readiness_diagnostics()}
+    configuration = _packaged_configuration_builder()(
+        _packaged_runtime_labels("cpu", tier=tier, window=window), diagnostics, "cpu")
+    not_applicable = {"status":"not_applicable", "reason":"not_qwen_64k_profile"}
+    assert all(configuration[key] == not_applicable for key in (
+        "runtime_profile", "batch_profile", "kv_cache", "acceleration", "yarn_rope"))
+    evidence = _packaged_main_evidence()
+    evidence["runtime_configuration"] = configuration
+    evidence["kv_compare"] = {"pass":True, "applicability":reason, "reason":reason,
+        "attestation":{"method":"active_runtime_selected_profile", "applicability":reason,
+            "architecture":architecture, "profile_id":"default", "backend":"cpu",
+            "context_tier":tier, "context_size_tokens":window}}
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: evidence)
+    args = _packaged_main_args(tmp_path)
+    if tier == "8k-fast":
+        args.extend(["--context-tier", tier])
+    assert h.main(args) == 0
+    report_path = tmp_path / "long_context_benchmark_report.json"
+    report = json.loads(report_path.read_text())
+    h.validate_report(report)
+    rewritten = h.write_report_atomic(tmp_path / "rewritten", report)
+    assert json.loads(rewritten.read_text()) == report
 
 
 def test_packaged_trials_default_and_multiple_are_sequential(tmp_path, monkeypatch):

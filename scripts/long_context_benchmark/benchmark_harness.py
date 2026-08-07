@@ -798,12 +798,9 @@ def validate_runtime_configuration(value: Any, *, backend: str, context_tier: st
             or set(backend_evidence) != {"requested", "available", "selected", "used", "fallback_reason"}
             or any(backend_evidence[key] not in {"cpu", "metal", "cuda"}
                 for key in ("requested", "available", "selected", "used"))
-            or backend_evidence["requested"] != backend
-            or backend_evidence["selected"] != backend or backend_evidence["used"] != backend
-            or backend_evidence["fallback_reason"] not in {
-                "none", "memory_pressure", "compatibility_failure", "backend_unavailable",
-                "automatic_cpu_fallback", "requested_cpu",
-            }):
+            or any(backend_evidence[key] != backend
+                for key in ("requested", "available", "selected", "used"))
+            or backend_evidence["fallback_reason"] != "none"):
         raise ValueError("runtime_configuration_invalid")
     context = value["context"]
     if (not isinstance(context, dict) or set(context) != {"tier", "effective_window_tokens"}
@@ -828,7 +825,7 @@ def validate_runtime_configuration(value: Any, *, backend: str, context_tier: st
                 "selected", "preferred", "attempted", "recovery_count", "result", "fallback_reason"}
                 or not isinstance(profile["attempted"], list) or not 1 <= len(profile["attempted"]) <= 16
                 or profile["selected"] not in profile["attempted"]
-                or profile["result"] != "constructed"
+                or profile["result"] != "passed"
                 or profile["fallback_reason"] not in {
                     "none", "memory_pressure", "compatibility_failure",
                     "capability_incompatibility"}):

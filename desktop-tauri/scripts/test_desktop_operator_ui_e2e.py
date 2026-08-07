@@ -616,12 +616,14 @@ def packaged_runtime_configuration(runtime: dict[str, str], diagnostics: dict[st
         requested_backend: str) -> dict[str, object]:
     """Build bounded current-worker configuration evidence from UI-safe fields only."""
     profile_key = "api_v1_readiness_qwen_64k_runtime_profile_id"
-    if profile_key in diagnostics:
+    profile_id = diagnostics.get(profile_key)
+    profile_applicable = profile_id not in {None, "", "null"}
+    if profile_applicable:
         attempts = diagnostics.get(
             "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids", "").split(",")
         fallback_reason = _normalize_profile_fallback_reason(diagnostics.get(
             "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason"))
-        profile = {"selected": diagnostics[profile_key],
+        profile = {"selected": profile_id,
             "preferred": diagnostics["api_v1_readiness_qwen_64k_runtime_preferred_profile_id"],
             "attempted": attempts,
             "recovery_count": _diagnostic_int(diagnostics,
@@ -649,7 +651,7 @@ def packaged_runtime_configuration(runtime: dict[str, str], diagnostics: dict[st
     else:
         profile = batch = kv_cache = acceleration = yarn = {
             "status": "not_applicable", "reason": "not_qwen_64k_profile"}
-    if profile_key in diagnostics:
+    if profile_applicable:
         yarn = {
             "requested_context_tokens": _diagnostic_int(diagnostics,
                 "api_v1_readiness_yarn_requested_context_tokens"),

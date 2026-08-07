@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+import psutil
+
 from utils.context_profiles import get_context_profile
 
 SCHEMA_VERSION = "long-context-benchmark-report-v1"
@@ -685,6 +687,16 @@ def validate_report(report: Any) -> None:
             or len(aggregate["trials"]) != completed):
         raise ValueError("report_trial_aggregate_invalid")
     validate_generation_settings(report.get("generation_settings"))
+    memory = report.get("memory")
+    if (not isinstance(memory, dict) or set(memory) != {"maximum_peak_rss_bytes", "trials"}
+            or not isinstance(memory["maximum_peak_rss_bytes"], int)
+            or isinstance(memory["maximum_peak_rss_bytes"], bool)
+            or memory["maximum_peak_rss_bytes"] < 0
+            or not isinstance(memory["trials"], list) or len(memory["trials"]) != completed):
+        raise ValueError("report_memory_invalid")
+    trial_memory = [validate_physical_memory_evidence(item) for item in memory["trials"]]
+    if memory["maximum_peak_rss_bytes"] != max(item["peak_rss_bytes"] for item in trial_memory):
+        raise ValueError("report_memory_invalid")
     if "cancellation_recovery" in report:
         cancellation = report["cancellation_recovery"]
         if (not isinstance(cancellation, dict) or cancellation.get("pass") is not True
@@ -713,6 +725,70 @@ def platform_memory_probe(command: list[str], timeout_s: float = 2.0) -> dict[st
     try: payload = json.loads(stdout)
     except Exception: return {"available": False, "code": "probe_malformed", "stdout_tail": sanitize(stdout[-200:])}
     return sanitize({"available": cp.returncode == 0, "code": "ok" if cp.returncode == 0 else "probe_failed", "payload": payload})
+
+MEMORY_METHOD = "psutil_process_tree_rss_v1"
+MEMORY_SCOPE = "owned_tauri_driver_process_tree"
+
+def normalized_memory_platform(system: str | None = None) -> str:
+    value = (system or platform.system()).lower()
+    return {"darwin": "macos", "linux": "linux", "windows": "windows"}.get(value, "unsupported")
+
+class OwnedProcessTreeMemorySampler:
+    """Aggregate RSS only for a runner-owned root and its current descendants."""
+    def __init__(self, root_pid: int, process_factory: Callable[[int], Any] = psutil.Process,
+            system: str | None = None):
+        self.root_pid = root_pid
+        self.process_factory = process_factory
+        self.platform = normalized_memory_platform(system)
+        self.samples: list[int] = []
+
+    def sample(self) -> bool:
+        if self.platform == "unsupported":
+            return False
+        try:
+            root = self.process_factory(self.root_pid)
+            processes = [root, *root.children(recursive=True)]
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return False
+        rss = 0
+        observed = 0
+        for process in processes:
+            try:
+                value = process.memory_info().rss
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    rss += value
+                    observed += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        if not observed:
+            return False
+        self.samples.append(rss)
+        return True
+
+    def summary(self) -> dict[str, Any]:
+        if not self.samples:
+            raise ValueError("memory_sample_unavailable")
+        return {"method": MEMORY_METHOD, "scope": MEMORY_SCOPE, "platform": self.platform,
+            "sample_count": len(self.samples), "baseline_rss_bytes": self.samples[0],
+            "peak_rss_bytes": max(self.samples), "final_rss_bytes": self.samples[-1]}
+
+def validate_physical_memory_evidence(value: Any) -> dict[str, Any]:
+    keys = {"method", "scope", "platform", "sample_count", "baseline_rss_bytes",
+        "peak_rss_bytes", "final_rss_bytes"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError("physical_memory_evidence_invalid")
+    if value["method"] != MEMORY_METHOD or value["scope"] != MEMORY_SCOPE or \
+            value["platform"] not in {"linux", "macos", "windows"}:
+        raise ValueError("physical_memory_evidence_invalid")
+    numeric = ("sample_count", "baseline_rss_bytes", "peak_rss_bytes", "final_rss_bytes")
+    if any(not isinstance(value[key], int) or isinstance(value[key], bool) for key in numeric):
+        raise ValueError("physical_memory_evidence_invalid")
+    if (value["sample_count"] <= 0 or value["baseline_rss_bytes"] < 0
+            or value["final_rss_bytes"] < 0
+            or value["peak_rss_bytes"] < value["baseline_rss_bytes"]
+            or value["peak_rss_bytes"] < value["final_rss_bytes"]):
+        raise ValueError("physical_memory_evidence_invalid")
+    return dict(value)
 
 def _valid_relay_url(value: str) -> bool:
     parsed = urlparse(value)
@@ -932,7 +1008,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         "authoritative_prompt_tokens", "progress_events",
         "authoritative_tokenizer_evidence", "terminal_observation", "result_observation",
         "response_text", "start_s", "preparing_end_s", "prefill_end_s", "first_token_s", "end_s",
-        "output_tokens", "post_terminal_observations", "generation_settings"}
+        "output_tokens", "post_terminal_observations", "generation_settings", "memory"}
     missing_evidence = sorted(key for key in required if key not in payload or payload.get(key) in (None, "", {}))
     if missing_evidence:
         if "authoritative_tokenizer_evidence" in missing_evidence:
@@ -948,8 +1024,9 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         return {"pass": False, "code": "packaged_evidence_malformed"}
     try:
         generation_settings = validate_generation_settings(payload["generation_settings"])
+        memory = validate_physical_memory_evidence(payload["memory"])
     except ValueError as exc:
-        return {"pass": False, "code": str(exc)}
+        return {"pass": False, "runtime_contract_pass": False, "code": str(exc)}
     authoritative_offsets, depth_error = _validate_authoritative_tokenizer_evidence(
         payload["authoritative_tokenizer_evidence"], manifest,
         payload["runtime_identity"], payload["authoritative_prompt_tokens"])
@@ -977,7 +1054,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         "generation_settings": generation_settings,
         "progress": progress,
         "metrics": metrics,
-        "memory": payload.get("memory", {}),
+        "memory": memory,
         "runtime": {key: payload[key] for key in ("app_identity", "runtime_identity",
             "bundled_runtime_identity", "build_identity", "backend_requested", "backend_selected",
             "backend_used", "model_fingerprint",
@@ -1108,7 +1185,10 @@ def main(argv: list[str] | None = None) -> int:
                     "prompt_tokens":evidence["fixture"]["authoritative_prompt_tokens"],
                     "output_tokens":evidence["metrics"]["output_tokens"]},
                 "progress":evidence["progress"], "metrics":evidence["metrics"],
-                "semantic":evidence["semantic"], "aggregate_semantic":aggregate}
+                "semantic":evidence["semantic"], "aggregate_semantic":aggregate,
+                "memory":{"maximum_peak_rss_bytes":max(
+                    trial["memory"]["peak_rss_bytes"] for trial in completed),
+                    "trials":[trial["memory"] for trial in completed]}}
             if args.cancellation_validation:
                 report["cancellation_recovery"] = cancellation_evidence
         else:

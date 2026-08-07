@@ -49,6 +49,7 @@ try:
         classify_benchmark_landing_state,
         observe_post_terminal,
         benchmark_operator_mode,
+        OwnedProcessTreeMemorySampler,
         prefill_cancellation_trigger_state,
     )
 except Exception as exc:
@@ -683,6 +684,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
     try:
         process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
             stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
+        memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
         wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log, 90)
         driver = start_driver(app_binary.resolve(strict=True))
         wait_for_ui_ready(driver)
@@ -714,6 +716,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
         if selected_tier != request["context_tier"]:
             raise RuntimeError("landing context selection failed")
         wait.until(lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
+        if not memory_sampler.sample():
+            raise RuntimeError("memory_sample_unavailable")
         browser.execute_script("""
             const v = document.querySelector('#app').__vue__;
             const original = v.encrypt.bind(v);
@@ -745,6 +749,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
         browser.find_element(By.CSS_SELECTOR, ".send-button").click()
         progress: list[dict[str, object]] = []
         while time.monotonic() - started < float(request["request_timeout_s"]):
+            memory_sampler.sample()
             state = browser.execute_script(
                 "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,"
                 "b:v.isGeneratingResponse,t:v.selectedContextTier};")
@@ -792,6 +797,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
                     "elapsed_ms": terminal_observation["elapsed_ms"] + 1}
             return None
         post_terminal = [item for item in observe_post_terminal(post_terminal_poll) if item is not None]
+        memory_sampler.sample()
+        memory_evidence = memory_sampler.summary()
         first_generated = next((event for event in progress if int(event.get("generated_tokens", 0)) > 0), None)
         first_s = started + (float(first_generated["elapsed_ms"]) / 1000) if first_generated else None
         first_prefill = next((event for event in progress if event.get("phase") == "prefill"), None)
@@ -828,6 +835,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
             "result_observation": result_observation, "terminal_observation": terminal_observation,
             "post_terminal_observations": post_terminal, "response_text": response_text, "start_s": started,
             "generation_settings": generation_settings,
+            "memory": memory_evidence,
             "preparing_end_s": preparing_end_s, "prefill_end_s": prefill_end_s,
             "first_token_s": first_s, "end_s": ended, "output_tokens": progress[-1]["generated_tokens"]}
         if cancellation_recovery is not None:

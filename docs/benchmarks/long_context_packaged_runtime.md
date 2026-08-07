@@ -316,8 +316,20 @@ comparison uses the estimator's `exact_kv_allocation_bytes` (or stable exact KV 
 and compares it to llama.cpp/GGML runtime diagnostics such as `kv_allocation_bytes`. The default
 alignment rule allows at most one 4 KiB page of difference. If exact comparison is requested and the
 estimator used a conservative fallback, or runtime diagnostics are missing/ambiguous, the comparison
-fails closed. RSS, VRAM, and unified-memory probes are recorded as noisy optional observations with
-methodology rather than byte-for-byte assertions.
+fails closed.
+
+Physical packaged runs require an RSS summary sampled with `psutil` from the process tree rooted at
+the `tauri-driver` process created by that trial. Each sample sums the root's RSS with the RSS of its
+currently visible packaged-app and sidecar descendants; unrelated browser and system processes are
+not selected by name or included. Sampling occurs before the primary request, during its bounded
+polling loop, and after terminal observation. Processes that disappear or become inaccessible while
+the tree is enumerated are skipped, but a run fails closed if it obtains no valid owned-tree sample.
+
+Reports retain only the method/scope/platform enums, sample count, and baseline/peak/final RSS byte
+counts for each sequential trial, plus the maximum peak RSS across trials. They contain no PIDs,
+process names, executable paths, command lines, usernames, probe output, or request content. RSS is
+noisy OS-accounted resident memory: it is not GPU VRAM, Metal unified-memory residency, or evidence
+that P7's estimated KV allocation matches the runtime GGML diagnostic.
 
 ## Exit codes
 

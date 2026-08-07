@@ -8,6 +8,11 @@ import pytest
 
 from scripts.long_context_benchmark import benchmark_harness as h
 
+def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="linux"):
+    return {"method": h.MEMORY_METHOD, "scope": h.MEMORY_SCOPE, "platform": platform,
+        "sample_count": samples, "baseline_rss_bytes": baseline,
+        "peak_rss_bytes": peak, "final_rss_bytes": final}
+
 
 def test_desktop_runner_uses_evergreen_generation_settings_probe_name():
     source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
@@ -592,6 +597,54 @@ def test_memory_probe_parses_before_sanitizing_long_json(tmp_path):
     assert len(result["payload"]["padding"]) == 512
 
 
+def test_owned_process_tree_memory_aggregation_handles_descendant_churn():
+    class Process:
+        def __init__(self, rss=0, children=(), error=None):
+            self.rss, self.descendants, self.error = rss, list(children), error
+        def children(self, recursive=False):
+            assert recursive is True
+            return self.descendants
+        def memory_info(self):
+            if self.error:
+                raise self.error
+            return type("Memory", (), {"rss": self.rss})()
+
+    gone = Process(error=h.psutil.NoSuchProcess(9))
+    denied = Process(error=h.psutil.AccessDenied(10))
+    roots = iter([Process(100, [Process(40), gone]), Process(110, [Process(90), denied]),
+        Process(80)])
+    sampler = h.OwnedProcessTreeMemorySampler(7, lambda _pid: next(roots), system="Linux")
+    assert [sampler.sample(), sampler.sample(), sampler.sample()] == [True, True, True]
+    assert sampler.summary() == _memory_evidence(baseline=140, peak=200, final=80)
+
+
+def test_owned_process_tree_memory_fails_without_valid_sample_or_platform():
+    denied = lambda _pid: (_ for _ in ()).throw(h.psutil.AccessDenied(7))
+    sampler = h.OwnedProcessTreeMemorySampler(7, denied, system="Linux")
+    assert sampler.sample() is False
+    with pytest.raises(ValueError, match="memory_sample_unavailable"):
+        sampler.summary()
+    assert h.normalized_memory_platform("Darwin") == "macos"
+    assert h.normalized_memory_platform("Windows") == "windows"
+    assert h.normalized_memory_platform("Plan9") == "unsupported"
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda value: value.pop("scope"),
+    lambda value: value.update(method="process_name_scan"),
+    lambda value: value.update(platform="freebsd"),
+    lambda value: value.update(sample_count=0),
+    lambda value: value.update(peak_rss_bytes=99),
+    lambda value: value.update(final_rss_bytes=-1),
+    lambda value: value.update(pid=123),
+])
+def test_physical_memory_evidence_exact_shape_and_bounds(mutation):
+    evidence = _memory_evidence()
+    mutation(evidence)
+    with pytest.raises(ValueError, match="physical_memory_evidence_invalid"):
+        h.validate_physical_memory_evidence(evidence)
+
+
 def test_report_redacts_authorization_and_message_like_payloads(tmp_path):
     path = h.write_report_atomic(tmp_path, {
         "mode":"semantic-evaluation", "status":"passed",
@@ -639,7 +692,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         "generation_settings": {"supplied": {"max_tokens": 1024},
             "omitted_runtime_default": ["seed", "temperature", "top_p"]},
         "messages": [{"content": "plaintext"}],
-        "memory": {"diagnostic": "Authorization: Bearer sk-runtime"},
+        "memory": _memory_evidence(),
         "app_identity": "token.place-test",
         "runtime_identity": "bundled-test",
         "bundled_runtime_identity": "bundled-test",
@@ -677,7 +730,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
     assert result["fixture"]["authoritative_target_offsets_tokens"] == authoritative_offsets
     assert seen["request"]["cancellation_validation"] is True
     assert result["cancellation_recovery"]["pass"] is True
-    assert result["memory"]["diagnostic"] == "<redacted>"
+    assert result["memory"] == _memory_evidence()
     assert "messages" not in result
     assert not h.Path(seen["command"][seen["command"].index("--benchmark-request") + 1]).exists()
     assert not h.Path(seen["command"][seen["command"].index("--benchmark-evidence") + 1]).exists()
@@ -848,6 +901,7 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
         "response_text": json.dumps(response), "start_s": 0.0, "preparing_end_s": 0.0,
         "generation_settings":{"supplied":{"max_tokens":1024},
             "omitted_runtime_default":["seed", "temperature", "top_p"]},
+        "memory": _memory_evidence(),
         "prefill_end_s": 1.0, "first_token_s": 1.0, "end_s": 2.0, "output_tokens": 4,
         "result_observation":{"kind":"result", "status":"success", "sequence":3, "elapsed_ms":2001},
         "terminal_observation":{"kind":"terminal", "state":"completed", "sequence":4, "elapsed_ms":2002},
@@ -1011,7 +1065,8 @@ def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
             "decode_tokens_per_s":1, "request_budget_s":600, "completion_margin_s":598},
         "semantic":{"semantic_pass":False, "exact_match":False, "errors":["exact_match"]},
         "generation_settings":{"supplied":{"max_tokens":1024},
-            "omitted_runtime_default":["seed", "temperature", "top_p"]}}
+            "omitted_runtime_default":["seed", "temperature", "top_p"]},
+        "memory": _memory_evidence()}
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: evidence)
     args = ["packaged-runtime", "--out-dir", str(tmp_path), "--app-binary", "app",
         "--model", "model", "--backend", "cpu", "--relay-url", "https://relay.example",
@@ -1040,7 +1095,8 @@ def _packaged_main_evidence(semantic_pass=True, *, max_tokens=1024):
         "semantic":{"semantic_pass":semantic_pass, "exact_match":semantic_pass,
             "errors":[] if semantic_pass else ["exact_match", "target_selection"]},
         "generation_settings":{"supplied":{"max_tokens":max_tokens},
-            "omitted_runtime_default":["seed", "temperature", "top_p"]}}
+            "omitted_runtime_default":["seed", "temperature", "top_p"]},
+        "memory": _memory_evidence()}
 
 
 def _packaged_main_args(tmp_path, *extra):

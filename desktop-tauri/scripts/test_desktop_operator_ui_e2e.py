@@ -227,6 +227,14 @@ def wait_for_running_stability(
         time.sleep(0.2)
 
 
+def landing_compute_node_status_matches(driver: webdriver.Remote, expected: str) -> bool:
+    try:
+        status = driver.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
+        return status.text.strip() == expected
+    except (NoSuchElementException, StaleElementReferenceException):
+        return False
+
+
 def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -> None:
     locator = (
         f"(//label[normalize-space()='{label_text}']/following::input[1] | "
@@ -1145,9 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
         landing_driver = start_landing_driver()
         landing_driver.get(relay_url)
         WebDriverWait(landing_driver, 4).until(
-            lambda d: d.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
-            .text.strip()
-            == "Live compute nodes: 1"
+            lambda d: landing_compute_node_status_matches(d, "Live compute nodes: 1")
         )
 
         prompt = driver.find_element(
@@ -1207,9 +1213,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         WebDriverWait(landing_driver, 2.5).until(
-            lambda d: d.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
-            .text.strip()
-            == "Live compute nodes: 0"
+            lambda d: landing_compute_node_status_matches(d, "Live compute nodes: 0")
         )
         widget_zero_at = time.monotonic()
         diagnostics_to_widget_seconds = widget_zero_at - diagnostics_zero_observed_at

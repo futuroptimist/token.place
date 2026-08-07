@@ -13975,6 +13975,19 @@ def test_parse_pinned_llama_cpp_kv_allocation_diagnostic_fails_closed(lines, cod
     with pytest.raises(ValueError, match=code):
         module.parse_llama_cpp_kv_allocation_diagnostics(lines)
 
+
+def test_initialization_diagnostic_barrier_waits_for_delayed_reader():
+    from utils.llm import model_manager as module
+
+    proxy = object.__new__(module._SubprocessLlamaProxy)
+    proxy._stderr_activity = threading.Event()
+    delayed = threading.Thread(target=lambda: (time.sleep(0.075), proxy._stderr_activity.set()))
+    started = time.monotonic()
+    delayed.start()
+    proxy._wait_for_initialization_stderr()
+    delayed.join()
+    assert time.monotonic() - started >= 0.1
+
 def _qwen3_8b_metadata():
     return {
         'general.architecture': 'qwen3',

@@ -5432,6 +5432,10 @@ def test_long_context_benchmark_tokenizer_observation_uses_same_render_bridge_op
         "kv_precision":"q8", "memory_estimate":{"context_size_tokens":65536, "type_k":"q8",
         "type_v":"q8", "exact_kv_allocation_bytes":123, "metadata_source":"gguf_header",
         "conservative_fallback_used":False}}
+    runtime._token_place_benchmark_kv_applicability = {
+        "method":"active_runtime_selected_profile", "applicability":"qwen_64k_full",
+        "architecture":"qwen3", "profile_id":"qwen64k_kv_q8_fa_balanced_batch",
+        "backend":"metal", "context_tier":"64k-full", "context_size_tokens":65536}
     runtime.kv_runtime_diagnostic = {"method":"pinned_llama_cpp_kv_buffer_diagnostic",
         "observed_bytes":123, "precision_bytes":1}
     total = RelayClient._api_v1_render_and_tokenize_chat_prompt(
@@ -5446,6 +5450,7 @@ def test_long_context_benchmark_tokenizer_observation_uses_same_render_bridge_op
     assert payload["target_offsets_tokens"] == {"needle": cut + 7}
     assert payload["kv_estimator"]["exact_kv_allocation_bytes"] == 123
     assert payload["kv_runtime"]["observed_bytes"] == 123
+    assert payload["kv_applicability"]["architecture"] == "qwen3"
     assert len(calls) == 2
     assert calls[0][1] == calls[1][1] == {
         "tokenize": False, "add_generation_prompt": True,

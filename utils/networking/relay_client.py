@@ -4004,6 +4004,9 @@ class RelayClient:
                 "fixture_sha256": config["fixture_sha256"],
                 "total_prompt_tokens": full_prompt_tokens,
                 "target_offsets_tokens": counts}
+            applicability = getattr(llm_instance, "_token_place_benchmark_kv_applicability", None)
+            if isinstance(applicability, dict):
+                evidence["kv_applicability"] = dict(applicability)
             estimate = getattr(llm_instance, "_token_place_benchmark_kv_estimate", None)
             runtime_diagnostic = getattr(llm_instance, "kv_runtime_diagnostic", None)
             if isinstance(estimate, dict) and isinstance(runtime_diagnostic, dict):

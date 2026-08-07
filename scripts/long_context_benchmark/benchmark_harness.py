@@ -614,27 +614,101 @@ def compare_kv_estimate(estimate: dict[str, Any], runtime: dict[str, Any], *,
     integer_fields = [estimate.get("context_size_tokens"), estimate.get("exact_kv_allocation_bytes"),
         runtime.get("observed_bytes"), runtime.get("precision_bytes"), runtime.get("record_count"),
         runtime.get("decimal_places")]
-    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in integer_fields):
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > (1 << 63) - 1
+            for value in integer_fields):
         return {"pass": False, "code": "kv_diagnostic_value_invalid"}
+    profile_id = estimate.get("profile_id")
+    profile_type = next((kind for kind in ("f16", "q8", "q4")
+        if isinstance(profile_id, str) and kind in profile_id.split("_")), None)
+    expected_precision = runtime["record_count"] * math.ceil(
+        (1024 * 1024) / (2 * (10 ** runtime["decimal_places"])))
     if (estimate["conservative_fallback_used"] is not False or estimate["exact_kv_allocation_bytes"] <= 0
             or runtime["observed_bytes"] <= 0 or runtime["precision_bytes"] <= 0
             or runtime["record_count"] <= 0 or runtime["method"] != "pinned_llama_cpp_kv_buffer_diagnostic"
             or runtime["llama_cpp_python_version"] != "0.3.32"
             or runtime["llama_cpp_commit"] != "b3fed31b99f9bd37725833674252bccb429bb183"
             or runtime["unit"] != "MiB" or runtime["decimal_places"] not in {1, 2}
+            or runtime["record_count"] > 64 or runtime["precision_bytes"] != expected_precision
             or estimate["metadata_source"] != "gguf_header"
-            or estimate["type_k"] != estimate["type_v"]
+            or not isinstance(profile_id, str) or not 1 <= len(profile_id) <= 128
+            or estimate["backend"] not in {"cpu", "metal", "cuda"}
+            or estimate["type_k"] not in {"f16", "q8", "q4"}
+            or estimate["type_v"] not in {"f16", "q8", "q4"}
+            or estimate["type_k"] != estimate["type_v"] or profile_type != estimate["type_k"]
+            or estimate["context_size_tokens"] != 65536
             or backend is not None and estimate["backend"] != backend
             or context_tokens is not None and estimate["context_size_tokens"] != context_tokens):
         return {"pass": False, "code": "kv_diagnostic_provenance_mismatch"}
     estimated, observed, precision = (estimate["exact_kv_allocation_bytes"],
         runtime["observed_bytes"], runtime["precision_bytes"])
     lower, upper = max(1, observed - precision), observed + precision
-    return {"pass": lower <= estimated <= upper,
+    return {"pass": lower <= estimated <= upper, "applicability": "qwen_64k_full",
+        "profile_id": profile_id, "backend": estimate["backend"],
+        "context_size_tokens": estimate["context_size_tokens"],
+        "type_k": estimate["type_k"], "type_v": estimate["type_v"],
         "estimated_bytes": estimated, "observed_bytes": observed,
         "delta_bytes": abs(estimated - observed), "precision_interval_bytes": [lower, upper],
+        "precision_bytes": precision, "record_count": runtime["record_count"],
+        "decimal_places": runtime["decimal_places"],
         "estimator_provenance": "qwen_selected_profile_gguf_header",
         "runtime_provenance": "pinned_llama_cpp_kv_buffer_diagnostic"}
+
+def validate_kv_applicability(value: Any, *, backend: str, context_tier: str) -> dict[str, Any]:
+    keys = {"method", "applicability", "architecture", "profile_id", "backend",
+        "context_tier", "context_size_tokens"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError("kv_applicability_missing")
+    if (value["method"] != "active_runtime_selected_profile"
+            or not isinstance(value["architecture"], str) or not 1 <= len(value["architecture"]) <= 64
+            or not isinstance(value["profile_id"], str) or not 1 <= len(value["profile_id"]) <= 128
+            or value["backend"] != backend or value["context_tier"] != context_tier
+            or not isinstance(value["context_size_tokens"], int)
+            or isinstance(value["context_size_tokens"], bool)
+            or not 1 <= value["context_size_tokens"] <= 65536):
+        raise ValueError("kv_applicability_invalid")
+    expected = ("qwen_64k_full" if value["architecture"] == "qwen3"
+        and context_tier == "64k-full" and value["context_size_tokens"] == 65536
+        else "not_applicable_verified_non_qwen" if value["architecture"] != "qwen3"
+        else "not_applicable_context_tier")
+    if value["applicability"] != expected:
+        raise ValueError("kv_applicability_mismatch")
+    return dict(value)
+
+def validate_kv_comparison_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("pass") is not True:
+        raise ValueError("report_kv_diagnostics_invalid")
+    applicability = value.get("applicability")
+    if applicability in {"not_applicable_verified_non_qwen", "not_applicable_context_tier"}:
+        if set(value) != {"pass", "applicability", "reason"} or value["reason"] != applicability:
+            raise ValueError("report_kv_diagnostics_invalid")
+        return dict(value)
+    keys = {"pass", "applicability", "profile_id", "backend", "context_size_tokens", "type_k", "type_v",
+        "estimated_bytes", "observed_bytes", "delta_bytes", "precision_interval_bytes", "precision_bytes",
+        "record_count", "decimal_places", "estimator_provenance", "runtime_provenance"}
+    if set(value) != keys or applicability != "qwen_64k_full":
+        raise ValueError("report_kv_diagnostics_invalid")
+    integers = ("context_size_tokens", "estimated_bytes", "observed_bytes", "delta_bytes",
+        "precision_bytes", "record_count", "decimal_places")
+    if any(not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 0
+            for key in integers):
+        raise ValueError("report_kv_diagnostics_invalid")
+    lower, upper = value.get("precision_interval_bytes", [None, None]) if isinstance(
+        value.get("precision_interval_bytes"), list) and len(value["precision_interval_bytes"]) == 2 else (None, None)
+    if (not isinstance(value["profile_id"], str) or not 1 <= len(value["profile_id"]) <= 128
+            or value["backend"] not in {"cpu", "metal", "cuda"} or value["type_k"] not in {"f16", "q8", "q4"}
+            or value["type_k"] != value["type_v"] or value["context_size_tokens"] != 65536
+            or value["record_count"] <= 0 or value["record_count"] > 64
+            or value["decimal_places"] not in {1, 2}
+            or value["delta_bytes"] != abs(value["estimated_bytes"] - value["observed_bytes"])
+            or lower != max(1, value["observed_bytes"] - value["precision_bytes"])
+            or upper != value["observed_bytes"] + value["precision_bytes"]
+            or not lower <= value["estimated_bytes"] <= upper
+            or value["precision_bytes"] != value["record_count"] * math.ceil(
+                (1024 * 1024) / (2 * 10 ** value["decimal_places"]))
+            or value["estimator_provenance"] != "qwen_selected_profile_gguf_header"
+            or value["runtime_provenance"] != "pinned_llama_cpp_kv_buffer_diagnostic"):
+        raise ValueError("report_kv_diagnostics_invalid")
+    return dict(value)
 
 def sanitize(value: Any) -> Any:
     if isinstance(value, dict): return {str(k)[:64]: sanitize(v) for k,v in value.items() if str(k).lower() not in SENSITIVE_KEYS}
@@ -732,11 +806,10 @@ def validate_report(report: Any) -> None:
             raise ValueError("report_cancellation_recovery_invalid")
     kv = report.get("kv_diagnostics")
     if (not isinstance(kv, dict) or set(kv) != {"trials"}
-            or not isinstance(kv["trials"], list) or len(kv["trials"]) != completed
-            or any(not isinstance(item, dict) or item.get("pass") is not True
-                or item.get("applicability") not in {"qwen_64k_full", "not_applicable_context_tier"}
-                for item in kv["trials"])):
+            or not isinstance(kv["trials"], list) or len(kv["trials"]) != completed):
         raise ValueError("report_kv_diagnostics_invalid")
+    for item in kv["trials"]:
+        validate_kv_comparison_summary(item)
 
 def write_report_atomic(out_dir: Path, report: dict[str, Any]) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1104,13 +1177,21 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
                 generation_threshold=generation_cancel_tokens)
         except ValueError as exc:
             return {"pass": False, "runtime_contract_pass": False, "code": str(exc)}
-    p7_required = context_tier == "64k-full" and "qwen" in Path(model).name.lower()
+    try:
+        applicability = validate_kv_applicability(payload.get("kv_applicability"),
+            backend=backend, context_tier=context_tier)
+    except ValueError as exc:
+        return {"pass": False, "runtime_contract_pass": False, "code": str(exc)}
+    p7_required = applicability["applicability"] == "qwen_64k_full"
     if p7_required:
         evidence["kv_compare"] = compare_kv_estimate(payload.get("kv_estimate"), payload.get("kv_runtime"),
             backend=backend, context_tokens=65536)
-        evidence["kv_compare"]["applicability"] = "qwen_64k_full"
+        if (evidence["kv_compare"].get("pass")
+                and evidence["kv_compare"].get("profile_id") != applicability["profile_id"]):
+            evidence["kv_compare"] = {"pass": False, "code": "kv_diagnostic_provenance_mismatch"}
     else:
-        evidence["kv_compare"] = {"pass": True, "applicability": "not_applicable_context_tier"}
+        reason = applicability["applicability"]
+        evidence["kv_compare"] = {"pass": True, "applicability": reason, "reason": reason}
     runtime = evidence["runtime"]
     identity_ok = (runtime["app_identity"] not in {"dev", "mock", "unknown"} and
         runtime["runtime_identity"] == runtime.get("bundled_runtime_identity") and
@@ -1227,9 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
                 "memory":{"maximum_peak_rss_bytes":max(
                     trial["memory"]["peak_rss_bytes"] for trial in completed),
                     "trials":[trial["memory"] for trial in completed]},
-                "kv_diagnostics":{"trials":[trial.get("kv_compare", {
-                    "pass": True, "applicability": "not_applicable_context_tier"})
-                    for trial in completed]}}
+                "kv_diagnostics":{"trials":[trial["kv_compare"] for trial in completed]}}
             if args.cancellation_validation:
                 report["cancellation_recovery"] = cancellation_evidence
         else:

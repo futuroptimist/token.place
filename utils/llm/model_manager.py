@@ -2829,6 +2829,7 @@ class _SubprocessLlamaProxy:
         self._process._token_place_stdout_tail = []  # type: ignore[attr-defined]
         self._process._token_place_stderr_tail = []  # type: ignore[attr-defined]
         self._process._token_place_stderr_sequence = 0  # type: ignore[attr-defined]
+        self._stderr_activity = threading.Event()
         self._process._token_place_unclaimed_frames = self._unclaimed_frames  # type: ignore[attr-defined]
         self._process._token_place_legacy_frames = self._legacy_frames  # type: ignore[attr-defined]
         self._stderr_reader_thread: Optional[threading.Thread] = None
@@ -2861,14 +2862,10 @@ class _SubprocessLlamaProxy:
             init_stderr_sequence = int(getattr(self._process, '_token_place_stderr_sequence', 0) or 0)
             init_message = self._rpc({'method': '__init__', 'args': args, 'kwargs': kwargs}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_model_initialization', check_health=False)
             self.child_model_path_exists = bool(init_message.get('child_model_path_exists'))
-            deadline = time.monotonic() + 0.05
-            previous_sequence = -1
-            while time.monotonic() < deadline:
-                sequence = int(getattr(self._process, '_token_place_stderr_sequence', 0) or 0)
-                if sequence == previous_sequence:
-                    break
-                previous_sequence = sequence
-                time.sleep(0.001)
+            # The RPC response and stderr are drained by different readers.  Wait
+            # for a bounded quiet period after the completed init RPC so a slow
+            # stderr reader cannot make current-attempt diagnostics disappear.
+            self._wait_for_initialization_stderr()
             tail = getattr(self._process, '_token_place_stderr_tail', [])
             scoped_lines = [line for sequence, line in tail
                 if isinstance(sequence, int) and sequence > init_stderr_sequence]
@@ -2921,9 +2918,20 @@ class _SubprocessLlamaProxy:
                     self._process._token_place_stderr_sequence = seq  # type: ignore[attr-defined]
                     tail.append((seq, line))
                     del tail[:-100]
+                    self._stderr_activity.set()
 
         self._stderr_reader_thread = threading.Thread(target=_reader, name='llama_cpp_stderr_reader', daemon=True)
         self._stderr_reader_thread.start()
+
+    def _wait_for_initialization_stderr(self) -> None:
+        """Wait for a bounded post-init minimum and then one quiet interval."""
+        deadline = time.monotonic() + 0.5
+        not_before = time.monotonic() + 0.1
+        while time.monotonic() < deadline:
+            self._stderr_activity.clear()
+            active = self._stderr_activity.wait(timeout=min(0.05, deadline - time.monotonic()))
+            if not active and time.monotonic() >= not_before:
+                return
 
     def _start_stdout_demultiplexer(self) -> None:
         """Continuously drain and route the versioned private worker protocol."""
@@ -6892,6 +6900,28 @@ class ModelManager:
                                             'kv_precision': profile_diag.get('kv_precision'),
                                             'memory_estimate': profile_diag.get('memory_estimate'),
                                         })
+                                    provider = str(self.model_profile.get('provider') or '').lower()
+                                    context_size = int(self.config.get('model.context_size', 8192))
+                                    context_tier = str(getattr(self, 'context_tier', '8k-fast'))
+                                    selected_profile = profile_id if isinstance(profile_id, str) and profile_id else str(self.profile_id)
+                                    if provider == 'qwen' and context_tier == '64k-full' and context_size == 65536:
+                                        applicability = 'qwen_64k_full'
+                                        architecture = 'qwen3'
+                                    elif provider and provider != 'qwen':
+                                        applicability = 'not_applicable_verified_non_qwen'
+                                        architecture = provider
+                                    else:
+                                        applicability = 'not_applicable_context_tier'
+                                        architecture = 'qwen3' if provider == 'qwen' else provider
+                                    setattr(llm_instance, '_token_place_benchmark_kv_applicability', {
+                                        'method': 'active_runtime_selected_profile',
+                                        'applicability': applicability,
+                                        'architecture': architecture,
+                                        'profile_id': selected_profile,
+                                        'backend': str(compute_plan.get('backend_used') or '').lower(),
+                                        'context_tier': context_tier,
+                                        'context_size_tokens': context_size,
+                                    })
                                     break
                                 except Exception as init_exc:
                                     category = _classify_runtime_initialization_error(init_exc)

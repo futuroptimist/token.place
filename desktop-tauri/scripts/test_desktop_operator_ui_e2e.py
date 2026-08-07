@@ -832,6 +832,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
             "backend_used": runtime["Backend used"].lower(), "model_fingerprint": digest.hexdigest(),
             "authoritative_prompt_tokens": progress[-1]["total_prompt_tokens"], "progress_events": progress,
             "authoritative_tokenizer_evidence": tokenizer_observation,
+            "kv_applicability": tokenizer_observation.get("kv_applicability"),
             "kv_estimate": tokenizer_observation.get("kv_estimator"),
             "kv_runtime": tokenizer_observation.get("kv_runtime"),
             "result_observation": result_observation, "terminal_observation": terminal_observation,

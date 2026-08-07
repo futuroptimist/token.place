@@ -309,14 +309,7 @@ The command above is the genuine-hardware procedure. It was not executed during 
 this harness change; a packaged 0.1.14 application, model, relay, and supported hardware are
 required before recording physical evidence.
 
-## Memory-estimator comparison
-
-The harness consumes the shared memory-estimator output; it does not duplicate the estimator formulas. Exact KV
-comparison uses the estimator's `exact_kv_allocation_bytes` (or stable exact KV cache byte surface)
-and compares it to llama.cpp/GGML runtime diagnostics such as `kv_allocation_bytes`. The default
-alignment rule allows at most one 4 KiB page of difference. If exact comparison is requested and the
-estimator used a conservative fallback, or runtime diagnostics are missing/ambiguous, the comparison
-fails closed.
+## Physical process-tree memory
 
 Physical packaged runs require an RSS summary sampled with `psutil` from the process tree rooted at
 the `tauri-driver` process created by that trial. Each sample sums the root's RSS with the RSS of its
@@ -362,7 +355,8 @@ baseline.
 
 ### Qwen 64K KV allocation diagnostics
 
-For a supported Qwen model using `64k-full`, packaged trials require two independent,
+Applicability comes from the active runtime's verified architecture and selected profile, never the
+GGUF filename. A supported Qwen model using `64k-full` therefore requires two independent,
 same-session records. The selected runtime profile supplies the exact GGUF-header-derived KV
 allocation, backend, context size, K/V types, profile ID, metadata source, and fallback state. The
 pinned `llama-cpp-python` 0.3.32 runtime (llama.cpp commit
@@ -370,14 +364,16 @@ pinned `llama-cpp-python` 0.3.32 runtime (llama.cpp commit
 `KV buffer size` diagnostics. Multiple backend buffers are summed only when their device labels
 are unique within that initialization attempt.
 
-The runtime diagnostic prints MiB to one or two decimal places, so it is not byte-exact. Comparison
-uses the interval implied by half of the displayed unit at the diagnostic's actual decimal precision;
-it does not use an arbitrary 4 KiB tolerance. Missing, stale, duplicate-device, mixed-precision,
+The runtime diagnostic prints MiB to one or two decimal places, so it is not byte-exact. For each
+record the half-unit precision is `ceil(1 MiB / (2 * 10**decimal_places))`; the total
+`precision_bytes` must equal that value times `record_count`. Comparison uses the resulting interval.
+Missing, stale, duplicate-device, mixed-precision,
 overflowed, fallback-derived, backend/context-mismatched, or out-of-interval evidence fails the
 runtime contract and cannot be suppressed by `--report-only`. Reports retain one bounded comparison
-per sequential trial: estimated and observed bytes, delta, precision interval, provenance enums,
-applicability, and pass state. Other context tiers are explicitly `not_applicable_context_tier` and
-do not claim P7 validation.
+per sequential trial with exact validated keys for profile, backend, context, K/V types, estimated
+and observed bytes, delta, precision interval inputs, provenance enums, applicability, and pass state.
+Only a positively attested non-Qwen architecture or non-64K Qwen profile is not applicable; missing
+or malformed applicability evidence fails closed.
 
 Only bounded numeric/categorical summaries are retained. Raw stderr, paths, PIDs, command lines,
 prompts, responses, credentials, and runtime/session identifiers are excluded. The pinned fixture

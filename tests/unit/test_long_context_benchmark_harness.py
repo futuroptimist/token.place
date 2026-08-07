@@ -327,17 +327,65 @@ def test_phase_timing_throughput():
 
 
 def test_kv_compare_boundaries_and_fallback():
-    est = {"profile_id":"qwen64k", "backend":"metal", "context_size_tokens":65536,
+    est = {"profile_id":"qwen64k_kv_q8_fa_balanced_batch", "backend":"metal", "context_size_tokens":65536,
         "type_k":"q8", "type_v":"q8", "exact_kv_allocation_bytes":10000,
         "metadata_source":"gguf_header", "conservative_fallback_used":False}
     runtime = {"method":"pinned_llama_cpp_kv_buffer_diagnostic", "llama_cpp_python_version":"0.3.32",
         "llama_cpp_commit":"b3fed31b99f9bd37725833674252bccb429bb183", "observed_bytes":11000,
-        "precision_bytes":1000, "record_count":1, "unit":"MiB", "decimal_places":2}
+        "precision_bytes":5243, "record_count":1, "unit":"MiB", "decimal_places":2}
     assert h.compare_kv_estimate(est, runtime, backend="metal", context_tokens=65536)["pass"] is True
-    runtime["observed_bytes"] = 11001
+    runtime["observed_bytes"] = 16000
     assert h.compare_kv_estimate(est, runtime)["pass"] is False
     est["conservative_fallback_used"] = True
     assert h.compare_kv_estimate(est, runtime)["code"] == "kv_diagnostic_provenance_mismatch"
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("profile_id", None), ("type_k", None), ("type_v", "unknown"),
+    ("exact_kv_allocation_bytes", True), ("exact_kv_allocation_bytes", -1),
+    ("exact_kv_allocation_bytes", 1 << 64),
+])
+def test_kv_compare_rejects_malformed_estimator_fields(field, value):
+    estimate = {"profile_id":"qwen64k_kv_q8_fa_balanced_batch", "backend":"metal",
+        "context_size_tokens":65536, "type_k":"q8", "type_v":"q8",
+        "exact_kv_allocation_bytes":104857600, "metadata_source":"gguf_header",
+        "conservative_fallback_used":False}
+    runtime = {"method":"pinned_llama_cpp_kv_buffer_diagnostic",
+        "llama_cpp_python_version":"0.3.32",
+        "llama_cpp_commit":"b3fed31b99f9bd37725833674252bccb429bb183",
+        "observed_bytes":104857600, "precision_bytes":5243, "record_count":1,
+        "unit":"MiB", "decimal_places":2}
+    estimate[field] = value
+    assert h.compare_kv_estimate(estimate, runtime)["pass"] is False
+
+
+def test_kv_precision_arithmetic_and_report_shape_fail_closed():
+    summary = {"pass":True, "applicability":"qwen_64k_full",
+        "profile_id":"qwen64k_kv_q8_fa_balanced_batch", "backend":"metal",
+        "context_size_tokens":65536, "type_k":"q8", "type_v":"q8",
+        "estimated_bytes":104857600, "observed_bytes":104857600, "delta_bytes":0,
+        "precision_interval_bytes":[104852357, 104862843], "precision_bytes":5243,
+        "record_count":1, "decimal_places":2,
+        "estimator_provenance":"qwen_selected_profile_gguf_header",
+        "runtime_provenance":"pinned_llama_cpp_kv_buffer_diagnostic"}
+    assert h.validate_kv_comparison_summary(summary)["pass"] is True
+    for mutation in ({"precision_bytes":5242}, {"record_count":2},
+            {"delta_bytes":1}, {"profile_id":None}, {"extra":True}):
+        malformed = {**summary, **mutation}
+        with pytest.raises(ValueError, match="report_kv_diagnostics_invalid"):
+            h.validate_kv_comparison_summary(malformed)
+
+
+def test_kv_applicability_is_profile_attested_not_filename_derived():
+    qwen = {"method":"active_runtime_selected_profile", "applicability":"qwen_64k_full",
+        "architecture":"qwen3", "profile_id":"qwen64k_kv_q8_fa_balanced_batch",
+        "backend":"metal", "context_tier":"64k-full", "context_size_tokens":65536}
+    assert h.validate_kv_applicability(qwen, backend="metal", context_tier="64k-full") == qwen
+    non_qwen = {**qwen, "architecture":"llama", "profile_id":"default",
+        "applicability":"not_applicable_verified_non_qwen"}
+    assert h.validate_kv_applicability(non_qwen, backend="metal", context_tier="64k-full") == non_qwen
+    with pytest.raises(ValueError, match="kv_applicability"):
+        h.validate_kv_applicability(None, backend="metal", context_tier="64k-full")
 
 
 def test_memory_probe_success_absent_timeout_malformed_and_sanitize(tmp_path):
@@ -708,6 +756,19 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": authoritative_total,
         "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled-test", "fixture_sha256": manifest["fixture_sha256"], "total_prompt_tokens": authoritative_total, "target_offsets_tokens": authoritative_offsets},
+        "kv_applicability": {"method":"active_runtime_selected_profile",
+            "applicability":"qwen_64k_full", "architecture":"qwen3",
+            "profile_id":"qwen64k_kv_q8_fa_balanced_batch", "backend":"metal", "context_tier":"64k-full",
+            "context_size_tokens":65536},
+        "kv_estimate":{"profile_id":"qwen64k_kv_q8_fa_balanced_batch", "backend":"metal",
+            "context_size_tokens":65536, "type_k":"q8", "type_v":"q8",
+            "exact_kv_allocation_bytes":104857600, "metadata_source":"gguf_header",
+            "conservative_fallback_used":False},
+        "kv_runtime":{"method":"pinned_llama_cpp_kv_buffer_diagnostic",
+            "llama_cpp_python_version":"0.3.32",
+            "llama_cpp_commit":"b3fed31b99f9bd37725833674252bccb429bb183",
+            "observed_bytes":104857600, "precision_bytes":5243, "record_count":1,
+            "unit":"MiB", "decimal_places":2},
         "cancellation_recovery": _physical_cancellation_evidence(authoritative_total),
     }
     app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
@@ -755,7 +816,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
 
 def test_packaged_runtime_external_fixture_pair_and_hash_fail_closed(tmp_path):
     prompt, manifest = h.generate_fixture("small-8k")
-    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    model = tmp_path / "qwen-in-name-but-verified-llama.gguf"; model.write_bytes(b"x")
     app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
     common = dict(app_binary=str(app), model=str(model), backend="cpu",
         relay_url="https://relay.example", cleanup_timeout_s=1)
@@ -918,6 +979,10 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
         "backend_requested": "cpu", "backend_selected": "cpu", "backend_used": "cpu", "model_fingerprint": "sha256:test",
         "authoritative_prompt_tokens": manifest["actual_tokens"],
         "authoritative_tokenizer_evidence": {"method": "packaged_admission_render_and_tokenize_chat", "runtime_identity": "bundled", "fixture_sha256": manifest["fixture_sha256"], "total_prompt_tokens": manifest["actual_tokens"], "target_offsets_tokens": {key: value["actual_offset_tokens"] for key, value in manifest["targets"].items()}},
+        "kv_applicability": {"method":"active_runtime_selected_profile",
+            "applicability":"not_applicable_verified_non_qwen", "architecture":"llama",
+            "profile_id":"default", "backend":"cpu", "context_tier":"64k-full",
+            "context_size_tokens":65536},
         "progress_events": [
             {"sequence": 1, "phase": "prefill",
              "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0,
@@ -1073,7 +1138,9 @@ def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
         "semantic":{"semantic_pass":False, "exact_match":False, "errors":["exact_match"]},
         "generation_settings":{"supplied":{"max_tokens":1024},
             "omitted_runtime_default":["seed", "temperature", "top_p"]},
-        "memory": _memory_evidence()}
+        "memory": _memory_evidence(),
+        "kv_compare":{"pass":True, "applicability":"not_applicable_verified_non_qwen",
+            "reason":"not_applicable_verified_non_qwen"}}
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: evidence)
     args = ["packaged-runtime", "--out-dir", str(tmp_path), "--app-binary", "app",
         "--model", "model", "--backend", "cpu", "--relay-url", "https://relay.example",
@@ -1103,7 +1170,9 @@ def _packaged_main_evidence(semantic_pass=True, *, max_tokens=1024):
             "errors":[] if semantic_pass else ["exact_match", "target_selection"]},
         "generation_settings":{"supplied":{"max_tokens":max_tokens},
             "omitted_runtime_default":["seed", "temperature", "top_p"]},
-        "memory": _memory_evidence()}
+        "memory": _memory_evidence(),
+        "kv_compare":{"pass":True, "applicability":"not_applicable_verified_non_qwen",
+            "reason":"not_applicable_verified_non_qwen"}}
 
 
 def _packaged_main_args(tmp_path, *extra):

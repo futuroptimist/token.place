@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import shutil
 import socket
@@ -583,6 +584,94 @@ def _readiness_diagnostics_map(driver: webdriver.Remote) -> dict[str, str]:
     return dict(item.split("=", 1) for item in text.split() if "=" in item)
 
 
+def _diagnostic_bool(diagnostics: dict[str, str], key: str) -> bool:
+    value = diagnostics.get(key, "").lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError("runtime_configuration_invalid")
+    return value == "true"
+
+
+def _diagnostic_int(diagnostics: dict[str, str], key: str) -> int:
+    value = diagnostics.get(key, "")
+    if not value.isdigit():
+        raise RuntimeError("runtime_configuration_invalid")
+    return int(value)
+
+
+def _diagnostic_float(diagnostics: dict[str, str], key: str) -> float:
+    try:
+        value = float(diagnostics[key])
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError("runtime_configuration_invalid") from exc
+    if not math.isfinite(value):
+        raise RuntimeError("runtime_configuration_invalid")
+    return value
+
+
+def packaged_runtime_configuration(runtime: dict[str, str], diagnostics: dict[str, str],
+        requested_backend: str) -> dict[str, object]:
+    """Build bounded current-worker configuration evidence from UI-safe fields only."""
+    profile_key = "api_v1_readiness_qwen_64k_runtime_profile_id"
+    if profile_key in diagnostics:
+        attempts = diagnostics.get(
+            "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids", "").split(",")
+        profile = {"selected": diagnostics[profile_key],
+            "preferred": diagnostics["api_v1_readiness_qwen_64k_runtime_preferred_profile_id"],
+            "attempted": attempts,
+            "recovery_count": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_recovery_count"),
+            "result": diagnostics["api_v1_readiness_qwen_64k_runtime_profile_result"],
+            "fallback_reason": diagnostics.get(
+                "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason", "none")}
+        batch = {"requested": diagnostics["api_v1_readiness_qwen_64k_batch_profile_requested"],
+            "selected": diagnostics["api_v1_readiness_qwen_64k_batch_profile_selected"],
+            "n_batch": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_n_batch"),
+            "n_ubatch": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_n_ubatch")}
+        kv_cache = {"precision": diagnostics["api_v1_readiness_qwen_64k_runtime_profile_kv_precision"],
+            "type_k": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_type_k"),
+            "type_v": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_type_v"),
+            "device": diagnostics["kv_cache_device"]}
+        offloaded = diagnostics["offloaded_layers"]
+        acceleration = {"flash_attention": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_flash_attn"),
+            "kqv_offload": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_offload_kqv"),
+            "offloaded_layers": int(offloaded) if offloaded.isdigit() else offloaded}
+    else:
+        profile = batch = kv_cache = acceleration = yarn = {
+            "status": "not_applicable", "reason": "not_qwen_64k_profile"}
+    if profile_key in diagnostics:
+        yarn = {
+            "requested_context_tokens": _diagnostic_int(diagnostics,
+                "api_v1_readiness_yarn_requested_context_tokens"),
+            "original_context_tokens": _diagnostic_int(diagnostics,
+                "api_v1_readiness_yarn_original_context_tokens"),
+            "context_multiplier": _diagnostic_float(diagnostics,
+                "api_v1_readiness_yarn_context_multiplier"),
+            "rope_frequency_scale": _diagnostic_float(diagnostics,
+                "api_v1_readiness_yarn_rope_freq_scale"),
+            "extension_factor_overridden": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_yarn_ext_factor_overridden"),
+            "scaling_source": diagnostics["api_v1_readiness_yarn_rope_scaling_type_source"],
+            "configuration_valid": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_yarn_configuration_valid")}
+    return {"mode": {"requested": runtime["Requested mode"].lower(),
+            "effective": runtime["Effective mode"].lower()},
+        "backend": {"requested": requested_backend,
+            "available": runtime["Backend available"].lower(),
+            "selected": runtime["Backend selected"].lower(),
+            "used": runtime["Backend used"].lower(),
+            "fallback_reason": runtime["Fallback reason"].lower()},
+        "context": {"tier": runtime["Context tier"],
+            "effective_window_tokens": int(runtime["Context window"].split()[0])},
+        "runtime_profile": profile, "batch_profile": batch, "kv_cache": kv_cache,
+        "acceleration": acceleration, "yarn_rope": yarn}
+
+
 def assert_packaged_windows_nvidia_status(
     driver: webdriver.Remote, context_tier: str, pre_start_session_id: str
 ) -> None:
@@ -710,7 +799,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
 
         runtime = {label: _status_value(driver, label) for label in
             ("App version", "Build ID", "Runtime ID", "Bundled runtime ID", "Launcher source",
-             "Requested mode", "Backend selected", "Backend used", "Context tier")}
+             "Requested mode", "Effective mode", "Backend available", "Backend selected",
+             "Backend used", "Fallback reason", "Context tier", "Context window")}
+        diagnostics = _readiness_diagnostics_map(driver)
+        runtime_configuration = packaged_runtime_configuration(runtime, diagnostics, request["backend"])
         if (runtime["Launcher source"].lower() != "bundled"):
             raise RuntimeError("packaged launcher attestation failed")
         if runtime["Backend selected"].lower() != request["backend"] or runtime["Backend used"].lower() != request["backend"]:
@@ -847,6 +939,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
             "post_terminal_observations": post_terminal, "response_text": response_text, "start_s": started,
             "generation_settings": generation_settings,
             "memory": memory_evidence,
+            "runtime_configuration": runtime_configuration,
             "preparing_end_s": preparing_end_s, "prefill_end_s": prefill_end_s,
             "first_token_s": first_s, "end_s": ended, "output_tokens": progress[-1]["generated_tokens"]}
         if cancellation_recovery is not None:

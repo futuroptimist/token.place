@@ -14,11 +14,89 @@ def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="
         "peak_rss_bytes": peak, "final_rss_bytes": final}
 
 
+def _runtime_configuration(backend="cpu", tier="64k-full", window=65536, qwen=False):
+    na = {"status": "not_applicable", "reason": "not_qwen_64k_profile"}
+    result = {"mode": {"requested": "cpu" if backend == "cpu" else "gpu",
+            "effective": "cpu" if backend == "cpu" else "gpu"},
+        "backend": {"requested": backend, "available": backend, "selected": backend,
+            "used": backend, "fallback_reason": "none"},
+        "context": {"tier": tier, "effective_window_tokens": window},
+        "runtime_profile": dict(na), "batch_profile": dict(na), "kv_cache": dict(na),
+        "acceleration": dict(na), "yarn_rope": dict(na)}
+    if qwen:
+        result.update({"runtime_profile": {
+                "selected": "qwen64k_kv_q8_fa_balanced_batch",
+                "preferred": "qwen64k_kv_q8_fa_balanced_batch",
+                "attempted": ["qwen64k_kv_q8_fa_balanced_batch"], "recovery_count": 0,
+                "result": "constructed", "fallback_reason": "none"},
+            "batch_profile": {"requested": "balanced", "selected": "balanced",
+                "n_batch": 512, "n_ubatch": 128},
+            "kv_cache": {"precision": "q8", "type_k": 8, "type_v": 8,
+                "device": backend},
+            "acceleration": {"flash_attention": True, "kqv_offload": True,
+                "offloaded_layers": "all_supported_layers"},
+            "yarn_rope": {"requested_context_tokens": 65536,
+                "original_context_tokens": 32768, "context_multiplier": 2.0,
+                "rope_frequency_scale": 0.5, "extension_factor_overridden": False,
+                "scaling_source": "top_level_enum", "configuration_valid": True}})
+    return result
+
+
 def test_desktop_runner_uses_evergreen_generation_settings_probe_name():
     source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
         "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
     assert "__p8" not in source
     assert source.count("__longContextBenchmarkGenerationSettings") == 3
+
+
+def test_matrix_plan_is_deterministic_complete_and_duplicate_free():
+    first = h.build_matrix_plan()
+    second = h.build_matrix_plan()
+    assert first == second
+    h.validate_matrix_plan(first)
+    cells = first["cells"]
+    assert len(cells) == 5 * 7
+    assert len({h._canonical_json(cell) for cell in cells}) == len(cells)
+    for platform_name, backend, package in h.MATRIX_PACKAGED_BACKENDS:
+        scoped = [cell for cell in cells if (cell["platform"], cell["backend"], cell["package"])
+            == (platform_name, backend, package)]
+        assert sum(cell["trials"] for cell in scoped) == 18
+        assert sum(cell["cancellation_sequences"] for cell in scoped) == 1
+        assert {(cell["context_tier"], cell["fixture"], cell["scenario"])
+            for cell in scoped if cell["trials"]} == {
+                (tier, fixture, scenario) for tier, fixture in h.MATRIX_WORKLOADS
+                for scenario in ("single-needle", "structured-extraction")}
+
+
+def test_runtime_configuration_validation_is_exact_and_fail_closed():
+    attestation = {"attestation": {"applicability": "not_applicable_verified_non_qwen",
+        "architecture": "llama", "profile_id": "default"}}
+    valid = _runtime_configuration()
+    assert h.validate_runtime_configuration(valid, backend="cpu", context_tier="64k-full",
+        context_tokens=65536, kv_attestation=attestation) == valid
+    for mutation in (
+            lambda item: item.update(secret="plaintext"),
+            lambda item: item["context"].update(effective_window_tokens=True),
+            lambda item: item["backend"].update(used="cuda"),
+            lambda item: item.update(yarn_rope={"status": "not_applicable", "reason": "arbitrary"})):
+        malformed = json.loads(json.dumps(valid)); mutation(malformed)
+        with pytest.raises(ValueError, match="runtime_configuration_invalid"):
+            h.validate_runtime_configuration(malformed, backend="cpu", context_tier="64k-full",
+                context_tokens=65536, kv_attestation=attestation)
+
+
+def test_qwen_runtime_configuration_requires_complete_valid_yarn_and_profile_evidence():
+    attestation = {"applicability": "qwen_64k_full", "architecture": "qwen3",
+        "profile_id": "qwen64k_kv_q8_fa_balanced_batch", "type_k": "q8", "type_v": "q8"}
+    valid = _runtime_configuration("metal", qwen=True)
+    assert h.validate_runtime_configuration(valid, backend="metal", context_tier="64k-full",
+        context_tokens=65536, kv_attestation=attestation) == valid
+    for field, value in (("configuration_valid", False), ("rope_frequency_scale", float("nan")),
+            ("requested_context_tokens", 65535)):
+        malformed = json.loads(json.dumps(valid)); malformed["yarn_rope"][field] = value
+        with pytest.raises(ValueError, match="runtime_configuration_invalid"):
+            h.validate_runtime_configuration(malformed, backend="metal", context_tier="64k-full",
+                context_tokens=65536, kv_attestation=attestation)
 
 
 def test_fixture_generation_stable_hash_and_depths():
@@ -812,6 +890,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
             "omitted_runtime_default": ["seed", "temperature", "top_p"]},
         "messages": [{"content": "plaintext"}],
         "memory": _memory_evidence(),
+        "runtime_configuration": _runtime_configuration("metal", qwen=True),
         "app_identity": "token.place-test",
         "runtime_identity": "bundled-test",
         "bundled_runtime_identity": "bundled-test",
@@ -835,6 +914,8 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
             "unit":"MiB", "decimal_places":2},
         "cancellation_recovery": _physical_cancellation_evidence(authoritative_total),
     }
+
+
     app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
     payload["cancellation_recovery"]["scenarios"][0].update(
         threshold=max(1, int(authoritative_total * 0.5)),
@@ -1034,6 +1115,7 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
         "generation_settings":{"supplied":{"max_tokens":1024},
             "omitted_runtime_default":["seed", "temperature", "top_p"]},
         "memory": _memory_evidence(),
+        "runtime_configuration": _runtime_configuration(),
         "prefill_end_s": 1.0, "first_token_s": 1.0, "end_s": 2.0, "output_tokens": 4,
         "result_observation":{"kind":"result", "status":"success", "sequence":3, "elapsed_ms":2001},
         "terminal_observation":{"kind":"terminal", "state":"completed", "sequence":4, "elapsed_ms":2002},
@@ -1203,6 +1285,7 @@ def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
         "generation_settings":{"supplied":{"max_tokens":1024},
             "omitted_runtime_default":["seed", "temperature", "top_p"]},
         "memory": _memory_evidence(),
+        "runtime_configuration": _runtime_configuration(),
         "kv_compare":{"pass":True, "applicability":"not_applicable_verified_non_qwen",
             "reason":"not_applicable_verified_non_qwen",
             "attestation":{"method":"active_runtime_selected_profile",
@@ -1239,6 +1322,7 @@ def _packaged_main_evidence(semantic_pass=True, *, max_tokens=1024):
         "generation_settings":{"supplied":{"max_tokens":max_tokens},
             "omitted_runtime_default":["seed", "temperature", "top_p"]},
         "memory": _memory_evidence(),
+        "runtime_configuration": _runtime_configuration(),
         "kv_compare":{"pass":True, "applicability":"not_applicable_verified_non_qwen",
             "reason":"not_applicable_verified_non_qwen",
             "attestation":{"method":"active_runtime_selected_profile",

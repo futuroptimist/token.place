@@ -751,6 +751,135 @@ def sanitize(value: Any) -> Any:
         return s
     return value
 
+RUNTIME_CONFIGURATION_KEYS = {
+    "mode", "backend", "context", "runtime_profile", "batch_profile", "kv_cache",
+    "acceleration", "yarn_rope",
+}
+NOT_APPLICABLE_CONFIGURATION = {"status": "not_applicable", "reason": "not_qwen_64k_profile"}
+
+
+def _configuration_int(value: Any, *, minimum: int = 0, maximum: int = 2**31 - 1) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+        raise ValueError("runtime_configuration_invalid")
+    return value
+
+
+def _configuration_number(value: Any, *, minimum: float = 0.0, maximum: float = 65536.0) -> float:
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(value) or not minimum <= float(value) <= maximum):
+        raise ValueError("runtime_configuration_invalid")
+    return float(value)
+
+
+def _configuration_identifier(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.+:-]{1,128}", value):
+        raise ValueError("runtime_configuration_invalid")
+    return value
+
+
+def validate_runtime_configuration(value: Any, *, backend: str, context_tier: str,
+        context_tokens: int, kv_attestation: dict[str, Any]) -> dict[str, Any]:
+    """Validate the exact, privacy-safe current-worker configuration attestation."""
+    applicability = kv_attestation.get("attestation", kv_attestation)
+    if not isinstance(applicability, dict) or not isinstance(value, dict) or set(value) != RUNTIME_CONFIGURATION_KEYS:
+        raise ValueError("runtime_configuration_invalid")
+    mode = value["mode"]
+    if (not isinstance(mode, dict) or set(mode) != {"requested", "effective"}
+            or mode["requested"] not in {"auto", "cpu", "gpu", "hybrid"}
+            or mode["effective"] not in {"cpu", "gpu", "hybrid"}):
+        raise ValueError("runtime_configuration_invalid")
+    backend_evidence = value["backend"]
+    if (not isinstance(backend_evidence, dict)
+            or set(backend_evidence) != {"requested", "available", "selected", "used", "fallback_reason"}
+            or any(backend_evidence[key] not in {"cpu", "metal", "cuda"}
+                for key in ("requested", "available", "selected", "used"))
+            or backend_evidence["requested"] != backend
+            or backend_evidence["selected"] != backend or backend_evidence["used"] != backend
+            or backend_evidence["fallback_reason"] not in {
+                "none", "memory_pressure", "compatibility_failure", "backend_unavailable",
+                "automatic_cpu_fallback", "requested_cpu",
+            }):
+        raise ValueError("runtime_configuration_invalid")
+    context = value["context"]
+    if (not isinstance(context, dict) or set(context) != {"tier", "effective_window_tokens"}
+            or context["tier"] != context_tier
+            or _configuration_int(context["effective_window_tokens"], minimum=1, maximum=131072) != context_tokens):
+        raise ValueError("runtime_configuration_invalid")
+
+    profile = value["runtime_profile"]
+    batch = value["batch_profile"]
+    kv_cache = value["kv_cache"]
+    acceleration = value["acceleration"]
+    if profile == NOT_APPLICABLE_CONFIGURATION:
+        if any(section != NOT_APPLICABLE_CONFIGURATION for section in (batch, kv_cache, acceleration)):
+            raise ValueError("runtime_configuration_invalid")
+    else:
+        if (not isinstance(profile, dict) or set(profile) != {
+                "selected", "preferred", "attempted", "recovery_count", "result", "fallback_reason"}
+                or not isinstance(profile["attempted"], list) or not 1 <= len(profile["attempted"]) <= 16
+                or profile["selected"] not in profile["attempted"]
+                or profile["result"] != "constructed"
+                or profile["fallback_reason"] not in {"none", "memory_pressure", "compatibility_failure"}):
+            raise ValueError("runtime_configuration_invalid")
+        for identifier in [profile["selected"], profile["preferred"], *profile["attempted"]]:
+            _configuration_identifier(identifier)
+        if _configuration_int(profile["recovery_count"], maximum=15) != len(profile["attempted"]) - 1:
+            raise ValueError("runtime_configuration_invalid")
+        if (not isinstance(batch, dict) or set(batch) != {"requested", "selected", "n_batch", "n_ubatch"}
+                or batch["requested"] not in {"safe", "balanced", "experimental"}
+                or batch["selected"] not in {"safe", "balanced", "experimental"}):
+            raise ValueError("runtime_configuration_invalid")
+        _configuration_int(batch["n_batch"], minimum=1, maximum=65536)
+        _configuration_int(batch["n_ubatch"], minimum=1, maximum=65536)
+        if (not isinstance(kv_cache, dict) or set(kv_cache) != {"precision", "type_k", "type_v", "device"}
+                or kv_cache["precision"] not in {"f16", "q8", "q4"}
+                or kv_cache["device"] not in {"cpu", "metal", "cuda"}):
+            raise ValueError("runtime_configuration_invalid")
+        _configuration_int(kv_cache["type_k"], maximum=64)
+        _configuration_int(kv_cache["type_v"], maximum=64)
+        kv_type_ids = {"f16": 1, "q8": 8, "q4": 2}
+        if (applicability.get("applicability") == "qwen_64k_full"
+                and (profile["selected"] != applicability.get("profile_id")
+                     or kv_cache["type_k"] != kv_type_ids.get(kv_attestation.get("type_k"))
+                     or kv_cache["type_v"] != kv_type_ids.get(kv_attestation.get("type_v")))):
+            raise ValueError("runtime_configuration_invalid")
+        if (not isinstance(acceleration, dict)
+                or set(acceleration) != {"flash_attention", "kqv_offload", "offloaded_layers"}
+                or not isinstance(acceleration["flash_attention"], bool)
+                or not isinstance(acceleration["kqv_offload"], bool)
+                or (acceleration["offloaded_layers"] != "all_supported_layers"
+                    and (not isinstance(acceleration["offloaded_layers"], int)
+                         or isinstance(acceleration["offloaded_layers"], bool)
+                         or not 0 <= acceleration["offloaded_layers"] <= 10000))):
+            raise ValueError("runtime_configuration_invalid")
+
+    yarn = value["yarn_rope"]
+    if yarn == NOT_APPLICABLE_CONFIGURATION:
+        if (profile != NOT_APPLICABLE_CONFIGURATION
+                or context_tier == "64k-full" and applicability.get("architecture") == "qwen3"):
+            raise ValueError("runtime_configuration_invalid")
+        return value
+    if not isinstance(yarn, dict) or set(yarn) != {
+            "requested_context_tokens", "original_context_tokens", "context_multiplier",
+            "rope_frequency_scale", "extension_factor_overridden", "scaling_source",
+            "configuration_valid"}:
+        raise ValueError("runtime_configuration_invalid")
+    requested = _configuration_int(yarn["requested_context_tokens"], minimum=1, maximum=131072)
+    original = _configuration_int(yarn["original_context_tokens"], minimum=1, maximum=131072)
+    multiplier = _configuration_number(yarn["context_multiplier"], minimum=0.000001, maximum=16)
+    frequency = _configuration_number(yarn["rope_frequency_scale"], minimum=0.000001, maximum=16)
+    if (not isinstance(yarn["extension_factor_overridden"], bool)
+            or yarn["scaling_source"] not in {"not_required", "top_level_enum", "nested_enum", "llama_class_enum", "numeric_fallback"}
+            or yarn["configuration_valid"] is not True
+            or requested != context_tokens):
+        raise ValueError("runtime_configuration_invalid")
+    if context_tier == "64k-full" and applicability.get("architecture") == "qwen3":
+        if not (requested == 65536 and original == 32768 and math.isclose(multiplier, 2.0)
+                and math.isclose(frequency, 0.5) and yarn["extension_factor_overridden"] is False
+                and yarn["scaling_source"] != "not_required"):
+            raise ValueError("runtime_configuration_invalid")
+    return value
+
 def validate_report(report: Any) -> None:
     """Validate the stable, privacy-safe v1 report envelope before replacement."""
     if not isinstance(report, dict): raise ValueError("report_schema_invalid")
@@ -840,9 +969,20 @@ def validate_report(report: Any) -> None:
     if (not isinstance(kv, dict) or set(kv) != {"trials"}
             or not isinstance(kv["trials"], list) or len(kv["trials"]) != completed):
         raise ValueError("report_kv_diagnostics_invalid")
-    for item in kv["trials"]:
-        validate_kv_comparison_summary(item, backend=backend["used"],
+    configuration = report.get("runtime_configuration")
+    if (not isinstance(configuration, dict) or set(configuration) != {"trials"}
+            or not isinstance(configuration["trials"], list)
+            or len(configuration["trials"]) != completed):
+        raise ValueError("report_runtime_configuration_invalid")
+    validated_configurations = []
+    for item, config in zip(kv["trials"], configuration["trials"]):
+        summary = validate_kv_comparison_summary(item, backend=backend["used"],
             context_tier=context["tier"], context_tokens=context["window_tokens"])
+        validated_configurations.append(validate_runtime_configuration(config,
+            backend=backend["used"], context_tier=context["tier"],
+            context_tokens=context["window_tokens"], kv_attestation=summary["attestation"]))
+    if any(item != validated_configurations[0] for item in validated_configurations[1:]):
+        raise ValueError("report_runtime_configuration_drift")
 
 def write_report_atomic(out_dir: Path, report: dict[str, Any]) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1147,7 +1287,8 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         "authoritative_prompt_tokens", "progress_events",
         "authoritative_tokenizer_evidence", "terminal_observation", "result_observation",
         "response_text", "start_s", "preparing_end_s", "prefill_end_s", "first_token_s", "end_s",
-        "output_tokens", "post_terminal_observations", "generation_settings", "memory"}
+        "output_tokens", "post_terminal_observations", "generation_settings", "memory",
+        "runtime_configuration"}
     missing_evidence = sorted(key for key in required if key not in payload or payload.get(key) in (None, "", {}))
     if missing_evidence:
         if "authoritative_tokenizer_evidence" in missing_evidence:
@@ -1228,6 +1369,12 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         reason = applicability["applicability"]
         evidence["kv_compare"] = {"pass": True, "applicability": reason, "reason": reason,
             "attestation": applicability}
+    try:
+        evidence["runtime_configuration"] = validate_runtime_configuration(
+            payload["runtime_configuration"], backend=backend, context_tier=context_tier,
+            context_tokens=profile.total_context_tokens, kv_attestation=evidence["kv_compare"])
+    except ValueError as exc:
+        return {"pass": False, "runtime_contract_pass": False, "code": str(exc)}
     runtime = evidence["runtime"]
     identity_ok = (runtime["app_identity"] not in {"dev", "mock", "unknown"} and
         runtime["runtime_identity"] == runtime.get("bundled_runtime_identity") and
@@ -1248,9 +1395,48 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     evidence["code"] = "ok" if passed else "packaged_contract_failed"
     return sanitize(evidence)
 
+MATRIX_PLAN_SCHEMA_VERSION = "long-context-benchmark-matrix-plan-v1"
+MATRIX_PACKAGED_BACKENDS = (
+    ("linux", "cpu", "linux-packaged-cpu"),
+    ("macos", "cpu", "macos-packaged-cpu"),
+    ("macos", "metal", "macos-packaged-metal"),
+    ("windows", "cpu", "windows-packaged-cpu"),
+    ("windows", "cuda", "windows-nvidia-packaged-cuda"),
+)
+MATRIX_WORKLOADS = (
+    ("8k-fast", "small-8k"),
+    ("64k-full", "intermediate-32k"),
+    ("64k-full", "long-55k"),
+)
+
+
+def build_matrix_plan() -> dict[str, Any]:
+    cells = []
+    for platform_name, backend, package in MATRIX_PACKAGED_BACKENDS:
+        for context_tier, fixture in MATRIX_WORKLOADS:
+            for scenario in ("single-needle", "structured-extraction"):
+                cells.append({"platform": platform_name, "package": package, "backend": backend,
+                    "context_tier": context_tier, "fixture": fixture, "scenario": scenario,
+                    "trials": 3, "cancellation_sequences": 0})
+        cells.append({"platform": platform_name, "package": package, "backend": backend,
+            "context_tier": "64k-full", "fixture": "long-55k",
+            "scenario": "structured-extraction", "trials": 0, "cancellation_sequences": 1})
+    return {"schema_version": MATRIX_PLAN_SCHEMA_VERSION, "cells": cells}
+
+
+def validate_matrix_plan(plan: Any) -> None:
+    if not isinstance(plan, dict) or set(plan) != {"schema_version", "cells"} \
+            or plan["schema_version"] != MATRIX_PLAN_SCHEMA_VERSION or not isinstance(plan["cells"], list):
+        raise ValueError("matrix_plan_invalid")
+    expected = build_matrix_plan()["cells"]
+    if plan["cells"] != expected or len({_canonical_json(cell) for cell in plan["cells"]}) != len(expected):
+        raise ValueError("matrix_plan_invalid")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Long-context packaged-runtime benchmark harness")
     sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("matrix-plan", help="emit the deterministic packaged benchmark execution matrix")
     g = sub.add_parser("generate-fixture"); g.add_argument("--fixture", choices=FIXTURES, required=True); g.add_argument("--scenario", choices=("single-needle", "structured-extraction"), required=True); g.add_argument("--out-dir", required=True); g.add_argument("--seed", default=DEFAULT_SEED)
     e = sub.add_parser("evaluate"); e.add_argument("--manifest", required=True); e.add_argument("--response", required=True); e.add_argument("--strict", action="store_true"); e.add_argument("--out-dir", required=True)
     r = sub.add_parser("packaged-runtime", help="run the installed desktop through repository WebDriver control")
@@ -1274,6 +1460,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--cancellation-observation-window", type=float, default=0.5)
     r.add_argument("--cancellation-recovery-timeout", type=float, default=30.0)
     args = p.parse_args(argv)
+    if args.cmd == "matrix-plan":
+        plan = build_matrix_plan(); validate_matrix_plan(plan); print(_canonical_json(plan)); return 0
     if args.cmd == "generate-fixture":
         prompt, manifest = generate_fixture(args.fixture, args.seed, scenario=args.scenario); validate_manifest(manifest, prompt); out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True); (out/f"{args.fixture}.prompt.txt").write_text(prompt); (out/f"{args.fixture}.manifest.json").write_text(_canonical_json(manifest)+"\n"); print(f"generated {args.fixture}: scenario={args.scenario} requested={manifest['requested_tokens']} actual={manifest['actual_tokens']} sha256={manifest['fixture_sha256']}"); return 0
     if args.cmd == "evaluate":
@@ -1296,6 +1484,7 @@ def main(argv: list[str] | None = None) -> int:
         completed: list[dict[str, Any]] = []
         evidence: dict[str, Any] = {"pass": False, "code": "packaged_contract_failed"}
         settings: dict[str, Any] | None = None
+        runtime_configuration: dict[str, Any] | None = None
         cancellation_evidence = None
         for trial_index in range(args.trials):
             evidence = invoke_packaged_runtime_adapter(fixture_id=args.fixture, scenario=args.scenario, timeout_s=args.request_timeout,
@@ -1318,6 +1507,12 @@ def main(argv: list[str] | None = None) -> int:
             elif evidence.get("generation_settings") != settings:
                 evidence = {"pass": False, "runtime_contract_pass": False,
                     "code": "generation_settings_inconsistent"}
+                break
+            if runtime_configuration is None:
+                runtime_configuration = evidence.get("runtime_configuration")
+            elif evidence.get("runtime_configuration") != runtime_configuration:
+                evidence = {"pass": False, "runtime_contract_pass": False,
+                    "code": "runtime_configuration_drift"}
                 break
             completed.append(evidence)
         all_runtime_complete = len(completed) == args.trials
@@ -1344,6 +1539,8 @@ def main(argv: list[str] | None = None) -> int:
                 "memory":{"maximum_peak_rss_bytes":max(
                     trial["memory"]["peak_rss_bytes"] for trial in completed),
                     "trials":[trial["memory"] for trial in completed]},
+                "runtime_configuration":{"trials":[
+                    trial["runtime_configuration"] for trial in completed]},
                 "kv_diagnostics":{"trials":[trial["kv_compare"] for trial in completed]}}
             if args.cancellation_validation:
                 report["cancellation_recovery"] = cancellation_evidence

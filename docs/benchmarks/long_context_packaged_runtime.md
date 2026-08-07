@@ -324,6 +324,51 @@ process names, executable paths, command lines, usernames, probe output, or requ
 noisy OS-accounted resident memory: it is not GPU VRAM, Metal unified-memory residency, or evidence
 that P7's estimated KV allocation matches the runtime GGML diagnostic.
 
+## Runtime-configuration attestation
+
+Every physical trial contains one exact-shape `runtime_configuration` attestation read from the
+current packaged worker's labeled status and sanitized `Readiness diagnostics` surface. It records:
+
+- requested/effective compute mode and requested/available/selected/used backend, plus the bounded
+  fallback reason;
+- context tier and effective context window;
+- selected, preferred, and attempted runtime profiles, recovery count, construction result, and
+  profile fallback reason;
+- requested/selected batch profile, `n_batch`, and `n_ubatch`;
+- KV precision, `type_k`, `type_v`, and KV-cache device;
+- Flash Attention, KQV offload, and the bounded offloaded-layer value; and
+- requested/original context tokens, context multiplier, RoPE frequency scale, extension-factor
+  override status, RoPE scaling-source classification, and YaRN configuration-valid status.
+
+Profile-dependent fields for a positively verified non-Qwen/non-64K runtime use only
+`{"status":"not_applicable","reason":"not_qwen_64k_profile"}`; the harness never invents
+profile or YaRN values. Qwen3 `64k-full` requires the complete valid YaRN/RoPE object (65,536
+requested, 32,768 original, multiplier 2.0, frequency scale 0.5, no extension-factor override,
+and an applicable scaling source). The attestation is cross-checked against the report backend and
+context and against P7 profile/KV evidence. Unknown keys, arbitrary strings, missing fields,
+malformed types, contradictory values, and cross-trial drift fail the runtime contract even with
+`--report-only`. Reports retain `runtime_configuration.trials`, one consistent entry per completed
+physical trial, and never retain arbitrary readiness keys, paths, identifiers, logs, or payloads.
+
+## Deterministic benchmark matrix
+
+Emit the machine-readable execution plan without launching a desktop runtime:
+
+```bash
+python scripts/long_context_benchmark.py matrix-plan > matrix.json
+python -m json.tool matrix.json >/dev/null
+```
+
+The `long-context-benchmark-matrix-plan-v1` plan is deterministic and duplicate-free. For each
+declared packaged platform/backend (macOS Metal, Windows/NVIDIA CUDA, and the existing packaged CPU
+mode on Linux, macOS, and Windows), it contains three sequential trials for both `single-needle`
+and `structured-extraction` in each required context cell: `8k-fast`/`small-8k`,
+`64k-full`/`intermediate-32k`, and `64k-full`/`long-55k`. It also contains exactly one separate
+progress-triggered cancellation/recovery sequence for the `64k-full`/`long-55k`
+`structured-extraction` cell. A matrix plan, schema test, or injected unit fake is scheduling and
+orchestration evidence only; none is physical benchmark evidence. This documentation does not claim
+that any Metal, CUDA, or CPU matrix cell was executed.
+
 ## Exit codes
 
 - `0`: requested CI-safe operation passed, or packaged-runtime produced passing runtime evidence.

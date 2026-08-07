@@ -780,13 +780,18 @@ def _configuration_identifier(value: Any) -> str:
 def validate_runtime_configuration(value: Any, *, backend: str, context_tier: str,
         context_tokens: int, kv_attestation: dict[str, Any]) -> dict[str, Any]:
     """Validate the exact, privacy-safe current-worker configuration attestation."""
-    applicability = kv_attestation.get("attestation", kv_attestation)
-    if not isinstance(applicability, dict) or not isinstance(value, dict) or set(value) != RUNTIME_CONFIGURATION_KEYS:
+    applicability = kv_attestation.get("attestation")
+    if (not isinstance(applicability, dict)
+            or applicability.get("applicability") not in {
+                "qwen_64k_full", "not_applicable_verified_non_qwen",
+                "not_applicable_context_tier"}
+            or not isinstance(value, dict) or set(value) != RUNTIME_CONFIGURATION_KEYS):
         raise ValueError("runtime_configuration_invalid")
     mode = value["mode"]
+    expected_mode = {"requested": "cpu", "effective": "cpu"} if backend == "cpu" else {
+        "requested": "gpu", "effective": backend}
     if (not isinstance(mode, dict) or set(mode) != {"requested", "effective"}
-            or mode["requested"] not in {"auto", "cpu", "gpu", "hybrid"}
-            or mode["effective"] not in {"cpu", "gpu", "hybrid"}):
+            or mode != expected_mode):
         raise ValueError("runtime_configuration_invalid")
     backend_evidence = value["backend"]
     if (not isinstance(backend_evidence, dict)
@@ -810,16 +815,23 @@ def validate_runtime_configuration(value: Any, *, backend: str, context_tier: st
     batch = value["batch_profile"]
     kv_cache = value["kv_cache"]
     acceleration = value["acceleration"]
-    if profile == NOT_APPLICABLE_CONFIGURATION:
-        if any(section != NOT_APPLICABLE_CONFIGURATION for section in (batch, kv_cache, acceleration)):
+    applicable = applicability.get("applicability") == "qwen_64k_full"
+    if not applicable:
+        if any(section != NOT_APPLICABLE_CONFIGURATION
+                for section in (profile, batch, kv_cache, acceleration, value["yarn_rope"])):
             raise ValueError("runtime_configuration_invalid")
+        return value
+    if profile == NOT_APPLICABLE_CONFIGURATION:
+        raise ValueError("runtime_configuration_invalid")
     else:
         if (not isinstance(profile, dict) or set(profile) != {
                 "selected", "preferred", "attempted", "recovery_count", "result", "fallback_reason"}
                 or not isinstance(profile["attempted"], list) or not 1 <= len(profile["attempted"]) <= 16
                 or profile["selected"] not in profile["attempted"]
                 or profile["result"] != "constructed"
-                or profile["fallback_reason"] not in {"none", "memory_pressure", "compatibility_failure"}):
+                or profile["fallback_reason"] not in {
+                    "none", "memory_pressure", "compatibility_failure",
+                    "capability_incompatibility"}):
             raise ValueError("runtime_configuration_invalid")
         for identifier in [profile["selected"], profile["preferred"], *profile["attempted"]]:
             _configuration_identifier(identifier)
@@ -838,10 +850,11 @@ def validate_runtime_configuration(value: Any, *, backend: str, context_tier: st
         _configuration_int(kv_cache["type_k"], maximum=64)
         _configuration_int(kv_cache["type_v"], maximum=64)
         kv_type_ids = {"f16": 1, "q8": 8, "q4": 2}
-        if (applicability.get("applicability") == "qwen_64k_full"
-                and (profile["selected"] != applicability.get("profile_id")
-                     or kv_cache["type_k"] != kv_type_ids.get(kv_attestation.get("type_k"))
-                     or kv_cache["type_v"] != kv_type_ids.get(kv_attestation.get("type_v")))):
+        if (profile["selected"] != applicability.get("profile_id")
+                or kv_cache["precision"] != kv_attestation.get("type_k")
+                or kv_attestation.get("type_k") != kv_attestation.get("type_v")
+                or kv_cache["type_k"] != kv_type_ids.get(kv_attestation.get("type_k"))
+                or kv_cache["type_v"] != kv_type_ids.get(kv_attestation.get("type_v"))):
             raise ValueError("runtime_configuration_invalid")
         if (not isinstance(acceleration, dict)
                 or set(acceleration) != {"flash_attention", "kqv_offload", "offloaded_layers"}
@@ -855,10 +868,7 @@ def validate_runtime_configuration(value: Any, *, backend: str, context_tier: st
 
     yarn = value["yarn_rope"]
     if yarn == NOT_APPLICABLE_CONFIGURATION:
-        if (profile != NOT_APPLICABLE_CONFIGURATION
-                or context_tier == "64k-full" and applicability.get("architecture") == "qwen3"):
-            raise ValueError("runtime_configuration_invalid")
-        return value
+        raise ValueError("runtime_configuration_invalid")
     if not isinstance(yarn, dict) or set(yarn) != {
             "requested_context_tokens", "original_context_tokens", "context_multiplier",
             "rope_frequency_scale", "extension_factor_overridden", "scaling_source",
@@ -980,7 +990,7 @@ def validate_report(report: Any) -> None:
             context_tier=context["tier"], context_tokens=context["window_tokens"])
         validated_configurations.append(validate_runtime_configuration(config,
             backend=backend["used"], context_tier=context["tier"],
-            context_tokens=context["window_tokens"], kv_attestation=summary["attestation"]))
+            context_tokens=context["window_tokens"], kv_attestation=summary))
     if any(item != validated_configurations[0] for item in validated_configurations[1:]):
         raise ValueError("report_runtime_configuration_drift")
 

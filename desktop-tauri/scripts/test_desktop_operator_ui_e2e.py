@@ -608,6 +608,10 @@ def _diagnostic_float(diagnostics: dict[str, str], key: str) -> float:
     return value
 
 
+def _normalize_profile_fallback_reason(value: str | None) -> str:
+    return "none" if value in {None, "", "null"} else value
+
+
 def packaged_runtime_configuration(runtime: dict[str, str], diagnostics: dict[str, str],
         requested_backend: str) -> dict[str, object]:
     """Build bounded current-worker configuration evidence from UI-safe fields only."""
@@ -615,14 +619,15 @@ def packaged_runtime_configuration(runtime: dict[str, str], diagnostics: dict[st
     if profile_key in diagnostics:
         attempts = diagnostics.get(
             "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids", "").split(",")
+        fallback_reason = _normalize_profile_fallback_reason(diagnostics.get(
+            "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason"))
         profile = {"selected": diagnostics[profile_key],
             "preferred": diagnostics["api_v1_readiness_qwen_64k_runtime_preferred_profile_id"],
             "attempted": attempts,
             "recovery_count": _diagnostic_int(diagnostics,
                 "api_v1_readiness_qwen_64k_runtime_profile_recovery_count"),
             "result": diagnostics["api_v1_readiness_qwen_64k_runtime_profile_result"],
-            "fallback_reason": diagnostics.get(
-                "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason", "none")}
+            "fallback_reason": fallback_reason}
         batch = {"requested": diagnostics["api_v1_readiness_qwen_64k_batch_profile_requested"],
             "selected": diagnostics["api_v1_readiness_qwen_64k_batch_profile_selected"],
             "n_batch": _diagnostic_int(diagnostics,

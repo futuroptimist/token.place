@@ -1,3 +1,4 @@
+import ast
 import json
 import signal
 import subprocess
@@ -17,7 +18,7 @@ def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="
 def _runtime_configuration(backend="cpu", tier="64k-full", window=65536, qwen=False):
     na = {"status": "not_applicable", "reason": "not_qwen_64k_profile"}
     result = {"mode": {"requested": "cpu" if backend == "cpu" else "gpu",
-            "effective": "cpu" if backend == "cpu" else "gpu"},
+            "effective": backend},
         "backend": {"requested": backend, "available": backend, "selected": backend,
             "used": backend, "fallback_reason": "none"},
         "context": {"tier": tier, "effective_window_tokens": window},
@@ -42,11 +43,40 @@ def _runtime_configuration(backend="cpu", tier="64k-full", window=65536, qwen=Fa
     return result
 
 
+def _qwen_kv_summary(backend="metal"):
+    attestation = {"method":"active_runtime_selected_profile", "applicability":"qwen_64k_full",
+        "architecture":"qwen3", "profile_id":"qwen64k_kv_q8_fa_balanced_batch",
+        "backend":backend, "context_tier":"64k-full", "context_size_tokens":65536}
+    return {"pass":True, "applicability":"qwen_64k_full",
+        "profile_id":"qwen64k_kv_q8_fa_balanced_batch", "backend":backend,
+        "context_size_tokens":65536, "type_k":"q8", "type_v":"q8",
+        "estimated_bytes":104857600, "observed_bytes":104857600, "delta_bytes":0,
+        "precision_interval_bytes":[104852357, 104862843], "precision_bytes":5243,
+        "record_count":1, "decimal_places":2,
+        "estimator_provenance":"qwen_selected_profile_gguf_header",
+        "runtime_provenance":"pinned_llama_cpp_kv_buffer_diagnostic", "attestation":attestation}
+
+
 def test_desktop_runner_uses_evergreen_generation_settings_probe_name():
     source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
         "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
     assert "__p8" not in source
     assert source.count("__longContextBenchmarkGenerationSettings") == 3
+
+
+def test_packaged_profile_fallback_normalizes_only_producer_absence_values():
+    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
+        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    node = next(item for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name == "_normalize_profile_fallback_reason")
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<fallback-normalizer>", "exec"),
+        {"__builtins__": __builtins__}, namespace)
+    normalize = namespace["_normalize_profile_fallback_reason"]
+    assert [normalize(value) for value in (None, "", "null")] == ["none"] * 3
+    assert normalize("capability_incompatibility") == "capability_incompatibility"
+    assert normalize("arbitrary") == "arbitrary"
 
 
 def test_matrix_plan_is_deterministic_complete_and_duplicate_free():
@@ -86,8 +116,9 @@ def test_runtime_configuration_validation_is_exact_and_fail_closed():
 
 
 def test_qwen_runtime_configuration_requires_complete_valid_yarn_and_profile_evidence():
-    attestation = {"applicability": "qwen_64k_full", "architecture": "qwen3",
-        "profile_id": "qwen64k_kv_q8_fa_balanced_batch", "type_k": "q8", "type_v": "q8"}
+    attestation = {"type_k": "q8", "type_v": "q8", "attestation": {
+        "applicability": "qwen_64k_full", "architecture": "qwen3",
+        "profile_id": "qwen64k_kv_q8_fa_balanced_batch"}}
     valid = _runtime_configuration("metal", qwen=True)
     assert h.validate_runtime_configuration(valid, backend="metal", context_tier="64k-full",
         context_tokens=65536, kv_attestation=attestation) == valid
@@ -97,6 +128,40 @@ def test_qwen_runtime_configuration_requires_complete_valid_yarn_and_profile_evi
         with pytest.raises(ValueError, match="runtime_configuration_invalid"):
             h.validate_runtime_configuration(malformed, backend="metal", context_tier="64k-full",
                 context_tokens=65536, kv_attestation=attestation)
+
+
+def test_runtime_configuration_binds_modes_applicability_and_p7_precision():
+    summary = _qwen_kv_summary()
+    valid = _runtime_configuration("metal", qwen=True)
+    mutations = (
+        ("mode", {"requested":"gpu", "effective":"gpu"}),
+        ("runtime_profile", {**valid["runtime_profile"], "selected":"qwen64k_kv_q4_fa"}),
+        ("kv_cache", {**valid["kv_cache"], "precision":"q4"}),
+        ("kv_cache", {**valid["kv_cache"], "type_k":2}),
+        ("context", {"tier":"64k-full", "effective_window_tokens":65535}),
+        ("yarn_rope", {**valid["yarn_rope"], "rope_frequency_scale":1.0}),
+    )
+    for section, replacement in mutations:
+        malformed = json.loads(json.dumps(valid)); malformed[section] = replacement
+        with pytest.raises(ValueError, match="runtime_configuration_invalid"):
+            h.validate_runtime_configuration(malformed, backend="metal", context_tier="64k-full",
+                context_tokens=65536, kv_attestation=summary)
+    for architecture, tier, window, reason in (
+            ("llama", "64k-full", 65536, "not_applicable_verified_non_qwen"),
+            ("qwen3", "8k-fast", 8192, "not_applicable_context_tier")):
+        attestation = {"method":"active_runtime_selected_profile", "applicability":reason,
+            "architecture":architecture, "profile_id":"default", "backend":"cpu",
+            "context_tier":tier, "context_size_tokens":window}
+        summary_na = {"pass":True, "applicability":reason, "reason":reason,
+            "attestation":attestation}
+        exact = _runtime_configuration("cpu", tier=tier, window=window)
+        assert h.validate_runtime_configuration(exact, backend="cpu", context_tier=tier,
+            context_tokens=window, kv_attestation=summary_na) == exact
+        fabricated = json.loads(json.dumps(exact))
+        fabricated["runtime_profile"] = valid["runtime_profile"]
+        with pytest.raises(ValueError, match="runtime_configuration_invalid"):
+            h.validate_runtime_configuration(fabricated, backend="cpu", context_tier=tier,
+                context_tokens=window, kv_attestation=summary_na)
 
 
 def test_fixture_generation_stable_hash_and_depths():
@@ -1334,6 +1399,45 @@ def _packaged_main_evidence(semantic_pass=True, *, max_tokens=1024):
 def _packaged_main_args(tmp_path, *extra):
     return ["packaged-runtime", "--out-dir", str(tmp_path), "--app-binary", "app",
         "--model", "model", "--backend", "cpu", "--relay-url", "https://relay.example", *extra]
+
+
+def test_production_shaped_qwen_report_validates_and_writes_atomically(tmp_path, monkeypatch):
+    evidence = _packaged_main_evidence()
+    evidence["runtime"].update(backend_requested="metal", backend_selected="metal",
+        backend_used="metal")
+    evidence["runtime_configuration"] = _runtime_configuration("metal", qwen=True)
+    evidence["kv_compare"] = _qwen_kv_summary()
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: evidence)
+    args = ["packaged-runtime", "--out-dir", str(tmp_path), "--app-binary", "app",
+        "--model", "renamed-model.gguf", "--backend", "metal",
+        "--relay-url", "https://relay.example"]
+    assert h.main(args) == 0
+    report_path = tmp_path / "long_context_benchmark_report.json"
+    report = json.loads(report_path.read_text())
+    assert report["runtime_configuration"]["trials"][0]["mode"] == {
+        "requested":"gpu", "effective":"metal"}
+    assert report["kv_diagnostics"]["trials"][0]["type_k"] == "q8"
+    h.validate_report(report)
+    rewritten = h.write_report_atomic(tmp_path / "rewritten", report)
+    assert json.loads(rewritten.read_text()) == report
+
+    mutations = (
+        lambda item: item["runtime_configuration"]["trials"][0]["mode"].update(effective="gpu"),
+        lambda item: item["runtime_configuration"]["trials"][0]["runtime_profile"].update(
+            fallback_reason="null"),
+        lambda item: item["runtime_configuration"]["trials"][0]["runtime_profile"].update(
+            selected="qwen64k_kv_q4_fa"),
+        lambda item: item["runtime_configuration"]["trials"][0]["kv_cache"].update(precision="q4"),
+        lambda item: item["runtime_configuration"]["trials"][0]["kv_cache"].update(type_v=2),
+        lambda item: item["backend"].update(used="cuda"),
+        lambda item: item["context"].update(window_tokens=65535),
+        lambda item: item["runtime_configuration"]["trials"][0]["yarn_rope"].update(
+            configuration_valid=False),
+    )
+    for mutate in mutations:
+        malformed = json.loads(json.dumps(report)); mutate(malformed)
+        with pytest.raises(ValueError):
+            h.validate_report(malformed)
 
 
 def test_packaged_trials_default_and_multiple_are_sequential(tmp_path, monkeypatch):

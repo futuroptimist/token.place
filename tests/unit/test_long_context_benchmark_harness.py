@@ -359,7 +359,28 @@ def test_kv_compare_rejects_malformed_estimator_fields(field, value):
     assert h.compare_kv_estimate(estimate, runtime)["pass"] is False
 
 
+@pytest.mark.parametrize(("field", "value"), [
+    ("decimal_places", 10**9), ("record_count", 10**9),
+])
+def test_kv_compare_bounds_diagnostic_dimensions_before_arithmetic(field, value, monkeypatch):
+    estimate = {"profile_id":"qwen64k_kv_q8_fa_balanced_batch", "backend":"metal",
+        "context_size_tokens":65536, "type_k":"q8", "type_v":"q8",
+        "exact_kv_allocation_bytes":104857600, "metadata_source":"gguf_header",
+        "conservative_fallback_used":False}
+    runtime = {"method":"pinned_llama_cpp_kv_buffer_diagnostic",
+        "llama_cpp_python_version":"0.3.32",
+        "llama_cpp_commit":"b3fed31b99f9bd37725833674252bccb429bb183",
+        "observed_bytes":104857600, "precision_bytes":5243, "record_count":1,
+        "unit":"MiB", "decimal_places":2}
+    runtime[field] = value
+    monkeypatch.setattr(h.math, "ceil", lambda _value: pytest.fail("arithmetic ran before bounds validation"))
+    assert h.compare_kv_estimate(estimate, runtime)["pass"] is False
+
+
 def test_kv_precision_arithmetic_and_report_shape_fail_closed():
+    attestation = {"method":"active_runtime_selected_profile", "applicability":"qwen_64k_full",
+        "architecture":"qwen3", "profile_id":"qwen64k_kv_q8_fa_balanced_batch",
+        "backend":"metal", "context_tier":"64k-full", "context_size_tokens":65536}
     summary = {"pass":True, "applicability":"qwen_64k_full",
         "profile_id":"qwen64k_kv_q8_fa_balanced_batch", "backend":"metal",
         "context_size_tokens":65536, "type_k":"q8", "type_v":"q8",
@@ -367,7 +388,7 @@ def test_kv_precision_arithmetic_and_report_shape_fail_closed():
         "precision_interval_bytes":[104852357, 104862843], "precision_bytes":5243,
         "record_count":1, "decimal_places":2,
         "estimator_provenance":"qwen_selected_profile_gguf_header",
-        "runtime_provenance":"pinned_llama_cpp_kv_buffer_diagnostic"}
+        "runtime_provenance":"pinned_llama_cpp_kv_buffer_diagnostic", "attestation":attestation}
     assert h.validate_kv_comparison_summary(summary)["pass"] is True
     for mutation in ({"precision_bytes":5242}, {"record_count":2},
             {"delta_bytes":1}, {"profile_id":None}, {"extra":True}):
@@ -386,6 +407,49 @@ def test_kv_applicability_is_profile_attested_not_filename_derived():
     assert h.validate_kv_applicability(non_qwen, backend="metal", context_tier="64k-full") == non_qwen
     with pytest.raises(ValueError, match="kv_applicability"):
         h.validate_kv_applicability(None, backend="metal", context_tier="64k-full")
+    for context_size in (65535, 32768):
+        with pytest.raises(ValueError, match="kv_applicability_context_mismatch"):
+            h.validate_kv_applicability({**qwen, "context_size_tokens":context_size,
+                "applicability":"not_applicable_context_tier"},
+                backend="metal", context_tier="64k-full")
+    non_64k = {**qwen, "context_tier":"8k-fast", "context_size_tokens":8192,
+        "applicability":"not_applicable_context_tier"}
+    assert h.validate_kv_applicability(non_64k, backend="metal", context_tier="8k-fast") == non_64k
+
+
+def test_kv_report_summary_binds_profile_backend_context_and_attestation():
+    qwen_attestation = {"method":"active_runtime_selected_profile", "applicability":"qwen_64k_full",
+        "architecture":"qwen3", "profile_id":"qwen64k_kv_q8_fa_balanced_batch",
+        "backend":"metal", "context_tier":"64k-full", "context_size_tokens":65536}
+    summary = {"pass":True, "applicability":"qwen_64k_full",
+        "profile_id":"qwen64k_kv_q8_fa_balanced_batch", "backend":"metal",
+        "context_size_tokens":65536, "type_k":"q8", "type_v":"q8",
+        "estimated_bytes":104857600, "observed_bytes":104857600, "delta_bytes":0,
+        "precision_interval_bytes":[104852357, 104862843], "precision_bytes":5243,
+        "record_count":1, "decimal_places":2,
+        "estimator_provenance":"qwen_selected_profile_gguf_header",
+        "runtime_provenance":"pinned_llama_cpp_kv_buffer_diagnostic", "attestation":qwen_attestation}
+    assert h.validate_kv_comparison_summary(summary, backend="metal",
+        context_tier="64k-full", context_tokens=65536)["pass"] is True
+    for mutation, kwargs in (({"profile_id":"qwen64k_kv_q4_fa"}, {}),
+            ({"backend":"cuda"}, {}), ({"estimated_bytes":1 << 63}, {}),
+            ({}, {"context_tokens":8192}), ({}, {"context_tier":"8k-fast"})):
+        with pytest.raises(ValueError, match="report_kv_diagnostics_invalid"):
+            h.validate_kv_comparison_summary({**summary, **mutation}, backend="metal",
+                context_tier=kwargs.get("context_tier", "64k-full"),
+                context_tokens=kwargs.get("context_tokens", 65536))
+    attestation = {"method":"active_runtime_selected_profile",
+        "applicability":"not_applicable_verified_non_qwen", "architecture":"llama",
+        "profile_id":"default", "backend":"metal", "context_tier":"64k-full",
+        "context_size_tokens":65536}
+    non_applicable = {"pass":True, "applicability":"not_applicable_verified_non_qwen",
+        "reason":"not_applicable_verified_non_qwen", "attestation":attestation}
+    assert h.validate_kv_comparison_summary(non_applicable, backend="metal",
+        context_tier="64k-full", context_tokens=65536)["pass"] is True
+    with pytest.raises(ValueError, match="report_kv_diagnostics_invalid"):
+        h.validate_kv_comparison_summary({**non_applicable, "attestation":{**attestation,
+            "architecture":"qwen3"}}, backend="metal", context_tier="64k-full",
+            context_tokens=65536)
 
 
 def test_memory_probe_success_absent_timeout_malformed_and_sanitize(tmp_path):
@@ -1140,7 +1204,11 @@ def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
             "omitted_runtime_default":["seed", "temperature", "top_p"]},
         "memory": _memory_evidence(),
         "kv_compare":{"pass":True, "applicability":"not_applicable_verified_non_qwen",
-            "reason":"not_applicable_verified_non_qwen"}}
+            "reason":"not_applicable_verified_non_qwen",
+            "attestation":{"method":"active_runtime_selected_profile",
+                "applicability":"not_applicable_verified_non_qwen", "architecture":"llama",
+                "profile_id":"default", "backend":"cpu", "context_tier":"64k-full",
+                "context_size_tokens":65536}}}
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: evidence)
     args = ["packaged-runtime", "--out-dir", str(tmp_path), "--app-binary", "app",
         "--model", "model", "--backend", "cpu", "--relay-url", "https://relay.example",
@@ -1172,7 +1240,11 @@ def _packaged_main_evidence(semantic_pass=True, *, max_tokens=1024):
             "omitted_runtime_default":["seed", "temperature", "top_p"]},
         "memory": _memory_evidence(),
         "kv_compare":{"pass":True, "applicability":"not_applicable_verified_non_qwen",
-            "reason":"not_applicable_verified_non_qwen"}}
+            "reason":"not_applicable_verified_non_qwen",
+            "attestation":{"method":"active_runtime_selected_profile",
+                "applicability":"not_applicable_verified_non_qwen", "architecture":"llama",
+                "profile_id":"default", "backend":"cpu", "context_tier":"64k-full",
+                "context_size_tokens":65536}}}
 
 
 def _packaged_main_args(tmp_path, *extra):

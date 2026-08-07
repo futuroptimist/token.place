@@ -617,6 +617,9 @@ def compare_kv_estimate(estimate: dict[str, Any], runtime: dict[str, Any], *,
     if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > (1 << 63) - 1
             for value in integer_fields):
         return {"pass": False, "code": "kv_diagnostic_value_invalid"}
+    # Bound untrusted diagnostic dimensions before using either in exponentiation or multiplication.
+    if runtime["decimal_places"] not in {1, 2} or not 1 <= runtime["record_count"] <= 64:
+        return {"pass": False, "code": "kv_diagnostic_provenance_mismatch"}
     profile_id = estimate.get("profile_id")
     profile_type = next((kind for kind in ("f16", "q8", "q4")
         if isinstance(profile_id, str) and kind in profile_id.split("_")), None)
@@ -627,8 +630,7 @@ def compare_kv_estimate(estimate: dict[str, Any], runtime: dict[str, Any], *,
             or runtime["record_count"] <= 0 or runtime["method"] != "pinned_llama_cpp_kv_buffer_diagnostic"
             or runtime["llama_cpp_python_version"] != "0.3.32"
             or runtime["llama_cpp_commit"] != "b3fed31b99f9bd37725833674252bccb429bb183"
-            or runtime["unit"] != "MiB" or runtime["decimal_places"] not in {1, 2}
-            or runtime["record_count"] > 64 or runtime["precision_bytes"] != expected_precision
+            or runtime["unit"] != "MiB" or runtime["precision_bytes"] != expected_precision
             or estimate["metadata_source"] != "gguf_header"
             or not isinstance(profile_id, str) or not 1 <= len(profile_id) <= 128
             or estimate["backend"] not in {"cpu", "metal", "cuda"}
@@ -666,37 +668,67 @@ def validate_kv_applicability(value: Any, *, backend: str, context_tier: str) ->
             or isinstance(value["context_size_tokens"], bool)
             or not 1 <= value["context_size_tokens"] <= 65536):
         raise ValueError("kv_applicability_invalid")
+    if (value["architecture"] == "qwen3" and context_tier == "64k-full"
+            and value["context_size_tokens"] != 65536):
+        raise ValueError("kv_applicability_context_mismatch")
     expected = ("qwen_64k_full" if value["architecture"] == "qwen3"
-        and context_tier == "64k-full" and value["context_size_tokens"] == 65536
+        and context_tier == "64k-full"
         else "not_applicable_verified_non_qwen" if value["architecture"] != "qwen3"
         else "not_applicable_context_tier")
     if value["applicability"] != expected:
         raise ValueError("kv_applicability_mismatch")
     return dict(value)
 
-def validate_kv_comparison_summary(value: Any) -> dict[str, Any]:
+def validate_kv_comparison_summary(value: Any, *, backend: str | None = None,
+        context_tier: str | None = None, context_tokens: int | None = None) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("pass") is not True:
         raise ValueError("report_kv_diagnostics_invalid")
     applicability = value.get("applicability")
     if applicability in {"not_applicable_verified_non_qwen", "not_applicable_context_tier"}:
-        if set(value) != {"pass", "applicability", "reason"} or value["reason"] != applicability:
+        if set(value) != {"pass", "applicability", "reason", "attestation"} or value["reason"] != applicability:
+            raise ValueError("report_kv_diagnostics_invalid")
+        attestation = value["attestation"]
+        if backend is None or context_tier is None:
+            raise ValueError("report_kv_diagnostics_invalid")
+        try:
+            validated = validate_kv_applicability(attestation, backend=backend, context_tier=context_tier)
+        except ValueError as exc:
+            raise ValueError("report_kv_diagnostics_invalid") from exc
+        if validated["applicability"] != applicability or (context_tokens is not None
+                and validated["context_size_tokens"] != context_tokens):
             raise ValueError("report_kv_diagnostics_invalid")
         return dict(value)
     keys = {"pass", "applicability", "profile_id", "backend", "context_size_tokens", "type_k", "type_v",
         "estimated_bytes", "observed_bytes", "delta_bytes", "precision_interval_bytes", "precision_bytes",
-        "record_count", "decimal_places", "estimator_provenance", "runtime_provenance"}
+        "record_count", "decimal_places", "estimator_provenance", "runtime_provenance", "attestation"}
     if set(value) != keys or applicability != "qwen_64k_full":
         raise ValueError("report_kv_diagnostics_invalid")
     integers = ("context_size_tokens", "estimated_bytes", "observed_bytes", "delta_bytes",
         "precision_bytes", "record_count", "decimal_places")
-    if any(not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 0
+    integer_limit = (1 << 63) - 1
+    if any(not isinstance(value[key], int) or isinstance(value[key], bool)
+            or value[key] < 0 or value[key] > integer_limit
             for key in integers):
         raise ValueError("report_kv_diagnostics_invalid")
     lower, upper = value.get("precision_interval_bytes", [None, None]) if isinstance(
         value.get("precision_interval_bytes"), list) and len(value["precision_interval_bytes"]) == 2 else (None, None)
+    profile_type = next((kind for kind in ("f16", "q8", "q4")
+        if isinstance(value["profile_id"], str) and kind in value["profile_id"].split("_")), None)
+    attestation = value.get("attestation")
+    try:
+        validated_attestation = validate_kv_applicability(attestation,
+            backend=value["backend"], context_tier="64k-full")
+    except ValueError as exc:
+        raise ValueError("report_kv_diagnostics_invalid") from exc
     if (not isinstance(value["profile_id"], str) or not 1 <= len(value["profile_id"]) <= 128
             or value["backend"] not in {"cpu", "metal", "cuda"} or value["type_k"] not in {"f16", "q8", "q4"}
-            or value["type_k"] != value["type_v"] or value["context_size_tokens"] != 65536
+            or value["type_k"] != value["type_v"] or profile_type != value["type_k"]
+            or value["context_size_tokens"] != 65536
+            or backend is not None and value["backend"] != backend
+            or context_tier is not None and context_tier != "64k-full"
+            or context_tokens is not None and value["context_size_tokens"] != context_tokens
+            or validated_attestation["applicability"] != "qwen_64k_full"
+            or validated_attestation["profile_id"] != value["profile_id"]
             or value["record_count"] <= 0 or value["record_count"] > 64
             or value["decimal_places"] not in {1, 2}
             or value["delta_bytes"] != abs(value["estimated_bytes"] - value["observed_bytes"])
@@ -809,7 +841,8 @@ def validate_report(report: Any) -> None:
             or not isinstance(kv["trials"], list) or len(kv["trials"]) != completed):
         raise ValueError("report_kv_diagnostics_invalid")
     for item in kv["trials"]:
-        validate_kv_comparison_summary(item)
+        validate_kv_comparison_summary(item, backend=backend["used"],
+            context_tier=context["tier"], context_tokens=context["window_tokens"])
 
 def write_report_atomic(out_dir: Path, report: dict[str, Any]) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1189,9 +1222,12 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         if (evidence["kv_compare"].get("pass")
                 and evidence["kv_compare"].get("profile_id") != applicability["profile_id"]):
             evidence["kv_compare"] = {"pass": False, "code": "kv_diagnostic_provenance_mismatch"}
+        elif evidence["kv_compare"].get("pass"):
+            evidence["kv_compare"]["attestation"] = applicability
     else:
         reason = applicability["applicability"]
-        evidence["kv_compare"] = {"pass": True, "applicability": reason, "reason": reason}
+        evidence["kv_compare"] = {"pass": True, "applicability": reason, "reason": reason,
+            "attestation": applicability}
     runtime = evidence["runtime"]
     identity_ok = (runtime["app_identity"] not in {"dev", "mock", "unknown"} and
         runtime["runtime_identity"] == runtime.get("bundled_runtime_identity") and

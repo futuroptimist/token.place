@@ -327,10 +327,17 @@ def test_phase_timing_throughput():
 
 
 def test_kv_compare_boundaries_and_fallback():
-    est = {"exact_kv_allocation_bytes": 10000, "kv_cache_breakdown": {"exact_allocation_available": True}}
-    assert h.compare_kv_estimate(est, {"kv_allocation_bytes": 14096})["pass"] is True
-    assert h.compare_kv_estimate(est, {"kv_allocation_bytes": 14097})["pass"] is False
-    assert h.compare_kv_estimate({"fallback": True}, {"kv_allocation_bytes": 1})["code"] == "exact_kv_diagnostics_absent_or_fallback"
+    est = {"profile_id":"qwen64k", "backend":"metal", "context_size_tokens":65536,
+        "type_k":"q8", "type_v":"q8", "exact_kv_allocation_bytes":10000,
+        "metadata_source":"gguf_header", "conservative_fallback_used":False}
+    runtime = {"method":"pinned_llama_cpp_kv_buffer_diagnostic", "llama_cpp_python_version":"0.3.32",
+        "llama_cpp_commit":"b3fed31b99f9bd37725833674252bccb429bb183", "observed_bytes":11000,
+        "precision_bytes":1000, "record_count":1, "unit":"MiB", "decimal_places":2}
+    assert h.compare_kv_estimate(est, runtime, backend="metal", context_tokens=65536)["pass"] is True
+    runtime["observed_bytes"] = 11001
+    assert h.compare_kv_estimate(est, runtime)["pass"] is False
+    est["conservative_fallback_used"] = True
+    assert h.compare_kv_estimate(est, runtime)["code"] == "kv_diagnostic_provenance_mismatch"
 
 
 def test_memory_probe_success_absent_timeout_malformed_and_sanitize(tmp_path):

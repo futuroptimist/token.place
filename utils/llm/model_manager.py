@@ -482,6 +482,50 @@ GGML_KV_TENSOR_ALIGNMENT_BYTES = 32
 GGML_KV_BACKEND_ALIGNMENT_BYTES = {'cpu': 32, 'metal': 32, 'cuda': 128}
 GGML_KV_CONTEXT_ALLOCATION_ALIGNMENT_TOKENS = 256
 GGML_CUDA_QUANTIZED_MATRIX_ROW_PADDING = 512
+LLAMA_CPP_KV_DIAGNOSTIC_MAX_BYTES = 1 << 63
+_LLAMA_CPP_KV_BUFFER_RE = re.compile(
+    r"^llama_kv_cache(?:_init|_unified)?:\s+(?P<device>[A-Za-z0-9_-]+)\s+KV buffer size =\s+"
+    r"(?P<value>[0-9]+(?:\.[0-9]{1,2})?)\s+(?P<unit>MiB)$"
+)
+
+
+def parse_llama_cpp_kv_allocation_diagnostics(lines: Iterable[str]) -> Dict[str, Any]:
+    """Parse the pinned llama.cpp KV-buffer diagnostic without retaining raw text."""
+    records = []
+    for raw in lines:
+        match = _LLAMA_CPP_KV_BUFFER_RE.fullmatch(str(raw).strip())
+        if not match:
+            continue
+        value = match.group('value')
+        decimals = len(value.partition('.')[2])
+        scale = 10 ** decimals
+        units = int(value.replace('.', ''))
+        numerator = _checked_mul(units, 1024 * 1024, 'kv_diagnostic_bytes', maximum=LLAMA_CPP_KV_DIAGNOSTIC_MAX_BYTES * scale)
+        center = numerator // scale
+        precision = max(1, math.ceil((1024 * 1024) / (2 * scale)))
+        records.append((match.group('device').lower(), center, precision, decimals))
+    if not records:
+        raise ValueError('kv_runtime_diagnostic_missing')
+    devices = [record[0] for record in records]
+    if len(devices) != len(set(devices)):
+        raise ValueError('kv_runtime_diagnostic_ambiguous')
+    decimals = {record[3] for record in records}
+    if len(decimals) != 1:
+        raise ValueError('kv_runtime_diagnostic_mixed_precision')
+    observed = sum(record[1] for record in records)
+    precision = sum(record[2] for record in records)
+    if observed <= 0 or observed >= LLAMA_CPP_KV_DIAGNOSTIC_MAX_BYTES:
+        raise ValueError('kv_runtime_diagnostic_out_of_range')
+    return {
+        'method': 'pinned_llama_cpp_kv_buffer_diagnostic',
+        'llama_cpp_python_version': '0.3.32',
+        'llama_cpp_commit': 'b3fed31b99f9bd37725833674252bccb429bb183',
+        'observed_bytes': observed,
+        'precision_bytes': precision,
+        'record_count': len(records),
+        'unit': 'MiB',
+        'decimal_places': decimals.pop(),
+    }
 SUPPORTED_STANDARD_KV_ARCHITECTURES = {'qwen3'}
 UNSUPPORTED_KV_LAYOUT_SUFFIXES = (
     'attention.sliding_window', 'attention.layer_types', 'attention.recurrent',
@@ -2814,8 +2858,24 @@ class _SubprocessLlamaProxy:
                 raise RuntimeError(safe_exc) from exc
             raise
         try:
+            init_stderr_sequence = int(getattr(self._process, '_token_place_stderr_sequence', 0) or 0)
             init_message = self._rpc({'method': '__init__', 'args': args, 'kwargs': kwargs}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_model_initialization', check_health=False)
             self.child_model_path_exists = bool(init_message.get('child_model_path_exists'))
+            deadline = time.monotonic() + 0.05
+            previous_sequence = -1
+            while time.monotonic() < deadline:
+                sequence = int(getattr(self._process, '_token_place_stderr_sequence', 0) or 0)
+                if sequence == previous_sequence:
+                    break
+                previous_sequence = sequence
+                time.sleep(0.001)
+            tail = getattr(self._process, '_token_place_stderr_tail', [])
+            scoped_lines = [line for sequence, line in tail
+                if isinstance(sequence, int) and sequence > init_stderr_sequence]
+            try:
+                self.kv_runtime_diagnostic = parse_llama_cpp_kv_allocation_diagnostics(scoped_lines)
+            except ValueError as exc:
+                self.kv_runtime_diagnostic = {'error': str(exc)}
         except LlamaCppRuntimeStageTimeout:
             self.close()
             raise
@@ -6826,6 +6886,12 @@ class ModelManager:
                                     if isinstance(profile_diag, dict):
                                         profile_diag['selected'] = True
                                         self.last_qwen_64k_memory_profile_diagnostics = profile_diag
+                                        setattr(llm_instance, '_token_place_benchmark_kv_estimate', {
+                                            'profile_id': profile_diag.get('profile_id'),
+                                            'backend': profile_diag.get('backend'),
+                                            'kv_precision': profile_diag.get('kv_precision'),
+                                            'memory_estimate': profile_diag.get('memory_estimate'),
+                                        })
                                     break
                                 except Exception as init_exc:
                                     category = _classify_runtime_initialization_error(init_exc)

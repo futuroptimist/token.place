@@ -9,7 +9,7 @@ run multi-minute inference.
 
 Physical packaged-runtime mode is intentionally fail-closed. Run it only on a machine with:
 
-- a built or installed token.place desktop application at version `0.1.13`;
+- a built or installed token.place desktop application at version `0.1.14`;
 - the existing pinned `llama-cpp-python==0.3.32` packaged runtime;
 - Qwen3 8B Q4_K_M or another explicitly recorded local model artifact;
 - macOS Apple Silicon with Metal or Windows with NVIDIA/CUDA for GPU validation, with CPU only where
@@ -306,7 +306,7 @@ unchanged worker session, restart failure, and malformed evidence are runtime-co
 `--report-only` cannot suppress them.
 
 The command above is the genuine-hardware procedure. It was not executed during development of
-this harness change; a packaged 0.1.13 application, model, relay, and supported hardware are
+this harness change; a packaged 0.1.14 application, model, relay, and supported hardware are
 required before recording physical evidence.
 
 ## Memory-estimator comparison
@@ -357,5 +357,29 @@ git diff --check
 ```
 
 Physical Metal/CUDA validation is manual and should attach only sanitized reports to #1566, #1608,
-or downstream validation. Do not claim 0.1.13 release validation or general semantic correctness from a report-only
+or downstream validation. Do not claim 0.1.14 release validation or general semantic correctness from a report-only
 baseline.
+
+### Qwen 64K KV allocation diagnostics
+
+For a supported Qwen model using `64k-full`, packaged trials require two independent,
+same-session records. The selected runtime profile supplies the exact GGUF-header-derived KV
+allocation, backend, context size, K/V types, profile ID, metadata source, and fallback state. The
+pinned `llama-cpp-python` 0.3.32 runtime (llama.cpp commit
+`b3fed31b99f9bd37725833674252bccb429bb183`) separately supplies its initialization-time
+`KV buffer size` diagnostics. Multiple backend buffers are summed only when their device labels
+are unique within that initialization attempt.
+
+The runtime diagnostic prints MiB to one or two decimal places, so it is not byte-exact. Comparison
+uses the interval implied by half of the displayed unit at the diagnostic's actual decimal precision;
+it does not use an arbitrary 4 KiB tolerance. Missing, stale, duplicate-device, mixed-precision,
+overflowed, fallback-derived, backend/context-mismatched, or out-of-interval evidence fails the
+runtime contract and cannot be suppressed by `--report-only`. Reports retain one bounded comparison
+per sequential trial: estimated and observed bytes, delta, precision interval, provenance enums,
+applicability, and pass state. Other context tiers are explicitly `not_applicable_context_tier` and
+do not claim P7 validation.
+
+Only bounded numeric/categorical summaries are retained. Raw stderr, paths, PIDs, command lines,
+prompts, responses, credentials, and runtime/session identifiers are excluded. The pinned fixture
+is source-derived parser/accounting evidence, not proof of a physical Metal or CUDA run. No physical
+Metal or CUDA KV validation was performed for this change.

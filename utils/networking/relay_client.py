@@ -4004,6 +4004,22 @@ class RelayClient:
                 "fixture_sha256": config["fixture_sha256"],
                 "total_prompt_tokens": full_prompt_tokens,
                 "target_offsets_tokens": counts}
+            estimate = getattr(llm_instance, "_token_place_benchmark_kv_estimate", None)
+            runtime_diagnostic = getattr(llm_instance, "kv_runtime_diagnostic", None)
+            if isinstance(estimate, dict) and isinstance(runtime_diagnostic, dict):
+                memory = estimate.get("memory_estimate")
+                if isinstance(memory, dict):
+                    evidence["kv_estimator"] = {
+                        "profile_id": estimate.get("profile_id"),
+                        "backend": estimate.get("backend"),
+                        "context_size_tokens": memory.get("context_size_tokens"),
+                        "type_k": memory.get("type_k"),
+                        "type_v": memory.get("type_v"),
+                        "exact_kv_allocation_bytes": memory.get("exact_kv_allocation_bytes"),
+                        "metadata_source": memory.get("metadata_source"),
+                        "conservative_fallback_used": memory.get("conservative_fallback_used"),
+                    }
+                    evidence["kv_runtime"] = dict(runtime_diagnostic)
             output = Path(evidence_name)
             output.parent.mkdir(parents=True, exist_ok=True)
             fd, temporary = tempfile.mkstemp(prefix=".long-context-tokenizer-", dir=output.parent)

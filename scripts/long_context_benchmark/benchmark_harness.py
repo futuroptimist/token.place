@@ -600,15 +600,41 @@ def summarize_metrics(*, start_s: float, preparing_end_s: float, prefill_end_s: 
         "decode_tokens_per_s": output_tokens / decode if decode > 0 else None,
         "request_budget_s": request_budget_s, "completion_margin_s": request_budget_s - total}
 
-def compare_kv_estimate(estimate: dict[str, Any], runtime: dict[str, Any], exact_required: bool = True, tolerance_bytes: int = 4096) -> dict[str, Any]:
-    est = estimate.get("exact_kv_allocation_bytes") or estimate.get("exact_kv_cache_bytes")
-    obs = runtime.get("kv_allocation_bytes")
-    fallback = bool(estimate.get("fallback") or estimate.get("kv_cache_breakdown", {}).get("exact_allocation_available") is False)
-    if exact_required and (fallback or not isinstance(est, int) or not isinstance(obs, int)):
-        return {"pass": False, "code": "exact_kv_diagnostics_absent_or_fallback"}
-    if not isinstance(est, int) or not isinstance(obs, int): return {"pass": False, "code": "kv_diagnostics_absent"}
-    delta = abs(est-obs)
-    return {"pass": delta <= tolerance_bytes, "estimated_bytes": est, "observed_bytes": obs, "delta_bytes": delta, "tolerance_bytes": tolerance_bytes, "alignment_rule": "exact GGML allocation bytes must match runtime diagnostics within one 4KiB page"}
+def compare_kv_estimate(estimate: dict[str, Any], runtime: dict[str, Any], *,
+        backend: str | None = None, context_tokens: int | None = None) -> dict[str, Any]:
+    """Compare exact estimator bytes with the pinned diagnostic's rounding interval."""
+    estimator_keys = {"profile_id", "backend", "context_size_tokens", "type_k", "type_v",
+        "exact_kv_allocation_bytes", "metadata_source", "conservative_fallback_used"}
+    runtime_keys = {"method", "llama_cpp_python_version", "llama_cpp_commit", "observed_bytes",
+        "precision_bytes", "record_count", "unit", "decimal_places"}
+    if not isinstance(estimate, dict) or set(estimate) != estimator_keys:
+        return {"pass": False, "code": "kv_estimator_evidence_malformed"}
+    if not isinstance(runtime, dict) or set(runtime) != runtime_keys:
+        return {"pass": False, "code": "kv_runtime_diagnostic_malformed"}
+    integer_fields = [estimate.get("context_size_tokens"), estimate.get("exact_kv_allocation_bytes"),
+        runtime.get("observed_bytes"), runtime.get("precision_bytes"), runtime.get("record_count"),
+        runtime.get("decimal_places")]
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in integer_fields):
+        return {"pass": False, "code": "kv_diagnostic_value_invalid"}
+    if (estimate["conservative_fallback_used"] is not False or estimate["exact_kv_allocation_bytes"] <= 0
+            or runtime["observed_bytes"] <= 0 or runtime["precision_bytes"] <= 0
+            or runtime["record_count"] <= 0 or runtime["method"] != "pinned_llama_cpp_kv_buffer_diagnostic"
+            or runtime["llama_cpp_python_version"] != "0.3.32"
+            or runtime["llama_cpp_commit"] != "b3fed31b99f9bd37725833674252bccb429bb183"
+            or runtime["unit"] != "MiB" or runtime["decimal_places"] not in {1, 2}
+            or estimate["metadata_source"] != "gguf_header"
+            or estimate["type_k"] != estimate["type_v"]
+            or backend is not None and estimate["backend"] != backend
+            or context_tokens is not None and estimate["context_size_tokens"] != context_tokens):
+        return {"pass": False, "code": "kv_diagnostic_provenance_mismatch"}
+    estimated, observed, precision = (estimate["exact_kv_allocation_bytes"],
+        runtime["observed_bytes"], runtime["precision_bytes"])
+    lower, upper = max(1, observed - precision), observed + precision
+    return {"pass": lower <= estimated <= upper,
+        "estimated_bytes": estimated, "observed_bytes": observed,
+        "delta_bytes": abs(estimated - observed), "precision_interval_bytes": [lower, upper],
+        "estimator_provenance": "qwen_selected_profile_gguf_header",
+        "runtime_provenance": "pinned_llama_cpp_kv_buffer_diagnostic"}
 
 def sanitize(value: Any) -> Any:
     if isinstance(value, dict): return {str(k)[:64]: sanitize(v) for k,v in value.items() if str(k).lower() not in SENSITIVE_KEYS}
@@ -704,6 +730,13 @@ def validate_report(report: Any) -> None:
                 or len(cancellation["scenarios"]) != 2
                 or not isinstance(cancellation.get("operator_lifecycle"), dict)):
             raise ValueError("report_cancellation_recovery_invalid")
+    kv = report.get("kv_diagnostics")
+    if (not isinstance(kv, dict) or set(kv) != {"trials"}
+            or not isinstance(kv["trials"], list) or len(kv["trials"]) != completed
+            or any(not isinstance(item, dict) or item.get("pass") is not True
+                or item.get("applicability") not in {"qwen_64k_full", "not_applicable_context_tier"}
+                for item in kv["trials"])):
+        raise ValueError("report_kv_diagnostics_invalid")
 
 def write_report_atomic(out_dir: Path, report: dict[str, Any]) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1071,8 +1104,13 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
                 generation_threshold=generation_cancel_tokens)
         except ValueError as exc:
             return {"pass": False, "runtime_contract_pass": False, "code": str(exc)}
-    if "kv_estimate" in payload or "kv_runtime" in payload:
-        evidence["kv_compare"] = compare_kv_estimate(payload.get("kv_estimate", {}), payload.get("kv_runtime", {}))
+    p7_required = context_tier == "64k-full" and "qwen" in Path(model).name.lower()
+    if p7_required:
+        evidence["kv_compare"] = compare_kv_estimate(payload.get("kv_estimate"), payload.get("kv_runtime"),
+            backend=backend, context_tokens=65536)
+        evidence["kv_compare"]["applicability"] = "qwen_64k_full"
+    else:
+        evidence["kv_compare"] = {"pass": True, "applicability": "not_applicable_context_tier"}
     runtime = evidence["runtime"]
     identity_ok = (runtime["app_identity"] not in {"dev", "mock", "unknown"} and
         runtime["runtime_identity"] == runtime.get("bundled_runtime_identity") and
@@ -1084,7 +1122,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     if cancellation_validation:
         runtime_contract_pass = runtime_contract_pass and bool(
             evidence.get("cancellation_recovery", {}).get("pass"))
-    if "kv_compare" in evidence:
+    if p7_required:
         runtime_contract_pass = runtime_contract_pass and bool(evidence["kv_compare"].get("pass"))
     passed = bool(runtime_contract_pass and semantic.get("semantic_pass"))
     evidence["runtime_contract_pass"] = runtime_contract_pass
@@ -1188,7 +1226,10 @@ def main(argv: list[str] | None = None) -> int:
                 "semantic":evidence["semantic"], "aggregate_semantic":aggregate,
                 "memory":{"maximum_peak_rss_bytes":max(
                     trial["memory"]["peak_rss_bytes"] for trial in completed),
-                    "trials":[trial["memory"] for trial in completed]}}
+                    "trials":[trial["memory"] for trial in completed]},
+                "kv_diagnostics":{"trials":[trial.get("kv_compare", {
+                    "pass": True, "applicability": "not_applicable_context_tier"})
+                    for trial in completed]}}
             if args.cancellation_validation:
                 report["cancellation_recovery"] = cancellation_evidence
         else:

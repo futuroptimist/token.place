@@ -1369,7 +1369,7 @@ def test_owned_runner_posix_terminates_exact_process_group(monkeypatch):
 
 
 @pytest.mark.parametrize("cleanup_outcome", ["failed", "timeout"])
-def test_owned_runner_windows_cleans_exact_pid_and_reaps(cleanup_outcome):
+def test_owned_runner_windows_never_invokes_injected_killpg(cleanup_outcome):
     process = _TimedOutProcess(["timeout", 1] if cleanup_outcome == "failed" else ["timeout", 1])
     process.stdout = type("Output", (), {"read": lambda self, size: b""})()
     launched = {}; cleanup = []
@@ -1387,6 +1387,22 @@ def test_owned_runner_windows_cleans_exact_pid_and_reaps(cleanup_outcome):
     assert launched["creationflags"] == getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     assert cleanup[0][0] == ["taskkill", "/PID", "731", "/T", "/F"]
     assert process.killed is (cleanup_outcome == "timeout")
+
+
+def test_owned_runner_windows_never_resolves_os_killpg(monkeypatch):
+    process = _TimedOutProcess(["timeout", 1])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    cleanup = []
+    monkeypatch.delattr(os, "killpg", raising=False)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        h._run_owned_runner(["runner"], 1, 2,
+            popen=lambda _command, **_kwargs: process,
+            cleanup_run=lambda command, **kwargs: cleanup.append((command, kwargs))
+            or subprocess.CompletedProcess(command, 0),
+            platform_name="nt")
+
+    assert cleanup[0][0] == ["taskkill", "/PID", "731", "/T", "/F"]
 
 
 def test_owned_runner_posix_fails_closed_without_killpg(monkeypatch):

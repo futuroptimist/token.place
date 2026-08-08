@@ -1,8 +1,10 @@
 import ast
 import json
+import os
 import signal
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -146,6 +148,27 @@ def test_matrix_plan_is_deterministic_complete_and_duplicate_free():
             for cell in scoped if cell["trials"]} == {
                 (tier, fixture, scenario) for tier, fixture in h.MATRIX_WORKLOADS
                 for scenario in ("single-needle", "structured-extraction")}
+
+
+def test_matrix_plan_entry_point_imports_without_os_killpg():
+    script = Path(__file__).parents[2] / "scripts" / "long_context_benchmark.py"
+    probe = textwrap.dedent(f"""
+        import os
+        import runpy
+        import sys
+        if hasattr(os, "killpg"):
+            del os.killpg
+        sys.argv = [{str(script)!r}, "matrix-plan"]
+        try:
+            runpy.run_path({str(script)!r}, run_name="__main__")
+        except SystemExit as exc:
+            if exc.code:
+                raise
+    """)
+    completed = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    plan = json.loads(completed.stdout)
+    h.validate_matrix_plan(plan)
 
 
 def test_runtime_configuration_validation_is_exact_and_fail_closed():
@@ -1358,10 +1381,22 @@ def test_owned_runner_windows_cleans_exact_pid_and_reaps(cleanup_outcome):
     with pytest.raises(subprocess.TimeoutExpired):
         h._run_owned_runner(["runner"], 1, 2,
             popen=lambda command, **kwargs: launched.update(kwargs) or process,
-            cleanup_run=cleanup_run, platform_name="nt")
+            cleanup_run=cleanup_run,
+            killpg=lambda *_args: pytest.fail("Windows cleanup called POSIX killpg"),
+            platform_name="nt")
     assert launched["creationflags"] == getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     assert cleanup[0][0] == ["taskkill", "/PID", "731", "/T", "/F"]
     assert process.killed is (cleanup_outcome == "timeout")
+
+
+def test_owned_runner_posix_fails_closed_without_killpg(monkeypatch):
+    process = _TimedOutProcess(["timeout", 1])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    monkeypatch.delattr(os, "killpg", raising=False)
+    with pytest.raises(RuntimeError, match="^owned_process_group_cleanup_unavailable$"):
+        h._run_owned_runner(["runner"], 1, 2,
+            popen=lambda _command, **_kwargs: process, platform_name="posix")
+    assert process.killed is True
 
 
 def test_main_generate_and_evaluate_commands(tmp_path):

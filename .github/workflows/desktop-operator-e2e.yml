@@ -23,6 +23,9 @@ on:
       - 'desktop-tauri/scripts/run_desktop_parity_checks.py'
       - 'tests/unit/test_model_manager.py'
       - 'tests/integration/test_desktop_qwen64k_packaged_runtime.py'
+      - 'scripts/long_context_benchmark.py'
+      - 'scripts/long_context_benchmark/**'
+      - 'tests/unit/test_long_context_benchmark_harness.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -44,6 +47,9 @@ on:
       - 'desktop-tauri/scripts/run_desktop_parity_checks.py'
       - 'tests/unit/test_model_manager.py'
       - 'tests/integration/test_desktop_qwen64k_packaged_runtime.py'
+      - 'scripts/long_context_benchmark.py'
+      - 'scripts/long_context_benchmark/**'
+      - 'tests/unit/test_long_context_benchmark_harness.py'
       - 'utils/**'
       - 'config.py'
       - 'encrypt.py'
@@ -187,6 +193,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
+
+      - name: Smoke test long-context benchmark matrix plan
+        run: python scripts/long_context_benchmark.py matrix-plan
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable

@@ -188,6 +188,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
 
+      - name: Smoke test long-context benchmark matrix plan
+        run: python scripts/long_context_benchmark.py matrix-plan
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 

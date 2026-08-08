@@ -1139,7 +1139,7 @@ def observe_post_terminal(poller: Callable[[], object], *, clock: Callable[[], f
 def _run_owned_runner(command: list[str], timeout_s: float,
         cleanup_timeout_s: float, *, popen: Callable[..., Any] = subprocess.Popen,
         cleanup_run: Callable[..., Any] = subprocess.run,
-        killpg: Callable[[int, int], Any] = os.killpg,
+        killpg: Callable[[int, int], Any] | None = None,
         platform_name: str | None = None) -> subprocess.CompletedProcess[str]:
     """Run one owned process group without buffering output or killing by name."""
     kwargs: dict[str, Any] = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
@@ -1172,13 +1172,19 @@ def _run_owned_runner(command: list[str], timeout_s: float,
                 process.kill()
                 process.wait(timeout=cleanup_timeout_s)
         else:
+            owned_killpg = killpg if killpg is not None else getattr(os, "killpg", None)
+            if not callable(owned_killpg):
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    process.kill()
+                    process.wait(timeout=cleanup_timeout_s)
+                raise RuntimeError("owned_process_group_cleanup_unavailable") from None
             with contextlib.suppress(ProcessLookupError):
-                killpg(process.pid, signal.SIGTERM)
+                owned_killpg(process.pid, signal.SIGTERM)
             try:
                 process.wait(timeout=cleanup_timeout_s)
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
-                    killpg(process.pid, signal.SIGKILL)
+                    owned_killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=cleanup_timeout_s)
         raise
     drain.join(timeout=cleanup_timeout_s)

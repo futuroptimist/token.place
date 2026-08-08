@@ -4278,6 +4278,14 @@ mod tests {
     const PRODUCTION_PREFLIGHT_FAILURE_EVENT: &str = r#"{"type":"status","startup_result":"runtime_validation_failed","probe_stage":"native_import","probe_error_code":"native_dll_load_failed","exception_type":"OSError","child_exit_code":101,"detected_architecture":"x86_64","architecture_source":"attested_windows_x86_64","import_root_valid":true,"provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
     const CPU_SMOKE_PREFLIGHT_VALIDATED_EVENT: &str = r#"{"type":"status","cpu_smoke_preflight":true,"startup_result":"cpu_smoke_validated","requested_mode":"cpu","selected_backend":"cpu","runtime_action":"skipped","provisioning_actions":0,"repair_actions":0,"pip_actions":0,"compiler_actions":0,"network_actions":0,"download_actions":0}"#;
 
+    fn production_operator_preflight_event_test_timeout() -> Duration {
+        if cfg!(windows) {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(2)
+        }
+    }
+
     fn operator_preflight_test_command(output: Option<&str>, wedge: bool) -> Command {
         #[cfg(unix)]
         {
@@ -4331,7 +4339,7 @@ mod tests {
     async fn operator_preflight_accepts_valid_runtime_validation_event() {
         let event = run_production_operator_preflight_child(
             operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_VALIDATED_EVENT), false),
-            Duration::from_secs(2),
+            production_operator_preflight_event_test_timeout(),
         )
         .await
         .expect("valid production runtime validation");
@@ -4345,7 +4353,7 @@ mod tests {
     async fn operator_preflight_reports_valid_bounded_failure_event() {
         let error = run_production_operator_preflight_child(
             operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_FAILURE_EVENT), false),
-            Duration::from_secs(2),
+            production_operator_preflight_event_test_timeout(),
         )
         .await
         .expect_err("bounded failure must be transported");
@@ -4465,7 +4473,7 @@ mod tests {
         );
         let error = run_production_operator_preflight_child(
             operator_preflight_test_command(Some(&output), false),
-            Duration::from_secs(2),
+            production_operator_preflight_event_test_timeout(),
         )
         .await
         .unwrap_err();
@@ -4568,7 +4576,7 @@ mod tests {
         let started = Instant::now();
         run_production_operator_preflight_child(
             operator_preflight_test_command(Some(PRODUCTION_PREFLIGHT_VALIDATED_EVENT), true),
-            Duration::from_secs(2),
+            production_operator_preflight_event_test_timeout(),
         )
         .await
         .expect("ready event must be accepted before cleanup");

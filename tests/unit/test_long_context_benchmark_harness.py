@@ -1345,8 +1345,18 @@ def test_owned_runner_posix_terminates_exact_process_group(monkeypatch):
     assert signals == [(731, signal.SIGTERM), (731, signal.SIGKILL)]
 
 
+def test_owned_runner_posix_fails_closed_without_process_group_cleanup(monkeypatch):
+    process = _TimedOutProcess(["timeout", 1])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    monkeypatch.delattr(h.os, "killpg", raising=False)
+    with pytest.raises(RuntimeError, match="^owned_process_group_cleanup_unavailable$"):
+        h._run_owned_runner(["runner"], 1, 2,
+            popen=lambda command, **kwargs: process, platform_name="posix")
+    assert process.killed is True
+
+
 @pytest.mark.parametrize("cleanup_outcome", ["failed", "timeout"])
-def test_owned_runner_windows_cleans_exact_pid_and_reaps(cleanup_outcome):
+def test_owned_runner_windows_cleans_exact_pid_and_reaps(cleanup_outcome, monkeypatch):
     process = _TimedOutProcess(["timeout", 1] if cleanup_outcome == "failed" else ["timeout", 1])
     process.stdout = type("Output", (), {"read": lambda self, size: b""})()
     launched = {}; cleanup = []
@@ -1355,6 +1365,7 @@ def test_owned_runner_windows_cleans_exact_pid_and_reaps(cleanup_outcome):
         if cleanup_outcome == "timeout":
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         return subprocess.CompletedProcess(command, 1)
+    monkeypatch.delattr(h.os, "killpg", raising=False)
     with pytest.raises(subprocess.TimeoutExpired):
         h._run_owned_runner(["runner"], 1, 2,
             popen=lambda command, **kwargs: launched.update(kwargs) or process,
@@ -1362,6 +1373,17 @@ def test_owned_runner_windows_cleans_exact_pid_and_reaps(cleanup_outcome):
     assert launched["creationflags"] == getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     assert cleanup[0][0] == ["taskkill", "/PID", "731", "/T", "/F"]
     assert process.killed is (cleanup_outcome == "timeout")
+
+
+def test_matrix_plan_entry_point_imports_without_os_killpg():
+    script = ("import os,runpy,sys; delattr(os,'killpg') if hasattr(os,'killpg') else None; "
+        "sys.argv[1:]=['matrix-plan']; "
+        "runpy.run_path('scripts/long_context_benchmark.py',run_name='__main__')")
+    completed = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).parents[2],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    plan = json.loads(completed.stdout)
+    assert plan == h.build_matrix_plan()
 
 
 def test_main_generate_and_evaluate_commands(tmp_path):

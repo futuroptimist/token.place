@@ -160,7 +160,7 @@ For the planned Qwen3 default-model migration, see [Qwen3 8B Q4_K_M API v1 model
 Benchmarks must avoid real user content. Publish coarse bands or aggregate
 operator diagnostics only; do not publish prompts or exact user-derived token
 counts. The Q8_0 preference does not promise an unmeasured speedup: P5 owns
-batch-profile tuning, and P8 owns performance and quality benchmarks.
+batch-profile tuning, and the long-context benchmark owns performance and quality benchmarks.
 
 ### Qwen 64K batch profiles
 
@@ -182,7 +182,7 @@ batch class before Safe Q4. Other failures do not reduce batches or select Q4.
 Thus batch-profile fallback is distinct from KV-precision fallback, and the
 requested preference remains separate from the active profile in diagnostics.
 Performance varies by backend and hardware; these initial product values are
-not throughput guarantees. P8 will supply formal comparative benchmarks and
+not throughput guarantees. The long-context benchmark will supply formal comparative benchmarks and
 regression thresholds.
 
 ## Context profile schema

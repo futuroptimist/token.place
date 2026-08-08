@@ -13947,6 +13947,47 @@ def _write_minimal_gguf(path, metadata):
 def _llama_cpp_kv_fixture():
     return json.loads((Path(__file__).parent.parent / 'fixtures' / 'llama_cpp_kv_allocation_b3fed31b9.json').read_text())
 
+
+def test_parse_pinned_llama_cpp_kv_allocation_diagnostic_precision_and_devices():
+    from utils.llm import model_manager as module
+
+    result = module.parse_llama_cpp_kv_allocation_diagnostics([
+        'llama_kv_cache_unified: Metal0 KV buffer size = 100.00 MiB',
+        'llama_kv_cache_unified: Metal1 KV buffer size = 20.00 MiB',
+    ])
+    assert result['observed_bytes'] == 120 * 1024 * 1024
+    assert result['precision_bytes'] == 2 * 5243
+    assert result['record_count'] == 2
+    assert 'Metal0' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('lines, code', [
+    ([], 'kv_runtime_diagnostic_missing'),
+    (['llama_kv_cache_unified: Metal0 KV buffer size = 1.00 MiB'] * 2,
+     'kv_runtime_diagnostic_ambiguous'),
+    (['llama_kv_cache_unified: Metal0 KV buffer size = 1.0 MiB',
+      'llama_kv_cache_unified: Metal1 KV buffer size = 1.00 MiB'],
+     'kv_runtime_diagnostic_mixed_precision'),
+])
+def test_parse_pinned_llama_cpp_kv_allocation_diagnostic_fails_closed(lines, code):
+    from utils.llm import model_manager as module
+
+    with pytest.raises(ValueError, match=code):
+        module.parse_llama_cpp_kv_allocation_diagnostics(lines)
+
+
+def test_initialization_diagnostic_barrier_waits_for_delayed_reader():
+    from utils.llm import model_manager as module
+
+    proxy = object.__new__(module._SubprocessLlamaProxy)
+    proxy._stderr_activity = threading.Event()
+    delayed = threading.Thread(target=lambda: (time.sleep(0.075), proxy._stderr_activity.set()))
+    started = time.monotonic()
+    delayed.start()
+    proxy._wait_for_initialization_stderr()
+    delayed.join()
+    assert time.monotonic() - started >= 0.1
+
 def _qwen3_8b_metadata():
     return {
         'general.architecture': 'qwen3',

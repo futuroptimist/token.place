@@ -1237,6 +1237,13 @@ describe('desktop app start failure handling', () => {
           api_v1_readiness_qwen_64k_batch_profile_selected: 'safe',
           api_v1_readiness_qwen_64k_runtime_profile_kv_precision: 'q4',
           api_v1_readiness_qwen_64k_runtime_profile_fallback_reason: 'memory_pressure',
+          api_v1_readiness_yarn_requested_context_tokens: 65536,
+          api_v1_readiness_yarn_original_context_tokens: 32768,
+          api_v1_readiness_yarn_context_multiplier: 2,
+          api_v1_readiness_yarn_rope_freq_scale: 0.5,
+          api_v1_readiness_yarn_ext_factor_overridden: false,
+          api_v1_readiness_yarn_rope_scaling_type_source: 'top_level_enum',
+          api_v1_readiness_yarn_configuration_valid: true,
           api_v1_readiness_completion_smoke_internal_reason: 'SECRET_PROMPT',
           unsafe_nested: { prompt: 'secret' },
         },
@@ -1267,6 +1274,15 @@ describe('desktop app start failure handling', () => {
     );
     expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
       'api_v1_readiness_qwen_64k_runtime_profile_fallback_reason=memory_pressure'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_yarn_requested_context_tokens=65536'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_yarn_rope_freq_scale=0.5'
+    );
+    expect(screen.getByText(/Readiness diagnostics:/).textContent).toContain(
+      'api_v1_readiness_yarn_configuration_valid=true'
     );
     expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain('unsafe_nested');
     expect(screen.getByText(/Readiness diagnostics:/).textContent).not.toContain(

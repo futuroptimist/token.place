@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
+import math
 import os
 import shutil
 import socket
@@ -43,6 +45,14 @@ try:
     from selenium.webdriver.support.ui import WebDriverWait
 
     from utils.crypto_helpers import CryptoClient
+    from scripts.long_context_benchmark.benchmark_harness import (
+        apply_benchmark_context_tier,
+        classify_benchmark_landing_state,
+        observe_post_terminal,
+        benchmark_operator_mode,
+        OwnedProcessTreeMemorySampler,
+        prefill_cancellation_trigger_state,
+    )
 except Exception as exc:
     BOOTSTRAP_LOG.write_text(
         "desktop ui e2e bootstrap failure\n"
@@ -196,10 +206,11 @@ def resolve_real_e2e_model_path() -> Path:
 
 
 def wait_for_running_stability(
-    driver: webdriver.Remote, expected: str, stable_seconds: float = 2.0
+    driver: webdriver.Remote, expected: str, stable_seconds: float = 2.0,
+    timeout_seconds: float = 45,
 ) -> None:
     status_xpath = "//p[contains(.,'Running:')]//strong"
-    wait = WebDriverWait(driver, 45, poll_frequency=0.25)
+    wait = WebDriverWait(driver, timeout_seconds, poll_frequency=0.25)
     wait.until(
         lambda d: d.find_element(By.XPATH, status_xpath).text.strip().lower() == expected.lower()
     )
@@ -215,6 +226,14 @@ def wait_for_running_stability(
                 f"Running state became unstable: expected {expected!r}, observed {current!r}"
             )
         time.sleep(0.2)
+
+
+def landing_compute_node_status_matches(driver: webdriver.Remote, expected: str) -> bool:
+    try:
+        status = driver.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
+        return status.text.strip() == expected
+    except (NoSuchElementException, StaleElementReferenceException):
+        return False
 
 
 def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -> None:
@@ -565,6 +584,101 @@ def _readiness_diagnostics_map(driver: webdriver.Remote) -> dict[str, str]:
     return dict(item.split("=", 1) for item in text.split() if "=" in item)
 
 
+def _diagnostic_bool(diagnostics: dict[str, str], key: str) -> bool:
+    value = diagnostics.get(key, "").lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError("runtime_configuration_invalid")
+    return value == "true"
+
+
+def _diagnostic_int(diagnostics: dict[str, str], key: str) -> int:
+    value = diagnostics.get(key, "")
+    if not value.isdigit():
+        raise RuntimeError("runtime_configuration_invalid")
+    return int(value)
+
+
+def _diagnostic_float(diagnostics: dict[str, str], key: str) -> float:
+    try:
+        value = float(diagnostics[key])
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError("runtime_configuration_invalid") from exc
+    if not math.isfinite(value):
+        raise RuntimeError("runtime_configuration_invalid")
+    return value
+
+
+def _normalize_profile_fallback_reason(value: str | None) -> str:
+    return "none" if value in {None, "", "null"} else value
+
+
+def packaged_runtime_configuration(runtime: dict[str, str], diagnostics: dict[str, str],
+        requested_backend: str) -> dict[str, object]:
+    """Build bounded current-worker configuration evidence from UI-safe fields only."""
+    profile_key = "api_v1_readiness_qwen_64k_runtime_profile_id"
+    profile_id = diagnostics.get(profile_key)
+    profile_applicable = profile_id not in {None, "", "null"}
+    if profile_applicable:
+        attempts = diagnostics.get(
+            "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids", "").split(",")
+        fallback_reason = _normalize_profile_fallback_reason(diagnostics.get(
+            "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason"))
+        profile = {"selected": profile_id,
+            "preferred": diagnostics["api_v1_readiness_qwen_64k_runtime_preferred_profile_id"],
+            "attempted": attempts,
+            "recovery_count": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_recovery_count"),
+            "result": diagnostics["api_v1_readiness_qwen_64k_runtime_profile_result"],
+            "fallback_reason": fallback_reason}
+        batch = {"requested": diagnostics["api_v1_readiness_qwen_64k_batch_profile_requested"],
+            "selected": diagnostics["api_v1_readiness_qwen_64k_batch_profile_selected"],
+            "n_batch": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_n_batch"),
+            "n_ubatch": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_n_ubatch")}
+        kv_cache = {"precision": diagnostics["api_v1_readiness_qwen_64k_runtime_profile_kv_precision"],
+            "type_k": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_type_k"),
+            "type_v": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_type_v"),
+            "device": diagnostics["kv_cache_device"]}
+        offloaded = diagnostics["offloaded_layers"]
+        acceleration = {"flash_attention": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_flash_attn"),
+            "kqv_offload": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_offload_kqv"),
+            "offloaded_layers": int(offloaded) if offloaded.isdigit() else offloaded}
+    else:
+        profile = batch = kv_cache = acceleration = yarn = {
+            "status": "not_applicable", "reason": "not_qwen_64k_profile"}
+    if profile_applicable:
+        yarn = {
+            "requested_context_tokens": _diagnostic_int(diagnostics,
+                "api_v1_readiness_yarn_requested_context_tokens"),
+            "original_context_tokens": _diagnostic_int(diagnostics,
+                "api_v1_readiness_yarn_original_context_tokens"),
+            "context_multiplier": _diagnostic_float(diagnostics,
+                "api_v1_readiness_yarn_context_multiplier"),
+            "rope_frequency_scale": _diagnostic_float(diagnostics,
+                "api_v1_readiness_yarn_rope_freq_scale"),
+            "extension_factor_overridden": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_yarn_ext_factor_overridden"),
+            "scaling_source": diagnostics["api_v1_readiness_yarn_rope_scaling_type_source"],
+            "configuration_valid": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_yarn_configuration_valid")}
+    return {"mode": {"requested": runtime["Requested mode"].lower(),
+            "effective": runtime["Effective mode"].lower()},
+        "backend": {"requested": requested_backend,
+            "available": runtime["Backend available"].lower(),
+            "selected": runtime["Backend selected"].lower(),
+            "used": runtime["Backend used"].lower(),
+            "fallback_reason": runtime["Fallback reason"].lower()},
+        "context": {"tier": runtime["Context tier"],
+            "effective_window_tokens": int(runtime["Context window"].split()[0])},
+        "runtime_profile": profile, "batch_profile": batch, "kv_cache": kv_cache,
+        "acceleration": acceleration, "yarn_rope": yarn}
+
+
 def assert_packaged_windows_nvidia_status(
     driver: webdriver.Remote, context_tier: str, pre_start_session_id: str
 ) -> None:
@@ -640,13 +754,355 @@ def assert_packaged_windows_nvidia_status(
         raise AssertionError(f"hardware status reports KV cache device is not CUDA: {kv_cache_device!r}")
 
 
+def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Path) -> int:
+    """Drive a packaged app and the existing landing-page API v1 E2EE client."""
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    cleanup_timeout = float(request["cleanup_timeout_s"])
+    driver_log_fd, driver_log_name = tempfile.mkstemp(prefix="long-context-tauri-driver-", suffix=".log")
+    os.close(driver_log_fd)
+    driver_log = Path(driver_log_name)
+    isolated_home = Path(tempfile.mkdtemp(prefix="long-context-desktop-home-"))
+    tokenizer_dir = Path(tempfile.mkdtemp(prefix="long-context-tokenizer-observation-"))
+    tokenizer_request = tokenizer_dir / "request.json"
+    tokenizer_evidence = tokenizer_dir / "evidence.json"
+    tokenizer_request.write_text(json.dumps({
+        "fixture_sha256": request["manifest"]["fixture_sha256"],
+        "target_prefix_utf8_bytes": {name: target["target_prefix_utf8_bytes"]
+            for name, target in request["manifest"]["targets"].items()},
+    }), encoding="utf-8")
+    if hasattr(os, "chmod"):
+        os.chmod(tokenizer_request, 0o600)
+    env = os.environ.copy()
+    for key in ("USE_MOCK_LLM", "TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON", "PYTHONPATH"):
+        env.pop(key, None)
+    env.update({"HOME": str(isolated_home), "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+                "XDG_DATA_HOME": str(isolated_home / ".local/share"),
+                "APPDATA": str(isolated_home / "AppData/Roaming"),
+                "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST": str(tokenizer_request),
+                "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE": str(tokenizer_evidence)})
+    driver_log_handle = driver_log.open("w", encoding="utf-8")
+    process: subprocess.Popen[str] | None = None
+    driver: webdriver.Remote | None = None
+    browser: webdriver.Chrome | None = None
+    cleanup_ok = True
+    try:
+        process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
+            stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
+        memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
+        wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log, 90)
+        driver = start_driver(app_binary.resolve(strict=True))
+        wait_for_ui_ready(driver)
+        fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
+        fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
+        mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
+        compute_mode = benchmark_operator_mode(request["backend"])
+        driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", mode, compute_mode)
+        tier = driver.find_element(By.XPATH, "//select[@aria-label='Context tier']")
+        driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", tier, request["context_tier"])
+        wait_for_start_operator_enabled(driver, driver_log, driver_log)
+        driver.find_element(By.XPATH, "//button[.='Start operator']").click()
+        wait_for_running_stability(driver, "yes", stable_seconds=3)
+        WebDriverWait(driver, 60).until(lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+
+        runtime = {label: _status_value(driver, label) for label in
+            ("App version", "Build ID", "Runtime ID", "Bundled runtime ID", "Launcher source",
+             "Requested mode", "Effective mode", "Backend available", "Backend selected",
+             "Backend used", "Fallback reason", "Context tier", "Context window")}
+        diagnostics = _readiness_diagnostics_map(driver)
+        runtime_configuration = packaged_runtime_configuration(runtime, diagnostics, request["backend"])
+        if (runtime["Launcher source"].lower() != "bundled"):
+            raise RuntimeError("packaged launcher attestation failed")
+        if runtime["Backend selected"].lower() != request["backend"] or runtime["Backend used"].lower() != request["backend"]:
+            raise RuntimeError("packaged backend attestation failed")
+
+        browser = start_landing_driver()
+        browser.get(request["relay_url"])
+        wait = WebDriverWait(browser, float(request["request_timeout_s"]), poll_frequency=0.05)
+        wait.until(lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
+        selected_tier = apply_benchmark_context_tier(browser, request["context_tier"])
+        if selected_tier != request["context_tier"]:
+            raise RuntimeError("landing context selection failed")
+        wait.until(lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
+        if not memory_sampler.sample():
+            raise RuntimeError("memory_sample_unavailable")
+        browser.execute_script("""
+            const v = document.querySelector('#app').__vue__;
+            const original = v.encrypt.bind(v);
+            v.encrypt = async function(plaintext, ...args) {
+                const envelope = JSON.parse(plaintext);
+                if (envelope.protocol === 'tokenplace_api_v1_relay_e2ee') {
+                    const options = envelope.api_v1_request?.options;
+                    const allowed = ['max_tokens', 'temperature', 'top_p', 'seed'];
+                    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+                        this.__longContextBenchmarkGenerationSettings = null;
+                    } else {
+                        const supplied = {};
+                        for (const key of Object.keys(options)) {
+                            if (allowed.includes(key)) supplied[key] = options[key];
+                            else supplied.__unsupported__ = key;
+                        }
+                        this.__longContextBenchmarkGenerationSettings = {
+                            supplied,
+                            omitted_runtime_default: allowed.filter(key => !(key in options)).sort()
+                        };
+                    }
+                }
+                return original(plaintext, ...args);
+            };
+        """)
+        field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+        field.send_keys(request["prompt"])
+        started = time.monotonic()
+        browser.find_element(By.CSS_SELECTOR, ".send-button").click()
+        progress: list[dict[str, object]] = []
+        while time.monotonic() - started < float(request["request_timeout_s"]):
+            memory_sampler.sample()
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,"
+                "b:v.isGeneratingResponse,t:v.selectedContextTier};")
+            event = state.get("p")
+            if isinstance(event, dict) and (not progress or event.get("sequence") != progress[-1].get("sequence")):
+                progress.append(event)
+            lifecycle, response_text = classify_benchmark_landing_state(state)
+            if lifecycle == "completed":
+                break
+            if lifecycle == "failed":
+                raise RuntimeError("packaged_response_error")
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("packaged request timeout")
+        ended = time.monotonic()
+        if not progress or not isinstance(response_text, str):
+            raise RuntimeError("required encrypted progress or response evidence missing")
+        generation_settings = browser.execute_script(
+            "return document.querySelector('#app').__vue__.__longContextBenchmarkGenerationSettings;")
+        if not isinstance(generation_settings, dict):
+            raise RuntimeError("generation_settings_unavailable")
+        last_sequence = int(progress[-1]["sequence"])
+        last_elapsed = int(progress[-1]["elapsed_ms"])
+        result_observation = {"kind": "result", "status": "success",
+            "sequence": last_sequence + 1, "elapsed_ms": last_elapsed + 1}
+        terminal_observation = {"kind": "terminal", "state": "completed",
+            "sequence": last_sequence + 2, "elapsed_ms": last_elapsed + 2}
+        known_sequence = last_sequence
+        def post_terminal_poll() -> dict[str, object] | None:
+            nonlocal known_sequence
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,b:v.isGeneratingResponse};")
+            event = state.get("p")
+            if isinstance(event, dict) and isinstance(event.get("sequence"), int) and event["sequence"] > known_sequence:
+                known_sequence = event["sequence"]
+                return event
+            lifecycle, later_response = classify_benchmark_landing_state(state)
+            if lifecycle == "completed" and later_response != response_text:
+                return {"kind": "result", "status": "success",
+                    "sequence": terminal_observation["sequence"] + 1,
+                    "elapsed_ms": terminal_observation["elapsed_ms"] + 1}
+            if lifecycle == "failed":
+                return {"kind": "result", "status": "failed",
+                    "sequence": terminal_observation["sequence"] + 1,
+                    "elapsed_ms": terminal_observation["elapsed_ms"] + 1}
+            return None
+        post_terminal = [item for item in observe_post_terminal(post_terminal_poll) if item is not None]
+        memory_sampler.sample()
+        memory_evidence = memory_sampler.summary()
+        first_generated = next((event for event in progress if int(event.get("generated_tokens", 0)) > 0), None)
+        first_s = started + (float(first_generated["elapsed_ms"]) / 1000) if first_generated else None
+        first_prefill = next((event for event in progress if event.get("phase") == "prefill"), None)
+        first_generating = next((event for event in progress if event.get("phase") == "generating"), None)
+        if first_prefill is None:
+            raise RuntimeError("prefill_phase_missing")
+        if first_generated is None or first_generating is None:
+            raise RuntimeError("required timing telemetry missing")
+        try:
+            tokenizer_observation = json.loads(tokenizer_evidence.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("authoritative_target_depth_unavailable") from exc
+        if (not isinstance(tokenizer_observation, dict)
+                or tokenizer_observation.get("runtime_identity") != runtime["Runtime ID"]
+                or tokenizer_observation.get("fixture_sha256") != request["manifest"]["fixture_sha256"]
+                or tokenizer_observation.get("total_prompt_tokens") != progress[-1]["total_prompt_tokens"]):
+            raise RuntimeError("authoritative_target_depth_mismatched")
+        cancellation_recovery = None
+        if request.get("cancellation_validation"):
+            cancellation_recovery = run_long_context_cancellation_recovery(browser, driver, request)
+        preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
+        prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
+        digest = hashlib.sha256()
+        with Path(request["model"]).open("rb") as model_handle:
+            for chunk in iter(lambda: model_handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        evidence = {"app_identity": runtime["App version"], "build_identity": runtime["Build ID"],
+            "runtime_identity": runtime["Runtime ID"], "bundled_runtime_identity": runtime["Bundled runtime ID"],
+            "backend_requested": request["backend"],
+            "backend_selected": runtime["Backend selected"].lower(),
+            "backend_used": runtime["Backend used"].lower(), "model_fingerprint": digest.hexdigest(),
+            "authoritative_prompt_tokens": progress[-1]["total_prompt_tokens"], "progress_events": progress,
+            "authoritative_tokenizer_evidence": tokenizer_observation,
+            "kv_applicability": tokenizer_observation.get("kv_applicability"),
+            "kv_estimate": tokenizer_observation.get("kv_estimator"),
+            "kv_runtime": tokenizer_observation.get("kv_runtime"),
+            "result_observation": result_observation, "terminal_observation": terminal_observation,
+            "post_terminal_observations": post_terminal, "response_text": response_text, "start_s": started,
+            "generation_settings": generation_settings,
+            "memory": memory_evidence,
+            "runtime_configuration": runtime_configuration,
+            "preparing_end_s": preparing_end_s, "prefill_end_s": prefill_end_s,
+            "first_token_s": first_s, "end_s": ended, "output_tokens": progress[-1]["generated_tokens"]}
+        if cancellation_recovery is not None:
+            evidence["cancellation_recovery"] = cancellation_recovery
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        os.chmod(evidence_path, 0o600)
+        return 0
+    finally:
+        if browser is not None:
+            with contextlib.suppress(Exception): browser.quit()
+        if driver is not None:
+            with contextlib.suppress(Exception): driver.quit()
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try: process.wait(timeout=cleanup_timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try: process.wait(timeout=min(cleanup_timeout, 5))
+                except subprocess.TimeoutExpired: cleanup_ok = False
+        driver_log_handle.close()
+        shutil.rmtree(isolated_home, ignore_errors=True)
+        shutil.rmtree(tokenizer_dir, ignore_errors=True)
+        driver_log.unlink(missing_ok=True)
+        if not cleanup_ok:
+            raise RuntimeError("owned process cleanup failed")
+
+
+def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float) -> tuple[bool, float]:
+    """Exercise the ordinary encrypted request lifecycle without retaining its plaintext result."""
+    browser.execute_script("const v=document.querySelector('#app').__vue__; v.chatHistory=[];")
+    field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+    field.clear()
+    field.send_keys("Reply with exactly OK")
+    started = time.monotonic()
+    browser.find_element(By.CSS_SELECTOR, ".send-button").click()
+    wait = WebDriverWait(browser, timeout_s, poll_frequency=0.05)
+    state = wait.until(lambda d: (lambda s: s if classify_benchmark_landing_state(s)[0] != "running" else False)(
+        d.execute_script("const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,b:v.isGeneratingResponse};")))
+    lifecycle, _response = classify_benchmark_landing_state(state)
+    return lifecycle == "completed", time.monotonic() - started
+
+
+def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: webdriver.Remote,
+        request: dict[str, object]) -> dict[str, object]:
+    """Physically cancel prefill/generation requests, recover, then restart the operator."""
+    config = request["cancellation"]
+    assert isinstance(config, dict)
+    timeout_s = float(request["request_timeout_s"])
+    observation_s = float(config["observation_window_s"])
+    recovery_s = float(config["recovery_timeout_s"])
+    scenarios: list[dict[str, object]] = []
+    for phase in ("prefill", "generating"):
+        browser.execute_script("const v=document.querySelector('#app').__vue__; v.chatHistory=[];")
+        field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+        field.clear()
+        field.send_keys(str(request["prompt"]))
+        browser.find_element(By.CSS_SELECTOR, ".send-button").click()
+        deadline = time.monotonic() + timeout_s
+        threshold = int(config["generation_tokens"]) if phase == "generating" else config.get("prefill_tokens")
+        trigger_count = -1
+        last_sequence = -1
+        authoritative_total = None
+        while time.monotonic() < deadline:
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,b:v.isGeneratingResponse};")
+            event = state.get("p") if isinstance(state, dict) else None
+            if isinstance(event, dict):
+                total = event.get("total_prompt_tokens")
+                if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
+                    raise RuntimeError("cancellation_trigger_missed")
+                if authoritative_total is None:
+                    authoritative_total = total
+                elif total != authoritative_total:
+                    raise RuntimeError("cancellation_trigger_missed")
+                if phase == "prefill" and threshold is None and isinstance(total, int):
+                    threshold = max(1, int(total * float(config["prefill_fraction"])))
+                count = event.get("processed_prompt_tokens") if phase == "prefill" else event.get("generated_tokens")
+                trigger_state = (prefill_cancellation_trigger_state(count, threshold, total)
+                    if phase == "prefill" and event.get("phase") == phase else None)
+                if trigger_state in {"completed", "invalid"}:
+                    raise RuntimeError("cancellation_trigger_missed")
+                if event.get("phase") == phase and isinstance(count, int) and isinstance(threshold, int) and (
+                        trigger_state == "trigger" if phase == "prefill" else count >= threshold):
+                    trigger_count = count
+                    last_sequence = int(event.get("sequence", -1))
+                    break
+                if (phase == "prefill" and event.get("phase") == "generating") or state.get("b") is False:
+                    raise RuntimeError("cancellation_trigger_missed")
+            time.sleep(0.01)
+        if trigger_count < 0 or not isinstance(threshold, int) or authoritative_total is None:
+            raise RuntimeError("cancellation_trigger_missed")
+        triggered = time.monotonic()
+        acknowledgement = browser.execute_async_script("""
+            const done=arguments[arguments.length-1]; const v=document.querySelector('#app').__vue__;
+            const active=v.activeRelayRequest; const pending=v.cancelRelayRequest('requester_cancelled');
+            v.terminateRelayRequestLocally(active);
+            Promise.resolve(pending).then((result) => { v.clearActiveRelayRequest(active?.requestId); done(result); })
+                .catch(() => { v.clearActiveRelayRequest(active?.requestId); done(null); });
+        """)
+        attempted = isinstance(acknowledgement, dict) and acknowledgement.get("attempted") is True
+        acknowledged = isinstance(acknowledgement, dict) and acknowledgement.get("confirmed") is True
+        stale = late = 0
+        active_after = False
+        quiet_started = time.monotonic()
+        quiet_deadline = quiet_started + observation_s
+        while time.monotonic() < quiet_deadline:
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,b:v.isGeneratingResponse,a:Boolean(v.activeRelayRequest),h:v.chatHistory};")
+            event = state.get("p") if isinstance(state, dict) else None
+            if isinstance(event, dict) and int(event.get("sequence", -1)) > last_sequence:
+                stale += 1
+            lifecycle, _response = classify_benchmark_landing_state(state)
+            if lifecycle == "completed": late += 1
+            active_after = bool(state.get("a") or state.get("b"))
+            time.sleep(0.01)
+        quiescence_s = time.monotonic() - quiet_started
+        cleanup_s = time.monotonic() - triggered
+        followup_ok, followup_s = _long_context_followup_request(browser, recovery_s)
+        scenarios.append({"phase": phase, "trigger_observed": True, "trigger_count": trigger_count,
+            "threshold": threshold, "total_prompt_tokens": authoritative_total,
+            "attempted": attempted, "acknowledged": acknowledged,
+            "cleanup_s": cleanup_s, "quiescence_s": quiescence_s,
+            "stale_progress_count": stale, "late_result_count": late,
+            "active_after_quiescence": active_after, "followup_ok": followup_ok,
+            "followup_s": followup_s})
+    old_session = _status_value(driver, "Operator session ID")
+    restarted = time.monotonic()
+    driver.find_element(By.XPATH, "//button[.='Stop operator']").click()
+    WebDriverWait(driver, recovery_s).until(
+        lambda d: d.find_element(By.XPATH, "//button[.='Start operator']").is_enabled())
+    stop_confirmed = _status_value(driver, "Worker alive").lower() != "yes"
+    driver.find_element(By.XPATH, "//button[.='Start operator']").click()
+    wait_for_running_stability(driver, "yes", stable_seconds=1, timeout_seconds=recovery_s)
+    WebDriverWait(driver, recovery_s).until(lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+    new_session = _status_value(driver, "Operator session ID")
+    restart_s = time.monotonic() - restarted
+    followup_ok, followup_s = _long_context_followup_request(browser, recovery_s)
+    return {"scenarios": scenarios, "operator_lifecycle": {"stop_confirmed": stop_confirmed,
+        "restart_ready": True, "session_changed": bool(old_session and new_session != old_session),
+        "restart_s": restart_s, "post_restart_followup_ok": followup_ok,
+        "post_restart_followup_s": followup_s}}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packaged-windows-nvidia-hardware", action="store_true")
     parser.add_argument("--app-binary", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
+    parser.add_argument("--benchmark-request", type=Path)
+    parser.add_argument("--benchmark-evidence", type=Path)
     args = parser.parse_args(argv)
+    if args.benchmark_request or args.benchmark_evidence:
+        if not (args.benchmark_request and args.benchmark_evidence and args.app_binary):
+            parser.error("long-context benchmark mode requires --benchmark-request, --benchmark-evidence, and --app-binary")
+        return run_long_context_packaged_mode(args.benchmark_request, args.benchmark_evidence, args.app_binary)
     hardware_mode = args.packaged_windows_nvidia_hardware
     if hardware_mode and (args.app_binary is None or args.model is None):
         parser.error("packaged Windows NVIDIA mode requires --app-binary and --model")
@@ -797,9 +1253,7 @@ def main(argv: list[str] | None = None) -> int:
         landing_driver = start_landing_driver()
         landing_driver.get(relay_url)
         WebDriverWait(landing_driver, 4).until(
-            lambda d: d.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
-            .text.strip()
-            == "Live compute nodes: 1"
+            lambda d: landing_compute_node_status_matches(d, "Live compute nodes: 1")
         )
 
         prompt = driver.find_element(
@@ -859,9 +1313,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         WebDriverWait(landing_driver, 2.5).until(
-            lambda d: d.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
-            .text.strip()
-            == "Live compute nodes: 0"
+            lambda d: landing_compute_node_status_matches(d, "Live compute nodes: 0")
         )
         widget_zero_at = time.monotonic()
         diagnostics_to_widget_seconds = widget_zero_at - diagnostics_zero_observed_at

@@ -482,6 +482,50 @@ GGML_KV_TENSOR_ALIGNMENT_BYTES = 32
 GGML_KV_BACKEND_ALIGNMENT_BYTES = {'cpu': 32, 'metal': 32, 'cuda': 128}
 GGML_KV_CONTEXT_ALLOCATION_ALIGNMENT_TOKENS = 256
 GGML_CUDA_QUANTIZED_MATRIX_ROW_PADDING = 512
+LLAMA_CPP_KV_DIAGNOSTIC_MAX_BYTES = 1 << 63
+_LLAMA_CPP_KV_BUFFER_RE = re.compile(
+    r"^llama_kv_cache(?:_init|_unified)?:\s+(?P<device>[A-Za-z0-9_-]+)\s+KV buffer size =\s+"
+    r"(?P<value>[0-9]+(?:\.[0-9]{1,2})?)\s+(?P<unit>MiB)$"
+)
+
+
+def parse_llama_cpp_kv_allocation_diagnostics(lines: Iterable[str]) -> Dict[str, Any]:
+    """Parse the pinned llama.cpp KV-buffer diagnostic without retaining raw text."""
+    records = []
+    for raw in lines:
+        match = _LLAMA_CPP_KV_BUFFER_RE.fullmatch(str(raw).strip())
+        if not match:
+            continue
+        value = match.group('value')
+        decimals = len(value.partition('.')[2])
+        scale = 10 ** decimals
+        units = int(value.replace('.', ''))
+        numerator = _checked_mul(units, 1024 * 1024, 'kv_diagnostic_bytes', maximum=LLAMA_CPP_KV_DIAGNOSTIC_MAX_BYTES * scale)
+        center = numerator // scale
+        precision = max(1, math.ceil((1024 * 1024) / (2 * scale)))
+        records.append((match.group('device').lower(), center, precision, decimals))
+    if not records:
+        raise ValueError('kv_runtime_diagnostic_missing')
+    devices = [record[0] for record in records]
+    if len(devices) != len(set(devices)):
+        raise ValueError('kv_runtime_diagnostic_ambiguous')
+    decimals = {record[3] for record in records}
+    if len(decimals) != 1:
+        raise ValueError('kv_runtime_diagnostic_mixed_precision')
+    observed = sum(record[1] for record in records)
+    precision = sum(record[2] for record in records)
+    if observed <= 0 or observed >= LLAMA_CPP_KV_DIAGNOSTIC_MAX_BYTES:
+        raise ValueError('kv_runtime_diagnostic_out_of_range')
+    return {
+        'method': 'pinned_llama_cpp_kv_buffer_diagnostic',
+        'llama_cpp_python_version': '0.3.32',
+        'llama_cpp_commit': 'b3fed31b99f9bd37725833674252bccb429bb183',
+        'observed_bytes': observed,
+        'precision_bytes': precision,
+        'record_count': len(records),
+        'unit': 'MiB',
+        'decimal_places': decimals.pop(),
+    }
 SUPPORTED_STANDARD_KV_ARCHITECTURES = {'qwen3'}
 UNSUPPORTED_KV_LAYOUT_SUFFIXES = (
     'attention.sliding_window', 'attention.layer_types', 'attention.recurrent',
@@ -2785,6 +2829,7 @@ class _SubprocessLlamaProxy:
         self._process._token_place_stdout_tail = []  # type: ignore[attr-defined]
         self._process._token_place_stderr_tail = []  # type: ignore[attr-defined]
         self._process._token_place_stderr_sequence = 0  # type: ignore[attr-defined]
+        self._stderr_activity = threading.Event()
         self._process._token_place_unclaimed_frames = self._unclaimed_frames  # type: ignore[attr-defined]
         self._process._token_place_legacy_frames = self._legacy_frames  # type: ignore[attr-defined]
         self._stderr_reader_thread: Optional[threading.Thread] = None
@@ -2814,8 +2859,20 @@ class _SubprocessLlamaProxy:
                 raise RuntimeError(safe_exc) from exc
             raise
         try:
+            init_stderr_sequence = int(getattr(self._process, '_token_place_stderr_sequence', 0) or 0)
             init_message = self._rpc({'method': '__init__', 'args': args, 'kwargs': kwargs}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_model_initialization', check_health=False)
             self.child_model_path_exists = bool(init_message.get('child_model_path_exists'))
+            # The RPC response and stderr are drained by different readers.  Wait
+            # for a bounded quiet period after the completed init RPC so a slow
+            # stderr reader cannot make current-attempt diagnostics disappear.
+            self._wait_for_initialization_stderr()
+            tail = getattr(self._process, '_token_place_stderr_tail', [])
+            scoped_lines = [line for sequence, line in tail
+                if isinstance(sequence, int) and sequence > init_stderr_sequence]
+            try:
+                self.kv_runtime_diagnostic = parse_llama_cpp_kv_allocation_diagnostics(scoped_lines)
+            except ValueError as exc:
+                self.kv_runtime_diagnostic = {'error': str(exc)}
         except LlamaCppRuntimeStageTimeout:
             self.close()
             raise
@@ -2861,9 +2918,20 @@ class _SubprocessLlamaProxy:
                     self._process._token_place_stderr_sequence = seq  # type: ignore[attr-defined]
                     tail.append((seq, line))
                     del tail[:-100]
+                    self._stderr_activity.set()
 
         self._stderr_reader_thread = threading.Thread(target=_reader, name='llama_cpp_stderr_reader', daemon=True)
         self._stderr_reader_thread.start()
+
+    def _wait_for_initialization_stderr(self) -> None:
+        """Wait for a bounded post-init minimum and then one quiet interval."""
+        deadline = time.monotonic() + 0.5
+        not_before = time.monotonic() + 0.1
+        while time.monotonic() < deadline:
+            self._stderr_activity.clear()
+            active = self._stderr_activity.wait(timeout=min(0.05, deadline - time.monotonic()))
+            if not active and time.monotonic() >= not_before:
+                return
 
     def _start_stdout_demultiplexer(self) -> None:
         """Continuously drain and route the versioned private worker protocol."""
@@ -6826,6 +6894,34 @@ class ModelManager:
                                     if isinstance(profile_diag, dict):
                                         profile_diag['selected'] = True
                                         self.last_qwen_64k_memory_profile_diagnostics = profile_diag
+                                        setattr(llm_instance, '_token_place_benchmark_kv_estimate', {
+                                            'profile_id': profile_diag.get('profile_id'),
+                                            'backend': profile_diag.get('backend'),
+                                            'kv_precision': profile_diag.get('kv_precision'),
+                                            'memory_estimate': profile_diag.get('memory_estimate'),
+                                        })
+                                    provider = str(self.model_profile.get('provider') or '').lower()
+                                    context_size = int(self.config.get('model.context_size', 8192))
+                                    context_tier = str(getattr(self, 'context_tier', '8k-fast'))
+                                    selected_profile = profile_id if isinstance(profile_id, str) and profile_id else str(self.profile_id)
+                                    if provider == 'qwen' and context_tier == '64k-full' and context_size == 65536:
+                                        applicability = 'qwen_64k_full'
+                                        architecture = 'qwen3'
+                                    elif provider and provider != 'qwen':
+                                        applicability = 'not_applicable_verified_non_qwen'
+                                        architecture = provider
+                                    else:
+                                        applicability = 'not_applicable_context_tier'
+                                        architecture = 'qwen3' if provider == 'qwen' else provider
+                                    setattr(llm_instance, '_token_place_benchmark_kv_applicability', {
+                                        'method': 'active_runtime_selected_profile',
+                                        'applicability': applicability,
+                                        'architecture': architecture,
+                                        'profile_id': selected_profile,
+                                        'backend': str(compute_plan.get('backend_used') or '').lower(),
+                                        'context_tier': context_tier,
+                                        'context_size_tokens': context_size,
+                                    })
                                     break
                                 except Exception as init_exc:
                                     category = _classify_runtime_initialization_error(init_exc)

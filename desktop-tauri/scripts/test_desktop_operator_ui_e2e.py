@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -773,6 +774,7 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
     temporary_fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
+    deadline = clock() + max(0.0, retry_timeout_s)
     try:
         if hasattr(os, "fchmod"):
             os.fchmod(temporary_fd, 0o600)
@@ -781,7 +783,6 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
             json.dump(payload, handle, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
-        deadline = clock() + max(0.0, retry_timeout_s)
         while True:
             try:
                 temporary.replace(path)
@@ -794,13 +795,12 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
     finally:
         if temporary_fd >= 0:
             os.close(temporary_fd)
-        cleanup_deadline = clock() + max(0.0, retry_timeout_s)
         while True:
             try:
                 temporary.unlink(missing_ok=True)
                 break
             except PermissionError:
-                remaining = cleanup_deadline - clock()
+                remaining = deadline - clock()
                 if remaining <= 0:
                     break
                 sleeper(min(0.01, remaining))
@@ -823,6 +823,20 @@ def _remove_owned_path(path: Path, deadline: float, *, directory: bool = False,
             if remaining <= 0:
                 return False
             sleeper(min(0.01, remaining))
+
+
+def _quit_webdriver(session, timeout_s: float) -> bool:
+    """Attempt to release a WebDriver even when configuring its timeout fails."""
+    succeeded = True
+    try:
+        session.set_script_timeout(timeout_s)
+    except Exception:
+        succeeded = False
+    try:
+        session.quit()
+    except Exception:
+        succeeded = False
+    return succeeded
 
 
 def _wait_for_packaged_setup_condition(browser: webdriver.Chrome, setup_remaining,
@@ -957,8 +971,12 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     primary_failed = False
     try:
         setup_remaining()
+        process_group_options = ({"creationflags": getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)} if os.name == "nt"
+            else {"start_new_session": True})
         process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
-            stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
+            stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True,
+            **process_group_options)  # noqa: S603
         memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
         wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log,
             min(90, setup_remaining()))
@@ -1176,17 +1194,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         def cleanup_remaining() -> float:
             return max(0.001, cleanup_deadline - time.monotonic())
         if browser is not None:
-            try:
-                browser.set_script_timeout(cleanup_remaining())
-                browser.quit()
-            except Exception:
-                cleanup_ok = False
+            cleanup_ok = _quit_webdriver(browser, cleanup_remaining()) and cleanup_ok
         if driver is not None:
-            try:
-                driver.set_script_timeout(cleanup_remaining())
-                driver.quit()
-            except Exception:
-                cleanup_ok = False
+            cleanup_ok = _quit_webdriver(driver, cleanup_remaining()) and cleanup_ok
         if process is not None and process.poll() is None:
             if os.name == "nt":
                 try:
@@ -1198,14 +1208,41 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 except (OSError, subprocess.TimeoutExpired):
                     cleanup_ok = False
             else:
-                process.terminate()
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    cleanup_ok = False
             try:
                 process.wait(timeout=cleanup_remaining())
             except subprocess.TimeoutExpired:
-                process.kill()
+                if os.name == "nt":
+                    process.kill()
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except OSError:
+                        cleanup_ok = False
                 try:
                     process.wait(timeout=cleanup_remaining())
                 except subprocess.TimeoutExpired: cleanup_ok = False
+            if os.name != "nt":
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    cleanup_ok = False
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except OSError:
+                        cleanup_ok = False
         driver_log_handle.close()
         for owned_path, is_directory in (
                 (isolated_home, True), (tokenizer_dir, True), (driver_log, False)):

@@ -22,7 +22,7 @@ def desktop_runner():
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
         "_populate_and_submit_packaged_prompt", "_write_benchmark_phase",
-        "_remove_owned_path"}
+        "_remove_owned_path", "_quit_webdriver"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ModuleType("desktop_runner_under_test")
@@ -101,6 +101,19 @@ def test_phase_checkpoint_does_not_retry_unrelated_error(
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_phase_checkpoint_temp_cleanup_reuses_publication_deadline(
+        desktop_runner, monkeypatch, tmp_path):
+    now = [0.0]
+    monkeypatch.setattr(Path, "replace", lambda *_args: (_ for _ in ()).throw(
+        PermissionError("locked")))
+    monkeypatch.setattr(Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        PermissionError("still locked")))
+    with pytest.raises(RuntimeError, match="phase checkpoint publication failed"):
+        _phase_write(desktop_runner, tmp_path / "phase.json", clock=lambda: now[0],
+            sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    assert now[0] == pytest.approx(0.03)
+
+
 def test_owned_file_removal_retries_sharing_denial_without_real_sleep(
         desktop_runner, monkeypatch, tmp_path):
     path = tmp_path / "driver.log"
@@ -133,6 +146,20 @@ def test_owned_file_removal_permanent_lock_is_bounded(desktop_runner, monkeypatc
     assert desktop_runner._remove_owned_path(path, 0.02, clock=lambda: now[0],
         sleeper=lambda delay: now.__setitem__(0, now[0] + delay)) is False
     assert len(attempts) == 3
+
+
+def test_webdriver_quit_is_attempted_after_timeout_configuration_failure(desktop_runner):
+    calls = []
+    class Session:
+        def set_script_timeout(self, timeout):
+            calls.append(("timeout", timeout))
+            raise RuntimeError("disconnected")
+
+        def quit(self):
+            calls.append(("quit",))
+
+    assert desktop_runner._quit_webdriver(Session(), 2.5) is False
+    assert calls == [("timeout", 2.5), ("quit",)]
 
 
 def test_phase_reader_treats_sharing_denial_and_partial_json_as_retryable(monkeypatch, tmp_path):

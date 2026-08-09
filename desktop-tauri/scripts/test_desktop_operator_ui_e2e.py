@@ -814,6 +814,7 @@ def _populate_and_submit_packaged_prompt(browser: webdriver.Chrome, prompt: str,
             By.CSS_SELECTOR, ".send-button")).is_enabled() else False),
         "send_button_not_enabled", fail_closed)
     write_phase("landing_page_ready")
+    setup_remaining()
     started = clock()
     send_button.click()
     write_phase("request_active")

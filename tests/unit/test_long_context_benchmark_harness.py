@@ -1522,6 +1522,44 @@ def test_packaged_multiline_prompt_uses_shift_enter_and_submits_after_exact_popu
     assert events.index(("click",)) < events.index(("phase", "request_active"))
 
 
+def test_packaged_prompt_fails_closed_when_setup_expires_before_click(
+        desktop_runner, monkeypatch):
+    events = []
+    prompt = "ready"
+    class Field:
+        parent = object()
+        def send_keys(self, value): events.append(("text", value))
+    class Button:
+        def is_enabled(self): return True
+        def click(self): events.append(("click",))
+    field, button = Field(), Button()
+    class Browser:
+        def find_element(self, _by, selector):
+            return field if selector == ".message-input" else button
+        def execute_script(self, _script): return prompt
+    class Wait:
+        def __init__(self, browser, timeout, **_kwargs): pass
+        def until(self, predicate): return predicate(Browser())
+    monkeypatch.setattr(desktop_runner, "WebDriverWait", Wait)
+    remaining_calls = 0
+    def setup_remaining():
+        nonlocal remaining_calls
+        remaining_calls += 1
+        if remaining_calls == 5:
+            raise RuntimeError("packaged setup timeout")
+        return 10
+    def checkpoint(phase): events.append(("phase", phase))
+    with pytest.raises(RuntimeError, match="packaged setup timeout"):
+        desktop_runner._populate_and_submit_packaged_prompt(
+            Browser(), prompt, setup_remaining, pytest.fail, checkpoint,
+            clock=lambda: events.append(("timer",)) or 42.0)
+    assert remaining_calls == 5
+    assert ("phase", "landing_page_ready") in events
+    assert ("timer",) not in events
+    assert ("click",) not in events
+    assert ("phase", "request_active") not in events
+
+
 @pytest.mark.parametrize("reason", [
     "vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
     "send_button_not_enabled",

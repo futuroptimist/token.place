@@ -22,7 +22,7 @@ def desktop_runner():
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
         "_populate_and_submit_packaged_prompt", "_is_windows_sharing_violation", "_write_benchmark_phase",
-        "_remove_owned_path", "_quit_webdriver"}
+        "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ModuleType("desktop_runner_under_test")
@@ -31,6 +31,8 @@ def desktop_runner():
         "time": time, "By": SimpleNamespace(CSS_SELECTOR="css"),
         "os": os, "json": json, "tempfile": __import__("tempfile"),
         "shutil": __import__("shutil"), "Path": Path,
+        "subprocess": subprocess, "Callable": __import__("typing").Callable,
+        "psutil": __import__("psutil"),
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
         "WebDriverWait": object,
@@ -1907,6 +1909,87 @@ def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowanc
     assert removals == [pytest.approx(9.0)] * 3
     assert writes[-1]["cleanup_succeeded"] is False
     assert writes[-1]["failure_reason"] == "packaged_runner_failure"
+
+
+class _CleanupProcess:
+    def __init__(self, name, events, *, terminate_error=False, kill_error=False):
+        self.name = name
+        self.events = events
+        self.terminate_error = terminate_error
+        self.kill_error = kill_error
+
+    def terminate(self):
+        self.events.append(f"terminate:{self.name}")
+        if self.terminate_error:
+            raise RuntimeError("private terminate detail /absolute/path")
+
+    def kill(self):
+        self.events.append(f"kill:{self.name}")
+        if self.kill_error:
+            raise RuntimeError("private kill detail /absolute/path")
+
+
+def test_cleanup_owned_process_tree_recurses_kills_survivor_and_waits(desktop_runner,
+        monkeypatch):
+    events = []
+    child = _CleanupProcess("child", events)
+    root = _CleanupProcess("root", events)
+    root.children = lambda recursive: (events.append(f"children:{recursive}") or [child])
+    monkeypatch.setattr(desktop_runner.psutil, "Process", lambda pid:
+        (events.append(f"root:{pid}") or root))
+    wait_calls = [0]
+
+    def wait_procs(processes, timeout):
+        wait_calls[0] += 1
+        events.append(f"wait:{wait_calls[0]}:{','.join(item.name for item in processes)}")
+        return ([], [child]) if wait_calls[0] == 1 else ([child], [])
+
+    monkeypatch.setattr(desktop_runner.psutil, "wait_procs", wait_procs)
+    parent = SimpleNamespace(pid=731, wait=lambda timeout: events.append("parent-wait"))
+
+    assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 5.0) is True
+    assert events == ["root:731", "children:True", "terminate:child", "terminate:root",
+        "wait:1:child,root", "kill:child", "wait:2:child", "parent-wait"]
+
+
+@pytest.mark.parametrize("fault", [
+    "access", "terminate", "first_wait", "kill", "second_wait", "process_wait",
+])
+def test_cleanup_owned_process_tree_faults_are_non_raising_failures(
+        desktop_runner, monkeypatch, fault):
+    events = []
+    child = _CleanupProcess("child", events, terminate_error=fault == "terminate",
+        kill_error=fault == "kill")
+    root = _CleanupProcess("root", events)
+    root.children = lambda recursive: [child]
+
+    def discover(_pid):
+        if fault == "access":
+            raise desktop_runner.psutil.AccessDenied(731)
+        return root
+
+    monkeypatch.setattr(desktop_runner.psutil, "Process", discover)
+    wait_calls = [0]
+
+    def wait_procs(processes, timeout):
+        wait_calls[0] += 1
+        events.append(f"wait:{wait_calls[0]}")
+        if fault == "first_wait" and wait_calls[0] == 1:
+            raise RuntimeError("private first wait /absolute/path")
+        if fault == "second_wait" and wait_calls[0] == 2:
+            raise RuntimeError("private second wait /absolute/path")
+        return ([], [child]) if wait_calls[0] == 1 else ([child], [])
+
+    monkeypatch.setattr(desktop_runner.psutil, "wait_procs", wait_procs)
+
+    def parent_wait(timeout):
+        events.append("parent-wait")
+        if fault == "process_wait":
+            raise RuntimeError("private parent wait /absolute/path")
+
+    parent = SimpleNamespace(pid=731, wait=parent_wait)
+    assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 5.0) is False
+    assert "parent-wait" in events
 
 
 @pytest.mark.parametrize("reason", [

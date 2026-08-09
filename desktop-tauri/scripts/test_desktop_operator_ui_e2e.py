@@ -837,6 +837,66 @@ def _remove_owned_path(path: Path, deadline: float, *, directory: bool = False,
             sleeper(min(0.01, remaining))
 
 
+def _cleanup_owned_process_tree(process: subprocess.Popen, remaining: Callable[[], float]) -> bool:
+    """Boundedly stop and observe the exact PID-owned descendant tree."""
+    cleanup_ok = True
+    try:
+        root = psutil.Process(process.pid)
+        owned_processes = [*root.children(recursive=True), root]
+    except psutil.NoSuchProcess:
+        owned_processes = []
+    except (psutil.AccessDenied, psutil.ZombieProcess):
+        owned_processes = []
+        cleanup_ok = False
+    for owned in owned_processes:
+        if remaining() <= 0:
+            cleanup_ok = False
+            break
+        try:
+            owned.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except Exception:
+            cleanup_ok = False
+    alive = owned_processes
+    allowance = remaining()
+    if allowance <= 0 and alive:
+        cleanup_ok = False
+    elif alive:
+        try:
+            _, alive = psutil.wait_procs(alive, timeout=allowance)
+        except Exception:
+            cleanup_ok = False
+    for owned in alive:
+        if remaining() <= 0:
+            cleanup_ok = False
+            break
+        try:
+            owned.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except Exception:
+            cleanup_ok = False
+    allowance = remaining()
+    if allowance <= 0 and alive:
+        cleanup_ok = False
+    elif alive:
+        try:
+            _, alive = psutil.wait_procs(alive, timeout=allowance)
+        except Exception:
+            cleanup_ok = False
+    cleanup_ok = cleanup_ok and not alive
+    allowance = remaining()
+    if allowance <= 0:
+        cleanup_ok = False
+    else:
+        try:
+            process.wait(timeout=allowance)
+        except Exception:
+            cleanup_ok = False
+    return cleanup_ok
+
+
 def _quit_webdriver(session, timeout_s: float) -> bool:
     """Attempt to release a WebDriver even when configuring its timeout fails."""
     succeeded = True
@@ -1214,60 +1274,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             cleanup_ok = (allowance is not None
                 and _quit_webdriver(driver, allowance) and cleanup_ok)
         if process is not None:
-            try:
-                root = psutil.Process(process.pid)
-                owned_processes = [*root.children(recursive=True), root]
-            except psutil.NoSuchProcess:
-                owned_processes = []
-            except (psutil.AccessDenied, psutil.ZombieProcess):
-                owned_processes = []
-                cleanup_ok = False
-            for owned in owned_processes:
-                if cleanup_allowance() is None:
-                    cleanup_ok = False
-                    break
-                try:
-                    owned.terminate()
-                except psutil.NoSuchProcess:
-                    pass
-                except Exception:
-                    cleanup_ok = False
-            alive = owned_processes
-            allowance = cleanup_allowance()
-            if allowance is None and alive:
-                cleanup_ok = False
-            elif alive:
-                try:
-                    _, alive = psutil.wait_procs(alive, timeout=allowance)
-                except Exception:
-                    cleanup_ok = False
-            for owned in alive:
-                if cleanup_allowance() is None:
-                    cleanup_ok = False
-                    break
-                try:
-                    owned.kill()
-                except psutil.NoSuchProcess:
-                    pass
-                except Exception:
-                    cleanup_ok = False
-            allowance = cleanup_allowance()
-            if allowance is None and alive:
-                cleanup_ok = False
-            elif alive:
-                try:
-                    _, alive = psutil.wait_procs(alive, timeout=allowance)
-                except Exception:
-                    cleanup_ok = False
-            cleanup_ok = cleanup_ok and not alive
-            allowance = cleanup_allowance()
-            if allowance is None:
-                cleanup_ok = False
-            else:
-                try:
-                    process.wait(timeout=allowance)
-                except Exception:
-                    cleanup_ok = False
+            cleanup_ok = (_cleanup_owned_process_tree(process, cleanup_remaining)
+                and cleanup_ok)
         try:
             driver_log_handle.close()
         except Exception:

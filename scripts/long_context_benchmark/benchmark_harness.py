@@ -62,7 +62,7 @@ PACKAGED_PHASES = (
 PACKAGED_FAILURE_REASONS = frozenset({
     "vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
     "requested_context_tier_not_applied", "message_input_not_populated",
-    "send_button_not_enabled", "packaged_runner_failure",
+    "send_button_not_enabled", "packaged_runner_failure", "cleanup_failure",
 })
 
 
@@ -1216,7 +1216,8 @@ def observe_post_terminal(poller: Callable[[], object], *, clock: Callable[[], f
     return observed
 
 
-def _read_packaged_phase_status(path: Path, parent_elapsed_s: float) -> tuple[dict[str, Any] | None, str | None]:
+def _read_packaged_phase_status(path: Path, parent_elapsed_s: float, *,
+        require_final: bool = False) -> tuple[dict[str, Any] | None, str | None]:
     """Read the child's owner-only, low-cardinality atomic phase checkpoint."""
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -1239,6 +1240,9 @@ def _read_packaged_phase_status(path: Path, parent_elapsed_s: float) -> tuple[di
             or isinstance(value.get("elapsed_s"), bool) or not math.isfinite(value["elapsed_s"])
             or value["elapsed_s"] < 0 or value["elapsed_s"] > parent_elapsed_s + 1.0):
         return None, "packaged_phase_status_malformed"
+    if require_final and (value["phase"] != "cleanup"
+            or not isinstance(value["cleanup_succeeded"], bool)):
+        return None, "packaged_phase_status_missing"
     return value, None
 
 
@@ -1451,7 +1455,8 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
                         timeout=overall_budget_s, check=False)
         except subprocess.TimeoutExpired as exc:
             elapsed_s = min(overall_budget_s, max(0.0, time.monotonic() - runner_started))
-            status, phase_error = _read_packaged_phase_status(Path(phase_name), elapsed_s)
+            status, phase_error = _read_packaged_phase_status(
+                Path(phase_name), elapsed_s, require_final=True)
             if phase_error:
                 return {"pass": False, "runtime_contract_pass": False, "code": phase_error}
             return {"pass": False, "runtime_contract_pass": False,
@@ -1466,12 +1471,15 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
                 "cleanup_succeeded": bool(getattr(exc, "cleanup_succeeded", False))}
         if completed.returncode != 0:
             elapsed_s = min(overall_budget_s, max(0.0, time.monotonic() - runner_started))
-            status, phase_error = _read_packaged_phase_status(Path(phase_name), elapsed_s)
+            status, phase_error = _read_packaged_phase_status(
+                Path(phase_name), elapsed_s, require_final=True)
             if phase_error:
                 return {"pass": False, "runtime_contract_pass": False, "code": phase_error}
             return {"pass": False, "runtime_contract_pass": False,
                 "code": "packaged_runner_failed", "last_safe_phase": status["last_safe_phase"],
-                "failure_reason": status["failure_reason"] or "packaged_runner_failure",
+                "failure_reason": status["failure_reason"] or (
+                    "cleanup_failure" if status["cleanup_succeeded"] is False
+                    else "packaged_runner_failure"),
                 "elapsed_s": min(runner_budget_s, float(status["elapsed_s"])),
                 "cleanup_succeeded": status["cleanup_succeeded"] is True}
         try:

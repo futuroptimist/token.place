@@ -36,6 +36,32 @@ def desktop_runner():
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
     return module
 
+
+@pytest.fixture
+def desktop_checkpoint_helpers():
+    tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
+    names = {"_write_benchmark_phase", "_remove_owned_temporary"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names]
+    namespace = {"Path": Path, "json": json, "time": time, "os": os,
+        "tempfile": __import__("tempfile"), "shutil": __import__("shutil")}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
+        namespace)
+    return SimpleNamespace(**{name: namespace[name] for name in names})
+
+
+class _RetryClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
 def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="linux"):
     return {"method": h.MEMORY_METHOD, "scope": h.MEMORY_SCOPE, "platform": platform,
         "sample_count": samples, "baseline_rss_bytes": baseline,
@@ -1201,7 +1227,8 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
     def fake_run(command, **kwargs):
         if runner_outcome == "timeout":
             phase_path = command[command.index("--benchmark-phase-status") + 1]
-            _write_phase(h.Path(phase_path), "request_active", 0.0)
+            _write_phase(h.Path(phase_path), "cleanup", 0.0,
+                last_safe_phase="request_active", cleanup_succeeded=False)
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if runner_outcome == "failed":
             phase_path = command[command.index("--benchmark-phase-status") + 1]
@@ -1256,6 +1283,111 @@ def test_packaged_phase_status_missing_malformed_or_stale_fails_closed(tmp_path,
     if contents is not None:
         path.write_text(contents)
     assert h._read_packaged_phase_status(path, 1) == (None, expected)
+
+
+@pytest.mark.parametrize("failures", [1, 4])
+def test_phase_checkpoint_retries_sharing_violations_atomically(
+        tmp_path, monkeypatch, desktop_checkpoint_helpers, failures):
+    path = tmp_path / "phase.json"
+    path.write_text(json.dumps({"stale": True}))
+    clock = _RetryClock()
+    original_replace = Path.replace
+    attempts = []
+
+    def replace(source, destination):
+        attempts.append(source)
+        if len(attempts) <= failures:
+            raise PermissionError("private absolute path must not escape")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    desktop_checkpoint_helpers._write_benchmark_phase(
+        path, "runner_startup", 0.0, h.PACKAGED_PHASE_STATUS_VERSION,
+        h.PACKAGED_PHASES, last_safe_phase="runner_startup", clock=clock,
+        sleeper=clock.sleep, retry_timeout_s=1)
+
+    value = json.loads(path.read_text())
+    assert value["phase"] == "runner_startup"
+    assert len(attempts) == failures + 1
+    assert len({candidate.name for candidate in attempts}) == 1
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_phase_checkpoint_retry_deadline_is_bounded_and_private(
+        tmp_path, monkeypatch, desktop_checkpoint_helpers):
+    path = tmp_path / "phase.json"
+    clock = _RetryClock()
+    attempts = []
+    def locked(source, destination):
+        attempts.append((source, destination))
+        raise PermissionError("C:/Users/private/checkpoint.json is locked")
+    monkeypatch.setattr(Path, "replace", locked)
+
+    with pytest.raises(RuntimeError) as raised:
+        desktop_checkpoint_helpers._write_benchmark_phase(
+            path, "runner_startup", 0.0, h.PACKAGED_PHASE_STATUS_VERSION,
+            h.PACKAGED_PHASES, last_safe_phase="runner_startup", clock=clock,
+            sleeper=clock.sleep, retry_timeout_s=0.025)
+
+    assert str(raised.value) == "phase_checkpoint_publication_failed"
+    assert clock.now == pytest.approx(0.025)
+    assert len(attempts) == 4
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_phase_checkpoint_does_not_retry_unrelated_error(
+        tmp_path, monkeypatch, desktop_checkpoint_helpers):
+    attempts = []
+    def invalid(_source, _destination):
+        attempts.append(True)
+        raise ValueError("programming error")
+    monkeypatch.setattr(Path, "replace", invalid)
+    with pytest.raises(ValueError, match="programming error"):
+        desktop_checkpoint_helpers._write_benchmark_phase(
+            tmp_path / "phase.json", "runner_startup", 0.0,
+            h.PACKAGED_PHASE_STATUS_VERSION, h.PACKAGED_PHASES,
+            last_safe_phase="runner_startup")
+    assert attempts == [True]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_phase_reader_rejects_partial_and_requires_final_checkpoint(tmp_path):
+    path = tmp_path / "phase.json"
+    path.write_text('{"schema_version":')
+    assert h._read_packaged_phase_status(path, 1)[0] is None
+    _write_phase(path, "request_active", 0.0)
+    assert h._read_packaged_phase_status(path, 1, require_final=True) == (
+        None, "packaged_phase_status_missing")
+
+
+def test_owned_temporary_unlink_retries_without_real_sleep(
+        tmp_path, monkeypatch, desktop_checkpoint_helpers):
+    path = tmp_path / "driver.log"; path.write_text("private log")
+    clock = _RetryClock(); original_unlink = Path.unlink; attempts = []
+    def unlink(candidate, *args, **kwargs):
+        attempts.append(candidate)
+        if len(attempts) == 1:
+            raise PermissionError("sharing violation")
+        return original_unlink(candidate, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    assert desktop_checkpoint_helpers._remove_owned_temporary(
+        path, 1.0, clock=clock, sleeper=clock.sleep) is True
+    assert not path.exists()
+    assert len(attempts) == 2
+
+
+def test_owned_temporary_permanent_lock_is_bounded_and_categorical(
+        tmp_path, monkeypatch, desktop_checkpoint_helpers):
+    path = tmp_path / "private-driver.log"; path.write_text("private log")
+    clock = _RetryClock(); attempts = []
+    def locked(*_args, **_kwargs):
+        attempts.append(True)
+        raise PermissionError("C:/Users/private/private-driver.log")
+    monkeypatch.setattr(Path, "unlink", locked)
+    assert desktop_checkpoint_helpers._remove_owned_temporary(
+        path, 0.025, clock=clock, sleeper=clock.sleep) is False
+    assert clock.now == pytest.approx(0.025)
+    assert len(attempts) == 4
 
 
 def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
@@ -1593,12 +1725,14 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     """Exercise the real runner's pre-launch failure and final checkpoint path."""
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"_write_benchmark_phase", "run_long_context_packaged_mode"}
+    wanted = {"_write_benchmark_phase", "_remove_owned_temporary",
+        "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
-        "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
+        "os": os, "sys": sys, "shutil": __import__("shutil"),
+        "contextlib": __import__("contextlib"),
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
@@ -1621,6 +1755,19 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     assert checkpoint["phase"] == "cleanup"
     assert checkpoint["failure_reason"] == "packaged_runner_failure"
     assert checkpoint["cleanup_succeeded"] is True
+
+    original_remove = namespace["_remove_owned_temporary"]
+    def remove_but_report_failure(path, deadline, **kwargs):
+        original_remove(path, deadline, **kwargs)
+        return False
+    namespace["_remove_owned_temporary"] = remove_but_report_failure
+    second_phase = tmp_path / "second-phase.json"
+    with pytest.raises(RuntimeError, match="packaged setup timeout"):
+        namespace["run_long_context_packaged_mode"](
+            request_path, tmp_path / "second-evidence.json", second_phase, tmp_path / "app")
+    failed_cleanup = json.loads(second_phase.read_text())
+    assert failed_cleanup["failure_reason"] == "packaged_runner_failure"
+    assert failed_cleanup["cleanup_succeeded"] is False
 
 
 @pytest.mark.parametrize("reason", [

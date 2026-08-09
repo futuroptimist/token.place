@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -1459,6 +1460,7 @@ class _TimedOutProcess:
     def wait(self, timeout):
         outcome = next(self.waits)
         if outcome == "timeout":
+            time.sleep(timeout)
             raise subprocess.TimeoutExpired("runner", timeout)
         return outcome
 
@@ -1475,13 +1477,13 @@ def _write_phase(path, phase, elapsed):
 def test_owned_runner_allows_on_time_child_cleanup_once(tmp_path):
     clock = [0.0]
     phase = tmp_path / "phase.json"
-    _write_phase(phase, "cleanup", 9.5)
     class Process(_TimedOutProcess):
         def wait(self, timeout):
             clock[0] += timeout
-            if clock[0] <= 10.0:
+            if clock[0] >= 2.0 and not phase.exists():
+                _write_phase(phase, "cleanup", 2.0)
+            if clock[0] < 4.0:
                 raise subprocess.TimeoutExpired("runner", timeout)
-            clock[0] = 12.0
             return 0
     process = Process([])
     process.stdout = type("Output", (), {"read": lambda self, size: b""})()
@@ -1489,7 +1491,7 @@ def test_owned_runner_allows_on_time_child_cleanup_once(tmp_path):
         popen=lambda _command, **_kwargs: process, phase_status_path=phase,
         platform_name="posix", clock=lambda: clock[0])
     assert completed.returncode == 0
-    assert clock[0] == 12.0
+    assert 4.0 <= clock[0] < 5.1
     assert process.killed is False
 
 
@@ -1499,16 +1501,17 @@ def test_owned_runner_work_timeout_does_not_borrow_cleanup_window(tmp_path):
     _write_phase(phase, "request_active", 9.5)
     class Process(_TimedOutProcess):
         def wait(self, timeout):
-            outcome = next(self.waits)
-            if outcome == "timeout":
-                clock[0] += timeout
-                raise subprocess.TimeoutExpired("runner", timeout)
-            return outcome
-    process = Process(["timeout", 0])
+            if process.killed:
+                return 0
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired("runner", timeout)
+    process = Process([])
     process.stdout = type("Output", (), {"read": lambda self, size: b""})()
     signals = []
     def kill_group(pid, sig):
         signals.append(sig)
+        if sig == signal.SIGTERM:
+            process.killed = True
         if sig == 0:
             raise ProcessLookupError
     with pytest.raises(h.PackagedRunnerTimeout) as raised:
@@ -1523,10 +1526,11 @@ def test_owned_runner_work_timeout_does_not_borrow_cleanup_window(tmp_path):
 def test_owned_runner_cleanup_overrun_is_bounded_and_fails_closed(tmp_path):
     clock = [0.0]
     phase = tmp_path / "phase.json"
-    _write_phase(phase, "cleanup", 9.5)
     class Process(_TimedOutProcess):
         def wait(self, timeout):
             clock[0] += timeout
+            if clock[0] >= 2.0 and not phase.exists():
+                _write_phase(phase, "cleanup", 2.0)
             raise subprocess.TimeoutExpired("runner", timeout)
     process = Process([])
     process.stdout = type("Output", (), {"read": lambda self, size: b""})()
@@ -1536,7 +1540,7 @@ def test_owned_runner_cleanup_overrun_is_bounded_and_fails_closed(tmp_path):
             popen=lambda _command, **_kwargs: process, phase_status_path=phase,
             killpg=lambda _pid, sig: signals.append(sig), platform_name="posix",
             clock=lambda: clock[0])
-    assert clock[0] <= 15.01
+    assert 5.0 <= clock[0] < 10.0
     assert signal.SIGKILL in signals
     assert raised.value.cleanup_succeeded is False
 
@@ -1553,23 +1557,31 @@ def test_owned_runner_posix_terminates_exact_process_group(monkeypatch):
     with pytest.raises(subprocess.TimeoutExpired) as raised:
         h._run_owned_runner(["runner"], 1, 2,
             popen=lambda command, **kwargs: launched.update(kwargs) or process,
-            killpg=kill_group, platform_name="posix")
+            killpg=kill_group, platform_name="posix", phase_poll_interval_s=10)
     assert launched["start_new_session"] is True
     assert signals == [(731, signal.SIGTERM), (731, signal.SIGKILL),
-        (731, signal.SIGKILL), (731, 0)]
-    assert raised.value.cleanup_succeeded is True
+        (731, signal.SIGKILL)]
+    assert raised.value.cleanup_succeeded is False
 
 
 def test_owned_runner_posix_does_not_claim_cleanup_while_group_survives(monkeypatch):
-    process = _TimedOutProcess(["timeout", 0])
+    clock = [0.0]
+    class Process(_TimedOutProcess):
+        def wait(self, timeout):
+            if self.killed:
+                return 0
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired("runner", timeout)
+    process = Process([])
     process.stdout = type("Output", (), {"read": lambda self, size: b""})()
-    monkeypatch.setattr(h.time, "sleep", lambda _seconds: None)
-    ticks = iter((0.0, 0.1, 0.2, 0.3, 3.0, 3.0))
-    monkeypatch.setattr(h.time, "monotonic", lambda: next(ticks, 3.0))
+    monkeypatch.setattr(h.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    def surviving_group(_pid, sig):
+        if sig == signal.SIGTERM:
+            process.killed = True
     with pytest.raises(subprocess.TimeoutExpired) as raised:
         h._run_owned_runner(["runner"], 1, 2,
             popen=lambda _command, **_kwargs: process,
-            killpg=lambda _pid, _signal: None, platform_name="posix")
+            killpg=surviving_group, platform_name="posix", clock=lambda: clock[0])
     assert raised.value.cleanup_succeeded is False
 
 
@@ -1588,7 +1600,7 @@ def test_owned_runner_windows_never_invokes_injected_killpg(cleanup_outcome):
             popen=lambda command, **kwargs: launched.update(kwargs) or process,
             cleanup_run=cleanup_run,
             killpg=lambda *_args: pytest.fail("Windows cleanup called POSIX killpg"),
-            platform_name="nt")
+            platform_name="nt", phase_poll_interval_s=10)
     assert launched["creationflags"] == getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     assert cleanup[0][0] == ["taskkill", "/PID", "731", "/T", "/F"]
     assert process.killed is True
@@ -1606,7 +1618,7 @@ def test_owned_runner_windows_never_resolves_os_killpg(monkeypatch):
             popen=lambda _command, **_kwargs: process,
             cleanup_run=lambda command, **kwargs: cleanup.append((command, kwargs))
             or subprocess.CompletedProcess(command, 0),
-            platform_name="nt")
+            platform_name="nt", phase_poll_interval_s=10)
 
     assert cleanup[0][0] == ["taskkill", "/PID", "731", "/T", "/F"]
 
@@ -1617,7 +1629,8 @@ def test_owned_runner_posix_fails_closed_without_killpg(monkeypatch):
     monkeypatch.delattr(os, "killpg", raising=False)
     with pytest.raises(RuntimeError, match="^owned_process_group_cleanup_unavailable$"):
         h._run_owned_runner(["runner"], 1, 2,
-            popen=lambda _command, **_kwargs: process, platform_name="posix")
+            popen=lambda _command, **_kwargs: process, platform_name="posix",
+            phase_poll_interval_s=10)
     assert process.killed is True
 
 

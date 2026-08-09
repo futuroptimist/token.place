@@ -1222,7 +1222,8 @@ def _run_owned_runner(command: list[str], timeout_s: float,
         cleanup_run: Callable[..., Any] = subprocess.run,
         killpg: Callable[[int, int], Any] | None = None,
         platform_name: str | None = None, phase_status_path: Path | None = None,
-        clock: Callable[[], float] | None = None) -> subprocess.CompletedProcess[str]:
+        clock: Callable[[], float] | None = None,
+        phase_poll_interval_s: float = 0.05) -> subprocess.CompletedProcess[str]:
     """Run one owned process group without buffering output or killing by name."""
     kwargs: dict[str, Any] = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
     clock = time.monotonic if clock is None else clock
@@ -1235,6 +1236,9 @@ def _run_owned_runner(command: list[str], timeout_s: float,
     started = clock()
     work_deadline = started + timeout_s
     overall_deadline = work_deadline + cleanup_timeout_s
+    active_deadline = work_deadline
+    cleanup_observed = False
+    returncode: int | None = None
     chunks: deque[bytes] = deque(maxlen=8)
     def drain_output() -> None:
         assert process.stdout is not None
@@ -1242,24 +1246,27 @@ def _run_owned_runner(command: list[str], timeout_s: float,
             chunks.append(chunk)
     drain = threading.Thread(target=drain_output, daemon=True)
     drain.start()
-    try:
-        returncode = process.wait(timeout=max(0.001, work_deadline - clock()))
-    except subprocess.TimeoutExpired:
-        elapsed_s = max(0.0, clock() - started)
-        phase = None
-        if phase_status_path is not None:
-            phase, _phase_error = _read_packaged_phase_status(phase_status_path, elapsed_s)
-        if phase == "cleanup":
-            try:
-                returncode = process.wait(timeout=max(0.001, overall_deadline - clock()))
-            except subprocess.TimeoutExpired:
-                returncode = None
-            else:
-                drain.join(timeout=max(0.0, overall_deadline - clock()))
-                tail = b"".join(chunks)[-2048:].decode("utf-8", errors="replace")
-                return subprocess.CompletedProcess(command, returncode, stdout=tail)
+    while True:
+        now = clock()
+        if now >= active_deadline:
+            break
+        # A bounded wait doubles as the phase monitor: it avoids polling sleeps
+        # while ensuring an atomic cleanup checkpoint is observed promptly.
+        monitor_window_s = min(phase_poll_interval_s, active_deadline - now)
+        try:
+            returncode = process.wait(timeout=monitor_window_s)
+            break
+        except subprocess.TimeoutExpired:
+            elapsed_s = max(0.0, clock() - started)
+            phase = None
+            if phase_status_path is not None:
+                phase, _phase_error = _read_packaged_phase_status(phase_status_path, elapsed_s)
+            if phase == "cleanup" and not cleanup_observed:
+                cleanup_observed = True
+                active_deadline = min(overall_deadline, clock() + cleanup_timeout_s)
+    if returncode is None:
         cleanup_succeeded = False
-        cleanup_deadline = overall_deadline
+        cleanup_deadline = active_deadline if cleanup_observed else overall_deadline
         def cleanup_remaining() -> float:
             return max(0.001, cleanup_deadline - clock())
         if owned_platform == "nt":

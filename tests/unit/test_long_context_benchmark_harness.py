@@ -21,13 +21,18 @@ def desktop_runner():
     tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
-        "_populate_and_submit_packaged_prompt"}
+        "_populate_and_submit_packaged_prompt", "_is_windows_sharing_violation", "_write_benchmark_phase",
+        "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ModuleType("desktop_runner_under_test")
     namespace = module.__dict__
     namespace.update({"webdriver": SimpleNamespace(Chrome=object), "ActionChains": object,
         "time": time, "By": SimpleNamespace(CSS_SELECTOR="css"),
+        "os": os, "json": json, "tempfile": __import__("tempfile"),
+        "shutil": __import__("shutil"), "Path": Path,
+        "subprocess": subprocess, "Callable": __import__("typing").Callable,
+        "psutil": __import__("psutil"),
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
         "WebDriverWait": object,
@@ -35,6 +40,207 @@ def desktop_runner():
         "apply_benchmark_context_tier": h.apply_benchmark_context_tier})
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
     return module
+
+
+def _phase_write(desktop_runner, path, *, clock, sleeper):
+    desktop_runner._write_benchmark_phase(path, "runner_startup", 0.0,
+        h.PACKAGED_PHASE_STATUS_VERSION, h.PACKAGED_PHASES,
+        last_safe_phase="runner_startup", clock=clock, sleeper=sleeper,
+        retry_timeout_s=0.03)
+
+
+def _sharing_violation(message="locked"):
+    error = PermissionError(message)
+    error.winerror = 32
+    return error
+
+
+@pytest.mark.parametrize("denials", [1, 3])
+def test_phase_checkpoint_retries_sharing_denial_atomically(
+        desktop_runner, monkeypatch, tmp_path, denials):
+    destination = tmp_path / "phase.json"
+    destination.write_text('{"stale": true}')
+    original_replace = Path.replace
+    attempts = []
+    now = [0.0]
+    def replace(path, target):
+        attempts.append(path)
+        if len(attempts) <= denials:
+            raise _sharing_violation("locked raw detail")
+        return original_replace(path, target)
+    monkeypatch.setattr(Path, "replace", replace)
+    _phase_write(desktop_runner, destination, clock=lambda: now[0],
+        sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    checkpoint = json.loads(destination.read_text())
+    assert checkpoint["phase"] == "runner_startup"
+    assert len(attempts) == denials + 1
+    assert not list(tmp_path.glob(".phase.json.*.tmp"))
+
+
+def test_phase_checkpoint_sharing_deadline_is_bounded_and_sanitized(
+        desktop_runner, monkeypatch, tmp_path):
+    destination = tmp_path / "private-phase.json"
+    now = [0.0]
+    attempts = []
+    def denied(path, target):
+        attempts.append((path, target))
+        raise _sharing_violation("C:/private/raw sharing violation")
+    monkeypatch.setattr(Path, "replace", denied)
+    with pytest.raises(RuntimeError) as raised:
+        _phase_write(desktop_runner, destination, clock=lambda: now[0],
+            sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    assert str(raised.value) == "phase checkpoint publication failed"
+    assert len(attempts) == 4
+    assert "private" not in str(raised.value)
+    assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
+
+
+def test_phase_checkpoint_does_not_retry_unrelated_error(
+        desktop_runner, monkeypatch, tmp_path):
+    attempts = []
+    def invalid(_path, _target):
+        attempts.append(True)
+        raise PermissionError("deterministic access denial")
+    monkeypatch.setattr(Path, "replace", invalid)
+    with pytest.raises(PermissionError, match="deterministic access denial"):
+        _phase_write(desktop_runner, tmp_path / "phase.json",
+            clock=lambda: 0.0, sleeper=lambda _delay: pytest.fail("slept"))
+    assert attempts == [True]
+    destination = tmp_path / "phase.json"
+    assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
+
+
+def test_phase_checkpoint_temp_cleanup_reuses_publication_deadline(
+        desktop_runner, monkeypatch, tmp_path):
+    now = [0.0]
+    monkeypatch.setattr(Path, "replace", lambda *_args: (_ for _ in ()).throw(
+        _sharing_violation("locked")))
+    monkeypatch.setattr(Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        _sharing_violation("still locked")))
+    with pytest.raises(RuntimeError, match="phase checkpoint publication failed"):
+        _phase_write(desktop_runner, tmp_path / "phase.json", clock=lambda: now[0],
+            sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    assert now[0] == pytest.approx(0.03)
+
+
+@pytest.mark.parametrize("sharing_denials", [0, 1])
+def test_phase_checkpoint_temp_cleanup_rejects_unrelated_errors_after_bounded_retry(
+        desktop_runner, monkeypatch, tmp_path, sharing_denials):
+    destination = tmp_path / "phase.json"
+    now = [0.0]
+    monkeypatch.setattr(Path, "replace", lambda *_args: (_ for _ in ()).throw(
+        PermissionError("publication denied")))
+    original_unlink = Path.unlink
+    attempts = []
+
+    def unlink(path, *args, **kwargs):
+        if path.name.startswith(f".{destination.name}."):
+            attempts.append(True)
+            if len(attempts) <= sharing_denials:
+                raise _sharing_violation()
+            raise PermissionError("cleanup denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(PermissionError, match="cleanup denied"):
+        _phase_write(desktop_runner, destination, clock=lambda: now[0],
+            sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    assert len(attempts) == sharing_denials + 1
+    assert now[0] == pytest.approx(0.01 * sharing_denials)
+
+
+def test_owned_file_removal_retries_sharing_denial_without_real_sleep(
+        desktop_runner, monkeypatch, tmp_path):
+    path = tmp_path / "driver.log"
+    path.write_text("bounded diagnostic")
+    original_unlink = Path.unlink
+    attempts = []
+    now = [0.0]
+    def unlink(candidate, *args, **kwargs):
+        if candidate == path:
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise _sharing_violation("locked")
+        return original_unlink(candidate, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    assert desktop_runner._remove_owned_path(path, 0.03, clock=lambda: now[0],
+        sleeper=lambda delay: now.__setitem__(0, now[0] + delay)) is True
+    assert attempts == [True, True]
+    assert not path.exists()
+
+
+def test_owned_file_removal_permanent_lock_is_bounded(desktop_runner, monkeypatch, tmp_path):
+    path = tmp_path / "secret-driver.log"
+    path.write_text("bounded diagnostic")
+    now = [0.0]
+    attempts = []
+    def denied(_candidate, *args, **kwargs):
+        attempts.append(True)
+        raise _sharing_violation("C:/private/secret-driver.log")
+    monkeypatch.setattr(Path, "unlink", denied)
+    assert desktop_runner._remove_owned_path(path, 0.02, clock=lambda: now[0],
+        sleeper=lambda delay: now.__setitem__(0, now[0] + delay)) is False
+    assert len(attempts) == 3
+
+
+def test_owned_directory_removal_handles_absence_but_not_unrelated_denial(
+        desktop_runner, monkeypatch, tmp_path):
+    missing = tmp_path / "missing"
+    assert desktop_runner._remove_owned_path(missing, 1.0, directory=True,
+        clock=lambda: 0.0, sleeper=lambda _delay: pytest.fail("slept")) is True
+    monkeypatch.setattr(desktop_runner.shutil, "rmtree", lambda _path: (_ for _ in ()).throw(
+        PermissionError("unrelated denial")))
+    with pytest.raises(PermissionError, match="unrelated denial"):
+        desktop_runner._remove_owned_path(missing, 1.0, directory=True,
+            clock=lambda: 0.0, sleeper=lambda _delay: pytest.fail("slept"))
+
+
+def test_webdriver_quit_is_attempted_after_timeout_configuration_failure(desktop_runner):
+    calls = []
+    class Session:
+        def set_script_timeout(self, timeout):
+            calls.append(("timeout", timeout))
+            raise RuntimeError("disconnected")
+
+        def quit(self):
+            calls.append(("quit",))
+
+    assert desktop_runner._quit_webdriver(Session(), 2.5) is False
+    assert calls == [("timeout", 2.5), ("quit",)]
+
+
+def test_webdriver_quit_failure_is_reported(desktop_runner):
+    session = SimpleNamespace(set_script_timeout=lambda _timeout: None,
+        quit=lambda: (_ for _ in ()).throw(RuntimeError("disconnected")))
+    assert desktop_runner._quit_webdriver(session, 2.5) is False
+
+
+def test_phase_reader_treats_sharing_denial_and_partial_json_as_retryable(monkeypatch, tmp_path):
+    path = tmp_path / "phase.json"
+    valid = {"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase": "runner_startup", "sequence": 1,
+        "last_safe_phase": "runner_startup", "failure_reason": None,
+        "elapsed_s": 0.0, "cleanup_succeeded": None}
+    observations = [_sharing_violation("sharing violation"), '{"schema_version":',
+        json.dumps(valid)]
+    def read_text(_path, **_kwargs):
+        observation = observations.pop(0)
+        if isinstance(observation, Exception):
+            raise observation
+        return observation
+    monkeypatch.setattr(Path, "read_text", read_text)
+    assert h._read_packaged_phase_status(path, 1.0) == (
+        None, "packaged_phase_status_missing")
+    assert h._read_packaged_phase_status(path, 1.0) == (
+        None, "packaged_phase_status_missing")
+    assert h._read_packaged_phase_status(path, 1.0) == (valid, None)
+
+
+def test_phase_reader_does_not_hide_unrelated_io_errors(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "read_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        PermissionError("unrelated denial")))
+    with pytest.raises(PermissionError, match="unrelated denial"):
+        h._read_packaged_phase_status(tmp_path / "phase.json", 1.0)
 
 def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="linux"):
     return {"method": h.MEMORY_METHOD, "scope": h.MEMORY_SCOPE, "platform": platform,
@@ -1091,6 +1297,8 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         evidence_path = command[command.index("--benchmark-evidence") + 1]
         seen["request"] = json.loads(h.Path(request_path).read_text())
         h.Path(evidence_path).write_text(json.dumps(payload))
+        _write_phase(h.Path(command[command.index("--benchmark-phase-status") + 1]),
+            "cleanup", 0.0, cleanup_succeeded=True)
         return subprocess.CompletedProcess(command, 0, "", "")
 
     result = h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app), model=str(model),
@@ -1212,6 +1420,8 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
         evidence_path = command[command.index("--benchmark-evidence") + 1]
         evidence = {"invalid-json": "not json", "non-object": "[]", "missing": "{}"}[runner_outcome]
         h.Path(evidence_path).write_text(evidence)
+        _write_phase(h.Path(command[command.index("--benchmark-phase-status") + 1]),
+            "cleanup", 0.0, cleanup_succeeded=True)
         return subprocess.CompletedProcess(command, 0, "", "")
 
     result = h.invoke_packaged_runtime_adapter(
@@ -1232,6 +1442,43 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
             h.PACKAGED_SETUP_BUDGET_S + 1 + h.PACKAGED_FINALIZATION_BUDGET_S)
         assert result["overall_timeout_s"] == result["runner_timeout_s"] + 1
         assert result["cleanup_succeeded"] is False
+
+
+@pytest.mark.parametrize(("phase", "cleanup_value"), [
+    ("request_active", None), ("cleanup", None),
+])
+def test_nonzero_normal_exit_requires_final_cleanup_checkpoint(
+        tmp_path, phase, cleanup_value):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    def failed_runner(command, **_kwargs):
+        _write_phase(h.Path(command[command.index("--benchmark-phase-status") + 1]),
+            phase, 0.0, cleanup_succeeded=cleanup_value)
+        return subprocess.CompletedProcess(command, 1)
+    result = h.invoke_packaged_runtime_adapter(timeout_s=1, app_binary=str(app),
+        model=str(model), backend="metal", relay_url="https://relay.example",
+        cleanup_timeout_s=1, subprocess_run=failed_runner)
+    assert result["code"] == "packaged_phase_status_malformed"
+
+
+@pytest.mark.parametrize(("primary_reason", "expected_reason"), [
+    (None, "cleanup_failure"),
+    ("send_button_not_enabled", "send_button_not_enabled"),
+])
+def test_nonzero_cleanup_failure_is_categorical_and_preserves_primary(
+        tmp_path, primary_reason, expected_reason):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    def failed_runner(command, **_kwargs):
+        phase = h.Path(command[command.index("--benchmark-phase-status") + 1])
+        _write_phase(phase, "cleanup", 0.0, failure_reason=primary_reason,
+            cleanup_succeeded=False)
+        return subprocess.CompletedProcess(command, 1)
+    result = h.invoke_packaged_runtime_adapter(timeout_s=1, app_binary=str(app),
+        model=str(model), backend="metal", relay_url="https://relay.example",
+        cleanup_timeout_s=1, subprocess_run=failed_runner)
+    assert result["failure_reason"] == expected_reason
+    assert result["cleanup_succeeded"] is False
 
 
 @pytest.mark.parametrize(("contents", "expected"), [
@@ -1428,6 +1675,8 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
     }
     def fake_run(command, **kwargs):
         h.Path(command[command.index("--benchmark-evidence") + 1]).write_text(json.dumps(payload))
+        _write_phase(h.Path(command[command.index("--benchmark-phase-status") + 1]),
+            "cleanup", 0.0, cleanup_succeeded=True)
         return subprocess.CompletedProcess(command, 0)
     result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model), backend="cpu",
         relay_url="https://relay.example", cleanup_timeout_s=1, report_only=report_only,
@@ -1593,13 +1842,14 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     """Exercise the real runner's pre-launch failure and final checkpoint path."""
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"_write_benchmark_phase", "run_long_context_packaged_mode"}
+    wanted = {"_is_windows_sharing_violation", "_write_benchmark_phase", "_remove_owned_path",
+        "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
-        "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS, "psutil": __import__("psutil"),
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
         namespace)
@@ -1621,6 +1871,286 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     assert checkpoint["phase"] == "cleanup"
     assert checkpoint["failure_reason"] == "packaged_runner_failure"
     assert checkpoint["cleanup_succeeded"] is True
+
+
+def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {"_is_windows_sharing_violation", "_write_benchmark_phase", "_remove_owned_path",
+        "run_long_context_packaged_mode"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    namespace = {
+        "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
+        "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
+        "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS, "psutil": __import__("psutil"),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
+        namespace)
+    namespace["_remove_owned_path"] = lambda *_args, **_kwargs: False
+    request_path = tmp_path / "request.json"
+    phase_path = tmp_path / "phase.json"
+    request_path.write_text(json.dumps({
+        "phase_status_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase_status_phases": list(h.PACKAGED_PHASES), "setup_timeout_s": 0,
+        "cleanup_timeout_s": 1,
+        "manifest": {"fixture_sha256": "0" * 64, "targets": {}},
+    }))
+
+    with pytest.raises(RuntimeError, match="packaged setup timeout"):
+        namespace["run_long_context_packaged_mode"](
+            request_path, tmp_path / "evidence.json", phase_path, tmp_path / "app")
+
+    checkpoint = json.loads(phase_path.read_text())
+    assert checkpoint["failure_reason"] == "packaged_runner_failure"
+    assert checkpoint["cleanup_succeeded"] is False
+
+
+def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowance(tmp_path):
+    """The provisional publish gets the small retry window, not all cleanup time."""
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {"_is_windows_sharing_violation", "_write_benchmark_phase",
+        "_remove_owned_path", "run_long_context_packaged_mode"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    now = [0.0]
+    fake_time = SimpleNamespace(monotonic=lambda: now[0], sleep=lambda delay: None)
+    namespace = {
+        "Path": Path, "json": json, "time": fake_time,
+        "tempfile": __import__("tempfile"), "os": os,
+        "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
+        "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "psutil": __import__("psutil"), "sys": sys,
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
+        namespace)
+    writes = []
+    removals = []
+
+    def write_phase(_path, _phase, _started, _version, _phases, **kwargs):
+        writes.append(kwargs)
+        if kwargs.get("cleanup_succeeded") is False and len(writes) == 2:
+            now[0] += kwargs["retry_timeout_s"]
+            raise RuntimeError("phase checkpoint publication failed")
+
+    def remove_path(_path, deadline, **_kwargs):
+        removals.append(deadline - now[0])
+        return True
+
+    namespace["_write_benchmark_phase"] = write_phase
+    namespace["_remove_owned_path"] = remove_path
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps({
+        "phase_status_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase_status_phases": list(h.PACKAGED_PHASES), "setup_timeout_s": 0,
+        "cleanup_timeout_s": 10,
+        "manifest": {"fixture_sha256": "0" * 64, "targets": {}},
+    }))
+
+    with pytest.raises(RuntimeError, match="packaged setup timeout"):
+        namespace["run_long_context_packaged_mode"](
+            request_path, tmp_path / "evidence.json", tmp_path / "phase.json",
+            tmp_path / "app")
+
+    provisional = [write for write in writes
+        if write.get("cleanup_succeeded") is False]
+    assert provisional[0]["retry_timeout_s"] == 1.0
+    assert len(removals) == 3
+    assert removals == [pytest.approx(9.0)] * 3
+    assert writes[-1]["cleanup_succeeded"] is False
+    assert writes[-1]["failure_reason"] == "packaged_runner_failure"
+
+
+def test_packaged_runner_log_close_failure_preserves_primary_and_finishes_cleanup(
+        tmp_path, monkeypatch):
+    """A log-close fault cannot interrupt owned cleanup or final reporting."""
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {"run_long_context_packaged_mode"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    events = []
+    checkpoints = []
+    removed = []
+    process = SimpleNamespace(pid=1234)
+
+    class ClosingFault:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def write(self, value):
+            return self.handle.write(value)
+
+        def close(self):
+            events.append("log_close")
+            self.handle.close()
+            raise RuntimeError("private close detail /absolute/private/path")
+
+    real_io_open = __import__("io").open
+
+    def open_with_closing_fault(path, *args, **kwargs):
+        handle = real_io_open(path, *args, **kwargs)
+        if str(path).endswith(".log") and "long-context-tauri-driver-" in str(path):
+            return ClosingFault(handle)
+        return handle
+
+    monkeypatch.setattr("io.open", open_with_closing_fault)
+    namespace = {
+        "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
+        "os": os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
+        "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
+        "OwnedProcessTreeMemorySampler": lambda _pid: object(),
+        "wait_for_port": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("primary packaged failure")),
+        "_write_benchmark_phase": lambda *_args, **kwargs: checkpoints.append(dict(kwargs)),
+        "_cleanup_owned_process_tree": lambda owned, _remaining: (
+            events.append(("process_cleanup", owned.pid)) or True),
+        "_remove_owned_path": lambda path, *_args, **_kwargs: (
+            events.append(("remove", path)) or removed.append(path) or True),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
+        namespace)
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps({
+        "phase_status_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase_status_phases": list(h.PACKAGED_PHASES), "setup_timeout_s": 10,
+        "cleanup_timeout_s": 1,
+        "manifest": {"fixture_sha256": "0" * 64, "targets": {}},
+    }))
+
+    with pytest.raises(RuntimeError, match="primary packaged failure") as raised:
+        namespace["run_long_context_packaged_mode"](
+            request_path, tmp_path / "evidence.json", tmp_path / "phase.json",
+            tmp_path / "app")
+
+    assert events.index(("process_cleanup", 1234)) < events.index("log_close")
+    assert events.index("log_close") < min(events.index(("remove", path)) for path in removed)
+    assert len(removed) == 3
+    assert checkpoints[-1]["cleanup_succeeded"] is False
+    assert checkpoints[-1]["failure_reason"] == "packaged_runner_failure"
+    report = json.dumps(checkpoints)
+    assert "private close detail" not in report
+    assert str(tmp_path) not in report
+    assert "private close detail" not in str(raised.value)
+
+
+class _CleanupProcess:
+    def __init__(self, name, events, *, terminate_error=False, kill_error=False):
+        self.name = name
+        self.events = events
+        self.terminate_error = terminate_error
+        self.kill_error = kill_error
+
+    def terminate(self):
+        self.events.append(f"terminate:{self.name}")
+        if self.terminate_error:
+            raise RuntimeError("private terminate detail /absolute/path")
+
+    def kill(self):
+        self.events.append(f"kill:{self.name}")
+        if self.kill_error:
+            raise RuntimeError("private kill detail /absolute/path")
+
+
+def test_cleanup_owned_process_tree_recurses_kills_survivor_and_waits(desktop_runner,
+        monkeypatch):
+    events = []
+    child = _CleanupProcess("child", events)
+    root = _CleanupProcess("root", events)
+    root.children = lambda recursive: (events.append(f"children:{recursive}") or [child])
+    monkeypatch.setattr(desktop_runner.psutil, "Process", lambda pid:
+        (events.append(f"root:{pid}") or root))
+    wait_calls = [0]
+
+    def wait_procs(processes, timeout):
+        wait_calls[0] += 1
+        events.append(f"wait:{wait_calls[0]}:{','.join(item.name for item in processes)}")
+        return ([], [child]) if wait_calls[0] == 1 else ([child], [])
+
+    monkeypatch.setattr(desktop_runner.psutil, "wait_procs", wait_procs)
+    parent = SimpleNamespace(pid=731, wait=lambda timeout: events.append("parent-wait"))
+
+    assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 5.0) is True
+    assert events == ["root:731", "children:True", "terminate:child", "terminate:root",
+        "wait:1:child,root", "kill:child", "wait:2:child", "parent-wait"]
+
+
+@pytest.mark.parametrize("fault", [
+    "access", "terminate", "first_wait", "kill", "second_wait", "process_wait",
+])
+def test_cleanup_owned_process_tree_faults_are_non_raising_failures(
+        desktop_runner, monkeypatch, fault):
+    events = []
+    child = _CleanupProcess("child", events, terminate_error=fault == "terminate",
+        kill_error=fault == "kill")
+    root = _CleanupProcess("root", events)
+    root.children = lambda recursive: [child]
+
+    def discover(_pid):
+        if fault == "access":
+            raise desktop_runner.psutil.AccessDenied(731)
+        return root
+
+    monkeypatch.setattr(desktop_runner.psutil, "Process", discover)
+    wait_calls = [0]
+
+    def wait_procs(processes, timeout):
+        wait_calls[0] += 1
+        events.append(f"wait:{wait_calls[0]}")
+        if fault == "first_wait" and wait_calls[0] == 1:
+            raise RuntimeError("private first wait /absolute/path")
+        if fault == "second_wait" and wait_calls[0] == 2:
+            raise RuntimeError("private second wait /absolute/path")
+        return ([], [child]) if wait_calls[0] == 1 else ([child], [])
+
+    monkeypatch.setattr(desktop_runner.psutil, "wait_procs", wait_procs)
+
+    def parent_wait(timeout):
+        events.append("parent-wait")
+        if fault == "process_wait":
+            raise RuntimeError("private parent wait /absolute/path")
+
+    parent = SimpleNamespace(pid=731, wait=parent_wait)
+    assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 5.0) is False
+    assert "parent-wait" in events
+
+
+def test_cleanup_owned_process_tree_treats_missing_root_as_already_gone(
+        desktop_runner, monkeypatch):
+    monkeypatch.setattr(desktop_runner.psutil, "Process", lambda _pid: (_ for _ in ()).throw(
+        desktop_runner.psutil.NoSuchProcess(731)))
+    parent = SimpleNamespace(pid=731, wait=lambda timeout: None)
+    assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 5.0) is True
+
+
+def test_cleanup_owned_process_tree_deadline_exhaustion_is_non_raising(
+        desktop_runner, monkeypatch):
+    child = _CleanupProcess("child", [])
+    root = _CleanupProcess("root", [])
+    root.children = lambda recursive: [child]
+    monkeypatch.setattr(desktop_runner.psutil, "Process", lambda _pid: root)
+    parent = SimpleNamespace(pid=731, wait=lambda timeout: pytest.fail("waited"))
+    assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 0.0) is False
+
+
+def test_cleanup_owned_process_tree_ignores_racing_process_exits(
+        desktop_runner, monkeypatch):
+    class ExitedProcess:
+        def terminate(self):
+            raise desktop_runner.psutil.NoSuchProcess(732)
+
+        def kill(self):
+            raise desktop_runner.psutil.NoSuchProcess(732)
+
+    child = ExitedProcess()
+    root = SimpleNamespace(children=lambda recursive: [child], terminate=lambda: None)
+    monkeypatch.setattr(desktop_runner.psutil, "Process", lambda _pid: root)
+    monkeypatch.setattr(desktop_runner.psutil, "wait_procs",
+        lambda processes, timeout: ([], [child]))
+    parent = SimpleNamespace(pid=731, wait=lambda timeout: None)
+    assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 5.0) is False
 
 
 @pytest.mark.parametrize("reason", [

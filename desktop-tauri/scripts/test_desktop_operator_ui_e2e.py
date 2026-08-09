@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from urllib.request import urlopen
 
+import psutil
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPO_ROOT / "desktop-tauri"
 TAURI_ROOT = DESKTOP_ROOT / "src-tauri"
@@ -761,18 +763,152 @@ def assert_packaged_windows_nvidia_status(
 
 def _write_benchmark_phase(path: Path, phase: str, started: float,
         schema_version: str, phases: tuple[str, ...], *, last_safe_phase: str,
-        failure_reason: str | None = None, cleanup_succeeded: bool | None = None) -> None:
+        failure_reason: str | None = None, cleanup_succeeded: bool | None = None,
+        retry_timeout_s: float = 1.0, clock=time.monotonic,
+        sleeper=time.sleep) -> None:
     """Atomically checkpoint an allowlisted phase without identifiers or payload data."""
     payload = {"schema_version": schema_version, "phase": phase,
         "sequence": phases.index(phase) + 1,
         "last_safe_phase": last_safe_phase, "failure_reason": failure_reason,
-        "elapsed_s": round(max(0.0, time.monotonic() - started), 3),
+        "elapsed_s": round(max(0.0, clock() - started), 3),
         "cleanup_succeeded": cleanup_succeeded}
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-    if hasattr(os, "chmod"):
-        os.chmod(temporary, 0o600)
-    temporary.replace(path)
+    temporary_fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    deadline = clock() + max(0.0, retry_timeout_s)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(temporary_fd, 0o600)
+        with os.fdopen(temporary_fd, "w", encoding="utf-8") as handle:
+            temporary_fd = -1
+            json.dump(payload, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        while True:
+            try:
+                temporary.replace(path)
+                return
+            except OSError as exc:
+                if not _is_windows_sharing_violation(exc):
+                    raise
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    raise RuntimeError("phase checkpoint publication failed") from None
+                sleeper(min(0.01, remaining))
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        while True:
+            try:
+                temporary.unlink(missing_ok=True)
+                break
+            except OSError as exc:
+                if not _is_windows_sharing_violation(exc):
+                    raise
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    break
+                sleeper(min(0.01, remaining))
+
+
+def _is_windows_sharing_violation(exc: BaseException) -> bool:
+    """Recognize only Windows sharing/lock violations, not generic access denial."""
+    return isinstance(exc, OSError) and getattr(exc, "winerror", None) in {32, 33}
+
+
+def _remove_owned_path(path: Path, deadline: float, *, directory: bool = False,
+        clock=time.monotonic, sleeper=time.sleep) -> bool:
+    """Remove one owner-created path, retrying only transient sharing denials."""
+    while True:
+        try:
+            if directory:
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if not _is_windows_sharing_violation(exc):
+                raise
+            remaining = deadline - clock()
+            if remaining <= 0:
+                return False
+            sleeper(min(0.01, remaining))
+
+
+def _cleanup_owned_process_tree(process: subprocess.Popen, remaining: Callable[[], float]) -> bool:
+    """Boundedly stop and observe the exact PID-owned descendant tree."""
+    cleanup_ok = True
+    try:
+        root = psutil.Process(process.pid)
+        owned_processes = [*root.children(recursive=True), root]
+    except psutil.NoSuchProcess:
+        owned_processes = []
+    except (psutil.AccessDenied, psutil.ZombieProcess):
+        owned_processes = []
+        cleanup_ok = False
+    for owned in owned_processes:
+        if remaining() <= 0:
+            cleanup_ok = False
+            break
+        try:
+            owned.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except Exception:
+            cleanup_ok = False
+    alive = owned_processes
+    allowance = remaining()
+    if allowance <= 0 and alive:
+        cleanup_ok = False
+    elif alive:
+        try:
+            _, alive = psutil.wait_procs(alive, timeout=allowance)
+        except Exception:
+            cleanup_ok = False
+    for owned in alive:
+        if remaining() <= 0:
+            cleanup_ok = False
+            break
+        try:
+            owned.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except Exception:
+            cleanup_ok = False
+    allowance = remaining()
+    if allowance <= 0 and alive:
+        cleanup_ok = False
+    elif alive:
+        try:
+            _, alive = psutil.wait_procs(alive, timeout=allowance)
+        except Exception:
+            cleanup_ok = False
+    cleanup_ok = cleanup_ok and not alive
+    allowance = remaining()
+    if allowance <= 0:
+        cleanup_ok = False
+    else:
+        try:
+            process.wait(timeout=allowance)
+        except Exception:
+            cleanup_ok = False
+    return cleanup_ok
+
+
+def _quit_webdriver(session, timeout_s: float) -> bool:
+    """Attempt to release a WebDriver even when configuring its timeout fails."""
+    succeeded = True
+    try:
+        session.set_script_timeout(timeout_s)
+    except Exception:
+        succeeded = False
+    try:
+        session.quit()
+    except Exception:
+        succeeded = False
+    return succeeded
 
 
 def _wait_for_packaged_setup_condition(browser: webdriver.Chrome, setup_remaining,
@@ -904,6 +1040,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     driver: webdriver.Remote | None = None
     browser: webdriver.Chrome | None = None
     cleanup_ok = True
+    primary_failed = False
     try:
         setup_remaining()
         process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
@@ -1109,45 +1246,64 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         os.chmod(evidence_path, 0o600)
         return 0
     except Exception:
+        primary_failed = True
         if failure_reason is None:
             failure_reason = "packaged_runner_failure"
         raise
     finally:
+        cleanup_deadline = time.monotonic() + cleanup_timeout
+        def cleanup_remaining() -> float:
+            return max(0.0, cleanup_deadline - time.monotonic())
+        def cleanup_allowance() -> float | None:
+            remaining = cleanup_remaining()
+            return remaining if remaining > 0 else None
         checkpoint_error = None
         try:
             _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
                 phase_schema_version, phases, last_safe_phase=last_safe_phase,
-                failure_reason=failure_reason)
+                failure_reason=failure_reason, cleanup_succeeded=False,
+                retry_timeout_s=min(cleanup_remaining(), 1.0))
         except Exception as exc:
             checkpoint_error = exc
-        cleanup_deadline = time.monotonic() + cleanup_timeout
-        def cleanup_remaining() -> float:
-            return max(0.001, cleanup_deadline - time.monotonic())
         if browser is not None:
-            with contextlib.suppress(Exception): browser.set_script_timeout(cleanup_remaining())
-            with contextlib.suppress(Exception): browser.quit()
+            allowance = cleanup_allowance()
+            cleanup_ok = (allowance is not None
+                and _quit_webdriver(browser, allowance) and cleanup_ok)
         if driver is not None:
-            with contextlib.suppress(Exception): driver.set_script_timeout(cleanup_remaining())
-            with contextlib.suppress(Exception): driver.quit()
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try: process.wait(timeout=cleanup_remaining())
-            except subprocess.TimeoutExpired:
-                process.kill()
-                try: process.wait(timeout=cleanup_remaining())
-                except subprocess.TimeoutExpired: cleanup_ok = False
-        driver_log_handle.close()
-        shutil.rmtree(isolated_home, ignore_errors=True)
-        shutil.rmtree(tokenizer_dir, ignore_errors=True)
-        driver_log.unlink(missing_ok=True)
-        with contextlib.suppress(Exception):
+            allowance = cleanup_allowance()
+            cleanup_ok = (allowance is not None
+                and _quit_webdriver(driver, allowance) and cleanup_ok)
+        if process is not None:
+            cleanup_ok = (_cleanup_owned_process_tree(process, cleanup_remaining)
+                and cleanup_ok)
+        try:
+            driver_log_handle.close()
+        except Exception:
+            cleanup_ok = False
+        for owned_path, is_directory in (
+                (isolated_home, True), (tokenizer_dir, True), (driver_log, False)):
+            try:
+                cleanup_ok = (_remove_owned_path(owned_path, cleanup_deadline,
+                    directory=is_directory) and cleanup_ok)
+            except OSError:
+                cleanup_ok = False
+        cleanup_ok = cleanup_ok and checkpoint_error is None
+        if not cleanup_ok and not primary_failed:
+            failure_reason = "cleanup_failure"
+        final_checkpoint_error = None
+        try:
             _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
                 phase_schema_version, phases, last_safe_phase=last_safe_phase,
-                failure_reason=failure_reason, cleanup_succeeded=cleanup_ok)
-        if not cleanup_ok:
-            raise RuntimeError("owned process cleanup failed")
-        if checkpoint_error is not None:
-            raise RuntimeError("cleanup phase checkpoint failed") from checkpoint_error
+                failure_reason=failure_reason, cleanup_succeeded=cleanup_ok,
+                retry_timeout_s=max(0.0, cleanup_deadline - time.monotonic()))
+        except Exception as exc:
+            final_checkpoint_error = exc
+        cleanup_failure = (not cleanup_ok or checkpoint_error is not None
+            or final_checkpoint_error is not None)
+        if final_checkpoint_error is not None:
+            print("cleanup phase checkpoint failed", file=sys.stderr)
+        if cleanup_failure and not primary_failed:
+            raise RuntimeError("cleanup_failure")
 
 
 def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float,

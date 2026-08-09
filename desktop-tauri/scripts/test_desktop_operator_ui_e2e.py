@@ -757,11 +757,12 @@ def assert_packaged_windows_nvidia_status(
 
 
 def _write_benchmark_phase(path: Path, phase: str, started: float,
-        schema_version: str, phases: tuple[str, ...]) -> None:
+        schema_version: str, phases: tuple[str, ...], **safe_status: object) -> None:
     """Atomically checkpoint an allowlisted phase without identifiers or payload data."""
     payload = {"schema_version": schema_version, "phase": phase,
         "sequence": phases.index(phase) + 1,
         "elapsed_s": round(max(0.0, time.monotonic() - started), 3)}
+    payload.update(safe_status)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     if hasattr(os, "chmod"):
@@ -782,9 +783,14 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         raise RuntimeError("packaged phase contract malformed")
     phases = tuple(phase_values)
     runner_started = time.monotonic()
+    last_safe_phase = "runner_startup"
+    failure_reason: str | None = None
     def write_phase(phase: str) -> None:
+        nonlocal last_safe_phase
         _write_benchmark_phase(phase_status_path, phase, runner_started,
             phase_schema_version, phases)
+        if phase != "cleanup":
+            last_safe_phase = phase
     setup_deadline = runner_started + float(request["setup_timeout_s"])
     def setup_remaining() -> float:
         remaining = setup_deadline - time.monotonic()
@@ -868,15 +874,27 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         browser.set_page_load_timeout(setup_remaining())
         browser.set_script_timeout(setup_remaining())
         browser.get(request["relay_url"])
-        WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
-            lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
+        try:
+            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
+                lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
+        except TimeoutException as exc:
+            raise RuntimeError("vue_not_ready") from exc
+        try:
+            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
+                lambda d: d.execute_script(
+                    "const v=document.querySelector('#app').__vue__; return Boolean(v.hasClientKeypair);"))
+        except TimeoutException as exc:
+            raise RuntimeError("client_keypair_not_ready") from exc
+        try:
+            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
+                lambda d: d.execute_script(
+                    "const v=document.querySelector('#app').__vue__; return Boolean(v.modelsLoaded && v.selectedModel);"))
+        except TimeoutException as exc:
+            raise RuntimeError("model_not_ready") from exc
         setup_remaining()
         selected_tier = apply_benchmark_context_tier(browser, request["context_tier"])
         if selected_tier != request["context_tier"]:
-            raise RuntimeError("landing context selection failed")
-        WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
-            lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
-        write_phase("landing_page_ready")
+            raise RuntimeError("context_tier_not_applied")
         if not memory_sampler.sample():
             raise RuntimeError("memory_sample_unavailable")
         browser.set_script_timeout(setup_remaining())
@@ -909,10 +927,20 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         field = browser.find_element(By.CSS_SELECTOR, ".message-input")
         setup_remaining()
         field.send_keys(request["prompt"])
+        if not browser.execute_script(
+                "return Boolean(document.querySelector('#app').__vue__.newMessage.trim())"):
+            raise RuntimeError("message_input_not_populated")
+        try:
+            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
+                lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
+        except TimeoutException as exc:
+            raise RuntimeError("send_button_not_enabled") from exc
+        write_phase("landing_page_ready")
         setup_remaining()
         write_phase("request_active")
+        send_button = browser.find_element(By.CSS_SELECTOR, ".send-button")
         started = time.monotonic()
-        browser.find_element(By.CSS_SELECTOR, ".send-button").click()
+        send_button.click()
         progress: list[dict[str, object]] = []
         while time.monotonic() - started < float(request["request_timeout_s"]):
             memory_sampler.sample()
@@ -1037,6 +1065,12 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         finalization_remaining()
         os.chmod(evidence_path, 0o600)
         return 0
+    except Exception as exc:
+        failure_reason = str(exc) if str(exc) in {
+            "vue_not_ready", "client_keypair_not_ready", "model_not_ready",
+            "context_tier_not_applied", "message_input_not_populated",
+            "send_button_not_enabled"} else "runner_failure"
+        raise
     finally:
         checkpoint_error = None
         try:
@@ -1067,6 +1101,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             raise RuntimeError("owned process cleanup failed")
         if checkpoint_error is not None:
             raise RuntimeError("cleanup phase checkpoint failed") from checkpoint_error
+        if failure_reason is not None:
+            _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
+                phase_schema_version, phases, last_safe_phase=last_safe_phase,
+                failure_reason=failure_reason, cleanup_succeeded=cleanup_ok)
 
 
 def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float,

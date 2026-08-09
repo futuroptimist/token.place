@@ -117,6 +117,35 @@ def test_desktop_runner_uses_evergreen_generation_settings_probe_name():
     assert source.count("__longContextBenchmarkGenerationSettings") == 3
 
 
+def test_packaged_landing_readiness_precedes_message_dependent_send_eligibility():
+    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
+        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
+    source = source[source.index("def run_long_context_packaged_mode"):]
+    ordered = ["vue_not_ready", "client_keypair_not_ready", "model_not_ready",
+        "context_tier_not_applied", 'field.send_keys(request["prompt"])',
+        "message_input_not_populated", "send_button_not_enabled",
+        'write_phase("request_active")', "\n        started = time.monotonic()", "send_button.click()"]
+    positions = [source.index(marker) for marker in ordered]
+    assert positions == sorted(positions)
+    pre_prompt = source[positions[0]:positions[4]]
+    assert 'find_element(By.CSS_SELECTOR, ".send-button").is_enabled()' not in pre_prompt
+    assert "sendMessage(" not in source
+    assert "disabled = false" not in source and "removeAttribute('disabled')" not in source
+
+
+def test_packaged_failure_status_accepts_only_categorical_safe_evidence(tmp_path):
+    path = tmp_path / "phase.json"
+    safe = {"schema_version": h.PACKAGED_PHASE_STATUS_VERSION, "phase": "cleanup",
+        "sequence": h.PACKAGED_PHASES.index("cleanup") + 1, "elapsed_s": 1.25,
+        "last_safe_phase": "operator_ready", "failure_reason": "model_not_ready",
+        "cleanup_succeeded": True}
+    path.write_text(json.dumps(safe))
+    assert h._read_packaged_failure_status(path, 2) == (safe, None)
+    safe["failure_reason"] = "traceback with prompt /home/user/secret"
+    path.write_text(json.dumps(safe))
+    assert h._read_packaged_failure_status(path, 2)[1] == "packaged_phase_status_malformed"
+
+
 def test_packaged_profile_fallback_normalizes_only_producer_absence_values():
     source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
         "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
@@ -1183,6 +1212,12 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
             }))
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if runner_outcome == "failed":
+            phase_path = command[command.index("--benchmark-phase-status") + 1]
+            h.Path(phase_path).write_text(json.dumps({
+                "schema_version": h.PACKAGED_PHASE_STATUS_VERSION, "phase": "cleanup",
+                "sequence": len(h.PACKAGED_PHASES), "elapsed_s": 0.0,
+                "last_safe_phase": "operator_ready", "failure_reason": "runner_failure",
+                "cleanup_succeeded": True}))
             return subprocess.CompletedProcess(command, 1, "", "")
         evidence_path = command[command.index("--benchmark-evidence") + 1]
         evidence = {"invalid-json": "not json", "non-object": "[]", "missing": "{}"}[runner_outcome]
@@ -1839,6 +1874,26 @@ def test_not_run_timeout_report_retains_validated_fixture_sha_and_safe_diagnosti
     assert report["completed_trial_count"] == 0
     assert report["last_safe_phase"] == "request_active"
     assert not h.SENSITIVE_KEYS.intersection(report)
+
+
+def test_not_run_runner_failure_retains_only_safe_categorical_diagnostics(tmp_path, monkeypatch):
+    _, manifest = h.generate_fixture("small-8k", scenario="single-needle")
+    failure = {"pass": False, "runtime_contract_pass": False,
+        "code": "packaged_runner_failed", "last_safe_phase": "operator_ready",
+        "failure_reason": "client_keypair_not_ready", "elapsed_s": 42.5,
+        "cleanup_succeeded": True}
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: failure)
+    assert h.main(_packaged_main_args(tmp_path, "--fixture", "small-8k", "--scenario",
+        "single-needle", "--report-only")) == 1
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
+    assert report["fixture"]["sha256"] == manifest["fixture_sha256"]
+    assert {key: report[key] for key in ("last_safe_phase", "failure_reason", "elapsed_s",
+        "cleanup_succeeded")} == {key: failure[key] for key in ("last_safe_phase",
+            "failure_reason", "elapsed_s", "cleanup_succeeded")}
+    serialized = json.dumps(report).lower()
+    for prohibited in ("prompt", "traceback", "diagnostic_tail", "/home/", "request_id",
+            "secret", "ciphertext"):
+        assert prohibited not in serialized
 
 
 def test_not_run_invalid_external_manifest_uses_safe_fixture_sha(tmp_path, monkeypatch):

@@ -235,6 +235,12 @@ immediately after cancellation validation finishes; otherwise it begins immediat
 primary response. Every later telemetry, polling, tokenizer, hashing, and evidence-write operation
 uses its complete allowance.
 
+Landing-page readiness deliberately excludes message-dependent Send eligibility. The runner first
+waits for Vue, the client keypair, and a loaded model catalog with a selected model, then applies and
+verifies the requested context tier. It enters the prompt through the normal message-input event
+path before checking final Send eligibility; it never force-enables the button or calls the Vue send
+method directly. All of these steps remain within the setup/readiness deadline.
+
 An owner-only phase file is atomically replaced at allowlisted boundaries (`runner_startup`,
 `webdriver_ready`, `desktop_ready`, `operator_ready`, `landing_page_ready`, `request_active`,
 `response_received`, `cancellation_validation`, `evidence_finalization`, and `cleanup`). Cancellation
@@ -249,11 +255,16 @@ The channel contains no prompts, responses, ciphertext, keys, credentials, ident
 command lines, or logs. Missing, malformed, or stale phase state fails closed as a runtime-contract
 failure, and all request, response, diagnostic, and phase files are deleted after the attempt.
 
-The sanitized Windows 11/NVIDIA attempt described for this follow-up timed out in the first
-`small-8k` / `single-needle` / `8k-fast` trial before completing any of three requested trials.
-It therefore supplied **no semantic baseline**. Corrected accounting and mocked orchestration tests
-are not physical CUDA or Metal validation; physical Windows/CUDA and macOS/Metal reruns remain
-required.
+For a nonzero child exit, the same owner-only channel retains only the last safe phase, one
+allowlisted categorical reason, bounded elapsed time, and the cleanup outcome when available.
+Shareable `packaged_runner_failed` reports propagate those fields without a traceback, diagnostic
+tail, arbitrary exception text, or other high-cardinality evidence.
+
+The sanitized Windows 11/NVIDIA attempt described for this follow-up returned
+`packaged_runner_failed` after the deterministic pre-prompt Send wait. It completed zero
+`small-8k` / `single-needle` / `8k-fast` trials and therefore supplied **no semantic baseline**.
+Corrected accounting and mocked orchestration tests are not physical CUDA or Metal validation;
+physical Windows/CUDA and macOS/Metal reruns remain required.
 
 Failed or `not_run` packaged reports require a stable categorical failure code. Report validation
 does not fill absent telemetry with zero and does not allow `NaN` or infinity.

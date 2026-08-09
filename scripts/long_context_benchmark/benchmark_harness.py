@@ -59,6 +59,11 @@ PACKAGED_PHASES = (
     "landing_page_ready", "request_active", "response_received",
     "cancellation_validation", "evidence_finalization", "cleanup",
 )
+PACKAGED_FAILURE_REASONS = frozenset({
+    "vue_not_ready", "client_keypair_not_ready", "model_not_ready",
+    "context_tier_not_applied", "message_input_not_populated",
+    "send_button_not_enabled", "runner_failure",
+})
 
 
 def packaged_cancellation_budget_s(request_timeout_s: float, observation_window_s: float,
@@ -977,6 +982,15 @@ def validate_report(report: Any) -> None:
                         + report["cleanup_timeout_s"]
                     or report["elapsed_s"] > report["overall_timeout_s"]):
                 raise ValueError("report_timeout_diagnostics_invalid")
+        elif report["code"] == "packaged_runner_failed":
+            expected = {"last_safe_phase", "failure_reason", "elapsed_s", "cleanup_succeeded"}
+            present_failure_fields = expected.intersection(report)
+            if (present_failure_fields and (present_failure_fields != expected
+                    or report.get("last_safe_phase") not in PACKAGED_PHASES
+                    or report.get("failure_reason") not in PACKAGED_FAILURE_REASONS
+                    or not finite(report.get("elapsed_s")) or report["elapsed_s"] < 0
+                    or not isinstance(report.get("cleanup_succeeded"), bool))):
+                raise ValueError("report_runner_failure_diagnostics_invalid")
         elif present_timeout_fields:
             raise ValueError("report_timeout_diagnostics_unexpected")
         return
@@ -1217,6 +1231,28 @@ def _read_packaged_phase_status(path: Path, parent_elapsed_s: float) -> tuple[st
     return str(value["phase"]), None
 
 
+def _read_packaged_failure_status(path: Path, parent_elapsed_s: float) -> tuple[dict[str, Any] | None, str | None]:
+    """Read only allowlisted, bounded child-failure evidence."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "packaged_phase_status_missing"
+    required = {"schema_version", "phase", "sequence", "elapsed_s", "last_safe_phase",
+        "failure_reason", "cleanup_succeeded"}
+    if (not isinstance(value, dict) or set(value) != required
+            or value.get("schema_version") != PACKAGED_PHASE_STATUS_VERSION
+            or value.get("phase") != "cleanup"
+            or value.get("sequence") != PACKAGED_PHASES.index("cleanup") + 1
+            or value.get("last_safe_phase") not in PACKAGED_PHASES
+            or value.get("failure_reason") not in PACKAGED_FAILURE_REASONS
+            or not isinstance(value.get("cleanup_succeeded"), bool)
+            or not isinstance(value.get("elapsed_s"), (int, float))
+            or isinstance(value.get("elapsed_s"), bool) or not math.isfinite(value["elapsed_s"])
+            or value["elapsed_s"] < 0 or value["elapsed_s"] > parent_elapsed_s + 1.0):
+        return None, "packaged_phase_status_malformed"
+    return value, None
+
+
 def _run_owned_runner(command: list[str], timeout_s: float,
         cleanup_timeout_s: float, *, popen: Callable[..., Any] = subprocess.Popen,
         cleanup_run: Callable[..., Any] = subprocess.run,
@@ -1439,9 +1475,15 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
                 "elapsed_s": elapsed_s,
                 "cleanup_succeeded": bool(getattr(exc, "cleanup_succeeded", False))}
         if completed.returncode != 0:
-            tail = (completed.stdout or Path(diagnostic_name).read_text(
-                encoding="utf-8", errors="replace"))[-2048:]
-            return {"pass": False, "code": "packaged_runner_failed", "diagnostic_tail": sanitize(tail)}
+            elapsed_s = min(overall_budget_s, max(0.0, time.monotonic() - runner_started))
+            status, status_error = _read_packaged_failure_status(Path(phase_name), elapsed_s)
+            if status_error:
+                return {"pass": False, "runtime_contract_pass": False,
+                    "code": "packaged_runner_failed"}
+            return {"pass": False, "runtime_contract_pass": False,
+                "code": "packaged_runner_failed", "last_safe_phase": status["last_safe_phase"],
+                "failure_reason": status["failure_reason"], "elapsed_s": status["elapsed_s"],
+                "cleanup_succeeded": status["cleanup_succeeded"]}
         try:
             payload = json.loads(Path(evidence_name).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1737,7 +1779,7 @@ def main(argv: list[str] | None = None) -> int:
                 "requested_trial_count":args.trials, "completed_trial_count":len(completed),
                 "fixture":{"id":args.fixture, "version":FIXTURE_VERSION, "scenario":args.scenario,
                     "sha256":validated_fixture_sha256}}
-            for key in ("last_safe_phase", "request_timeout_s", "setup_timeout_s",
+            for key in ("last_safe_phase", "failure_reason", "request_timeout_s", "setup_timeout_s",
                     "finalization_timeout_s", "cancellation_timeout_s", "cleanup_timeout_s", "runner_timeout_s",
                     "overall_timeout_s", "elapsed_s", "cleanup_succeeded"):
                 if key in evidence:

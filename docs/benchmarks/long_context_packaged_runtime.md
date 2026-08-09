@@ -235,6 +235,13 @@ immediately after cancellation validation finishes; otherwise it begins immediat
 primary response. Every later telemetry, polling, tokenizer, hashing, and evidence-write operation
 uses its complete allowance.
 
+Landing readiness is deliberately independent of message-dependent Send eligibility. The harness
+first observes Vue initialization, the real client keypair, and loaded model-catalog selection,
+then applies and reads back the requested context tier. It enters the fixture through the normal
+message input event path before checking that Send is enabled; only immediately before clicking
+Send does the independent inference-request timer begin. The harness never fabricates readiness,
+force-enables the control, or calls the Vue submission method directly.
+
 An owner-only phase file is atomically replaced at allowlisted boundaries (`runner_startup`,
 `webdriver_ready`, `desktop_ready`, `operator_ready`, `landing_page_ready`, `request_active`,
 `response_received`, `cancellation_validation`, `evidence_finalization`, and `cleanup`). Cancellation
@@ -248,10 +255,14 @@ their derived runner/overall totals, bounded elapsed time, and whether owned-tre
 The channel contains no prompts, responses, ciphertext, keys, credentials, identifiers, paths,
 command lines, or logs. Missing, malformed, or stale phase state fails closed as a runtime-contract
 failure, and all request, response, diagnostic, and phase files are deleted after the attempt.
+Nonzero child exits retain only the last safe phase, bounded elapsed time, cleanup outcome when
+available, and an allowlisted categorical reason. Raw exception text, tracebacks, diagnostic tails,
+prompts, paths, and identifiers are excluded from shareable reports.
 
-The sanitized Windows 11/NVIDIA attempt described for this follow-up timed out in the first
-`small-8k` / `single-needle` / `8k-fast` trial before completing any of three requested trials.
-It therefore supplied **no semantic baseline**. Corrected accounting and mocked orchestration tests
+The sanitized Windows 11/NVIDIA attempt described for this follow-up completed zero trials after
+the child encountered the deterministic pre-prompt Send-readiness deadlock in the first
+`small-8k` / `single-needle` / `8k-fast` trial. It therefore supplied **no semantic baseline**.
+Corrected readiness ordering, accounting, and mocked orchestration tests
 are not physical CUDA or Metal validation; physical Windows/CUDA and macOS/Metal reruns remain
 required.
 

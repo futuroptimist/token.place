@@ -117,6 +117,22 @@ def test_desktop_runner_uses_evergreen_generation_settings_probe_name():
     assert source.count("__longContextBenchmarkGenerationSettings") == 3
 
 
+def test_packaged_landing_readiness_precedes_message_dependent_send_eligibility():
+    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
+        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
+    ordered = ["vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
+        "requested_context_tier_not_applied", 'field.send_keys(request["prompt"])',
+        "message_input_not_populated", "send_button_not_enabled", 'write_phase("request_active")',
+        "started = time.monotonic()", '.send-button").click()']
+    landing_start = source.index('browser.get(request["relay_url"])')
+    positions = [source.index(marker, landing_start) for marker in ordered]
+    assert positions == sorted(positions)
+    pre_prompt = source[positions[0]:positions[4]]
+    assert "send-button" not in pre_prompt
+    assert "sendMessage(" not in source
+    assert "disabled = false" not in source and "removeAttribute('disabled')" not in source
+
+
 def test_packaged_profile_fallback_normalizes_only_producer_absence_values():
     source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
         "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
@@ -1180,9 +1196,18 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
             h.Path(phase_path).write_text(json.dumps({
                 "schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
                 "phase": "request_active", "sequence": 6, "elapsed_s": 0.0,
+                "last_safe_phase": "request_active", "failure_reason": None,
+                "cleanup_succeeded": None,
             }))
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if runner_outcome == "failed":
+            phase_path = command[command.index("--benchmark-phase-status") + 1]
+            h.Path(phase_path).write_text(json.dumps({
+                "schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+                "phase": "cleanup", "sequence": len(h.PACKAGED_PHASES), "elapsed_s": 0.0,
+                "last_safe_phase": "landing_page_ready",
+                "failure_reason": "send_button_not_enabled", "cleanup_succeeded": True,
+            }))
             return subprocess.CompletedProcess(command, 1, "", "")
         evidence_path = command[command.index("--benchmark-evidence") + 1]
         evidence = {"invalid-json": "not json", "non-object": "[]", "missing": "{}"}[runner_outcome]
@@ -1233,6 +1258,8 @@ def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
         observed["timeout"] = kwargs["timeout"]
         request_path = command[command.index("--benchmark-request") + 1]
         observed["request"] = json.loads(h.Path(request_path).read_text())
+        phase_path = command[command.index("--benchmark-phase-status") + 1]
+        _write_phase(Path(phase_path), "runner_startup", 0.0)
         return subprocess.CompletedProcess(command, 1)
     result = h.invoke_packaged_runtime_adapter(timeout_s=600, app_binary=str(app),
         model=str(model), backend="cuda", relay_url="https://relay.example",
@@ -1344,6 +1371,8 @@ def test_small_fixture_passes_8k_fast_context_preflight(tmp_path, scenario):
     launched = []
     def fake_run(command, **kwargs):
         launched.append(command)
+        phase_path = command[command.index("--benchmark-phase-status") + 1]
+        _write_phase(Path(phase_path), "runner_startup", 0.0)
         return subprocess.CompletedProcess(command, 1, "runner stopped", "")
     result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model),
         backend="cpu", relay_url="https://relay.example", cleanup_timeout_s=1,
@@ -1405,6 +1434,8 @@ def test_packaged_temp_permissions_do_not_require_fchmod(tmp_path, monkeypatch):
     app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
     monkeypatch.delattr(h.os, "fchmod")
     def failed_runner(command, **kwargs):
+        phase_path = command[command.index("--benchmark-phase-status") + 1]
+        _write_phase(Path(phase_path), "runner_startup", 0.0)
         return subprocess.CompletedProcess(command, 1)
     result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model), backend="cpu",
         relay_url="https://relay.example", cleanup_timeout_s=1, subprocess_run=failed_runner)
@@ -1471,7 +1502,8 @@ class _TimedOutProcess:
 def _write_phase(path, phase, elapsed):
     path.write_text(json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
         "phase": phase, "sequence": h.PACKAGED_PHASES.index(phase) + 1,
-        "elapsed_s": elapsed}))
+        "elapsed_s": elapsed, "last_safe_phase": phase, "failure_reason": None,
+        "cleanup_succeeded": None}))
 
 
 def test_owned_runner_allows_on_time_child_cleanup_once(tmp_path):
@@ -1839,6 +1871,27 @@ def test_not_run_timeout_report_retains_validated_fixture_sha_and_safe_diagnosti
     assert report["completed_trial_count"] == 0
     assert report["last_safe_phase"] == "request_active"
     assert not h.SENSITIVE_KEYS.intersection(report)
+
+
+def test_not_run_child_failure_retains_only_categorical_safe_diagnostics(tmp_path, monkeypatch):
+    _, manifest = h.generate_fixture("small-8k", scenario="single-needle")
+    failure = {"pass": False, "runtime_contract_pass": False,
+        "code": "packaged_runner_failed", "last_safe_phase": "operator_ready",
+        "failure_reason": "client_keypair_not_ready", "elapsed_s": 12.5,
+        "cleanup_succeeded": True}
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: failure)
+    assert h.main(_packaged_main_args(tmp_path, "--fixture", "small-8k", "--scenario",
+        "single-needle", "--report-only")) == 1
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
+    assert report["fixture"]["sha256"] == manifest["fixture_sha256"]
+    assert report["completed_trial_count"] == 0
+    assert report["failure_reason"] == "client_keypair_not_ready"
+    assert report["last_safe_phase"] == "operator_ready"
+    assert report["elapsed_s"] == 12.5 and report["cleanup_succeeded"] is True
+    serialized = json.dumps(report).lower()
+    assert all(value not in serialized for value in
+        ("traceback", "diagnostic_tail", "absolute/path", "secret", "request_id", "prompt"))
+    h.validate_report(report)
 
 
 def test_not_run_invalid_external_manifest_uses_safe_fixture_sha(tmp_path, monkeypatch):

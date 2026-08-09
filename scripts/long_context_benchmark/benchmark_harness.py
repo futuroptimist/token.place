@@ -57,16 +57,17 @@ PACKAGED_PHASE_STATUS_VERSION = "packaged-runner-phase-v1"
 PACKAGED_PHASES = (
     "runner_startup", "webdriver_ready", "desktop_ready", "operator_ready",
     "landing_page_ready", "request_active", "response_received",
-    "evidence_finalization", "cleanup",
+    "cancellation_validation", "evidence_finalization", "cleanup",
 )
 
 
 def packaged_cancellation_budget_s(request_timeout_s: float, observation_window_s: float,
         recovery_timeout_s: float) -> float:
     """Return the additive upper bound for the opt-in cancellation sequence."""
-    # Two trigger waits, two quiescence windows, two recovery requests, and the
-    # stop/start/restarted-request lifecycle (three further recovery waits).
-    return 2 * request_timeout_s + 2 * observation_window_s + 5 * recovery_timeout_s
+    # Two trigger waits, two quiescence windows, two asynchronous cancellation
+    # acknowledgements, two scenario follow-ups, operator stop, restart
+    # stability, relay registration, and the post-restart follow-up.
+    return 2 * request_timeout_s + 2 * observation_window_s + 8 * recovery_timeout_s
 
 
 class PackagedRunnerTimeout(subprocess.TimeoutExpired):

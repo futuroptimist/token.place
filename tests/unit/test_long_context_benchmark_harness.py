@@ -1260,10 +1260,57 @@ def test_cancellation_budget_is_named_additive_and_bounded(tmp_path):
         cancellation_validation=True, prefill_cancel_fraction=0.5,
         observation_window_s=2, recovery_timeout_s=4, subprocess_run=fake_run)
     cancellation = h.packaged_cancellation_budget_s(10, 2, 4)
-    assert cancellation == 44
+    assert cancellation == 56
     assert observed["request"]["cancellation_timeout_s"] == cancellation
     assert observed["timeout"] == (h.PACKAGED_SETUP_BUDGET_S + 10
         + h.PACKAGED_FINALIZATION_BUDGET_S + cancellation)
+
+
+def test_cancellation_budget_enumerates_every_bounded_operation():
+    request, observation, recovery = 11, 3, 5
+    bounded_operations = ([request] * 2 + [observation] * 2 + [recovery] * 8)
+    assert h.packaged_cancellation_budget_s(request, observation, recovery) == sum(bounded_operations)
+
+
+def test_cancellation_phase_and_finalization_allowances_are_independent():
+    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
+        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
+    cancellation_call = source.index("run_long_context_cancellation_recovery(")
+    finalization_start = source.index("finalization_deadline = time.monotonic()", cancellation_call)
+    assert cancellation_call < finalization_start
+    assert 'RuntimeError("packaged cancellation validation timeout")' in source
+    assert "cancellation_validation" in h.PACKAGED_PHASES
+
+
+def test_cancellation_deadline_exhaustion_fails_closed_with_fake_clock():
+    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
+        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
+    function = next(node for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "run_long_context_cancellation_recovery")
+    namespace = {"webdriver": type("WebDriver", (), {"Chrome": object, "Remote": object}),
+        "time": type("Clock", (), {"monotonic": staticmethod(lambda: 2.0)}),
+        "Callable": __import__("typing").Callable}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "<cancellation>", "exec"), namespace)
+    request = {"request_timeout_s": 10, "prompt": "not-observed",
+        "cancellation": {"observation_window_s": 1, "recovery_timeout_s": 2}}
+    with pytest.raises(RuntimeError, match="packaged cancellation validation timeout"):
+        namespace["run_long_context_cancellation_recovery"](object(), object(), request, 1.0)
+
+
+def test_disabled_cancellation_has_no_budget_or_cli_contract_change(tmp_path):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    observed = {}
+    def fake_run(command, **kwargs):
+        request_path = command[command.index("--benchmark-request") + 1]
+        observed.update(json.loads(h.Path(request_path).read_text()))
+        return subprocess.CompletedProcess(command, 1)
+    h.invoke_packaged_runtime_adapter(timeout_s=10, app_binary=str(app), model=str(model),
+        backend="cuda", relay_url="https://relay.example", cleanup_timeout_s=3,
+        subprocess_run=fake_run)
+    assert observed["cancellation_timeout_s"] == 0
+    assert observed["cancellation_validation"] is False
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), "1"])

@@ -929,13 +929,19 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         else:
             raise RuntimeError("packaged request timeout")
         ended = time.monotonic()
-        finalization_deadline = ended + float(request["finalization_timeout_s"])
+        write_phase("response_received")
+        cancellation_recovery = None
+        if request.get("cancellation_validation"):
+            write_phase("cancellation_validation")
+            cancellation_deadline = time.monotonic() + float(request["cancellation_timeout_s"])
+            cancellation_recovery = run_long_context_cancellation_recovery(
+                browser, driver, request, cancellation_deadline)
+        finalization_deadline = time.monotonic() + float(request["finalization_timeout_s"])
         def finalization_remaining() -> float:
             remaining = finalization_deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("packaged evidence finalization timeout")
             return remaining
-        write_phase("response_received")
         finalization_remaining()
         if not progress or not isinstance(response_text, str):
             raise RuntimeError("required encrypted progress or response evidence missing")
@@ -993,9 +999,6 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 or tokenizer_observation.get("fixture_sha256") != request["manifest"]["fixture_sha256"]
                 or tokenizer_observation.get("total_prompt_tokens") != progress[-1]["total_prompt_tokens"]):
             raise RuntimeError("authoritative_target_depth_mismatched")
-        cancellation_recovery = None
-        if request.get("cancellation_validation"):
-            cancellation_recovery = run_long_context_cancellation_recovery(browser, driver, request)
         finalization_remaining()
         preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
         prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
@@ -1061,7 +1064,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             raise RuntimeError("cleanup phase checkpoint failed") from checkpoint_error
 
 
-def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float) -> tuple[bool, float]:
+def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float,
+        remaining: Callable[[], float]) -> tuple[bool, float]:
     """Exercise the ordinary encrypted request lifecycle without retaining its plaintext result."""
     browser.execute_script("const v=document.querySelector('#app').__vue__; v.chatHistory=[];")
     field = browser.find_element(By.CSS_SELECTOR, ".message-input")
@@ -1069,7 +1073,7 @@ def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float) 
     field.send_keys("Reply with exactly OK")
     started = time.monotonic()
     browser.find_element(By.CSS_SELECTOR, ".send-button").click()
-    wait = WebDriverWait(browser, timeout_s, poll_frequency=0.05)
+    wait = WebDriverWait(browser, min(timeout_s, remaining()), poll_frequency=0.05)
     state = wait.until(lambda d: (lambda s: s if classify_benchmark_landing_state(s)[0] != "running" else False)(
         d.execute_script("const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,b:v.isGeneratingResponse};")))
     lifecycle, _response = classify_benchmark_landing_state(state)
@@ -1077,21 +1081,27 @@ def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float) 
 
 
 def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: webdriver.Remote,
-        request: dict[str, object]) -> dict[str, object]:
+        request: dict[str, object], cancellation_deadline: float) -> dict[str, object]:
     """Physically cancel prefill/generation requests, recover, then restart the operator."""
     config = request["cancellation"]
     assert isinstance(config, dict)
     timeout_s = float(request["request_timeout_s"])
     observation_s = float(config["observation_window_s"])
     recovery_s = float(config["recovery_timeout_s"])
+    def cancellation_remaining(cap: float | None = None) -> float:
+        remaining = cancellation_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("packaged cancellation validation timeout")
+        return min(remaining, cap) if cap is not None else remaining
     scenarios: list[dict[str, object]] = []
     for phase in ("prefill", "generating"):
+        cancellation_remaining()
         browser.execute_script("const v=document.querySelector('#app').__vue__; v.chatHistory=[];")
         field = browser.find_element(By.CSS_SELECTOR, ".message-input")
         field.clear()
         field.send_keys(str(request["prompt"]))
         browser.find_element(By.CSS_SELECTOR, ".send-button").click()
-        deadline = time.monotonic() + timeout_s
+        deadline = time.monotonic() + min(timeout_s, cancellation_remaining())
         threshold = int(config["generation_tokens"]) if phase == "generating" else config.get("prefill_tokens")
         trigger_count = -1
         last_sequence = -1
@@ -1122,10 +1132,11 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
                     break
                 if (phase == "prefill" and event.get("phase") == "generating") or state.get("b") is False:
                     raise RuntimeError("cancellation_trigger_missed")
-            time.sleep(0.01)
+            time.sleep(min(0.01, cancellation_remaining()))
         if trigger_count < 0 or not isinstance(threshold, int) or authoritative_total is None:
             raise RuntimeError("cancellation_trigger_missed")
         triggered = time.monotonic()
+        browser.set_script_timeout(cancellation_remaining(recovery_s))
         acknowledgement = browser.execute_async_script("""
             const done=arguments[arguments.length-1]; const v=document.querySelector('#app').__vue__;
             const active=v.activeRelayRequest; const pending=v.cancelRelayRequest('requester_cancelled');
@@ -1138,7 +1149,7 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
         stale = late = 0
         active_after = False
         quiet_started = time.monotonic()
-        quiet_deadline = quiet_started + observation_s
+        quiet_deadline = quiet_started + min(observation_s, cancellation_remaining())
         while time.monotonic() < quiet_deadline:
             state = browser.execute_script(
                 "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,b:v.isGeneratingResponse,a:Boolean(v.activeRelayRequest),h:v.chatHistory};")
@@ -1148,10 +1159,11 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
             lifecycle, _response = classify_benchmark_landing_state(state)
             if lifecycle == "completed": late += 1
             active_after = bool(state.get("a") or state.get("b"))
-            time.sleep(0.01)
+            time.sleep(min(0.01, cancellation_remaining()))
         quiescence_s = time.monotonic() - quiet_started
         cleanup_s = time.monotonic() - triggered
-        followup_ok, followup_s = _long_context_followup_request(browser, recovery_s)
+        followup_ok, followup_s = _long_context_followup_request(
+            browser, recovery_s, cancellation_remaining)
         scenarios.append({"phase": phase, "trigger_observed": True, "trigger_count": trigger_count,
             "threshold": threshold, "total_prompt_tokens": authoritative_total,
             "attempted": attempted, "acknowledged": acknowledged,
@@ -1162,15 +1174,18 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
     old_session = _status_value(driver, "Operator session ID")
     restarted = time.monotonic()
     driver.find_element(By.XPATH, "//button[.='Stop operator']").click()
-    WebDriverWait(driver, recovery_s).until(
+    WebDriverWait(driver, cancellation_remaining(recovery_s)).until(
         lambda d: d.find_element(By.XPATH, "//button[.='Start operator']").is_enabled())
     stop_confirmed = _status_value(driver, "Worker alive").lower() != "yes"
     driver.find_element(By.XPATH, "//button[.='Start operator']").click()
-    wait_for_running_stability(driver, "yes", stable_seconds=1, timeout_seconds=recovery_s)
-    WebDriverWait(driver, recovery_s).until(lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+    wait_for_running_stability(driver, "yes", stable_seconds=1,
+        timeout_seconds=cancellation_remaining(recovery_s))
+    WebDriverWait(driver, cancellation_remaining(recovery_s)).until(
+        lambda d: _status_value(d, "Registered").lower().startswith("yes"))
     new_session = _status_value(driver, "Operator session ID")
     restart_s = time.monotonic() - restarted
-    followup_ok, followup_s = _long_context_followup_request(browser, recovery_s)
+    followup_ok, followup_s = _long_context_followup_request(
+        browser, recovery_s, cancellation_remaining)
     return {"scenarios": scenarios, "operator_lifecycle": {"stop_confirmed": stop_confirmed,
         "restart_ready": True, "session_changed": bool(old_session and new_session != old_session),
         "restart_s": restart_s, "post_restart_followup_ok": followup_ok,

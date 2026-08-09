@@ -218,9 +218,9 @@ runner applies four separate allowances:
 - **evidence finalization: 120 seconds** for bounded telemetry/tokenizer collection, model
   fingerprinting, and the atomic evidence write; and
 - **cancellation validation: zero when disabled, otherwise
-  `2 × request timeout + 2 × observation window + 5 × recovery timeout` seconds** for the two
-  progress-trigger waits, two quiescence windows, two follow-up requests, and bounded operator
-  stop/start/post-restart verification; and
+  `2 × request timeout + 2 × observation window + 8 × recovery timeout` seconds** for the two
+  progress-trigger waits, two quiescence windows, two asynchronous acknowledgements, two scenario
+  follow-ups, operator stop, restart stability, relay registration, and the post-restart follow-up; and
 - **cleanup: `--cleanup-timeout` seconds**, reserved for the exact process tree owned by the trial.
 
 The parent watchdog is finite and uses the explicit equation
@@ -236,7 +236,9 @@ remaining allowance.
 
 An owner-only phase file is atomically replaced at allowlisted boundaries (`runner_startup`,
 `webdriver_ready`, `desktop_ready`, `operator_ready`, `landing_page_ready`, `request_active`,
-`response_received`, `evidence_finalization`, and `cleanup`). If the parent watchdog expires, the
+`response_received`, `cancellation_validation`, `evidence_finalization`, and `cleanup`). Cancellation
+uses one finite deadline, and the complete evidence-finalization allowance starts only after it
+finishes. If the parent watchdog expires, the
 `packaged_runner_timeout` report records only the last safe phase, the five configured budgets and
 their derived runner/overall totals, bounded elapsed time, and whether owned-tree cleanup succeeded.
 The channel contains no prompts, responses, ciphertext, keys, credentials, identifiers, paths,

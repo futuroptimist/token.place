@@ -1708,9 +1708,12 @@ def test_packaged_failure_reasons_are_explicit_low_cardinality_categories():
         for value in h.PACKAGED_FAILURE_REASONS)
 
 
-def test_desktop_runner_validates_packaged_failure_reasons(desktop_runner):
-    assert (desktop_runner._validate_packaged_failure_reason("vue_not_ready")
-        == "vue_not_ready")
+@pytest.mark.parametrize("reason", sorted(h.PACKAGED_FAILURE_REASONS))
+def test_desktop_runner_accepts_every_packaged_failure_reason(desktop_runner, reason):
+    assert desktop_runner._validate_packaged_failure_reason(reason) == reason
+
+
+def test_desktop_runner_rejects_unlisted_packaged_failure_reason(desktop_runner):
     with pytest.raises(RuntimeError, match="invalid packaged failure reason"):
         desktop_runner._validate_packaged_failure_reason("prompt content")
 

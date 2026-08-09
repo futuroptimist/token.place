@@ -35,6 +35,13 @@ SCHEMA_VERSION = "long-context-benchmark-report-v1"
 FIXTURE_VERSION = "long-context-semantic-haystack-v6"
 DEFAULT_SEED = "long-context-benchmark-default"
 PHASES = {"preparing": 0, "prefill": 1, "generating": 2}
+PACKAGED_SETUP_BUDGET_S = 300.0
+PACKAGED_FINALIZATION_BUDGET_S = 120.0
+PACKAGED_RUNNER_PHASES = (
+    "runner_startup", "webdriver_ready", "desktop_ready", "operator_ready",
+    "landing_page_ready", "request_active", "response_received",
+    "evidence_finalization", "cleanup",
+)
 SECRET_PATTERNS = [
     re.compile(r"(?i)\b(authorization|api[_-]?key|secret|token)\b\s*[:=]\s*(?:bearer\s+)?[^\s,}\]\)]+"),
     re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+"),
@@ -46,8 +53,37 @@ SENSITIVE_KEYS = {
     "message", "messages", "tool_argument", "tool_arguments", "model_output",
     "completion", "completions", "plaintext", "ciphertext", "iv", "key",
     "authorization", "api_key", "apikey", "secret", "token", "cancel_token",
-    "request_id", "client_id", "session_id",
+    "request_id", "client_id", "session_id", "process_id", "command_line",
 }
+
+
+def packaged_runner_budgets(request_timeout_s: float, cleanup_timeout_s: float) -> dict[str, float]:
+    """Return the explicit parent/child phase contract used by packaged trials."""
+    return {
+        "setup_s": PACKAGED_SETUP_BUDGET_S,
+        "request_s": float(request_timeout_s),
+        "finalization_s": PACKAGED_FINALIZATION_BUDGET_S,
+        "cleanup_s": float(cleanup_timeout_s),
+        "overall_s": (PACKAGED_SETUP_BUDGET_S + float(request_timeout_s)
+            + PACKAGED_FINALIZATION_BUDGET_S + float(cleanup_timeout_s)),
+    }
+
+
+def _read_phase_status(path: str, budgets: dict[str, float]) -> tuple[str | None, str | None]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "phase_status_missing"
+    except (OSError, json.JSONDecodeError):
+        return None, "phase_status_malformed"
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "phase", "sequence", "budgets"}
+            or value.get("schema_version") != "packaged-runner-phase-v1"
+            or value.get("phase") not in PACKAGED_RUNNER_PHASES
+            or value.get("sequence") != PACKAGED_RUNNER_PHASES.index(value.get("phase")) + 1):
+        return None, "phase_status_malformed"
+    if value.get("budgets") != budgets:
+        return None, "phase_status_stale"
+    return value["phase"], None
 
 @dataclass(frozen=True)
 class FixtureSpec:
@@ -916,6 +952,23 @@ def validate_report(report: Any) -> None:
         return
     if report["status"] != "passed" and "runtime" not in report:
         if not isinstance(report.get("code"), str) or not report["code"]: raise ValueError("report_failure_code_invalid")
+        diagnostics = report.get("timeout_diagnostics")
+        if diagnostics is not None:
+            expected = {"last_safe_phase", "request_timeout_s", "setup_budget_s",
+                "finalization_budget_s", "cleanup_budget_s", "overall_runner_budget_s",
+                "elapsed_s", "cleanup_succeeded"}
+            if (report["code"] != "packaged_runner_timeout" or not isinstance(diagnostics, dict)
+                    or set(diagnostics) != expected
+                    or diagnostics["last_safe_phase"] not in PACKAGED_RUNNER_PHASES
+                    or not all(finite(diagnostics[key]) and diagnostics[key] >= 0 for key in
+                        ("request_timeout_s", "setup_budget_s", "finalization_budget_s",
+                         "cleanup_budget_s", "overall_runner_budget_s", "elapsed_s"))
+                    or not isinstance(diagnostics["cleanup_succeeded"], bool)
+                    or diagnostics["overall_runner_budget_s"] != diagnostics["setup_budget_s"]
+                        + diagnostics["request_timeout_s"] + diagnostics["finalization_budget_s"]
+                        + diagnostics["cleanup_budget_s"]
+                    or diagnostics["elapsed_s"] > diagnostics["overall_runner_budget_s"]):
+                raise ValueError("report_timeout_diagnostics_invalid")
         return
     runtime, backend, context = report.get("runtime"), report.get("backend"), report.get("context")
     if not isinstance(runtime, dict) or not all(isinstance(runtime.get(key), str) and runtime[key]
@@ -1158,7 +1211,8 @@ def _run_owned_runner(command: list[str], timeout_s: float,
     drain.start()
     try:
         returncode = process.wait(timeout=timeout_s + cleanup_timeout_s)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as timeout_error:
+        cleanup_succeeded = False
         if owned_platform == "nt":
             try:
                 cleanup_run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
@@ -1168,9 +1222,11 @@ def _run_owned_runner(command: list[str], timeout_s: float,
                 process.kill()
             try:
                 process.wait(timeout=cleanup_timeout_s)
+                cleanup_succeeded = True
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=cleanup_timeout_s)
+                cleanup_succeeded = True
         else:
             owned_killpg = killpg if killpg is not None else getattr(os, "killpg", None)
             if not callable(owned_killpg):
@@ -1182,11 +1238,14 @@ def _run_owned_runner(command: list[str], timeout_s: float,
                 owned_killpg(process.pid, signal.SIGTERM)
             try:
                 process.wait(timeout=cleanup_timeout_s)
+                cleanup_succeeded = True
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
                     owned_killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=cleanup_timeout_s)
-        raise
+                cleanup_succeeded = True
+        timeout_error.cleanup_succeeded = cleanup_succeeded
+        raise timeout_error
     drain.join(timeout=cleanup_timeout_s)
     tail = b"".join(chunks)[-2048:].decode("utf-8", errors="replace")
     return subprocess.CompletedProcess(command, returncode, stdout=tail)
@@ -1251,36 +1310,54 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         return {"pass": False, "runtime_contract_pass": False,
             "code": "fixture_context_incompatible", "fixture_tokens": manifest["actual_tokens"],
             "prompt_budget_tokens": prompt_budget, "context_tier": context_tier}
+    budgets = packaged_runner_budgets(float(timeout_s), float(cleanup_timeout_s))
     request = {"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest,
         "model": str(model_path), "backend": backend, "relay_url": relay_url,
         "context_tier": context_tier, "request_timeout_s": timeout_s,
-        "cleanup_timeout_s": cleanup_timeout_s, "cancellation_validation": cancellation_validation,
+        "cleanup_timeout_s": cleanup_timeout_s, "phase_budgets": budgets,
+        "cancellation_validation": cancellation_validation,
         "cancellation": {"prefill_tokens": prefill_cancel_tokens,
             "prefill_fraction": prefill_cancel_fraction, "generation_tokens": generation_cancel_tokens,
             "observation_window_s": observation_window_s, "recovery_timeout_s": recovery_timeout_s}}
-    request_name = evidence_name = diagnostic_name = None
+    request_name = evidence_name = diagnostic_name = phase_name = None
     try:
         request_fd, request_name = tempfile.mkstemp(prefix="long-context-request-", suffix=".json")
         evidence_fd, evidence_name = tempfile.mkstemp(prefix="long-context-evidence-", suffix=".json")
+        phase_fd, phase_name = tempfile.mkstemp(prefix="long-context-phase-", suffix=".json")
         if hasattr(os, "fchmod"):
-            os.fchmod(request_fd, 0o600); os.fchmod(evidence_fd, 0o600)
+            os.fchmod(request_fd, 0o600); os.fchmod(evidence_fd, 0o600); os.fchmod(phase_fd, 0o600)
         with os.fdopen(request_fd, "w", encoding="utf-8") as handle:
             json.dump(request, handle)
         os.close(evidence_fd)
+        os.close(phase_fd)
+        Path(phase_name).unlink()
         command = [sys.executable, str(Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
             "test_desktop_operator_ui_e2e.py"), "--benchmark-request", request_name,
-            "--benchmark-evidence", evidence_name, "--app-binary", str(app_path)]
+            "--benchmark-evidence", evidence_name, "--benchmark-phase-status", phase_name,
+            "--app-binary", str(app_path)]
         diagnostic_fd, diagnostic_name = tempfile.mkstemp(prefix="long-context-runner-", suffix=".log")
+        runner_started = time.monotonic()
         try:
             with os.fdopen(diagnostic_fd, "w+", encoding="utf-8") as diagnostic_handle:
                 if subprocess_run is None:
-                    completed = _run_owned_runner(command, timeout_s, cleanup_timeout_s)
+                    completed = _run_owned_runner(command, budgets["overall_s"] - budgets["cleanup_s"], cleanup_timeout_s)
                 else:
                     completed = subprocess_run(command, stdout=diagnostic_handle,
                         stderr=subprocess.STDOUT, text=True,
-                        timeout=timeout_s + cleanup_timeout_s, check=False)
-        except subprocess.TimeoutExpired:
-            return {"pass": False, "code": "packaged_runner_timeout"}
+                        timeout=budgets["overall_s"], check=False)
+        except subprocess.TimeoutExpired as exc:
+            phase, phase_error = _read_phase_status(phase_name, budgets)
+            if phase_error:
+                return {"pass": False, "runtime_contract_pass": False, "code": phase_error}
+            return {"pass": False, "runtime_contract_pass": False,
+                "code": "packaged_runner_timeout", "timeout_diagnostics": {
+                    "last_safe_phase": phase, "request_timeout_s": budgets["request_s"],
+                    "setup_budget_s": budgets["setup_s"],
+                    "finalization_budget_s": budgets["finalization_s"],
+                    "cleanup_budget_s": budgets["cleanup_s"],
+                    "overall_runner_budget_s": budgets["overall_s"],
+                    "elapsed_s": min(budgets["overall_s"], max(0.0, time.monotonic() - runner_started)),
+                    "cleanup_succeeded": bool(getattr(exc, "cleanup_succeeded", False))}}
         if completed.returncode != 0:
             tail = (completed.stdout or Path(diagnostic_name).read_text(
                 encoding="utf-8", errors="replace"))[-2048:]
@@ -1290,7 +1367,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         except (OSError, json.JSONDecodeError):
             return {"pass": False, "code": "packaged_evidence_malformed"}
     finally:
-        for name in (request_name, evidence_name, diagnostic_name):
+        for name in (request_name, evidence_name, diagnostic_name, phase_name):
             if name:
                 Path(name).unlink(missing_ok=True)
     if not isinstance(payload, dict):
@@ -1494,6 +1571,8 @@ def main(argv: list[str] | None = None) -> int:
             p.error("cancellation validation requires one bounded prefill trigger and bounded timeouts")
         external_prompt = _read_bounded_text(args.prompt) if args.prompt else None
         external_manifest = json.loads(_read_bounded_text(args.manifest, 1024 * 1024)) if args.manifest else None
+        report_manifest = external_manifest or generate_fixture(args.fixture, scenario=args.scenario)[1]
+        fixture_sha256 = report_manifest.get("fixture_sha256", "unavailable")
         completed: list[dict[str, Any]] = []
         evidence: dict[str, Any] = {"pass": False, "code": "packaged_contract_failed"}
         settings: dict[str, Any] | None = None
@@ -1561,7 +1640,9 @@ def main(argv: list[str] | None = None) -> int:
             report = {"mode":"packaged-runtime", "status":"not_run", "code":evidence.get("code", "packaged_contract_failed"),
                 "requested_trial_count":args.trials, "completed_trial_count":len(completed),
                 "fixture":{"id":args.fixture, "version":FIXTURE_VERSION, "scenario":args.scenario,
-                    "sha256":"unavailable"}}
+                    "sha256":fixture_sha256}}
+            if "timeout_diagnostics" in evidence:
+                report["timeout_diagnostics"] = evidence["timeout_diagnostics"]
         path=write_report_atomic(Path(args.out_dir), report)
         print(f"packaged_runtime_pass={evidence.get('pass', False)} report={path}")
         return 0 if all_runtime_complete and (all_semantic_pass or report_only_accepted) else 1

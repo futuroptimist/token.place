@@ -42,6 +42,21 @@ invocation retains its own protected temporary files, WebDriver/app resources, t
 bounded cleanup; trials are never concurrent. The command stops at the first runtime-contract
 failure and never labels a partial run as a completed aggregate.
 
+Each trial uses four distinct, finite budgets. Setup/readiness has 300 seconds for WebDriver and
+desktop startup, operator provisioning and model warm-load, relay registration, and landing-page
+readiness. `--request-timeout` belongs exclusively to inference and starts immediately before the
+send-button request submission. Evidence finalization has 120 seconds for telemetry/tokenizer
+collection, model fingerprinting, and the atomic evidence write. `--cleanup-timeout` separately
+bounds owned-process cleanup. Thus the parent watchdog is:
+
+```
+overall = 300s setup + request timeout + 120s finalization + cleanup timeout
+```
+
+The existing CLI remains unchanged; for example, `--request-timeout 600 --cleanup-timeout 30`
+gives a 1,050-second overall watchdog while preserving all 600 seconds for inference. Pre-request
+waits share the setup deadline and never borrow the request allowance.
+
 The `8k-fast` context window is 8,192 tokens and retains its 1,024-token output reservation, leaving
 an effective prompt budget of 7,168 tokens. The `small-8k` fixture therefore requests 7,168 prompt
 tokens, and its manifest reports that request separately from the bounded actual CI estimate. Both
@@ -64,8 +79,19 @@ Credentials, fragments, malformed ports, and other schemes are rejected. Tempora
 evidence, and diagnostic files are owner-only on POSIX, portable to Windows Python 3.11, and closed
 and deleted after each run. Runner output is written to a temporary bounded diagnostic tail rather
 than buffered without limit. On timeout the harness targets only the process tree it created after
-the runner's bounded cleanup opportunity; it never matches broad process names. Unit tests replace only the subprocess
+the runner's bounded cleanup opportunity; it never matches broad process names. A separate
+owner-only phase file is atomically replaced at safe boundaries. The parent can therefore report
+the last safe phase, configured low-cardinality budgets, bounded elapsed duration, and cleanup
+outcome after terminating a timed-out child. Missing, malformed, or stale phase evidence fails
+closed. This status never contains prompts, responses, encrypted envelopes, identifiers, paths,
+command lines, credentials, or raw logs, and it is deleted with the other temporary files.
+Unit tests replace only the subprocess
 boundary and are orchestration evidence, never physical Metal/CUDA evidence.
+
+The attempted Windows 11/NVIDIA run at desktop `0.1.14` timed out before completing its first
+`small-8k` / `single-needle` / `8k-fast` trial. It completed zero trials, so it supplied no semantic
+baseline. This harness correction is not physical CUDA or Metal validation; both physical reruns
+remain required.
 
 ## Fixture generation
 

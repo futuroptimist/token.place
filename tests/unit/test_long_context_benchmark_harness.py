@@ -1175,6 +1175,11 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
 
     def fake_run(command, **kwargs):
         if runner_outcome == "timeout":
+            request_path = command[command.index("--benchmark-request") + 1]
+            request = json.loads(h.Path(request_path).read_text())
+            phase_path = command[command.index("--benchmark-phase-status") + 1]
+            h.Path(phase_path).write_text(json.dumps({"schema_version": "packaged-runner-phase-v1",
+                "phase": "request_active", "sequence": 6, "budgets": request["phase_budgets"]}))
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if runner_outcome == "failed":
             return subprocess.CompletedProcess(command, 1, "", "")
@@ -1194,6 +1199,59 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
     )
     assert result["pass"] is False
     assert result["code"] == expected_code
+
+
+def test_packaged_runner_deadline_and_timeout_diagnostics_are_phase_bounded(tmp_path):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    observed = {}
+    def timeout_runner(command, **kwargs):
+        request = json.loads(h.Path(command[command.index("--benchmark-request") + 1]).read_text())
+        observed.update(request)
+        phase = command[command.index("--benchmark-phase-status") + 1]
+        h.Path(phase).write_text(json.dumps({"schema_version": "packaged-runner-phase-v1",
+            "phase": "request_active", "sequence": 6, "budgets": request["phase_budgets"]}))
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+    result = h.invoke_packaged_runtime_adapter(timeout_s=600, app_binary=str(app), model=str(model),
+        backend="cuda", relay_url="https://relay.example", cleanup_timeout_s=30,
+        report_only=True, subprocess_run=timeout_runner)
+    budgets = observed["phase_budgets"]
+    assert budgets == {"setup_s": 300.0, "request_s": 600.0, "finalization_s": 120.0,
+        "cleanup_s": 30.0, "overall_s": 1050.0}
+    assert result["code"] == "packaged_runner_timeout"
+    assert result["runtime_contract_pass"] is False
+    diagnostics = result["timeout_diagnostics"]
+    elapsed = diagnostics.pop("elapsed_s")
+    assert 0 <= elapsed <= 1050
+    assert diagnostics == {"last_safe_phase": "request_active",
+        "request_timeout_s": 600.0, "setup_budget_s": 300.0,
+        "finalization_budget_s": 120.0, "cleanup_budget_s": 30.0,
+        "overall_runner_budget_s": 1050.0,
+        "cleanup_succeeded": False}
+    serialized = json.dumps(result)
+    for prohibited in ("prompt", "response_text", "ciphertext", "request_id", str(tmp_path)):
+        assert prohibited not in serialized
+
+
+@pytest.mark.parametrize(("status", "code"), [
+    (None, "phase_status_missing"),
+    ("not-json", "phase_status_malformed"),
+    ({"schema_version":"packaged-runner-phase-v1", "phase":"request_active", "sequence":6,
+      "budgets":{"setup_s":1}}, "phase_status_stale"),
+])
+def test_packaged_timeout_phase_status_fails_closed(tmp_path, status, code):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    def timeout_runner(command, **kwargs):
+        phase = h.Path(command[command.index("--benchmark-phase-status") + 1])
+        if status is not None:
+            phase.write_text(status if isinstance(status, str) else json.dumps(status))
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+    result = h.invoke_packaged_runtime_adapter(timeout_s=1, app_binary=str(app), model=str(model),
+        backend="cpu", relay_url="https://relay.example", cleanup_timeout_s=1,
+        subprocess_run=timeout_runner)
+    assert result["code"] == code
+    assert result["runtime_contract_pass"] is False
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), "1"])
@@ -1223,6 +1281,10 @@ def test_report_only_does_not_suppress_runtime_failure(tmp_path):
         "--report-only",
     ], text=True, capture_output=True)
     assert proc.returncode == 1
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
+    _, manifest = h.generate_fixture("small-8k", scenario="structured-extraction")
+    assert report["completed_trial_count"] == 0
+    assert report["fixture"]["sha256"] == manifest["fixture_sha256"]
 
 
 @pytest.mark.parametrize("scenario", ["single-needle", "structured-extraction"])

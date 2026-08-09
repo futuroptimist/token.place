@@ -62,7 +62,12 @@ readable regular file, the app must be an executable regular file, and request/c
 be finite and positive. External E2EE relays require HTTPS; loopback relays may use HTTP or HTTPS.
 Credentials, fragments, malformed ports, and other schemes are rejected. Temporary request,
 evidence, and diagnostic files are owner-only on POSIX, portable to Windows Python 3.11, and closed
-and deleted after each run. Runner output is written to a temporary bounded diagnostic tail rather
+and deleted after each run. Phase checkpoints use unique owner-only temporary files and atomic
+publication; transient Windows sharing violations are retried only within an explicit deadline, so
+polling never exposes partially written JSON. Owner-created logs and directories are removed with
+the same bounded, lock-tolerant discipline after the exact owned process tree has exited. Cleanup
+failure is reported separately and never replaces an earlier categorical runner failure; a final
+checkpoint records the truthful cleanup result. Runner output is written to a temporary bounded diagnostic tail rather
 than buffered without limit. On timeout the harness targets only the process tree it created after
 the runner's bounded cleanup opportunity; it never matches broad process names. Unit tests replace only the subprocess
 boundary and are orchestration evidence, never physical Metal/CUDA evidence.
@@ -118,6 +123,9 @@ and ratios within an absolute 0.03 tolerance of the controlled fixture placement
 malformed, stale-hash, identity/total mismatch, ambiguous ordering, or out-of-tolerance evidence
 fails closed. Fixture whitespace/callback estimates are never relabeled as physical evidence. No
 Metal, CUDA, or CPU tokenizer run is claimed by this documentation.
+
+Physical Windows/CUDA and macOS/Metal validation of these checkpoint and cleanup changes remains
+outstanding; this harness-only change does not claim a successful physical benchmark.
 
 To run a separately stored golden prompt, supply its manifest as a required pair (the harness does
 not infer an oracle from model output):

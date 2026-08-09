@@ -1220,8 +1220,10 @@ def _read_packaged_phase_status(path: Path, parent_elapsed_s: float) -> tuple[di
     """Read the child's owner-only, low-cardinality atomic phase checkpoint."""
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (PermissionError, FileNotFoundError, json.JSONDecodeError):
         return None, "packaged_phase_status_missing"
+    except OSError:
+        return None, "packaged_phase_status_malformed"
     if (not isinstance(value, dict) or set(value) != {"schema_version", "phase", "sequence",
             "last_safe_phase", "failure_reason", "elapsed_s", "cleanup_succeeded"}
             or value.get("schema_version") != PACKAGED_PHASE_STATUS_VERSION

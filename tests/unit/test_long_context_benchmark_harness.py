@@ -36,6 +36,21 @@ def desktop_runner():
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
     return module
 
+
+@pytest.fixture
+def checkpoint_runner():
+    tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
+    names = {"_write_benchmark_phase", "_remove_owned_temporary"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names]
+    module = ModuleType("checkpoint_runner_under_test")
+    module.__dict__.update({"Path": Path, "json": json, "os": os,
+        "tempfile": __import__("tempfile"), "shutil": __import__("shutil"),
+        "time": time})
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
+        module.__dict__)
+    return module
+
 def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="linux"):
     return {"method": h.MEMORY_METHOD, "scope": h.MEMORY_SCOPE, "platform": platform,
         "sample_count": samples, "baseline_rss_bytes": baseline,
@@ -1258,6 +1273,106 @@ def test_packaged_phase_status_missing_malformed_or_stale_fails_closed(tmp_path,
     assert h._read_packaged_phase_status(path, 1) == (None, expected)
 
 
+def test_phase_checkpoint_retries_sharing_violation_atomically(
+        checkpoint_runner, tmp_path, monkeypatch):
+    path = tmp_path / "phase.json"
+    path.write_text("stale-but-complete")
+    original = Path.replace
+    attempts = []
+    observed = []
+    now = [0.0]
+
+    def replace(source, destination):
+        attempts.append(source)
+        if len(attempts) < 4:
+            observed.append(destination.read_text())
+            raise PermissionError("sensitive raw sharing error")
+        return original(source, destination)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    checkpoint_runner._write_benchmark_phase(
+        path, "runner_startup", 0, h.PACKAGED_PHASE_STATUS_VERSION,
+        h.PACKAGED_PHASES, last_safe_phase="runner_startup", retry_timeout_s=1,
+        clock=lambda: now[0], sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+
+    assert observed == ["stale-but-complete"] * 3
+    assert json.loads(path.read_text())["phase"] == "runner_startup"
+    assert len(set(attempts)) == 1
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_phase_checkpoint_deadline_is_bounded_and_sanitized(
+        checkpoint_runner, tmp_path, monkeypatch):
+    path = tmp_path / "private" / "phase.json"
+    path.parent.mkdir()
+    now = [0.0]
+    calls = [0]
+
+    def locked(_source, _destination):
+        calls[0] += 1
+        raise PermissionError("C:/Users/private/phase.json is used by secret.exe")
+
+    monkeypatch.setattr(Path, "replace", locked)
+    with pytest.raises(RuntimeError) as raised:
+        checkpoint_runner._write_benchmark_phase(
+            path, "runner_startup", 0, h.PACKAGED_PHASE_STATUS_VERSION,
+            h.PACKAGED_PHASES, last_safe_phase="runner_startup", retry_timeout_s=0.1,
+            clock=lambda: now[0], sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    assert str(raised.value) == "phase_checkpoint_publication_failed"
+    assert calls[0] == 3
+    assert "private" not in str(raised.value)
+    assert not list(path.parent.glob("*.tmp"))
+
+
+def test_phase_checkpoint_does_not_retry_non_sharing_error(
+        checkpoint_runner, tmp_path, monkeypatch):
+    calls = [0]
+    def invalid(_source, _destination):
+        calls[0] += 1
+        raise ValueError("programming error")
+    monkeypatch.setattr(Path, "replace", invalid)
+    with pytest.raises(ValueError, match="programming error"):
+        checkpoint_runner._write_benchmark_phase(
+            tmp_path / "phase.json", "runner_startup", 0,
+            h.PACKAGED_PHASE_STATUS_VERSION, h.PACKAGED_PHASES,
+            last_safe_phase="runner_startup")
+    assert calls[0] == 1
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_owned_temporary_unlink_retries_and_reports_truthfully(
+        checkpoint_runner, tmp_path, monkeypatch):
+    path = tmp_path / "driver.log"
+    path.touch()
+    original = Path.unlink
+    calls = [0]
+    now = [0.0]
+    def unlink(target, *args, **kwargs):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise PermissionError("sharing violation")
+        return original(target, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    checkpoint_runner._remove_owned_temporary(path, 1, clock=lambda: now[0],
+        sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    assert calls[0] == 2
+    assert not path.exists()
+
+
+def test_owned_temporary_permanent_lock_is_bounded_and_private(
+        checkpoint_runner, tmp_path, monkeypatch):
+    path = tmp_path / "driver-secret.log"
+    path.touch()
+    now = [0.0]
+    monkeypatch.setattr(Path, "unlink", lambda *_args, **_kwargs:
+        (_ for _ in ()).throw(PermissionError("C:/private/driver-secret.log")))
+    with pytest.raises(RuntimeError) as raised:
+        checkpoint_runner._remove_owned_temporary(path, 0.1, clock=lambda: now[0],
+            sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    assert str(raised.value) == "temporary_file_cleanup_failed"
+    assert "driver-secret" not in str(raised.value)
+
+
 def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
     model = tmp_path / "model.gguf"; model.write_bytes(b"x")
     app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
@@ -1593,12 +1708,14 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     """Exercise the real runner's pre-launch failure and final checkpoint path."""
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"_write_benchmark_phase", "run_long_context_packaged_mode"}
+    wanted = {"_write_benchmark_phase", "_remove_owned_temporary",
+        "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
+        "sys": sys,
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
@@ -1621,6 +1738,24 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     assert checkpoint["phase"] == "cleanup"
     assert checkpoint["failure_reason"] == "packaged_runner_failure"
     assert checkpoint["cleanup_succeeded"] is True
+
+    original_remove = namespace["_remove_owned_temporary"]
+    locked_log = []
+    def fail_driver_log(path, deadline, **kwargs):
+        if path.suffix == ".log":
+            locked_log.append(path)
+            raise RuntimeError("temporary_file_cleanup_failed")
+        return original_remove(path, deadline, **kwargs)
+    namespace["_remove_owned_temporary"] = fail_driver_log
+    phase_path.unlink()
+    with pytest.raises(RuntimeError, match="packaged setup timeout"):
+        namespace["run_long_context_packaged_mode"](
+            request_path, tmp_path / "evidence.json", phase_path, tmp_path / "app")
+    checkpoint = json.loads(phase_path.read_text())
+    assert checkpoint["failure_reason"] == "packaged_runner_failure"
+    assert checkpoint["cleanup_succeeded"] is False
+    assert locked_log
+    locked_log[0].unlink()
 
 
 @pytest.mark.parametrize("reason", [

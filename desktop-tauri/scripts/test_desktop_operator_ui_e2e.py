@@ -56,6 +56,7 @@ try:
         benchmark_operator_mode,
         OwnedProcessTreeMemorySampler,
         PACKAGED_FAILURE_REASONS,
+        parse_packaged_local_telemetry,
         packaged_phase_remaining,
         prefill_cancellation_trigger_state,
         start_phase_after,
@@ -957,7 +958,7 @@ def _enter_packaged_prompt(field, prompt: str, *, action_factory=ActionChains) -
 
 def _populate_and_submit_packaged_prompt(browser: webdriver.Chrome, prompt: str,
         setup_remaining, fail_closed, write_phase, *, clock=time.monotonic,
-        action_factory=ActionChains) -> float:
+        action_factory=ActionChains, before_submit=None) -> float:
     """Populate exactly, then check eligibility and explicitly submit."""
     setup_remaining()
     field = browser.find_element(By.CSS_SELECTOR, ".message-input")
@@ -975,6 +976,8 @@ def _populate_and_submit_packaged_prompt(browser: webdriver.Chrome, prompt: str,
         "send_button_not_enabled", fail_closed)
     write_phase("landing_page_ready")
     setup_remaining()
+    if before_submit is not None:
+        before_submit()
     started = clock()
     send_button.click()
     write_phase("request_active")
@@ -1118,9 +1121,37 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 }
                 return original(plaintext, ...args);
             };
+            const originalDecrypt = v.decrypt.bind(v);
+            v.decrypt = async function(...args) {
+                const plaintext = await originalDecrypt(...args);
+                try {
+                    const envelope = JSON.parse(plaintext);
+                    const response = envelope?.api_v1_response;
+                    if (envelope?.protocol === 'tokenplace_api_v1_relay_e2ee' &&
+                            response && typeof response === 'object' && !Array.isArray(response)) {
+                        const usage = response.usage;
+                        const choice = Array.isArray(response.choices) ? response.choices[0] : null;
+                        this.__longContextBenchmarkFinalMetadata = {
+                            prompt_tokens: usage?.prompt_tokens,
+                            completion_tokens: usage?.completion_tokens,
+                            finish_reason: response.finish_reason ?? choice?.finish_reason
+                        };
+                    }
+                } catch (_error) {
+                    // Progress envelopes and non-JSON plaintext are intentionally ignored.
+                }
+                return plaintext;
+            };
         """)
+        # The child writes directly to this file descriptor. Capture the exact byte
+        # boundary immediately before submission.
+        driver_log_boundary = 0
+        def capture_driver_log_boundary() -> None:
+            nonlocal driver_log_boundary
+            driver_log_boundary = driver_log.stat().st_size
         started = _populate_and_submit_packaged_prompt(browser, request["prompt"],
-            setup_remaining, fail_closed, write_phase)
+            setup_remaining, fail_closed, write_phase,
+            before_submit=capture_driver_log_boundary)
         progress: list[dict[str, object]] = []
         while time.monotonic() - started < float(request["request_timeout_s"]):
             memory_sampler.sample()
@@ -1140,6 +1171,13 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             raise RuntimeError("packaged request timeout")
         ended = time.monotonic()
         write_phase("response_received")
+        with driver_log.open("rb") as telemetry_handle:
+            telemetry_handle.seek(driver_log_boundary)
+            primary_log_slice = telemetry_handle.read().decode("utf-8", errors="replace")
+        local_telemetry = parse_packaged_local_telemetry(primary_log_slice)
+        # Retain only allowlisted final metadata at the decryption boundary.
+        response_metadata = browser.execute_script(
+            "return document.querySelector('#app').__vue__.__longContextBenchmarkFinalMetadata;")
         cancellation_recovery = None
         if request.get("cancellation_validation"):
             write_phase("cancellation_validation")
@@ -1163,13 +1201,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             "return document.querySelector('#app').__vue__.__longContextBenchmarkGenerationSettings;")
         if not isinstance(generation_settings, dict):
             raise RuntimeError("generation_settings_unavailable")
-        last_sequence = int(progress[-1]["sequence"])
-        last_elapsed = int(progress[-1]["elapsed_ms"])
-        result_observation = {"kind": "result", "status": "success",
-            "sequence": last_sequence + 1, "elapsed_ms": last_elapsed + 1}
-        terminal_observation = {"kind": "terminal", "state": "completed",
-            "sequence": last_sequence + 2, "elapsed_ms": last_elapsed + 2}
-        known_sequence = last_sequence
+        known_sequence = int(progress[-1]["sequence"])
         def post_terminal_poll() -> dict[str, object] | None:
             nonlocal known_sequence
             state = browser.execute_script(
@@ -1180,13 +1212,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 return event
             lifecycle, later_response = classify_benchmark_landing_state(state)
             if lifecycle == "completed" and later_response != response_text:
-                return {"kind": "result", "status": "success",
-                    "sequence": terminal_observation["sequence"] + 1,
-                    "elapsed_ms": terminal_observation["elapsed_ms"] + 1}
+                return {"kind": "unexpected_result"}
             if lifecycle == "failed":
-                return {"kind": "result", "status": "failed",
-                    "sequence": terminal_observation["sequence"] + 1,
-                    "elapsed_ms": terminal_observation["elapsed_ms"] + 1}
+                return {"kind": "unexpected_failure"}
             return None
         finalization_remaining()
         post_terminal = [item for item in observe_post_terminal(post_terminal_poll,
@@ -1194,14 +1222,6 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         finalization_remaining()
         memory_sampler.sample()
         memory_evidence = memory_sampler.summary()
-        first_generated = next((event for event in progress if int(event.get("generated_tokens", 0)) > 0), None)
-        first_s = started + (float(first_generated["elapsed_ms"]) / 1000) if first_generated else None
-        first_prefill = next((event for event in progress if event.get("phase") == "prefill"), None)
-        first_generating = next((event for event in progress if event.get("phase") == "generating"), None)
-        if first_prefill is None:
-            raise RuntimeError("prefill_phase_missing")
-        if first_generated is None or first_generating is None:
-            raise RuntimeError("required timing telemetry missing")
         try:
             finalization_remaining()
             tokenizer_observation = json.loads(tokenizer_evidence.read_text(encoding="utf-8"))
@@ -1209,12 +1229,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             raise RuntimeError("authoritative_target_depth_unavailable") from exc
         if (not isinstance(tokenizer_observation, dict)
                 or tokenizer_observation.get("runtime_identity") != runtime["Runtime ID"]
-                or tokenizer_observation.get("fixture_sha256") != request["manifest"]["fixture_sha256"]
-                or tokenizer_observation.get("total_prompt_tokens") != progress[-1]["total_prompt_tokens"]):
+                or tokenizer_observation.get("fixture_sha256") != request["manifest"]["fixture_sha256"]):
             raise RuntimeError("authoritative_target_depth_mismatched")
         finalization_remaining()
-        preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
-        prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
         write_phase("evidence_finalization")
         digest = hashlib.sha256()
         with Path(request["model"]).open("rb") as model_handle:
@@ -1226,18 +1243,19 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             "backend_requested": request["backend"],
             "backend_selected": runtime["Backend selected"].lower(),
             "backend_used": runtime["Backend used"].lower(), "model_fingerprint": digest.hexdigest(),
-            "authoritative_prompt_tokens": progress[-1]["total_prompt_tokens"], "progress_events": progress,
+            "authoritative_prompt_tokens": tokenizer_observation["total_prompt_tokens"],
+            "local_telemetry": local_telemetry, "progress_events": progress,
+            "response_metadata": response_metadata,
             "authoritative_tokenizer_evidence": tokenizer_observation,
             "kv_applicability": tokenizer_observation.get("kv_applicability"),
             "kv_estimate": tokenizer_observation.get("kv_estimator"),
             "kv_runtime": tokenizer_observation.get("kv_runtime"),
-            "result_observation": result_observation, "terminal_observation": terminal_observation,
-            "post_terminal_observations": post_terminal, "response_text": response_text, "start_s": started,
+            "atomic_response_completed": True,
+            "post_terminal_observations": post_terminal, "response_text": response_text,
             "generation_settings": generation_settings,
             "memory": memory_evidence,
             "runtime_configuration": runtime_configuration,
-            "preparing_end_s": preparing_end_s, "prefill_end_s": prefill_end_s,
-            "first_token_s": first_s, "end_s": ended, "output_tokens": progress[-1]["generated_tokens"]}
+            "request_duration_s": ended - started}
         if cancellation_recovery is not None:
             evidence["cancellation_recovery"] = cancellation_recovery
         finalization_remaining()

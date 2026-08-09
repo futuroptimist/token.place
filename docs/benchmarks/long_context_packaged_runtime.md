@@ -192,7 +192,7 @@ score. A successful packaged-runtime contract requires:
 - packaged app, build, bundled runtime, and safe model-fingerprint identity;
 - requested, selected, and used backend (`cpu`, `metal`, or `cuda`);
 - context tier, context window, output reservation, authoritative prompt count, and output count;
-- the validated progress summary and ordered terminal/result evidence;
+- separately validated authoritative packaged-local progress and best-effort encrypted delivery;
 - every timing, throughput, request-budget, and completion-margin field;
 - the complete semantic score and aggregate trial count, exact-match count, and pass rate.
 - requested/completed trial counts, per-category failure counts, and bounded per-trial boolean/error
@@ -283,8 +283,8 @@ Physical runs report these low-cardinality fields:
   layers, fallback/recovery diagnostics, and YaRN/RoPE configuration;
 - preparing, prefill, first-token, decode, total duration, throughput, request budget, and remaining
   margin;
-- progress counts, first/final progress, monotonicity, total consistency, processed-never-exceeds
-  total, cancellation timing, and worker recovery timing.
+- authoritative local phase counts, encrypted phases actually delivered, total consistency,
+  processed-never-exceeds-total, cancellation timing, and worker recovery timing.
 
 Validate JSON syntax before attachment:
 
@@ -294,33 +294,37 @@ python -m json.tool .tmp/long-context-report/long_context_benchmark_report.json 
 
 ## Progress, cancellation, and recovery invariants
 
-The evidence stream is ordered. Each observation has a strictly increasing integer `sequence` and
-strictly increasing non-negative integer `elapsed_ms` in the request's monotonic clock domain.
-Progress observations use only the production phases `preparing`, `prefill`, and `generating`;
-phases may repeat or advance one step and never regress or skip a phase after observation begins.
-Every progress observation contains a positive, stable `total_prompt_tokens` plus non-negative
-`cached_prompt_tokens`, `processed_prompt_tokens`, and `generated_tokens`. Processed and generated
-counts are monotonic, cached never exceeds processed, and processed never exceeds total.
+The authoritative runtime stream is the packaged operator's privacy-safe
+`api_v1.local_progress` records after the driver-log byte boundary captured immediately before the
+primary request. The runner takes that bounded snapshot as soon as the atomic response arrives,
+before any cancellation or recovery request. It parses only the exact old-app record shapes and
+the matching `api_v1.inference_complete` record; arbitrary surrounding log text and correlation
+identifiers are discarded. Multiple request/worker correlations, malformed records, or an
+ambiguous completion fail closed.
 
-The successful API response is an ordered `result` observation followed by exactly one ordered
-`terminal` observation with state `completed`. Cancellation and failure instead use `cancelled` or
-`failed`. Completion requires at least one progress observation, a generating phase, exactly one
-successful result, and full prompt processing. Duplicate or conflicting terminal observations,
-terminal timestamps preceding prior progress, results after cancellation, and any result or
-progress after terminal are categorical failures. The desktop runner continues polling for a short
-monotonic-deadline-bounded window after completion so late progress or a conflicting result is
-observable; it does not use a multi-second fixed sleep. Missing or malformed lifecycle telemetry
-returns stable errors such as `progress_missing`, `malformed_telemetry`, `incomplete_prefill`, or
-`progress_after_terminal` rather than passing or raising an uncaught exception.
+Local progress permits only `preparing`, `prefill`, and `generating`. Sequence and elapsed values
+are monotonic, phases cannot regress or skip, counters are non-negative, cached is at most processed,
+and processed is at most total. An initial pre-authoritative `preparing` event may truthfully carry
+total zero. The first positive total becomes stable. Completion requires full prompt processing,
+a genuine local generating event, positive generated-token progress, and agreement between local,
+admission/tokenizer, and final response prompt counts.
 
-Timings use five ordered monotonic boundaries: request start, end of preparing, end of prefill,
-first generated token, and request end. They produce preparing duration, prefill duration,
-time-to-first-token, decode duration, and total duration. Prompt throughput is authoritative prompt
-tokens divided by prefill duration; decode throughput is authoritative output tokens divided by
-decode duration. The report also records the request budget and `budget - total duration` completion
-margin. Zero-duration boundaries are valid and retain a zero duration (their division-based
-throughput is `null`); absent, non-finite, reversed, or over-budget timing fails closed and is never
-coerced to zero.
+Browser-observed encrypted P6 progress is validated separately as best-effort delivery. Every
+delivered event must be an exact, monotonic, schema-valid projection of the authoritative local
+stream, but terminal completion may overtake a coalesced generating update. Reports list only the
+phases actually delivered and set `terminal_overtook_generating_update` when appropriate; they
+never synthesize a browser phase. Atomic response completion and a short monotonic-deadline-bounded
+post-terminal silence check remain independent requirements. This preserves P6's one-latest-pending
+coalescing and terminal-discard behavior: encrypted progress never delays or changes the response.
+
+Runtime preparation, prefill, time-to-first-token, decode, and inference duration use only the
+packaged-local elapsed/timing domain. End-to-end request duration is recorded separately from the
+browser runner's monotonic clock; worker-relative elapsed values are never added to the browser
+click timestamp. Prompt tokens come from admission/tokenizer evidence and validated local progress,
+while completed output tokens come exclusively from allowlisted final response
+`usage.completion_tokens` (with `finish_reason` retained). The last coalesced progress counter and
+response-text estimates are not output-token authority. Missing, non-finite, reversed, inconsistent,
+or over-budget evidence fails closed rather than being coerced or inferred.
 
 Cancellation scenarios must be progress-triggered, not sleep-only:
 

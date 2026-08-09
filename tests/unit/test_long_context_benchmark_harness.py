@@ -18,6 +18,15 @@ def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="
         "peak_rss_bytes": peak, "final_rss_bytes": final}
 
 
+def _write_runner_status(command, *, phase="operator_ready", failure_reason="model_not_ready",
+        cleanup_succeeded=True, elapsed=0.0):
+    path = command[command.index("--benchmark-phase-status") + 1]
+    Path(path).write_text(json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase": phase, "sequence": h.PACKAGED_PHASES.index(phase) + 1,
+        "elapsed_s": elapsed, "failure_reason": failure_reason,
+        "cleanup_succeeded": cleanup_succeeded}))
+
+
 def _runtime_configuration(backend="cpu", tier="64k-full", window=65536, qwen=False):
     na = {"status": "not_applicable", "reason": "not_qwen_64k_profile"}
     result = {"mode": {"requested": "cpu" if backend == "cpu" else "gpu",
@@ -115,6 +124,31 @@ def test_desktop_runner_uses_evergreen_generation_settings_probe_name():
         "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
     assert "__p8" not in source
     assert source.count("__longContextBenchmarkGenerationSettings") == 3
+
+
+def test_packaged_landing_readiness_precedes_message_dependent_send_eligibility():
+    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
+        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
+    packaged = source[source.index("def run_long_context_packaged_mode"):source.index(
+        "def _long_context_followup_request")]
+    ordered = ["vue_not_ready", "client_keypair_not_ready", "model_not_ready",
+        "selected_tier = apply_benchmark_context_tier", ".message-input",
+        "field.send_keys(request[\"prompt\"])", "send_button_not_enabled",
+        "write_phase(\"request_active\")", ".send-button\").click()"]
+    positions = [packaged.index(marker) for marker in ordered]
+    assert positions == sorted(positions)
+    before_prompt = packaged[:packaged.index("field.send_keys(request[\"prompt\"])")]
+    assert 'find_element(By.CSS_SELECTOR, ".send-button").is_enabled()' not in before_prompt
+    assert "sendMessage()" not in packaged
+    assert "disabled = false" not in packaged
+    assert "removeAttribute('disabled')" not in packaged
+
+
+def test_packaged_failure_status_allowlist_excludes_sensitive_evidence():
+    prohibited = {"prompt", "traceback", "log", "path", "request_id", "client_id",
+        "session_id", "key", "secret", "ciphertext"}
+    assert h.PACKAGED_FAILURE_REASONS
+    assert h.PACKAGED_FAILURE_REASONS.isdisjoint(prohibited)
 
 
 def test_packaged_profile_fallback_normalizes_only_producer_absence_values():
@@ -1180,9 +1214,16 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
             h.Path(phase_path).write_text(json.dumps({
                 "schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
                 "phase": "request_active", "sequence": 6, "elapsed_s": 0.0,
+                "failure_reason": None, "cleanup_succeeded": False,
             }))
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if runner_outcome == "failed":
+            phase_path = command[command.index("--benchmark-phase-status") + 1]
+            h.Path(phase_path).write_text(json.dumps({
+                "schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+                "phase": "operator_ready", "sequence": 4, "elapsed_s": 0.0,
+                "failure_reason": "model_not_ready", "cleanup_succeeded": True,
+            }))
             return subprocess.CompletedProcess(command, 1, "", "")
         evidence_path = command[command.index("--benchmark-evidence") + 1]
         evidence = {"invalid-json": "not json", "non-object": "[]", "missing": "{}"}[runner_outcome]
@@ -1207,6 +1248,11 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
             h.PACKAGED_SETUP_BUDGET_S + 1 + h.PACKAGED_FINALIZATION_BUDGET_S)
         assert result["overall_timeout_s"] == result["runner_timeout_s"] + 1
         assert result["cleanup_succeeded"] is False
+    elif runner_outcome == "failed":
+        assert result == {"pass": False, "runtime_contract_pass": False,
+            "code": "packaged_runner_failed", "last_safe_phase": "operator_ready",
+            "failure_reason": "model_not_ready", "elapsed_s": 0.0,
+            "cleanup_succeeded": True}
 
 
 @pytest.mark.parametrize(("contents", "expected"), [
@@ -1233,6 +1279,7 @@ def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
         observed["timeout"] = kwargs["timeout"]
         request_path = command[command.index("--benchmark-request") + 1]
         observed["request"] = json.loads(h.Path(request_path).read_text())
+        _write_runner_status(command)
         return subprocess.CompletedProcess(command, 1)
     result = h.invoke_packaged_runtime_adapter(timeout_s=600, app_binary=str(app),
         model=str(model), backend="cuda", relay_url="https://relay.example",
@@ -1344,6 +1391,7 @@ def test_small_fixture_passes_8k_fast_context_preflight(tmp_path, scenario):
     launched = []
     def fake_run(command, **kwargs):
         launched.append(command)
+        _write_runner_status(command)
         return subprocess.CompletedProcess(command, 1, "runner stopped", "")
     result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model),
         backend="cpu", relay_url="https://relay.example", cleanup_timeout_s=1,
@@ -1405,6 +1453,7 @@ def test_packaged_temp_permissions_do_not_require_fchmod(tmp_path, monkeypatch):
     app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
     monkeypatch.delattr(h.os, "fchmod")
     def failed_runner(command, **kwargs):
+        _write_runner_status(command)
         return subprocess.CompletedProcess(command, 1)
     result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model), backend="cpu",
         relay_url="https://relay.example", cleanup_timeout_s=1, subprocess_run=failed_runner)
@@ -1471,7 +1520,7 @@ class _TimedOutProcess:
 def _write_phase(path, phase, elapsed):
     path.write_text(json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
         "phase": phase, "sequence": h.PACKAGED_PHASES.index(phase) + 1,
-        "elapsed_s": elapsed}))
+        "elapsed_s": elapsed, "failure_reason": None, "cleanup_succeeded": None}))
 
 
 def test_owned_runner_allows_on_time_child_cleanup_once(tmp_path):

@@ -53,12 +53,18 @@ SENSITIVE_KEYS = {
 # not borrow from the inference request's independently measured allowance.
 PACKAGED_SETUP_BUDGET_S = 300.0
 PACKAGED_FINALIZATION_BUDGET_S = 120.0
-PACKAGED_PHASE_STATUS_VERSION = "packaged-runner-phase-v1"
+PACKAGED_PHASE_STATUS_VERSION = "packaged-runner-phase-v2"
 PACKAGED_PHASES = (
     "runner_startup", "webdriver_ready", "desktop_ready", "operator_ready",
     "landing_page_ready", "request_active", "response_received",
     "cancellation_validation", "evidence_finalization", "cleanup",
 )
+PACKAGED_FAILURE_REASONS = frozenset({
+    "vue_not_ready", "client_keypair_not_ready", "model_not_ready",
+    "context_tier_not_applied", "message_input_not_populated",
+    "send_button_not_enabled", "packaged_runner_internal_failure",
+    "owned_process_cleanup_failed", "cleanup_checkpoint_failed",
+})
 
 
 def packaged_cancellation_budget_s(request_timeout_s: float, observation_window_s: float,
@@ -977,6 +983,15 @@ def validate_report(report: Any) -> None:
                         + report["cleanup_timeout_s"]
                     or report["elapsed_s"] > report["overall_timeout_s"]):
                 raise ValueError("report_timeout_diagnostics_invalid")
+        elif report["code"] == "packaged_runner_failed":
+            failure_fields = {"last_safe_phase", "failure_reason", "elapsed_s",
+                "cleanup_succeeded"}
+            if (not failure_fields.issubset(report)
+                    or report["last_safe_phase"] not in PACKAGED_PHASES
+                    or report["failure_reason"] not in PACKAGED_FAILURE_REASONS
+                    or not finite(report["elapsed_s"]) or report["elapsed_s"] < 0
+                    or not isinstance(report["cleanup_succeeded"], bool)):
+                raise ValueError("report_runner_failure_diagnostics_invalid")
         elif present_timeout_fields:
             raise ValueError("report_timeout_diagnostics_unexpected")
         return
@@ -1199,22 +1214,25 @@ def observe_post_terminal(poller: Callable[[], object], *, clock: Callable[[], f
     return observed
 
 
-def _read_packaged_phase_status(path: Path, parent_elapsed_s: float) -> tuple[str | None, str | None]:
+def _read_packaged_phase_status(path: Path, parent_elapsed_s: float) -> tuple[dict[str, Any] | None, str | None]:
     """Read the child's owner-only, low-cardinality atomic phase checkpoint."""
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None, "packaged_phase_status_missing"
-    if (not isinstance(value, dict) or set(value) != {"schema_version", "phase", "sequence", "elapsed_s"}
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "phase", "sequence",
+            "elapsed_s", "failure_reason", "cleanup_succeeded"}
             or value.get("schema_version") != PACKAGED_PHASE_STATUS_VERSION
             or value.get("phase") not in PACKAGED_PHASES
             or not isinstance(value.get("sequence"), int) or isinstance(value.get("sequence"), bool)
             or value["sequence"] != PACKAGED_PHASES.index(value["phase"]) + 1
             or not isinstance(value.get("elapsed_s"), (int, float))
             or isinstance(value.get("elapsed_s"), bool) or not math.isfinite(value["elapsed_s"])
-            or value["elapsed_s"] < 0 or value["elapsed_s"] > parent_elapsed_s + 1.0):
+            or value["elapsed_s"] < 0 or value["elapsed_s"] > parent_elapsed_s + 1.0
+            or value.get("failure_reason") not in ({None} | PACKAGED_FAILURE_REASONS)
+            or value.get("cleanup_succeeded") not in {None, True, False}):
         return None, "packaged_phase_status_malformed"
-    return str(value["phase"]), None
+    return value, None
 
 
 def _run_owned_runner(command: list[str], timeout_s: float,
@@ -1260,7 +1278,8 @@ def _run_owned_runner(command: list[str], timeout_s: float,
             elapsed_s = max(0.0, clock() - started)
             phase = None
             if phase_status_path is not None:
-                phase, _phase_error = _read_packaged_phase_status(phase_status_path, elapsed_s)
+                status, _phase_error = _read_packaged_phase_status(phase_status_path, elapsed_s)
+                phase = status.get("phase") if status else None
             if phase == "cleanup" and not cleanup_observed:
                 cleanup_observed = True
                 active_deadline = min(overall_deadline, clock() + cleanup_timeout_s)
@@ -1425,11 +1444,11 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
                         timeout=overall_budget_s, check=False)
         except subprocess.TimeoutExpired as exc:
             elapsed_s = min(overall_budget_s, max(0.0, time.monotonic() - runner_started))
-            phase, phase_error = _read_packaged_phase_status(Path(phase_name), elapsed_s)
+            status, phase_error = _read_packaged_phase_status(Path(phase_name), elapsed_s)
             if phase_error:
                 return {"pass": False, "runtime_contract_pass": False, "code": phase_error}
             return {"pass": False, "runtime_contract_pass": False,
-                "code": "packaged_runner_timeout", "last_safe_phase": phase,
+                "code": "packaged_runner_timeout", "last_safe_phase": status["phase"],
                 "request_timeout_s": float(timeout_s),
                 "setup_timeout_s": PACKAGED_SETUP_BUDGET_S,
                 "finalization_timeout_s": PACKAGED_FINALIZATION_BUDGET_S,
@@ -1439,9 +1458,15 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
                 "elapsed_s": elapsed_s,
                 "cleanup_succeeded": bool(getattr(exc, "cleanup_succeeded", False))}
         if completed.returncode != 0:
-            tail = (completed.stdout or Path(diagnostic_name).read_text(
-                encoding="utf-8", errors="replace"))[-2048:]
-            return {"pass": False, "code": "packaged_runner_failed", "diagnostic_tail": sanitize(tail)}
+            elapsed_s = min(overall_budget_s, max(0.0, time.monotonic() - runner_started))
+            status, phase_error = _read_packaged_phase_status(Path(phase_name), elapsed_s)
+            if phase_error:
+                return {"pass": False, "runtime_contract_pass": False, "code": phase_error}
+            return {"pass": False, "runtime_contract_pass": False,
+                "code": "packaged_runner_failed", "last_safe_phase": status["phase"],
+                "failure_reason": status["failure_reason"] or "packaged_runner_internal_failure",
+                "elapsed_s": status["elapsed_s"],
+                "cleanup_succeeded": bool(status["cleanup_succeeded"])}
         try:
             payload = json.loads(Path(evidence_name).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1737,7 +1762,7 @@ def main(argv: list[str] | None = None) -> int:
                 "requested_trial_count":args.trials, "completed_trial_count":len(completed),
                 "fixture":{"id":args.fixture, "version":FIXTURE_VERSION, "scenario":args.scenario,
                     "sha256":validated_fixture_sha256}}
-            for key in ("last_safe_phase", "request_timeout_s", "setup_timeout_s",
+            for key in ("last_safe_phase", "failure_reason", "request_timeout_s", "setup_timeout_s",
                     "finalization_timeout_s", "cancellation_timeout_s", "cleanup_timeout_s", "runner_timeout_s",
                     "overall_timeout_s", "elapsed_s", "cleanup_succeeded"):
                 if key in evidence:

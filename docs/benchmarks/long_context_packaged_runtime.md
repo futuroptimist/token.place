@@ -98,6 +98,22 @@ that estimate separately from the runtime admission/progress count, and uses onl
 physical throughput. Missing or inconsistent authoritative totals or target-offset evidence fails
 the packaged contract closed.
 
+Runtime timing has two deliberately separate clock domains. The authoritative preparation,
+prefill, time-to-first-token, and decode evidence comes from the packaged operator's exact
+`api_v1.local_progress` and `api_v1.inference_complete` records written after the request log
+boundary. End-to-end request duration comes from the browser runner's monotonic clock; worker
+elapsed values are never added to the browser click timestamp. The primary log snapshot is taken
+before cancellation or recovery requests, and only allowlisted numeric fields enter evidence.
+
+Browser-observed P6 progress is reported separately as `best_effort_encrypted`. Every delivered
+event must be schema-valid, monotonic, and compatible with the local stream, but documented
+coalescing and terminal discard may leave the observed phase list without `generating`. That gap
+is recorded as `terminal_overtook_generating_update`, not filled in or treated as a runtime timing
+failure. Final prompt/completion counts and finish reason come from an allowlisted metadata snapshot
+at the response decryption boundary; response content, envelopes, identifiers, keys, and ciphertext
+are not retained. Missing local prefill/generating evidence, positive generated-token progress,
+local completion timing, or consistent response usage still fails closed.
+
 The current synthetic fixture IDs are:
 
 | Fixture | Requested size | Purpose |

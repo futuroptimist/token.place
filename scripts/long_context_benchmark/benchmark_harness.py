@@ -64,7 +64,150 @@ PACKAGED_FAILURE_REASONS = frozenset({
     "vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
     "requested_context_tier_not_applied", "message_input_not_populated",
     "send_button_not_enabled", "packaged_runner_failure",
+    "authoritative_local_progress_missing", "local_prefill_phase_missing",
+    "local_generating_phase_missing", "positive_generated_token_progress_missing",
+    "local_timing_record_malformed", "response_usage_missing_or_inconsistent",
+    "encrypted_progress_delivery_invalid",
 })
+
+_LOCAL_PROGRESS_RE = re.compile(
+    r"api_v1\.local_progress request_id=(\S+) worker_generation=(\d+) sequence=(\d+) "
+    r"phase=(\S+) total_prompt_tokens=(\d+) cached_prompt_tokens=(\d+) "
+    r"processed_prompt_tokens=(\d+) generated_tokens=(\d+) elapsed_ms=(\d+)\s*$")
+_INFERENCE_COMPLETE_RE = re.compile(
+    r"api_v1\.inference_complete active_tier=(\S+) prompt_tokens=(\d+) "
+    r"output_reservation=(\d+) admission_result=admitted "
+    r"inference_duration_seconds=([0-9]+(?:\.[0-9]+)?) safe_error_code=none\s*$")
+
+
+def parse_packaged_local_telemetry(log_tail: str) -> dict[str, Any]:
+    """Parse only allowlisted P3 records from a request-bounded driver-log tail.
+
+    Correlation identifiers are used transiently and are deliberately absent from
+    the returned, report-safe value.
+    """
+    streams: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    timings: list[dict[str, Any]] = []
+    for raw_line_with_ending in log_tail.splitlines(keepends=True):
+        if not raw_line_with_ending.endswith(("\n", "\r")):
+            continue
+        raw_line = raw_line_with_ending.rstrip("\r\n")
+        progress_match = _LOCAL_PROGRESS_RE.search(raw_line)
+        if progress_match:
+            request_id, generation, sequence, phase, total, cached, processed, generated, elapsed = progress_match.groups()
+            streams.setdefault((request_id, int(generation)), []).append({
+                "sequence": int(sequence), "phase": phase,
+                "total_prompt_tokens": int(total), "cached_prompt_tokens": int(cached),
+                "processed_prompt_tokens": int(processed), "generated_tokens": int(generated),
+                "elapsed_ms": int(elapsed),
+            })
+            continue
+        timing_match = _INFERENCE_COMPLETE_RE.search(raw_line)
+        if timing_match:
+            tier, prompt, reservation, duration = timing_match.groups()
+            timings.append({"active_tier": tier, "prompt_tokens": int(prompt),
+                "output_reservation": int(reservation),
+                "inference_duration_seconds": float(duration)})
+    if not streams:
+        raise ValueError("authoritative_local_progress_missing")
+    if len(streams) != 1 or len(timings) != 1:
+        raise ValueError("local_timing_record_malformed")
+    events = next(iter(streams.values()))
+    validate_authoritative_local_progress(events)
+    timing = timings[0]
+    if timing["prompt_tokens"] != events[-1]["total_prompt_tokens"]:
+        raise ValueError("local_timing_record_malformed")
+    return {"progress_events": events, "inference_complete": timing}
+
+
+def validate_authoritative_local_progress(events: Any) -> dict[str, Any]:
+    """Strictly validate complete, packaged-local P3 progress evidence."""
+    if not isinstance(events, list) or not events:
+        raise ValueError("authoritative_local_progress_missing")
+    last_sequence = -1; last_elapsed = -1; last_phase = -1
+    last_processed = 0; last_cached = 0; last_generated = 0; positive_total = None
+    phases: set[str] = set()
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or set(event) != {"sequence", "phase",
+                "total_prompt_tokens", "cached_prompt_tokens", "processed_prompt_tokens",
+                "generated_tokens", "elapsed_ms"}:
+            raise ValueError("local_timing_record_malformed")
+        phase = event["phase"]
+        values = [event[key] for key in ("sequence", "total_prompt_tokens",
+            "cached_prompt_tokens", "processed_prompt_tokens", "generated_tokens", "elapsed_ms")]
+        if phase not in PHASES or any(not isinstance(value, int) or isinstance(value, bool)
+                or value < 0 for value in values):
+            raise ValueError("local_timing_record_malformed")
+        total, cached, processed, generated = values[1:5]
+        if total == 0 and not (index == 0 and phase == "preparing" and processed == cached == 0):
+            raise ValueError("local_timing_record_malformed")
+        if total > 0:
+            if positive_total is None: positive_total = total
+            elif total != positive_total: raise ValueError("local_timing_record_malformed")
+        if (event["sequence"] <= last_sequence or event["elapsed_ms"] < last_elapsed
+                or PHASES[phase] < last_phase
+                or last_phase >= 0 and PHASES[phase] > last_phase + 1
+                or processed < last_processed or cached < last_cached or generated < last_generated
+                or cached > processed or total > 0 and processed > total):
+            raise ValueError("local_timing_record_malformed")
+        last_sequence, last_elapsed, last_phase = event["sequence"], event["elapsed_ms"], PHASES[phase]
+        last_processed, last_cached, last_generated = processed, cached, generated
+        phases.add(phase)
+    if "prefill" not in phases: raise ValueError("local_prefill_phase_missing")
+    if "generating" not in phases: raise ValueError("local_generating_phase_missing")
+    if not any(e["phase"] == "generating" and e["generated_tokens"] > 0 for e in events):
+        raise ValueError("positive_generated_token_progress_missing")
+    if positive_total is None or last_processed != positive_total:
+        raise ValueError("local_timing_record_malformed")
+    return {"total_prompt_tokens": positive_total, "phases": sorted(phases, key=PHASES.get)}
+
+
+def validate_response_usage(value: Any, *, prompt_tokens: int) -> dict[str, Any]:
+    """Validate the content-free final response metadata retained by the browser hook."""
+    if not isinstance(value, dict) or set(value) != {"prompt_tokens", "completion_tokens", "finish_reason"}:
+        raise ValueError("response_usage_missing_or_inconsistent")
+    if any(not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 0
+            for key in ("prompt_tokens", "completion_tokens")):
+        raise ValueError("response_usage_missing_or_inconsistent")
+    if value["prompt_tokens"] != prompt_tokens or not isinstance(value["finish_reason"], str):
+        raise ValueError("response_usage_missing_or_inconsistent")
+    return dict(value)
+
+
+def validate_encrypted_progress_delivery(events: Any, authoritative_events: Any) -> dict[str, Any]:
+    """Validate P6 observations without requiring coalesced-away phases."""
+    if not isinstance(events, list) or not events:
+        raise ValueError("encrypted_progress_delivery_invalid")
+    try:
+        local = validate_authoritative_local_progress(authoritative_events)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    last_sequence = -1; last_elapsed = -1; last_processed = 0; last_generated = 0; last_phase = -1
+    phases: list[str] = []
+    for event in events:
+        if not isinstance(event, dict): raise ValueError("encrypted_progress_delivery_invalid")
+        phase = event.get("phase")
+        numbers = [event.get(key) for key in ("sequence", "elapsed_ms", "total_prompt_tokens",
+            "cached_prompt_tokens", "processed_prompt_tokens", "generated_tokens")]
+        if phase not in PHASES or any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in numbers):
+            raise ValueError("encrypted_progress_delivery_invalid")
+        sequence, elapsed, total, cached, processed, generated = numbers
+        if (sequence <= last_sequence or elapsed <= last_elapsed or PHASES[phase] < last_phase
+                or cached > processed or processed > total or processed < last_processed
+                or generated < last_generated or total != local["total_prompt_tokens"]):
+            raise ValueError("encrypted_progress_delivery_invalid")
+        last_sequence, last_elapsed, last_phase = sequence, elapsed, PHASES[phase]
+        last_processed, last_generated = processed, generated
+        if phase not in phases: phases.append(phase)
+    local_pairs = {(e["phase"], e["processed_prompt_tokens"], e["generated_tokens"])
+        for e in authoritative_events}
+    if any((e["phase"], e["processed_prompt_tokens"], e["generated_tokens"]) not in local_pairs
+            for e in events):
+        raise ValueError("encrypted_progress_delivery_invalid")
+    return {"pass": True, "delivery": "best_effort_encrypted",
+        "progress_event_count": len(events), "observed_phases": phases,
+        "terminal_overtook_generating_update": "generating" not in phases,
+        "final_progress": events[-1]}
 
 
 def packaged_cancellation_budget_s(request_timeout_s: float, observation_window_s: float,
@@ -1516,7 +1659,8 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         return {"pass": False, "code": "packaged_evidence_malformed"}
     required = {"app_identity", "runtime_identity", "bundled_runtime_identity", "build_identity",
         "backend_requested", "backend_selected", "backend_used", "model_fingerprint",
-        "authoritative_prompt_tokens", "progress_events",
+        "authoritative_prompt_tokens", "local_progress_events", "progress_events",
+        "encrypted_progress_delivery", "response_usage", "end_to_end_request_duration_s",
         "authoritative_tokenizer_evidence", "terminal_observation", "result_observation",
         "response_text", "start_s", "preparing_end_s", "prefill_end_s", "first_token_s", "end_s",
         "output_tokens", "post_terminal_observations", "generation_settings", "memory",
@@ -1531,12 +1675,18 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
             isinstance(payload["authoritative_prompt_tokens"], bool) or
             payload["authoritative_prompt_tokens"] <= 0 or
             not isinstance(payload["output_tokens"], int) or isinstance(payload["output_tokens"], bool) or
-            payload["output_tokens"] < 0 or not isinstance(payload["progress_events"], list) or
+            payload["output_tokens"] < 0 or not isinstance(payload["local_progress_events"], list) or
+            not isinstance(payload["progress_events"], list) or
             not isinstance(payload["post_terminal_observations"], list)):
         return {"pass": False, "code": "packaged_evidence_malformed"}
     try:
         generation_settings = validate_generation_settings(payload["generation_settings"])
         memory = validate_physical_memory_evidence(payload["memory"])
+        local_summary = validate_authoritative_local_progress(payload["local_progress_events"])
+        response_usage = validate_response_usage(payload["response_usage"],
+            prompt_tokens=payload["authoritative_prompt_tokens"])
+        encrypted_delivery = validate_encrypted_progress_delivery(
+            payload["progress_events"], payload["local_progress_events"])
     except ValueError as exc:
         return {"pass": False, "runtime_contract_pass": False, "code": str(exc)}
     authoritative_offsets, depth_error = _validate_authoritative_tokenizer_evidence(
@@ -1544,9 +1694,11 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         payload["runtime_identity"], payload["authoritative_prompt_tokens"])
     if depth_error:
         return {"pass": False, "code": depth_error}
-    observations = [*payload.get("progress_events", []), payload["result_observation"],
-        payload["terminal_observation"], *payload["post_terminal_observations"]]
-    progress = analyze_progress(observations)
+    progress = {**encrypted_delivery,
+        "authoritative_source": "packaged_local_operator_diagnostics",
+        "authoritative_phases": local_summary["phases"],
+        "atomic_result_observed": payload["result_observation"].get("status") == "success",
+        "post_terminal_silence": not payload["post_terminal_observations"]}
     semantic = evaluate_semantic(payload.get("response_text", ""), manifest)
     metrics = summarize_metrics(start_s=payload["start_s"], preparing_end_s=payload["preparing_end_s"],
         prefill_end_s=payload["prefill_end_s"], first_token_s=payload["first_token_s"],
@@ -1567,6 +1719,10 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         "progress": progress,
         "metrics": metrics,
         "memory": memory,
+        "timing_provenance": {"runtime": "packaged_local_monotonic",
+            "end_to_end": "browser_runner_monotonic",
+            "end_to_end_request_duration_s": payload["end_to_end_request_duration_s"]},
+        "response_usage": response_usage,
         "runtime": {key: payload[key] for key in ("app_identity", "runtime_identity",
             "bundled_runtime_identity", "build_identity", "backend_requested", "backend_selected",
             "backend_used", "model_fingerprint",
@@ -1612,9 +1768,11 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         runtime["runtime_identity"] == runtime.get("bundled_runtime_identity") and
         runtime["backend_requested"] == backend and runtime["backend_selected"] == backend and
         runtime["backend_used"] == backend)
-    final_total = (progress.get("final_progress") or {}).get("total_prompt_tokens")
+    final_total = local_summary["total_prompt_tokens"]
     runtime_contract_pass = bool(progress.get("pass") and metrics.get("pass") and identity_ok
-        and payload["authoritative_prompt_tokens"] == final_total)
+        and payload["authoritative_prompt_tokens"] == final_total
+        and payload["output_tokens"] == response_usage["completion_tokens"]
+        and progress["atomic_result_observed"] and progress["post_terminal_silence"])
     if cancellation_validation:
         runtime_contract_pass = runtime_contract_pass and bool(
             evidence.get("cancellation_recovery", {}).get("pass"))

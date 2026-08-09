@@ -248,6 +248,77 @@ def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="
         "peak_rss_bytes": peak, "final_rss_bytes": final}
 
 
+def _local_events(total=8):
+    return [
+        {"sequence": 1, "phase": "preparing", "total_prompt_tokens": 0,
+            "cached_prompt_tokens": 0, "processed_prompt_tokens": 0,
+            "generated_tokens": 0, "elapsed_ms": 0},
+        {"sequence": 2, "phase": "prefill", "total_prompt_tokens": total,
+            "cached_prompt_tokens": 0, "processed_prompt_tokens": total,
+            "generated_tokens": 0, "elapsed_ms": 10},
+        {"sequence": 3, "phase": "generating", "total_prompt_tokens": total,
+            "cached_prompt_tokens": 0, "processed_prompt_tokens": total,
+            "generated_tokens": 2, "elapsed_ms": 12},
+    ]
+
+
+def test_local_log_is_authoritative_when_encrypted_delivery_ends_at_prefill():
+    lines = []
+    for event in _local_events():
+        lines.append("2026-01-01 INFO api_v1.local_progress request_id=ephemeral "
+            "worker_generation=4 " + " ".join(f"{key}={event[key]}" for key in (
+                "sequence", "phase", "total_prompt_tokens", "cached_prompt_tokens",
+                "processed_prompt_tokens", "generated_tokens", "elapsed_ms")))
+    lines.append("C:\\Program Files\\token.place\\sidecar INFO api_v1.inference_complete "
+        "active_tier=64k-full prompt_tokens=8 output_reservation=32 admission_result=admitted "
+        "inference_duration_seconds=0.014 safe_error_code=none")
+    parsed = h.parse_packaged_local_telemetry(
+        "unrelated prompt text\n" + "\n".join(lines) + "\npartial final secret path")
+    delivery = h.validate_encrypted_progress_delivery([_local_events()[1]], parsed["progress_events"])
+    assert delivery["observed_phases"] == ["prefill"]
+    assert delivery["terminal_overtook_generating_update"] is True
+    assert "ephemeral" not in json.dumps(parsed)
+    assert "Program Files" not in json.dumps(parsed)
+
+
+def test_local_generating_and_positive_output_are_required():
+    with pytest.raises(ValueError, match="local_generating_phase_missing"):
+        h.validate_authoritative_local_progress(_local_events()[:-1])
+    events = _local_events()
+    events[-1]["generated_tokens"] = 0
+    with pytest.raises(ValueError, match="positive_generated_token_progress_missing"):
+        h.validate_authoritative_local_progress(events)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda events: events[1].update(sequence=0),
+    lambda events: events[2].update(elapsed_ms=9),
+    lambda events: events[2].update(phase="preparing"),
+    lambda events: events[2].update(processed_prompt_tokens=7),
+    lambda events: events[2].update(total_prompt_tokens=9),
+])
+def test_local_progress_rejects_decreases_changed_totals_and_incomplete_prefill(mutation):
+    events = _local_events()
+    mutation(events)
+    with pytest.raises(ValueError, match="local_timing_record_malformed"):
+        h.validate_authoritative_local_progress(events)
+
+
+def test_zero_total_preparing_is_only_valid_initially_and_usage_is_authoritative():
+    assert h.validate_authoritative_local_progress(_local_events())["total_prompt_tokens"] == 8
+    events = _local_events()
+    events.insert(1, dict(events[0], sequence=2, elapsed_ms=1))
+    events[2]["sequence"] = 3; events[3]["sequence"] = 4
+    with pytest.raises(ValueError, match="local_timing_record_malformed"):
+        h.validate_authoritative_local_progress(events)
+    usage = h.validate_response_usage(
+        {"prompt_tokens": 8, "completion_tokens": 7, "finish_reason": "stop"}, prompt_tokens=8)
+    assert usage["completion_tokens"] == 7
+    with pytest.raises(ValueError, match="response_usage_missing_or_inconsistent"):
+        h.validate_response_usage(
+            {"prompt_tokens": 9, "completion_tokens": 7, "finish_reason": "stop"}, prompt_tokens=8)
+
+
 def _runtime_configuration(backend="cpu", tier="64k-full", window=65536, qwen=False):
     na = {"status": "not_applicable", "reason": "not_qwen_64k_profile"}
     result = {"mode": {"requested": "cpu" if backend == "cpu" else "gpu",
@@ -1250,6 +1321,10 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
             {"sequence": 2, "phase": "prefill", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": authoritative_total, "generated_tokens": 0, "elapsed_ms": 1000},
             {"sequence": 3, "phase": "generating", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": authoritative_total, "generated_tokens": 4, "elapsed_ms": 2000},
         ],
+        "encrypted_progress_delivery": {"delivery": "best_effort_encrypted"},
+        "response_usage": {"prompt_tokens": authoritative_total,
+            "completion_tokens": 4, "finish_reason": "stop"},
+        "end_to_end_request_duration_s": 2.1,
         "result_observation": {"kind":"result", "status":"success", "sequence":4, "elapsed_ms":2001},
         "terminal_observation": {"kind":"terminal", "state":"completed", "sequence":5, "elapsed_ms":2002},
         "post_terminal_observations": [], "start_s": 0.0, "preparing_end_s": 0.0,
@@ -1283,6 +1358,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
             "unit":"MiB", "decimal_places":2},
         "cancellation_recovery": _physical_cancellation_evidence(authoritative_total),
     }
+    payload["local_progress_events"] = [dict(event) for event in payload["progress_events"]]
 
 
     app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
@@ -1654,6 +1730,10 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
         "result_observation":{"kind":"result", "status":"success", "sequence":3, "elapsed_ms":2001},
         "terminal_observation":{"kind":"terminal", "state":"completed", "sequence":4, "elapsed_ms":2002},
         "post_terminal_observations":[],
+        "response_usage": {"prompt_tokens": manifest["actual_tokens"],
+            "completion_tokens": 4, "finish_reason": "stop"},
+        "encrypted_progress_delivery": {"delivery": "best_effort_encrypted"},
+        "end_to_end_request_duration_s": 2.1,
         "app_identity": "token.place", "runtime_identity": "bundled",
         "bundled_runtime_identity": "bundled", "build_identity": "build",
         "backend_requested": "cpu", "backend_selected": "cpu", "backend_used": "cpu", "model_fingerprint": "sha256:test",
@@ -1673,6 +1753,7 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
              "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4,
              "elapsed_ms": 2000}],
     }
+    payload["local_progress_events"] = [dict(event) for event in payload["progress_events"]]
     def fake_run(command, **kwargs):
         h.Path(command[command.index("--benchmark-evidence") + 1]).write_text(json.dumps(payload))
         _write_phase(h.Path(command[command.index("--benchmark-phase-status") + 1]),

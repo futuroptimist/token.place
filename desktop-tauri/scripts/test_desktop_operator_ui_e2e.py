@@ -56,6 +56,9 @@ try:
         benchmark_operator_mode,
         OwnedProcessTreeMemorySampler,
         PACKAGED_FAILURE_REASONS,
+        parse_packaged_local_telemetry,
+        validate_authoritative_local_telemetry,
+        validate_response_usage,
         packaged_phase_remaining,
         prefill_cancellation_trigger_state,
         start_phase_after,
@@ -1097,6 +1100,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         browser.execute_script("""
             const v = document.querySelector('#app').__vue__;
             const original = v.encrypt.bind(v);
+            const originalDecrypt = v.decrypt.bind(v);
             v.encrypt = async function(plaintext, ...args) {
                 const envelope = JSON.parse(plaintext);
                 if (envelope.protocol === 'tokenplace_api_v1_relay_e2ee') {
@@ -1118,7 +1122,29 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 }
                 return original(plaintext, ...args);
             };
+            v.decrypt = async function(...args) {
+                const plaintext = await originalDecrypt(...args);
+                try {
+                    const envelope = JSON.parse(plaintext);
+                    const response = envelope?.protocol === 'tokenplace_api_v1_relay_e2ee'
+                        ? envelope.api_v1_response : null;
+                    const usage = response?.usage;
+                    const finishReason = response?.finish_reason
+                        ?? response?.choices?.[0]?.finish_reason;
+                    if (usage && typeof usage === 'object' && !Array.isArray(usage)) {
+                        this.__longContextBenchmarkResponseUsage = {
+                            prompt_tokens: usage.prompt_tokens,
+                            completion_tokens: usage.completion_tokens,
+                            finish_reason: finishReason
+                        };
+                    }
+                } catch (_) {}
+                return plaintext;
+            };
         """)
+        # The byte boundary makes later recovery requests ineligible for primary evidence.
+        driver_log_handle.flush()
+        log_boundary = driver_log.stat().st_size
         started = _populate_and_submit_packaged_prompt(browser, request["prompt"],
             setup_remaining, fail_closed, write_phase)
         progress: list[dict[str, object]] = []
@@ -1140,6 +1166,27 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             raise RuntimeError("packaged request timeout")
         ended = time.monotonic()
         write_phase("response_received")
+        driver_log_handle.flush()
+        with driver_log.open("rb") as log_reader:
+            log_reader.seek(log_boundary)
+            primary_log_slice = log_reader.read(4 * 1024 * 1024 + 1)
+        if len(primary_log_slice) > 4 * 1024 * 1024:
+            fail_closed("local_timing_record_malformed")
+        try:
+            raw_local_telemetry = parse_packaged_local_telemetry(
+                primary_log_slice.decode("utf-8"))
+            local_telemetry = validate_authoritative_local_telemetry(raw_local_telemetry)
+        except (UnicodeDecodeError, ValueError) as exc:
+            reason = str(exc) if str(exc) in PACKAGED_FAILURE_REASONS else "local_timing_record_malformed"
+            fail_closed(reason)
+        browser.set_script_timeout(min(5, float(request["finalization_timeout_s"])))
+        response_usage_raw = browser.execute_script(
+            "return document.querySelector('#app').__vue__.__longContextBenchmarkResponseUsage;")
+        try:
+            response_usage = validate_response_usage(
+                response_usage_raw, local_telemetry["prompt_tokens"])
+        except ValueError:
+            fail_closed("response_usage_missing_or_inconsistent")
         cancellation_recovery = None
         if request.get("cancellation_validation"):
             write_phase("cancellation_validation")
@@ -1156,20 +1203,16 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 raise RuntimeError("packaged evidence finalization timeout")
             return remaining
         finalization_remaining()
-        if not progress or not isinstance(response_text, str):
-            raise RuntimeError("required encrypted progress or response evidence missing")
+        if not progress:
+            fail_closed("encrypted_progress_delivery_invalid")
+        if not isinstance(response_text, str):
+            raise RuntimeError("packaged_response_error")
         browser.set_script_timeout(finalization_remaining())
         generation_settings = browser.execute_script(
             "return document.querySelector('#app').__vue__.__longContextBenchmarkGenerationSettings;")
         if not isinstance(generation_settings, dict):
             raise RuntimeError("generation_settings_unavailable")
-        last_sequence = int(progress[-1]["sequence"])
-        last_elapsed = int(progress[-1]["elapsed_ms"])
-        result_observation = {"kind": "result", "status": "success",
-            "sequence": last_sequence + 1, "elapsed_ms": last_elapsed + 1}
-        terminal_observation = {"kind": "terminal", "state": "completed",
-            "sequence": last_sequence + 2, "elapsed_ms": last_elapsed + 2}
-        known_sequence = last_sequence
+        known_sequence = int(progress[-1]["sequence"])
         def post_terminal_poll() -> dict[str, object] | None:
             nonlocal known_sequence
             state = browser.execute_script(
@@ -1180,13 +1223,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 return event
             lifecycle, later_response = classify_benchmark_landing_state(state)
             if lifecycle == "completed" and later_response != response_text:
-                return {"kind": "result", "status": "success",
-                    "sequence": terminal_observation["sequence"] + 1,
-                    "elapsed_ms": terminal_observation["elapsed_ms"] + 1}
+                return {"unexpected_result": True}
             if lifecycle == "failed":
-                return {"kind": "result", "status": "failed",
-                    "sequence": terminal_observation["sequence"] + 1,
-                    "elapsed_ms": terminal_observation["elapsed_ms"] + 1}
+                return {"unexpected_failure": True}
             return None
         finalization_remaining()
         post_terminal = [item for item in observe_post_terminal(post_terminal_poll,
@@ -1194,14 +1233,6 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         finalization_remaining()
         memory_sampler.sample()
         memory_evidence = memory_sampler.summary()
-        first_generated = next((event for event in progress if int(event.get("generated_tokens", 0)) > 0), None)
-        first_s = started + (float(first_generated["elapsed_ms"]) / 1000) if first_generated else None
-        first_prefill = next((event for event in progress if event.get("phase") == "prefill"), None)
-        first_generating = next((event for event in progress if event.get("phase") == "generating"), None)
-        if first_prefill is None:
-            raise RuntimeError("prefill_phase_missing")
-        if first_generated is None or first_generating is None:
-            raise RuntimeError("required timing telemetry missing")
         try:
             finalization_remaining()
             tokenizer_observation = json.loads(tokenizer_evidence.read_text(encoding="utf-8"))
@@ -1210,11 +1241,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         if (not isinstance(tokenizer_observation, dict)
                 or tokenizer_observation.get("runtime_identity") != runtime["Runtime ID"]
                 or tokenizer_observation.get("fixture_sha256") != request["manifest"]["fixture_sha256"]
-                or tokenizer_observation.get("total_prompt_tokens") != progress[-1]["total_prompt_tokens"]):
+                or tokenizer_observation.get("total_prompt_tokens") != local_telemetry["prompt_tokens"]):
             raise RuntimeError("authoritative_target_depth_mismatched")
         finalization_remaining()
-        preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
-        prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
         write_phase("evidence_finalization")
         digest = hashlib.sha256()
         with Path(request["model"]).open("rb") as model_handle:
@@ -1226,18 +1255,20 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             "backend_requested": request["backend"],
             "backend_selected": runtime["Backend selected"].lower(),
             "backend_used": runtime["Backend used"].lower(), "model_fingerprint": digest.hexdigest(),
-            "authoritative_prompt_tokens": progress[-1]["total_prompt_tokens"], "progress_events": progress,
+            "authoritative_prompt_tokens": local_telemetry["prompt_tokens"],
+            "authoritative_local_telemetry": raw_local_telemetry,
+            "encrypted_progress_events": progress, "response_usage": response_usage,
             "authoritative_tokenizer_evidence": tokenizer_observation,
             "kv_applicability": tokenizer_observation.get("kv_applicability"),
             "kv_estimate": tokenizer_observation.get("kv_estimator"),
             "kv_runtime": tokenizer_observation.get("kv_runtime"),
-            "result_observation": result_observation, "terminal_observation": terminal_observation,
-            "post_terminal_observations": post_terminal, "response_text": response_text, "start_s": started,
+            "atomic_final_response_completed": True,
+            "post_terminal_silence": not post_terminal,
+            "response_text": response_text, "start_s": started,
             "generation_settings": generation_settings,
             "memory": memory_evidence,
             "runtime_configuration": runtime_configuration,
-            "preparing_end_s": preparing_end_s, "prefill_end_s": prefill_end_s,
-            "first_token_s": first_s, "end_s": ended, "output_tokens": progress[-1]["generated_tokens"]}
+            "end_s": ended, "output_tokens": response_usage["completion_tokens"]}
         if cancellation_recovery is not None:
             evidence["cancellation_recovery"] = cancellation_recovery
         finalization_remaining()

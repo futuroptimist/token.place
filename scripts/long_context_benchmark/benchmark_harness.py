@@ -31,10 +31,18 @@ import psutil
 
 from utils.context_profiles import get_context_profile
 
-SCHEMA_VERSION = "long-context-benchmark-report-v1"
+SCHEMA_VERSION = "long-context-benchmark-report-v2"
 FIXTURE_VERSION = "long-context-semantic-haystack-v6"
 DEFAULT_SEED = "long-context-benchmark-default"
 PHASES = {"preparing": 0, "prefill": 1, "generating": 2}
+LOCAL_PROGRESS_RE = re.compile(
+    r"api_v1\.local_progress request_id=(\S+) worker_generation=(\d+) sequence=(\d+) "
+    r"phase=(\S+) total_prompt_tokens=(\d+) cached_prompt_tokens=(\d+) "
+    r"processed_prompt_tokens=(\d+) generated_tokens=(\d+) elapsed_ms=(\d+)(?=\s|$)")
+INFERENCE_COMPLETE_RE = re.compile(
+    r"api_v1\.inference_complete active_tier=(\S+) prompt_tokens=(\d+) "
+    r"output_reservation=(\d+) admission_result=admitted "
+    r"inference_duration_seconds=([0-9]+(?:\.[0-9]+)?) safe_error_code=none(?=\s|$)")
 SECRET_PATTERNS = [
     re.compile(r"(?i)\b(authorization|api[_-]?key|secret|token)\b\s*[:=]\s*(?:bearer\s+)?[^\s,}\]\)]+"),
     re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+"),
@@ -64,6 +72,10 @@ PACKAGED_FAILURE_REASONS = frozenset({
     "vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
     "requested_context_tier_not_applied", "message_input_not_populated",
     "send_button_not_enabled", "packaged_runner_failure",
+    "authoritative_local_progress_missing", "local_prefill_phase_missing",
+    "local_generating_phase_missing", "positive_generated_token_progress_missing",
+    "local_timing_record_malformed", "response_usage_missing_or_inconsistent",
+    "encrypted_progress_delivery_invalid",
 })
 
 
@@ -559,6 +571,161 @@ def prefill_cancellation_trigger_state(processed_prompt_tokens: Any, threshold: 
         return "completed"
     return "trigger" if processed_prompt_tokens >= threshold else "waiting"
 
+
+def parse_packaged_local_telemetry(text: str) -> dict[str, Any]:
+    """Extract only allowlisted P3 records from one bounded, post-submit log slice."""
+    if not isinstance(text, str):
+        raise ValueError("local_timing_record_malformed")
+    groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    completions: list[dict[str, Any]] = []
+    lines = text.splitlines()
+    if text and not text.endswith(("\n", "\r")):
+        lines = lines[:-1]  # the child may still be writing this record
+    for line in lines:
+        marker = "api_v1.local_progress"
+        if marker in line:
+            match = LOCAL_PROGRESS_RE.search(line)
+            if not match:
+                raise ValueError("local_timing_record_malformed")
+            request_id, generation, sequence, phase, total, cached, processed, generated, elapsed = match.groups()
+            event = {"phase": phase, "sequence": int(sequence), "elapsed_ms": int(elapsed),
+                "total_prompt_tokens": int(total), "cached_prompt_tokens": int(cached),
+                "processed_prompt_tokens": int(processed), "generated_tokens": int(generated)}
+            groups.setdefault((request_id, int(generation)), []).append(event)
+        elif "api_v1.inference_complete" in line:
+            match = INFERENCE_COMPLETE_RE.search(line)
+            if not match:
+                raise ValueError("local_timing_record_malformed")
+            tier, prompt, reservation, duration = match.groups()
+            completions.append({"active_tier": tier, "prompt_tokens": int(prompt),
+                "output_reservation": int(reservation),
+                "inference_duration_seconds": float(duration)})
+    if not groups:
+        raise ValueError("authoritative_local_progress_missing")
+    if len(groups) != 1 or len(completions) != 1:
+        raise ValueError("local_timing_record_malformed")
+    return {"local_progress": next(iter(groups.values())), "inference_complete": completions[0]}
+
+
+def validate_authoritative_local_telemetry(value: Any) -> dict[str, Any]:
+    """Validate a complete P3 stream without retaining its ephemeral correlation identity."""
+    if (not isinstance(value, dict) or set(value) != {"local_progress", "inference_complete"}
+            or not isinstance(value["local_progress"], list)):
+        raise ValueError("local_timing_record_malformed")
+    events = value["local_progress"]
+    if not events:
+        raise ValueError("authoritative_local_progress_missing")
+    last_sequence = last_elapsed = -1
+    last_phase = -1
+    last_processed = last_cached = last_generated = 0
+    total: int | None = None
+    phases: list[str] = []
+    for index, event in enumerate(events):
+        keys = {"phase", "sequence", "elapsed_ms", "total_prompt_tokens",
+            "cached_prompt_tokens", "processed_prompt_tokens", "generated_tokens"}
+        if not isinstance(event, dict) or set(event) != keys or event.get("phase") not in PHASES:
+            raise ValueError("local_timing_record_malformed")
+        numbers = [event[key] for key in keys - {"phase"}]
+        if any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in numbers):
+            raise ValueError("local_timing_record_malformed")
+        phase = PHASES[event["phase"]]
+        if (event["sequence"] <= last_sequence or event["elapsed_ms"] < last_elapsed
+                or phase < last_phase or last_phase >= 0 and phase > last_phase + 1
+                or event["processed_prompt_tokens"] < last_processed
+                or event["cached_prompt_tokens"] < last_cached
+                or event["generated_tokens"] < last_generated):
+            raise ValueError("local_timing_record_malformed")
+        current_total = event["total_prompt_tokens"]
+        if current_total == 0:
+            if not (index == 0 and event["phase"] == "preparing" and total is None
+                    and event["cached_prompt_tokens"] == event["processed_prompt_tokens"] == 0):
+                raise ValueError("local_timing_record_malformed")
+        elif total is None:
+            total = current_total
+        elif current_total != total:
+            raise ValueError("local_timing_record_malformed")
+        if current_total and not (event["cached_prompt_tokens"] <= event["processed_prompt_tokens"] <= current_total):
+            raise ValueError("local_timing_record_malformed")
+        last_sequence, last_elapsed, last_phase = event["sequence"], event["elapsed_ms"], phase
+        last_processed = event["processed_prompt_tokens"]
+        last_cached = event["cached_prompt_tokens"]
+        last_generated = event["generated_tokens"]
+        phases.append(event["phase"])
+    if "prefill" not in phases:
+        raise ValueError("local_prefill_phase_missing")
+    if "generating" not in phases:
+        raise ValueError("local_generating_phase_missing")
+    if last_generated <= 0:
+        raise ValueError("positive_generated_token_progress_missing")
+    if total is None or last_processed != total:
+        raise ValueError("local_timing_record_malformed")
+    complete = value["inference_complete"]
+    expected_keys = {"active_tier", "prompt_tokens", "output_reservation", "inference_duration_seconds"}
+    if (not isinstance(complete, dict) or set(complete) != expected_keys
+            or complete["prompt_tokens"] != total
+            or not isinstance(complete["active_tier"], str)
+            or not isinstance(complete["output_reservation"], int)
+            or isinstance(complete["output_reservation"], bool) or complete["output_reservation"] < 0
+            or not isinstance(complete["inference_duration_seconds"], (int, float))
+            or isinstance(complete["inference_duration_seconds"], bool)
+            or not math.isfinite(complete["inference_duration_seconds"])
+            or complete["inference_duration_seconds"] < last_elapsed / 1000):
+        raise ValueError("local_timing_record_malformed")
+    first_prefill = next(event for event in events if event["phase"] == "prefill")
+    first_generating = next(event for event in events if event["phase"] == "generating")
+    first_generated = next(event for event in events if event["generated_tokens"] > 0)
+    return {"events": [dict(event) for event in events], "prompt_tokens": total,
+        "observed_phases": list(dict.fromkeys(phases)),
+        "preparing_end_ms": first_prefill["elapsed_ms"],
+        "prefill_end_ms": first_generating["elapsed_ms"],
+        "first_token_ms": first_generated["elapsed_ms"],
+        "inference_duration_ms": complete["inference_duration_seconds"] * 1000}
+
+
+def validate_response_usage(value: Any, prompt_tokens: int) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"prompt_tokens", "completion_tokens", "finish_reason"}:
+        raise ValueError("response_usage_missing_or_inconsistent")
+    if (any(not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 0
+            for key in ("prompt_tokens", "completion_tokens"))
+            or value["prompt_tokens"] != prompt_tokens or value["completion_tokens"] <= 0
+            or not isinstance(value["finish_reason"], str) or not value["finish_reason"]):
+        raise ValueError("response_usage_missing_or_inconsistent")
+    return dict(value)
+
+
+def analyze_encrypted_progress(observations: Any, local_events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Validate delivered P6 events as a best-effort subset of authoritative P3."""
+    if not isinstance(observations, list) or not observations:
+        raise ValueError("encrypted_progress_delivery_invalid")
+    last_seq = last_elapsed = -1
+    last_phase = -1
+    last_processed = last_generated = 0
+    phases: list[str] = []
+    keys = {"phase", "sequence", "elapsed_ms", "total_prompt_tokens",
+        "cached_prompt_tokens", "processed_prompt_tokens", "generated_tokens"}
+    for event in observations:
+        if not isinstance(event, dict) or set(event) != keys or event.get("phase") not in PHASES:
+            raise ValueError("encrypted_progress_delivery_invalid")
+        numeric = [event[key] for key in keys - {"phase"}]
+        phase = PHASES[event["phase"]]
+        if (any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in numeric)
+                or event["sequence"] <= last_seq or event["elapsed_ms"] <= last_elapsed
+                or phase < last_phase or last_phase >= 0 and phase > last_phase + 1
+                or event["processed_prompt_tokens"] < last_processed
+                or event["generated_tokens"] < last_generated
+                or event["total_prompt_tokens"] <= 0
+                or not event["cached_prompt_tokens"] <= event["processed_prompt_tokens"] <= event["total_prompt_tokens"]
+                or not any(all(local.get(key) == event[key] for key in keys) for local in local_events)):
+            raise ValueError("encrypted_progress_delivery_invalid")
+        last_seq, last_elapsed, last_phase = event["sequence"], event["elapsed_ms"], phase
+        last_processed, last_generated = event["processed_prompt_tokens"], event["generated_tokens"]
+        phases.append(event["phase"])
+    observed = list(dict.fromkeys(phases))
+    return {"pass": True, "delivery": "best_effort_encrypted",
+        "progress_event_count": len(observations), "observed_phases": observed,
+        "terminal_overtook_generating_update": "generating" not in observed,
+        "atomic_final_response_completed": True, "post_terminal_silence": True}
+
 def analyze_progress(observations: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Validate the ordered progress/result/terminal lifecycle, returning stable errors."""
     errors: list[str] = []
@@ -1010,7 +1177,13 @@ def validate_report(report: Any) -> None:
             ("window_tokens", "output_reservation_tokens", "prompt_tokens", "output_tokens")):
         raise ValueError("report_context_invalid")
     progress, metrics, semantic = report.get("progress"), report.get("metrics"), report.get("semantic")
-    if not isinstance(progress, dict) or progress.get("pass") is not True or not isinstance(progress.get("progress_event_count"), int):
+    if (not isinstance(progress, dict) or progress.get("pass") is not True
+            or progress.get("delivery") != "best_effort_encrypted"
+            or not isinstance(progress.get("progress_event_count"), int)
+            or not isinstance(progress.get("observed_phases"), list)
+            or not isinstance(progress.get("terminal_overtook_generating_update"), bool)
+            or progress.get("atomic_final_response_completed") is not True
+            or progress.get("post_terminal_silence") is not True):
         raise ValueError("report_progress_invalid")
     metric_keys = ("preparing_duration_s", "prefill_duration_s", "time_to_first_token_s",
         "decode_duration_s", "total_duration_s", "prompt_tokens", "output_tokens",
@@ -1020,6 +1193,11 @@ def validate_report(report: Any) -> None:
     for key in ("prompt_tokens_per_s", "decode_tokens_per_s"):
         if key not in metrics or (metrics[key] is not None and not finite(metrics[key])):
             raise ValueError("report_metrics_invalid")
+    if (metrics.get("timing_domain") != "packaged_local_worker_monotonic"
+            or metrics.get("end_to_end_timing_domain") != "packaged_runner_monotonic"
+            or not finite(metrics.get("end_to_end_duration_s"))
+            or metrics["end_to_end_duration_s"] < 0):
+        raise ValueError("report_metrics_invalid")
     if not isinstance(semantic, dict) or not isinstance(semantic.get("semantic_pass"), bool):
         raise ValueError("report_semantic_invalid")
     aggregate = report.get("aggregate_semantic")
@@ -1516,10 +1694,11 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         return {"pass": False, "code": "packaged_evidence_malformed"}
     required = {"app_identity", "runtime_identity", "bundled_runtime_identity", "build_identity",
         "backend_requested", "backend_selected", "backend_used", "model_fingerprint",
-        "authoritative_prompt_tokens", "progress_events",
-        "authoritative_tokenizer_evidence", "terminal_observation", "result_observation",
-        "response_text", "start_s", "preparing_end_s", "prefill_end_s", "first_token_s", "end_s",
-        "output_tokens", "post_terminal_observations", "generation_settings", "memory",
+        "authoritative_prompt_tokens", "authoritative_local_telemetry",
+        "encrypted_progress_events", "response_usage", "authoritative_tokenizer_evidence",
+        "atomic_final_response_completed", "post_terminal_silence",
+        "response_text", "start_s", "end_s",
+        "output_tokens", "generation_settings", "memory",
         "runtime_configuration"}
     missing_evidence = sorted(key for key in required if key not in payload or payload.get(key) in (None, "", {}))
     if missing_evidence:
@@ -1531,8 +1710,9 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
             isinstance(payload["authoritative_prompt_tokens"], bool) or
             payload["authoritative_prompt_tokens"] <= 0 or
             not isinstance(payload["output_tokens"], int) or isinstance(payload["output_tokens"], bool) or
-            payload["output_tokens"] < 0 or not isinstance(payload["progress_events"], list) or
-            not isinstance(payload["post_terminal_observations"], list)):
+            payload["output_tokens"] < 0 or not isinstance(payload["encrypted_progress_events"], list)
+            or payload["atomic_final_response_completed"] is not True
+            or payload["post_terminal_silence"] is not True):
         return {"pass": False, "code": "packaged_evidence_malformed"}
     try:
         generation_settings = validate_generation_settings(payload["generation_settings"])
@@ -1544,14 +1724,23 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         payload["runtime_identity"], payload["authoritative_prompt_tokens"])
     if depth_error:
         return {"pass": False, "code": depth_error}
-    observations = [*payload.get("progress_events", []), payload["result_observation"],
-        payload["terminal_observation"], *payload["post_terminal_observations"]]
-    progress = analyze_progress(observations)
+    try:
+        local = validate_authoritative_local_telemetry(payload["authoritative_local_telemetry"])
+        usage = validate_response_usage(payload["response_usage"], payload["authoritative_prompt_tokens"])
+        if (local["prompt_tokens"] != payload["authoritative_prompt_tokens"]
+                or usage["completion_tokens"] != payload["output_tokens"]):
+            raise ValueError("response_usage_missing_or_inconsistent")
+        progress = analyze_encrypted_progress(payload["encrypted_progress_events"], local["events"])
+    except ValueError as exc:
+        return {"pass": False, "runtime_contract_pass": False, "code": str(exc)}
     semantic = evaluate_semantic(payload.get("response_text", ""), manifest)
-    metrics = summarize_metrics(start_s=payload["start_s"], preparing_end_s=payload["preparing_end_s"],
-        prefill_end_s=payload["prefill_end_s"], first_token_s=payload["first_token_s"],
-        end_s=payload["end_s"], prompt_tokens=payload["authoritative_prompt_tokens"],
+    metrics = summarize_metrics(start_s=0, preparing_end_s=local["preparing_end_ms"] / 1000,
+        prefill_end_s=local["prefill_end_ms"] / 1000, first_token_s=local["first_token_ms"] / 1000,
+        end_s=local["inference_duration_ms"] / 1000, prompt_tokens=payload["authoritative_prompt_tokens"],
         output_tokens=payload["output_tokens"], request_budget_s=timeout_s)
+    metrics["timing_domain"] = "packaged_local_worker_monotonic"
+    metrics["end_to_end_duration_s"] = payload["end_s"] - payload["start_s"]
+    metrics["end_to_end_timing_domain"] = "packaged_runner_monotonic"
     evidence = {
         "runner_kind": "repository_packaged_desktop_webdriver",
         "fixture": {"id": fixture_id, "sha256": manifest.get("fixture_sha256"),
@@ -1612,9 +1801,8 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         runtime["runtime_identity"] == runtime.get("bundled_runtime_identity") and
         runtime["backend_requested"] == backend and runtime["backend_selected"] == backend and
         runtime["backend_used"] == backend)
-    final_total = (progress.get("final_progress") or {}).get("total_prompt_tokens")
     runtime_contract_pass = bool(progress.get("pass") and metrics.get("pass") and identity_ok
-        and payload["authoritative_prompt_tokens"] == final_total)
+        and payload["authoritative_prompt_tokens"] == local["prompt_tokens"])
     if cancellation_validation:
         runtime_contract_pass = runtime_contract_pass and bool(
             evidence.get("cancellation_recovery", {}).get("pass"))

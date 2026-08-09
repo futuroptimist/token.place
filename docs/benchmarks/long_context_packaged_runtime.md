@@ -177,7 +177,7 @@ prose and target selection even though JSON shape and canary can still pass.
 
 ## Metrics and report schema
 
-Reports use schema `long-context-benchmark-report-v1` and are written atomically as
+Reports use schema `long-context-benchmark-report-v2` and are written atomically as
 `long_context_benchmark_report.json` in the selected output directory. Reports are sanitized for GitHub issue
 attachment: prompt/response bodies, ciphertext, IVs, keys, cancellation tokens, high-cardinality
 request/client/session IDs, absolute user paths, secrets, and unbounded subprocess output are
@@ -192,7 +192,8 @@ score. A successful packaged-runtime contract requires:
 - packaged app, build, bundled runtime, and safe model-fingerprint identity;
 - requested, selected, and used backend (`cpu`, `metal`, or `cuda`);
 - context tier, context window, output reservation, authoritative prompt count, and output count;
-- the validated progress summary and ordered terminal/result evidence;
+- strictly validated packaged-local P3 progress/timing, a separately validated best-effort P6
+  encrypted-delivery summary, and atomic final-response/post-terminal evidence;
 - every timing, throughput, request-budget, and completion-margin field;
 - the complete semantic score and aggregate trial count, exact-match count, and pass rate.
 - requested/completed trial counts, per-category failure counts, and bounded per-trial boolean/error
@@ -313,14 +314,26 @@ observable; it does not use a multi-second fixed sleep. Missing or malformed lif
 returns stable errors such as `progress_missing`, `malformed_telemetry`, `incomplete_prefill`, or
 `progress_after_terminal` rather than passing or raising an uncaught exception.
 
-Timings use five ordered monotonic boundaries: request start, end of preparing, end of prefill,
-first generated token, and request end. They produce preparing duration, prefill duration,
-time-to-first-token, decode duration, and total duration. Prompt throughput is authoritative prompt
-tokens divided by prefill duration; decode throughput is authoritative output tokens divided by
-decode duration. The report also records the request budget and `budget - total duration` completion
-margin. Zero-duration boundaries are valid and retain a zero duration (their division-based
-throughput is `null`); absent, non-finite, reversed, or over-budget timing fails closed and is never
-coerced to zero.
+Runtime timings use the packaged worker's local monotonic domain: preparing end, prefill end, first
+generated token, and the privacy-safe `api_v1.inference_complete` duration. They produce preparing,
+prefill, time-to-first-token, decode, and inference durations without translating worker-relative
+elapsed values onto the browser clock. End-to-end duration is recorded separately from the
+packaged runner's monotonic send/response boundaries. Prompt throughput uses the admission/local
+prompt count; decode throughput uses final decrypted response `usage.completion_tokens`, never a
+coalesced progress count or response-text estimate. The report names both timing domains. Missing,
+non-finite, reversed, inconsistent, or over-budget evidence fails closed and is never synthesized.
+
+The driver-log byte boundary is captured immediately before request submission. Only complete,
+allowlisted `api_v1.local_progress` and `api_v1.inference_complete` records after that boundary are
+parsed, and the primary snapshot is taken before optional cancellation/recovery traffic. Ephemeral
+request correlation and worker generation values are used only to reject ambiguous streams; they,
+raw lines, paths, prompts, responses, ciphertext, and keys are never copied into evidence.
+
+Browser-observed encrypted progress remains P6 best-effort delivery. Every delivered event must be
+schema-valid, monotonic, and compatible with an authoritative local event, but completion does not
+require the browser to observe a final generating update. The report records the delivered phases
+and `terminal_overtook_generating_update=true` when the atomic result legitimately overtakes that
+coalesced update. Atomic response completion and post-terminal silence remain separate requirements.
 
 Cancellation scenarios must be progress-triggered, not sleep-only:
 

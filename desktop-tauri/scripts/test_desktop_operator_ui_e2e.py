@@ -9,7 +9,6 @@ import hashlib
 import json
 import math
 import os
-import signal
 import shutil
 import socket
 import subprocess
@@ -18,6 +17,8 @@ import tempfile
 import time
 from pathlib import Path
 from urllib.request import urlopen
+
+import psutil
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPO_ROOT / "desktop-tauri"
@@ -787,7 +788,9 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
             try:
                 temporary.replace(path)
                 return
-            except PermissionError:
+            except OSError as exc:
+                if not _is_windows_sharing_violation(exc):
+                    raise
                 remaining = deadline - clock()
                 if remaining <= 0:
                     raise RuntimeError("phase checkpoint publication failed") from None
@@ -799,11 +802,18 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
             try:
                 temporary.unlink(missing_ok=True)
                 break
-            except PermissionError:
+            except OSError as exc:
+                if not _is_windows_sharing_violation(exc):
+                    raise
                 remaining = deadline - clock()
                 if remaining <= 0:
                     break
                 sleeper(min(0.01, remaining))
+
+
+def _is_windows_sharing_violation(exc: BaseException) -> bool:
+    """Recognize only Windows sharing/lock violations, not generic access denial."""
+    return isinstance(exc, OSError) and getattr(exc, "winerror", None) in {32, 33}
 
 
 def _remove_owned_path(path: Path, deadline: float, *, directory: bool = False,
@@ -818,7 +828,9 @@ def _remove_owned_path(path: Path, deadline: float, *, directory: bool = False,
             return True
         except FileNotFoundError:
             return True
-        except PermissionError:
+        except OSError as exc:
+            if not _is_windows_sharing_violation(exc):
+                raise
             remaining = deadline - clock()
             if remaining <= 0:
                 return False
@@ -971,12 +983,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     primary_failed = False
     try:
         setup_remaining()
-        process_group_options = ({"creationflags": getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)} if os.name == "nt"
-            else {"start_new_session": True})
         process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
-            stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True,
-            **process_group_options)  # noqa: S603
+            stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
         memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
         wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log,
             min(90, setup_remaining()))
@@ -1187,7 +1195,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         try:
             _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
                 phase_schema_version, phases, last_safe_phase=last_safe_phase,
-                failure_reason=failure_reason)
+                failure_reason=failure_reason, cleanup_succeeded=False)
         except Exception as exc:
             checkpoint_error = exc
         cleanup_deadline = time.monotonic() + cleanup_timeout
@@ -1197,52 +1205,23 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             cleanup_ok = _quit_webdriver(browser, cleanup_remaining()) and cleanup_ok
         if driver is not None:
             cleanup_ok = _quit_webdriver(driver, cleanup_remaining()) and cleanup_ok
-        if process is not None and process.poll() is None:
-            if os.name == "nt":
-                try:
-                    stopped = subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        timeout=cleanup_remaining(), check=False)  # noqa: S603
-                    cleanup_ok = cleanup_ok and stopped.returncode == 0
-                except (OSError, subprocess.TimeoutExpired):
-                    cleanup_ok = False
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                except OSError:
-                    cleanup_ok = False
+        if process is not None:
             try:
+                root = psutil.Process(process.pid)
+                owned_processes = [*root.children(recursive=True), root]
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                owned_processes = []
+            for owned in owned_processes:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    owned.terminate()
+            _, alive = psutil.wait_procs(owned_processes, timeout=cleanup_remaining())
+            for owned in alive:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    owned.kill()
+            _, alive = psutil.wait_procs(alive, timeout=cleanup_remaining())
+            cleanup_ok = cleanup_ok and not alive
+            with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=cleanup_remaining())
-            except subprocess.TimeoutExpired:
-                if os.name == "nt":
-                    process.kill()
-                else:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    except OSError:
-                        cleanup_ok = False
-                try:
-                    process.wait(timeout=cleanup_remaining())
-                except subprocess.TimeoutExpired: cleanup_ok = False
-            if os.name != "nt":
-                try:
-                    os.killpg(process.pid, 0)
-                except ProcessLookupError:
-                    pass
-                except OSError:
-                    cleanup_ok = False
-                else:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    except OSError:
-                        cleanup_ok = False
         driver_log_handle.close()
         for owned_path, is_directory in (
                 (isolated_home, True), (tokenizer_dir, True), (driver_log, False)):
@@ -1252,6 +1231,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             except OSError:
                 cleanup_ok = False
         cleanup_ok = cleanup_ok and checkpoint_error is None
+        if not cleanup_ok and not primary_failed:
+            failure_reason = "cleanup_failure"
         final_checkpoint_error = None
         try:
             _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
@@ -1265,7 +1246,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         if final_checkpoint_error is not None:
             print("cleanup phase checkpoint failed", file=sys.stderr)
         if cleanup_failure and not primary_failed:
-            raise RuntimeError("owned process cleanup failed")
+            raise RuntimeError("cleanup_failure")
 
 
 def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float,

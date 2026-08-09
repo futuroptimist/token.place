@@ -62,10 +62,18 @@ readable regular file, the app must be an executable regular file, and request/c
 be finite and positive. External E2EE relays require HTTPS; loopback relays may use HTTP or HTTPS.
 Credentials, fragments, malformed ports, and other schemes are rejected. Temporary request,
 evidence, and diagnostic files are owner-only on POSIX, portable to Windows Python 3.11, and closed
-and deleted after each run. Runner output is written to a temporary bounded diagnostic tail rather
-than buffered without limit. On timeout the harness targets only the process tree it created after
-the runner's bounded cleanup opportunity; it never matches broad process names. Unit tests replace only the subprocess
-boundary and are orchestration evidence, never physical Metal/CUDA evidence.
+and deleted after each run. Phase checkpoints use owner-only, unique temporary files and atomic
+replacement; Windows sharing denials during publication are retried only until a small deadline, so
+polling never exposes partial JSON. Owner-created logs and directories are closed and removed with
+the same bounded, Windows-lock-tolerant cleanup policy after the exact owned process tree has been
+asked to exit. A cleanup failure is reported categorically and separately without replacing an
+earlier runner failure. Runner output is written to a temporary bounded diagnostic tail rather than
+buffered without limit. On timeout the harness targets only the process tree it created after the
+runner's bounded cleanup opportunity; it never matches broad process names. Unit tests replace only
+the subprocess boundary and are orchestration evidence, never physical Metal/CUDA evidence.
+
+Physical Windows/CUDA and macOS/Metal validation of these checkpoint and cleanup changes remains
+outstanding; this harness change does not claim a successful physical benchmark.
 
 ## Fixture generation
 

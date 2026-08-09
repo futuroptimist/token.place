@@ -1217,7 +1217,7 @@ def observe_post_terminal(poller: Callable[[], object], *, clock: Callable[[], f
 
 
 def _read_packaged_phase_status(path: Path, parent_elapsed_s: float) -> tuple[dict[str, Any] | None, str | None]:
-    """Read the child's owner-only, low-cardinality atomic phase checkpoint."""
+    """Read one complete checkpoint; sharing denials and partial JSON are retryable misses."""
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

@@ -761,18 +761,68 @@ def assert_packaged_windows_nvidia_status(
 
 def _write_benchmark_phase(path: Path, phase: str, started: float,
         schema_version: str, phases: tuple[str, ...], *, last_safe_phase: str,
-        failure_reason: str | None = None, cleanup_succeeded: bool | None = None) -> None:
+        failure_reason: str | None = None, cleanup_succeeded: bool | None = None,
+        retry_timeout_s: float = 1.0, clock=time.monotonic,
+        sleeper=time.sleep) -> None:
     """Atomically checkpoint an allowlisted phase without identifiers or payload data."""
     payload = {"schema_version": schema_version, "phase": phase,
         "sequence": phases.index(phase) + 1,
         "last_safe_phase": last_safe_phase, "failure_reason": failure_reason,
-        "elapsed_s": round(max(0.0, time.monotonic() - started), 3),
+        "elapsed_s": round(max(0.0, clock() - started), 3),
         "cleanup_succeeded": cleanup_succeeded}
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-    if hasattr(os, "chmod"):
-        os.chmod(temporary, 0o600)
-    temporary.replace(path)
+    temporary_fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(temporary_fd, 0o600)
+        with os.fdopen(temporary_fd, "w", encoding="utf-8") as handle:
+            temporary_fd = -1
+            json.dump(payload, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        deadline = clock() + max(0.0, retry_timeout_s)
+        while True:
+            try:
+                temporary.replace(path)
+                return
+            except PermissionError:
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    raise RuntimeError("phase checkpoint publication failed") from None
+                sleeper(min(0.01, remaining))
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        cleanup_deadline = clock() + max(0.0, retry_timeout_s)
+        while True:
+            try:
+                temporary.unlink(missing_ok=True)
+                break
+            except PermissionError:
+                remaining = cleanup_deadline - clock()
+                if remaining <= 0:
+                    break
+                sleeper(min(0.01, remaining))
+
+
+def _remove_owned_path(path: Path, deadline: float, *, directory: bool = False,
+        clock=time.monotonic, sleeper=time.sleep) -> bool:
+    """Remove one owner-created path, retrying only transient sharing denials."""
+    while True:
+        try:
+            if directory:
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                return False
+            sleeper(min(0.01, remaining))
 
 
 def _wait_for_packaged_setup_condition(browser: webdriver.Chrome, setup_remaining,
@@ -904,6 +954,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     driver: webdriver.Remote | None = None
     browser: webdriver.Chrome | None = None
     cleanup_ok = True
+    primary_failed = False
     try:
         setup_remaining()
         process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
@@ -1109,6 +1160,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         os.chmod(evidence_path, 0o600)
         return 0
     except Exception:
+        primary_failed = True
         if failure_reason is None:
             failure_reason = "packaged_runner_failure"
         raise
@@ -1124,30 +1176,59 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         def cleanup_remaining() -> float:
             return max(0.001, cleanup_deadline - time.monotonic())
         if browser is not None:
-            with contextlib.suppress(Exception): browser.set_script_timeout(cleanup_remaining())
-            with contextlib.suppress(Exception): browser.quit()
+            try:
+                browser.set_script_timeout(cleanup_remaining())
+                browser.quit()
+            except Exception:
+                cleanup_ok = False
         if driver is not None:
-            with contextlib.suppress(Exception): driver.set_script_timeout(cleanup_remaining())
-            with contextlib.suppress(Exception): driver.quit()
+            try:
+                driver.set_script_timeout(cleanup_remaining())
+                driver.quit()
+            except Exception:
+                cleanup_ok = False
         if process is not None and process.poll() is None:
-            process.terminate()
-            try: process.wait(timeout=cleanup_remaining())
+            if os.name == "nt":
+                try:
+                    stopped = subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=cleanup_remaining(), check=False)  # noqa: S603
+                    cleanup_ok = cleanup_ok and stopped.returncode == 0
+                except (OSError, subprocess.TimeoutExpired):
+                    cleanup_ok = False
+            else:
+                process.terminate()
+            try:
+                process.wait(timeout=cleanup_remaining())
             except subprocess.TimeoutExpired:
                 process.kill()
-                try: process.wait(timeout=cleanup_remaining())
+                try:
+                    process.wait(timeout=cleanup_remaining())
                 except subprocess.TimeoutExpired: cleanup_ok = False
         driver_log_handle.close()
-        shutil.rmtree(isolated_home, ignore_errors=True)
-        shutil.rmtree(tokenizer_dir, ignore_errors=True)
-        driver_log.unlink(missing_ok=True)
-        with contextlib.suppress(Exception):
+        for owned_path, is_directory in (
+                (isolated_home, True), (tokenizer_dir, True), (driver_log, False)):
+            try:
+                cleanup_ok = (_remove_owned_path(owned_path, cleanup_deadline,
+                    directory=is_directory) and cleanup_ok)
+            except OSError:
+                cleanup_ok = False
+        cleanup_ok = cleanup_ok and checkpoint_error is None
+        final_checkpoint_error = None
+        try:
             _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
                 phase_schema_version, phases, last_safe_phase=last_safe_phase,
-                failure_reason=failure_reason, cleanup_succeeded=cleanup_ok)
-        if not cleanup_ok:
+                failure_reason=failure_reason, cleanup_succeeded=cleanup_ok,
+                retry_timeout_s=max(0.0, cleanup_deadline - time.monotonic()))
+        except Exception as exc:
+            final_checkpoint_error = exc
+        cleanup_failure = (not cleanup_ok or checkpoint_error is not None
+            or final_checkpoint_error is not None)
+        if final_checkpoint_error is not None:
+            print("cleanup phase checkpoint failed", file=sys.stderr)
+        if cleanup_failure and not primary_failed:
             raise RuntimeError("owned process cleanup failed")
-        if checkpoint_error is not None:
-            raise RuntimeError("cleanup phase checkpoint failed") from checkpoint_error
 
 
 def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float,

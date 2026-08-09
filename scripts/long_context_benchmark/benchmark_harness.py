@@ -971,6 +971,7 @@ def validate_report(report: Any) -> None:
         present_timeout_fields = timeout_fields.intersection(report)
         if report["code"] == "packaged_runner_timeout":
             if (present_timeout_fields != timeout_fields
+                    or not isinstance(report["last_safe_phase"], str)
                     or report["last_safe_phase"] not in PACKAGED_PHASES
                     or not all(finite(report[key]) and report[key] >= 0 for key in timeout_fields
                         - {"last_safe_phase", "cleanup_succeeded"})
@@ -986,7 +987,9 @@ def validate_report(report: Any) -> None:
             failure_fields = {"last_safe_phase", "failure_reason", "elapsed_s", "cleanup_succeeded"}
             if (failure_fields.intersection(report) != failure_fields
                     or present_timeout_fields != failure_fields - {"failure_reason"}
+                    or not isinstance(report["last_safe_phase"], str)
                     or report["last_safe_phase"] not in PACKAGED_PHASES
+                    or not isinstance(report["failure_reason"], str)
                     or report["failure_reason"] not in PACKAGED_FAILURE_REASONS
                     or not finite(report["elapsed_s"]) or report["elapsed_s"] < 0
                     or not isinstance(report["cleanup_succeeded"], bool)):

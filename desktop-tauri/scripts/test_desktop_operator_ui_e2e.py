@@ -42,6 +42,8 @@ try:
         WebDriverException,
     )
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.action_chains import ActionChains
+    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
 
     from utils.crypto_helpers import CryptoClient
@@ -773,6 +775,51 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
     temporary.replace(path)
 
 
+def _wait_for_packaged_setup_condition(browser: webdriver.Chrome, setup_remaining,
+        predicate, failure_reason: str, fail_closed):
+    """Wait within setup and preserve the readiness-specific failure category."""
+    try:
+        return WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(predicate)
+    except (TimeoutException, RuntimeError):
+        fail_closed(failure_reason)
+
+
+def _enter_packaged_prompt(field, prompt: str, *, action_factory=ActionChains) -> None:
+    """Type through the textarea, encoding embedded newlines as Shift+Enter."""
+    lines = prompt.split("\n")
+    for index, line in enumerate(lines):
+        if line:
+            field.send_keys(line)
+        if index < len(lines) - 1:
+            (action_factory(field.parent).key_down(Keys.SHIFT).send_keys(Keys.ENTER)
+                .key_up(Keys.SHIFT).perform())
+
+
+def _populate_and_submit_packaged_prompt(browser: webdriver.Chrome, prompt: str,
+        setup_remaining, fail_closed, write_phase, *, clock=time.monotonic,
+        action_factory=ActionChains) -> float:
+    """Populate exactly, then check eligibility and explicitly submit."""
+    setup_remaining()
+    field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+    setup_remaining()
+    _enter_packaged_prompt(field, prompt, action_factory=action_factory)
+    setup_remaining()
+    populated = browser.execute_script(
+        "return document.querySelector('#app').__vue__.newMessage;")
+    if populated != prompt:
+        fail_closed("message_input_not_populated")
+    send_button = _wait_for_packaged_setup_condition(
+        browser, setup_remaining,
+        lambda d: (button if (button := d.find_element(
+            By.CSS_SELECTOR, ".send-button")).is_enabled() else False),
+        "send_button_not_enabled", fail_closed)
+    write_phase("landing_page_ready")
+    started = clock()
+    send_button.click()
+    write_phase("request_active")
+    return started
+
+
 def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         phase_status_path: Path, app_binary: Path) -> int:
     """Drive a packaged app and the existing landing-page API v1 E2EE client."""
@@ -882,23 +929,17 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         browser.set_page_load_timeout(setup_remaining())
         browser.set_script_timeout(setup_remaining())
         browser.get(request["relay_url"])
-        try:
-            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
-                lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
-        except TimeoutException:
-            fail_closed("vue_not_ready")
-        try:
-            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
-                lambda d: d.execute_script(
-                    "const v=document.querySelector('#app').__vue__; return Boolean(v.hasClientKeypair);"))
-        except TimeoutException:
-            fail_closed("client_keypair_not_ready")
-        try:
-            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
-                lambda d: d.execute_script(
-                    "const v=document.querySelector('#app').__vue__; return Boolean(v.modelsLoaded && v.selectedModel);"))
-        except TimeoutException:
-            fail_closed("model_selection_not_ready")
+        _wait_for_packaged_setup_condition(browser, setup_remaining,
+            lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"),
+            "vue_not_ready", fail_closed)
+        _wait_for_packaged_setup_condition(browser, setup_remaining,
+            lambda d: d.execute_script(
+                "const v=document.querySelector('#app').__vue__; return Boolean(v.hasClientKeypair);"),
+            "client_keypair_not_ready", fail_closed)
+        _wait_for_packaged_setup_condition(browser, setup_remaining,
+            lambda d: d.execute_script(
+                "const v=document.querySelector('#app').__vue__; return Boolean(v.modelsLoaded && v.selectedModel);"),
+            "model_selection_not_ready", fail_closed)
         setup_remaining()
         selected_tier = apply_benchmark_context_tier(browser, request["context_tier"])
         if selected_tier != request["context_tier"]:
@@ -931,24 +972,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 return original(plaintext, ...args);
             };
         """)
-        setup_remaining()
-        field = browser.find_element(By.CSS_SELECTOR, ".message-input")
-        setup_remaining()
-        field.send_keys(request["prompt"])
-        setup_remaining()
-        populated = browser.execute_script(
-            "return document.querySelector('#app').__vue__.newMessage.length > 0;")
-        if not populated:
-            fail_closed("message_input_not_populated")
-        try:
-            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
-                lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
-        except TimeoutException:
-            fail_closed("send_button_not_enabled")
-        write_phase("landing_page_ready")
-        started = time.monotonic()
-        browser.find_element(By.CSS_SELECTOR, ".send-button").click()
-        write_phase("request_active")
+        started = _populate_and_submit_packaged_prompt(browser, request["prompt"],
+            setup_remaining, fail_closed, write_phase)
         progress: list[dict[str, object]] = []
         while time.monotonic() - started < float(request["request_timeout_s"]):
             memory_sampler.sample()

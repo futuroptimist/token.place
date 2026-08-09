@@ -6,6 +6,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from types import ModuleType, SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,24 @@ import pytest
 from scripts.long_context_benchmark import benchmark_harness as h
 
 RUNNER_SOURCE = Path(__file__).parents[2] / "desktop-tauri/scripts/test_desktop_operator_ui_e2e.py"
+
+
+@pytest.fixture
+def desktop_runner():
+    tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
+    names = {"_wait_for_packaged_setup_condition", "_enter_packaged_prompt",
+        "_populate_and_submit_packaged_prompt"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names]
+    module = ModuleType("desktop_runner_under_test")
+    namespace = module.__dict__
+    namespace.update({"webdriver": SimpleNamespace(Chrome=object), "ActionChains": object,
+        "time": time, "By": SimpleNamespace(CSS_SELECTOR="css"),
+        "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
+        "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
+        "WebDriverWait": object})
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
+    return module
 
 def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="linux"):
     return {"method": h.MEMORY_METHOD, "scope": h.MEMORY_SCOPE, "platform": platform,
@@ -1458,27 +1477,66 @@ def test_desktop_runner_applies_tier_and_maps_operator_mode():
         h.benchmark_operator_mode("mock")
 
 
-def test_packaged_landing_readiness_orders_prompt_before_send_eligibility_and_submission():
-    full_source = RUNNER_SOURCE.read_text(encoding="utf-8")
-    source = full_source[full_source.index("def run_long_context_packaged_mode"):full_source.index(
-        "def _long_context_followup_request")]
-    markers = [
-        'fail_closed("vue_not_ready")',
-        'fail_closed("client_keypair_not_ready")',
-        'fail_closed("model_selection_not_ready")',
-        'fail_closed("requested_context_tier_not_applied")',
-        'field.send_keys(request["prompt"])',
-        'fail_closed("send_button_not_enabled")',
-        'started = time.monotonic()',
-        'find_element(By.CSS_SELECTOR, ".send-button").click()',
-    ]
-    positions = []
-    cursor = 0
-    for marker in markers:
-        cursor = source.index(marker, cursor)
-        positions.append(cursor)
-    assert positions == sorted(positions)
-    assert source.index("started = time.monotonic()", positions[5]) < positions[7]
+def test_packaged_multiline_prompt_uses_shift_enter_and_submits_after_exact_population(
+        desktop_runner, monkeypatch):
+    events = []
+    prompt = "line1\nline2\n\nline4"
+    class Field:
+        parent = object()
+        def send_keys(self, value): events.append(("text", value))
+    class Button:
+        def is_enabled(self): events.append(("eligibility",)); return True
+        def click(self): events.append(("click",))
+    field, button = Field(), Button()
+    class Browser:
+        def find_element(self, _by, selector):
+            return field if selector == ".message-input" else button
+        def execute_script(self, _script): events.append(("population",)); return prompt
+    class Actions:
+        def __init__(self, _parent): pass
+        def key_down(self, key): events.append(("key_down", key)); return self
+        def send_keys(self, key): events.append(("newline", key)); return self
+        def key_up(self, key): events.append(("key_up", key)); return self
+        def perform(self): events.append(("perform",)); return self
+    class Wait:
+        def __init__(self, browser, timeout, **_kwargs): pass
+        def until(self, predicate): return predicate(Browser())
+    monkeypatch.setattr(desktop_runner, "WebDriverWait", Wait)
+    phases = []
+    def checkpoint(phase):
+        phases.append(phase)
+        events.append(("phase", phase))
+    started = desktop_runner._populate_and_submit_packaged_prompt(
+        Browser(), prompt, lambda: 10, pytest.fail, checkpoint,
+        clock=lambda: events.append(("timer",)) or 42.0, action_factory=Actions)
+    assert started == 42.0
+    assert [event for event in events if event[0] == "text"] == [
+        ("text", "line1"), ("text", "line2"), ("text", "line4")]
+    assert len([event for event in events if event[0] == "newline"]) == 3
+    assert all(event[1] == desktop_runner.Keys.ENTER
+        for event in events if event[0] == "newline")
+    assert not any(event == ("text", desktop_runner.Keys.ENTER) for event in events)
+    assert events.index(("population",)) < events.index(("eligibility",))
+    assert events.index(("timer",)) + 1 == events.index(("click",))
+    assert phases == ["landing_page_ready", "request_active"]
+    assert events.index(("click",)) < events.index(("phase", "request_active"))
+
+
+@pytest.mark.parametrize("reason", [
+    "vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
+    "send_button_not_enabled",
+])
+def test_packaged_setup_exhaustion_preserves_specific_failure_reason(desktop_runner, reason):
+    observed = []
+    def exhausted():
+        raise RuntimeError("packaged setup timeout")
+    def fail_closed(value):
+        observed.append(value)
+        raise LookupError(value)
+    with pytest.raises(LookupError, match=reason):
+        desktop_runner._wait_for_packaged_setup_condition(
+            object(), exhausted, lambda _browser: True, reason, fail_closed)
+    assert observed == [reason]
 
 
 def test_packaged_runner_never_bypasses_production_send_eligibility():
@@ -1488,10 +1546,7 @@ def test_packaged_runner_never_bypasses_production_send_eligibility():
     assert "sendMessage(" not in benchmark
     assert "disabled = false" not in benchmark
     assert "removeAttribute('disabled')" not in benchmark
-    prompt_position = benchmark.index('field.send_keys(request["prompt"])')
-    send_wait_position = benchmark.index(
-        'lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled()')
-    assert prompt_position < send_wait_position
+    assert '_populate_and_submit_packaged_prompt(browser, request["prompt"]' in benchmark
 
 
 def test_packaged_failure_reasons_are_explicit_low_cardinality_categories():
@@ -1909,7 +1964,10 @@ def test_not_run_runner_failure_retains_only_allowlisted_safe_diagnostics(tmp_pa
     failure = {"pass": False, "runtime_contract_pass": False,
         "code": "packaged_runner_failed", "last_safe_phase": "operator_ready",
         "failure_reason": "client_keypair_not_ready", "elapsed_s": 299.0,
-        "cleanup_succeeded": True}
+        "cleanup_succeeded": True, "prompt": "secret fixture prompt",
+        "traceback": "Traceback: secret", "diagnostic_tail": "private log text",
+        "path": "/private/model.gguf", "request_id": "request-secret",
+        "client_id": "client-secret", "session_id": "session-secret"}
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: failure)
     assert h.main(_packaged_main_args(tmp_path, "--fixture", "small-8k", "--scenario",
         "single-needle", "--report-only")) == 1
@@ -1921,15 +1979,38 @@ def test_not_run_runner_failure_retains_only_allowlisted_safe_diagnostics(tmp_pa
     prohibited = {"prompt", "response_text", "diagnostic_tail", "traceback", "path",
         "request_id", "client_id", "session_id", "ciphertext", "key"}
     assert not prohibited.intersection(report)
+    assert report["last_safe_phase"] == "operator_ready"
+    assert report["elapsed_s"] == 299.0
+    assert report["cleanup_succeeded"] is True
 
 
-def test_runner_failure_report_rejects_timeout_budget_fields():
+@pytest.mark.parametrize("timeout_field", [
+    "request_timeout_s", "setup_timeout_s", "runner_timeout_s", "overall_timeout_s",
+])
+def test_runner_failure_report_rejects_timeout_budget_fields(timeout_field):
     report = {"schema_version": h.SCHEMA_VERSION, "mode": "packaged-runtime",
         "status": "not_run", "fixture": {"id": "small-8k", "version": h.FIXTURE_VERSION,
             "scenario": "single-needle", "sha256": "unavailable"},
         "code": "packaged_runner_failed", "last_safe_phase": "operator_ready",
         "failure_reason": "client_keypair_not_ready", "elapsed_s": 1.0,
-        "cleanup_succeeded": True, "request_timeout_s": 600.0}
+        "cleanup_succeeded": True, timeout_field: 600.0}
+    with pytest.raises(ValueError, match="report_runner_failure_diagnostics_invalid"):
+        h.validate_report(report)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("failure_reason", []), ("failure_reason", {}),
+    ("cleanup_succeeded", []), ("cleanup_succeeded", {}),
+    ("elapsed_s", []), ("last_safe_phase", {}),
+])
+def test_runner_failure_report_rejects_malformed_diagnostic_types(field, value):
+    report = {"schema_version": h.SCHEMA_VERSION, "mode": "packaged-runtime",
+        "status": "not_run", "fixture": {"id": "small-8k", "version": h.FIXTURE_VERSION,
+            "scenario": "single-needle", "sha256": "unavailable"},
+        "code": "packaged_runner_failed", "last_safe_phase": "operator_ready",
+        "failure_reason": "client_keypair_not_ready", "elapsed_s": 1.0,
+        "cleanup_succeeded": True}
+    report[field] = value
     with pytest.raises(ValueError, match="report_runner_failure_diagnostics_invalid"):
         h.validate_report(report)
 

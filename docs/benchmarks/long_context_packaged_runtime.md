@@ -309,6 +309,35 @@ The command above is the genuine-hardware procedure. It was not executed during 
 this harness change; a packaged 0.1.14 application, model, relay, and supported hardware are
 required before recording physical evidence.
 
+## Packaged-runner phase budgets and timeout diagnostics
+
+`--request-timeout` is exclusively the inference-request budget and begins immediately before the
+landing page submits the request. It is not reused for WebDriver startup, desktop UI readiness,
+CUDA/Metal model warm-load, operator registration, or landing-page readiness. Those operations use
+a named 300-second setup/readiness budget. After a response, model fingerprinting and evidence
+serialization use a separate 120-second finalization budget, and exact-owned-process cleanup uses
+the configured `--cleanup-timeout` budget.
+
+The parent watchdog is finite and deterministic:
+
+```text
+overall = setup (300s) + request timeout + finalization (120s) + cleanup timeout
+```
+
+The child atomically updates an owner-only phase file at low-cardinality safe boundaries. If the
+parent watchdog expires, it terminates only its owned process tree and reports
+`packaged_runner_timeout` with the last validated phase, each configured budget, bounded elapsed
+seconds, and a cleanup-success boolean. Missing, stale, malformed, or out-of-order phase evidence
+fails closed. Neither this channel nor the report contains prompts, responses, relay payloads,
+cryptographic material, identifiers, process details, command lines, usernames, absolute paths, or
+raw logs. Setup, request, finalization, runner, phase-evidence, and cleanup failures remain runtime
+contract failures even under `--report-only`.
+
+The attempted physical Windows 11/NVIDIA CUDA baseline described for P8 timed out in its first
+`small-8k` / `single-needle` / `8k-fast` trial and completed zero trials. It therefore supplied no
+semantic result or semantic baseline. This harness correction is not physical CUDA or Metal
+validation; both physical reruns remain required.
+
 ## Physical process-tree memory
 
 Physical packaged runs require an RSS summary sampled with `psutil` from the process tree rooted at

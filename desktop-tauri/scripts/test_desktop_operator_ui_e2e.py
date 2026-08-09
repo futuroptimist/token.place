@@ -52,6 +52,7 @@ try:
         benchmark_operator_mode,
         OwnedProcessTreeMemorySampler,
         prefill_cancellation_trigger_state,
+        PACKAGED_PHASE_STATUS_VERSION,
     )
 except Exception as exc:
     BOOTSTRAP_LOG.write_text(
@@ -754,10 +755,26 @@ def assert_packaged_windows_nvidia_status(
         raise AssertionError(f"hardware status reports KV cache device is not CUDA: {kv_cache_device!r}")
 
 
-def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Path) -> int:
+def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_binary: Path,
+        phase_status_path: Path) -> int:
     """Drive a packaged app and the existing landing-page API v1 E2EE client."""
     request = json.loads(request_path.read_text(encoding="utf-8"))
     cleanup_timeout = float(request["cleanup_timeout_s"])
+    setup_deadline = time.monotonic() + float(request["setup_budget_s"])
+    phase_sequence = -1
+    def remaining_setup() -> float:
+        remaining = setup_deadline - time.monotonic()
+        if remaining <= 0: raise RuntimeError("packaged setup timeout")
+        return remaining
+    def record_phase(name: str) -> None:
+        nonlocal phase_sequence
+        phase_sequence += 1
+        temporary = phase_status_path.with_name(phase_status_path.name + ".tmp")
+        temporary.write_text(json.dumps({"schema_version": PACKAGED_PHASE_STATUS_VERSION,
+            "phase": name, "sequence": phase_sequence}, sort_keys=True), encoding="utf-8")
+        if hasattr(os, "chmod"): os.chmod(temporary, 0o600)
+        os.replace(temporary, phase_status_path)
+    record_phase("runner_startup")
     driver_log_fd, driver_log_name = tempfile.mkstemp(prefix="long-context-tauri-driver-", suffix=".log")
     os.close(driver_log_fd)
     driver_log = Path(driver_log_name)
@@ -789,9 +806,11 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
         process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
             stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
         memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
-        wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log, 90)
+        wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log, min(90, remaining_setup()))
         driver = start_driver(app_binary.resolve(strict=True))
-        wait_for_ui_ready(driver)
+        record_phase("webdriver_ready")
+        wait_for_ui_ready(driver, min(45, remaining_setup()))
+        record_phase("desktop_ready")
         fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
         fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
         mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
@@ -799,10 +818,11 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", mode, compute_mode)
         tier = driver.find_element(By.XPATH, "//select[@aria-label='Context tier']")
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", tier, request["context_tier"])
-        wait_for_start_operator_enabled(driver, driver_log, driver_log)
+        wait_for_start_operator_enabled(driver, driver_log, driver_log, min(45, remaining_setup()))
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
-        wait_for_running_stability(driver, "yes", stable_seconds=3)
-        WebDriverWait(driver, 60).until(lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+        wait_for_running_stability(driver, "yes", stable_seconds=3, timeout_seconds=min(45, remaining_setup()))
+        WebDriverWait(driver, min(60, remaining_setup())).until(lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+        record_phase("operator_ready")
 
         runtime = {label: _status_value(driver, label) for label in
             ("App version", "Build ID", "Runtime ID", "Bundled runtime ID", "Launcher source",
@@ -817,12 +837,13 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
 
         browser = start_landing_driver()
         browser.get(request["relay_url"])
-        wait = WebDriverWait(browser, float(request["request_timeout_s"]), poll_frequency=0.05)
+        wait = WebDriverWait(browser, remaining_setup(), poll_frequency=0.05)
         wait.until(lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
         selected_tier = apply_benchmark_context_tier(browser, request["context_tier"])
         if selected_tier != request["context_tier"]:
             raise RuntimeError("landing context selection failed")
         wait.until(lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
+        record_phase("landing_page_ready")
         if not memory_sampler.sample():
             raise RuntimeError("memory_sample_unavailable")
         browser.execute_script("""
@@ -853,6 +874,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
         field = browser.find_element(By.CSS_SELECTOR, ".message-input")
         field.send_keys(request["prompt"])
         started = time.monotonic()
+        record_phase("request_active")
         browser.find_element(By.CSS_SELECTOR, ".send-button").click()
         progress: list[dict[str, object]] = []
         while time.monotonic() - started < float(request["request_timeout_s"]):
@@ -872,6 +894,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
         else:
             raise RuntimeError("packaged request timeout")
         ended = time.monotonic()
+        record_phase("response_received")
         if not progress or not isinstance(response_text, str):
             raise RuntimeError("required encrypted progress or response evidence missing")
         generation_settings = browser.execute_script(
@@ -928,9 +951,13 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
             cancellation_recovery = run_long_context_cancellation_recovery(browser, driver, request)
         preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
         prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
+        record_phase("evidence_finalization")
+        finalization_deadline = time.monotonic() + float(request["finalization_budget_s"])
         digest = hashlib.sha256()
         with Path(request["model"]).open("rb") as model_handle:
             for chunk in iter(lambda: model_handle.read(1024 * 1024), b""):
+                if time.monotonic() >= finalization_deadline:
+                    raise RuntimeError("packaged evidence finalization timeout")
                 digest.update(chunk)
         evidence = {"app_identity": runtime["App version"], "build_identity": runtime["Build ID"],
             "runtime_identity": runtime["Runtime ID"], "bundled_runtime_identity": runtime["Bundled runtime ID"],
@@ -955,6 +982,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
         os.chmod(evidence_path, 0o600)
         return 0
     finally:
+        record_phase("cleanup")
         if browser is not None:
             with contextlib.suppress(Exception): browser.quit()
         if driver is not None:
@@ -972,6 +1000,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path, app_
         driver_log.unlink(missing_ok=True)
         if not cleanup_ok:
             raise RuntimeError("owned process cleanup failed")
+        record_phase("complete")
 
 
 def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float) -> tuple[bool, float]:
@@ -1098,11 +1127,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
     parser.add_argument("--benchmark-request", type=Path)
     parser.add_argument("--benchmark-evidence", type=Path)
+    parser.add_argument("--benchmark-phase-status", type=Path)
     args = parser.parse_args(argv)
-    if args.benchmark_request or args.benchmark_evidence:
-        if not (args.benchmark_request and args.benchmark_evidence and args.app_binary):
-            parser.error("long-context benchmark mode requires --benchmark-request, --benchmark-evidence, and --app-binary")
-        return run_long_context_packaged_mode(args.benchmark_request, args.benchmark_evidence, args.app_binary)
+    if args.benchmark_request or args.benchmark_evidence or args.benchmark_phase_status:
+        if not (args.benchmark_request and args.benchmark_evidence
+                and args.benchmark_phase_status and args.app_binary):
+            parser.error("long-context benchmark mode requires request, evidence, phase status, and app binary")
+        return run_long_context_packaged_mode(args.benchmark_request, args.benchmark_evidence,
+            args.app_binary, args.benchmark_phase_status)
     hardware_mode = args.packaged_windows_nvidia_hardware
     if hardware_mode and (args.app_binary is None or args.model is None):
         parser.error("packaged Windows NVIDIA mode requires --app-binary and --model")

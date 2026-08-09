@@ -11,6 +11,12 @@ import pytest
 
 from scripts.long_context_benchmark import benchmark_harness as h
 
+
+def _write_complete_phase(command):
+    path = command[command.index("--benchmark-phase-status") + 1]
+    h.Path(path).write_text(json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase": "complete", "sequence": 9}))
+
 def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="linux"):
     return {"method": h.MEMORY_METHOD, "scope": h.MEMORY_SCOPE, "platform": platform,
         "sample_count": samples, "baseline_rss_bytes": baseline,
@@ -1066,6 +1072,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         evidence_path = command[command.index("--benchmark-evidence") + 1]
         seen["request"] = json.loads(h.Path(request_path).read_text())
         h.Path(evidence_path).write_text(json.dumps(payload))
+        _write_complete_phase(command)
         return subprocess.CompletedProcess(command, 0, "", "")
 
     result = h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app), model=str(model),
@@ -1175,12 +1182,16 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
 
     def fake_run(command, **kwargs):
         if runner_outcome == "timeout":
+            phase_path = command[command.index("--benchmark-phase-status") + 1]
+            h.Path(phase_path).write_text(json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+                "phase": "request_active", "sequence": 5}))
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if runner_outcome == "failed":
             return subprocess.CompletedProcess(command, 1, "", "")
         evidence_path = command[command.index("--benchmark-evidence") + 1]
         evidence = {"invalid-json": "not json", "non-object": "[]", "missing": "{}"}[runner_outcome]
         h.Path(evidence_path).write_text(evidence)
+        _write_complete_phase(command)
         return subprocess.CompletedProcess(command, 0, "", "")
 
     result = h.invoke_packaged_runtime_adapter(
@@ -1194,6 +1205,48 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
     )
     assert result["pass"] is False
     assert result["code"] == expected_code
+
+
+def test_packaged_watchdog_preserves_complete_request_budget_and_phase_diagnostics(tmp_path):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    observed = {}
+    def timeout_runner(command, **kwargs):
+        request = json.loads(h.Path(command[command.index("--benchmark-request") + 1]).read_text())
+        observed.update(request=request, timeout=kwargs["timeout"])
+        status = h.Path(command[command.index("--benchmark-phase-status") + 1])
+        status.write_text(json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+            "phase": "request_active", "sequence": 5}))
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+    result = h.invoke_packaged_runtime_adapter(timeout_s=600, cleanup_timeout_s=30,
+        app_binary=str(app), model=str(model), backend="cuda",
+        relay_url="https://relay.example", subprocess_run=timeout_runner)
+    budgets = h.packaged_runner_budgets(600, 30)
+    assert observed["request"]["request_timeout_s"] == 600
+    assert observed["request"]["setup_budget_s"] == h.PACKAGED_SETUP_BUDGET_S
+    assert observed["timeout"] == budgets["overall_budget_s"] - budgets["cleanup_budget_s"]
+    assert budgets["overall_budget_s"] == 300 + 600 + 120 + 30
+    assert result["code"] == "packaged_runner_timeout"
+    assert result["timeout_diagnostics"]["last_safe_phase"] == "request_active"
+    assert result["timeout_diagnostics"]["cleanup_succeeded"] is False
+
+
+@pytest.mark.parametrize("status_payload", [None, "{", "stale"])
+def test_packaged_timeout_phase_status_fails_closed(tmp_path, status_payload):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    def timeout_runner(command, **kwargs):
+        status = h.Path(command[command.index("--benchmark-phase-status") + 1])
+        if status_payload == "{": status.write_text("{")
+        elif status_payload == "stale":
+            status.write_text(json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+                "phase": "request_active", "sequence": 5}))
+            os.utime(status, ns=(1, 1))
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+    result = h.invoke_packaged_runtime_adapter(timeout_s=1, cleanup_timeout_s=1,
+        app_binary=str(app), model=str(model), backend="cpu",
+        relay_url="https://relay.example", subprocess_run=timeout_runner)
+    assert result["code"] == "packaged_phase_status_invalid"
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), "1"])
@@ -1279,6 +1332,7 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
     }
     def fake_run(command, **kwargs):
         h.Path(command[command.index("--benchmark-evidence") + 1]).write_text(json.dumps(payload))
+        _write_complete_phase(command)
         return subprocess.CompletedProcess(command, 0)
     result = h.invoke_packaged_runtime_adapter(app_binary=str(app), model=str(model), backend="cpu",
         relay_url="https://relay.example", cleanup_timeout_s=1, report_only=report_only,
@@ -1353,6 +1407,9 @@ class _TimedOutProcess:
 
     def kill(self):
         self.killed = True
+
+    def poll(self):
+        return -9 if self.killed else None
 
 
 def test_owned_runner_posix_terminates_exact_process_group(monkeypatch):
@@ -1657,6 +1714,23 @@ def test_packaged_trials_fail_closed_on_runtime_failure_and_settings_drift(tmp_p
     monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **kwargs: next(outcomes))
     assert h.main(_packaged_main_args(tmp_path, "--trials", "2", "--report-only")) == 1
     assert json.loads((tmp_path / "long_context_benchmark_report.json").read_text())["code"] == "generation_settings_inconsistent"
+
+
+def test_not_run_timeout_report_retains_validated_fixture_sha_and_diagnostics(tmp_path, monkeypatch):
+    budgets = h.packaged_runner_budgets(600, 30)
+    failure = {"pass": False, "runtime_contract_pass": False,
+        "code": "packaged_runner_timeout", "timeout_diagnostics": {
+            "last_safe_phase": "request_active", **budgets, "elapsed_s": 700.0,
+            "cleanup_succeeded": True}}
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: failure)
+    assert h.main(_packaged_main_args(tmp_path, "--report-only")) == 1
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
+    _, manifest = h.generate_fixture("small-8k", scenario="structured-extraction")
+    assert report["fixture"]["sha256"] == manifest["fixture_sha256"]
+    assert report["timeout_diagnostics"] == failure["timeout_diagnostics"]
+    serialized = json.dumps(report).lower()
+    assert all(value not in serialized for value in
+        ("prompt", "response_text", "ciphertext", "request_id", "session_id", "/workspace/"))
 
 
 @pytest.mark.parametrize("trials", ["0", "-1", str(h.MAX_PACKAGED_TRIALS + 1)])

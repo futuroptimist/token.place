@@ -49,6 +49,50 @@ SENSITIVE_KEYS = {
     "request_id", "client_id", "session_id",
 }
 
+# The watchdog contract is deliberately additive: setup and evidence work may
+# not borrow from the inference request's independently measured allowance.
+PACKAGED_SETUP_BUDGET_S = 300.0
+PACKAGED_FINALIZATION_BUDGET_S = 120.0
+PACKAGED_PHASE_STATUS_VERSION = "packaged-runner-phase-v1"
+PACKAGED_PHASES = (
+    "runner_startup", "webdriver_ready", "desktop_ready", "operator_ready",
+    "landing_page_ready", "request_active", "response_received",
+    "cancellation_validation", "evidence_finalization", "cleanup",
+)
+
+
+def packaged_cancellation_budget_s(request_timeout_s: float, observation_window_s: float,
+        recovery_timeout_s: float) -> float:
+    """Return the additive upper bound for the opt-in cancellation sequence."""
+    # Two trigger waits, two quiescence windows, two asynchronous cancellation
+    # acknowledgements, two scenario follow-ups, operator stop, restart
+    # stability, relay registration, and the post-restart follow-up.
+    return 2 * request_timeout_s + 2 * observation_window_s + 8 * recovery_timeout_s
+
+
+def packaged_phase_remaining(deadline: float, timeout_message: str, *,
+        clock: Callable[[], float] = time.monotonic, cap: float | None = None) -> float:
+    """Return one phase's remaining allowance, failing closed at its deadline."""
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise RuntimeError(timeout_message)
+    return min(remaining, cap) if cap is not None else remaining
+
+
+def start_phase_after(work: Callable[[], Any], allowance_s: float, *,
+        clock: Callable[[], float] = time.monotonic) -> tuple[Any, float]:
+    """Run the preceding phase before starting a complete independent allowance."""
+    result = work()
+    return result, clock() + allowance_s
+
+
+class PackagedRunnerTimeout(subprocess.TimeoutExpired):
+    """A watchdog expiry carrying only bounded owned-cleanup outcome."""
+
+    def __init__(self, command: list[str], timeout: float, cleanup_succeeded: bool):
+        super().__init__(command, timeout)
+        self.cleanup_succeeded = cleanup_succeeded
+
 @dataclass(frozen=True)
 class FixtureSpec:
     fixture_id: str
@@ -916,6 +960,25 @@ def validate_report(report: Any) -> None:
         return
     if report["status"] != "passed" and "runtime" not in report:
         if not isinstance(report.get("code"), str) or not report["code"]: raise ValueError("report_failure_code_invalid")
+        timeout_fields = {"last_safe_phase", "request_timeout_s", "setup_timeout_s",
+            "finalization_timeout_s", "cancellation_timeout_s", "cleanup_timeout_s", "runner_timeout_s",
+            "overall_timeout_s", "elapsed_s", "cleanup_succeeded"}
+        present_timeout_fields = timeout_fields.intersection(report)
+        if report["code"] == "packaged_runner_timeout":
+            if (present_timeout_fields != timeout_fields
+                    or report["last_safe_phase"] not in PACKAGED_PHASES
+                    or not all(finite(report[key]) and report[key] >= 0 for key in timeout_fields
+                        - {"last_safe_phase", "cleanup_succeeded"})
+                    or not isinstance(report["cleanup_succeeded"], bool)
+                    or report["runner_timeout_s"] != report["setup_timeout_s"]
+                        + report["request_timeout_s"] + report["finalization_timeout_s"]
+                        + report["cancellation_timeout_s"]
+                    or report["overall_timeout_s"] != report["runner_timeout_s"]
+                        + report["cleanup_timeout_s"]
+                    or report["elapsed_s"] > report["overall_timeout_s"]):
+                raise ValueError("report_timeout_diagnostics_invalid")
+        elif present_timeout_fields:
+            raise ValueError("report_timeout_diagnostics_unexpected")
         return
     runtime, backend, context = report.get("runtime"), report.get("backend"), report.get("context")
     if not isinstance(runtime, dict) or not all(isinstance(runtime.get(key), str) and runtime[key]
@@ -1136,19 +1199,46 @@ def observe_post_terminal(poller: Callable[[], object], *, clock: Callable[[], f
     return observed
 
 
+def _read_packaged_phase_status(path: Path, parent_elapsed_s: float) -> tuple[str | None, str | None]:
+    """Read the child's owner-only, low-cardinality atomic phase checkpoint."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "packaged_phase_status_missing"
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "phase", "sequence", "elapsed_s"}
+            or value.get("schema_version") != PACKAGED_PHASE_STATUS_VERSION
+            or value.get("phase") not in PACKAGED_PHASES
+            or not isinstance(value.get("sequence"), int) or isinstance(value.get("sequence"), bool)
+            or value["sequence"] != PACKAGED_PHASES.index(value["phase"]) + 1
+            or not isinstance(value.get("elapsed_s"), (int, float))
+            or isinstance(value.get("elapsed_s"), bool) or not math.isfinite(value["elapsed_s"])
+            or value["elapsed_s"] < 0 or value["elapsed_s"] > parent_elapsed_s + 1.0):
+        return None, "packaged_phase_status_malformed"
+    return str(value["phase"]), None
+
+
 def _run_owned_runner(command: list[str], timeout_s: float,
         cleanup_timeout_s: float, *, popen: Callable[..., Any] = subprocess.Popen,
         cleanup_run: Callable[..., Any] = subprocess.run,
         killpg: Callable[[int, int], Any] | None = None,
-        platform_name: str | None = None) -> subprocess.CompletedProcess[str]:
+        platform_name: str | None = None, phase_status_path: Path | None = None,
+        clock: Callable[[], float] | None = None,
+        phase_poll_interval_s: float = 0.05) -> subprocess.CompletedProcess[str]:
     """Run one owned process group without buffering output or killing by name."""
     kwargs: dict[str, Any] = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+    clock = time.monotonic if clock is None else clock
     owned_platform = os.name if platform_name is None else platform_name
     if owned_platform == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     else:
         kwargs["start_new_session"] = True
     process = popen(command, **kwargs)  # noqa: S603
+    started = clock()
+    work_deadline = started + timeout_s
+    overall_deadline = work_deadline + cleanup_timeout_s
+    active_deadline = work_deadline
+    cleanup_observed = False
+    returncode: int | None = None
     chunks: deque[bytes] = deque(maxlen=8)
     def drain_output() -> None:
         assert process.stdout is not None
@@ -1156,37 +1246,76 @@ def _run_owned_runner(command: list[str], timeout_s: float,
             chunks.append(chunk)
     drain = threading.Thread(target=drain_output, daemon=True)
     drain.start()
-    try:
-        returncode = process.wait(timeout=timeout_s + cleanup_timeout_s)
-    except subprocess.TimeoutExpired:
+    while True:
+        now = clock()
+        if now >= active_deadline:
+            break
+        # A bounded wait doubles as the phase monitor: it avoids polling sleeps
+        # while ensuring an atomic cleanup checkpoint is observed promptly.
+        monitor_window_s = min(phase_poll_interval_s, active_deadline - now)
+        try:
+            returncode = process.wait(timeout=monitor_window_s)
+            break
+        except subprocess.TimeoutExpired:
+            elapsed_s = max(0.0, clock() - started)
+            phase = None
+            if phase_status_path is not None:
+                phase, _phase_error = _read_packaged_phase_status(phase_status_path, elapsed_s)
+            if phase == "cleanup" and not cleanup_observed:
+                cleanup_observed = True
+                active_deadline = min(overall_deadline, clock() + cleanup_timeout_s)
+    if returncode is None:
+        cleanup_succeeded = False
+        cleanup_deadline = active_deadline if cleanup_observed else overall_deadline
+        def cleanup_remaining() -> float:
+            return max(0.001, cleanup_deadline - clock())
         if owned_platform == "nt":
+            taskkill_ok = False
             try:
-                cleanup_run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                killed = cleanup_run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=cleanup_timeout_s, check=False)  # noqa: S603
+                    timeout=cleanup_remaining(), check=False)  # noqa: S603
+                taskkill_ok = getattr(killed, "returncode", 1) == 0
             except (OSError, subprocess.TimeoutExpired):
+                pass
+            if not taskkill_ok:
                 process.kill()
             try:
-                process.wait(timeout=cleanup_timeout_s)
+                process.wait(timeout=cleanup_remaining())
+                cleanup_succeeded = taskkill_ok
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait(timeout=cleanup_timeout_s)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=cleanup_remaining())
         else:
             owned_killpg = killpg if killpg is not None else getattr(os, "killpg", None)
             if not callable(owned_killpg):
                 with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                     process.kill()
-                    process.wait(timeout=cleanup_timeout_s)
+                    process.wait(timeout=cleanup_remaining())
                 raise RuntimeError("owned_process_group_cleanup_unavailable") from None
             with contextlib.suppress(ProcessLookupError):
                 owned_killpg(process.pid, signal.SIGTERM)
             try:
-                process.wait(timeout=cleanup_timeout_s)
+                process.wait(timeout=cleanup_remaining())
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
                     owned_killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=cleanup_timeout_s)
-        raise
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=cleanup_remaining())
+            # The leader can exit before its browser/driver descendants. Target
+            # the whole owned group again and prove it is gone before claiming
+            # successful cleanup in the bounded timeout diagnostic.
+            with contextlib.suppress(ProcessLookupError):
+                owned_killpg(process.pid, signal.SIGKILL)
+            while clock() < cleanup_deadline:
+                try:
+                    owned_killpg(process.pid, 0)
+                except ProcessLookupError:
+                    cleanup_succeeded = True
+                    break
+                time.sleep(min(0.01, cleanup_remaining()))
+        raise PackagedRunnerTimeout(command, timeout_s, cleanup_succeeded) from None
     drain.join(timeout=cleanup_timeout_s)
     tail = b"".join(chunks)[-2048:].decode("utf-8", errors="replace")
     return subprocess.CompletedProcess(command, returncode, stdout=tail)
@@ -1196,7 +1325,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         model: str | None = None, backend: str | None = None, relay_url: str | None = None,
         cleanup_timeout_s: float | None = None, app_binary: str | None = None,
         context_tier: str = "64k-full", report_only: bool = False,
-        external_prompt: str | None = None, external_manifest: dict[str, Any] | None = None,
+        external_prompt: str | None = None, external_manifest: Any | None = None,
         subprocess_run: Callable[..., Any] | None = None, cancellation_validation: bool = False,
         prefill_cancel_tokens: int | None = None, prefill_cancel_fraction: float | None = None,
         generation_cancel_tokens: int = 1, observation_window_s: float = 0.5,
@@ -1251,36 +1380,64 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         return {"pass": False, "runtime_contract_pass": False,
             "code": "fixture_context_incompatible", "fixture_tokens": manifest["actual_tokens"],
             "prompt_budget_tokens": prompt_budget, "context_tier": context_tier}
+    cancellation_budget_s = (packaged_cancellation_budget_s(float(timeout_s),
+        float(observation_window_s), float(recovery_timeout_s)) if cancellation_validation else 0.0)
+    runner_budget_s = (PACKAGED_SETUP_BUDGET_S + float(timeout_s)
+        + PACKAGED_FINALIZATION_BUDGET_S + cancellation_budget_s)
+    overall_budget_s = runner_budget_s + float(cleanup_timeout_s)
     request = {"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest,
         "model": str(model_path), "backend": backend, "relay_url": relay_url,
         "context_tier": context_tier, "request_timeout_s": timeout_s,
-        "cleanup_timeout_s": cleanup_timeout_s, "cancellation_validation": cancellation_validation,
+        "cleanup_timeout_s": cleanup_timeout_s, "setup_timeout_s": PACKAGED_SETUP_BUDGET_S,
+        "finalization_timeout_s": PACKAGED_FINALIZATION_BUDGET_S,
+        "cancellation_timeout_s": cancellation_budget_s,
+        "phase_status_version": PACKAGED_PHASE_STATUS_VERSION,
+        "phase_status_phases": list(PACKAGED_PHASES),
+        "cancellation_validation": cancellation_validation,
         "cancellation": {"prefill_tokens": prefill_cancel_tokens,
             "prefill_fraction": prefill_cancel_fraction, "generation_tokens": generation_cancel_tokens,
             "observation_window_s": observation_window_s, "recovery_timeout_s": recovery_timeout_s}}
-    request_name = evidence_name = diagnostic_name = None
+    request_name = evidence_name = diagnostic_name = phase_name = None
+    runner_started = time.monotonic()
     try:
         request_fd, request_name = tempfile.mkstemp(prefix="long-context-request-", suffix=".json")
         evidence_fd, evidence_name = tempfile.mkstemp(prefix="long-context-evidence-", suffix=".json")
+        phase_fd, phase_name = tempfile.mkstemp(prefix="long-context-phase-", suffix=".json")
         if hasattr(os, "fchmod"):
-            os.fchmod(request_fd, 0o600); os.fchmod(evidence_fd, 0o600)
+            os.fchmod(request_fd, 0o600); os.fchmod(evidence_fd, 0o600); os.fchmod(phase_fd, 0o600)
         with os.fdopen(request_fd, "w", encoding="utf-8") as handle:
             json.dump(request, handle)
         os.close(evidence_fd)
+        os.close(phase_fd)
         command = [sys.executable, str(Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
             "test_desktop_operator_ui_e2e.py"), "--benchmark-request", request_name,
-            "--benchmark-evidence", evidence_name, "--app-binary", str(app_path)]
+            "--benchmark-evidence", evidence_name, "--benchmark-phase-status", phase_name,
+            "--app-binary", str(app_path)]
         diagnostic_fd, diagnostic_name = tempfile.mkstemp(prefix="long-context-runner-", suffix=".log")
         try:
             with os.fdopen(diagnostic_fd, "w+", encoding="utf-8") as diagnostic_handle:
                 if subprocess_run is None:
-                    completed = _run_owned_runner(command, timeout_s, cleanup_timeout_s)
+                    completed = _run_owned_runner(command, runner_budget_s, cleanup_timeout_s,
+                        phase_status_path=Path(phase_name))
                 else:
                     completed = subprocess_run(command, stdout=diagnostic_handle,
                         stderr=subprocess.STDOUT, text=True,
-                        timeout=timeout_s + cleanup_timeout_s, check=False)
-        except subprocess.TimeoutExpired:
-            return {"pass": False, "code": "packaged_runner_timeout"}
+                        timeout=overall_budget_s, check=False)
+        except subprocess.TimeoutExpired as exc:
+            elapsed_s = min(overall_budget_s, max(0.0, time.monotonic() - runner_started))
+            phase, phase_error = _read_packaged_phase_status(Path(phase_name), elapsed_s)
+            if phase_error:
+                return {"pass": False, "runtime_contract_pass": False, "code": phase_error}
+            return {"pass": False, "runtime_contract_pass": False,
+                "code": "packaged_runner_timeout", "last_safe_phase": phase,
+                "request_timeout_s": float(timeout_s),
+                "setup_timeout_s": PACKAGED_SETUP_BUDGET_S,
+                "finalization_timeout_s": PACKAGED_FINALIZATION_BUDGET_S,
+                "cancellation_timeout_s": cancellation_budget_s,
+                "cleanup_timeout_s": float(cleanup_timeout_s),
+                "runner_timeout_s": runner_budget_s, "overall_timeout_s": overall_budget_s,
+                "elapsed_s": elapsed_s,
+                "cleanup_succeeded": bool(getattr(exc, "cleanup_succeeded", False))}
         if completed.returncode != 0:
             tail = (completed.stdout or Path(diagnostic_name).read_text(
                 encoding="utf-8", errors="replace"))[-2048:]
@@ -1290,7 +1447,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         except (OSError, json.JSONDecodeError):
             return {"pass": False, "code": "packaged_evidence_malformed"}
     finally:
-        for name in (request_name, evidence_name, diagnostic_name):
+        for name in (request_name, evidence_name, diagnostic_name, phase_name):
             if name:
                 Path(name).unlink(missing_ok=True)
     if not isinstance(payload, dict):
@@ -1493,7 +1650,25 @@ def main(argv: list[str] | None = None) -> int:
                 or not 0 < args.cancellation_recovery_timeout <= 300):
             p.error("cancellation validation requires one bounded prefill trigger and bounded timeouts")
         external_prompt = _read_bounded_text(args.prompt) if args.prompt else None
-        external_manifest = json.loads(_read_bounded_text(args.manifest, 1024 * 1024)) if args.manifest else None
+        try:
+            external_manifest = (json.loads(_read_bounded_text(args.manifest, 1024 * 1024))
+                if args.manifest else None)
+        except json.JSONDecodeError:
+            # Preserve the adapter's stable categorical fail-closed report path.
+            external_manifest = []
+        if external_manifest is None:
+            _validated_prompt, validated_manifest = generate_fixture(args.fixture, scenario=args.scenario)
+        else:
+            validated_manifest = external_manifest
+        validated_fixture_sha256 = "unavailable"
+        try:
+            validate_manifest(validated_manifest, external_prompt)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if (validated_manifest["fixture_id"] == args.fixture
+                    and validated_manifest["scenario"] == args.scenario):
+                validated_fixture_sha256 = validated_manifest["fixture_sha256"]
         completed: list[dict[str, Any]] = []
         evidence: dict[str, Any] = {"pass": False, "code": "packaged_contract_failed"}
         settings: dict[str, Any] | None = None
@@ -1561,7 +1736,12 @@ def main(argv: list[str] | None = None) -> int:
             report = {"mode":"packaged-runtime", "status":"not_run", "code":evidence.get("code", "packaged_contract_failed"),
                 "requested_trial_count":args.trials, "completed_trial_count":len(completed),
                 "fixture":{"id":args.fixture, "version":FIXTURE_VERSION, "scenario":args.scenario,
-                    "sha256":"unavailable"}}
+                    "sha256":validated_fixture_sha256}}
+            for key in ("last_safe_phase", "request_timeout_s", "setup_timeout_s",
+                    "finalization_timeout_s", "cancellation_timeout_s", "cleanup_timeout_s", "runner_timeout_s",
+                    "overall_timeout_s", "elapsed_s", "cleanup_succeeded"):
+                if key in evidence:
+                    report[key] = evidence[key]
         path=write_report_atomic(Path(args.out_dir), report)
         print(f"packaged_runtime_pass={evidence.get('pass', False)} report={path}")
         return 0 if all_runtime_complete and (all_semantic_pass or report_only_accepted) else 1

@@ -206,6 +206,55 @@ semantic outcomes only after all requested runtime trials completed; exact-match
 failure-category counts, and `overall_pass=false` remain truthful in the report. Each trial receives
 the full `--request-timeout`; cleanup remains bounded separately by `--cleanup-timeout`.
 
+### Packaged-runner phase budgets and watchdog
+
+The two existing CLI flags remain sufficient; no additional argument is required. The packaged
+runner applies five separate allowances:
+
+- **setup/readiness: 300 seconds** for `tauri-driver`, WebDriver, desktop UI, operator provisioning,
+  CUDA/Metal model warm-load, relay registration, and landing-page readiness;
+- **inference request: `--request-timeout` seconds**, beginning immediately before the send-button
+  click that submits the request, so setup cannot consume inference time;
+- **evidence finalization: 120 seconds** for bounded telemetry/tokenizer collection, model
+  fingerprinting, and the atomic evidence write; and
+- **cancellation validation: zero when disabled, otherwise
+  `2 × request timeout + 2 × observation window + 8 × recovery timeout` seconds** for the two
+  progress-trigger waits, two quiescence windows, two asynchronous acknowledgements, two scenario
+  follow-ups, operator stop, restart stability, relay registration, and the post-restart follow-up; and
+- **cleanup: `--cleanup-timeout` seconds**, reserved for the exact process tree owned by the trial.
+
+The parent watchdog is finite and uses the explicit equation
+`300 + request timeout + 120 + cancellation validation` seconds
+for child execution, followed by at most the configured cleanup budget. Thus the complete overall
+allowance is `setup + request + finalization + cancellation validation + cleanup`; it is neither
+an undocumented multiplier nor an unbounded wait. Cancellation validation retains its existing
+bounded waits and CLI controls; the named additive budget does not change cancellation semantics or
+add a required argument. Pre-request WebDriver and readiness waits draw only from the shared setup
+deadline, not from the request timeout. When cancellation validation is enabled, finalization begins
+immediately after cancellation validation finishes; otherwise it begins immediately after the
+primary response. Every later telemetry, polling, tokenizer, hashing, and evidence-write operation
+uses its complete allowance.
+
+An owner-only phase file is atomically replaced at allowlisted boundaries (`runner_startup`,
+`webdriver_ready`, `desktop_ready`, `operator_ready`, `landing_page_ready`, `request_active`,
+`response_received`, `cancellation_validation`, `evidence_finalization`, and `cleanup`). Cancellation
+uses one finite deadline, and the complete evidence-finalization allowance starts only after it
+finishes (or after the primary response when cancellation is disabled). A child that reaches
+`cleanup` within the work deadline may use the one reserved cleanup window; child cleanup and
+parent-enforced exact-tree teardown share that window and cannot add a second allowance. If the
+parent watchdog expires, the
+`packaged_runner_timeout` report records only the last safe phase, the five configured budgets and
+their derived runner/overall totals, bounded elapsed time, and whether owned-tree cleanup succeeded.
+The channel contains no prompts, responses, ciphertext, keys, credentials, identifiers, paths,
+command lines, or logs. Missing, malformed, or stale phase state fails closed as a runtime-contract
+failure, and all request, response, diagnostic, and phase files are deleted after the attempt.
+
+The sanitized Windows 11/NVIDIA attempt described for this follow-up timed out in the first
+`small-8k` / `single-needle` / `8k-fast` trial before completing any of three requested trials.
+It therefore supplied **no semantic baseline**. Corrected accounting and mocked orchestration tests
+are not physical CUDA or Metal validation; physical Windows/CUDA and macOS/Metal reruns remain
+required.
+
 Failed or `not_run` packaged reports require a stable categorical failure code. Report validation
 does not fill absent telemetry with zero and does not allow `NaN` or infinity.
 

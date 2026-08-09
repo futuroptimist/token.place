@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -1175,6 +1176,11 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
 
     def fake_run(command, **kwargs):
         if runner_outcome == "timeout":
+            phase_path = command[command.index("--benchmark-phase-status") + 1]
+            h.Path(phase_path).write_text(json.dumps({
+                "schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+                "phase": "request_active", "sequence": 6, "elapsed_s": 0.0,
+            }))
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if runner_outcome == "failed":
             return subprocess.CompletedProcess(command, 1, "", "")
@@ -1194,6 +1200,112 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
     )
     assert result["pass"] is False
     assert result["code"] == expected_code
+    if runner_outcome == "timeout":
+        assert result["last_safe_phase"] == "request_active"
+        assert result["request_timeout_s"] == 1
+        assert result["runner_timeout_s"] == (
+            h.PACKAGED_SETUP_BUDGET_S + 1 + h.PACKAGED_FINALIZATION_BUDGET_S)
+        assert result["overall_timeout_s"] == result["runner_timeout_s"] + 1
+        assert result["cleanup_succeeded"] is False
+
+
+@pytest.mark.parametrize(("contents", "expected"), [
+    (None, "packaged_phase_status_missing"),
+    ("not-json", "packaged_phase_status_missing"),
+    (json.dumps({"schema_version": "wrong", "phase": "request_active",
+        "sequence": 6, "elapsed_s": 0}), "packaged_phase_status_malformed"),
+    (json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase": "request_active", "sequence": 6, "elapsed_s": 50}),
+        "packaged_phase_status_malformed"),
+])
+def test_packaged_phase_status_missing_malformed_or_stale_fails_closed(tmp_path, contents, expected):
+    path = tmp_path / "phase.json"
+    if contents is not None:
+        path.write_text(contents)
+    assert h._read_packaged_phase_status(path, 1) == (None, expected)
+
+
+def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    observed = {}
+    def fake_run(command, **kwargs):
+        observed["timeout"] = kwargs["timeout"]
+        request_path = command[command.index("--benchmark-request") + 1]
+        observed["request"] = json.loads(h.Path(request_path).read_text())
+        return subprocess.CompletedProcess(command, 1)
+    result = h.invoke_packaged_runtime_adapter(timeout_s=600, app_binary=str(app),
+        model=str(model), backend="cuda", relay_url="https://relay.example",
+        cleanup_timeout_s=30, subprocess_run=fake_run)
+    assert result["code"] == "packaged_runner_failed"
+    work_budget = h.PACKAGED_SETUP_BUDGET_S + 600 + h.PACKAGED_FINALIZATION_BUDGET_S
+    assert observed["timeout"] == work_budget + 30
+    assert observed["request"]["phase_status_version"] == h.PACKAGED_PHASE_STATUS_VERSION
+    assert observed["request"]["phase_status_phases"] == list(h.PACKAGED_PHASES)
+    assert observed["request"]["request_timeout_s"] == 600
+    assert observed["request"]["setup_timeout_s"] == h.PACKAGED_SETUP_BUDGET_S
+    assert observed["request"]["finalization_timeout_s"] == h.PACKAGED_FINALIZATION_BUDGET_S
+    assert observed["request"]["cancellation_timeout_s"] == 0
+
+
+def test_cancellation_budget_is_named_additive_and_bounded(tmp_path):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    observed = {}
+    def fake_run(command, **kwargs):
+        observed["timeout"] = kwargs["timeout"]
+        request_path = command[command.index("--benchmark-request") + 1]
+        observed["request"] = json.loads(h.Path(request_path).read_text())
+        return subprocess.CompletedProcess(command, 1)
+    h.invoke_packaged_runtime_adapter(timeout_s=10, app_binary=str(app), model=str(model),
+        backend="cuda", relay_url="https://relay.example", cleanup_timeout_s=3,
+        cancellation_validation=True, prefill_cancel_fraction=0.5,
+        observation_window_s=2, recovery_timeout_s=4, subprocess_run=fake_run)
+    cancellation = h.packaged_cancellation_budget_s(10, 2, 4)
+    assert cancellation == 56
+    assert observed["request"]["cancellation_timeout_s"] == cancellation
+    assert observed["timeout"] == (h.PACKAGED_SETUP_BUDGET_S + 10
+        + h.PACKAGED_FINALIZATION_BUDGET_S + cancellation + 3)
+
+
+def test_cancellation_budget_enumerates_every_bounded_operation():
+    request, observation, recovery = 11, 3, 5
+    bounded_operations = ([request] * 2 + [observation] * 2 + [recovery] * 8)
+    assert h.packaged_cancellation_budget_s(request, observation, recovery) == sum(bounded_operations)
+
+
+def test_cancellation_phase_and_finalization_allowances_are_independent():
+    now = [10.0]
+    def consume_complete_cancellation_allowance():
+        now[0] += 56.0
+        return "validated"
+    result, finalization_deadline = h.start_phase_after(
+        consume_complete_cancellation_allowance, 120.0, clock=lambda: now[0])
+    assert result == "validated"
+    assert finalization_deadline == 186.0
+    assert h.packaged_phase_remaining(finalization_deadline, "timeout",
+        clock=lambda: now[0]) == 120.0
+
+
+def test_cancellation_deadline_exhaustion_fails_closed_with_fake_clock():
+    with pytest.raises(RuntimeError, match="packaged cancellation validation timeout"):
+        h.packaged_phase_remaining(1.0, "packaged cancellation validation timeout",
+            clock=lambda: 1.0)
+
+
+def test_disabled_cancellation_has_no_budget_or_cli_contract_change(tmp_path):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    observed = {}
+    def fake_run(command, **kwargs):
+        request_path = command[command.index("--benchmark-request") + 1]
+        observed.update(json.loads(h.Path(request_path).read_text()))
+        return subprocess.CompletedProcess(command, 1)
+    h.invoke_packaged_runtime_adapter(timeout_s=10, app_binary=str(app), model=str(model),
+        backend="cuda", relay_url="https://relay.example", cleanup_timeout_s=3,
+        subprocess_run=fake_run)
+    assert observed["cancellation_timeout_s"] == 0
+    assert observed["cancellation_validation"] is False
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), "1"])
@@ -1348,6 +1460,7 @@ class _TimedOutProcess:
     def wait(self, timeout):
         outcome = next(self.waits)
         if outcome == "timeout":
+            time.sleep(timeout)
             raise subprocess.TimeoutExpired("runner", timeout)
         return outcome
 
@@ -1355,17 +1468,121 @@ class _TimedOutProcess:
         self.killed = True
 
 
+def _write_phase(path, phase, elapsed):
+    path.write_text(json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase": phase, "sequence": h.PACKAGED_PHASES.index(phase) + 1,
+        "elapsed_s": elapsed}))
+
+
+def test_owned_runner_allows_on_time_child_cleanup_once(tmp_path):
+    clock = [0.0]
+    phase = tmp_path / "phase.json"
+    class Process(_TimedOutProcess):
+        def wait(self, timeout):
+            clock[0] += timeout
+            if clock[0] >= 2.0 and not phase.exists():
+                _write_phase(phase, "cleanup", 2.0)
+            if clock[0] < 4.0:
+                raise subprocess.TimeoutExpired("runner", timeout)
+            return 0
+    process = Process([])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    completed = h._run_owned_runner(["runner"], 10, 5,
+        popen=lambda _command, **_kwargs: process, phase_status_path=phase,
+        platform_name="posix", clock=lambda: clock[0])
+    assert completed.returncode == 0
+    assert 4.0 <= clock[0] < 5.1
+    assert process.killed is False
+
+
+def test_owned_runner_work_timeout_does_not_borrow_cleanup_window(tmp_path):
+    clock = [0.0]
+    phase = tmp_path / "phase.json"
+    _write_phase(phase, "request_active", 9.5)
+    class Process(_TimedOutProcess):
+        def wait(self, timeout):
+            if process.killed:
+                return 0
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired("runner", timeout)
+    process = Process([])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    signals = []
+    def kill_group(pid, sig):
+        signals.append(sig)
+        if sig == signal.SIGTERM:
+            process.killed = True
+        if sig == 0:
+            raise ProcessLookupError
+    with pytest.raises(h.PackagedRunnerTimeout) as raised:
+        h._run_owned_runner(["runner"], 10, 5,
+            popen=lambda _command, **_kwargs: process, phase_status_path=phase,
+            killpg=kill_group, platform_name="posix", clock=lambda: clock[0])
+    assert raised.value.timeout == 10
+    assert signal.SIGTERM in signals
+    assert raised.value.cleanup_succeeded is True
+
+
+def test_owned_runner_cleanup_overrun_is_bounded_and_fails_closed(tmp_path):
+    clock = [0.0]
+    phase = tmp_path / "phase.json"
+    class Process(_TimedOutProcess):
+        def wait(self, timeout):
+            clock[0] += timeout
+            if clock[0] >= 2.0 and not phase.exists():
+                _write_phase(phase, "cleanup", 2.0)
+            raise subprocess.TimeoutExpired("runner", timeout)
+    process = Process([])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    signals = []
+    with pytest.raises(h.PackagedRunnerTimeout) as raised:
+        h._run_owned_runner(["runner"], 10, 5,
+            popen=lambda _command, **_kwargs: process, phase_status_path=phase,
+            killpg=lambda _pid, sig: signals.append(sig), platform_name="posix",
+            clock=lambda: clock[0])
+    assert 5.0 <= clock[0] < 10.0
+    assert signal.SIGKILL in signals
+    assert raised.value.cleanup_succeeded is False
+
+
 def test_owned_runner_posix_terminates_exact_process_group(monkeypatch):
     process = _TimedOutProcess(["timeout", "timeout", -9])
     process.stdout = type("Output", (), {"read": lambda self, size: b""})()
     launched = {}
     signals = []
-    with pytest.raises(subprocess.TimeoutExpired):
+    def kill_group(pid, sig):
+        signals.append((pid, sig))
+        if sig == 0:
+            raise ProcessLookupError
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
         h._run_owned_runner(["runner"], 1, 2,
             popen=lambda command, **kwargs: launched.update(kwargs) or process,
-            killpg=lambda pid, sig: signals.append((pid, sig)), platform_name="posix")
+            killpg=kill_group, platform_name="posix", phase_poll_interval_s=10)
     assert launched["start_new_session"] is True
-    assert signals == [(731, signal.SIGTERM), (731, signal.SIGKILL)]
+    assert signals == [(731, signal.SIGTERM), (731, signal.SIGKILL),
+        (731, signal.SIGKILL)]
+    assert raised.value.cleanup_succeeded is False
+
+
+def test_owned_runner_posix_does_not_claim_cleanup_while_group_survives(monkeypatch):
+    clock = [0.0]
+    class Process(_TimedOutProcess):
+        def wait(self, timeout):
+            if self.killed:
+                return 0
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired("runner", timeout)
+    process = Process([])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    monkeypatch.setattr(h.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    def surviving_group(_pid, sig):
+        if sig == signal.SIGTERM:
+            process.killed = True
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        h._run_owned_runner(["runner"], 1, 2,
+            popen=lambda _command, **_kwargs: process,
+            killpg=surviving_group, platform_name="posix", clock=lambda: clock[0])
+    assert raised.value.cleanup_succeeded is False
 
 
 @pytest.mark.parametrize("cleanup_outcome", ["failed", "timeout"])
@@ -1378,15 +1595,16 @@ def test_owned_runner_windows_never_invokes_injected_killpg(cleanup_outcome):
         if cleanup_outcome == "timeout":
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         return subprocess.CompletedProcess(command, 1)
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
         h._run_owned_runner(["runner"], 1, 2,
             popen=lambda command, **kwargs: launched.update(kwargs) or process,
             cleanup_run=cleanup_run,
             killpg=lambda *_args: pytest.fail("Windows cleanup called POSIX killpg"),
-            platform_name="nt")
+            platform_name="nt", phase_poll_interval_s=10)
     assert launched["creationflags"] == getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     assert cleanup[0][0] == ["taskkill", "/PID", "731", "/T", "/F"]
-    assert process.killed is (cleanup_outcome == "timeout")
+    assert process.killed is True
+    assert raised.value.cleanup_succeeded is False
 
 
 def test_owned_runner_windows_never_resolves_os_killpg(monkeypatch):
@@ -1400,7 +1618,7 @@ def test_owned_runner_windows_never_resolves_os_killpg(monkeypatch):
             popen=lambda _command, **_kwargs: process,
             cleanup_run=lambda command, **kwargs: cleanup.append((command, kwargs))
             or subprocess.CompletedProcess(command, 0),
-            platform_name="nt")
+            platform_name="nt", phase_poll_interval_s=10)
 
     assert cleanup[0][0] == ["taskkill", "/PID", "731", "/T", "/F"]
 
@@ -1411,7 +1629,8 @@ def test_owned_runner_posix_fails_closed_without_killpg(monkeypatch):
     monkeypatch.delattr(os, "killpg", raising=False)
     with pytest.raises(RuntimeError, match="^owned_process_group_cleanup_unavailable$"):
         h._run_owned_runner(["runner"], 1, 2,
-            popen=lambda _command, **_kwargs: process, platform_name="posix")
+            popen=lambda _command, **_kwargs: process, platform_name="posix",
+            phase_poll_interval_s=10)
     assert process.killed is True
 
 
@@ -1597,6 +1816,60 @@ def test_packaged_trials_default_and_multiple_are_sequential(tmp_path, monkeypat
     report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
     assert report["requested_trial_count"] == report["completed_trial_count"] == 3
     assert report["aggregate_semantic"]["trial_count"] == 3
+
+
+def test_not_run_timeout_report_retains_validated_fixture_sha_and_safe_diagnostics(tmp_path, monkeypatch):
+    _, manifest = h.generate_fixture("small-8k", scenario="single-needle")
+    timeout = {"pass": False, "runtime_contract_pass": False,
+        "code": "packaged_runner_timeout", "last_safe_phase": "request_active",
+        "request_timeout_s": 600.0, "setup_timeout_s": h.PACKAGED_SETUP_BUDGET_S,
+        "finalization_timeout_s": h.PACKAGED_FINALIZATION_BUDGET_S,
+        "cancellation_timeout_s": 0.0,
+        "cleanup_timeout_s": 30.0,
+        "runner_timeout_s": h.PACKAGED_SETUP_BUDGET_S + 600 + h.PACKAGED_FINALIZATION_BUDGET_S,
+        "overall_timeout_s": h.PACKAGED_SETUP_BUDGET_S + 600
+            + h.PACKAGED_FINALIZATION_BUDGET_S + 30,
+        "elapsed_s": 700.0, "cleanup_succeeded": True}
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: timeout)
+    assert h.main(_packaged_main_args(tmp_path, "--fixture", "small-8k", "--scenario",
+        "single-needle", "--request-timeout", "600", "--cleanup-timeout", "30",
+        "--report-only")) == 1
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
+    assert report["fixture"]["sha256"] == manifest["fixture_sha256"]
+    assert report["completed_trial_count"] == 0
+    assert report["last_safe_phase"] == "request_active"
+    assert not h.SENSITIVE_KEYS.intersection(report)
+
+
+def test_not_run_invalid_external_manifest_uses_safe_fixture_sha(tmp_path, monkeypatch):
+    prompt = tmp_path / "prompt.txt"
+    manifest = tmp_path / "manifest.json"
+    prompt.write_text("external prompt", encoding="utf-8")
+    manifest.write_text(json.dumps({"fixture_id": "small-8k"}), encoding="utf-8")
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: {
+        "pass": False, "runtime_contract_pass": False,
+        "code": "manifest_missing_fields"})
+
+    assert h.main(_packaged_main_args(tmp_path, "--prompt", str(prompt),
+        "--manifest", str(manifest))) == 1
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
+    assert report["status"] == "not_run"
+    assert report["code"] == "manifest_missing_fields"
+    assert report["fixture"]["sha256"] == "unavailable"
+
+
+@pytest.mark.parametrize("manifest_value", ["not-json", "[]"])
+def test_not_run_malformed_external_manifest_is_categorical(tmp_path, manifest_value, monkeypatch):
+    prompt = tmp_path / "prompt.txt"; prompt.write_text("external prompt", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"; manifest.write_text(manifest_value, encoding="utf-8")
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: {
+        "pass": False, "runtime_contract_pass": False, "code": "manifest_not_object"})
+    assert h.main(_packaged_main_args(tmp_path, "--prompt", str(prompt),
+        "--manifest", str(manifest), "--report-only")) == 1
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
+    assert report["status"] == "not_run"
+    assert report["code"] == "manifest_not_object"
+    assert report["fixture"]["sha256"] == "unavailable"
 
 
 def test_cancellation_sequence_runs_once_outside_semantic_trial_count(tmp_path, monkeypatch):

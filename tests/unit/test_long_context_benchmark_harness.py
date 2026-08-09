@@ -19,7 +19,8 @@ RUNNER_SOURCE = Path(__file__).parents[2] / "desktop-tauri/scripts/test_desktop_
 @pytest.fixture
 def desktop_runner():
     tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
-    names = {"_wait_for_packaged_setup_condition", "_enter_packaged_prompt",
+    names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
+        "_validate_packaged_failure_reason", "_enter_packaged_prompt",
         "_populate_and_submit_packaged_prompt"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
@@ -29,7 +30,9 @@ def desktop_runner():
         "time": time, "By": SimpleNamespace(CSS_SELECTOR="css"),
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
-        "WebDriverWait": object})
+        "WebDriverWait": object,
+        "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "apply_benchmark_context_tier": h.apply_benchmark_context_tier})
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
     return module
 
@@ -1560,6 +1563,66 @@ def test_packaged_prompt_fails_closed_when_setup_expires_before_click(
     assert ("phase", "request_active") not in events
 
 
+def test_packaged_prompt_rejects_inexact_vue_population(desktop_runner):
+    class Field:
+        parent = object()
+
+        def send_keys(self, _value):
+            pass
+
+    class Browser:
+        def find_element(self, _by, _selector):
+            return Field()
+
+        def execute_script(self, _script):
+            return "partial prompt"
+
+    failures = []
+
+    def fail_closed(reason):
+        failures.append(reason)
+        raise RuntimeError(reason)
+
+    with pytest.raises(RuntimeError, match="message_input_not_populated"):
+        desktop_runner._populate_and_submit_packaged_prompt(
+            Browser(), "complete prompt", lambda: 10, fail_closed, pytest.fail)
+    assert failures == ["message_input_not_populated"]
+
+
+def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_path):
+    """Exercise the real runner's pre-launch failure and final checkpoint path."""
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {"_write_benchmark_phase", "run_long_context_packaged_mode"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    namespace = {
+        "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
+        "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
+        "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
+        namespace)
+    request_path = tmp_path / "request.json"
+    phase_path = tmp_path / "phase.json"
+    request_path.write_text(json.dumps({
+        "phase_status_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase_status_phases": list(h.PACKAGED_PHASES),
+        "setup_timeout_s": 0,
+        "cleanup_timeout_s": 1,
+        "manifest": {"fixture_sha256": "0" * 64, "targets": {}},
+    }))
+
+    with pytest.raises(RuntimeError, match="packaged setup timeout"):
+        namespace["run_long_context_packaged_mode"](
+            request_path, tmp_path / "evidence.json", phase_path, tmp_path / "app")
+
+    checkpoint = json.loads(phase_path.read_text())
+    assert checkpoint["phase"] == "cleanup"
+    assert checkpoint["failure_reason"] == "packaged_runner_failure"
+    assert checkpoint["cleanup_succeeded"] is True
+
+
 @pytest.mark.parametrize("reason", [
     "vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
     "send_button_not_enabled",
@@ -1575,6 +1638,56 @@ def test_packaged_setup_exhaustion_preserves_specific_failure_reason(desktop_run
         desktop_runner._wait_for_packaged_setup_condition(
             object(), exhausted, lambda _browser: True, reason, fail_closed)
     assert observed == [reason]
+
+
+def test_packaged_landing_page_readiness_checks_and_context_are_bounded(
+        desktop_runner, monkeypatch):
+    scripts = []
+    remaining_calls = []
+
+    class Browser:
+        def execute_script(self, script, *_args):
+            scripts.append(script)
+            return "64k-full" if "selectedContextTier" in script else True
+
+    class Wait:
+        def __init__(self, browser, timeout, **_kwargs):
+            self.browser = browser
+            assert timeout == 10
+
+        def until(self, predicate):
+            return predicate(self.browser)
+
+    monkeypatch.setattr(desktop_runner, "WebDriverWait", Wait)
+
+    def setup_remaining():
+        remaining_calls.append(True)
+        return 10
+
+    desktop_runner._prepare_packaged_landing_page(
+        Browser(), setup_remaining, pytest.fail, "64k-full")
+    assert len(remaining_calls) == 4
+    assert any("hasClientKeypair" in script for script in scripts)
+    assert any("modelsLoaded" in script for script in scripts)
+
+
+def test_packaged_landing_page_rejects_wrong_context_tier(desktop_runner, monkeypatch):
+    class Browser:
+        def execute_script(self, script, *_args):
+            return "8k-fast" if "selectedContextTier" in script else True
+
+    class Wait:
+        def __init__(self, browser, _timeout, **_kwargs):
+            self.browser = browser
+
+        def until(self, predicate):
+            return predicate(self.browser)
+
+    monkeypatch.setattr(desktop_runner, "WebDriverWait", Wait)
+    with pytest.raises(RuntimeError, match="requested_context_tier_not_applied"):
+        desktop_runner._prepare_packaged_landing_page(
+            Browser(), lambda: 10,
+            lambda reason: (_ for _ in ()).throw(RuntimeError(reason)), "64k-full")
 
 
 def test_packaged_runner_never_bypasses_production_send_eligibility():
@@ -1593,6 +1706,13 @@ def test_packaged_failure_reasons_are_explicit_low_cardinality_categories():
         "send_button_not_enabled"}.issubset(h.PACKAGED_FAILURE_REASONS)
     assert all(value.isascii() and value.replace("_", "").islower()
         for value in h.PACKAGED_FAILURE_REASONS)
+
+
+def test_desktop_runner_validates_packaged_failure_reasons(desktop_runner):
+    assert (desktop_runner._validate_packaged_failure_reason("vue_not_ready")
+        == "vue_not_ready")
+    with pytest.raises(RuntimeError, match="invalid packaged failure reason"):
+        desktop_runner._validate_packaged_failure_reason("prompt content")
 
 
 def test_owned_runner_keeps_only_bounded_diagnostic_tail():

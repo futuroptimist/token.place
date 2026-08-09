@@ -42,8 +42,8 @@ try:
         WebDriverException,
     )
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.action_chains import ActionChains
-    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.common.action_chains import ActionChains  # pragma: no cover
+    from selenium.webdriver.common.keys import Keys  # pragma: no cover
     from selenium.webdriver.support.ui import WebDriverWait
 
     from utils.crypto_helpers import CryptoClient
@@ -784,6 +784,30 @@ def _wait_for_packaged_setup_condition(browser: webdriver.Chrome, setup_remainin
         fail_closed(failure_reason)
 
 
+def _prepare_packaged_landing_page(browser: webdriver.Chrome, setup_remaining,
+        fail_closed, context_tier: str) -> None:
+    """Verify the landing-page prerequisites within the setup allowance."""
+    checks = (
+        ("return Boolean(document.querySelector('#app').__vue__)", "vue_not_ready"),
+        ("const v=document.querySelector('#app').__vue__; return Boolean(v.hasClientKeypair);",
+            "client_keypair_not_ready"),
+        ("const v=document.querySelector('#app').__vue__; return Boolean(v.modelsLoaded && v.selectedModel);",
+            "model_selection_not_ready"),
+    )
+    for script, reason in checks:
+        _wait_for_packaged_setup_condition(browser, setup_remaining,
+            lambda d, probe=script: d.execute_script(probe), reason, fail_closed)
+    setup_remaining()
+    if apply_benchmark_context_tier(browser, context_tier) != context_tier:
+        fail_closed("requested_context_tier_not_applied")
+
+
+def _validate_packaged_failure_reason(reason: str) -> str:
+    if reason not in PACKAGED_FAILURE_REASONS:
+        raise RuntimeError("invalid packaged failure reason")
+    return reason
+
+
 def _enter_packaged_prompt(field, prompt: str, *, action_factory=ActionChains) -> None:
     """Type through the textarea, encoding embedded newlines as Shift+Enter."""
     lines = prompt.split("\n")
@@ -843,9 +867,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             phase_schema_version, phases, last_safe_phase=last_safe_phase)
     def fail_closed(reason: str) -> None:
         nonlocal failure_reason
-        if reason not in PACKAGED_FAILURE_REASONS:
-            raise RuntimeError("invalid packaged failure reason")
-        failure_reason = reason
+        failure_reason = _validate_packaged_failure_reason(reason)
         raise RuntimeError(reason)
     setup_deadline = runner_started + float(request["setup_timeout_s"])
     def setup_remaining() -> float:
@@ -930,21 +952,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         browser.set_page_load_timeout(setup_remaining())
         browser.set_script_timeout(setup_remaining())
         browser.get(request["relay_url"])
-        _wait_for_packaged_setup_condition(browser, setup_remaining,
-            lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"),
-            "vue_not_ready", fail_closed)
-        _wait_for_packaged_setup_condition(browser, setup_remaining,
-            lambda d: d.execute_script(
-                "const v=document.querySelector('#app').__vue__; return Boolean(v.hasClientKeypair);"),
-            "client_keypair_not_ready", fail_closed)
-        _wait_for_packaged_setup_condition(browser, setup_remaining,
-            lambda d: d.execute_script(
-                "const v=document.querySelector('#app').__vue__; return Boolean(v.modelsLoaded && v.selectedModel);"),
-            "model_selection_not_ready", fail_closed)
-        setup_remaining()
-        selected_tier = apply_benchmark_context_tier(browser, request["context_tier"])
-        if selected_tier != request["context_tier"]:
-            fail_closed("requested_context_tier_not_applied")
+        _prepare_packaged_landing_page(
+            browser, setup_remaining, fail_closed, request["context_tier"])
         if not memory_sampler.sample():
             raise RuntimeError("memory_sample_unavailable")
         browser.set_script_timeout(setup_remaining())

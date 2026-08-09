@@ -12,7 +12,7 @@ import pytest
 
 from scripts.long_context_benchmark import benchmark_harness as h
 
-RUNNER_SOURCE = Path("desktop-tauri/scripts/test_desktop_operator_ui_e2e.py")
+RUNNER_SOURCE = Path(__file__).parents[2] / "desktop-tauri/scripts/test_desktop_operator_ui_e2e.py"
 
 def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="linux"):
     return {"method": h.MEMORY_METHOD, "scope": h.MEMORY_SCOPE, "platform": platform,
@@ -1220,6 +1220,14 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
     (json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
         "phase": "request_active", "sequence": 6, "elapsed_s": 50}),
         "packaged_phase_status_malformed"),
+    (json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase": "request_active", "sequence": 6, "last_safe_phase": "operator_ready",
+        "failure_reason": [], "elapsed_s": 0, "cleanup_succeeded": None}),
+        "packaged_phase_status_malformed"),
+    (json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase": "request_active", "sequence": 6, "last_safe_phase": "operator_ready",
+        "failure_reason": None, "elapsed_s": 0, "cleanup_succeeded": {}}),
+        "packaged_phase_status_malformed"),
 ])
 def test_packaged_phase_status_missing_malformed_or_stale_fails_closed(tmp_path, contents, expected):
     path = tmp_path / "phase.json"
@@ -1913,6 +1921,17 @@ def test_not_run_runner_failure_retains_only_allowlisted_safe_diagnostics(tmp_pa
     prohibited = {"prompt", "response_text", "diagnostic_tail", "traceback", "path",
         "request_id", "client_id", "session_id", "ciphertext", "key"}
     assert not prohibited.intersection(report)
+
+
+def test_runner_failure_report_rejects_timeout_budget_fields():
+    report = {"schema_version": h.SCHEMA_VERSION, "mode": "packaged-runtime",
+        "status": "not_run", "fixture": {"id": "small-8k", "version": h.FIXTURE_VERSION,
+            "scenario": "single-needle", "sha256": "unavailable"},
+        "code": "packaged_runner_failed", "last_safe_phase": "operator_ready",
+        "failure_reason": "client_keypair_not_ready", "elapsed_s": 1.0,
+        "cleanup_succeeded": True, "request_timeout_s": 600.0}
+    with pytest.raises(ValueError, match="report_runner_failure_diagnostics_invalid"):
+        h.validate_report(report)
 
 
 def test_not_run_invalid_external_manifest_uses_safe_fixture_sha(tmp_path, monkeypatch):

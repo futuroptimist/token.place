@@ -985,6 +985,7 @@ def validate_report(report: Any) -> None:
         elif report["code"] == "packaged_runner_failed":
             failure_fields = {"last_safe_phase", "failure_reason", "elapsed_s", "cleanup_succeeded"}
             if (failure_fields.intersection(report) != failure_fields
+                    or present_timeout_fields != failure_fields - {"failure_reason"}
                     or report["last_safe_phase"] not in PACKAGED_PHASES
                     or report["failure_reason"] not in PACKAGED_FAILURE_REASONS
                     or not finite(report["elapsed_s"]) or report["elapsed_s"] < 0
@@ -1223,7 +1224,11 @@ def _read_packaged_phase_status(path: Path, parent_elapsed_s: float) -> tuple[di
             or value.get("schema_version") != PACKAGED_PHASE_STATUS_VERSION
             or value.get("phase") not in PACKAGED_PHASES
             or value.get("last_safe_phase") not in PACKAGED_PHASES
+            or not (isinstance(value.get("failure_reason"), str)
+                or value.get("failure_reason") is None)
             or value.get("failure_reason") not in PACKAGED_FAILURE_REASONS | {None}
+            or not (isinstance(value.get("cleanup_succeeded"), bool)
+                or value.get("cleanup_succeeded") is None)
             or value.get("cleanup_succeeded") not in {True, False, None}
             or not isinstance(value.get("sequence"), int) or isinstance(value.get("sequence"), bool)
             or value["sequence"] != PACKAGED_PHASES.index(value["phase"]) + 1

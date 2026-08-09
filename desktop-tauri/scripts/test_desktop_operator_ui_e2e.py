@@ -759,20 +759,69 @@ def assert_packaged_windows_nvidia_status(
         raise AssertionError(f"hardware status reports KV cache device is not CUDA: {kv_cache_device!r}")
 
 
+def _replace_checkpoint(temporary: Path, destination: Path, *, timeout_s: float = 0.5,
+        clock=time.monotonic, sleeper=time.sleep) -> None:
+    """Publish one complete checkpoint despite bounded Windows sharing races."""
+    deadline = clock() + timeout_s
+    while True:
+        try:
+            temporary.replace(destination)
+            return
+        except PermissionError:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise RuntimeError("checkpoint_publication_failed") from None
+            sleeper(min(0.01, remaining))
+
+
 def _write_benchmark_phase(path: Path, phase: str, started: float,
         schema_version: str, phases: tuple[str, ...], *, last_safe_phase: str,
-        failure_reason: str | None = None, cleanup_succeeded: bool | None = None) -> None:
+        failure_reason: str | None = None, cleanup_succeeded: bool | None = None,
+        clock=time.monotonic, sleeper=time.sleep, publication_timeout_s: float = 0.5) -> None:
     """Atomically checkpoint an allowlisted phase without identifiers or payload data."""
     payload = {"schema_version": schema_version, "phase": phase,
         "sequence": phases.index(phase) + 1,
         "last_safe_phase": last_safe_phase, "failure_reason": failure_reason,
-        "elapsed_s": round(max(0.0, time.monotonic() - started), 3),
+        "elapsed_s": round(max(0.0, clock() - started), 3),
         "cleanup_succeeded": cleanup_succeeded}
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-    if hasattr(os, "chmod"):
-        os.chmod(temporary, 0o600)
-    temporary.replace(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(payload, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace_checkpoint(temporary, path, timeout_s=publication_timeout_s,
+            clock=clock, sleeper=sleeper)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _remove_owned_path(path: Path, *, deadline: float, is_directory: bool = False,
+        clock=time.monotonic, sleeper=time.sleep) -> None:
+    """Delete an owner-created temporary path within the cleanup allowance."""
+    while True:
+        try:
+            if is_directory:
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise RuntimeError("owned_temporary_cleanup_failed") from None
+            sleeper(min(0.01, remaining))
+        except OSError:
+            raise RuntimeError("owned_temporary_cleanup_failed") from None
 
 
 def _wait_for_packaged_setup_condition(browser: webdriver.Chrome, setup_remaining,
@@ -1113,13 +1162,15 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             failure_reason = "packaged_runner_failure"
         raise
     finally:
-        checkpoint_error = None
+        primary_failure = failure_reason is not None
         try:
             _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
                 phase_schema_version, phases, last_safe_phase=last_safe_phase,
                 failure_reason=failure_reason)
-        except Exception as exc:
-            checkpoint_error = exc
+        except RuntimeError:
+            # Cleanup still proceeds and the required final checkpoint below is
+            # attempted independently after resources have been released.
+            pass
         cleanup_deadline = time.monotonic() + cleanup_timeout
         def cleanup_remaining() -> float:
             return max(0.001, cleanup_deadline - time.monotonic())
@@ -1137,17 +1188,22 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 try: process.wait(timeout=cleanup_remaining())
                 except subprocess.TimeoutExpired: cleanup_ok = False
         driver_log_handle.close()
-        shutil.rmtree(isolated_home, ignore_errors=True)
-        shutil.rmtree(tokenizer_dir, ignore_errors=True)
-        driver_log.unlink(missing_ok=True)
-        with contextlib.suppress(Exception):
+        try:
+            _remove_owned_path(isolated_home, deadline=cleanup_deadline, is_directory=True)
+            _remove_owned_path(tokenizer_dir, deadline=cleanup_deadline, is_directory=True)
+            _remove_owned_path(driver_log, deadline=cleanup_deadline)
+        except RuntimeError:
+            cleanup_ok = False
+        try:
             _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
                 phase_schema_version, phases, last_safe_phase=last_safe_phase,
                 failure_reason=failure_reason, cleanup_succeeded=cleanup_ok)
-        if not cleanup_ok:
-            raise RuntimeError("owned process cleanup failed")
-        if checkpoint_error is not None:
-            raise RuntimeError("cleanup phase checkpoint failed") from checkpoint_error
+        except Exception as exc:
+            raise RuntimeError("cleanup_checkpoint_publication_failed") from exc
+        if not cleanup_ok and not primary_failure:
+            raise RuntimeError("owned_temporary_cleanup_failed")
+        # A failed intermediate cleanup marker is superseded by the valid final
+        # marker above; it must not replace an already recorded primary outcome.
 
 
 def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float,

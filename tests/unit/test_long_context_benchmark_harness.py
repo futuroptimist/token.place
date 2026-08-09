@@ -19,7 +19,8 @@ RUNNER_SOURCE = Path(__file__).parents[2] / "desktop-tauri/scripts/test_desktop_
 @pytest.fixture
 def desktop_runner():
     tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
-    names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
+    names = {"_replace_checkpoint", "_write_benchmark_phase", "_remove_owned_path",
+        "_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
         "_populate_and_submit_packaged_prompt"}
     functions = [node for node in tree.body
@@ -27,7 +28,9 @@ def desktop_runner():
     module = ModuleType("desktop_runner_under_test")
     namespace = module.__dict__
     namespace.update({"webdriver": SimpleNamespace(Chrome=object), "ActionChains": object,
-        "time": time, "By": SimpleNamespace(CSS_SELECTOR="css"),
+        "time": time, "os": os, "json": json, "tempfile": __import__("tempfile"),
+        "shutil": __import__("shutil"), "Path": Path,
+        "By": SimpleNamespace(CSS_SELECTOR="css"),
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
         "WebDriverWait": object,
@@ -1593,7 +1596,8 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     """Exercise the real runner's pre-launch failure and final checkpoint path."""
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"_write_benchmark_phase", "run_long_context_packaged_mode"}
+    wanted = {"_replace_checkpoint", "_write_benchmark_phase", "_remove_owned_path",
+        "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
@@ -1621,6 +1625,110 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     assert checkpoint["phase"] == "cleanup"
     assert checkpoint["failure_reason"] == "packaged_runner_failure"
     assert checkpoint["cleanup_succeeded"] is True
+
+
+def test_phase_checkpoint_retries_sharing_violation_atomically(desktop_runner, tmp_path,
+        monkeypatch):
+    phase = tmp_path / "phase.json"
+    phase.write_text('{"old": true}')
+    original_replace = Path.replace
+    attempts = 0
+    observed = []
+    now = [0.0]
+
+    def replace_once(path, destination):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("private absolute path must not escape")
+        return original_replace(path, destination)
+
+    def sleep_without_wait(delay):
+        observed.append(phase.read_text())
+        now[0] += delay
+
+    monkeypatch.setattr(Path, "replace", replace_once)
+    desktop_runner._write_benchmark_phase(phase, "runner_startup", 0,
+        h.PACKAGED_PHASE_STATUS_VERSION, h.PACKAGED_PHASES,
+        last_safe_phase="runner_startup", clock=lambda: now[0],
+        sleeper=sleep_without_wait)
+
+    assert observed == ['{"old": true}']
+    assert json.loads(phase.read_text())["phase"] == "runner_startup"
+    assert attempts == 2
+    assert not list(tmp_path.glob(".phase.json.*.tmp"))
+
+
+def test_phase_checkpoint_sharing_retries_are_bounded_and_sanitized(
+        desktop_runner, tmp_path, monkeypatch):
+    phase = tmp_path / "secret-location" / "phase.json"
+    phase.parent.mkdir()
+    attempts = 0
+    now = [0.0]
+
+    def always_locked(_path, _destination):
+        nonlocal attempts
+        attempts += 1
+        raise PermissionError(str(phase))
+
+    def advance(delay):
+        now[0] += delay
+
+    monkeypatch.setattr(Path, "replace", always_locked)
+    with pytest.raises(RuntimeError) as raised:
+        desktop_runner._write_benchmark_phase(phase, "runner_startup", 0,
+            h.PACKAGED_PHASE_STATUS_VERSION, h.PACKAGED_PHASES,
+            last_safe_phase="runner_startup", clock=lambda: now[0], sleeper=advance,
+            publication_timeout_s=0.025)
+    assert str(raised.value) == "checkpoint_publication_failed"
+    assert str(tmp_path) not in str(raised.value)
+    assert attempts == 4
+    assert not list(phase.parent.glob(".phase.json.*.tmp"))
+
+
+def test_phase_checkpoint_does_not_retry_non_sharing_error(desktop_runner, tmp_path,
+        monkeypatch):
+    attempts = 0
+    def broken(_path, _destination):
+        nonlocal attempts
+        attempts += 1
+        raise ValueError("programming error")
+    monkeypatch.setattr(Path, "replace", broken)
+    with pytest.raises(ValueError, match="programming error"):
+        desktop_runner._write_benchmark_phase(tmp_path / "phase.json", "runner_startup", 0,
+            h.PACKAGED_PHASE_STATUS_VERSION, h.PACKAGED_PHASES,
+            last_safe_phase="runner_startup", clock=lambda: 0, sleeper=pytest.fail)
+    assert attempts == 1
+
+
+def test_owned_log_deletion_retries_and_reports_truthfully(desktop_runner):
+    class OwnedPath:
+        attempts = 0
+        def unlink(self, **_kwargs):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise PermissionError("locked")
+    owned = OwnedPath()
+    now = [0.0]
+    desktop_runner._remove_owned_path(owned, deadline=1, clock=lambda: now[0],
+        sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    assert owned.attempts == 3
+
+
+def test_owned_log_permanent_lock_is_bounded_and_private(desktop_runner, tmp_path):
+    class OwnedPath:
+        attempts = 0
+        def unlink(self, **_kwargs):
+            self.attempts += 1
+            raise PermissionError(str(tmp_path / "private.log"))
+    owned = OwnedPath()
+    now = [0.0]
+    with pytest.raises(RuntimeError) as raised:
+        desktop_runner._remove_owned_path(owned, deadline=0.02, clock=lambda: now[0],
+            sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    assert str(raised.value) == "owned_temporary_cleanup_failed"
+    assert str(tmp_path) not in str(raised.value)
+    assert owned.attempts == 3
 
 
 @pytest.mark.parametrize("reason", [

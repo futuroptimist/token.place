@@ -408,7 +408,7 @@ def _valid_status_driver(
 def _load_assert_packaged_windows_nvidia_status():
     source = UI_PATH.read_text(encoding="utf-8")
     start = source.index("def _status_value")
-    end = source.index("\ndef _write_benchmark_phase", start)
+    end = source.index("\ndef _replace_checkpoint", start)
     namespace = {
         "webdriver": SimpleNamespace(Remote=object),
         "By": SimpleNamespace(XPATH="xpath"),

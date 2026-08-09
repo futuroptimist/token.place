@@ -21,6 +21,10 @@ repository-owned desktop WebDriver runner with explicit arguments and bounded ex
 launches the selected installed/package-built application, configures its operator, and sends the
 fixture with the existing landing-page API v1 E2EE browser flow:
 
+Physical validation of the lock-tolerant checkpoint and cleanup paths on Windows/NVIDIA CUDA, and
+regression validation on macOS/Metal, remain outstanding. This harness change does not claim a
+successful physical benchmark.
+
 ```bash
 python scripts/long_context_benchmark.py packaged-runtime \
   --app-binary "$BENCHMARK_APP_BINARY" \
@@ -62,7 +66,12 @@ readable regular file, the app must be an executable regular file, and request/c
 be finite and positive. External E2EE relays require HTTPS; loopback relays may use HTTP or HTTPS.
 Credentials, fragments, malformed ports, and other schemes are rejected. Temporary request,
 evidence, and diagnostic files are owner-only on POSIX, portable to Windows Python 3.11, and closed
-and deleted after each run. Runner output is written to a temporary bounded diagnostic tail rather
+and deleted after each run. Phase checkpoints use owner-only, unique temporary files and atomic
+publication; transient Windows sharing violations are retried only within an explicit deadline, so
+polling never exposes partial JSON. Owner-created logs and temporary directories are likewise
+closed after the exact owned process tree exits and deleted with bounded sharing-violation retries.
+If cleanup still fails, the report records that categorical cleanup result separately without
+replacing an earlier primary runner failure. Runner output is written to a temporary bounded diagnostic tail rather
 than buffered without limit. On timeout the harness targets only the process tree it created after
 the runner's bounded cleanup opportunity; it never matches broad process names. Unit tests replace only the subprocess
 boundary and are orchestration evidence, never physical Metal/CUDA evidence.

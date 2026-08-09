@@ -1202,7 +1202,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
                 phase_schema_version, phases, last_safe_phase=last_safe_phase,
                 failure_reason=failure_reason, cleanup_succeeded=False,
-                retry_timeout_s=cleanup_remaining())
+                retry_timeout_s=min(cleanup_remaining(), 1.0))
         except Exception as exc:
             checkpoint_error = exc
         if browser is not None:

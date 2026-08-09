@@ -1853,6 +1853,62 @@ def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):
     assert checkpoint["cleanup_succeeded"] is False
 
 
+def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowance(tmp_path):
+    """The provisional publish gets the small retry window, not all cleanup time."""
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {"_is_windows_sharing_violation", "_write_benchmark_phase",
+        "_remove_owned_path", "run_long_context_packaged_mode"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    now = [0.0]
+    fake_time = SimpleNamespace(monotonic=lambda: now[0], sleep=lambda delay: None)
+    namespace = {
+        "Path": Path, "json": json, "time": fake_time,
+        "tempfile": __import__("tempfile"), "os": os,
+        "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
+        "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "psutil": __import__("psutil"), "sys": sys,
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
+        namespace)
+    writes = []
+    removals = []
+
+    def write_phase(_path, _phase, _started, _version, _phases, **kwargs):
+        writes.append(kwargs)
+        if kwargs.get("cleanup_succeeded") is False and len(writes) == 2:
+            now[0] += kwargs["retry_timeout_s"]
+            raise RuntimeError("phase checkpoint publication failed")
+
+    def remove_path(_path, deadline, **_kwargs):
+        removals.append(deadline - now[0])
+        return True
+
+    namespace["_write_benchmark_phase"] = write_phase
+    namespace["_remove_owned_path"] = remove_path
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps({
+        "phase_status_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase_status_phases": list(h.PACKAGED_PHASES), "setup_timeout_s": 0,
+        "cleanup_timeout_s": 10,
+        "manifest": {"fixture_sha256": "0" * 64, "targets": {}},
+    }))
+
+    with pytest.raises(RuntimeError, match="packaged setup timeout"):
+        namespace["run_long_context_packaged_mode"](
+            request_path, tmp_path / "evidence.json", tmp_path / "phase.json",
+            tmp_path / "app")
+
+    provisional = [write for write in writes
+        if write.get("cleanup_succeeded") is False]
+    assert provisional[0]["retry_timeout_s"] == 1.0
+    assert len(removals) == 3
+    assert removals == [pytest.approx(9.0)] * 3
+    assert writes[-1]["cleanup_succeeded"] is False
+    assert writes[-1]["failure_reason"] == "packaged_runner_failure"
+
+
 @pytest.mark.parametrize("reason", [
     "vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
     "send_button_not_enabled",

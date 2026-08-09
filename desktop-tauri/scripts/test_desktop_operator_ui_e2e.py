@@ -51,7 +51,9 @@ try:
         observe_post_terminal,
         benchmark_operator_mode,
         OwnedProcessTreeMemorySampler,
+        packaged_phase_remaining,
         prefill_cancellation_trigger_state,
+        start_phase_after,
     )
 except Exception as exc:
     BOOTSTRAP_LOG.write_text(
@@ -934,9 +936,12 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         if request.get("cancellation_validation"):
             write_phase("cancellation_validation")
             cancellation_deadline = time.monotonic() + float(request["cancellation_timeout_s"])
-            cancellation_recovery = run_long_context_cancellation_recovery(
-                browser, driver, request, cancellation_deadline)
-        finalization_deadline = time.monotonic() + float(request["finalization_timeout_s"])
+            cancellation_recovery, finalization_deadline = start_phase_after(
+                lambda: run_long_context_cancellation_recovery(
+                    browser, driver, request, cancellation_deadline),
+                float(request["finalization_timeout_s"]))
+        else:
+            finalization_deadline = time.monotonic() + float(request["finalization_timeout_s"])
         def finalization_remaining() -> float:
             remaining = finalization_deadline - time.monotonic()
             if remaining <= 0:
@@ -1089,10 +1094,8 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
     observation_s = float(config["observation_window_s"])
     recovery_s = float(config["recovery_timeout_s"])
     def cancellation_remaining(cap: float | None = None) -> float:
-        remaining = cancellation_deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError("packaged cancellation validation timeout")
-        return min(remaining, cap) if cap is not None else remaining
+        return packaged_phase_remaining(cancellation_deadline,
+            "packaged cancellation validation timeout", cap=cap)
     scenarios: list[dict[str, object]] = []
     for phase in ("prefill", "generating"):
         cancellation_remaining()

@@ -70,6 +70,22 @@ def packaged_cancellation_budget_s(request_timeout_s: float, observation_window_
     return 2 * request_timeout_s + 2 * observation_window_s + 8 * recovery_timeout_s
 
 
+def packaged_phase_remaining(deadline: float, timeout_message: str, *,
+        clock: Callable[[], float] = time.monotonic, cap: float | None = None) -> float:
+    """Return one phase's remaining allowance, failing closed at its deadline."""
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise RuntimeError(timeout_message)
+    return min(remaining, cap) if cap is not None else remaining
+
+
+def start_phase_after(work: Callable[[], Any], allowance_s: float, *,
+        clock: Callable[[], float] = time.monotonic) -> tuple[Any, float]:
+    """Run the preceding phase before starting a complete independent allowance."""
+    result = work()
+    return result, clock() + allowance_s
+
+
 class PackagedRunnerTimeout(subprocess.TimeoutExpired):
     """A watchdog expiry carrying only bounded owned-cleanup outcome."""
 
@@ -1205,15 +1221,20 @@ def _run_owned_runner(command: list[str], timeout_s: float,
         cleanup_timeout_s: float, *, popen: Callable[..., Any] = subprocess.Popen,
         cleanup_run: Callable[..., Any] = subprocess.run,
         killpg: Callable[[int, int], Any] | None = None,
-        platform_name: str | None = None) -> subprocess.CompletedProcess[str]:
+        platform_name: str | None = None, phase_status_path: Path | None = None,
+        clock: Callable[[], float] | None = None) -> subprocess.CompletedProcess[str]:
     """Run one owned process group without buffering output or killing by name."""
     kwargs: dict[str, Any] = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+    clock = time.monotonic if clock is None else clock
     owned_platform = os.name if platform_name is None else platform_name
     if owned_platform == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     else:
         kwargs["start_new_session"] = True
     process = popen(command, **kwargs)  # noqa: S603
+    started = clock()
+    work_deadline = started + timeout_s
+    overall_deadline = work_deadline + cleanup_timeout_s
     chunks: deque[bytes] = deque(maxlen=8)
     def drain_output() -> None:
         assert process.stdout is not None
@@ -1222,12 +1243,25 @@ def _run_owned_runner(command: list[str], timeout_s: float,
     drain = threading.Thread(target=drain_output, daemon=True)
     drain.start()
     try:
-        returncode = process.wait(timeout=timeout_s)
+        returncode = process.wait(timeout=max(0.001, work_deadline - clock()))
     except subprocess.TimeoutExpired:
+        elapsed_s = max(0.0, clock() - started)
+        phase = None
+        if phase_status_path is not None:
+            phase, _phase_error = _read_packaged_phase_status(phase_status_path, elapsed_s)
+        if phase == "cleanup":
+            try:
+                returncode = process.wait(timeout=max(0.001, overall_deadline - clock()))
+            except subprocess.TimeoutExpired:
+                returncode = None
+            else:
+                drain.join(timeout=max(0.0, overall_deadline - clock()))
+                tail = b"".join(chunks)[-2048:].decode("utf-8", errors="replace")
+                return subprocess.CompletedProcess(command, returncode, stdout=tail)
         cleanup_succeeded = False
-        cleanup_deadline = time.monotonic() + cleanup_timeout_s
+        cleanup_deadline = overall_deadline
         def cleanup_remaining() -> float:
-            return max(0.001, cleanup_deadline - time.monotonic())
+            return max(0.001, cleanup_deadline - clock())
         if owned_platform == "nt":
             taskkill_ok = False
             try:
@@ -1260,13 +1294,14 @@ def _run_owned_runner(command: list[str], timeout_s: float,
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
                     owned_killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=cleanup_remaining())
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=cleanup_remaining())
             # The leader can exit before its browser/driver descendants. Target
             # the whole owned group again and prove it is gone before claiming
             # successful cleanup in the bounded timeout diagnostic.
             with contextlib.suppress(ProcessLookupError):
                 owned_killpg(process.pid, signal.SIGKILL)
-            while time.monotonic() < cleanup_deadline:
+            while clock() < cleanup_deadline:
                 try:
                     owned_killpg(process.pid, 0)
                 except ProcessLookupError:
@@ -1375,11 +1410,12 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         try:
             with os.fdopen(diagnostic_fd, "w+", encoding="utf-8") as diagnostic_handle:
                 if subprocess_run is None:
-                    completed = _run_owned_runner(command, runner_budget_s, cleanup_timeout_s)
+                    completed = _run_owned_runner(command, runner_budget_s, cleanup_timeout_s,
+                        phase_status_path=Path(phase_name))
                 else:
                     completed = subprocess_run(command, stdout=diagnostic_handle,
                         stderr=subprocess.STDOUT, text=True,
-                        timeout=runner_budget_s, check=False)
+                        timeout=overall_budget_s, check=False)
         except subprocess.TimeoutExpired as exc:
             elapsed_s = min(overall_budget_s, max(0.0, time.monotonic() - runner_started))
             phase, phase_error = _read_packaged_phase_status(Path(phase_name), elapsed_s)

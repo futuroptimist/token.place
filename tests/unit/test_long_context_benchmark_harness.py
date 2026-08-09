@@ -1237,7 +1237,8 @@ def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
         model=str(model), backend="cuda", relay_url="https://relay.example",
         cleanup_timeout_s=30, subprocess_run=fake_run)
     assert result["code"] == "packaged_runner_failed"
-    assert observed["timeout"] == h.PACKAGED_SETUP_BUDGET_S + 600 + h.PACKAGED_FINALIZATION_BUDGET_S
+    work_budget = h.PACKAGED_SETUP_BUDGET_S + 600 + h.PACKAGED_FINALIZATION_BUDGET_S
+    assert observed["timeout"] == work_budget + 30
     assert observed["request"]["phase_status_version"] == h.PACKAGED_PHASE_STATUS_VERSION
     assert observed["request"]["phase_status_phases"] == list(h.PACKAGED_PHASES)
     assert observed["request"]["request_timeout_s"] == 600
@@ -1263,7 +1264,7 @@ def test_cancellation_budget_is_named_additive_and_bounded(tmp_path):
     assert cancellation == 56
     assert observed["request"]["cancellation_timeout_s"] == cancellation
     assert observed["timeout"] == (h.PACKAGED_SETUP_BUDGET_S + 10
-        + h.PACKAGED_FINALIZATION_BUDGET_S + cancellation)
+        + h.PACKAGED_FINALIZATION_BUDGET_S + cancellation + 3)
 
 
 def test_cancellation_budget_enumerates_every_bounded_operation():
@@ -1273,29 +1274,22 @@ def test_cancellation_budget_enumerates_every_bounded_operation():
 
 
 def test_cancellation_phase_and_finalization_allowances_are_independent():
-    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
-        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
-    cancellation_call = source.index("run_long_context_cancellation_recovery(")
-    finalization_start = source.index("finalization_deadline = time.monotonic()", cancellation_call)
-    assert cancellation_call < finalization_start
-    assert 'RuntimeError("packaged cancellation validation timeout")' in source
-    assert "cancellation_validation" in h.PACKAGED_PHASES
+    now = [10.0]
+    def consume_complete_cancellation_allowance():
+        now[0] += 56.0
+        return "validated"
+    result, finalization_deadline = h.start_phase_after(
+        consume_complete_cancellation_allowance, 120.0, clock=lambda: now[0])
+    assert result == "validated"
+    assert finalization_deadline == 186.0
+    assert h.packaged_phase_remaining(finalization_deadline, "timeout",
+        clock=lambda: now[0]) == 120.0
 
 
 def test_cancellation_deadline_exhaustion_fails_closed_with_fake_clock():
-    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
-        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
-    function = next(node for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "run_long_context_cancellation_recovery")
-    namespace = {"webdriver": type("WebDriver", (), {"Chrome": object, "Remote": object}),
-        "time": type("Clock", (), {"monotonic": staticmethod(lambda: 2.0)}),
-        "Callable": __import__("typing").Callable}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), "<cancellation>", "exec"), namespace)
-    request = {"request_timeout_s": 10, "prompt": "not-observed",
-        "cancellation": {"observation_window_s": 1, "recovery_timeout_s": 2}}
     with pytest.raises(RuntimeError, match="packaged cancellation validation timeout"):
-        namespace["run_long_context_cancellation_recovery"](object(), object(), request, 1.0)
+        h.packaged_phase_remaining(1.0, "packaged cancellation validation timeout",
+            clock=lambda: 1.0)
 
 
 def test_disabled_cancellation_has_no_budget_or_cli_contract_change(tmp_path):
@@ -1470,6 +1464,81 @@ class _TimedOutProcess:
 
     def kill(self):
         self.killed = True
+
+
+def _write_phase(path, phase, elapsed):
+    path.write_text(json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase": phase, "sequence": h.PACKAGED_PHASES.index(phase) + 1,
+        "elapsed_s": elapsed}))
+
+
+def test_owned_runner_allows_on_time_child_cleanup_once(tmp_path):
+    clock = [0.0]
+    phase = tmp_path / "phase.json"
+    _write_phase(phase, "cleanup", 9.5)
+    class Process(_TimedOutProcess):
+        def wait(self, timeout):
+            clock[0] += timeout
+            if clock[0] <= 10.0:
+                raise subprocess.TimeoutExpired("runner", timeout)
+            clock[0] = 12.0
+            return 0
+    process = Process([])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    completed = h._run_owned_runner(["runner"], 10, 5,
+        popen=lambda _command, **_kwargs: process, phase_status_path=phase,
+        platform_name="posix", clock=lambda: clock[0])
+    assert completed.returncode == 0
+    assert clock[0] == 12.0
+    assert process.killed is False
+
+
+def test_owned_runner_work_timeout_does_not_borrow_cleanup_window(tmp_path):
+    clock = [0.0]
+    phase = tmp_path / "phase.json"
+    _write_phase(phase, "request_active", 9.5)
+    class Process(_TimedOutProcess):
+        def wait(self, timeout):
+            outcome = next(self.waits)
+            if outcome == "timeout":
+                clock[0] += timeout
+                raise subprocess.TimeoutExpired("runner", timeout)
+            return outcome
+    process = Process(["timeout", 0])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    signals = []
+    def kill_group(pid, sig):
+        signals.append(sig)
+        if sig == 0:
+            raise ProcessLookupError
+    with pytest.raises(h.PackagedRunnerTimeout) as raised:
+        h._run_owned_runner(["runner"], 10, 5,
+            popen=lambda _command, **_kwargs: process, phase_status_path=phase,
+            killpg=kill_group, platform_name="posix", clock=lambda: clock[0])
+    assert raised.value.timeout == 10
+    assert signal.SIGTERM in signals
+    assert raised.value.cleanup_succeeded is True
+
+
+def test_owned_runner_cleanup_overrun_is_bounded_and_fails_closed(tmp_path):
+    clock = [0.0]
+    phase = tmp_path / "phase.json"
+    _write_phase(phase, "cleanup", 9.5)
+    class Process(_TimedOutProcess):
+        def wait(self, timeout):
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired("runner", timeout)
+    process = Process([])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    signals = []
+    with pytest.raises(h.PackagedRunnerTimeout) as raised:
+        h._run_owned_runner(["runner"], 10, 5,
+            popen=lambda _command, **_kwargs: process, phase_status_path=phase,
+            killpg=lambda _pid, sig: signals.append(sig), platform_name="posix",
+            clock=lambda: clock[0])
+    assert clock[0] <= 15.01
+    assert signal.SIGKILL in signals
+    assert raised.value.cleanup_succeeded is False
 
 
 def test_owned_runner_posix_terminates_exact_process_group(monkeypatch):

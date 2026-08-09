@@ -209,7 +209,7 @@ the full `--request-timeout`; cleanup remains bounded separately by `--cleanup-t
 ### Packaged-runner phase budgets and watchdog
 
 The two existing CLI flags remain sufficient; no additional argument is required. The packaged
-runner applies four separate allowances:
+runner applies five separate allowances:
 
 - **setup/readiness: 300 seconds** for `tauri-driver`, WebDriver, desktop UI, operator provisioning,
   CUDA/Metal model warm-load, relay registration, and landing-page readiness;
@@ -230,15 +230,19 @@ allowance is `setup + request + finalization + cancellation validation + cleanup
 an undocumented multiplier nor an unbounded wait. Cancellation validation retains its existing
 bounded waits and CLI controls; the named additive budget does not change cancellation semantics or
 add a required argument. Pre-request WebDriver and readiness waits draw only from the shared setup
-deadline, not from the request timeout. Finalization begins as soon as the primary response arrives,
-and every later telemetry, polling, tokenizer, hashing, and evidence-write operation uses its
-remaining allowance.
+deadline, not from the request timeout. When cancellation validation is enabled, finalization begins
+immediately after cancellation validation finishes; otherwise it begins immediately after the
+primary response. Every later telemetry, polling, tokenizer, hashing, and evidence-write operation
+uses its complete allowance.
 
 An owner-only phase file is atomically replaced at allowlisted boundaries (`runner_startup`,
 `webdriver_ready`, `desktop_ready`, `operator_ready`, `landing_page_ready`, `request_active`,
 `response_received`, `cancellation_validation`, `evidence_finalization`, and `cleanup`). Cancellation
 uses one finite deadline, and the complete evidence-finalization allowance starts only after it
-finishes. If the parent watchdog expires, the
+finishes (or after the primary response when cancellation is disabled). A child that reaches
+`cleanup` within the work deadline may use the one reserved cleanup window; child cleanup and
+parent-enforced exact-tree teardown share that window and cannot add a second allowance. If the
+parent watchdog expires, the
 `packaged_runner_timeout` report records only the last safe phase, the five configured budgets and
 their derived runner/overall totals, bounded elapsed time, and whether owned-tree cleanup succeeded.
 The channel contains no prompts, responses, ciphertext, keys, credentials, identifiers, paths,

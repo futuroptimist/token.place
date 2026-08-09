@@ -754,12 +754,10 @@ def assert_packaged_windows_nvidia_status(
         raise AssertionError(f"hardware status reports KV cache device is not CUDA: {kv_cache_device!r}")
 
 
-def _write_benchmark_phase(path: Path, phase: str, started: float) -> None:
+def _write_benchmark_phase(path: Path, phase: str, started: float,
+        schema_version: str, phases: tuple[str, ...]) -> None:
     """Atomically checkpoint an allowlisted phase without identifiers or payload data."""
-    phases = ("runner_startup", "webdriver_ready", "desktop_ready", "operator_ready",
-        "landing_page_ready", "request_active", "response_received",
-        "evidence_finalization", "cleanup")
-    payload = {"schema_version": "packaged-runner-phase-v1", "phase": phase,
+    payload = {"schema_version": schema_version, "phase": phase,
         "sequence": phases.index(phase) + 1,
         "elapsed_s": round(max(0.0, time.monotonic() - started), 3)}
     temporary = path.with_name(path.name + ".tmp")
@@ -773,14 +771,25 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         phase_status_path: Path, app_binary: Path) -> int:
     """Drive a packaged app and the existing landing-page API v1 E2EE client."""
     request = json.loads(request_path.read_text(encoding="utf-8"))
+    phase_schema_version = request["phase_status_version"]
+    phase_values = request["phase_status_phases"]
+    if (not isinstance(phase_schema_version, str) or not phase_schema_version
+            or not isinstance(phase_values, list) or not phase_values
+            or any(not isinstance(value, str) or not value for value in phase_values)
+            or len(set(phase_values)) != len(phase_values)):
+        raise RuntimeError("packaged phase contract malformed")
+    phases = tuple(phase_values)
     runner_started = time.monotonic()
+    def write_phase(phase: str) -> None:
+        _write_benchmark_phase(phase_status_path, phase, runner_started,
+            phase_schema_version, phases)
     setup_deadline = runner_started + float(request["setup_timeout_s"])
     def setup_remaining() -> float:
         remaining = setup_deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError("packaged setup timeout")
         return remaining
-    _write_benchmark_phase(phase_status_path, "runner_startup", runner_started)
+    write_phase("runner_startup")
     cleanup_timeout = float(request["cleanup_timeout_s"])
     driver_log_fd, driver_log_name = tempfile.mkstemp(prefix="long-context-tauri-driver-", suffix=".log")
     os.close(driver_log_fd)
@@ -815,10 +824,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
         wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log,
             min(90, setup_remaining()))
-        _write_benchmark_phase(phase_status_path, "webdriver_ready", runner_started)
+        write_phase("webdriver_ready")
         driver = start_driver(app_binary.resolve(strict=True))
         wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
-        _write_benchmark_phase(phase_status_path, "desktop_ready", runner_started)
+        write_phase("desktop_ready")
         fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
         fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
         mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
@@ -833,7 +842,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             timeout_seconds=setup_remaining())
         WebDriverWait(driver, setup_remaining()).until(
             lambda d: _status_value(d, "Registered").lower().startswith("yes"))
-        _write_benchmark_phase(phase_status_path, "operator_ready", runner_started)
+        write_phase("operator_ready")
 
         runtime = {label: _status_value(driver, label) for label in
             ("App version", "Build ID", "Runtime ID", "Bundled runtime ID", "Launcher source",
@@ -854,7 +863,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         if selected_tier != request["context_tier"]:
             raise RuntimeError("landing context selection failed")
         wait.until(lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
-        _write_benchmark_phase(phase_status_path, "landing_page_ready", runner_started)
+        write_phase("landing_page_ready")
         if not memory_sampler.sample():
             raise RuntimeError("memory_sample_unavailable")
         browser.execute_script("""
@@ -885,7 +894,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         field = browser.find_element(By.CSS_SELECTOR, ".message-input")
         field.send_keys(request["prompt"])
         started = time.monotonic()
-        _write_benchmark_phase(phase_status_path, "request_active", runner_started)
+        write_phase("request_active")
         browser.find_element(By.CSS_SELECTOR, ".send-button").click()
         progress: list[dict[str, object]] = []
         while time.monotonic() - started < float(request["request_timeout_s"]):
@@ -905,7 +914,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         else:
             raise RuntimeError("packaged request timeout")
         ended = time.monotonic()
-        _write_benchmark_phase(phase_status_path, "response_received", runner_started)
+        write_phase("response_received")
         finalization_deadline = time.monotonic() + float(request["finalization_timeout_s"])
         if not progress or not isinstance(response_text, str):
             raise RuntimeError("required encrypted progress or response evidence missing")
@@ -963,7 +972,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             cancellation_recovery = run_long_context_cancellation_recovery(browser, driver, request)
         preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
         prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
-        _write_benchmark_phase(phase_status_path, "evidence_finalization", runner_started)
+        write_phase("evidence_finalization")
         digest = hashlib.sha256()
         with Path(request["model"]).open("rb") as model_handle:
             for chunk in iter(lambda: model_handle.read(1024 * 1024), b""):
@@ -995,7 +1004,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         os.chmod(evidence_path, 0o600)
         return 0
     finally:
-        _write_benchmark_phase(phase_status_path, "cleanup", runner_started)
+        with contextlib.suppress(Exception):
+            write_phase("cleanup")
         if browser is not None:
             with contextlib.suppress(Exception): browser.quit()
         if driver is not None:

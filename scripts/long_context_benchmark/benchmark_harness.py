@@ -1243,12 +1243,22 @@ def _run_owned_runner(command: list[str], timeout_s: float,
                 owned_killpg(process.pid, signal.SIGTERM)
             try:
                 process.wait(timeout=cleanup_remaining())
-                cleanup_succeeded = True
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
                     owned_killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=cleanup_remaining())
-                cleanup_succeeded = True
+            # The leader can exit before its browser/driver descendants. Target
+            # the whole owned group again and prove it is gone before claiming
+            # successful cleanup in the bounded timeout diagnostic.
+            with contextlib.suppress(ProcessLookupError):
+                owned_killpg(process.pid, signal.SIGKILL)
+            while time.monotonic() < cleanup_deadline:
+                try:
+                    owned_killpg(process.pid, 0)
+                except ProcessLookupError:
+                    cleanup_succeeded = True
+                    break
+                time.sleep(min(0.01, cleanup_remaining()))
         raise PackagedRunnerTimeout(command, timeout_s, cleanup_succeeded) from None
     drain.join(timeout=cleanup_timeout_s)
     tail = b"".join(chunks)[-2048:].decode("utf-8", errors="replace")
@@ -1321,6 +1331,8 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         "context_tier": context_tier, "request_timeout_s": timeout_s,
         "cleanup_timeout_s": cleanup_timeout_s, "setup_timeout_s": PACKAGED_SETUP_BUDGET_S,
         "finalization_timeout_s": PACKAGED_FINALIZATION_BUDGET_S,
+        "phase_status_version": PACKAGED_PHASE_STATUS_VERSION,
+        "phase_status_phases": list(PACKAGED_PHASES),
         "cancellation_validation": cancellation_validation,
         "cancellation": {"prefill_tokens": prefill_cancel_tokens,
             "prefill_fraction": prefill_cancel_fraction, "generation_tokens": generation_cancel_tokens,
@@ -1581,6 +1593,13 @@ def main(argv: list[str] | None = None) -> int:
             _validated_prompt, validated_manifest = generate_fixture(args.fixture, scenario=args.scenario)
         else:
             validated_manifest = external_manifest
+        validated_fixture_sha256 = "unavailable"
+        try:
+            validate_manifest(validated_manifest, external_prompt)
+        except (TypeError, ValueError):
+            pass
+        else:
+            validated_fixture_sha256 = validated_manifest["fixture_sha256"]
         completed: list[dict[str, Any]] = []
         evidence: dict[str, Any] = {"pass": False, "code": "packaged_contract_failed"}
         settings: dict[str, Any] | None = None
@@ -1648,7 +1667,7 @@ def main(argv: list[str] | None = None) -> int:
             report = {"mode":"packaged-runtime", "status":"not_run", "code":evidence.get("code", "packaged_contract_failed"),
                 "requested_trial_count":args.trials, "completed_trial_count":len(completed),
                 "fixture":{"id":args.fixture, "version":FIXTURE_VERSION, "scenario":args.scenario,
-                    "sha256":validated_manifest["fixture_sha256"]}}
+                    "sha256":validated_fixture_sha256}}
             for key in ("last_safe_phase", "request_timeout_s", "setup_timeout_s",
                     "finalization_timeout_s", "cleanup_timeout_s", "runner_timeout_s",
                     "overall_timeout_s", "elapsed_s", "cleanup_succeeded"):

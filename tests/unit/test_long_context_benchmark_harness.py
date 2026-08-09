@@ -1238,6 +1238,8 @@ def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
         cleanup_timeout_s=30, subprocess_run=fake_run)
     assert result["code"] == "packaged_runner_failed"
     assert observed["timeout"] == h.PACKAGED_SETUP_BUDGET_S + 600 + h.PACKAGED_FINALIZATION_BUDGET_S
+    assert observed["request"]["phase_status_version"] == h.PACKAGED_PHASE_STATUS_VERSION
+    assert observed["request"]["phase_status_phases"] == list(h.PACKAGED_PHASES)
     assert observed["request"]["request_timeout_s"] == 600
     assert observed["request"]["setup_timeout_s"] == h.PACKAGED_SETUP_BUDGET_S
     assert observed["request"]["finalization_timeout_s"] == h.PACKAGED_FINALIZATION_BUDGET_S
@@ -1407,12 +1409,31 @@ def test_owned_runner_posix_terminates_exact_process_group(monkeypatch):
     process.stdout = type("Output", (), {"read": lambda self, size: b""})()
     launched = {}
     signals = []
-    with pytest.raises(subprocess.TimeoutExpired):
+    def kill_group(pid, sig):
+        signals.append((pid, sig))
+        if sig == 0:
+            raise ProcessLookupError
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
         h._run_owned_runner(["runner"], 1, 2,
             popen=lambda command, **kwargs: launched.update(kwargs) or process,
-            killpg=lambda pid, sig: signals.append((pid, sig)), platform_name="posix")
+            killpg=kill_group, platform_name="posix")
     assert launched["start_new_session"] is True
-    assert signals == [(731, signal.SIGTERM), (731, signal.SIGKILL)]
+    assert signals == [(731, signal.SIGTERM), (731, signal.SIGKILL),
+        (731, signal.SIGKILL), (731, 0)]
+    assert raised.value.cleanup_succeeded is True
+
+
+def test_owned_runner_posix_does_not_claim_cleanup_while_group_survives(monkeypatch):
+    process = _TimedOutProcess(["timeout", 0])
+    process.stdout = type("Output", (), {"read": lambda self, size: b""})()
+    monkeypatch.setattr(h.time, "sleep", lambda _seconds: None)
+    ticks = iter((0.0, 0.1, 0.2, 0.3, 3.0, 3.0))
+    monkeypatch.setattr(h.time, "monotonic", lambda: next(ticks, 3.0))
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        h._run_owned_runner(["runner"], 1, 2,
+            popen=lambda _command, **_kwargs: process,
+            killpg=lambda _pid, _signal: None, platform_name="posix")
+    assert raised.value.cleanup_succeeded is False
 
 
 @pytest.mark.parametrize("cleanup_outcome", ["failed", "timeout"])
@@ -1666,6 +1687,23 @@ def test_not_run_timeout_report_retains_validated_fixture_sha_and_safe_diagnosti
     assert report["completed_trial_count"] == 0
     assert report["last_safe_phase"] == "request_active"
     assert not h.SENSITIVE_KEYS.intersection(report)
+
+
+def test_not_run_invalid_external_manifest_uses_safe_fixture_sha(tmp_path, monkeypatch):
+    prompt = tmp_path / "prompt.txt"
+    manifest = tmp_path / "manifest.json"
+    prompt.write_text("external prompt", encoding="utf-8")
+    manifest.write_text(json.dumps({"fixture_id": "small-8k"}), encoding="utf-8")
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: {
+        "pass": False, "runtime_contract_pass": False,
+        "code": "manifest_missing_fields"})
+
+    assert h.main(_packaged_main_args(tmp_path, "--prompt", str(prompt),
+        "--manifest", str(manifest))) == 1
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
+    assert report["status"] == "not_run"
+    assert report["code"] == "manifest_missing_fields"
+    assert report["fixture"]["sha256"] == "unavailable"
 
 
 def test_cancellation_sequence_runs_once_outside_semantic_trial_count(tmp_path, monkeypatch):

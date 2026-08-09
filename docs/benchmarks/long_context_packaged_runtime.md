@@ -204,7 +204,23 @@ The aggregate is computed only after every requested trial completes its runtime
 success requires every trial to be semantically exact. `--report-only` can return zero for mixed
 semantic outcomes only after all requested runtime trials completed; exact-match count, pass rate,
 failure-category counts, and `overall_pass=false` remain truthful in the report. Each trial receives
-the full `--request-timeout`; cleanup remains bounded separately by `--cleanup-timeout`.
+the full `--request-timeout`, beginning immediately before request submission. The packaged
+watchdog uses four independent allowances: a 600-second setup/readiness budget, the configured
+inference request budget, a 120-second evidence-finalization budget, and the configured cleanup
+budget. Its deterministic deadline is therefore
+`600 + request_timeout + 120 + cleanup_timeout` seconds. WebDriver/desktop startup, CUDA model
+warm-load, operator registration, and landing-page readiness consume only setup time; model hashing
+and evidence writing consume finalization time; cleanup remains separately bounded. Existing CLI
+commands need no new option.
+
+The child atomically updates an owner-only phase-status file at allowlisted boundaries from runner
+startup through cleanup. If the parent watchdog expires, it kills only its exact owned process tree
+and recovers the last valid phase. A `packaged_runner_timeout` report then contains only that
+low-cardinality phase, configured phase budgets, bounded elapsed duration, and cleanup success. The
+status channel contains no prompt/response text, encrypted material, keys, credentials, identifiers,
+paths, command lines, or logs; missing, stale, or malformed status fails the runtime contract closed.
+Temporary request, response-evidence, diagnostic-tail, tokenizer, and phase-status files are deleted
+after success and failure.
 
 Failed or `not_run` packaged reports require a stable categorical failure code. Report validation
 does not fill absent telemetry with zero and does not allow `NaN` or infinity.
@@ -308,6 +324,12 @@ unchanged worker session, restart failure, and malformed evidence are runtime-co
 The command above is the genuine-hardware procedure. It was not executed during development of
 this harness change; a packaged 0.1.14 application, model, relay, and supported hardware are
 required before recording physical evidence.
+
+The attempted Windows 11/NVIDIA CUDA run of packaged desktop 0.1.14 reached the first
+`small-8k` / `single-needle` / `8k-fast` cell but the parent watchdog expired before any trial
+completed. It therefore supplied **zero semantic trials and no semantic baseline**. This harness
+correction is not physical CUDA or Metal validation; Windows/CUDA and macOS/Metal reruns remain
+required.
 
 ## Physical process-tree memory
 

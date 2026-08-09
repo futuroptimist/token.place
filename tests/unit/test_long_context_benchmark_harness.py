@@ -1175,6 +1175,10 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
 
     def fake_run(command, **kwargs):
         if runner_outcome == "timeout":
+            phase_path = command[command.index("--benchmark-phase-status") + 1]
+            h.Path(phase_path).write_text(json.dumps({
+                "schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+                "phase": "request_active", "sequence": 6, "elapsed_s": 1.0}))
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if runner_outcome == "failed":
             return subprocess.CompletedProcess(command, 1, "", "")
@@ -1194,6 +1198,40 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
     )
     assert result["pass"] is False
     assert result["code"] == expected_code
+
+
+def test_packaged_runner_budget_equation_preserves_complete_request_budget():
+    budgets = h.packaged_runner_budgets(600, 30)
+    assert budgets == {"setup_budget_s": 600.0, "request_timeout_s": 600.0,
+        "finalization_budget_s": 120.0, "cleanup_budget_s": 30.0,
+        "overall_budget_s": 1350.0}
+    assert budgets["overall_budget_s"] - budgets["setup_budget_s"] == (
+        budgets["request_timeout_s"] + budgets["finalization_budget_s"]
+        + budgets["cleanup_budget_s"])
+
+
+@pytest.mark.parametrize(("status_text", "expected"), [
+    (None, "packaged_phase_status_missing"),
+    ("not-json", "packaged_phase_status_malformed"),
+    (json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase": "request_active", "sequence": 5, "elapsed_s": 1}),
+     "packaged_phase_status_malformed"),
+])
+def test_timeout_phase_status_fails_closed(tmp_path, status_text, expected):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    def fake_run(command, **kwargs):
+        phase_path = h.Path(command[command.index("--benchmark-phase-status") + 1])
+        if status_text is None:
+            phase_path.unlink()
+        else:
+            phase_path.write_text(status_text)
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+    result = h.invoke_packaged_runtime_adapter(timeout_s=2, app_binary=str(app),
+        model=str(model), backend="cpu", relay_url="https://relay.example",
+        cleanup_timeout_s=1, subprocess_run=fake_run, report_only=True)
+    assert result["code"] == expected
+    assert result["runtime_contract_pass"] is False
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), "1"])

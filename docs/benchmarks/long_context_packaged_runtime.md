@@ -212,7 +212,10 @@ The two existing CLI flags remain sufficient; no additional argument is required
 runner applies five separate allowances:
 
 - **setup/readiness: 300 seconds** for `tauri-driver`, WebDriver, desktop UI, operator provisioning,
-  CUDA/Metal model warm-load, relay registration, and landing-page readiness;
+  CUDA/Metal model warm-load, relay registration, and landing-page readiness. Landing readiness
+  checks Vue, the real client keypair, model-catalog selection, and the requested context tier; it
+  deliberately excludes message-dependent Send eligibility. The runner enters the prompt through
+  the ordinary message input before checking final Send eligibility;
 - **inference request: `--request-timeout` seconds**, beginning immediately before the send-button
   click that submits the request, so setup cannot consume inference time;
 - **evidence finalization: 120 seconds** for bounded telemetry/tokenizer collection, model
@@ -246,14 +249,16 @@ parent watchdog expires, the
 `packaged_runner_timeout` report records only the last safe phase, the five configured budgets and
 their derived runner/overall totals, bounded elapsed time, and whether owned-tree cleanup succeeded.
 The channel contains no prompts, responses, ciphertext, keys, credentials, identifiers, paths,
-command lines, or logs. Missing, malformed, or stale phase state fails closed as a runtime-contract
-failure, and all request, response, diagnostic, and phase files are deleted after the attempt.
+command lines, or logs. A nonzero child exit retains only its last safe phase, one allowlisted
+categorical failure reason, bounded elapsed time, and the owned cleanup outcome when available; it
+never retains exception strings, traceback text, or a raw diagnostic tail. Missing, malformed, or
+stale phase state fails closed as a runtime-contract failure, and all request, response, diagnostic,
+and phase files are deleted after the attempt.
 
-The sanitized Windows 11/NVIDIA attempt described for this follow-up timed out in the first
-`small-8k` / `single-needle` / `8k-fast` trial before completing any of three requested trials.
-It therefore supplied **no semantic baseline**. Corrected accounting and mocked orchestration tests
-are not physical CUDA or Metal validation; physical Windows/CUDA and macOS/Metal reruns remain
-required.
+The sanitized Windows 11/NVIDIA attempt described for this follow-up completed zero trials: its
+child runner failed at the impossible pre-prompt Send-eligibility wait. It therefore supplied **no
+semantic baseline**. Corrected readiness ordering and mocked orchestration tests are not physical
+CUDA or Metal validation; physical Windows/CUDA and macOS/Metal reruns remain required.
 
 Failed or `not_run` packaged reports require a stable categorical failure code. Report validation
 does not fill absent telemetry with zero and does not allow `NaN` or infinity.

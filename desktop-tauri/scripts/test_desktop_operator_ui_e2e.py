@@ -51,6 +51,7 @@ try:
         observe_post_terminal,
         benchmark_operator_mode,
         OwnedProcessTreeMemorySampler,
+        PACKAGED_FAILURE_REASONS,
         packaged_phase_remaining,
         prefill_cancellation_trigger_state,
         start_phase_after,
@@ -757,11 +758,14 @@ def assert_packaged_windows_nvidia_status(
 
 
 def _write_benchmark_phase(path: Path, phase: str, started: float,
-        schema_version: str, phases: tuple[str, ...]) -> None:
+        schema_version: str, phases: tuple[str, ...], *, last_safe_phase: str,
+        failure_reason: str | None = None, cleanup_succeeded: bool | None = None) -> None:
     """Atomically checkpoint an allowlisted phase without identifiers or payload data."""
     payload = {"schema_version": schema_version, "phase": phase,
         "sequence": phases.index(phase) + 1,
-        "elapsed_s": round(max(0.0, time.monotonic() - started), 3)}
+        "last_safe_phase": last_safe_phase, "failure_reason": failure_reason,
+        "elapsed_s": round(max(0.0, time.monotonic() - started), 3),
+        "cleanup_succeeded": cleanup_succeeded}
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     if hasattr(os, "chmod"):
@@ -782,9 +786,19 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         raise RuntimeError("packaged phase contract malformed")
     phases = tuple(phase_values)
     runner_started = time.monotonic()
+    last_safe_phase = "runner_startup"
+    failure_reason: str | None = None
     def write_phase(phase: str) -> None:
+        nonlocal last_safe_phase
+        last_safe_phase = phase
         _write_benchmark_phase(phase_status_path, phase, runner_started,
-            phase_schema_version, phases)
+            phase_schema_version, phases, last_safe_phase=last_safe_phase)
+    def fail_closed(reason: str) -> None:
+        nonlocal failure_reason
+        if reason not in PACKAGED_FAILURE_REASONS:
+            raise RuntimeError("invalid packaged failure reason")
+        failure_reason = reason
+        raise RuntimeError(reason)
     setup_deadline = runner_started + float(request["setup_timeout_s"])
     def setup_remaining() -> float:
         remaining = setup_deadline - time.monotonic()
@@ -868,15 +882,27 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         browser.set_page_load_timeout(setup_remaining())
         browser.set_script_timeout(setup_remaining())
         browser.get(request["relay_url"])
-        WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
-            lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
+        try:
+            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
+                lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
+        except TimeoutException:
+            fail_closed("vue_not_ready")
+        try:
+            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
+                lambda d: d.execute_script(
+                    "const v=document.querySelector('#app').__vue__; return Boolean(v.hasClientKeypair);"))
+        except TimeoutException:
+            fail_closed("client_keypair_not_ready")
+        try:
+            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
+                lambda d: d.execute_script(
+                    "const v=document.querySelector('#app').__vue__; return Boolean(v.modelsLoaded && v.selectedModel);"))
+        except TimeoutException:
+            fail_closed("model_selection_not_ready")
         setup_remaining()
         selected_tier = apply_benchmark_context_tier(browser, request["context_tier"])
         if selected_tier != request["context_tier"]:
-            raise RuntimeError("landing context selection failed")
-        WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
-            lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
-        write_phase("landing_page_ready")
+            fail_closed("requested_context_tier_not_applied")
         if not memory_sampler.sample():
             raise RuntimeError("memory_sample_unavailable")
         browser.set_script_timeout(setup_remaining())
@@ -910,9 +936,19 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         setup_remaining()
         field.send_keys(request["prompt"])
         setup_remaining()
-        write_phase("request_active")
+        populated = browser.execute_script(
+            "return document.querySelector('#app').__vue__.newMessage.length > 0;")
+        if not populated:
+            fail_closed("message_input_not_populated")
+        try:
+            WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
+                lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
+        except TimeoutException:
+            fail_closed("send_button_not_enabled")
+        write_phase("landing_page_ready")
         started = time.monotonic()
         browser.find_element(By.CSS_SELECTOR, ".send-button").click()
+        write_phase("request_active")
         progress: list[dict[str, object]] = []
         while time.monotonic() - started < float(request["request_timeout_s"]):
             memory_sampler.sample()
@@ -1037,10 +1073,16 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         finalization_remaining()
         os.chmod(evidence_path, 0o600)
         return 0
+    except Exception:
+        if failure_reason is None:
+            failure_reason = "packaged_runner_failure"
+        raise
     finally:
         checkpoint_error = None
         try:
-            write_phase("cleanup")
+            _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
+                phase_schema_version, phases, last_safe_phase=last_safe_phase,
+                failure_reason=failure_reason)
         except Exception as exc:
             checkpoint_error = exc
         cleanup_deadline = time.monotonic() + cleanup_timeout
@@ -1063,6 +1105,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         shutil.rmtree(isolated_home, ignore_errors=True)
         shutil.rmtree(tokenizer_dir, ignore_errors=True)
         driver_log.unlink(missing_ok=True)
+        with contextlib.suppress(Exception):
+            _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
+                phase_schema_version, phases, last_safe_phase=last_safe_phase,
+                failure_reason=failure_reason, cleanup_succeeded=cleanup_ok)
         if not cleanup_ok:
             raise RuntimeError("owned process cleanup failed")
         if checkpoint_error is not None:

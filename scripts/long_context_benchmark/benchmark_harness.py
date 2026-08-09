@@ -1251,6 +1251,9 @@ def _read_packaged_phase_status(path: Path, parent_elapsed_s: float, *, final: b
             or isinstance(value.get("elapsed_s"), bool) or not math.isfinite(value["elapsed_s"])
             or value["elapsed_s"] < 0 or value["elapsed_s"] > parent_elapsed_s + 1.0):
         return None, "packaged_phase_status_malformed"
+    if final and (value["phase"] != "cleanup"
+            or not isinstance(value["cleanup_succeeded"], bool)):
+        return None, "packaged_phase_status_malformed"
     return value, None
 
 
@@ -1463,7 +1466,9 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
                         timeout=overall_budget_s, check=False)
         except subprocess.TimeoutExpired as exc:
             elapsed_s = min(overall_budget_s, max(0.0, time.monotonic() - runner_started))
-            status, phase_error = _read_packaged_phase_status(Path(phase_name), elapsed_s, final=True)
+            # A watchdog timeout may only have an active-phase checkpoint.  The
+            # watchdog independently owns and reports cleanup in this path.
+            status, phase_error = _read_packaged_phase_status(Path(phase_name), elapsed_s)
             if phase_error:
                 return {"pass": False, "runtime_contract_pass": False, "code": phase_error}
             return {"pass": False, "runtime_contract_pass": False,
@@ -1483,15 +1488,16 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
                 return {"pass": False, "runtime_contract_pass": False, "code": phase_error}
             return {"pass": False, "runtime_contract_pass": False,
                 "code": "packaged_runner_failed", "last_safe_phase": status["last_safe_phase"],
-                "failure_reason": status["failure_reason"] or "packaged_runner_failure",
+                "failure_reason": status["failure_reason"] or (
+                    "cleanup_failure" if not status["cleanup_succeeded"]
+                    else "packaged_runner_failure"),
                 "elapsed_s": min(runner_budget_s, float(status["elapsed_s"])),
                 "cleanup_succeeded": status["cleanup_succeeded"] is True}
         elapsed_s = min(overall_budget_s, max(0.0, time.monotonic() - runner_started))
         status, phase_error = _read_packaged_phase_status(Path(phase_name), elapsed_s, final=True)
-        if phase_error or status["phase"] != "cleanup" or not isinstance(
-                status["cleanup_succeeded"], bool):
+        if phase_error:
             return {"pass": False, "runtime_contract_pass": False,
-                "code": phase_error or "packaged_phase_status_malformed"}
+                "code": phase_error}
         if not status["cleanup_succeeded"]:
             return {"pass": False, "runtime_contract_pass": False,
                 "code": "packaged_runner_failed", "last_safe_phase": status["last_safe_phase"],

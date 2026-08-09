@@ -1191,38 +1191,87 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             failure_reason = "packaged_runner_failure"
         raise
     finally:
+        cleanup_deadline = time.monotonic() + cleanup_timeout
+        def cleanup_remaining() -> float:
+            return max(0.0, cleanup_deadline - time.monotonic())
+        def cleanup_allowance() -> float | None:
+            remaining = cleanup_remaining()
+            return remaining if remaining > 0 else None
         checkpoint_error = None
         try:
             _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
                 phase_schema_version, phases, last_safe_phase=last_safe_phase,
-                failure_reason=failure_reason, cleanup_succeeded=False)
+                failure_reason=failure_reason, cleanup_succeeded=False,
+                retry_timeout_s=cleanup_remaining())
         except Exception as exc:
             checkpoint_error = exc
-        cleanup_deadline = time.monotonic() + cleanup_timeout
-        def cleanup_remaining() -> float:
-            return max(0.001, cleanup_deadline - time.monotonic())
         if browser is not None:
-            cleanup_ok = _quit_webdriver(browser, cleanup_remaining()) and cleanup_ok
+            allowance = cleanup_allowance()
+            cleanup_ok = (allowance is not None
+                and _quit_webdriver(browser, allowance) and cleanup_ok)
         if driver is not None:
-            cleanup_ok = _quit_webdriver(driver, cleanup_remaining()) and cleanup_ok
+            allowance = cleanup_allowance()
+            cleanup_ok = (allowance is not None
+                and _quit_webdriver(driver, allowance) and cleanup_ok)
         if process is not None:
             try:
                 root = psutil.Process(process.pid)
                 owned_processes = [*root.children(recursive=True), root]
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            except psutil.NoSuchProcess:
                 owned_processes = []
+            except (psutil.AccessDenied, psutil.ZombieProcess):
+                owned_processes = []
+                cleanup_ok = False
             for owned in owned_processes:
-                with contextlib.suppress(psutil.NoSuchProcess):
+                if cleanup_allowance() is None:
+                    cleanup_ok = False
+                    break
+                try:
                     owned.terminate()
-            _, alive = psutil.wait_procs(owned_processes, timeout=cleanup_remaining())
+                except psutil.NoSuchProcess:
+                    pass
+                except Exception:
+                    cleanup_ok = False
+            alive = owned_processes
+            allowance = cleanup_allowance()
+            if allowance is None and alive:
+                cleanup_ok = False
+            elif alive:
+                try:
+                    _, alive = psutil.wait_procs(alive, timeout=allowance)
+                except Exception:
+                    cleanup_ok = False
             for owned in alive:
-                with contextlib.suppress(psutil.NoSuchProcess):
+                if cleanup_allowance() is None:
+                    cleanup_ok = False
+                    break
+                try:
                     owned.kill()
-            _, alive = psutil.wait_procs(alive, timeout=cleanup_remaining())
+                except psutil.NoSuchProcess:
+                    pass
+                except Exception:
+                    cleanup_ok = False
+            allowance = cleanup_allowance()
+            if allowance is None and alive:
+                cleanup_ok = False
+            elif alive:
+                try:
+                    _, alive = psutil.wait_procs(alive, timeout=allowance)
+                except Exception:
+                    cleanup_ok = False
             cleanup_ok = cleanup_ok and not alive
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=cleanup_remaining())
-        driver_log_handle.close()
+            allowance = cleanup_allowance()
+            if allowance is None:
+                cleanup_ok = False
+            else:
+                try:
+                    process.wait(timeout=allowance)
+                except Exception:
+                    cleanup_ok = False
+        try:
+            driver_log_handle.close()
+        except Exception:
+            cleanup_ok = False
         for owned_path, is_directory in (
                 (isolated_home, True), (tokenizer_dir, True), (driver_log, False)):
             try:

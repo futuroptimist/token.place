@@ -90,7 +90,7 @@ def test_phase_checkpoint_sharing_deadline_is_bounded_and_sanitized(
     assert str(raised.value) == "phase checkpoint publication failed"
     assert len(attempts) == 4
     assert "private" not in str(raised.value)
-    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
 
 
 def test_phase_checkpoint_does_not_retry_unrelated_error(
@@ -104,7 +104,8 @@ def test_phase_checkpoint_does_not_retry_unrelated_error(
         _phase_write(desktop_runner, tmp_path / "phase.json",
             clock=lambda: 0.0, sleeper=lambda _delay: pytest.fail("slept"))
     assert attempts == [True]
-    assert not list(tmp_path.glob("*.tmp"))
+    destination = tmp_path / "phase.json"
+    assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
 
 
 def test_phase_checkpoint_temp_cleanup_reuses_publication_deadline(
@@ -1388,6 +1389,43 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
             h.PACKAGED_SETUP_BUDGET_S + 1 + h.PACKAGED_FINALIZATION_BUDGET_S)
         assert result["overall_timeout_s"] == result["runner_timeout_s"] + 1
         assert result["cleanup_succeeded"] is False
+
+
+@pytest.mark.parametrize(("phase", "cleanup_value"), [
+    ("request_active", None), ("cleanup", None),
+])
+def test_nonzero_normal_exit_requires_final_cleanup_checkpoint(
+        tmp_path, phase, cleanup_value):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    def failed_runner(command, **_kwargs):
+        _write_phase(h.Path(command[command.index("--benchmark-phase-status") + 1]),
+            phase, 0.0, cleanup_succeeded=cleanup_value)
+        return subprocess.CompletedProcess(command, 1)
+    result = h.invoke_packaged_runtime_adapter(timeout_s=1, app_binary=str(app),
+        model=str(model), backend="metal", relay_url="https://relay.example",
+        cleanup_timeout_s=1, subprocess_run=failed_runner)
+    assert result["code"] == "packaged_phase_status_malformed"
+
+
+@pytest.mark.parametrize(("primary_reason", "expected_reason"), [
+    (None, "cleanup_failure"),
+    ("send_button_not_enabled", "send_button_not_enabled"),
+])
+def test_nonzero_cleanup_failure_is_categorical_and_preserves_primary(
+        tmp_path, primary_reason, expected_reason):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    def failed_runner(command, **_kwargs):
+        phase = h.Path(command[command.index("--benchmark-phase-status") + 1])
+        _write_phase(phase, "cleanup", 0.0, failure_reason=primary_reason,
+            cleanup_succeeded=False)
+        return subprocess.CompletedProcess(command, 1)
+    result = h.invoke_packaged_runtime_adapter(timeout_s=1, app_binary=str(app),
+        model=str(model), backend="metal", relay_url="https://relay.example",
+        cleanup_timeout_s=1, subprocess_run=failed_runner)
+    assert result["failure_reason"] == expected_reason
+    assert result["cleanup_succeeded"] is False
 
 
 @pytest.mark.parametrize(("contents", "expected"), [

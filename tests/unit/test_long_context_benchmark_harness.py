@@ -1911,6 +1911,80 @@ def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowanc
     assert writes[-1]["failure_reason"] == "packaged_runner_failure"
 
 
+def test_packaged_runner_log_close_failure_preserves_primary_and_finishes_cleanup(
+        tmp_path, monkeypatch):
+    """A log-close fault cannot interrupt owned cleanup or final reporting."""
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {"run_long_context_packaged_mode"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    events = []
+    checkpoints = []
+    removed = []
+    process = SimpleNamespace(pid=1234)
+
+    class ClosingFault:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def write(self, value):
+            return self.handle.write(value)
+
+        def close(self):
+            events.append("log_close")
+            self.handle.close()
+            raise RuntimeError("private close detail /absolute/private/path")
+
+    real_io_open = __import__("io").open
+
+    def open_with_closing_fault(path, *args, **kwargs):
+        handle = real_io_open(path, *args, **kwargs)
+        if str(path).endswith(".log") and "long-context-tauri-driver-" in str(path):
+            return ClosingFault(handle)
+        return handle
+
+    monkeypatch.setattr("io.open", open_with_closing_fault)
+    namespace = {
+        "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
+        "os": os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
+        "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
+        "OwnedProcessTreeMemorySampler": lambda _pid: object(),
+        "wait_for_port": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("primary packaged failure")),
+        "_write_benchmark_phase": lambda *_args, **kwargs: checkpoints.append(dict(kwargs)),
+        "_cleanup_owned_process_tree": lambda owned, _remaining: (
+            events.append(("process_cleanup", owned.pid)) or True),
+        "_remove_owned_path": lambda path, *_args, **_kwargs: (
+            events.append(("remove", path)) or removed.append(path) or True),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
+        namespace)
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps({
+        "phase_status_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase_status_phases": list(h.PACKAGED_PHASES), "setup_timeout_s": 10,
+        "cleanup_timeout_s": 1,
+        "manifest": {"fixture_sha256": "0" * 64, "targets": {}},
+    }))
+
+    with pytest.raises(RuntimeError, match="primary packaged failure") as raised:
+        namespace["run_long_context_packaged_mode"](
+            request_path, tmp_path / "evidence.json", tmp_path / "phase.json",
+            tmp_path / "app")
+
+    assert events.index(("process_cleanup", 1234)) < events.index("log_close")
+    assert events.index("log_close") < min(events.index(("remove", path)) for path in removed)
+    assert len(removed) == 3
+    assert checkpoints[-1]["cleanup_succeeded"] is False
+    assert checkpoints[-1]["failure_reason"] == "packaged_runner_failure"
+    report = json.dumps(checkpoints)
+    assert "private close detail" not in report
+    assert str(tmp_path) not in report
+    assert "private close detail" not in str(raised.value)
+
+
 class _CleanupProcess:
     def __init__(self, name, events, *, terminate_error=False, kill_error=False):
         self.name = name

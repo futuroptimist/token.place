@@ -1175,6 +1175,11 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
 
     def fake_run(command, **kwargs):
         if runner_outcome == "timeout":
+            phase_path = command[command.index("--benchmark-phase-status") + 1]
+            h.Path(phase_path).write_text(json.dumps({
+                "schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+                "phase": "request_active", "sequence": 6, "elapsed_s": 0.0,
+            }))
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         if runner_outcome == "failed":
             return subprocess.CompletedProcess(command, 1, "", "")
@@ -1194,6 +1199,48 @@ def test_packaged_runtime_rejects_runner_and_evidence_failures(tmp_path, runner_
     )
     assert result["pass"] is False
     assert result["code"] == expected_code
+    if runner_outcome == "timeout":
+        assert result["last_safe_phase"] == "request_active"
+        assert result["request_timeout_s"] == 1
+        assert result["runner_timeout_s"] == (
+            h.PACKAGED_SETUP_BUDGET_S + 1 + h.PACKAGED_FINALIZATION_BUDGET_S)
+        assert result["overall_timeout_s"] == result["runner_timeout_s"] + 1
+        assert result["cleanup_succeeded"] is False
+
+
+@pytest.mark.parametrize(("contents", "expected"), [
+    (None, "packaged_phase_status_missing"),
+    ("not-json", "packaged_phase_status_missing"),
+    (json.dumps({"schema_version": "wrong", "phase": "request_active",
+        "sequence": 6, "elapsed_s": 0}), "packaged_phase_status_malformed"),
+    (json.dumps({"schema_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase": "request_active", "sequence": 6, "elapsed_s": 50}),
+        "packaged_phase_status_malformed"),
+])
+def test_packaged_phase_status_missing_malformed_or_stale_fails_closed(tmp_path, contents, expected):
+    path = tmp_path / "phase.json"
+    if contents is not None:
+        path.write_text(contents)
+    assert h._read_packaged_phase_status(path, 1) == (None, expected)
+
+
+def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    observed = {}
+    def fake_run(command, **kwargs):
+        observed["timeout"] = kwargs["timeout"]
+        request_path = command[command.index("--benchmark-request") + 1]
+        observed["request"] = json.loads(h.Path(request_path).read_text())
+        return subprocess.CompletedProcess(command, 1)
+    result = h.invoke_packaged_runtime_adapter(timeout_s=600, app_binary=str(app),
+        model=str(model), backend="cuda", relay_url="https://relay.example",
+        cleanup_timeout_s=30, subprocess_run=fake_run)
+    assert result["code"] == "packaged_runner_failed"
+    assert observed["timeout"] == h.PACKAGED_SETUP_BUDGET_S + 600 + h.PACKAGED_FINALIZATION_BUDGET_S
+    assert observed["request"]["request_timeout_s"] == 600
+    assert observed["request"]["setup_timeout_s"] == h.PACKAGED_SETUP_BUDGET_S
+    assert observed["request"]["finalization_timeout_s"] == h.PACKAGED_FINALIZATION_BUDGET_S
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), "1"])
@@ -1597,6 +1644,28 @@ def test_packaged_trials_default_and_multiple_are_sequential(tmp_path, monkeypat
     report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
     assert report["requested_trial_count"] == report["completed_trial_count"] == 3
     assert report["aggregate_semantic"]["trial_count"] == 3
+
+
+def test_not_run_timeout_report_retains_validated_fixture_sha_and_safe_diagnostics(tmp_path, monkeypatch):
+    _, manifest = h.generate_fixture("small-8k", scenario="single-needle")
+    timeout = {"pass": False, "runtime_contract_pass": False,
+        "code": "packaged_runner_timeout", "last_safe_phase": "request_active",
+        "request_timeout_s": 600.0, "setup_timeout_s": h.PACKAGED_SETUP_BUDGET_S,
+        "finalization_timeout_s": h.PACKAGED_FINALIZATION_BUDGET_S,
+        "cleanup_timeout_s": 30.0,
+        "runner_timeout_s": h.PACKAGED_SETUP_BUDGET_S + 600 + h.PACKAGED_FINALIZATION_BUDGET_S,
+        "overall_timeout_s": h.PACKAGED_SETUP_BUDGET_S + 600
+            + h.PACKAGED_FINALIZATION_BUDGET_S + 30,
+        "elapsed_s": 700.0, "cleanup_succeeded": True}
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: timeout)
+    assert h.main(_packaged_main_args(tmp_path, "--fixture", "small-8k", "--scenario",
+        "single-needle", "--request-timeout", "600", "--cleanup-timeout", "30",
+        "--report-only")) == 1
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
+    assert report["fixture"]["sha256"] == manifest["fixture_sha256"]
+    assert report["completed_trial_count"] == 0
+    assert report["last_safe_phase"] == "request_active"
+    assert not h.SENSITIVE_KEYS.intersection(report)
 
 
 def test_cancellation_sequence_runs_once_outside_semantic_trial_count(tmp_path, monkeypatch):

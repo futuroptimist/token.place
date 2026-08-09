@@ -206,6 +206,40 @@ semantic outcomes only after all requested runtime trials completed; exact-match
 failure-category counts, and `overall_pass=false` remain truthful in the report. Each trial receives
 the full `--request-timeout`; cleanup remains bounded separately by `--cleanup-timeout`.
 
+### Packaged-runner phase budgets and watchdog
+
+The two existing CLI flags remain sufficient; no additional argument is required. The packaged
+runner applies four separate allowances:
+
+- **setup/readiness: 300 seconds** for `tauri-driver`, WebDriver, desktop UI, operator provisioning,
+  CUDA/Metal model warm-load, relay registration, and landing-page readiness;
+- **inference request: `--request-timeout` seconds**, beginning immediately before the send-button
+  click that submits the request, so setup cannot consume inference time;
+- **evidence finalization: 120 seconds** for bounded telemetry/tokenizer collection, model
+  fingerprinting, and the atomic evidence write; and
+- **cleanup: `--cleanup-timeout` seconds**, reserved for the exact process tree owned by the trial.
+
+The parent watchdog is finite and uses the explicit equation `300 + request timeout + 120` seconds
+for child execution, followed by at most the configured cleanup budget. Thus the complete overall
+allowance is `setup + request + finalization + cleanup`; it is neither an undocumented multiplier
+nor an unbounded wait. Pre-request WebDriver and readiness waits draw only from the shared setup
+deadline, not from the request timeout.
+
+An owner-only phase file is atomically replaced at allowlisted boundaries (`runner_startup`,
+`webdriver_ready`, `desktop_ready`, `operator_ready`, `landing_page_ready`, `request_active`,
+`response_received`, `evidence_finalization`, and `cleanup`). If the parent watchdog expires, the
+`packaged_runner_timeout` report records only the last safe phase, the four configured budgets and
+their derived runner/overall totals, bounded elapsed time, and whether owned-tree cleanup succeeded.
+The channel contains no prompts, responses, ciphertext, keys, credentials, identifiers, paths,
+command lines, or logs. Missing, malformed, or stale phase state fails closed as a runtime-contract
+failure, and all request, response, diagnostic, and phase files are deleted after the attempt.
+
+The sanitized Windows 11/NVIDIA attempt described for this follow-up timed out in the first
+`small-8k` / `single-needle` / `8k-fast` trial before completing any of three requested trials.
+It therefore supplied **no semantic baseline**. Corrected accounting and mocked orchestration tests
+are not physical CUDA or Metal validation; physical Windows/CUDA and macOS/Metal reruns remain
+required.
+
 Failed or `not_run` packaged reports require a stable categorical failure code. Report validation
 does not fill absent telemetry with zero and does not allow `NaN` or infinity.
 

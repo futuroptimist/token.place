@@ -302,10 +302,22 @@ Every progress observation contains a positive, stable `total_prompt_tokens` plu
 `cached_prompt_tokens`, `processed_prompt_tokens`, and `generated_tokens`. Processed and generated
 counts are monotonic, cached never exceeds processed, and processed never exceeds total.
 
-The successful API response is an ordered `result` observation followed by exactly one ordered
-`terminal` observation with state `completed`. Cancellation and failure instead use `cancelled` or
-`failed`. Completion requires at least one progress observation, a generating phase, exactly one
-successful result, and full prompt processing. Duplicate or conflicting terminal observations,
+The packaged benchmark separates two progress domains. Privacy-safe packaged-local
+`api_v1.local_progress` records are the authoritative runtime timeline: completion requires local
+prefill, full prompt processing, and a genuine local generating record with a positive generated
+count. The runner takes a bounded driver-log slice from the byte boundary immediately before the
+primary request through its response, before any cancellation/recovery follow-up. It parses only
+the exact allowlisted local-progress and `api_v1.inference_complete` shapes; request correlation is
+ephemeral and request IDs, worker identifiers, log text, paths, content, keys, and ciphertext never
+enter evidence or reports.
+
+Browser-observed encrypted progress is reported separately as `encrypted_progress`. It remains the
+P6 best-effort delivery stream: each event must be schema-valid, monotonic, and compatible with the
+local authority, but terminal completion may overtake a pending generating update. Reports list the
+phases actually delivered and set `terminal_overtook_final_generating_update` rather than inventing
+a generating observation. The successful atomic API response is still an ordered `result`
+observation followed by exactly one ordered `terminal` observation with state `completed`.
+Cancellation and failure instead use `cancelled` or `failed`. Duplicate or conflicting terminal observations,
 terminal timestamps preceding prior progress, results after cancellation, and any result or
 progress after terminal are categorical failures. The desktop runner continues polling for a short
 monotonic-deadline-bounded window after completion so late progress or a conflicting result is
@@ -313,14 +325,25 @@ observable; it does not use a multi-second fixed sleep. Missing or malformed lif
 returns stable errors such as `progress_missing`, `malformed_telemetry`, `incomplete_prefill`, or
 `progress_after_terminal` rather than passing or raising an uncaught exception.
 
-Timings use five ordered monotonic boundaries: request start, end of preparing, end of prefill,
-first generated token, and request end. They produce preparing duration, prefill duration,
-time-to-first-token, decode duration, and total duration. Prompt throughput is authoritative prompt
+Report schema v2 keeps clock provenance explicit. `preparing_duration_s`, `prefill_duration_s`,
+`time_to_first_token_s`, `decode_duration_s`, and `runtime_total_duration_s` come only from the
+packaged-local worker timing domain. `end_to_end_duration_s` is measured independently by the
+browser runner's monotonic clock; worker-relative milliseconds are never added to a browser-click
+timestamp. Prompt throughput is authoritative prompt
 tokens divided by prefill duration; decode throughput is authoritative output tokens divided by
-decode duration. The report also records the request budget and `budget - total duration` completion
+decode duration. Prompt tokens must agree among packaged admission/tokenizer evidence, local
+progress, the safe inference-complete record, and final response usage. Completion tokens come from
+allowlisted decrypted final metadata (`usage.completion_tokens`), never response text or the last
+coalesced progress counter. The report also records the request budget and `budget - end-to-end duration` completion
 margin. Zero-duration boundaries are valid and retain a zero duration (their division-based
 throughput is `null`); absent, non-finite, reversed, or over-budget timing fails closed and is never
 coerced to zero.
+
+Stable primary failures distinguish `authoritative_local_progress_missing`,
+`local_prefill_phase_missing`, `local_generating_phase_missing`,
+`positive_generated_token_progress_missing`, `local_timing_record_malformed`,
+`response_usage_missing_or_inconsistent`, and `encrypted_progress_delivery_invalid`. These do not
+waive semantic scoring, cleanup evidence, or the last safe packaged-runner phase.
 
 Cancellation scenarios must be progress-triggered, not sleep-only:
 

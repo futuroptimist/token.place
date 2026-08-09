@@ -248,6 +248,25 @@ def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="
         "peak_rss_bytes": peak, "final_rss_bytes": final}
 
 
+def _upgrade_packaged_telemetry_payload(payload):
+    events = payload.pop("progress_events")
+    if events[0]["phase"] != "preparing":
+        events.insert(0, {"sequence": 0, "phase": "preparing",
+            "total_prompt_tokens": 0, "cached_prompt_tokens": 0,
+            "processed_prompt_tokens": 0, "generated_tokens": 0, "elapsed_ms": 0})
+    payload["local_telemetry"] = {"pass": True, "progress_events": events,
+        "timing": {"active_tier": "64k-full",
+            "prompt_tokens": payload["authoritative_prompt_tokens"],
+            "output_reservation": 1024, "inference_duration_seconds": 2.0}}
+    payload["encrypted_progress_events"] = [
+        {"schema_version": 1, **event} for event in events if event["phase"] != "preparing"]
+    payload["response_usage"] = {"prompt_tokens": payload["authoritative_prompt_tokens"],
+        "completion_tokens": payload.pop("output_tokens"), "finish_reason": "stop"}
+    payload["end_to_end_duration_s"] = payload.pop("end_s") - payload.pop("start_s")
+    payload.pop("preparing_end_s"); payload.pop("prefill_end_s"); payload.pop("first_token_s")
+    return payload
+
+
 def _runtime_configuration(backend="cpu", tier="64k-full", window=65536, qwen=False):
     na = {"status": "not_applicable", "reason": "not_qwen_64k_profile"}
     result = {"mode": {"requested": "cpu" if backend == "cpu" else "gpu",
@@ -1039,6 +1058,94 @@ def _completed_lifecycle():
     ]
 
 
+def _old_app_local_log(*, include_generating=True, preparing_total=0):
+    lines = [
+        r"2026-08-01T12:00:00Z C:\Program Files\token.place\app.exe INFO unrelated safe startup",
+        "INFO api_v1.local_progress request_id=ephemeral-1 worker_generation=7 sequence=1 "
+        f"phase=preparing total_prompt_tokens={preparing_total} cached_prompt_tokens=0 "
+        "processed_prompt_tokens=0 generated_tokens=0 elapsed_ms=0",
+        "INFO api_v1.local_progress request_id=ephemeral-1 worker_generation=7 sequence=2 "
+        "phase=prefill total_prompt_tokens=10 cached_prompt_tokens=0 "
+        "processed_prompt_tokens=10 generated_tokens=0 elapsed_ms=100",
+    ]
+    if include_generating:
+        lines.append("INFO api_v1.local_progress request_id=ephemeral-1 worker_generation=7 sequence=3 "
+            "phase=generating total_prompt_tokens=10 cached_prompt_tokens=0 "
+            "processed_prompt_tokens=10 generated_tokens=2 elapsed_ms=120")
+    lines.append("INFO api_v1.inference_complete active_tier=64k-full prompt_tokens=10 "
+        "output_reservation=128 admission_result=admitted inference_duration_seconds=0.150 "
+        "safe_error_code=none")
+    return "\n".join(lines) + "\ntrailing unrelated partial line"
+
+
+def _usage(prompt=10, completion=3):
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "finish_reason": "stop"}
+
+
+def test_local_authority_allows_best_effort_prefill_only_delivery():
+    parsed = h.parse_packaged_local_telemetry(_old_app_local_log())
+    local = h.validate_local_runtime_telemetry(parsed, tokenizer_prompt_tokens=10,
+        response_usage=_usage())
+    delivered = h.validate_encrypted_progress_delivery([{
+        "schema_version": 1, "sequence": 1, "phase": "prefill", "total_prompt_tokens": 10,
+        "cached_prompt_tokens": 0, "processed_prompt_tokens": 10,
+        "generated_tokens": 0, "elapsed_ms": 100}], local)
+    assert local["pass"] is True
+    assert local["output_tokens"] == 3
+    assert delivered == {"pass": True, "progress_event_count": 1,
+        "observed_phases": ["prefill"], "terminal_overtook_final_generating_update": True}
+
+
+def test_local_generating_is_required_despite_completed_browser_response():
+    parsed = h.parse_packaged_local_telemetry(_old_app_local_log(include_generating=False))
+    result = h.validate_local_runtime_telemetry(parsed, tokenizer_prompt_tokens=10,
+        response_usage=_usage())
+    assert result["code"] == "local_generating_phase_missing"
+
+
+@pytest.mark.parametrize("total", [1, 10])
+def test_zero_preparing_total_is_only_valid_before_authoritative_total(total):
+    parsed = h.parse_packaged_local_telemetry(_old_app_local_log(preparing_total=total))
+    assert h.validate_local_runtime_telemetry(parsed, tokenizer_prompt_tokens=10,
+        response_usage=_usage())["pass"] is (total == 10)
+    assert h.validate_local_runtime_telemetry(
+        h.parse_packaged_local_telemetry(_old_app_local_log()), tokenizer_prompt_tokens=10,
+        response_usage=_usage())["pass"] is True
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda events: events[1].update(sequence=1),
+    lambda events: events[1].update(elapsed_ms=-1),
+    lambda events: events[2].update(phase="prefill"),
+    lambda events: events[2].update(generated_tokens=0),
+    lambda events: events[2].update(total_prompt_tokens=11),
+    lambda events: events[2].update(processed_prompt_tokens=9),
+])
+def test_local_authority_fails_closed_on_malformed_or_incomplete_stream(mutation):
+    parsed = h.parse_packaged_local_telemetry(_old_app_local_log())
+    mutation(parsed["progress_events"])
+    assert h.validate_local_runtime_telemetry(parsed, tokenizer_prompt_tokens=10,
+        response_usage=_usage())["pass"] is False
+
+
+def test_response_usage_is_authoritative_and_prompt_agreement_is_required():
+    parsed = h.parse_packaged_local_telemetry(_old_app_local_log())
+    result = h.validate_local_runtime_telemetry(parsed, tokenizer_prompt_tokens=10,
+        response_usage=_usage(completion=9))
+    assert result["output_tokens"] == 9
+    assert h.validate_local_runtime_telemetry(parsed, tokenizer_prompt_tokens=10,
+        response_usage=_usage(prompt=11))["code"] == "response_usage_missing_or_inconsistent"
+
+
+def test_local_parser_rejects_cross_request_and_never_returns_identity_or_raw_text():
+    log = _old_app_local_log().replace("request_id=ephemeral-1", "request_id=ephemeral-2", 1)
+    result = h.parse_packaged_local_telemetry(log)
+    assert result == {"pass": False, "code": "local_timing_record_malformed"}
+    serialized = json.dumps(h.parse_packaged_local_telemetry(_old_app_local_log()))
+    assert all(value not in serialized for value in ("ephemeral-1", "worker_generation",
+        "Program Files", "unrelated", "ciphertext", "prompt text"))
+
+
 @pytest.mark.parametrize(("mutate", "error"), [
     (lambda items: items.clear(), "progress_missing"),
     (lambda items: items[0].pop("total_prompt_tokens"), "malformed_telemetry"),
@@ -1283,6 +1390,7 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
             "unit":"MiB", "decimal_places":2},
         "cancellation_recovery": _physical_cancellation_evidence(authoritative_total),
     }
+    _upgrade_packaged_telemetry_payload(payload)
 
 
     app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
@@ -1673,6 +1781,7 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
              "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4,
              "elapsed_ms": 2000}],
     }
+    _upgrade_packaged_telemetry_payload(payload)
     def fake_run(command, **kwargs):
         h.Path(command[command.index("--benchmark-evidence") + 1]).write_text(json.dumps(payload))
         _write_phase(h.Path(command[command.index("--benchmark-phase-status") + 1]),

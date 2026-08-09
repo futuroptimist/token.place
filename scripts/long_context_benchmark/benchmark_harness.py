@@ -61,6 +61,14 @@ PACKAGED_PHASES = (
 )
 
 
+def packaged_cancellation_budget_s(request_timeout_s: float, observation_window_s: float,
+        recovery_timeout_s: float) -> float:
+    """Return the additive upper bound for the opt-in cancellation sequence."""
+    # Two trigger waits, two quiescence windows, two recovery requests, and the
+    # stop/start/restarted-request lifecycle (three further recovery waits).
+    return 2 * request_timeout_s + 2 * observation_window_s + 5 * recovery_timeout_s
+
+
 class PackagedRunnerTimeout(subprocess.TimeoutExpired):
     """A watchdog expiry carrying only bounded owned-cleanup outcome."""
 
@@ -936,7 +944,7 @@ def validate_report(report: Any) -> None:
     if report["status"] != "passed" and "runtime" not in report:
         if not isinstance(report.get("code"), str) or not report["code"]: raise ValueError("report_failure_code_invalid")
         timeout_fields = {"last_safe_phase", "request_timeout_s", "setup_timeout_s",
-            "finalization_timeout_s", "cleanup_timeout_s", "runner_timeout_s",
+            "finalization_timeout_s", "cancellation_timeout_s", "cleanup_timeout_s", "runner_timeout_s",
             "overall_timeout_s", "elapsed_s", "cleanup_succeeded"}
         present_timeout_fields = timeout_fields.intersection(report)
         if report["code"] == "packaged_runner_timeout":
@@ -947,6 +955,7 @@ def validate_report(report: Any) -> None:
                     or not isinstance(report["cleanup_succeeded"], bool)
                     or report["runner_timeout_s"] != report["setup_timeout_s"]
                         + report["request_timeout_s"] + report["finalization_timeout_s"]
+                        + report["cancellation_timeout_s"]
                     or report["overall_timeout_s"] != report["runner_timeout_s"]
                         + report["cleanup_timeout_s"]
                     or report["elapsed_s"] > report["overall_timeout_s"]):
@@ -1219,19 +1228,23 @@ def _run_owned_runner(command: list[str], timeout_s: float,
         def cleanup_remaining() -> float:
             return max(0.001, cleanup_deadline - time.monotonic())
         if owned_platform == "nt":
+            taskkill_ok = False
             try:
-                cleanup_run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                killed = cleanup_run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     timeout=cleanup_remaining(), check=False)  # noqa: S603
+                taskkill_ok = getattr(killed, "returncode", 1) == 0
             except (OSError, subprocess.TimeoutExpired):
+                pass
+            if not taskkill_ok:
                 process.kill()
             try:
                 process.wait(timeout=cleanup_remaining())
-                cleanup_succeeded = True
+                cleanup_succeeded = taskkill_ok
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait(timeout=cleanup_remaining())
-                cleanup_succeeded = True
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=cleanup_remaining())
         else:
             owned_killpg = killpg if killpg is not None else getattr(os, "killpg", None)
             if not callable(owned_killpg):
@@ -1269,7 +1282,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         model: str | None = None, backend: str | None = None, relay_url: str | None = None,
         cleanup_timeout_s: float | None = None, app_binary: str | None = None,
         context_tier: str = "64k-full", report_only: bool = False,
-        external_prompt: str | None = None, external_manifest: dict[str, Any] | None = None,
+        external_prompt: str | None = None, external_manifest: Any | None = None,
         subprocess_run: Callable[..., Any] | None = None, cancellation_validation: bool = False,
         prefill_cancel_tokens: int | None = None, prefill_cancel_fraction: float | None = None,
         generation_cancel_tokens: int = 1, observation_window_s: float = 0.5,
@@ -1324,13 +1337,17 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
         return {"pass": False, "runtime_contract_pass": False,
             "code": "fixture_context_incompatible", "fixture_tokens": manifest["actual_tokens"],
             "prompt_budget_tokens": prompt_budget, "context_tier": context_tier}
-    runner_budget_s = PACKAGED_SETUP_BUDGET_S + float(timeout_s) + PACKAGED_FINALIZATION_BUDGET_S
+    cancellation_budget_s = (packaged_cancellation_budget_s(float(timeout_s),
+        float(observation_window_s), float(recovery_timeout_s)) if cancellation_validation else 0.0)
+    runner_budget_s = (PACKAGED_SETUP_BUDGET_S + float(timeout_s)
+        + PACKAGED_FINALIZATION_BUDGET_S + cancellation_budget_s)
     overall_budget_s = runner_budget_s + float(cleanup_timeout_s)
     request = {"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest,
         "model": str(model_path), "backend": backend, "relay_url": relay_url,
         "context_tier": context_tier, "request_timeout_s": timeout_s,
         "cleanup_timeout_s": cleanup_timeout_s, "setup_timeout_s": PACKAGED_SETUP_BUDGET_S,
         "finalization_timeout_s": PACKAGED_FINALIZATION_BUDGET_S,
+        "cancellation_timeout_s": cancellation_budget_s,
         "phase_status_version": PACKAGED_PHASE_STATUS_VERSION,
         "phase_status_phases": list(PACKAGED_PHASES),
         "cancellation_validation": cancellation_validation,
@@ -1372,6 +1389,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
                 "request_timeout_s": float(timeout_s),
                 "setup_timeout_s": PACKAGED_SETUP_BUDGET_S,
                 "finalization_timeout_s": PACKAGED_FINALIZATION_BUDGET_S,
+                "cancellation_timeout_s": cancellation_budget_s,
                 "cleanup_timeout_s": float(cleanup_timeout_s),
                 "runner_timeout_s": runner_budget_s, "overall_timeout_s": overall_budget_s,
                 "elapsed_s": elapsed_s,
@@ -1588,7 +1606,12 @@ def main(argv: list[str] | None = None) -> int:
                 or not 0 < args.cancellation_recovery_timeout <= 300):
             p.error("cancellation validation requires one bounded prefill trigger and bounded timeouts")
         external_prompt = _read_bounded_text(args.prompt) if args.prompt else None
-        external_manifest = json.loads(_read_bounded_text(args.manifest, 1024 * 1024)) if args.manifest else None
+        try:
+            external_manifest = (json.loads(_read_bounded_text(args.manifest, 1024 * 1024))
+                if args.manifest else None)
+        except json.JSONDecodeError:
+            # Preserve the adapter's stable categorical fail-closed report path.
+            external_manifest = []
         if external_manifest is None:
             _validated_prompt, validated_manifest = generate_fixture(args.fixture, scenario=args.scenario)
         else:
@@ -1599,7 +1622,9 @@ def main(argv: list[str] | None = None) -> int:
         except (TypeError, ValueError):
             pass
         else:
-            validated_fixture_sha256 = validated_manifest["fixture_sha256"]
+            if (validated_manifest["fixture_id"] == args.fixture
+                    and validated_manifest["scenario"] == args.scenario):
+                validated_fixture_sha256 = validated_manifest["fixture_sha256"]
         completed: list[dict[str, Any]] = []
         evidence: dict[str, Any] = {"pass": False, "code": "packaged_contract_failed"}
         settings: dict[str, Any] | None = None
@@ -1669,7 +1694,7 @@ def main(argv: list[str] | None = None) -> int:
                 "fixture":{"id":args.fixture, "version":FIXTURE_VERSION, "scenario":args.scenario,
                     "sha256":validated_fixture_sha256}}
             for key in ("last_safe_phase", "request_timeout_s", "setup_timeout_s",
-                    "finalization_timeout_s", "cleanup_timeout_s", "runner_timeout_s",
+                    "finalization_timeout_s", "cancellation_timeout_s", "cleanup_timeout_s", "runner_timeout_s",
                     "overall_timeout_s", "elapsed_s", "cleanup_succeeded"):
                 if key in evidence:
                     report[key] = evidence[key]

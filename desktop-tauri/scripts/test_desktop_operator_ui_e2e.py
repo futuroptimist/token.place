@@ -819,17 +819,22 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     browser: webdriver.Chrome | None = None
     cleanup_ok = True
     try:
+        setup_remaining()
         process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
             stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
         memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
         wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log,
             min(90, setup_remaining()))
         write_phase("webdriver_ready")
+        setup_remaining()
         driver = start_driver(app_binary.resolve(strict=True))
         wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
         write_phase("desktop_ready")
+        setup_remaining()
         fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
+        setup_remaining()
         fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
+        setup_remaining()
         mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
         compute_mode = benchmark_operator_mode(request["backend"])
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", mode, compute_mode)
@@ -837,6 +842,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", tier, request["context_tier"])
         wait_for_start_operator_enabled(driver, driver_log, driver_log,
             timeout_seconds=setup_remaining())
+        setup_remaining()
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
         wait_for_running_stability(driver, "yes", stable_seconds=3,
             timeout_seconds=setup_remaining())
@@ -855,17 +861,23 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         if runtime["Backend selected"].lower() != request["backend"] or runtime["Backend used"].lower() != request["backend"]:
             raise RuntimeError("packaged backend attestation failed")
 
+        setup_remaining()
         browser = start_landing_driver()
+        browser.set_page_load_timeout(setup_remaining())
+        browser.set_script_timeout(setup_remaining())
         browser.get(request["relay_url"])
-        wait = WebDriverWait(browser, setup_remaining(), poll_frequency=0.05)
-        wait.until(lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
+        WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
+            lambda d: d.execute_script("return Boolean(document.querySelector('#app').__vue__)"))
+        setup_remaining()
         selected_tier = apply_benchmark_context_tier(browser, request["context_tier"])
         if selected_tier != request["context_tier"]:
             raise RuntimeError("landing context selection failed")
-        wait.until(lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
+        WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(
+            lambda d: d.find_element(By.CSS_SELECTOR, ".send-button").is_enabled())
         write_phase("landing_page_ready")
         if not memory_sampler.sample():
             raise RuntimeError("memory_sample_unavailable")
+        browser.set_script_timeout(setup_remaining())
         browser.execute_script("""
             const v = document.querySelector('#app').__vue__;
             const original = v.encrypt.bind(v);
@@ -891,10 +903,13 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 return original(plaintext, ...args);
             };
         """)
+        setup_remaining()
         field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+        setup_remaining()
         field.send_keys(request["prompt"])
-        started = time.monotonic()
+        setup_remaining()
         write_phase("request_active")
+        started = time.monotonic()
         browser.find_element(By.CSS_SELECTOR, ".send-button").click()
         progress: list[dict[str, object]] = []
         while time.monotonic() - started < float(request["request_timeout_s"]):
@@ -914,10 +929,17 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         else:
             raise RuntimeError("packaged request timeout")
         ended = time.monotonic()
+        finalization_deadline = ended + float(request["finalization_timeout_s"])
+        def finalization_remaining() -> float:
+            remaining = finalization_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("packaged evidence finalization timeout")
+            return remaining
         write_phase("response_received")
-        finalization_deadline = time.monotonic() + float(request["finalization_timeout_s"])
+        finalization_remaining()
         if not progress or not isinstance(response_text, str):
             raise RuntimeError("required encrypted progress or response evidence missing")
+        browser.set_script_timeout(finalization_remaining())
         generation_settings = browser.execute_script(
             "return document.querySelector('#app').__vue__.__longContextBenchmarkGenerationSettings;")
         if not isinstance(generation_settings, dict):
@@ -947,7 +969,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                     "sequence": terminal_observation["sequence"] + 1,
                     "elapsed_ms": terminal_observation["elapsed_ms"] + 1}
             return None
-        post_terminal = [item for item in observe_post_terminal(post_terminal_poll) if item is not None]
+        finalization_remaining()
+        post_terminal = [item for item in observe_post_terminal(post_terminal_poll,
+            window_s=min(0.1, finalization_remaining())) if item is not None]
+        finalization_remaining()
         memory_sampler.sample()
         memory_evidence = memory_sampler.summary()
         first_generated = next((event for event in progress if int(event.get("generated_tokens", 0)) > 0), None)
@@ -959,6 +984,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         if first_generated is None or first_generating is None:
             raise RuntimeError("required timing telemetry missing")
         try:
+            finalization_remaining()
             tokenizer_observation = json.loads(tokenizer_evidence.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError("authoritative_target_depth_unavailable") from exc
@@ -970,6 +996,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         cancellation_recovery = None
         if request.get("cancellation_validation"):
             cancellation_recovery = run_long_context_cancellation_recovery(browser, driver, request)
+        finalization_remaining()
         preparing_end_s = started + float(first_prefill["elapsed_ms"]) / 1000
         prefill_end_s = started + float(first_generating["elapsed_ms"]) / 1000
         write_phase("evidence_finalization")
@@ -977,8 +1004,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         with Path(request["model"]).open("rb") as model_handle:
             for chunk in iter(lambda: model_handle.read(1024 * 1024), b""):
                 digest.update(chunk)
-                if time.monotonic() >= finalization_deadline:
-                    raise RuntimeError("packaged evidence finalization timeout")
+                finalization_remaining()
         evidence = {"app_identity": runtime["App version"], "build_identity": runtime["Build ID"],
             "runtime_identity": runtime["Runtime ID"], "bundled_runtime_identity": runtime["Bundled runtime ID"],
             "backend_requested": request["backend"],
@@ -998,24 +1024,32 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             "first_token_s": first_s, "end_s": ended, "output_tokens": progress[-1]["generated_tokens"]}
         if cancellation_recovery is not None:
             evidence["cancellation_recovery"] = cancellation_recovery
-        if time.monotonic() >= finalization_deadline:
-            raise RuntimeError("packaged evidence finalization timeout")
+        finalization_remaining()
         evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        finalization_remaining()
         os.chmod(evidence_path, 0o600)
         return 0
     finally:
-        with contextlib.suppress(Exception):
+        checkpoint_error = None
+        try:
             write_phase("cleanup")
+        except Exception as exc:
+            checkpoint_error = exc
+        cleanup_deadline = time.monotonic() + cleanup_timeout
+        def cleanup_remaining() -> float:
+            return max(0.001, cleanup_deadline - time.monotonic())
         if browser is not None:
+            with contextlib.suppress(Exception): browser.set_script_timeout(cleanup_remaining())
             with contextlib.suppress(Exception): browser.quit()
         if driver is not None:
+            with contextlib.suppress(Exception): driver.set_script_timeout(cleanup_remaining())
             with contextlib.suppress(Exception): driver.quit()
         if process is not None and process.poll() is None:
             process.terminate()
-            try: process.wait(timeout=cleanup_timeout)
+            try: process.wait(timeout=cleanup_remaining())
             except subprocess.TimeoutExpired:
                 process.kill()
-                try: process.wait(timeout=min(cleanup_timeout, 5))
+                try: process.wait(timeout=cleanup_remaining())
                 except subprocess.TimeoutExpired: cleanup_ok = False
         driver_log_handle.close()
         shutil.rmtree(isolated_home, ignore_errors=True)
@@ -1023,6 +1057,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         driver_log.unlink(missing_ok=True)
         if not cleanup_ok:
             raise RuntimeError("owned process cleanup failed")
+        if checkpoint_error is not None:
+            raise RuntimeError("cleanup phase checkpoint failed") from checkpoint_error
 
 
 def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float) -> tuple[bool, float]:

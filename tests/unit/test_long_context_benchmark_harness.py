@@ -1243,6 +1243,27 @@ def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
     assert observed["request"]["request_timeout_s"] == 600
     assert observed["request"]["setup_timeout_s"] == h.PACKAGED_SETUP_BUDGET_S
     assert observed["request"]["finalization_timeout_s"] == h.PACKAGED_FINALIZATION_BUDGET_S
+    assert observed["request"]["cancellation_timeout_s"] == 0
+
+
+def test_cancellation_budget_is_named_additive_and_bounded(tmp_path):
+    model = tmp_path / "model.gguf"; model.write_bytes(b"x")
+    app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
+    observed = {}
+    def fake_run(command, **kwargs):
+        observed["timeout"] = kwargs["timeout"]
+        request_path = command[command.index("--benchmark-request") + 1]
+        observed["request"] = json.loads(h.Path(request_path).read_text())
+        return subprocess.CompletedProcess(command, 1)
+    h.invoke_packaged_runtime_adapter(timeout_s=10, app_binary=str(app), model=str(model),
+        backend="cuda", relay_url="https://relay.example", cleanup_timeout_s=3,
+        cancellation_validation=True, prefill_cancel_fraction=0.5,
+        observation_window_s=2, recovery_timeout_s=4, subprocess_run=fake_run)
+    cancellation = h.packaged_cancellation_budget_s(10, 2, 4)
+    assert cancellation == 44
+    assert observed["request"]["cancellation_timeout_s"] == cancellation
+    assert observed["timeout"] == (h.PACKAGED_SETUP_BUDGET_S + 10
+        + h.PACKAGED_FINALIZATION_BUDGET_S + cancellation)
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), "1"])
@@ -1446,7 +1467,7 @@ def test_owned_runner_windows_never_invokes_injected_killpg(cleanup_outcome):
         if cleanup_outcome == "timeout":
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         return subprocess.CompletedProcess(command, 1)
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
         h._run_owned_runner(["runner"], 1, 2,
             popen=lambda command, **kwargs: launched.update(kwargs) or process,
             cleanup_run=cleanup_run,
@@ -1454,7 +1475,8 @@ def test_owned_runner_windows_never_invokes_injected_killpg(cleanup_outcome):
             platform_name="nt")
     assert launched["creationflags"] == getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
     assert cleanup[0][0] == ["taskkill", "/PID", "731", "/T", "/F"]
-    assert process.killed is (cleanup_outcome == "timeout")
+    assert process.killed is True
+    assert raised.value.cleanup_succeeded is False
 
 
 def test_owned_runner_windows_never_resolves_os_killpg(monkeypatch):
@@ -1673,6 +1695,7 @@ def test_not_run_timeout_report_retains_validated_fixture_sha_and_safe_diagnosti
         "code": "packaged_runner_timeout", "last_safe_phase": "request_active",
         "request_timeout_s": 600.0, "setup_timeout_s": h.PACKAGED_SETUP_BUDGET_S,
         "finalization_timeout_s": h.PACKAGED_FINALIZATION_BUDGET_S,
+        "cancellation_timeout_s": 0.0,
         "cleanup_timeout_s": 30.0,
         "runner_timeout_s": h.PACKAGED_SETUP_BUDGET_S + 600 + h.PACKAGED_FINALIZATION_BUDGET_S,
         "overall_timeout_s": h.PACKAGED_SETUP_BUDGET_S + 600
@@ -1703,6 +1726,20 @@ def test_not_run_invalid_external_manifest_uses_safe_fixture_sha(tmp_path, monke
     report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
     assert report["status"] == "not_run"
     assert report["code"] == "manifest_missing_fields"
+    assert report["fixture"]["sha256"] == "unavailable"
+
+
+@pytest.mark.parametrize("manifest_value", ["not-json", "[]"])
+def test_not_run_malformed_external_manifest_is_categorical(tmp_path, manifest_value, monkeypatch):
+    prompt = tmp_path / "prompt.txt"; prompt.write_text("external prompt", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"; manifest.write_text(manifest_value, encoding="utf-8")
+    monkeypatch.setattr(h, "invoke_packaged_runtime_adapter", lambda **_kwargs: {
+        "pass": False, "runtime_contract_pass": False, "code": "manifest_not_object"})
+    assert h.main(_packaged_main_args(tmp_path, "--prompt", str(prompt),
+        "--manifest", str(manifest), "--report-only")) == 1
+    report = json.loads((tmp_path / "long_context_benchmark_report.json").read_text())
+    assert report["status"] == "not_run"
+    assert report["code"] == "manifest_not_object"
     assert report["fixture"]["sha256"] == "unavailable"
 
 

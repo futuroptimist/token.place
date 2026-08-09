@@ -123,6 +123,32 @@ def test_phase_checkpoint_temp_cleanup_reuses_publication_deadline(
     assert now[0] == pytest.approx(0.03)
 
 
+@pytest.mark.parametrize("sharing_denials", [0, 1])
+def test_phase_checkpoint_temp_cleanup_rejects_unrelated_errors_after_bounded_retry(
+        desktop_runner, monkeypatch, tmp_path, sharing_denials):
+    destination = tmp_path / "phase.json"
+    now = [0.0]
+    monkeypatch.setattr(Path, "replace", lambda *_args: (_ for _ in ()).throw(
+        PermissionError("publication denied")))
+    original_unlink = Path.unlink
+    attempts = []
+
+    def unlink(path, *args, **kwargs):
+        if path.name.startswith(f".{destination.name}."):
+            attempts.append(True)
+            if len(attempts) <= sharing_denials:
+                raise _sharing_violation()
+            raise PermissionError("cleanup denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(PermissionError, match="cleanup denied"):
+        _phase_write(desktop_runner, destination, clock=lambda: now[0],
+            sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
+    assert len(attempts) == sharing_denials + 1
+    assert now[0] == pytest.approx(0.01 * sharing_denials)
+
+
 def test_owned_file_removal_retries_sharing_denial_without_real_sleep(
         desktop_runner, monkeypatch, tmp_path):
     path = tmp_path / "driver.log"
@@ -157,6 +183,18 @@ def test_owned_file_removal_permanent_lock_is_bounded(desktop_runner, monkeypatc
     assert len(attempts) == 3
 
 
+def test_owned_directory_removal_handles_absence_but_not_unrelated_denial(
+        desktop_runner, monkeypatch, tmp_path):
+    missing = tmp_path / "missing"
+    assert desktop_runner._remove_owned_path(missing, 1.0, directory=True,
+        clock=lambda: 0.0, sleeper=lambda _delay: pytest.fail("slept")) is True
+    monkeypatch.setattr(desktop_runner.shutil, "rmtree", lambda _path: (_ for _ in ()).throw(
+        PermissionError("unrelated denial")))
+    with pytest.raises(PermissionError, match="unrelated denial"):
+        desktop_runner._remove_owned_path(missing, 1.0, directory=True,
+            clock=lambda: 0.0, sleeper=lambda _delay: pytest.fail("slept"))
+
+
 def test_webdriver_quit_is_attempted_after_timeout_configuration_failure(desktop_runner):
     calls = []
     class Session:
@@ -169,6 +207,12 @@ def test_webdriver_quit_is_attempted_after_timeout_configuration_failure(desktop
 
     assert desktop_runner._quit_webdriver(Session(), 2.5) is False
     assert calls == [("timeout", 2.5), ("quit",)]
+
+
+def test_webdriver_quit_failure_is_reported(desktop_runner):
+    session = SimpleNamespace(set_script_timeout=lambda _timeout: None,
+        quit=lambda: (_ for _ in ()).throw(RuntimeError("disconnected")))
+    assert desktop_runner._quit_webdriver(session, 2.5) is False
 
 
 def test_phase_reader_treats_sharing_denial_and_partial_json_as_retryable(monkeypatch, tmp_path):
@@ -190,6 +234,13 @@ def test_phase_reader_treats_sharing_denial_and_partial_json_as_retryable(monkey
     assert h._read_packaged_phase_status(path, 1.0) == (
         None, "packaged_phase_status_missing")
     assert h._read_packaged_phase_status(path, 1.0) == (valid, None)
+
+
+def test_phase_reader_does_not_hide_unrelated_io_errors(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "read_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        PermissionError("unrelated denial")))
+    with pytest.raises(PermissionError, match="unrelated denial"):
+        h._read_packaged_phase_status(tmp_path / "phase.json", 1.0)
 
 def _memory_evidence(*, baseline=100, peak=300, final=200, samples=3, platform="linux"):
     return {"method": h.MEMORY_METHOD, "scope": h.MEMORY_SCOPE, "platform": platform,
@@ -2064,6 +2115,42 @@ def test_cleanup_owned_process_tree_faults_are_non_raising_failures(
     parent = SimpleNamespace(pid=731, wait=parent_wait)
     assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 5.0) is False
     assert "parent-wait" in events
+
+
+def test_cleanup_owned_process_tree_treats_missing_root_as_already_gone(
+        desktop_runner, monkeypatch):
+    monkeypatch.setattr(desktop_runner.psutil, "Process", lambda _pid: (_ for _ in ()).throw(
+        desktop_runner.psutil.NoSuchProcess(731)))
+    parent = SimpleNamespace(pid=731, wait=lambda timeout: None)
+    assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 5.0) is True
+
+
+def test_cleanup_owned_process_tree_deadline_exhaustion_is_non_raising(
+        desktop_runner, monkeypatch):
+    child = _CleanupProcess("child", [])
+    root = _CleanupProcess("root", [])
+    root.children = lambda recursive: [child]
+    monkeypatch.setattr(desktop_runner.psutil, "Process", lambda _pid: root)
+    parent = SimpleNamespace(pid=731, wait=lambda timeout: pytest.fail("waited"))
+    assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 0.0) is False
+
+
+def test_cleanup_owned_process_tree_ignores_racing_process_exits(
+        desktop_runner, monkeypatch):
+    class ExitedProcess:
+        def terminate(self):
+            raise desktop_runner.psutil.NoSuchProcess(732)
+
+        def kill(self):
+            raise desktop_runner.psutil.NoSuchProcess(732)
+
+    child = ExitedProcess()
+    root = SimpleNamespace(children=lambda recursive: [child], terminate=lambda: None)
+    monkeypatch.setattr(desktop_runner.psutil, "Process", lambda _pid: root)
+    monkeypatch.setattr(desktop_runner.psutil, "wait_procs",
+        lambda processes, timeout: ([], [child]))
+    parent = SimpleNamespace(pid=731, wait=lambda timeout: None)
+    assert desktop_runner._cleanup_owned_process_tree(parent, lambda: 5.0) is False
 
 
 @pytest.mark.parametrize("reason", [

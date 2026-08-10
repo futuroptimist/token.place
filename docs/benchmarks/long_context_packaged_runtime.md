@@ -226,8 +226,10 @@ runner applies five separate allowances:
   the ordinary message input before checking final Send eligibility;
 - **inference request: `--request-timeout` seconds**, beginning immediately before the send-button
   click that submits the request, so setup cannot consume inference time;
-- **evidence finalization: 120 seconds** for bounded telemetry/tokenizer collection, model
-  fingerprinting, and the atomic evidence write; and
+- **evidence finalization: 120 seconds per window**: one window snapshots generation settings,
+  post-terminal observations, tokenizer/KV evidence, and primary-trial memory before cancellation;
+  when cancellation validation is enabled, a fresh 120-second window after cancellation covers
+  model fingerprinting and the atomic evidence write; and
 - **cancellation validation: zero when disabled, otherwise
   `2 × request timeout + 2 × observation window + 8 × recovery timeout` seconds** for the two
   progress-trigger waits, two quiescence windows, two asynchronous acknowledgements, two scenario
@@ -235,22 +237,25 @@ runner applies five separate allowances:
 - **cleanup: `--cleanup-timeout` seconds**, reserved for the exact process tree owned by the trial.
 
 The parent watchdog is finite and uses the explicit equation
-`300 + request timeout + 120 + cancellation validation` seconds
+`300 + request timeout + 120` seconds when cancellation validation is disabled, or
+`300 + request timeout + 120 + cancellation validation + 120` seconds when it is enabled,
 for child execution, followed by at most the configured cleanup budget. Thus the complete overall
-allowance is `setup + request + finalization + cancellation validation + cleanup`; it is neither
-an undocumented multiplier nor an unbounded wait. Cancellation validation retains its existing
-bounded waits and CLI controls; the named additive budget does not change cancellation semantics or
-add a required argument. Pre-request WebDriver and readiness waits draw only from the shared setup
-deadline, not from the request timeout. When cancellation validation is enabled, finalization begins
-immediately after cancellation validation finishes; otherwise it begins immediately after the
-primary response. Every later telemetry, polling, tokenizer, hashing, and evidence-write operation
-uses its complete allowance.
+allowance is `setup + request + finalization + cleanup` without cancellation, or `setup + request +
+pre-cancellation finalization + cancellation validation + post-cancellation finalization + cleanup`
+with it; neither equation contains an undocumented multiplier or an unbounded wait. Cancellation
+validation retains its existing bounded waits and CLI controls; the named additive budget does not
+change cancellation semantics or add a required argument. Pre-request WebDriver and readiness waits
+draw only from the shared setup deadline, not from the request timeout. Primary-evidence finalization
+begins immediately after the primary response. Cancellation then receives its independent complete
+allowance, followed by a fresh complete finalization window. Without cancellation, the initial
+finalization window covers the remaining work.
 
 An owner-only phase file is atomically replaced at allowlisted boundaries (`runner_startup`,
 `webdriver_ready`, `desktop_ready`, `operator_ready`, `landing_page_ready`, `request_active`,
 `response_received`, `cancellation_validation`, `evidence_finalization`, and `cleanup`). Cancellation
-uses one finite deadline, and the complete evidence-finalization allowance starts only after it
-finishes (or after the primary response when cancellation is disabled). A child that reaches
+uses one finite deadline, while primary evidence is captured within the pre-cancellation
+finalization deadline. A fresh evidence-finalization allowance starts after cancellation finishes;
+when cancellation is disabled, only the initial finalization deadline applies. A child that reaches
 `cleanup` within the work deadline may use the one reserved cleanup window; child cleanup and
 parent-enforced exact-tree teardown share that window and cannot add a second allowance. If the
 parent watchdog expires, the

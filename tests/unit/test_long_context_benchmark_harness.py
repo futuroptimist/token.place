@@ -1826,7 +1826,8 @@ def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
         model=str(model), backend="cuda", relay_url="https://relay.example",
         cleanup_timeout_s=30, subprocess_run=fake_run)
     assert result["code"] == "packaged_runner_failed"
-    work_budget = h.PACKAGED_SETUP_BUDGET_S + 600 + h.PACKAGED_FINALIZATION_BUDGET_S
+    work_budget = (h.PACKAGED_SETUP_BUDGET_S + 600
+        + h.packaged_finalization_budget_s(False))
     assert observed["timeout"] == work_budget + 30
     assert observed["request"]["phase_status_version"] == h.PACKAGED_PHASE_STATUS_VERSION
     assert observed["request"]["phase_status_phases"] == list(h.PACKAGED_PHASES)
@@ -1853,7 +1854,12 @@ def test_cancellation_budget_is_named_additive_and_bounded(tmp_path):
     assert cancellation == 56
     assert observed["request"]["cancellation_timeout_s"] == cancellation
     assert observed["timeout"] == (h.PACKAGED_SETUP_BUDGET_S + 10
-        + h.PACKAGED_FINALIZATION_BUDGET_S + cancellation + 3)
+        + h.packaged_finalization_budget_s(True) + cancellation + 3)
+
+
+def test_parent_watchdog_accounts_for_each_finalization_window():
+    assert h.packaged_finalization_budget_s(False) == h.PACKAGED_FINALIZATION_BUDGET_S
+    assert h.packaged_finalization_budget_s(True) == 2 * h.PACKAGED_FINALIZATION_BUDGET_S
 
 
 def test_cancellation_budget_enumerates_every_bounded_operation():

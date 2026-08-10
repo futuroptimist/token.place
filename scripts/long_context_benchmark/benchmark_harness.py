@@ -239,6 +239,12 @@ def packaged_cancellation_budget_s(request_timeout_s: float, observation_window_
     return 2 * request_timeout_s + 2 * observation_window_s + 8 * recovery_timeout_s
 
 
+def packaged_finalization_budget_s(cancellation_validation: bool) -> float:
+    """Return the parent budget for the child's bounded finalization windows."""
+    window_count = 2 if cancellation_validation else 1
+    return window_count * PACKAGED_FINALIZATION_BUDGET_S
+
+
 def packaged_phase_remaining(deadline: float, timeout_message: str, *,
         clock: Callable[[], float] = time.monotonic, cap: float | None = None) -> float:
     """Return one phase's remaining allowance, failing closed at its deadline."""
@@ -1646,7 +1652,7 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     cancellation_budget_s = (packaged_cancellation_budget_s(float(timeout_s),
         float(observation_window_s), float(recovery_timeout_s)) if cancellation_validation else 0.0)
     runner_budget_s = (PACKAGED_SETUP_BUDGET_S + float(timeout_s)
-        + PACKAGED_FINALIZATION_BUDGET_S + cancellation_budget_s)
+        + packaged_finalization_budget_s(cancellation_validation) + cancellation_budget_s)
     overall_budget_s = runner_budget_s + float(cleanup_timeout_s)
     request = {"fixture_id": fixture_id, "prompt": prompt, "manifest": manifest,
         "model": str(model_path), "backend": backend, "relay_url": relay_url,

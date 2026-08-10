@@ -158,6 +158,8 @@ def validate_authoritative_local_telemetry(value: Any, *, completed: bool = True
         if (cached > processed or (current_total and processed > current_total)
                 or processed < last_processed or cached < last_cached or generated < last_generated):
             raise ValueError("local_timing_record_malformed")
+        if phase in {"preparing", "prefill"} and generated != 0:
+            raise ValueError("local_timing_record_malformed")
         last_sequence, last_elapsed, last_phase = sequence, elapsed, PHASES[phase]
         last_processed, last_cached, last_generated = processed, cached, generated
         phases.append(phase)

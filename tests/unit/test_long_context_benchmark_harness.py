@@ -1,4 +1,5 @@
 import ast
+import copy
 import json
 import os
 import signal
@@ -1241,7 +1242,7 @@ def test_report_redacts_authorization_and_message_like_payloads(tmp_path):
     assert data["adapter"]["safe"] == "<redacted>"
 
 
-def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path):
+def test_packaged_runtime_response_usage_and_authoritative_evidence_validation(tmp_path):
     prompt, manifest = h.generate_fixture("small-8k")
     authoritative_total = manifest["actual_tokens"] + 17
     authoritative_offsets = {key: round(value["actual_ratio"] * authoritative_total)
@@ -1331,6 +1332,42 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
     assert not h.Path(seen["command"][seen["command"].index("--benchmark-request") + 1]).exists()
     assert not h.Path(seen["command"][seen["command"].index("--benchmark-evidence") + 1]).exists()
 
+    def invoke_with_payload_change(key, value):
+        original = payload.get(key)
+        had_key = key in payload
+        if value is missing:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+        try:
+            return h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app),
+                model=str(model), backend="metal", relay_url="https://relay.example",
+                cleanup_timeout_s=3.0, external_prompt=prompt, external_manifest=manifest,
+                subprocess_run=fake_run, cancellation_validation=True,
+                prefill_cancel_fraction=0.5, generation_cancel_tokens=8,
+                observation_window_s=0.5, recovery_timeout_s=3)
+        finally:
+            if had_key:
+                payload[key] = original
+            else:
+                payload.pop(key, None)
+
+    missing = object()
+    for local_telemetry in (None, {}):
+        assert invoke_with_payload_change("local_telemetry", local_telemetry)["code"] == \
+            "authoritative_local_progress_missing"
+    for response_metadata in (missing, None, {}):
+        assert invoke_with_payload_change("response_metadata", response_metadata)["code"] == \
+            "response_usage_missing_or_inconsistent"
+    zero_usage = {**payload["response_metadata"], "completion_tokens": 0}
+    assert invoke_with_payload_change("response_metadata", zero_usage)["code"] == \
+        "response_usage_missing_or_inconsistent"
+    for duration in (float("nan"), float("inf"), True):
+        local_telemetry = copy.deepcopy(payload["local_telemetry"])
+        local_telemetry["inference_complete"][0]["inference_duration_seconds"] = duration
+        assert invoke_with_payload_change("local_telemetry", local_telemetry)["code"] == \
+            "local_timing_record_malformed"
+
     payload["response_metadata"]["prompt_tokens"] += 1
     disagreement = h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app),
         model=str(model), backend="metal", relay_url="https://relay.example",
@@ -1409,6 +1446,14 @@ def test_authoritative_local_telemetry_fails_closed(mutate, reason):
     value = _local_telemetry()
     mutate(value)
     with pytest.raises(ValueError, match=reason):
+        h.validate_authoritative_local_telemetry(value)
+
+
+@pytest.mark.parametrize("phase_index", [0, 1], ids=["preparing", "prefill"])
+def test_authoritative_local_telemetry_rejects_generated_tokens_before_generation(phase_index):
+    value = _local_telemetry()
+    value["progress_events"][phase_index]["generated_tokens"] = 1
+    with pytest.raises(ValueError, match="local_timing_record_malformed"):
         h.validate_authoritative_local_telemetry(value)
 
 

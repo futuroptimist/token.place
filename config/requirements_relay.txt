@@ -11,7 +11,7 @@ requests==2.32.5
 
 # Shared with the API stack (relay imports api/, encrypt.py, and utils/)
 blinker==1.9.0
-certifi==2025.7.14
+certifi==2026.7.22
 charset-normalizer==3.4.3
 click==8.1.8
 cryptography==46.0.1

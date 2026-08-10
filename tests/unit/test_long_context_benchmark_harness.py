@@ -1,4 +1,5 @@
 import ast
+import copy
 import json
 import os
 import signal
@@ -22,7 +23,8 @@ def desktop_runner():
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
         "_populate_and_submit_packaged_prompt", "_is_windows_sharing_violation", "_write_benchmark_phase",
-        "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver"}
+        "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver",
+        "_read_primary_tokenizer_observation"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ModuleType("desktop_runner_under_test")
@@ -768,9 +770,9 @@ def test_progress_invariants_success_and_failures():
 
 def test_phase_timing_throughput():
     m = h.summarize_metrics(start_s=0, preparing_end_s=1, prefill_end_s=3,
-        first_token_s=3, end_s=6, prompt_tokens=100, output_tokens=6, request_budget_s=10)
+        first_token_s=3, inference_duration_s=6, request_duration_s=6, prompt_tokens=100, output_tokens=6, request_budget_s=10)
     assert m["prompt_tokens_per_s"] == 50
-    assert m["decode_tokens_per_s"] == 2
+    assert "decode_tokens_per_s" not in m
 
 
 def test_kv_compare_boundaries_and_fallback():
@@ -1020,10 +1022,10 @@ def test_manifest_scoring_rules_match_score_keys():
 
 def test_phase_timing_allows_zero_first_token():
     m = h.summarize_metrics(start_s=0.0, preparing_end_s=0.0, prefill_end_s=0.0,
-        first_token_s=0.0, end_s=5.0, prompt_tokens=100, output_tokens=6, request_budget_s=5.0)
+        first_token_s=0.0, inference_duration_s=5.0, request_duration_s=5.0, prompt_tokens=100, output_tokens=6, request_budget_s=5.0)
     assert m["prefill_duration_s"] == 0.0
-    assert m["decode_duration_s"] == 5.0
-    assert m["decode_tokens_per_s"] == 1.2
+    assert m["local_inference_duration_s"] == 5.0
+    assert "decode_duration_s" not in m
 
 
 def _completed_lifecycle():
@@ -1108,23 +1110,28 @@ def test_missing_prefill_cannot_become_zero_duration_passing_metrics():
 
 
 @pytest.mark.parametrize(("change", "code"), [
-    ({"end_s": float("nan")}, "timing_non_finite"),
+    ({"request_duration_s": float("nan")}, "timing_non_finite"),
     ({"prefill_end_s": 3, "first_token_s": 2}, "timing_order_invalid"),
-    ({"end_s": 11}, "request_budget_exceeded"),
+    ({"request_duration_s": 11}, "request_budget_exceeded"),
 ])
 def test_timing_fails_closed(change, code):
     values = dict(start_s=0, preparing_end_s=1, prefill_end_s=2, first_token_s=2,
-        end_s=5, prompt_tokens=100, output_tokens=6, request_budget_s=10)
+        inference_duration_s=5, request_duration_s=5, prompt_tokens=100, output_tokens=6, request_budget_s=10)
     assert h.summarize_metrics(**{**values, **change})["code"] == code
 
 
 def test_timing_reports_every_duration_throughput_budget_and_margin():
     metrics = h.summarize_metrics(start_s=1, preparing_end_s=2, prefill_end_s=4,
-        first_token_s=5, end_s=8, prompt_tokens=100, output_tokens=6, request_budget_s=10)
+        first_token_s=5, inference_duration_s=8, request_duration_s=7, prompt_tokens=100, output_tokens=6, request_budget_s=10)
     assert metrics == {"pass":True, "preparing_duration_s":1, "prefill_duration_s":2,
-        "time_to_first_token_s":4, "decode_duration_s":3, "total_duration_s":7,
+        "time_to_first_token_s":4, "local_inference_duration_s":8,
+        "end_to_end_request_duration_s":7,
         "prompt_tokens":100, "output_tokens":6, "prompt_tokens_per_s":50,
-        "decode_tokens_per_s":2, "request_budget_s":10, "completion_margin_s":3}
+        "request_budget_s":10, "completion_margin_s":3,
+        "phase_timing_source":"worker_progress_elapsed_ms",
+        "inference_timing_source":"parent_inference_monotonic",
+        "request_timing_source":"runner_end_to_end_monotonic",
+        "completion_token_source":"validated_response_usage"}
 
 
 def test_invalid_report_preserves_existing_atomic_destination(tmp_path):
@@ -1184,6 +1191,31 @@ def test_owned_process_tree_memory_aggregation_handles_descendant_churn():
     assert sampler.summary() == _memory_evidence(baseline=140, peak=200, final=80)
 
 
+def test_primary_memory_evidence_snapshot_survives_recovery_activity():
+    class Process:
+        def __init__(self, rss):
+            self.rss = rss
+        def children(self, recursive=False):
+            assert recursive is True
+            return []
+        def memory_info(self):
+            return type("Memory", (), {"rss": self.rss})()
+
+    processes = iter([Process(100), Process(200), Process(900)])
+    sampler = h.OwnedProcessTreeMemorySampler(
+        7, lambda _pid: next(processes), system="Linux")
+    assert sampler.sample() is True
+    assert sampler.sample() is True
+    primary_memory = sampler.summary()
+
+    # Recovery may use the same process tree, but the primary report is frozen.
+    assert sampler.sample() is True
+    assert primary_memory == _memory_evidence(
+        baseline=100, peak=200, final=200, samples=2)
+    assert sampler.summary() == _memory_evidence(
+        baseline=100, peak=900, final=900, samples=3)
+
+
 def test_owned_process_tree_memory_fails_without_valid_sample_or_platform():
     denied = lambda _pid: (_ for _ in ()).throw(h.psutil.AccessDenied(7))
     sampler = h.OwnedProcessTreeMemorySampler(7, denied, system="Linux")
@@ -1236,7 +1268,7 @@ def test_report_redacts_authorization_and_message_like_payloads(tmp_path):
     assert data["adapter"]["safe"] == "<redacted>"
 
 
-def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path):
+def test_packaged_runtime_response_usage_and_authoritative_evidence_validation(tmp_path):
     prompt, manifest = h.generate_fixture("small-8k")
     authoritative_total = manifest["actual_tokens"] + 17
     authoritative_offsets = {key: round(value["actual_ratio"] * authoritative_total)
@@ -1246,15 +1278,14 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
     payload = {
         "response_text": json.dumps(manifest["expected_answers"]),
         "progress_events": [
-            {"sequence": 1, "phase": "preparing", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": 0, "generated_tokens": 0, "elapsed_ms": 0},
-            {"sequence": 2, "phase": "prefill", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": authoritative_total, "generated_tokens": 0, "elapsed_ms": 1000},
-            {"sequence": 3, "phase": "generating", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": authoritative_total, "generated_tokens": 4, "elapsed_ms": 2000},
+            {"schema_version": 1, "sequence": 1, "phase": "preparing", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": 0, "generated_tokens": 0, "elapsed_ms": 0},
+            {"schema_version": 1, "sequence": 2, "phase": "prefill", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": authoritative_total, "generated_tokens": 0, "elapsed_ms": 1000},
+            {"schema_version": 1, "sequence": 3, "phase": "generating", "total_prompt_tokens": authoritative_total, "cached_prompt_tokens": 0, "processed_prompt_tokens": authoritative_total, "generated_tokens": 4, "elapsed_ms": 2000},
         ],
-        "result_observation": {"kind":"result", "status":"success", "sequence":4, "elapsed_ms":2001},
-        "terminal_observation": {"kind":"terminal", "state":"completed", "sequence":5, "elapsed_ms":2002},
-        "post_terminal_observations": [], "start_s": 0.0, "preparing_end_s": 0.0,
-        "prefill_end_s": 1.0, "first_token_s": 1.0, "end_s": 2.0,
-        "output_tokens": 4,
+        "post_terminal_observations": [], "atomic_response_completed": True,
+        "request_duration_s": 2.2,
+        "response_metadata": {"prompt_tokens": authoritative_total,
+            "completion_tokens": 4, "finish_reason": "stop"},
         "generation_settings": {"supplied": {"max_tokens": 1024},
             "omitted_runtime_default": ["seed", "temperature", "top_p"]},
         "messages": [{"content": "plaintext"}],
@@ -1283,6 +1314,11 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
             "unit":"MiB", "decimal_places":2},
         "cancellation_recovery": _physical_cancellation_evidence(authoritative_total),
     }
+    payload["local_telemetry"] = {"progress_events": [{key: value for key, value in event.items()
+            if key != "schema_version"} for event in payload["progress_events"]],
+        "inference_complete": [{"active_tier": "64k-full",
+            "prompt_tokens": authoritative_total, "output_reservation": 1024,
+            "inference_duration_seconds": 2.0}], "ambiguous": False, "malformed": False}
 
 
     app = tmp_path / "app"; app.write_text("app"); app.chmod(0o700)
@@ -1315,9 +1351,65 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
     assert seen["request"]["cancellation_validation"] is True
     assert result["cancellation_recovery"]["pass"] is True
     assert result["memory"] == _memory_evidence()
+    assert result["metrics"]["output_tokens"] == 4
+    assert result["metrics"]["completion_token_source"] == "validated_response_usage"
+    assert result["response_usage"] == {**payload["response_metadata"], "source": "validated_atomic_response_usage"}
     assert "messages" not in result
     assert not h.Path(seen["command"][seen["command"].index("--benchmark-request") + 1]).exists()
     assert not h.Path(seen["command"][seen["command"].index("--benchmark-evidence") + 1]).exists()
+
+    def invoke_with_payload_change(key, value):
+        original = payload.get(key)
+        had_key = key in payload
+        if value is missing:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+        try:
+            return h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app),
+                model=str(model), backend="metal", relay_url="https://relay.example",
+                cleanup_timeout_s=3.0, external_prompt=prompt, external_manifest=manifest,
+                subprocess_run=fake_run, cancellation_validation=True,
+                prefill_cancel_fraction=0.5, generation_cancel_tokens=8,
+                observation_window_s=0.5, recovery_timeout_s=3)
+        finally:
+            if had_key:
+                payload[key] = original
+            else:
+                payload.pop(key, None)
+
+    missing = object()
+    for local_telemetry in (None, {}):
+        assert invoke_with_payload_change("local_telemetry", local_telemetry)["code"] == \
+            "authoritative_local_progress_missing"
+    for response_metadata in (missing, None, {}):
+        assert invoke_with_payload_change("response_metadata", response_metadata)["code"] == \
+            "response_usage_missing_or_inconsistent"
+    zero_usage = {**payload["response_metadata"], "completion_tokens": 0}
+    assert invoke_with_payload_change("response_metadata", zero_usage)["code"] == \
+        "response_usage_missing_or_inconsistent"
+    for duration in (float("nan"), float("inf"), True):
+        local_telemetry = copy.deepcopy(payload["local_telemetry"])
+        local_telemetry["inference_complete"][0]["inference_duration_seconds"] = duration
+        assert invoke_with_payload_change("local_telemetry", local_telemetry)["code"] == \
+            "local_timing_record_malformed"
+    incompatible_settings = copy.deepcopy(payload["generation_settings"])
+    incompatible_settings["supplied"]["max_tokens"] = 2048
+    assert invoke_with_payload_change("generation_settings", incompatible_settings)["code"] == \
+        "local_telemetry_configuration_mismatch"
+    assert invoke_with_payload_change("request_duration_s", float("nan"))["code"] == \
+        "local_timing_record_malformed"
+    assert invoke_with_payload_change("atomic_response_completed", False)["code"] == \
+        "encrypted_progress_delivery_invalid"
+
+    payload["response_metadata"]["prompt_tokens"] += 1
+    disagreement = h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app),
+        model=str(model), backend="metal", relay_url="https://relay.example",
+        cleanup_timeout_s=3.0, external_prompt=prompt, external_manifest=manifest,
+        subprocess_run=fake_run, cancellation_validation=True, prefill_cancel_fraction=0.5,
+        generation_cancel_tokens=8, observation_window_s=0.5, recovery_timeout_s=3)
+    assert disagreement["code"] == "response_usage_missing_or_inconsistent"
+    payload["response_metadata"]["prompt_tokens"] -= 1
 
     payload["cancellation_recovery"]["scenarios"][0]["trigger_count"] = authoritative_total
     failed = h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app), model=str(model),
@@ -1328,6 +1420,222 @@ def test_packaged_runtime_loads_valid_external_fixture_and_cleans_files(tmp_path
         report_only=True)
     assert failed["code"] == "cancellation_trigger_missed"
     assert failed["runtime_contract_pass"] is False
+
+
+def _local_telemetry(total=100):
+    events = [
+        {"sequence": 1, "phase": "preparing", "total_prompt_tokens": 0,
+         "cached_prompt_tokens": 0, "processed_prompt_tokens": 0,
+         "generated_tokens": 0, "elapsed_ms": 0},
+        {"sequence": 2, "phase": "prefill", "total_prompt_tokens": total,
+         "cached_prompt_tokens": 0, "processed_prompt_tokens": total,
+         "generated_tokens": 0, "elapsed_ms": 900},
+        {"sequence": 3, "phase": "generating", "total_prompt_tokens": total,
+         "cached_prompt_tokens": 0, "processed_prompt_tokens": total,
+         "generated_tokens": 4, "elapsed_ms": 1000},
+    ]
+    return {"progress_events": events, "inference_complete": [{
+        "active_tier": "64k-full", "prompt_tokens": total,
+        "output_reservation": 1024, "inference_duration_seconds": 1.2}],
+        "ambiguous": False, "malformed": False}
+
+
+def test_old_app_log_parser_allowlists_windows_records_and_ignores_surrounding_text():
+    log = """2026-01-01T00:00:00Z C:\\Users\\alice\\secret.py unrelated prompt text
+[INFO] api_v1.local_progress request_id=private-id worker_generation=7 sequence=1 phase=preparing total_prompt_tokens=0 cached_prompt_tokens=0 processed_prompt_tokens=0 generated_tokens=0 elapsed_ms=0
+[INFO] api_v1.local_progress request_id=private-id worker_generation=7 sequence=2 phase=prefill total_prompt_tokens=100 cached_prompt_tokens=0 processed_prompt_tokens=100 generated_tokens=0 elapsed_ms=900
+[INFO] api_v1.local_progress request_id=private-id worker_generation=7 sequence=3 phase=generating total_prompt_tokens=100 cached_prompt_tokens=0 processed_prompt_tokens=100 generated_tokens=4 elapsed_ms=1000
+[INFO] api_v1.inference_complete active_tier=64k-full prompt_tokens=100 output_reservation=1024 admission_result=admitted inference_duration_seconds=1.2 safe_error_code=none"""
+    parsed = h.parse_packaged_local_telemetry(log)
+    authoritative = h.validate_authoritative_local_telemetry(parsed)
+    rendered = json.dumps(authoritative)
+    assert authoritative["prompt_tokens"] == 100
+    assert "private-id" not in rendered and "worker_generation" not in rendered
+    assert "Users" not in rendered and "prompt text" not in rendered
+
+
+def test_local_telemetry_failure_branches_are_directly_classified():
+    malformed_completion = h.parse_packaged_local_telemetry(
+        "api_v1.inference_complete active_tier=64k-full incomplete")
+    assert malformed_completion["malformed"] is True
+
+    mutations = [
+        lambda value: value.update(malformed=True),
+        lambda value: value.update(ambiguous=True),
+        lambda value: value.update(inference_complete=[]),
+        lambda value: value["progress_events"][0].update(extra=True),
+        lambda value: value["progress_events"][0].update(sequence=-1),
+        lambda value: value["progress_events"][1].update(phase="generating"),
+        lambda value: value["progress_events"][1].update(cached_prompt_tokens=101),
+    ]
+    for mutate in mutations:
+        telemetry = _local_telemetry()
+        mutate(telemetry)
+        with pytest.raises(ValueError, match="local_timing_record_malformed"):
+            h.validate_authoritative_local_telemetry(telemetry)
+
+    telemetry = _local_telemetry()
+    for event in telemetry["progress_events"]:
+        event["phase"] = "generating"
+        event["total_prompt_tokens"] = 100
+    with pytest.raises(ValueError, match="local_prefill_phase_missing"):
+        h.validate_authoritative_local_telemetry(telemetry)
+
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
+        h.validate_encrypted_progress_delivery([], authoritative)
+
+
+def test_best_effort_prefill_only_delivery_records_terminal_overtake():
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    browser_event = {**authoritative["events"][1], "schema_version": 1, "sequence": 1}
+    delivered = h.validate_encrypted_progress_delivery(
+        [browser_event], authoritative)
+    assert delivered == {"pass": True, "best_effort": True, "progress_event_count": 1,
+        "observed_phases": ["prefill"],
+        "terminal_overtook_generating_update": True}
+
+
+@pytest.mark.parametrize(("mutate", "reason"), [
+    (lambda value: value["progress_events"].pop(), "local_generating_phase_missing"),
+    (lambda value: value["progress_events"][-1].update(generated_tokens=0),
+        "positive_generated_token_progress_missing"),
+    (lambda value: value["progress_events"][1].update(sequence=0), "local_timing_record_malformed"),
+    (lambda value: value["progress_events"][1].update(elapsed_ms=1001), "local_timing_record_malformed"),
+    (lambda value: value["progress_events"][-1].update(total_prompt_tokens=101),
+        "local_timing_record_malformed"),
+    (lambda value: [event.update(processed_prompt_tokens=99)
+        for event in value["progress_events"][1:]],
+        "local_timing_record_malformed"),
+])
+def test_authoritative_local_telemetry_fails_closed(mutate, reason):
+    value = _local_telemetry()
+    mutate(value)
+    with pytest.raises(ValueError, match=reason):
+        h.validate_authoritative_local_telemetry(value)
+
+
+@pytest.mark.parametrize("phase_index", [0, 1], ids=["preparing", "prefill"])
+def test_authoritative_local_telemetry_rejects_generated_tokens_before_generation(phase_index):
+    value = _local_telemetry()
+    value["progress_events"][phase_index]["generated_tokens"] = 1
+    with pytest.raises(ValueError, match="local_timing_record_malformed"):
+        h.validate_authoritative_local_telemetry(value)
+
+
+def test_missing_authoritative_local_progress_has_stable_reason():
+    with pytest.raises(ValueError, match="authoritative_local_progress_missing"):
+        h.validate_authoritative_local_telemetry({"progress_events": [],
+            "inference_complete": [], "ambiguous": True, "malformed": False})
+
+
+def test_zero_total_preparing_is_only_valid_as_initial_observation():
+    value = _local_telemetry()
+    value["progress_events"].insert(1, {**value["progress_events"][0], "sequence": 2,
+        "elapsed_ms": 1})
+    value["progress_events"][2]["sequence"] = 3
+    value["progress_events"][3]["sequence"] = 4
+    with pytest.raises(ValueError, match="local_timing_record_malformed"):
+        h.validate_authoritative_local_telemetry(value)
+
+
+def test_encrypted_progress_must_match_authoritative_without_replay_or_fabrication():
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    replay = [
+        {**authoritative["events"][0], "schema_version": 1, "sequence": 2},
+        {**authoritative["events"][0], "schema_version": 1, "sequence": 2},
+    ]
+    with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
+        h.validate_encrypted_progress_delivery(replay, authoritative)
+    changed = [{**authoritative["events"][1], "schema_version": 1,
+        "sequence": 1, "processed_prompt_tokens": 99}]
+    with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
+        h.validate_encrypted_progress_delivery(changed, authoritative)
+
+
+def test_encrypted_progress_accepts_first_and_later_observation_gaps():
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    delivered = [
+        {**authoritative["events"][0], "schema_version": 1, "sequence": 3},
+        {**authoritative["events"][2], "schema_version": 1, "sequence": 8},
+    ]
+    result = h.validate_encrypted_progress_delivery(delivered, authoritative)
+    assert result["pass"] is True
+    assert result["observed_phases"] == ["preparing", "generating"]
+
+
+@pytest.mark.parametrize("sequences", [(2, 2), (3, 1)])
+def test_encrypted_progress_rejects_duplicate_or_decreasing_sequences(sequences):
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    delivered = [
+        {**authoritative["events"][0], "schema_version": 1, "sequence": sequences[0]},
+        {**authoritative["events"][1], "schema_version": 1, "sequence": sequences[1]},
+    ]
+    with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
+        h.validate_encrypted_progress_delivery(delivered, authoritative)
+
+
+@pytest.mark.parametrize("schema", [None, 2, True])
+def test_encrypted_progress_rejects_invalid_schema_version(schema):
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    event = {**authoritative["events"][0], "sequence": 1}
+    if schema is not None:
+        event["schema_version"] = schema
+    with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
+        h.validate_encrypted_progress_delivery([event], authoritative)
+
+
+def test_encrypted_progress_rejects_extra_fields():
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    event = {**authoritative["events"][0], "schema_version": 1,
+        "sequence": 1, "unexpected": "field"}
+    with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
+        h.validate_encrypted_progress_delivery([event], authoritative)
+
+
+def test_encrypted_progress_matches_ordered_local_projection_after_coalescing():
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    delivered = [
+        {**authoritative["events"][2], "schema_version": 1, "sequence": 1},
+    ]
+    result = h.validate_encrypted_progress_delivery(delivered, authoritative)
+    assert result["pass"] is True
+    assert result["observed_phases"] == ["generating"]
+
+
+def test_encrypted_progress_accepts_initial_zero_preparing_and_equal_elapsed():
+    telemetry = _local_telemetry()
+    telemetry["progress_events"][1]["elapsed_ms"] = 0
+    authoritative = h.validate_authoritative_local_telemetry(telemetry)
+    delivered = [
+        {**authoritative["events"][0], "schema_version": 1, "sequence": 1},
+        {**authoritative["events"][1], "schema_version": 1, "sequence": 2},
+    ]
+    result = h.validate_encrypted_progress_delivery(delivered, authoritative)
+    assert result["observed_phases"] == ["preparing", "prefill"]
+
+
+def test_local_log_parser_rejects_partial_final_line_and_mixed_identity():
+    complete = (
+        "api_v1.local_progress request_id=one worker_generation=1 sequence=1 "
+        "phase=preparing total_prompt_tokens=0 cached_prompt_tokens=0 "
+        "processed_prompt_tokens=0 generated_tokens=0 elapsed_ms=0\n")
+    partial = "api_v1.local_progress request_id=one worker_generation=1 sequence=2 phase=prefill"
+    assert h.parse_packaged_local_telemetry(complete + partial)["malformed"] is True
+    mixed = complete + complete.replace("request_id=one", "request_id=two")
+    assert h.parse_packaged_local_telemetry(mixed)["ambiguous"] is True
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("active_tier", "8k-fast"),
+    ("output_reservation", 2048),
+])
+def test_authoritative_local_telemetry_binds_requested_configuration(field, value):
+    telemetry = _local_telemetry()
+    telemetry["inference_complete"][0][field] = value
+    with pytest.raises(ValueError, match="local_telemetry_configuration_mismatch"):
+        h.validate_authoritative_local_telemetry(telemetry,
+            expected_tier="64k-full", expected_output_reservation=1024)
 
 
 def test_packaged_runtime_external_fixture_pair_and_hash_fail_closed(tmp_path):
@@ -1366,6 +1674,44 @@ def test_authoritative_target_depth_evidence_fails_categorically(mutation, code)
     _, error = h._validate_authoritative_tokenizer_evidence(
         evidence, manifest, "bundled", manifest["actual_tokens"])
     assert error == code
+
+
+def test_primary_tokenizer_evidence_snapshot_survives_recovery_overwrite(
+        desktop_runner, tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    primary = {"runtime_identity": "bundled", "fixture_sha256": "fixture",
+        "total_prompt_tokens": 8192, "kv_applicability": "primary",
+        "kv_estimator": {"estimated_bytes": 10}, "kv_runtime": {"observed_bytes": 11}}
+    recovery = {"runtime_identity": "bundled", "fixture_sha256": "fixture",
+        "total_prompt_tokens": 1024, "kv_applicability": "recovery",
+        "kv_estimator": {"estimated_bytes": 20}, "kv_runtime": {"observed_bytes": 21}}
+    evidence_path.write_text(json.dumps(primary), encoding="utf-8")
+
+    snapshot = desktop_runner._read_primary_tokenizer_observation(
+        evidence_path, "bundled", "fixture")
+    evidence_path.write_text(json.dumps(recovery), encoding="utf-8")
+
+    assert snapshot == primary
+    assert snapshot["total_prompt_tokens"] == 8192
+    assert snapshot["kv_applicability"] == "primary"
+    assert snapshot["kv_estimator"] == {"estimated_bytes": 10}
+    assert snapshot["kv_runtime"] == {"observed_bytes": 11}
+
+
+@pytest.mark.parametrize(("contents", "runtime_identity", "expected"), [
+    (None, "bundled", "authoritative_target_depth_unavailable"),
+    ("not-json", "bundled", "authoritative_target_depth_unavailable"),
+    ('{"runtime_identity":"other","fixture_sha256":"fixture"}', "bundled",
+     "authoritative_target_depth_mismatched"),
+])
+def test_primary_tokenizer_evidence_snapshot_preserves_failure_classifications(
+        desktop_runner, tmp_path, contents, runtime_identity, expected):
+    evidence_path = tmp_path / "evidence.json"
+    if contents is not None:
+        evidence_path.write_text(contents, encoding="utf-8")
+    with pytest.raises(RuntimeError, match=expected):
+        desktop_runner._read_primary_tokenizer_observation(
+            evidence_path, runtime_identity, "fixture")
 
 
 def test_packaged_runtime_requires_physical_prerequisites():
@@ -1520,7 +1866,8 @@ def test_packaged_adapter_watchdog_is_explicit_and_cli_compatible(tmp_path):
         model=str(model), backend="cuda", relay_url="https://relay.example",
         cleanup_timeout_s=30, subprocess_run=fake_run)
     assert result["code"] == "packaged_runner_failed"
-    work_budget = h.PACKAGED_SETUP_BUDGET_S + 600 + h.PACKAGED_FINALIZATION_BUDGET_S
+    work_budget = (h.PACKAGED_SETUP_BUDGET_S + 600
+        + h.packaged_finalization_budget_s(False))
     assert observed["timeout"] == work_budget + 30
     assert observed["request"]["phase_status_version"] == h.PACKAGED_PHASE_STATUS_VERSION
     assert observed["request"]["phase_status_phases"] == list(h.PACKAGED_PHASES)
@@ -1547,7 +1894,12 @@ def test_cancellation_budget_is_named_additive_and_bounded(tmp_path):
     assert cancellation == 56
     assert observed["request"]["cancellation_timeout_s"] == cancellation
     assert observed["timeout"] == (h.PACKAGED_SETUP_BUDGET_S + 10
-        + h.PACKAGED_FINALIZATION_BUDGET_S + cancellation + 3)
+        + h.packaged_finalization_budget_s(True) + cancellation + 3)
+
+
+def test_parent_watchdog_accounts_for_each_finalization_window():
+    assert h.packaged_finalization_budget_s(False) == h.PACKAGED_FINALIZATION_BUDGET_S
+    assert h.packaged_finalization_budget_s(True) == 2 * h.PACKAGED_FINALIZATION_BUDGET_S
 
 
 def test_cancellation_budget_enumerates_every_bounded_operation():
@@ -1645,14 +1997,14 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
     app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
     response = manifest["expected_answers"] if semantic_ok else {**manifest["expected_answers"], "canary": "wrong"}
     payload = {
-        "response_text": json.dumps(response), "start_s": 0.0, "preparing_end_s": 0.0,
+        "response_text": json.dumps(response),
         "generation_settings":{"supplied":{"max_tokens":1024},
             "omitted_runtime_default":["seed", "temperature", "top_p"]},
         "memory": _memory_evidence(),
         "runtime_configuration": _runtime_configuration(),
-        "prefill_end_s": 1.0, "first_token_s": 1.0, "end_s": 2.0, "output_tokens": 4,
-        "result_observation":{"kind":"result", "status":"success", "sequence":3, "elapsed_ms":2001},
-        "terminal_observation":{"kind":"terminal", "state":"completed", "sequence":4, "elapsed_ms":2002},
+        "request_duration_s": 2.2, "atomic_response_completed": True,
+        "response_metadata": {"prompt_tokens": manifest["actual_tokens"],
+            "completion_tokens": 4, "finish_reason": "stop"},
         "post_terminal_observations":[],
         "app_identity": "token.place", "runtime_identity": "bundled",
         "bundled_runtime_identity": "bundled", "build_identity": "build",
@@ -1664,15 +2016,20 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
             "profile_id":"default", "backend":"cpu", "context_tier":"64k-full",
             "context_size_tokens":65536},
         "progress_events": [
-            {"sequence": 1, "phase": "prefill",
+            {"schema_version": 1, "sequence": 1, "phase": "prefill",
              "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0,
              "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 0,
              "elapsed_ms": 1000},
-            {"sequence": 2, "phase": "generating",
+            {"schema_version": 1, "sequence": 2, "phase": "generating",
              "total_prompt_tokens": manifest["actual_tokens"], "cached_prompt_tokens": 0,
              "processed_prompt_tokens": manifest["actual_tokens"], "generated_tokens": 4,
              "elapsed_ms": 2000}],
     }
+    payload["local_telemetry"] = {"progress_events": [{key: value for key, value in event.items()
+            if key != "schema_version"} for event in payload["progress_events"]],
+        "inference_complete": [{"active_tier": "64k-full",
+            "prompt_tokens": manifest["actual_tokens"], "output_reservation": 1024,
+            "inference_duration_seconds": 2.0}], "ambiguous": False, "malformed": False}
     def fake_run(command, **kwargs):
         h.Path(command[command.index("--benchmark-evidence") + 1]).write_text(json.dumps(payload))
         _write_phase(h.Path(command[command.index("--benchmark-phase-status") + 1]),
@@ -1760,7 +2117,8 @@ def test_packaged_multiline_prompt_uses_shift_enter_and_submits_after_exact_popu
         events.append(("phase", phase))
     started = desktop_runner._populate_and_submit_packaged_prompt(
         Browser(), prompt, lambda: 10, pytest.fail, checkpoint,
-        clock=lambda: events.append(("timer",)) or 42.0, action_factory=Actions)
+        clock=lambda: events.append(("timer",)) or 42.0, action_factory=Actions,
+        before_submit=lambda: events.append(("boundary",)))
     assert started == 42.0
     assert [event for event in events if event[0] == "text"] == [
         ("text", "line1"), ("text", "line2"), ("text", "line4")]
@@ -1769,6 +2127,7 @@ def test_packaged_multiline_prompt_uses_shift_enter_and_submits_after_exact_popu
         for event in events if event[0] == "newline")
     assert not any(event == ("text", desktop_runner.Keys.ENTER) for event in events)
     assert events.index(("population",)) < events.index(("eligibility",))
+    assert events.index(("boundary",)) < events.index(("timer",))
     assert events.index(("timer",)) + 1 == events.index(("click",))
     assert phases == ["landing_page_ready", "request_active"]
     assert events.index(("click",)) < events.index(("phase", "request_active"))
@@ -2470,11 +2829,25 @@ def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
         "fixture":{"sha256":"abc", "authoritative_prompt_tokens":10},
         "runtime":{"app_identity":"token.place", "runtime_identity":"bundled",
             "build_identity":"build", "backend_requested":"cpu", "backend_selected":"cpu", "model_fingerprint":"sha256:model", "backend_used":"cpu"},
-        "progress":{"pass":True, "progress_event_count":1},
+        "authoritative_local_progress":{"pass":True, "progress_event_count":2,
+            "observed_phases":["prefill", "generating"]},
+        "encrypted_progress":{"pass":True, "best_effort":True,
+            "progress_event_count":1, "observed_phases":["prefill"],
+            "terminal_overtook_generating_update":True},
+        "response_usage":{"prompt_tokens":10, "completion_tokens":1,
+            "finish_reason":"stop", "source":"validated_atomic_response_usage"},
+        "atomic_response_completion":{"completed":True,
+            "source":"browser_decrypted_final_response"},
+        "post_terminal_silence":{"observed":True,
+            "source":"pre_cancellation_primary_snapshot"},
         "metrics":{"pass":True, "preparing_duration_s":0, "prefill_duration_s":1,
-            "time_to_first_token_s":1, "decode_duration_s":1, "total_duration_s":2,
-            "prompt_tokens":10, "output_tokens":1, "prompt_tokens_per_s":10,
-            "decode_tokens_per_s":1, "request_budget_s":600, "completion_margin_s":598},
+            "time_to_first_token_s":1, "local_inference_duration_s":2,
+            "end_to_end_request_duration_s":2, "prompt_tokens":10, "output_tokens":1,
+            "prompt_tokens_per_s":10, "request_budget_s":600, "completion_margin_s":598,
+            "phase_timing_source":"worker_progress_elapsed_ms",
+            "inference_timing_source":"parent_inference_monotonic",
+            "request_timing_source":"runner_end_to_end_monotonic",
+            "completion_token_source":"validated_response_usage"},
         "semantic":{"semantic_pass":False, "exact_match":False, "errors":["exact_match"]},
         "generation_settings":{"supplied":{"max_tokens":1024},
             "omitted_runtime_default":["seed", "temperature", "top_p"]},
@@ -2506,11 +2879,25 @@ def _packaged_main_evidence(semantic_pass=True, *, max_tokens=1024):
         "runtime":{"app_identity":"token.place", "runtime_identity":"bundled",
             "build_identity":"build", "backend_requested":"cpu", "backend_selected":"cpu",
             "model_fingerprint":"sha256:model", "backend_used":"cpu"},
-        "progress":{"pass":True, "progress_event_count":1},
+        "authoritative_local_progress":{"pass":True, "progress_event_count":2,
+            "observed_phases":["prefill", "generating"]},
+        "encrypted_progress":{"pass":True, "best_effort":True,
+            "progress_event_count":1, "observed_phases":["prefill"],
+            "terminal_overtook_generating_update":True},
+        "response_usage":{"prompt_tokens":10, "completion_tokens":1,
+            "finish_reason":"stop", "source":"validated_atomic_response_usage"},
+        "atomic_response_completion":{"completed":True,
+            "source":"browser_decrypted_final_response"},
+        "post_terminal_silence":{"observed":True,
+            "source":"pre_cancellation_primary_snapshot"},
         "metrics":{"pass":True, "preparing_duration_s":0, "prefill_duration_s":1,
-            "time_to_first_token_s":1, "decode_duration_s":1, "total_duration_s":2,
-            "prompt_tokens":10, "output_tokens":1, "prompt_tokens_per_s":10,
-            "decode_tokens_per_s":1, "request_budget_s":600, "completion_margin_s":598},
+            "time_to_first_token_s":1, "local_inference_duration_s":2,
+            "end_to_end_request_duration_s":2, "prompt_tokens":10, "output_tokens":1,
+            "prompt_tokens_per_s":10, "request_budget_s":600, "completion_margin_s":598,
+            "phase_timing_source":"worker_progress_elapsed_ms",
+            "inference_timing_source":"parent_inference_monotonic",
+            "request_timing_source":"runner_end_to_end_monotonic",
+            "completion_token_source":"validated_response_usage"},
         "semantic":{"semantic_pass":semantic_pass, "exact_match":semantic_pass,
             "errors":[] if semantic_pass else ["exact_match", "target_selection"]},
         "generation_settings":{"supplied":{"max_tokens":max_tokens},
@@ -2548,8 +2935,100 @@ def test_production_shaped_qwen_report_validates_and_writes_atomically(tmp_path,
         "requested":"gpu", "effective":"metal"}
     assert report["kv_diagnostics"]["trials"][0]["type_k"] == "q8"
     h.validate_report(report)
+    assert report["encrypted_progress"] == {
+        "pass": True, "best_effort": True, "progress_event_count": 1,
+        "observed_phases": ["prefill"],
+        "terminal_overtook_generating_update": True}
     rewritten = h.write_report_atomic(tmp_path / "rewritten", report)
     assert json.loads(rewritten.read_text()) == report
+
+    contract_mutations = (
+        ("report_response_usage_invalid",
+            lambda item: item["response_usage"].update(completion_tokens=0)),
+        ("report_response_usage_invalid",
+            lambda item: item["response_usage"].update(prompt_tokens=11)),
+        ("report_atomic_response_invalid",
+            lambda item: item.update(atomic_response_completion={"completed": False})),
+        ("report_post_terminal_silence_invalid",
+            lambda item: item.update(post_terminal_silence={"observed": False})),
+        ("report_metrics_invalid",
+            lambda item: item["metrics"].update(request_timing_source="unknown")),
+    )
+    for reason, mutate in contract_mutations:
+        malformed = copy.deepcopy(report)
+        mutate(malformed)
+        with pytest.raises(ValueError, match=reason):
+            h.validate_report(malformed)
+
+    progress_mutations = (
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].pop("observed_phases")),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(extra=True)),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                progress_event_count=True)),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                progress_event_count=0)),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                progress_event_count=-1)),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=[])),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=["prefill", "invalid", "generating"])),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=["prefill", "prefill", "generating"])),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=["generating", "prefill"])),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=["prefill"])),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=["prefill", "generating"], progress_event_count=1)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].pop("best_effort")),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].pop(
+                "terminal_overtook_generating_update")),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(extra=True)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(best_effort=False)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(progress_event_count=True)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(progress_event_count=0)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(progress_event_count=-1)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(observed_phases=[])),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(observed_phases=["invalid"])),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(
+                observed_phases=["prefill", "prefill"])),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(
+                observed_phases=["generating", "prefill"])),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(
+                terminal_overtook_generating_update=1)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(
+                terminal_overtook_generating_update=False)),
+    )
+    for reason, mutate_progress in progress_mutations:
+        malformed = json.loads(json.dumps(report))
+        mutate_progress(malformed)
+        with pytest.raises(ValueError, match=f"^{reason}$"):
+            h.validate_report(malformed)
 
     mutations = (
         lambda item: item["runtime_configuration"]["trials"][0]["mode"].update(effective="gpu"),

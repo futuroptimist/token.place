@@ -177,7 +177,7 @@ prose and target selection even though JSON shape and canary can still pass.
 
 ## Metrics and report schema
 
-Reports use schema `long-context-benchmark-report-v1` and are written atomically as
+Reports use schema `long-context-benchmark-report-v2` and are written atomically as
 `long_context_benchmark_report.json` in the selected output directory. Reports are sanitized for GitHub issue
 attachment: prompt/response bodies, ciphertext, IVs, keys, cancellation tokens, high-cardinality
 request/client/session IDs, absolute user paths, secrets, and unbounded subprocess output are
@@ -192,7 +192,7 @@ score. A successful packaged-runtime contract requires:
 - packaged app, build, bundled runtime, and safe model-fingerprint identity;
 - requested, selected, and used backend (`cpu`, `metal`, or `cuda`);
 - context tier, context window, output reservation, authoritative prompt count, and output count;
-- the validated progress summary and ordered terminal/result evidence;
+- separately validated authoritative packaged-local progress and best-effort encrypted delivery;
 - every timing, throughput, request-budget, and completion-margin field;
 - the complete semantic score and aggregate trial count, exact-match count, and pass rate.
 - requested/completed trial counts, per-category failure counts, and bounded per-trial boolean/error
@@ -226,8 +226,10 @@ runner applies five separate allowances:
   the ordinary message input before checking final Send eligibility;
 - **inference request: `--request-timeout` seconds**, beginning immediately before the send-button
   click that submits the request, so setup cannot consume inference time;
-- **evidence finalization: 120 seconds** for bounded telemetry/tokenizer collection, model
-  fingerprinting, and the atomic evidence write; and
+- **evidence finalization: 120 seconds per window**: one window snapshots generation settings,
+  post-terminal observations, tokenizer/KV evidence, and primary-trial memory before cancellation;
+  when cancellation validation is enabled, a fresh 120-second window after cancellation covers
+  model fingerprinting and the atomic evidence write; and
 - **cancellation validation: zero when disabled, otherwise
   `2 × request timeout + 2 × observation window + 8 × recovery timeout` seconds** for the two
   progress-trigger waits, two quiescence windows, two asynchronous acknowledgements, two scenario
@@ -235,22 +237,25 @@ runner applies five separate allowances:
 - **cleanup: `--cleanup-timeout` seconds**, reserved for the exact process tree owned by the trial.
 
 The parent watchdog is finite and uses the explicit equation
-`300 + request timeout + 120 + cancellation validation` seconds
+`300 + request timeout + 120` seconds when cancellation validation is disabled, or
+`300 + request timeout + 120 + cancellation validation + 120` seconds when it is enabled,
 for child execution, followed by at most the configured cleanup budget. Thus the complete overall
-allowance is `setup + request + finalization + cancellation validation + cleanup`; it is neither
-an undocumented multiplier nor an unbounded wait. Cancellation validation retains its existing
-bounded waits and CLI controls; the named additive budget does not change cancellation semantics or
-add a required argument. Pre-request WebDriver and readiness waits draw only from the shared setup
-deadline, not from the request timeout. When cancellation validation is enabled, finalization begins
-immediately after cancellation validation finishes; otherwise it begins immediately after the
-primary response. Every later telemetry, polling, tokenizer, hashing, and evidence-write operation
-uses its complete allowance.
+allowance is `setup + request + finalization + cleanup` without cancellation, or `setup + request +
+pre-cancellation finalization + cancellation validation + post-cancellation finalization + cleanup`
+with it; neither equation contains an undocumented multiplier or an unbounded wait. Cancellation
+validation retains its existing bounded waits and CLI controls; the named additive budget does not
+change cancellation semantics or add a required argument. Pre-request WebDriver and readiness waits
+draw only from the shared setup deadline, not from the request timeout. Primary-evidence finalization
+begins immediately after the primary response. Cancellation then receives its independent complete
+allowance, followed by a fresh complete finalization window. Without cancellation, the initial
+finalization window covers the remaining work.
 
 An owner-only phase file is atomically replaced at allowlisted boundaries (`runner_startup`,
 `webdriver_ready`, `desktop_ready`, `operator_ready`, `landing_page_ready`, `request_active`,
 `response_received`, `cancellation_validation`, `evidence_finalization`, and `cleanup`). Cancellation
-uses one finite deadline, and the complete evidence-finalization allowance starts only after it
-finishes (or after the primary response when cancellation is disabled). A child that reaches
+uses one finite deadline, while primary evidence is captured within the pre-cancellation
+finalization deadline. A fresh evidence-finalization allowance starts after cancellation finishes;
+when cancellation is disabled, only the initial finalization deadline applies. A child that reaches
 `cleanup` within the work deadline may use the one reserved cleanup window; child cleanup and
 parent-enforced exact-tree teardown share that window and cannot add a second allowance. If the
 parent watchdog expires, the
@@ -281,10 +286,10 @@ Physical runs report these low-cardinality fields:
 - requested/actual prompt tokens, output reservation, and actual output tokens;
 - batch/runtime profile, `n_batch`, `n_ubatch`, K/V types, Flash Attention, KQV offload, offloaded
   layers, fallback/recovery diagnostics, and YaRN/RoPE configuration;
-- preparing, prefill, first-token, decode, total duration, throughput, request budget, and remaining
-  margin;
-- progress counts, first/final progress, monotonicity, total consistency, processed-never-exceeds
-  total, cancellation timing, and worker recovery timing.
+- same-origin worker preparing, prefill, and first-token durations; independent parent inference
+  duration; runner end-to-end duration; prompt throughput; request budget; and remaining margin;
+- authoritative local phase counts, encrypted phases actually delivered, total consistency,
+  processed-never-exceeds-total, cancellation timing, and worker recovery timing.
 
 Validate JSON syntax before attachment:
 
@@ -294,33 +299,39 @@ python -m json.tool .tmp/long-context-report/long_context_benchmark_report.json 
 
 ## Progress, cancellation, and recovery invariants
 
-The evidence stream is ordered. Each observation has a strictly increasing integer `sequence` and
-strictly increasing non-negative integer `elapsed_ms` in the request's monotonic clock domain.
-Progress observations use only the production phases `preparing`, `prefill`, and `generating`;
-phases may repeat or advance one step and never regress or skip a phase after observation begins.
-Every progress observation contains a positive, stable `total_prompt_tokens` plus non-negative
-`cached_prompt_tokens`, `processed_prompt_tokens`, and `generated_tokens`. Processed and generated
-counts are monotonic, cached never exceeds processed, and processed never exceeds total.
+The authoritative runtime stream is the packaged operator's privacy-safe
+`api_v1.local_progress` records after the driver-log byte boundary captured immediately before the
+primary request. The runner takes that bounded snapshot as soon as the atomic response arrives,
+before any cancellation or recovery request. It parses only the exact old-app record shapes and
+the matching `api_v1.inference_complete` record; arbitrary surrounding log text and correlation
+identifiers are discarded. Multiple request/worker correlations, malformed records, or an
+ambiguous completion fail closed.
 
-The successful API response is an ordered `result` observation followed by exactly one ordered
-`terminal` observation with state `completed`. Cancellation and failure instead use `cancelled` or
-`failed`. Completion requires at least one progress observation, a generating phase, exactly one
-successful result, and full prompt processing. Duplicate or conflicting terminal observations,
-terminal timestamps preceding prior progress, results after cancellation, and any result or
-progress after terminal are categorical failures. The desktop runner continues polling for a short
-monotonic-deadline-bounded window after completion so late progress or a conflicting result is
-observable; it does not use a multi-second fixed sleep. Missing or malformed lifecycle telemetry
-returns stable errors such as `progress_missing`, `malformed_telemetry`, `incomplete_prefill`, or
-`progress_after_terminal` rather than passing or raising an uncaught exception.
+Local progress permits only `preparing`, `prefill`, and `generating`. Sequence and elapsed values
+are monotonic, phases cannot regress or skip, counters are non-negative, cached is at most processed,
+and processed is at most total. An initial pre-authoritative `preparing` event may truthfully carry
+total zero. The first positive total becomes stable. Completion requires full prompt processing,
+a genuine local generating event, positive generated-token progress, and agreement between local,
+admission/tokenizer, and final response prompt counts.
 
-Timings use five ordered monotonic boundaries: request start, end of preparing, end of prefill,
-first generated token, and request end. They produce preparing duration, prefill duration,
-time-to-first-token, decode duration, and total duration. Prompt throughput is authoritative prompt
-tokens divided by prefill duration; decode throughput is authoritative output tokens divided by
-decode duration. The report also records the request budget and `budget - total duration` completion
-margin. Zero-duration boundaries are valid and retain a zero duration (their division-based
-throughput is `null`); absent, non-finite, reversed, or over-budget timing fails closed and is never
-coerced to zero.
+Browser-observed encrypted P6 progress is validated separately as best-effort delivery. Every
+delivered event must be an exact, monotonic, schema-valid projection of the authoritative local
+stream, but terminal completion may overtake a coalesced generating update. Reports list only the
+phases actually delivered and set `terminal_overtook_generating_update` when appropriate; they
+never synthesize a browser phase. Atomic response completion and a short monotonic-deadline-bounded
+post-terminal silence check remain independent requirements. This preserves P6's one-latest-pending
+coalescing and terminal-discard behavior: encrypted progress never delays or changes the response.
+
+Runtime preparation, prefill, and time-to-first-token are derived only between worker-progress
+`elapsed_ms` boundaries. Parent inference duration and the browser runner's end-to-end monotonic
+duration are separate provenance fields: they have no proven common origin, so the report never
+subtracts one from another to fabricate decode duration or decode throughput. Request-budget
+compliance and completion margin use only the runner end-to-end duration. Prompt tokens come from
+admission/tokenizer evidence and validated local progress,
+while completed output tokens come exclusively from allowlisted final response
+`usage.completion_tokens` (with `finish_reason` retained). The last coalesced progress counter and
+response-text estimates are not output-token authority. Missing, non-finite, reversed, inconsistent,
+or over-budget evidence fails closed rather than being coerced or inferred.
 
 Cancellation scenarios must be progress-triggered, not sleep-only:
 

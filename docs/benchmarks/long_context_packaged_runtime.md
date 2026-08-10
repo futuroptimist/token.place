@@ -177,7 +177,7 @@ prose and target selection even though JSON shape and canary can still pass.
 
 ## Metrics and report schema
 
-Reports use schema `long-context-benchmark-report-v1` and are written atomically as
+Reports use schema `long-context-benchmark-report-v2` and are written atomically as
 `long_context_benchmark_report.json` in the selected output directory. Reports are sanitized for GitHub issue
 attachment: prompt/response bodies, ciphertext, IVs, keys, cancellation tokens, high-cardinality
 request/client/session IDs, absolute user paths, secrets, and unbounded subprocess output are
@@ -281,8 +281,8 @@ Physical runs report these low-cardinality fields:
 - requested/actual prompt tokens, output reservation, and actual output tokens;
 - batch/runtime profile, `n_batch`, `n_ubatch`, K/V types, Flash Attention, KQV offload, offloaded
   layers, fallback/recovery diagnostics, and YaRN/RoPE configuration;
-- preparing, prefill, first-token, decode, total duration, throughput, request budget, and remaining
-  margin;
+- same-origin worker preparing, prefill, and first-token durations; independent parent inference
+  duration; runner end-to-end duration; prompt throughput; request budget; and remaining margin;
 - authoritative local phase counts, encrypted phases actually delivered, total consistency,
   processed-never-exceeds-total, cancellation timing, and worker recovery timing.
 
@@ -317,10 +317,12 @@ never synthesize a browser phase. Atomic response completion and a short monoton
 post-terminal silence check remain independent requirements. This preserves P6's one-latest-pending
 coalescing and terminal-discard behavior: encrypted progress never delays or changes the response.
 
-Runtime preparation, prefill, time-to-first-token, decode, and inference duration use only the
-packaged-local elapsed/timing domain. End-to-end request duration is recorded separately from the
-browser runner's monotonic clock; worker-relative elapsed values are never added to the browser
-click timestamp. Prompt tokens come from admission/tokenizer evidence and validated local progress,
+Runtime preparation, prefill, and time-to-first-token are derived only between worker-progress
+`elapsed_ms` boundaries. Parent inference duration and the browser runner's end-to-end monotonic
+duration are separate provenance fields: they have no proven common origin, so the report never
+subtracts one from another to fabricate decode duration or decode throughput. Request-budget
+compliance and completion margin use only the runner end-to-end duration. Prompt tokens come from
+admission/tokenizer evidence and validated local progress,
 while completed output tokens come exclusively from allowlisted final response
 `usage.completion_tokens` (with `finish_reason` retained). The last coalesced progress counter and
 response-text estimates are not output-token authority. Missing, non-finite, reversed, inconsistent,

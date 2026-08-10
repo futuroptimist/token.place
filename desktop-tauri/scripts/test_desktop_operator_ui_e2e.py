@@ -1179,15 +1179,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         response_metadata = browser.execute_script(
             "return document.querySelector('#app').__vue__.__longContextBenchmarkFinalMetadata;")
         cancellation_recovery = None
-        if request.get("cancellation_validation"):
-            write_phase("cancellation_validation")
-            cancellation_deadline = time.monotonic() + float(request["cancellation_timeout_s"])
-            cancellation_recovery, finalization_deadline = start_phase_after(
-                lambda: run_long_context_cancellation_recovery(
-                    browser, driver, request, cancellation_deadline),
-                float(request["finalization_timeout_s"]))
-        else:
-            finalization_deadline = time.monotonic() + float(request["finalization_timeout_s"])
+        finalization_deadline = time.monotonic() + float(request["finalization_timeout_s"])
         def finalization_remaining() -> float:
             remaining = finalization_deadline - time.monotonic()
             if remaining <= 0:
@@ -1219,6 +1211,15 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         finalization_remaining()
         post_terminal = [item for item in observe_post_terminal(post_terminal_poll,
             window_s=min(0.1, finalization_remaining())) if item is not None]
+        # Freeze every primary-request observation before recovery generates any
+        # additional browser or driver-log traffic.
+        if request.get("cancellation_validation"):
+            write_phase("cancellation_validation")
+            cancellation_deadline = time.monotonic() + float(request["cancellation_timeout_s"])
+            cancellation_recovery, finalization_deadline = start_phase_after(
+                lambda: run_long_context_cancellation_recovery(
+                    browser, driver, request, cancellation_deadline),
+                float(request["finalization_timeout_s"]))
         finalization_remaining()
         memory_sampler.sample()
         memory_evidence = memory_sampler.summary()

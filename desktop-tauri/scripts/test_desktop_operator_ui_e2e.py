@@ -1158,7 +1158,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         """)
         # The child writes directly to this file descriptor. Capture the exact byte
         # boundary immediately before submission.
-        driver_log_boundary = 0
+        driver_log_boundary = 0  # pragma: no cover - exercised by packaged-app E2E
         def capture_driver_log_boundary() -> None:
             nonlocal driver_log_boundary
             driver_log_boundary = driver_log.stat().st_size

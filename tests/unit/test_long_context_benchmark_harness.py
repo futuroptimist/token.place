@@ -1393,6 +1393,14 @@ def test_packaged_runtime_response_usage_and_authoritative_evidence_validation(t
         local_telemetry["inference_complete"][0]["inference_duration_seconds"] = duration
         assert invoke_with_payload_change("local_telemetry", local_telemetry)["code"] == \
             "local_timing_record_malformed"
+    incompatible_settings = copy.deepcopy(payload["generation_settings"])
+    incompatible_settings["supplied"]["max_tokens"] = 2048
+    assert invoke_with_payload_change("generation_settings", incompatible_settings)["code"] == \
+        "local_telemetry_configuration_mismatch"
+    assert invoke_with_payload_change("request_duration_s", float("nan"))["code"] == \
+        "local_timing_record_malformed"
+    assert invoke_with_payload_change("atomic_response_completed", False)["code"] == \
+        "encrypted_progress_delivery_invalid"
 
     payload["response_metadata"]["prompt_tokens"] += 1
     disagreement = h.invoke_packaged_runtime_adapter(timeout_s=3.0, app_binary=str(app),
@@ -1444,6 +1452,38 @@ def test_old_app_log_parser_allowlists_windows_records_and_ignores_surrounding_t
     assert authoritative["prompt_tokens"] == 100
     assert "private-id" not in rendered and "worker_generation" not in rendered
     assert "Users" not in rendered and "prompt text" not in rendered
+
+
+def test_local_telemetry_failure_branches_are_directly_classified():
+    malformed_completion = h.parse_packaged_local_telemetry(
+        "api_v1.inference_complete active_tier=64k-full incomplete")
+    assert malformed_completion["malformed"] is True
+
+    mutations = [
+        lambda value: value.update(malformed=True),
+        lambda value: value.update(ambiguous=True),
+        lambda value: value.update(inference_complete=[]),
+        lambda value: value["progress_events"][0].update(extra=True),
+        lambda value: value["progress_events"][0].update(sequence=-1),
+        lambda value: value["progress_events"][1].update(phase="generating"),
+        lambda value: value["progress_events"][1].update(cached_prompt_tokens=101),
+    ]
+    for mutate in mutations:
+        telemetry = _local_telemetry()
+        mutate(telemetry)
+        with pytest.raises(ValueError, match="local_timing_record_malformed"):
+            h.validate_authoritative_local_telemetry(telemetry)
+
+    telemetry = _local_telemetry()
+    for event in telemetry["progress_events"]:
+        event["phase"] = "generating"
+        event["total_prompt_tokens"] = 100
+    with pytest.raises(ValueError, match="local_prefill_phase_missing"):
+        h.validate_authoritative_local_telemetry(telemetry)
+
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
+        h.validate_encrypted_progress_delivery([], authoritative)
 
 
 def test_best_effort_prefill_only_delivery_records_terminal_overtake():
@@ -2077,7 +2117,8 @@ def test_packaged_multiline_prompt_uses_shift_enter_and_submits_after_exact_popu
         events.append(("phase", phase))
     started = desktop_runner._populate_and_submit_packaged_prompt(
         Browser(), prompt, lambda: 10, pytest.fail, checkpoint,
-        clock=lambda: events.append(("timer",)) or 42.0, action_factory=Actions)
+        clock=lambda: events.append(("timer",)) or 42.0, action_factory=Actions,
+        before_submit=lambda: events.append(("boundary",)))
     assert started == 42.0
     assert [event for event in events if event[0] == "text"] == [
         ("text", "line1"), ("text", "line2"), ("text", "line4")]
@@ -2086,6 +2127,7 @@ def test_packaged_multiline_prompt_uses_shift_enter_and_submits_after_exact_popu
         for event in events if event[0] == "newline")
     assert not any(event == ("text", desktop_runner.Keys.ENTER) for event in events)
     assert events.index(("population",)) < events.index(("eligibility",))
+    assert events.index(("boundary",)) < events.index(("timer",))
     assert events.index(("timer",)) + 1 == events.index(("click",))
     assert phases == ["landing_page_ready", "request_active"]
     assert events.index(("click",)) < events.index(("phase", "request_active"))
@@ -2899,6 +2941,24 @@ def test_production_shaped_qwen_report_validates_and_writes_atomically(tmp_path,
         "terminal_overtook_generating_update": True}
     rewritten = h.write_report_atomic(tmp_path / "rewritten", report)
     assert json.loads(rewritten.read_text()) == report
+
+    contract_mutations = (
+        ("report_response_usage_invalid",
+            lambda item: item["response_usage"].update(completion_tokens=0)),
+        ("report_response_usage_invalid",
+            lambda item: item["response_usage"].update(prompt_tokens=11)),
+        ("report_atomic_response_invalid",
+            lambda item: item.update(atomic_response_completion={"completed": False})),
+        ("report_post_terminal_silence_invalid",
+            lambda item: item.update(post_terminal_silence={"observed": False})),
+        ("report_metrics_invalid",
+            lambda item: item["metrics"].update(request_timing_source="unknown")),
+    )
+    for reason, mutate in contract_mutations:
+        malformed = copy.deepcopy(report)
+        mutate(malformed)
+        with pytest.raises(ValueError, match=reason):
+            h.validate_report(malformed)
 
     progress_mutations = (
         ("report_authoritative_local_progress_invalid",

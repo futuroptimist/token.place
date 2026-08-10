@@ -2719,7 +2719,9 @@ def test_main_packaged_runtime_exit_codes(tmp_path, monkeypatch):
             "build_identity":"build", "backend_requested":"cpu", "backend_selected":"cpu", "model_fingerprint":"sha256:model", "backend_used":"cpu"},
         "authoritative_local_progress":{"pass":True, "progress_event_count":2,
             "observed_phases":["prefill", "generating"]},
-        "encrypted_progress":{"pass":True, "progress_event_count":1},
+        "encrypted_progress":{"pass":True, "best_effort":True,
+            "progress_event_count":1, "observed_phases":["prefill"],
+            "terminal_overtook_generating_update":True},
         "response_usage":{"prompt_tokens":10, "completion_tokens":1,
             "finish_reason":"stop", "source":"validated_atomic_response_usage"},
         "atomic_response_completion":{"completed":True,
@@ -2767,7 +2769,9 @@ def _packaged_main_evidence(semantic_pass=True, *, max_tokens=1024):
             "model_fingerprint":"sha256:model", "backend_used":"cpu"},
         "authoritative_local_progress":{"pass":True, "progress_event_count":2,
             "observed_phases":["prefill", "generating"]},
-        "encrypted_progress":{"pass":True, "progress_event_count":1},
+        "encrypted_progress":{"pass":True, "best_effort":True,
+            "progress_event_count":1, "observed_phases":["prefill"],
+            "terminal_overtook_generating_update":True},
         "response_usage":{"prompt_tokens":10, "completion_tokens":1,
             "finish_reason":"stop", "source":"validated_atomic_response_usage"},
         "atomic_response_completion":{"completed":True,
@@ -2819,8 +2823,82 @@ def test_production_shaped_qwen_report_validates_and_writes_atomically(tmp_path,
         "requested":"gpu", "effective":"metal"}
     assert report["kv_diagnostics"]["trials"][0]["type_k"] == "q8"
     h.validate_report(report)
+    assert report["encrypted_progress"] == {
+        "pass": True, "best_effort": True, "progress_event_count": 1,
+        "observed_phases": ["prefill"],
+        "terminal_overtook_generating_update": True}
     rewritten = h.write_report_atomic(tmp_path / "rewritten", report)
     assert json.loads(rewritten.read_text()) == report
+
+    progress_mutations = (
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].pop("observed_phases")),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(extra=True)),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                progress_event_count=True)),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                progress_event_count=0)),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                progress_event_count=-1)),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=[])),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=["prefill", "invalid", "generating"])),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=["prefill", "prefill", "generating"])),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=["generating", "prefill"])),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=["prefill"])),
+        ("report_authoritative_local_progress_invalid",
+            lambda item: item["authoritative_local_progress"].update(
+                observed_phases=["prefill", "generating"], progress_event_count=1)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].pop("best_effort")),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].pop(
+                "terminal_overtook_generating_update")),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(extra=True)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(best_effort=False)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(progress_event_count=True)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(progress_event_count=0)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(progress_event_count=-1)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(observed_phases=[])),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(observed_phases=["invalid"])),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(
+                observed_phases=["prefill", "prefill"])),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(
+                observed_phases=["generating", "prefill"])),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(
+                terminal_overtook_generating_update=1)),
+        ("report_progress_invalid",
+            lambda item: item["encrypted_progress"].update(
+                terminal_overtook_generating_update=False)),
+    )
+    for reason, mutate_progress in progress_mutations:
+        malformed = json.loads(json.dumps(report))
+        mutate_progress(malformed)
+        with pytest.raises(ValueError, match=f"^{reason}$"):
+            h.validate_report(malformed)
 
     mutations = (
         lambda item: item["runtime_configuration"]["trials"][0]["mode"].update(effective="gpu"),

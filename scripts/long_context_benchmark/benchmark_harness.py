@@ -1181,12 +1181,35 @@ def validate_report(report: Any) -> None:
         raise ValueError("report_context_invalid")
     local_progress = report.get("authoritative_local_progress")
     progress, metrics, semantic = report.get("encrypted_progress"), report.get("metrics"), report.get("semantic")
+    def valid_phase_summary(phases: Any) -> bool:
+        return (isinstance(phases, list) and bool(phases)
+            and all(isinstance(phase, str) and phase in PHASES for phase in phases)
+            and len(phases) == len(set(phases))
+            and phases == sorted(phases, key=PHASES.__getitem__))
     if (not isinstance(local_progress, dict) or set(local_progress) != {
             "pass", "progress_event_count", "observed_phases"}
             or local_progress.get("pass") is not True
-            or not isinstance(local_progress.get("progress_event_count"), int)):
+            or not isinstance(local_progress.get("progress_event_count"), int)
+            or isinstance(local_progress.get("progress_event_count"), bool)
+            or local_progress["progress_event_count"] <= 0
+            or not valid_phase_summary(local_progress.get("observed_phases"))
+            or not {"prefill", "generating"}.issubset(local_progress["observed_phases"])
+            or local_progress["progress_event_count"] < len(local_progress["observed_phases"])):
         raise ValueError("report_authoritative_local_progress_invalid")
-    if not isinstance(progress, dict) or progress.get("pass") is not True or not isinstance(progress.get("progress_event_count"), int):
+    if (not isinstance(progress, dict) or set(progress) != {
+            "pass", "best_effort", "progress_event_count", "observed_phases",
+            "terminal_overtook_generating_update"}
+            or progress.get("pass") is not True or progress.get("best_effort") is not True
+            or not isinstance(progress.get("progress_event_count"), int)
+            or isinstance(progress.get("progress_event_count"), bool)
+            or progress["progress_event_count"] <= 0
+            or not valid_phase_summary(progress.get("observed_phases"))
+            or not set(progress["observed_phases"]).issubset(local_progress["observed_phases"])
+            or progress["progress_event_count"] < len(progress["observed_phases"])
+            or not isinstance(progress.get("terminal_overtook_generating_update"), bool)
+            or progress["terminal_overtook_generating_update"] != (
+                "generating" in local_progress["observed_phases"]
+                and "generating" not in progress["observed_phases"])):
         raise ValueError("report_progress_invalid")
     usage = report.get("response_usage")
     if (not isinstance(usage, dict) or set(usage) != {

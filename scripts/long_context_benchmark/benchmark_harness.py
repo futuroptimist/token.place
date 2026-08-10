@@ -204,13 +204,16 @@ def validate_encrypted_progress_delivery(events: Any, authoritative: dict[str, A
     for event in events:
         if (not isinstance(event, dict)
                 or set(event) != {*comparison_keys, "sequence", "schema_version"}
+                or not isinstance(event["schema_version"], int)
+                or isinstance(event["schema_version"], bool)
                 or event["schema_version"] != 1
                 or not isinstance(event["sequence"], int)
                 or isinstance(event["sequence"], bool)
-                or event["sequence"] != last_sequence + 1):
+                or event["sequence"] <= last_sequence):
             raise ValueError("encrypted_progress_delivery_invalid")
-        # The publisher assigns contiguous delivery sequences after coalescing,
-        # so match the observed values as an ordered projection of local events.
+        # Browser polling can miss replaceable best-effort updates, so observed
+        # delivery sequences need only remain positive and strictly increasing.
+        # Match their values as an ordered projection of local events.
         while (local_index < len(local_events)
                 and any(event[key] != local_events[local_index][key]
                     for key in comparison_keys)):

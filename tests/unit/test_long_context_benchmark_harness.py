@@ -1430,12 +1430,56 @@ def test_zero_total_preparing_is_only_valid_as_initial_observation():
 
 def test_encrypted_progress_must_match_authoritative_without_replay_or_fabrication():
     authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
-    replay = [authoritative["events"][0], authoritative["events"][0]]
+    replay = [
+        {**authoritative["events"][0], "schema_version": 1, "sequence": 2},
+        {**authoritative["events"][0], "schema_version": 1, "sequence": 2},
+    ]
     with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
         h.validate_encrypted_progress_delivery(replay, authoritative)
-    changed = [dict(authoritative["events"][1], processed_prompt_tokens=99)]
+    changed = [{**authoritative["events"][1], "schema_version": 1,
+        "sequence": 1, "processed_prompt_tokens": 99}]
     with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
         h.validate_encrypted_progress_delivery(changed, authoritative)
+
+
+def test_encrypted_progress_accepts_first_and_later_observation_gaps():
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    delivered = [
+        {**authoritative["events"][0], "schema_version": 1, "sequence": 3},
+        {**authoritative["events"][2], "schema_version": 1, "sequence": 8},
+    ]
+    result = h.validate_encrypted_progress_delivery(delivered, authoritative)
+    assert result["pass"] is True
+    assert result["observed_phases"] == ["preparing", "generating"]
+
+
+@pytest.mark.parametrize("sequences", [(2, 2), (3, 1)])
+def test_encrypted_progress_rejects_duplicate_or_decreasing_sequences(sequences):
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    delivered = [
+        {**authoritative["events"][0], "schema_version": 1, "sequence": sequences[0]},
+        {**authoritative["events"][1], "schema_version": 1, "sequence": sequences[1]},
+    ]
+    with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
+        h.validate_encrypted_progress_delivery(delivered, authoritative)
+
+
+@pytest.mark.parametrize("schema", [None, 2, True])
+def test_encrypted_progress_rejects_invalid_schema_version(schema):
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    event = {**authoritative["events"][0], "sequence": 1}
+    if schema is not None:
+        event["schema_version"] = schema
+    with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
+        h.validate_encrypted_progress_delivery([event], authoritative)
+
+
+def test_encrypted_progress_rejects_extra_fields():
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    event = {**authoritative["events"][0], "schema_version": 1,
+        "sequence": 1, "unexpected": "field"}
+    with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
+        h.validate_encrypted_progress_delivery([event], authoritative)
 
 
 def test_encrypted_progress_matches_ordered_local_projection_after_coalescing():

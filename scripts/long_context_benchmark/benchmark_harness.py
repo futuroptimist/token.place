@@ -67,6 +67,7 @@ PACKAGED_FAILURE_REASONS = frozenset({
     "authoritative_local_progress_missing", "local_prefill_phase_missing",
     "local_generating_phase_missing", "positive_generated_token_progress_missing",
     "local_timing_record_malformed", "response_usage_missing_or_inconsistent",
+    "local_telemetry_configuration_mismatch",
     "encrypted_progress_delivery_invalid",
 })
 
@@ -113,7 +114,9 @@ def parse_packaged_local_telemetry(text: str) -> dict[str, Any]:
         "malformed": malformed}
 
 
-def validate_authoritative_local_telemetry(value: Any, *, completed: bool = True) -> dict[str, Any]:
+def validate_authoritative_local_telemetry(value: Any, *, completed: bool = True,
+        expected_tier: str | None = None,
+        expected_output_reservation: int | None = None) -> dict[str, Any]:
     """Validate sanitized P3 progress and completion timing without inventing observations."""
     if not isinstance(value, dict) or value.get("malformed"):
         raise ValueError("local_timing_record_malformed")
@@ -174,6 +177,10 @@ def validate_authoritative_local_telemetry(value: Any, *, completed: bool = True
         raise ValueError("local_timing_record_malformed")
     if total is None or completion["prompt_tokens"] != total or (completed and last_processed != total):
         raise ValueError("local_timing_record_malformed")
+    if ((expected_tier is not None and completion["active_tier"] != expected_tier)
+            or (expected_output_reservation is not None
+                and completion["output_reservation"] != expected_output_reservation)):
+        raise ValueError("local_telemetry_configuration_mismatch")
     first_prefill = next(e for e in events if e["phase"] == "prefill")
     first_generating = next(e for e in events if e["phase"] == "generating")
     first_token = next(e for e in events if e["phase"] == "generating" and e["generated_tokens"] > 0)
@@ -192,11 +199,23 @@ def validate_encrypted_progress_delivery(events: Any, authoritative: dict[str, A
     ignored = {"terminal_missing", "prefill_phase_missing", "terminal_lifecycle_without_generation"}
     if any(error not in ignored for error in lifecycle["errors"]):
         raise ValueError("encrypted_progress_delivery_invalid")
-    local_by_sequence = {event["sequence"]: event for event in authoritative["events"]}
+    local_events = authoritative["events"]
+    local_index = 0
+    comparison_keys = set(local_events[0]) - {"sequence"}
     for event in events:
-        local = local_by_sequence.get(event.get("sequence"))
-        if local is None or event != local:
+        if (set(event) not in ({*comparison_keys, "sequence"},
+                {*comparison_keys, "sequence", "schema_version"})
+                or ("schema_version" in event and event["schema_version"] != 1)):
             raise ValueError("encrypted_progress_delivery_invalid")
+        # The publisher assigns contiguous delivery sequences after coalescing,
+        # so match the observed values as an ordered projection of local events.
+        while (local_index < len(local_events)
+                and any(event[key] != local_events[local_index][key]
+                    for key in comparison_keys)):
+            local_index += 1
+        if local_index == len(local_events):
+            raise ValueError("encrypted_progress_delivery_invalid")
+        local_index += 1
     phases = list(dict.fromkeys(event["phase"] for event in events))
     return {"pass": True, "best_effort": True, "progress_event_count": len(events),
         "observed_phases": phases, "terminal_overtook_generating_update":
@@ -1679,7 +1698,9 @@ def invoke_packaged_runtime_adapter(*, fixture_id: str = "small-8k", scenario: s
     if depth_error:
         return {"pass": False, "code": depth_error}
     try:
-        local = validate_authoritative_local_telemetry(payload["local_telemetry"])
+        local = validate_authoritative_local_telemetry(payload["local_telemetry"],
+            expected_tier=context_tier,
+            expected_output_reservation=profile.default_output_reservation_tokens)
         progress = validate_encrypted_progress_delivery(payload["progress_events"], local)
     except ValueError as exc:
         return {"pass": False, "runtime_contract_pass": False, "code": str(exc)}

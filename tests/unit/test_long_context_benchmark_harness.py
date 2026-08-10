@@ -1379,8 +1379,9 @@ def test_old_app_log_parser_allowlists_windows_records_and_ignores_surrounding_t
 
 def test_best_effort_prefill_only_delivery_records_terminal_overtake():
     authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    browser_event = {**authoritative["events"][1], "schema_version": 1, "sequence": 1}
     delivered = h.validate_encrypted_progress_delivery(
-        [authoritative["events"][1]], authoritative)
+        [browser_event], authoritative)
     assert delivered == {"pass": True, "best_effort": True, "progress_event_count": 1,
         "observed_phases": ["prefill"],
         "terminal_overtook_generating_update": True}
@@ -1429,6 +1430,28 @@ def test_encrypted_progress_must_match_authoritative_without_replay_or_fabricati
     changed = [dict(authoritative["events"][1], processed_prompt_tokens=99)]
     with pytest.raises(ValueError, match="encrypted_progress_delivery_invalid"):
         h.validate_encrypted_progress_delivery(changed, authoritative)
+
+
+def test_encrypted_progress_matches_ordered_local_projection_after_coalescing():
+    authoritative = h.validate_authoritative_local_telemetry(_local_telemetry())
+    delivered = [
+        {**authoritative["events"][2], "schema_version": 1, "sequence": 1},
+    ]
+    result = h.validate_encrypted_progress_delivery(delivered, authoritative)
+    assert result["pass"] is True
+    assert result["observed_phases"] == ["generating"]
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("active_tier", "8k-fast"),
+    ("output_reservation", 2048),
+])
+def test_authoritative_local_telemetry_binds_requested_configuration(field, value):
+    telemetry = _local_telemetry()
+    telemetry["inference_complete"][0][field] = value
+    with pytest.raises(ValueError, match="local_telemetry_configuration_mismatch"):
+        h.validate_authoritative_local_telemetry(telemetry,
+            expected_tier="64k-full", expected_output_reservation=1024)
 
 
 def test_packaged_runtime_external_fixture_pair_and_hash_fail_closed(tmp_path):

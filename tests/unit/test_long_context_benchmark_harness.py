@@ -1191,6 +1191,31 @@ def test_owned_process_tree_memory_aggregation_handles_descendant_churn():
     assert sampler.summary() == _memory_evidence(baseline=140, peak=200, final=80)
 
 
+def test_primary_memory_evidence_snapshot_survives_recovery_activity():
+    class Process:
+        def __init__(self, rss):
+            self.rss = rss
+        def children(self, recursive=False):
+            assert recursive is True
+            return []
+        def memory_info(self):
+            return type("Memory", (), {"rss": self.rss})()
+
+    processes = iter([Process(100), Process(200), Process(900)])
+    sampler = h.OwnedProcessTreeMemorySampler(
+        7, lambda _pid: next(processes), system="Linux")
+    assert sampler.sample() is True
+    assert sampler.sample() is True
+    primary_memory = sampler.summary()
+
+    # Recovery may use the same process tree, but the primary report is frozen.
+    assert sampler.sample() is True
+    assert primary_memory == _memory_evidence(
+        baseline=100, peak=200, final=200, samples=2)
+    assert sampler.summary() == _memory_evidence(
+        baseline=100, peak=900, final=900, samples=3)
+
+
 def test_owned_process_tree_memory_fails_without_valid_sample_or_platform():
     denied = lambda _pid: (_ for _ in ()).throw(h.psutil.AccessDenied(7))
     sampler = h.OwnedProcessTreeMemorySampler(7, denied, system="Linux")

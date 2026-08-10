@@ -1229,8 +1229,11 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             tokenizer_evidence, runtime["Runtime ID"],
             request["manifest"]["fixture_sha256"])
         finalization_remaining()
+        memory_sampler.sample()
+        memory_evidence = memory_sampler.summary()
+        finalization_remaining()
         # All packaged requests share this evidence path, so freeze the primary
-        # snapshot before cancellation/recovery traffic can overwrite it.
+        # snapshots before cancellation/recovery traffic can overwrite them.
         if request.get("cancellation_validation"):
             write_phase("cancellation_validation")
             cancellation_deadline = time.monotonic() + float(request["cancellation_timeout_s"])
@@ -1238,9 +1241,6 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 lambda: run_long_context_cancellation_recovery(
                     browser, driver, request, cancellation_deadline),
                 float(request["finalization_timeout_s"]))
-        finalization_remaining()
-        memory_sampler.sample()
-        memory_evidence = memory_sampler.summary()
         finalization_remaining()
         write_phase("evidence_finalization")
         digest = hashlib.sha256()

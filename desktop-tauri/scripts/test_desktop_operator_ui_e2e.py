@@ -984,6 +984,19 @@ def _populate_and_submit_packaged_prompt(browser: webdriver.Chrome, prompt: str,
     return started
 
 
+def _read_primary_tokenizer_observation(evidence_path: Path, runtime_identity: str,
+        fixture_sha256: str) -> dict[str, object]:
+    try:
+        observation = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("authoritative_target_depth_unavailable") from exc
+    if (not isinstance(observation, dict)
+            or observation.get("runtime_identity") != runtime_identity
+            or observation.get("fixture_sha256") != fixture_sha256):
+        raise RuntimeError("authoritative_target_depth_mismatched")
+    return observation
+
+
 def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         phase_status_path: Path, app_binary: Path) -> int:
     """Drive a packaged app and the existing landing-page API v1 E2EE client."""
@@ -1211,8 +1224,13 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         finalization_remaining()
         post_terminal = [item for item in observe_post_terminal(post_terminal_poll,
             window_s=min(0.1, finalization_remaining())) if item is not None]
-        # Freeze every primary-request observation before recovery generates any
-        # additional browser or driver-log traffic.
+        finalization_remaining()
+        tokenizer_observation = _read_primary_tokenizer_observation(
+            tokenizer_evidence, runtime["Runtime ID"],
+            request["manifest"]["fixture_sha256"])
+        finalization_remaining()
+        # All packaged requests share this evidence path, so freeze the primary
+        # snapshot before cancellation/recovery traffic can overwrite it.
         if request.get("cancellation_validation"):
             write_phase("cancellation_validation")
             cancellation_deadline = time.monotonic() + float(request["cancellation_timeout_s"])
@@ -1223,15 +1241,6 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         finalization_remaining()
         memory_sampler.sample()
         memory_evidence = memory_sampler.summary()
-        try:
-            finalization_remaining()
-            tokenizer_observation = json.loads(tokenizer_evidence.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError("authoritative_target_depth_unavailable") from exc
-        if (not isinstance(tokenizer_observation, dict)
-                or tokenizer_observation.get("runtime_identity") != runtime["Runtime ID"]
-                or tokenizer_observation.get("fixture_sha256") != request["manifest"]["fixture_sha256"]):
-            raise RuntimeError("authoritative_target_depth_mismatched")
         finalization_remaining()
         write_phase("evidence_finalization")
         digest = hashlib.sha256()

@@ -23,7 +23,8 @@ def desktop_runner():
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
         "_populate_and_submit_packaged_prompt", "_is_windows_sharing_violation", "_write_benchmark_phase",
-        "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver"}
+        "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver",
+        "_read_primary_tokenizer_observation"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ModuleType("desktop_runner_under_test")
@@ -1608,6 +1609,44 @@ def test_authoritative_target_depth_evidence_fails_categorically(mutation, code)
     _, error = h._validate_authoritative_tokenizer_evidence(
         evidence, manifest, "bundled", manifest["actual_tokens"])
     assert error == code
+
+
+def test_primary_tokenizer_evidence_snapshot_survives_recovery_overwrite(
+        desktop_runner, tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    primary = {"runtime_identity": "bundled", "fixture_sha256": "fixture",
+        "total_prompt_tokens": 8192, "kv_applicability": "primary",
+        "kv_estimator": {"estimated_bytes": 10}, "kv_runtime": {"observed_bytes": 11}}
+    recovery = {"runtime_identity": "bundled", "fixture_sha256": "fixture",
+        "total_prompt_tokens": 1024, "kv_applicability": "recovery",
+        "kv_estimator": {"estimated_bytes": 20}, "kv_runtime": {"observed_bytes": 21}}
+    evidence_path.write_text(json.dumps(primary), encoding="utf-8")
+
+    snapshot = desktop_runner._read_primary_tokenizer_observation(
+        evidence_path, "bundled", "fixture")
+    evidence_path.write_text(json.dumps(recovery), encoding="utf-8")
+
+    assert snapshot == primary
+    assert snapshot["total_prompt_tokens"] == 8192
+    assert snapshot["kv_applicability"] == "primary"
+    assert snapshot["kv_estimator"] == {"estimated_bytes": 10}
+    assert snapshot["kv_runtime"] == {"observed_bytes": 11}
+
+
+@pytest.mark.parametrize(("contents", "runtime_identity", "expected"), [
+    (None, "bundled", "authoritative_target_depth_unavailable"),
+    ("not-json", "bundled", "authoritative_target_depth_unavailable"),
+    ('{"runtime_identity":"other","fixture_sha256":"fixture"}', "bundled",
+     "authoritative_target_depth_mismatched"),
+])
+def test_primary_tokenizer_evidence_snapshot_preserves_failure_classifications(
+        desktop_runner, tmp_path, contents, runtime_identity, expected):
+    evidence_path = tmp_path / "evidence.json"
+    if contents is not None:
+        evidence_path.write_text(contents, encoding="utf-8")
+    with pytest.raises(RuntimeError, match=expected):
+        desktop_runner._read_primary_tokenizer_observation(
+            evidence_path, runtime_identity, "fixture")
 
 
 def test_packaged_runtime_requires_physical_prerequisites():

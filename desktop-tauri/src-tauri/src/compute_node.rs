@@ -20,11 +20,12 @@ use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -57,6 +58,10 @@ const OPERATOR_PREFLIGHT_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 const OPERATOR_PREFLIGHT_CPU_SMOKE_EVENT_TIMEOUT: Duration = Duration::from_secs(35);
 const OPERATOR_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 const OPERATOR_PREFLIGHT_EVENT_MAX_BYTES: usize = 2048;
+const BENCHMARK_TOKENIZER_REQUEST_ENV: &str =
+    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST";
+const BENCHMARK_TOKENIZER_EVIDENCE_ENV: &str =
+    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComputeNodeStatus {
@@ -1658,6 +1663,11 @@ impl OperatorBridgeLaunchPreparation {
     fn command(&self) -> anyhow::Result<Command> {
         let mut command = build_bridge_command(&self.bridge_script, self.launcher.clone())?;
         self.configure_command(&mut command)?;
+        configure_benchmark_tokenizer_env(
+            &mut command,
+            std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
+            std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+        );
         Ok(command)
     }
 
@@ -1710,6 +1720,64 @@ impl OperatorBridgeLaunchPreparation {
         self.configure_command(&mut command)?;
         Ok(command)
     }
+}
+
+/// Restore the P8 tokenizer contract only for the compute-node bridge. Invalid or
+/// incomplete input is deliberately indistinguishable from an absent contract.
+fn configure_benchmark_tokenizer_env<C>(
+    command: &mut C,
+    request: Option<OsString>,
+    evidence: Option<OsString>,
+) where
+    C: PythonEnvCommand,
+{
+    command.remove_env(BENCHMARK_TOKENIZER_REQUEST_ENV);
+    command.remove_env(BENCHMARK_TOKENIZER_EVIDENCE_ENV);
+
+    let (Some(request), Some(evidence)) = (request, evidence) else {
+        return;
+    };
+    let request_path = PathBuf::from(&request);
+    let evidence_path = PathBuf::from(&evidence);
+    if !request_path.is_absolute() || !evidence_path.is_absolute() || !request_path.is_file() {
+        return;
+    }
+    if !matches!(
+        request_path.symlink_metadata(),
+        Ok(metadata) if !metadata.file_type().is_symlink()
+    ) || matches!(
+        evidence_path.symlink_metadata(),
+        Ok(metadata) if metadata.file_type().is_symlink()
+    ) {
+        return;
+    }
+    let Some(evidence_name) = evidence_path.file_name() else {
+        return;
+    };
+    let Some(evidence_parent) = evidence_path.parent() else {
+        return;
+    };
+    let (Ok(request_canonical), Ok(parent_canonical)) =
+        (request_path.canonicalize(), evidence_parent.canonicalize())
+    else {
+        return;
+    };
+    if !parent_canonical.is_dir() {
+        return;
+    }
+    let evidence_canonical_shape = parent_canonical.join(evidence_name);
+    if request_canonical == evidence_canonical_shape
+        || (evidence_path.exists()
+            && (!evidence_path.is_file()
+                || evidence_path
+                    .canonicalize()
+                    .map_or(true, |path| path == request_canonical)))
+    {
+        return;
+    }
+
+    command.set_env(BENCHMARK_TOKENIZER_REQUEST_ENV, request);
+    command.set_env(BENCHMARK_TOKENIZER_EVIDENCE_ENV, evidence);
 }
 
 #[derive(Debug)]
@@ -3494,12 +3562,125 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
     use std::path::PathBuf;
     use std::process::Command as StdCommand;
     use std::process::ExitStatus;
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+
+    fn tokenizer_env(command: &crate::python_runtime::PythonEnvCommandRecorder) -> (bool, bool) {
+        (
+            command.value(BENCHMARK_TOKENIZER_REQUEST_ENV).is_some(),
+            command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV).is_some(),
+        )
+    }
+
+    #[test]
+    fn benchmark_tokenizer_pair_is_restored_after_packaged_environment_clearing() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime = temp.path().join("runtime");
+        let import = temp.path().join("resources");
+        std::fs::create_dir_all(&runtime).expect("runtime");
+        std::fs::create_dir_all(&import).expect("import root");
+        let request = temp.path().join("tokenizer-request.json");
+        let evidence = temp.path().join("tokenizer-evidence.json");
+        std::fs::write(&request, "{}").expect("request");
+        let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+        configure_packaged_python_subprocess_env_for_layout(
+            &mut command,
+            &import,
+            ResourceLayoutKind::WindowsResources,
+            &runtime,
+        )
+        .expect("sanitize packaged environment");
+        assert_eq!(tokenizer_env(&command), (false, false));
+
+        configure_benchmark_tokenizer_env(
+            &mut command,
+            Some(request.as_os_str().to_owned()),
+            Some(evidence.as_os_str().to_owned()),
+        );
+
+        assert!(command.clear_env_called);
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_REQUEST_ENV),
+            Some(request.as_os_str())
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(evidence.as_os_str())
+        );
+        assert_eq!(
+            command.value("TOKEN_PLACE_PYTHON_IMPORT_ROOT"),
+            Some(import.as_os_str())
+        );
+    }
+
+    #[test]
+    fn benchmark_tokenizer_pair_is_all_or_nothing_and_rejects_unsafe_shapes() {
+        let temp = TempDir::new().expect("tempdir");
+        let request = temp.path().join("request.json");
+        let evidence = temp.path().join("evidence.json");
+        std::fs::write(&request, "{}").expect("request");
+        let cases = [
+            (None, None),
+            (Some(request.as_os_str().to_owned()), None),
+            (None, Some(evidence.as_os_str().to_owned())),
+            (
+                Some(OsString::from("relative-request")),
+                Some(evidence.as_os_str().to_owned()),
+            ),
+            (
+                Some(request.as_os_str().to_owned()),
+                Some(OsString::from("relative-evidence")),
+            ),
+            (
+                Some(request.as_os_str().to_owned()),
+                Some(request.as_os_str().to_owned()),
+            ),
+            (
+                Some(request.as_os_str().to_owned()),
+                Some(temp.path().as_os_str().to_owned()),
+            ),
+        ];
+        for (request, evidence) in cases {
+            let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+            configure_benchmark_tokenizer_env(&mut command, request, evidence);
+            assert_eq!(tokenizer_env(&command), (false, false));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_tokenizer_pair_preserves_non_utf8_os_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let request = temp
+            .path()
+            .join(OsString::from_vec(b"request-\xff.json".to_vec()));
+        let evidence = temp
+            .path()
+            .join(OsString::from_vec(b"evidence-\xfe.json".to_vec()));
+        std::fs::write(&request, "{}").expect("request");
+        let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+
+        configure_benchmark_tokenizer_env(
+            &mut command,
+            Some(request.as_os_str().to_owned()),
+            Some(evidence.as_os_str().to_owned()),
+        );
+
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_REQUEST_ENV),
+            Some(request.as_os_str())
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(evidence.as_os_str())
+        );
+    }
 
     async fn acknowledge_stopped_event_for_test(state: &ComputeNodeState, session_id: &str) {
         *state.stopped_event_ack_session_id.lock().await = Some(session_id.to_string());

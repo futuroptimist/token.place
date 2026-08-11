@@ -20,11 +20,12 @@ use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +37,70 @@ use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Notify};
 
 const EXPECTED_MODEL_ARTIFACT_FILENAME: &str = "Qwen3-8B-Q4_K_M.gguf";
+const BENCHMARK_TOKENIZER_REQUEST_ENV: &str =
+    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST";
+const BENCHMARK_TOKENIZER_EVIDENCE_ENV: &str =
+    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE";
+
+/// Restores the explicit P8 tokenizer file handoff after the packaged-runtime
+/// sanitizer has cleared the parent environment. This is intentionally called
+/// only for the compute-node bridge, rather than being a packaged-Python
+/// allowlist entry shared by probes and unrelated sidecars.
+fn configure_benchmark_tokenizer_bridge_env<C>(
+    command: &mut C,
+    request_value: Option<OsString>,
+    evidence_value: Option<OsString>,
+) where
+    C: PythonEnvCommand,
+{
+    command.remove_env(BENCHMARK_TOKENIZER_REQUEST_ENV);
+    command.remove_env(BENCHMARK_TOKENIZER_EVIDENCE_ENV);
+
+    let (Some(request_value), Some(evidence_value)) = (request_value, evidence_value) else {
+        return;
+    };
+    let request_path = PathBuf::from(&request_value);
+    let evidence_path = PathBuf::from(&evidence_value);
+    if !request_path.is_absolute() || !evidence_path.is_absolute() {
+        return;
+    }
+    let Ok(request_metadata) = request_path.metadata() else {
+        return;
+    };
+    if !request_metadata.is_file() {
+        return;
+    }
+    let Some(evidence_parent) = evidence_path.parent() else {
+        return;
+    };
+    let Some(evidence_name) = evidence_path.file_name() else {
+        return;
+    };
+    let Ok(request_canonical) = request_path.canonicalize() else {
+        return;
+    };
+    let Ok(parent_canonical) = evidence_parent.canonicalize() else {
+        return;
+    };
+    if !parent_canonical.is_dir() {
+        return;
+    }
+    let evidence_canonical = parent_canonical.join(evidence_name);
+    if evidence_canonical == request_canonical {
+        return;
+    }
+    if let Ok(metadata) = evidence_path.symlink_metadata() {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return;
+        }
+        if evidence_path.canonicalize().ok().as_ref() == Some(&request_canonical) {
+            return;
+        }
+    }
+
+    command.set_env(BENCHMARK_TOKENIZER_REQUEST_ENV, request_value);
+    command.set_env(BENCHMARK_TOKENIZER_EVIDENCE_ENV, evidence_value);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeNodeRequest {
@@ -2579,6 +2644,11 @@ pub async fn start_compute_node(
             launcher_metadata.as_ref().map(|m| m.2.as_str()).unwrap_or("none")
         ),
     );
+    configure_benchmark_tokenizer_bridge_env(
+        &mut bridge_command,
+        std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
+        std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+    );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
     for (key, value) in bridge_session_env_vars(&session_id, log_file_path.as_deref()) {
         bridge_command.env(key, value);
@@ -3500,6 +3570,127 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+
+    fn std_command_os_env(command: &StdCommand, key: &str) -> Option<OsString> {
+        command
+            .get_envs()
+            .find_map(|(name, value)| (name == key).then(|| value.map(OsString::from)).flatten())
+    }
+
+    #[test]
+    fn benchmark_tokenizer_pair_survives_sanitization_only_for_bridge() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime = temp.path().join("python-runtime");
+        std::fs::create_dir_all(&runtime).expect("runtime");
+        let request = temp.path().join("request.json");
+        let evidence = temp.path().join("evidence.json");
+        std::fs::write(&request, b"{}").expect("request");
+
+        let mut bridge = StdCommand::new("python");
+        crate::python_runtime::sanitize_packaged_python_subprocess_env(&mut bridge, Some(&runtime))
+            .expect("sanitized packaged environment");
+        configure_benchmark_tokenizer_bridge_env(
+            &mut bridge,
+            Some(request.clone().into_os_string()),
+            Some(evidence.clone().into_os_string()),
+        );
+        bridge.env("TOKENPLACE_RUNTIME_ID", "bundled-test");
+
+        assert_eq!(
+            std_command_os_env(&bridge, BENCHMARK_TOKENIZER_REQUEST_ENV),
+            Some(request.into_os_string())
+        );
+        assert_eq!(
+            std_command_os_env(&bridge, BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(evidence.into_os_string())
+        );
+        assert_eq!(
+            std_command_os_env(&bridge, "TOKENPLACE_RUNTIME_ID").as_deref(),
+            Some(std::ffi::OsStr::new("bundled-test"))
+        );
+
+        let unrelated = StdCommand::new("python");
+        assert_eq!(
+            std_command_os_env(&unrelated, BENCHMARK_TOKENIZER_REQUEST_ENV),
+            None
+        );
+        assert_eq!(
+            std_command_os_env(&unrelated, BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            None
+        );
+    }
+
+    #[test]
+    fn benchmark_tokenizer_pair_is_all_or_nothing_and_rejects_unsafe_shapes() {
+        let temp = TempDir::new().expect("tempdir");
+        let request = temp.path().join("request.json");
+        let evidence = temp.path().join("evidence.json");
+        std::fs::write(&request, b"{}").expect("request");
+        let cases = [
+            (None, None),
+            (Some(request.clone().into_os_string()), None),
+            (None, Some(evidence.clone().into_os_string())),
+            (
+                Some(OsString::from("relative.json")),
+                Some(evidence.clone().into_os_string()),
+            ),
+            (
+                Some(request.clone().into_os_string()),
+                Some(OsString::from("relative.json")),
+            ),
+            (
+                Some(request.clone().into_os_string()),
+                Some(request.clone().into_os_string()),
+            ),
+            (
+                Some(request.clone().into_os_string()),
+                Some(temp.path().as_os_str().to_owned()),
+            ),
+        ];
+        for (request_value, evidence_value) in cases {
+            let mut command = StdCommand::new("python");
+            command.env(BENCHMARK_TOKENIZER_REQUEST_ENV, "poison-request");
+            command.env(BENCHMARK_TOKENIZER_EVIDENCE_ENV, "poison-evidence");
+            configure_benchmark_tokenizer_bridge_env(&mut command, request_value, evidence_value);
+            assert_eq!(
+                std_command_os_env(&command, BENCHMARK_TOKENIZER_REQUEST_ENV),
+                None
+            );
+            assert_eq!(
+                std_command_os_env(&command, BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+                None
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_tokenizer_pair_preserves_non_utf8_os_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let request = temp
+            .path()
+            .join(OsString::from_vec(b"request-\xff.json".to_vec()));
+        let evidence = temp
+            .path()
+            .join(OsString::from_vec(b"evidence-\xfe.json".to_vec()));
+        std::fs::write(&request, b"{}").expect("request");
+        let mut command = StdCommand::new("python");
+        configure_benchmark_tokenizer_bridge_env(
+            &mut command,
+            Some(request.clone().into_os_string()),
+            Some(evidence.clone().into_os_string()),
+        );
+        assert_eq!(
+            std_command_os_env(&command, BENCHMARK_TOKENIZER_REQUEST_ENV),
+            Some(request.into_os_string())
+        );
+        assert_eq!(
+            std_command_os_env(&command, BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(evidence.into_os_string())
+        );
+    }
 
     async fn acknowledge_stopped_event_for_test(state: &ComputeNodeState, session_id: &str) {
         *state.stopped_event_ack_session_id.lock().await = Some(session_id.to_string());

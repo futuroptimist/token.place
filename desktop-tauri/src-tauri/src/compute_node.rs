@@ -56,20 +56,24 @@ fn apply_benchmark_tokenizer_env<C>(
     };
     let request_path = PathBuf::from(&request);
     let evidence_path = PathBuf::from(&evidence);
+    let request_metadata = std::fs::symlink_metadata(&request_path);
     if !request_path.is_absolute()
-        || !request_path.is_file()
+        || request_metadata.as_ref().map_or(true, |metadata| {
+            metadata.file_type().is_symlink() || !metadata.is_file()
+        })
         || !evidence_path.is_absolute()
         || evidence_path.file_name().is_none()
-        || evidence_path.is_dir()
-        || evidence_path.is_symlink()
-        || (evidence_path.exists() && !evidence_path.is_file())
+        || std::fs::symlink_metadata(&evidence_path)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
     {
         return;
     }
     let Some(evidence_parent) = evidence_path.parent() else {
         return;
     };
-    if !evidence_parent.is_dir() {
+    if std::fs::symlink_metadata(evidence_parent).map_or(true, |metadata| {
+        metadata.file_type().is_symlink() || !metadata.is_dir()
+    }) {
         return;
     }
     let Ok(canonical_request) = request_path.canonicalize() else {
@@ -3572,6 +3576,7 @@ mod tests {
             Some(&runtime),
         )
         .expect("packaged environment sanitizer");
+        configure_runtime_bootstrap_env(&mut command, &ComputeMode::Gpu);
         command.set_env("TOKENPLACE_APP_VERSION", "0.1.15");
         apply_benchmark_tokenizer_env(
             &mut command,
@@ -3589,6 +3594,15 @@ mod tests {
         assert_eq!(
             command.value("TOKENPLACE_APP_VERSION"),
             Some(OsStr::new("0.1.15"))
+        );
+        // The tokenizer handoff runs immediately before bridge spawn. On targets
+        // whose packaged runtime supports GPU acceleration, it must not erase the
+        // bootstrap flag and silently turn a GPU request into CPU execution.
+        let expected_gpu_bootstrap =
+            should_enable_runtime_bootstrap(&ComputeMode::Gpu).then_some(OsStr::new("1"));
+        assert_eq!(
+            command.value(ENABLE_RUNTIME_BOOTSTRAP_ENV),
+            expected_gpu_bootstrap
         );
 
         for (request_value, evidence_value) in [
@@ -3622,6 +3636,42 @@ mod tests {
             apply_benchmark_tokenizer_env(&mut rejected, request_value, evidence_value);
             assert_eq!(rejected.value(BENCHMARK_TOKENIZER_REQUEST_ENV), None);
             assert_eq!(rejected.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_tokenizer_env_rejects_symlinked_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let request = temp.path().join("tokenizer-request.json");
+        std::fs::write(&request, b"{}\n").expect("request fixture");
+        let request_link = temp.path().join("tokenizer-request-link.json");
+        symlink(&request, &request_link).expect("request symlink");
+
+        let evidence_dir = temp.path().join("evidence");
+        std::fs::create_dir(&evidence_dir).expect("evidence directory");
+        let evidence_dir_link = temp.path().join("evidence-link");
+        symlink(&evidence_dir, &evidence_dir_link).expect("evidence directory symlink");
+        let evidence_file = evidence_dir.join("existing-evidence.json");
+        std::fs::write(&evidence_file, b"{}\n").expect("evidence fixture");
+        let evidence_file_link = temp.path().join("evidence-file-link.json");
+        symlink(&evidence_file, &evidence_file_link).expect("evidence file symlink");
+
+        for (request_path, evidence_path) in [
+            (request_link, temp.path().join("evidence.json")),
+            (request.clone(), evidence_dir_link.join("evidence.json")),
+            (request.clone(), evidence_file_link),
+        ] {
+            let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+            apply_benchmark_tokenizer_env(
+                &mut command,
+                Some(request_path.into_os_string()),
+                Some(evidence_path.into_os_string()),
+            );
+            assert_eq!(command.value(BENCHMARK_TOKENIZER_REQUEST_ENV), None);
+            assert_eq!(command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV), None);
         }
     }
 

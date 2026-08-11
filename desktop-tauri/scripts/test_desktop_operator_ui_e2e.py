@@ -766,7 +766,7 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
         schema_version: str, phases: tuple[str, ...], *, last_safe_phase: str,
         failure_reason: str | None = None, cleanup_succeeded: bool | None = None,
         retry_timeout_s: float = 1.0, clock=time.monotonic,
-        sleeper=time.sleep) -> None:
+        sleeper=time.sleep, platform: str | None = None) -> None:
     """Atomically checkpoint an allowlisted phase without identifiers or payload data."""
     payload = {"schema_version": schema_version, "phase": phase,
         "sequence": phases.index(phase) + 1,
@@ -776,6 +776,7 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
     temporary_fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
+    platform = platform or ("win32" if os.name == "nt" else "other")
     deadline = clock() + max(0.0, retry_timeout_s)
     try:
         if hasattr(os, "fchmod"):
@@ -790,7 +791,7 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
                 temporary.replace(path)
                 return
             except OSError as exc:
-                if not _is_windows_sharing_violation(exc):
+                if not _is_windows_phase_checkpoint_contention(exc, platform=platform):
                     raise
                 remaining = deadline - clock()
                 if remaining <= 0:
@@ -804,7 +805,7 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
                 temporary.unlink(missing_ok=True)
                 break
             except OSError as exc:
-                if not _is_windows_sharing_violation(exc):
+                if not _is_windows_phase_checkpoint_contention(exc, platform=platform):
                     raise
                 remaining = deadline - clock()
                 if remaining <= 0:
@@ -815,6 +816,12 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
 def _is_windows_sharing_violation(exc: BaseException) -> bool:
     """Recognize only Windows sharing/lock violations, not generic access denial."""
     return isinstance(exc, OSError) and getattr(exc, "winerror", None) in {32, 33}
+
+
+def _is_windows_phase_checkpoint_contention(exc: BaseException, *, platform: str) -> bool:
+    """Recognize contention only while publishing an owner-created checkpoint temp file."""
+    return (_is_windows_sharing_violation(exc)
+        or (platform == "win32" and isinstance(exc, PermissionError)))
 
 
 def _remove_owned_path(path: Path, deadline: float, *, directory: bool = False,

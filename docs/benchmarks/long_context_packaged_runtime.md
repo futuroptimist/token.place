@@ -63,8 +63,10 @@ be finite and positive. External E2EE relays require HTTPS; loopback relays may 
 Credentials, fragments, malformed ports, and other schemes are rejected. Temporary request,
 evidence, and diagnostic files are owner-only on POSIX, portable to Windows Python 3.11, and closed
 and deleted after each run. Phase checkpoints use owner-only, unique temporary files and atomic
-replacement; Windows sharing denials during publication are retried only until a small deadline, so
-polling never exposes partial JSON. Owner-created logs and directories are closed and removed with
+replacement; Windows sharing denials and `PermissionError` contention on that checkpoint's own
+temporary file and destination are retried only until a small deadline, so polling never exposes
+partial JSON. This narrow exception does not broaden retries for other files or cleanup paths.
+Owner-created logs and directories are closed and removed with
 the same bounded, Windows-lock-tolerant cleanup policy after the exact owned process tree has been
 asked to exit. A cleanup failure is reported categorically and separately without replacing an
 earlier runner failure. Runner output is written to a temporary bounded diagnostic tail rather than
@@ -74,6 +76,11 @@ the subprocess boundary and are orchestration evidence, never physical Metal/CUD
 
 Physical Windows/CUDA and macOS/Metal validation of these checkpoint and cleanup changes remains
 outstanding; this harness change does not claim a successful physical benchmark.
+
+After this follow-up to #1631 and #1634 merges, rerun the #1566 one-cell Windows/CUDA physical gate
+with `small-8k` / `single-needle` / `64k-full` against the unchanged desktop `0.1.14` application
+and `llama-cpp-python==0.3.32`. Do not attempt `8k-fast` classification or the six-cell matrix until
+that gate succeeds; deterministic unit tests are not physical Windows/CUDA evidence.
 
 ## Fixture generation
 

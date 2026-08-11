@@ -64,7 +64,10 @@ Credentials, fragments, malformed ports, and other schemes are rejected. Tempora
 evidence, and diagnostic files are owner-only on POSIX, portable to Windows Python 3.11, and closed
 and deleted after each run. Phase checkpoints use owner-only, unique temporary files and atomic
 replacement; Windows sharing denials during publication are retried only until a small deadline, so
-polling never exposes partial JSON. Owner-created logs and directories are closed and removed with
+polling never exposes partial JSON. Windows `PermissionError` is also treated as potential
+contention only while replacing the checkpoint's unique owner-created temporary file, or removing
+that same temporary artifact; unrelated filesystem operations retain their existing strict error
+handling. Owner-created logs and directories are closed and removed with
 the same bounded, Windows-lock-tolerant cleanup policy after the exact owned process tree has been
 asked to exit. A cleanup failure is reported categorically and separately without replacing an
 earlier runner failure. Runner output is written to a temporary bounded diagnostic tail rather than
@@ -72,8 +75,11 @@ buffered without limit. On timeout the harness targets only the process tree it 
 runner's bounded cleanup opportunity; it never matches broad process names. Unit tests replace only
 the subprocess boundary and are orchestration evidence, never physical Metal/CUDA evidence.
 
-Physical Windows/CUDA and macOS/Metal validation of these checkpoint and cleanup changes remains
-outstanding; this harness change does not claim a successful physical benchmark.
+This #1566 physical-validation follow-up to #1631 and #1634 does not claim Windows/CUDA success from
+unit tests. After merge, rerun the same one-cell Windows/CUDA `small-8k` / `single-needle` /
+`64k-full` physical gate against unchanged desktop `0.1.14` and `llama-cpp-python==0.3.32` before
+attempting `8k-fast` classification or the six-cell matrix. Physical macOS/Metal validation also
+remains outstanding.
 
 ## Fixture generation
 

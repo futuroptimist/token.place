@@ -268,10 +268,19 @@ never retains exception strings, traceback text, or a raw diagnostic tail. Missi
 stale phase state fails closed as a runtime-contract failure, and all request, response, diagnostic,
 and phase files are deleted after the attempt.
 
+On Windows, publication of the phase file boundedly retries both sharing violations and
+`PermissionError` from atomic replacement of its unique owner-created temporary file. The same
+narrow rule covers removal of only that temporary artifact; it does not broaden retries for phase
+reads, general cleanup, model or user files, or other filesystem access. Deadline exhaustion still
+fails with a sanitized categorical publication error.
+
 The sanitized Windows 11/NVIDIA attempt described for this follow-up completed zero trials: its
 child runner failed at the impossible pre-prompt Send-eligibility wait. It therefore supplied **no
 semantic baseline**. Corrected readiness ordering and mocked orchestration tests are not physical
-CUDA or Metal validation; physical Windows/CUDA and macOS/Metal reruns remain required.
+CUDA or Metal validation; physical Windows/CUDA and macOS/Metal reruns remain required. After this
+#1566 physical-validation follow-up to #1631 and #1634 merges, rerun the same one-cell Windows/CUDA
+`small-8k` / `single-needle` / `64k-full` gate against the unchanged desktop `0.1.14` and
+`llama-cpp-python==0.3.32` before attempting `8k-fast` classification or the six-cell matrix.
 
 Failed or `not_run` packaged reports require a stable categorical failure code. Report validation
 does not fill absent telemetry with zero and does not allow `NaN` or infinity.

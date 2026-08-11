@@ -20,11 +20,12 @@ use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,6 +35,99 @@ use tokio::process::{Child, ChildStdin, Command};
 #[cfg(test)]
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Notify};
+
+const BENCHMARK_TOKENIZER_REQUEST_ENV: &str =
+    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST";
+const BENCHMARK_TOKENIZER_EVIDENCE_ENV: &str =
+    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE";
+
+fn metadata_is_alias(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn canonical_non_alias_directory(path: &Path) -> Option<PathBuf> {
+    // Validate the configured parent entry itself; unrelated platform ancestors
+    // may be aliases (for example, macOS /var). Canonicalization below supplies
+    // the directory identity used for request/evidence alias checks.
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata_is_alias(&metadata) || !metadata.is_dir() {
+        return None;
+    }
+    path.canonicalize().ok()
+}
+
+fn apply_benchmark_tokenizer_env<C>(
+    command: &mut C,
+    request: Option<OsString>,
+    evidence: Option<OsString>,
+) where
+    C: PythonEnvCommand,
+{
+    command.remove_env(OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ENV));
+    command.remove_env(OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ENV));
+
+    let (Some(request), Some(evidence)) = (request, evidence) else {
+        return;
+    };
+    let request_path = PathBuf::from(&request);
+    let evidence_path = PathBuf::from(&evidence);
+    let request_metadata = std::fs::symlink_metadata(&request_path);
+    if !request_path.is_absolute()
+        || request_metadata.as_ref().map_or(true, |metadata| {
+            metadata_is_alias(metadata) || !metadata.is_file()
+        })
+        || !evidence_path.is_absolute()
+        || !matches!(
+            evidence_path.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return;
+    }
+    let Some(evidence_parent) = evidence_path.parent() else {
+        return;
+    };
+    let Some(canonical_evidence_parent) = canonical_non_alias_directory(evidence_parent) else {
+        return;
+    };
+    let Ok(canonical_request) = request_path.canonicalize() else {
+        return;
+    };
+    let evidence_name = evidence_path
+        .file_name()
+        .expect("normal final component has a filename");
+    if canonical_evidence_parent.join(evidence_name) == canonical_request {
+        return;
+    }
+    match std::fs::symlink_metadata(&evidence_path) {
+        Ok(metadata) => {
+            if metadata_is_alias(&metadata) || !metadata.is_file() {
+                return;
+            }
+            let Ok(canonical_evidence) = evidence_path.canonicalize() else {
+                return;
+            };
+            if canonical_evidence == canonical_request {
+                return;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
+
+    command.set_env(OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ENV), request);
+    command.set_env(OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ENV), evidence);
+}
 
 const EXPECTED_MODEL_ARTIFACT_FILENAME: &str = "Qwen3-8B-Q4_K_M.gguf";
 
@@ -2595,6 +2689,11 @@ pub async fn start_compute_node(
         bridge_command.env("TOKENPLACE_INTERPRETER_BASENAME", basename);
         bridge_command.env("TOKENPLACE_RUNTIME_ID", runtime_id);
     }
+    apply_benchmark_tokenizer_env(
+        &mut bridge_command,
+        std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
+        std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+    );
 
     isolate_bridge_process_tree(&mut bridge_command);
 
@@ -3494,12 +3593,230 @@ pub async fn stop_compute_node(state: ComputeNodeState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::process::Command as StdCommand;
     use std::process::ExitStatus;
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+
+    #[test]
+    fn benchmark_tokenizer_env_is_paired_validated_and_bridge_scoped() {
+        let temp = TempDir::new().expect("tempdir");
+        let request = temp.path().join("tokenizer-request.json");
+        let evidence = temp.path().join("tokenizer-evidence.json");
+        let existing_evidence = temp.path().join("existing-tokenizer-evidence.json");
+        std::fs::write(&request, b"{}\n").expect("request fixture");
+        std::fs::write(&existing_evidence, b"{}\n").expect("existing evidence fixture");
+        let non_directory_parent = temp.path().join("not-a-directory");
+        std::fs::write(&non_directory_parent, b"not a directory").expect("parent fixture");
+        let runtime = temp.path().join("python-runtime");
+        std::fs::create_dir(&runtime).expect("runtime fixture");
+
+        let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+        crate::python_runtime::sanitize_packaged_python_subprocess_env(
+            &mut command,
+            Some(&runtime),
+        )
+        .expect("packaged environment sanitizer");
+        configure_runtime_bootstrap_env(&mut command, &ComputeMode::Gpu);
+        for (key, value) in [
+            ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
+            ("TOKENPLACE_BUILD_ID", "build-test"),
+            ("TOKENPLACE_APP_VERSION", "0.1.15"),
+            ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
+            ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
+            ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),
+            ("TOKENPLACE_INTERPRETER_BASENAME", "python3"),
+            ("TOKENPLACE_RUNTIME_ID", "runtime-test"),
+        ] {
+            command.set_env(key, value);
+        }
+        apply_benchmark_tokenizer_env(
+            &mut command,
+            Some(request.clone().into_os_string()),
+            Some(evidence.clone().into_os_string()),
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_REQUEST_ENV),
+            Some(request.as_os_str())
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(evidence.as_os_str())
+        );
+        for (key, value) in [
+            ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
+            ("TOKENPLACE_BUILD_ID", "build-test"),
+            ("TOKENPLACE_APP_VERSION", "0.1.15"),
+            ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
+            ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
+            ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),
+            ("TOKENPLACE_INTERPRETER_BASENAME", "python3"),
+            ("TOKENPLACE_RUNTIME_ID", "runtime-test"),
+        ] {
+            assert_eq!(command.value(key), Some(OsStr::new(value)));
+        }
+        // The tokenizer handoff runs immediately before bridge spawn. On targets
+        // whose packaged runtime supports GPU acceleration, it must not erase the
+        // bootstrap flag and silently turn a GPU request into CPU execution.
+        let expected_gpu_bootstrap =
+            should_enable_runtime_bootstrap(&ComputeMode::Gpu).then_some(OsStr::new("1"));
+        assert_eq!(
+            command.value(ENABLE_RUNTIME_BOOTSTRAP_ENV),
+            expected_gpu_bootstrap
+        );
+        let mut cpu_fallback = serde_json::from_str::<Value>(PRODUCTION_PREFLIGHT_VALIDATED_EVENT)
+            .expect("production preflight fixture");
+        cpu_fallback["selected_backend"] = Value::String("cpu".into());
+        assert_eq!(
+            validate_production_operator_preflight_event(cpu_fallback)
+                .expect_err("GPU handoff must fail closed on a CPU backend")
+                .to_string(),
+            "operator_preflight_invalid_event"
+        );
+
+        let mut existing = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+        apply_benchmark_tokenizer_env(
+            &mut existing,
+            Some(request.clone().into_os_string()),
+            Some(existing_evidence.clone().into_os_string()),
+        );
+        assert_eq!(
+            existing.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(existing_evidence.as_os_str())
+        );
+
+        for (request_value, evidence_value) in [
+            (None, None),
+            (Some(request.clone().into_os_string()), None),
+            (None, Some(evidence.clone().into_os_string())),
+            (
+                Some(PathBuf::from("relative-request").into_os_string()),
+                Some(evidence.clone().into_os_string()),
+            ),
+            (
+                Some(request.clone().into_os_string()),
+                Some(PathBuf::from("relative-evidence").into_os_string()),
+            ),
+            (
+                Some(request.clone().into_os_string()),
+                Some(request.clone().into_os_string()),
+            ),
+            (
+                Some(request.clone().into_os_string()),
+                Some(temp.path().join("missing/evidence.json").into_os_string()),
+            ),
+            (
+                Some(temp.path().join("missing-request.json").into_os_string()),
+                Some(evidence.clone().into_os_string()),
+            ),
+            (
+                Some(temp.path().to_path_buf().into_os_string()),
+                Some(evidence.clone().into_os_string()),
+            ),
+            (
+                Some(request.clone().into_os_string()),
+                Some(non_directory_parent.join("evidence.json").into_os_string()),
+            ),
+            (
+                Some(request.clone().into_os_string()),
+                Some(temp.path().to_path_buf().into_os_string()),
+            ),
+        ] {
+            let mut rejected = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+            rejected.set_env(BENCHMARK_TOKENIZER_REQUEST_ENV, "must-be-removed");
+            rejected.set_env(BENCHMARK_TOKENIZER_EVIDENCE_ENV, "must-be-removed");
+            apply_benchmark_tokenizer_env(&mut rejected, request_value, evidence_value);
+            assert_eq!(rejected.value(BENCHMARK_TOKENIZER_REQUEST_ENV), None);
+            assert_eq!(rejected.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_tokenizer_env_rejects_symlinked_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let request = temp.path().join("tokenizer-request.json");
+        std::fs::write(&request, b"{}\n").expect("request fixture");
+        let request_link = temp.path().join("tokenizer-request-link.json");
+        symlink(&request, &request_link).expect("request symlink");
+
+        let evidence_dir = temp.path().join("evidence");
+        std::fs::create_dir(&evidence_dir).expect("evidence directory");
+        std::fs::create_dir(evidence_dir.join("nested")).expect("nested evidence directory");
+        let evidence_dir_link = temp.path().join("evidence-link");
+        symlink(&evidence_dir, &evidence_dir_link).expect("evidence directory symlink");
+        let evidence_ancestor_link = temp.path().join("evidence-ancestor-link");
+        symlink(&evidence_dir, &evidence_ancestor_link).expect("evidence ancestor symlink");
+        let evidence_file = evidence_dir.join("existing-evidence.json");
+        std::fs::write(&evidence_file, b"{}\n").expect("evidence fixture");
+        let evidence_file_link = temp.path().join("evidence-file-link.json");
+        symlink(&evidence_file, &evidence_file_link).expect("evidence file symlink");
+
+        for (request_path, evidence_path) in [
+            (request_link, temp.path().join("evidence.json")),
+            (request.clone(), evidence_dir_link.join("evidence.json")),
+            (request.clone(), evidence_file_link),
+        ] {
+            let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+            apply_benchmark_tokenizer_env(
+                &mut command,
+                Some(request_path.into_os_string()),
+                Some(evidence_path.into_os_string()),
+            );
+            assert_eq!(command.value(BENCHMARK_TOKENIZER_REQUEST_ENV), None);
+            assert_eq!(command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV), None);
+        }
+
+        // An alias outside the configured parent is harmless: the parent entry
+        // (`nested`) is a real directory and canonical identity checks still apply.
+        let evidence_through_ancestor_alias = evidence_ancestor_link.join("nested/evidence.json");
+        let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+        apply_benchmark_tokenizer_env(
+            &mut command,
+            Some(request.clone().into_os_string()),
+            Some(evidence_through_ancestor_alias.clone().into_os_string()),
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_REQUEST_ENV),
+            Some(request.as_os_str())
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(evidence_through_ancestor_alias.as_os_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_tokenizer_env_preserves_non_utf8_os_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let request_name = OsString::from_vec(b"request-\x80.json".to_vec());
+        let evidence_name = OsString::from_vec(b"evidence-\x81.json".to_vec());
+        let request = temp.path().join(request_name);
+        let evidence = temp.path().join(evidence_name);
+        std::fs::write(&request, b"{}\n").expect("non-UTF-8 request fixture");
+        let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+
+        apply_benchmark_tokenizer_env(
+            &mut command,
+            Some(request.clone().into_os_string()),
+            Some(evidence.clone().into_os_string()),
+        );
+
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_REQUEST_ENV),
+            Some(request.as_os_str())
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(evidence.as_os_str())
+        );
+    }
 
     async fn acknowledge_stopped_event_for_test(state: &ComputeNodeState, session_id: &str) {
         *state.stopped_event_ack_session_id.lock().await = Some(session_id.to_string());
@@ -7247,21 +7564,49 @@ mod tests {
             layout: ResourceLayoutKind::WindowsResources,
         };
         let previous = std::env::var_os("TOKEN_PLACE_PYTHON_IMPORT_ROOT");
+        let previous_request = std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV);
+        let previous_evidence = std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV);
         // SAFETY: The shared environment-test lock prevents concurrent mutation, and the
         // previous value is restored before this test returns.
         unsafe {
             std::env::set_var("TOKEN_PLACE_PYTHON_IMPORT_ROOT", &poisoned_root);
+            std::env::set_var(BENCHMARK_TOKENIZER_REQUEST_ENV, "poison-request");
+            std::env::set_var(BENCHMARK_TOKENIZER_EVIDENCE_ENV, "poison-evidence");
         }
 
         let command =
             build_installed_context_probe_command(&preparation, &DesktopConfig::default())
                 .expect("build prepared context probe");
+        let async_command = preparation.command().expect("async bridge command");
+        let reusable_commands = [
+            preparation.blocking_command().expect("blocking command"),
+            preparation
+                .model_inspect_command()
+                .expect("model inspect command"),
+            crate::sidecar::build_sidecar_command(
+                import_root
+                    .join("python/inference_sidecar.py")
+                    .to_string_lossy()
+                    .as_ref(),
+                preparation.launcher.clone(),
+            )
+            .expect("sidecar command")
+            .into_std(),
+        ];
 
         // SAFETY: Restore the process environment while still holding the shared lock.
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("TOKEN_PLACE_PYTHON_IMPORT_ROOT", value),
                 None => std::env::remove_var("TOKEN_PLACE_PYTHON_IMPORT_ROOT"),
+            }
+            match previous_request {
+                Some(value) => std::env::set_var(BENCHMARK_TOKENIZER_REQUEST_ENV, value),
+                None => std::env::remove_var(BENCHMARK_TOKENIZER_REQUEST_ENV),
+            }
+            match previous_evidence {
+                Some(value) => std::env::set_var(BENCHMARK_TOKENIZER_EVIDENCE_ENV, value),
+                None => std::env::remove_var(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
             }
         }
         assert_eq!(
@@ -7275,7 +7620,7 @@ mod tests {
         assert_eq!(
             command
                 .get_envs()
-                .find_map(|(key, value)| (key == "PYTHONPATH").then_some(value))
+                .find_map(|(key, value)| (key == OsStr::new("PYTHONPATH")).then_some(value))
                 .flatten(),
             Some(expected_pythonpath.as_os_str())
         );
@@ -7297,33 +7642,37 @@ mod tests {
             expected_trusted.push(system32);
         }
         let expected_path = std::env::join_paths(expected_trusted).expect("trusted runtime path");
-        let async_command = preparation.command().expect("async bridge command");
         assert_eq!(
             command_env_value(&async_command, "PATH").as_deref(),
             expected_path.to_str()
         );
-        for command in [
-            preparation.blocking_command().expect("blocking command"),
-            preparation
-                .model_inspect_command()
-                .expect("model inspect command"),
-            crate::sidecar::build_sidecar_command(
-                import_root
-                    .join("python/inference_sidecar.py")
-                    .to_string_lossy()
-                    .as_ref(),
-                preparation.launcher.clone(),
-            )
-            .expect("sidecar command")
-            .into_std(),
-        ] {
+        for command in reusable_commands {
             assert_eq!(
                 command
                     .get_envs()
-                    .find_map(|(key, value)| (key == "PATH").then_some(value))
+                    .find_map(|(key, value)| (key == OsStr::new("PATH")).then_some(value))
                     .flatten(),
                 Some(expected_path.as_os_str())
             );
+            for key in [
+                BENCHMARK_TOKENIZER_REQUEST_ENV,
+                BENCHMARK_TOKENIZER_EVIDENCE_ENV,
+            ] {
+                assert_eq!(
+                    command
+                        .get_envs()
+                        .find(|(name, _)| *name == OsStr::new(key)),
+                    None,
+                    "reusable Python command must omit {key}"
+                );
+            }
+        }
+        for key in [
+            BENCHMARK_TOKENIZER_REQUEST_ENV,
+            BENCHMARK_TOKENIZER_EVIDENCE_ENV,
+        ] {
+            assert_eq!(std_command_env_value(&command, key), None);
+            assert_eq!(command_env_value(&async_command, key), None);
         }
     }
 

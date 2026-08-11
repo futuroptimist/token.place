@@ -7659,7 +7659,9 @@ mod tests {
                 BENCHMARK_TOKENIZER_EVIDENCE_ENV,
             ] {
                 assert_eq!(
-                    command.get_envs().find(|(name, _)| name == OsStr::new(key)),
+                    command
+                        .get_envs()
+                        .find(|(name, _)| *name == OsStr::new(key)),
                     None,
                     "reusable Python command must omit {key}"
                 );

@@ -20,11 +20,12 @@ use crate::subprocess_logging::{SubprocessLogFilter, SubprocessLogPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +37,60 @@ use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Notify};
 
 const EXPECTED_MODEL_ARTIFACT_FILENAME: &str = "Qwen3-8B-Q4_K_M.gguf";
+const BENCHMARK_TOKENIZER_REQUEST_ENV: &str =
+    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST";
+const BENCHMARK_TOKENIZER_EVIDENCE_ENV: &str =
+    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE";
+
+fn configure_benchmark_tokenizer_bridge_env<C>(
+    command: &mut C,
+    request_value: Option<OsString>,
+    evidence_value: Option<OsString>,
+) where
+    C: PythonEnvCommand,
+{
+    // This bridge-only configuration is deliberately restored after the generic
+    // packaged-runtime sanitizer. Never allow an incomplete or stale pair through.
+    command.remove_env(OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ENV));
+    command.remove_env(OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ENV));
+
+    let (Some(request_value), Some(evidence_value)) = (request_value, evidence_value) else {
+        return;
+    };
+    let request_path = PathBuf::from(&request_value);
+    let evidence_path = PathBuf::from(&evidence_value);
+    if !request_path.is_absolute() || !evidence_path.is_absolute() || !request_path.is_file() {
+        return;
+    }
+    let Some(evidence_parent) = evidence_path.parent() else {
+        return;
+    };
+    if evidence_path.file_name().is_none() || !evidence_parent.is_dir() {
+        return;
+    }
+
+    let Ok(canonical_request) = request_path.canonicalize() else {
+        return;
+    };
+    let Ok(canonical_evidence_parent) = evidence_parent.canonicalize() else {
+        return;
+    };
+    let canonical_evidence = canonical_evidence_parent.join(
+        evidence_path
+            .file_name()
+            .expect("evidence filename was validated"),
+    );
+    if canonical_evidence == canonical_request
+        || evidence_path.is_dir()
+        || evidence_path.is_symlink()
+        || (evidence_path.exists() && !evidence_path.is_file())
+    {
+        return;
+    }
+
+    command.set_env(OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ENV), request_value);
+    command.set_env(OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ENV), evidence_value);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeNodeRequest {
@@ -2580,6 +2635,11 @@ pub async fn start_compute_node(
         ),
     );
     configure_runtime_bootstrap_env(&mut bridge_command, &request.mode);
+    configure_benchmark_tokenizer_bridge_env(
+        &mut bridge_command,
+        std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
+        std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+    );
     for (key, value) in bridge_session_env_vars(&session_id, log_file_path.as_deref()) {
         bridge_command.env(key, value);
     }
@@ -3500,6 +3560,118 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+
+    fn benchmark_paths(temp: &TempDir) -> (PathBuf, PathBuf) {
+        let request = temp.path().join("tokenizer-request.json");
+        std::fs::write(&request, "{}").expect("write tokenizer request");
+        (request, temp.path().join("tokenizer-evidence.json"))
+    }
+
+    #[test]
+    fn benchmark_tokenizer_pair_is_restored_only_for_valid_bridge_configuration() {
+        let temp = TempDir::new().expect("tempdir");
+        let (request, evidence) = benchmark_paths(&temp);
+        let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+        crate::python_runtime::sanitize_packaged_python_subprocess_env(
+            &mut command,
+            Some(temp.path()),
+        )
+        .expect("sanitize packaged environment");
+        command.set_env("TOKENPLACE_RUNTIME_ID", "bundled-test");
+
+        configure_benchmark_tokenizer_bridge_env(
+            &mut command,
+            Some(request.clone().into_os_string()),
+            Some(evidence.clone().into_os_string()),
+        );
+
+        assert!(command.clear_env_called);
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_REQUEST_ENV),
+            Some(request.as_os_str())
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(evidence.as_os_str())
+        );
+        assert_eq!(
+            command.value("TOKENPLACE_RUNTIME_ID"),
+            Some(OsStr::new("bundled-test"))
+        );
+    }
+
+    #[test]
+    fn benchmark_tokenizer_pair_is_not_forwarded_when_absent_or_incomplete() {
+        let temp = TempDir::new().expect("tempdir");
+        let (request, evidence) = benchmark_paths(&temp);
+        for (request_value, evidence_value) in [
+            (None, None),
+            (Some(request.clone().into_os_string()), None),
+            (None, Some(evidence.clone().into_os_string())),
+        ] {
+            let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+            configure_benchmark_tokenizer_bridge_env(&mut command, request_value, evidence_value);
+            assert_eq!(command.value(BENCHMARK_TOKENIZER_REQUEST_ENV), None);
+            assert_eq!(command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV), None);
+        }
+    }
+
+    #[test]
+    fn benchmark_tokenizer_pair_rejects_unsafe_shapes_without_partial_forwarding() {
+        let temp = TempDir::new().expect("tempdir");
+        let (request, evidence) = benchmark_paths(&temp);
+        let missing_request = temp.path().join("private-missing-request");
+        let missing_parent_evidence = temp.path().join("private-missing-parent/evidence.json");
+        let relative_request = PathBuf::from("private-relative-request");
+        let cases = [
+            (missing_request, evidence.clone()),
+            (relative_request, evidence.clone()),
+            (request.clone(), missing_parent_evidence),
+            (request.clone(), request.clone()),
+            (request.clone(), temp.path().to_path_buf()),
+        ];
+        for (request_path, evidence_path) in cases {
+            let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+            configure_benchmark_tokenizer_bridge_env(
+                &mut command,
+                Some(request_path.into_os_string()),
+                Some(evidence_path.into_os_string()),
+            );
+            assert_eq!(command.value(BENCHMARK_TOKENIZER_REQUEST_ENV), None);
+            assert_eq!(command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_tokenizer_pair_preserves_non_utf8_os_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let request = temp
+            .path()
+            .join(OsString::from_vec(b"request-\xff.json".to_vec()));
+        let evidence = temp
+            .path()
+            .join(OsString::from_vec(b"evidence-\xfe.json".to_vec()));
+        std::fs::write(&request, "{}").expect("write non-UTF-8 request");
+        let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+
+        configure_benchmark_tokenizer_bridge_env(
+            &mut command,
+            Some(request.clone().into_os_string()),
+            Some(evidence.clone().into_os_string()),
+        );
+
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_REQUEST_ENV),
+            Some(request.as_os_str())
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(evidence.as_os_str())
+        );
+    }
 
     async fn acknowledge_stopped_event_for_test(state: &ComputeNodeState, session_id: &str) {
         *state.stopped_event_ack_session_id.lock().await = Some(session_id.to_string());
@@ -7324,6 +7496,19 @@ mod tests {
                     .flatten(),
                 Some(expected_path.as_os_str())
             );
+            for key in [
+                BENCHMARK_TOKENIZER_REQUEST_ENV,
+                BENCHMARK_TOKENIZER_EVIDENCE_ENV,
+            ] {
+                assert_eq!(
+                    command
+                        .get_envs()
+                        .find_map(|(candidate, value)| (candidate == key).then_some(value))
+                        .flatten(),
+                    None,
+                    "unrelated packaged Python command inherited {key}"
+                );
+            }
         }
     }
 

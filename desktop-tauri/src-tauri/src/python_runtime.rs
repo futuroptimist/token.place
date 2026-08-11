@@ -1505,6 +1505,14 @@ impl PythonEnvCommandRecorder {
                 ("FORCE_CMAKE", "poison-force-cmake"),
                 ("TOKEN_PLACE_SIDECAR_PYTHON", "poison-sidecar"),
                 ("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "poison-import-root"),
+                (
+                    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST",
+                    "poison-benchmark-request",
+                ),
+                (
+                    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE",
+                    "poison-benchmark-evidence",
+                ),
                 ("PROCESSOR_ARCHITECTURE", "x86"),
                 ("PROCESSOR_ARCHITEW6432", "ARM64"),
             ]

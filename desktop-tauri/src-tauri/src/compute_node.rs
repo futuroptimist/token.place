@@ -56,13 +56,12 @@ fn metadata_is_alias(metadata: &std::fs::Metadata) -> bool {
 }
 
 fn canonical_non_alias_directory(path: &Path) -> Option<PathBuf> {
-    let mut component = Some(path);
-    while let Some(candidate) = component {
-        let metadata = std::fs::symlink_metadata(candidate).ok()?;
-        if metadata_is_alias(&metadata) || !metadata.is_dir() {
-            return None;
-        }
-        component = candidate.parent();
+    // Validate the configured parent entry itself; unrelated platform ancestors
+    // may be aliases (for example, macOS /var). Canonicalization below supplies
+    // the directory identity used for request/evidence alias checks.
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata_is_alias(&metadata) || !metadata.is_dir() {
+        return None;
     }
     path.canonicalize().ok()
 }
@@ -3621,11 +3620,12 @@ mod tests {
         .expect("packaged environment sanitizer");
         configure_runtime_bootstrap_env(&mut command, &ComputeMode::Gpu);
         for (key, value) in [
-            ("TOKENPLACE_SESSION_ID", "session-test"),
+            ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
             ("TOKENPLACE_BUILD_ID", "build-test"),
             ("TOKENPLACE_APP_VERSION", "0.1.15"),
-            ("TOKENPLACE_PYTHON_LAUNCHER_SOURCE", "bundled_runtime"),
-            ("TOKENPLACE_BUNDLED_RUNTIME", "1"),
+            ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
+            ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
+            ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),
             ("TOKENPLACE_INTERPRETER_BASENAME", "python3"),
             ("TOKENPLACE_RUNTIME_ID", "runtime-test"),
         ] {
@@ -3645,11 +3645,12 @@ mod tests {
             Some(evidence.as_os_str())
         );
         for (key, value) in [
-            ("TOKENPLACE_SESSION_ID", "session-test"),
+            ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
             ("TOKENPLACE_BUILD_ID", "build-test"),
             ("TOKENPLACE_APP_VERSION", "0.1.15"),
-            ("TOKENPLACE_PYTHON_LAUNCHER_SOURCE", "bundled_runtime"),
-            ("TOKENPLACE_BUNDLED_RUNTIME", "1"),
+            ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
+            ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
+            ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),
             ("TOKENPLACE_INTERPRETER_BASENAME", "python3"),
             ("TOKENPLACE_RUNTIME_ID", "runtime-test"),
         ] {
@@ -3757,10 +3758,6 @@ mod tests {
         for (request_path, evidence_path) in [
             (request_link, temp.path().join("evidence.json")),
             (request.clone(), evidence_dir_link.join("evidence.json")),
-            (
-                request.clone(),
-                evidence_ancestor_link.join("nested").join("evidence.json"),
-            ),
             (request.clone(), evidence_file_link),
         ] {
             let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
@@ -3772,6 +3769,24 @@ mod tests {
             assert_eq!(command.value(BENCHMARK_TOKENIZER_REQUEST_ENV), None);
             assert_eq!(command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV), None);
         }
+
+        // An alias outside the configured parent is harmless: the parent entry
+        // (`nested`) is a real directory and canonical identity checks still apply.
+        let evidence_through_ancestor_alias = evidence_ancestor_link.join("nested/evidence.json");
+        let mut command = crate::python_runtime::PythonEnvCommandRecorder::with_poisoned_env();
+        apply_benchmark_tokenizer_env(
+            &mut command,
+            Some(request.clone().into_os_string()),
+            Some(evidence_through_ancestor_alias.clone().into_os_string()),
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_REQUEST_ENV),
+            Some(request.as_os_str())
+        );
+        assert_eq!(
+            command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+            Some(evidence_through_ancestor_alias.as_os_str())
+        );
     }
 
     #[cfg(unix)]
@@ -7562,6 +7577,22 @@ mod tests {
         let command =
             build_installed_context_probe_command(&preparation, &DesktopConfig::default())
                 .expect("build prepared context probe");
+        let async_command = preparation.command().expect("async bridge command");
+        let reusable_commands = [
+            preparation.blocking_command().expect("blocking command"),
+            preparation
+                .model_inspect_command()
+                .expect("model inspect command"),
+            crate::sidecar::build_sidecar_command(
+                import_root
+                    .join("python/inference_sidecar.py")
+                    .to_string_lossy()
+                    .as_ref(),
+                preparation.launcher.clone(),
+            )
+            .expect("sidecar command")
+            .into_std(),
+        ];
 
         // SAFETY: Restore the process environment while still holding the shared lock.
         unsafe {
@@ -7589,7 +7620,7 @@ mod tests {
         assert_eq!(
             command
                 .get_envs()
-                .find_map(|(key, value)| (key == "PYTHONPATH").then_some(value))
+                .find_map(|(key, value)| (key == OsStr::new("PYTHONPATH")).then_some(value))
                 .flatten(),
             Some(expected_pythonpath.as_os_str())
         );
@@ -7611,30 +7642,15 @@ mod tests {
             expected_trusted.push(system32);
         }
         let expected_path = std::env::join_paths(expected_trusted).expect("trusted runtime path");
-        let async_command = preparation.command().expect("async bridge command");
         assert_eq!(
             command_env_value(&async_command, "PATH").as_deref(),
             expected_path.to_str()
         );
-        for command in [
-            preparation.blocking_command().expect("blocking command"),
-            preparation
-                .model_inspect_command()
-                .expect("model inspect command"),
-            crate::sidecar::build_sidecar_command(
-                import_root
-                    .join("python/inference_sidecar.py")
-                    .to_string_lossy()
-                    .as_ref(),
-                preparation.launcher.clone(),
-            )
-            .expect("sidecar command")
-            .into_std(),
-        ] {
+        for command in reusable_commands {
             assert_eq!(
                 command
                     .get_envs()
-                    .find_map(|(key, value)| (key == "PATH").then_some(value))
+                    .find_map(|(key, value)| (key == OsStr::new("PATH")).then_some(value))
                     .flatten(),
                 Some(expected_path.as_os_str())
             );
@@ -7643,11 +7659,18 @@ mod tests {
                 BENCHMARK_TOKENIZER_EVIDENCE_ENV,
             ] {
                 assert_eq!(
-                    command.get_envs().find(|(name, _)| name == key),
+                    command.get_envs().find(|(name, _)| name == OsStr::new(key)),
                     None,
                     "reusable Python command must omit {key}"
                 );
             }
+        }
+        for key in [
+            BENCHMARK_TOKENIZER_REQUEST_ENV,
+            BENCHMARK_TOKENIZER_EVIDENCE_ENV,
+        ] {
+            assert_eq!(std_command_env_value(&command, key), None);
+            assert_eq!(command_env_value(&async_command, key), None);
         }
     }
 

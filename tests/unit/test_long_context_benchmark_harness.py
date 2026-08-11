@@ -22,7 +22,8 @@ def desktop_runner():
     tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
-        "_populate_and_submit_packaged_prompt", "_is_windows_sharing_violation", "_write_benchmark_phase",
+        "_populate_and_submit_packaged_prompt", "_is_windows_sharing_violation",
+        "_is_windows_checkpoint_contention", "_write_benchmark_phase",
         "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver",
         "_read_primary_tokenizer_observation"}
     functions = [node for node in tree.body
@@ -32,6 +33,7 @@ def desktop_runner():
     namespace.update({"webdriver": SimpleNamespace(Chrome=object), "ActionChains": object,
         "time": time, "By": SimpleNamespace(CSS_SELECTOR="css"),
         "os": os, "json": json, "tempfile": __import__("tempfile"),
+        "sys": sys,
         "shutil": __import__("shutil"), "Path": Path,
         "subprocess": subprocess, "Callable": __import__("typing").Callable,
         "psutil": __import__("psutil"),
@@ -44,11 +46,11 @@ def desktop_runner():
     return module
 
 
-def _phase_write(desktop_runner, path, *, clock, sleeper):
+def _phase_write(desktop_runner, path, *, clock, sleeper, platform_name=sys.platform):
     desktop_runner._write_benchmark_phase(path, "runner_startup", 0.0,
         h.PACKAGED_PHASE_STATUS_VERSION, h.PACKAGED_PHASES,
         last_safe_phase="runner_startup", clock=clock, sleeper=sleeper,
-        retry_timeout_s=0.03)
+        retry_timeout_s=0.03, platform_name=platform_name)
 
 
 def _sharing_violation(message="locked"):
@@ -77,6 +79,50 @@ def test_phase_checkpoint_retries_sharing_denial_atomically(
     assert checkpoint["phase"] == "runner_startup"
     assert len(attempts) == denials + 1
     assert not list(tmp_path.glob(".phase.json.*.tmp"))
+
+
+@pytest.mark.parametrize("denials", [1, 3])
+def test_phase_checkpoint_retries_windows_permission_error(
+        desktop_runner, monkeypatch, tmp_path, denials):
+    destination = tmp_path / "phase.json"
+    original_replace = Path.replace
+    attempts = []
+    now = [0.0]
+
+    def replace(path, target):
+        attempts.append(path)
+        if len(attempts) <= denials:
+            raise PermissionError("C:/private/transient checkpoint contention")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    _phase_write(desktop_runner, destination, clock=lambda: now[0],
+        sleeper=lambda delay: now.__setitem__(0, now[0] + delay),
+        platform_name="win32")
+    assert json.loads(destination.read_text())["phase"] == "runner_startup"
+    assert len(attempts) == denials + 1
+    assert not list(tmp_path.glob(".phase.json.*.tmp"))
+
+
+def test_phase_checkpoint_windows_permission_deadline_is_sanitized(
+        desktop_runner, monkeypatch, tmp_path):
+    destination = tmp_path / "private-phase.json"
+    now = [0.0]
+    attempts = []
+
+    def denied(path, target):
+        attempts.append((path, target))
+        raise PermissionError("C:/private/raw access detail")
+
+    monkeypatch.setattr(Path, "replace", denied)
+    with pytest.raises(RuntimeError) as raised:
+        _phase_write(desktop_runner, destination, clock=lambda: now[0],
+            sleeper=lambda delay: now.__setitem__(0, now[0] + delay),
+            platform_name="win32")
+    assert str(raised.value) == "phase checkpoint publication failed"
+    assert len(attempts) == 4
+    assert "private" not in str(raised.value)
+    assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
 
 
 def test_phase_checkpoint_sharing_deadline_is_bounded_and_sanitized(
@@ -112,6 +158,22 @@ def test_phase_checkpoint_does_not_retry_unrelated_error(
     assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
 
 
+def test_phase_checkpoint_does_not_retry_unrelated_windows_oserror(
+        desktop_runner, monkeypatch, tmp_path):
+    attempts = []
+
+    def invalid(_path, _target):
+        attempts.append(True)
+        raise OSError("unrelated filesystem failure")
+
+    monkeypatch.setattr(Path, "replace", invalid)
+    with pytest.raises(OSError, match="unrelated filesystem failure"):
+        _phase_write(desktop_runner, tmp_path / "phase.json",
+            clock=lambda: 0.0, sleeper=lambda _delay: pytest.fail("slept"),
+            platform_name="win32")
+    assert attempts == [True]
+
+
 def test_phase_checkpoint_temp_cleanup_reuses_publication_deadline(
         desktop_runner, monkeypatch, tmp_path):
     now = [0.0]
@@ -123,6 +185,46 @@ def test_phase_checkpoint_temp_cleanup_reuses_publication_deadline(
         _phase_write(desktop_runner, tmp_path / "phase.json", clock=lambda: now[0],
             sleeper=lambda delay: now.__setitem__(0, now[0] + delay))
     assert now[0] == pytest.approx(0.03)
+
+
+def test_phase_checkpoint_windows_temp_cleanup_does_not_mask_publication_failure(
+        desktop_runner, monkeypatch, tmp_path):
+    now = [0.0]
+    monkeypatch.setattr(Path, "replace", lambda *_args: (_ for _ in ()).throw(
+        PermissionError("C:/private/publication detail")))
+    monkeypatch.setattr(Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        PermissionError("C:/private/cleanup detail")))
+    with pytest.raises(RuntimeError) as raised:
+        _phase_write(desktop_runner, tmp_path / "phase.json", clock=lambda: now[0],
+            sleeper=lambda delay: now.__setitem__(0, now[0] + delay),
+            platform_name="win32")
+    assert str(raised.value) == "phase checkpoint publication failed"
+    assert now[0] == pytest.approx(0.03)
+
+
+def test_phase_checkpoint_retries_windows_permission_error_during_temp_cleanup(
+        desktop_runner, monkeypatch, tmp_path):
+    destination = tmp_path / "phase.json"
+    now = [0.0]
+    original_unlink = Path.unlink
+    cleanup_attempts = []
+    monkeypatch.setattr(Path, "replace", lambda *_args: (_ for _ in ()).throw(
+        OSError("primary unrelated failure")))
+
+    def unlink(path, *args, **kwargs):
+        cleanup_attempts.append(path)
+        if len(cleanup_attempts) == 1:
+            raise PermissionError("C:/private/transient cleanup contention")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(OSError, match="primary unrelated failure"):
+        _phase_write(desktop_runner, destination, clock=lambda: now[0],
+            sleeper=lambda delay: now.__setitem__(0, now[0] + delay),
+            platform_name="win32")
+    assert len(cleanup_attempts) == 2
+    assert now[0] == pytest.approx(0.01)
+    assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
 
 
 @pytest.mark.parametrize("sharing_denials", [0, 1])
@@ -2201,13 +2303,14 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     """Exercise the real runner's pre-launch failure and final checkpoint path."""
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"_is_windows_sharing_violation", "_write_benchmark_phase", "_remove_owned_path",
+    wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
+        "_write_benchmark_phase", "_remove_owned_path",
         "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
-        "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
+        "os": os, "sys": sys, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS, "psutil": __import__("psutil"),
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
@@ -2235,13 +2338,14 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
 def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"_is_windows_sharing_violation", "_write_benchmark_phase", "_remove_owned_path",
+    wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
+        "_write_benchmark_phase", "_remove_owned_path",
         "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
-        "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
+        "os": os, "sys": sys, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS, "psutil": __import__("psutil"),
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
@@ -2269,7 +2373,8 @@ def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowanc
     """The provisional publish gets the small retry window, not all cleanup time."""
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"_is_windows_sharing_violation", "_write_benchmark_phase",
+    wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
+        "_write_benchmark_phase",
         "_remove_owned_path", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]

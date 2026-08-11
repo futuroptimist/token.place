@@ -766,7 +766,7 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
         schema_version: str, phases: tuple[str, ...], *, last_safe_phase: str,
         failure_reason: str | None = None, cleanup_succeeded: bool | None = None,
         retry_timeout_s: float = 1.0, clock=time.monotonic,
-        sleeper=time.sleep) -> None:
+        sleeper=time.sleep, platform_name: str = sys.platform) -> None:
     """Atomically checkpoint an allowlisted phase without identifiers or payload data."""
     payload = {"schema_version": schema_version, "phase": phase,
         "sequence": phases.index(phase) + 1,
@@ -790,7 +790,7 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
                 temporary.replace(path)
                 return
             except OSError as exc:
-                if not _is_windows_sharing_violation(exc):
+                if not _is_windows_checkpoint_contention(exc, platform_name):
                     raise
                 remaining = deadline - clock()
                 if remaining <= 0:
@@ -804,7 +804,7 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
                 temporary.unlink(missing_ok=True)
                 break
             except OSError as exc:
-                if not _is_windows_sharing_violation(exc):
+                if not _is_windows_checkpoint_contention(exc, platform_name):
                     raise
                 remaining = deadline - clock()
                 if remaining <= 0:
@@ -815,6 +815,12 @@ def _write_benchmark_phase(path: Path, phase: str, started: float,
 def _is_windows_sharing_violation(exc: BaseException) -> bool:
     """Recognize only Windows sharing/lock violations, not generic access denial."""
     return isinstance(exc, OSError) and getattr(exc, "winerror", None) in {32, 33}
+
+
+def _is_windows_checkpoint_contention(exc: BaseException, platform_name: str) -> bool:
+    """Recognize contention only for the atomic phase-checkpoint operation."""
+    return (_is_windows_sharing_violation(exc)
+        or (platform_name == "win32" and isinstance(exc, PermissionError)))
 
 
 def _remove_owned_path(path: Path, deadline: float, *, directory: bool = False,

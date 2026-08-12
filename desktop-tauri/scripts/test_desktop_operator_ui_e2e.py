@@ -501,14 +501,14 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
             pass
 
 
-def start_driver(app_binary: Path) -> webdriver.Remote:
+def start_driver(app_binary: Path, app_args: list[str] | None = None) -> webdriver.Remote:
     options = webdriver.ChromeOptions()
     options.set_capability("browserName", "wry")
     options.set_capability(
         "tauri:options",
         {
             "application": str(app_binary),
-            "args": [],
+            "args": app_args or [],
         },
     )
     return webdriver.Remote(command_executor=WEBDRIVER_URL, options=options)
@@ -1074,7 +1074,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             min(90, setup_remaining()))
         write_phase("webdriver_ready")
         setup_remaining()
-        driver = start_driver(app_binary.resolve(strict=True))
+        driver = start_driver(app_binary.resolve(strict=True), [
+            "--token-place-long-context-benchmark-tokenizer-request", str(tokenizer_request),
+            "--token-place-long-context-benchmark-tokenizer-evidence", str(tokenizer_evidence),
+        ])
         wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
         write_phase("desktop_ready")
         setup_remaining()

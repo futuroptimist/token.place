@@ -40,6 +40,57 @@ const BENCHMARK_TOKENIZER_REQUEST_ENV: &str =
     "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST";
 const BENCHMARK_TOKENIZER_EVIDENCE_ENV: &str =
     "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE";
+const BENCHMARK_TOKENIZER_REQUEST_ARG: &str =
+    "--token-place-long-context-benchmark-tokenizer-request";
+const BENCHMARK_TOKENIZER_EVIDENCE_ARG: &str =
+    "--token-place-long-context-benchmark-tokenizer-evidence";
+
+fn benchmark_tokenizer_paths_from_args<I>(args: I) -> Option<(OsString, OsString)>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut request = None;
+    let mut evidence = None;
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        let destination = if argument == OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ARG) {
+            &mut request
+        } else if argument == OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ARG) {
+            &mut evidence
+        } else {
+            continue;
+        };
+        // Missing values and duplicate switches make the handoff ambiguous, so
+        // fail closed instead of falling back to the inherited environment.
+        if destination.is_some() {
+            return None;
+        }
+        let value = args.next()?;
+        if value == OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ARG)
+            || value == OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ARG)
+        {
+            return None;
+        }
+        *destination = Some(value);
+    }
+    Some((request?, evidence?))
+}
+
+fn benchmark_tokenizer_paths() -> (Option<OsString>, Option<OsString>) {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if args.iter().any(|argument| {
+        argument == OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ARG)
+            || argument == OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ARG)
+    }) {
+        return benchmark_tokenizer_paths_from_args(args)
+            .map(|(request, evidence)| (Some(request), Some(evidence)))
+            .unwrap_or((None, None));
+    }
+    (
+        std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
+        std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+    )
+}
 
 fn metadata_is_alias(metadata: &std::fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
@@ -2689,11 +2740,8 @@ pub async fn start_compute_node(
         bridge_command.env("TOKENPLACE_INTERPRETER_BASENAME", basename);
         bridge_command.env("TOKENPLACE_RUNTIME_ID", runtime_id);
     }
-    apply_benchmark_tokenizer_env(
-        &mut bridge_command,
-        std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
-        std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
-    );
+    let (tokenizer_request, tokenizer_evidence) = benchmark_tokenizer_paths();
+    apply_benchmark_tokenizer_env(&mut bridge_command, tokenizer_request, tokenizer_evidence);
 
     isolate_bridge_process_tree(&mut bridge_command);
 
@@ -3600,6 +3648,45 @@ mod tests {
     use tokio::process::Command;
 
     #[test]
+    fn benchmark_tokenizer_command_line_handoff_is_paired_and_unambiguous() {
+        let parse =
+            |args: &[&str]| benchmark_tokenizer_paths_from_args(args.iter().map(OsString::from));
+        assert_eq!(
+            parse(&[
+                "token-place.exe",
+                BENCHMARK_TOKENIZER_REQUEST_ARG,
+                r"C:\Temp\request.json",
+                BENCHMARK_TOKENIZER_EVIDENCE_ARG,
+                r"C:\Temp\evidence.json",
+            ]),
+            Some((
+                OsString::from(r"C:\Temp\request.json"),
+                OsString::from(r"C:\Temp\evidence.json"),
+            ))
+        );
+        for args in [
+            vec!["token-place.exe"],
+            vec!["token-place.exe", BENCHMARK_TOKENIZER_REQUEST_ARG],
+            vec![
+                "token-place.exe",
+                BENCHMARK_TOKENIZER_REQUEST_ARG,
+                "request.json",
+            ],
+            vec![
+                "token-place.exe",
+                BENCHMARK_TOKENIZER_REQUEST_ARG,
+                "request.json",
+                BENCHMARK_TOKENIZER_REQUEST_ARG,
+                "other.json",
+                BENCHMARK_TOKENIZER_EVIDENCE_ARG,
+                "evidence.json",
+            ],
+        ] {
+            assert_eq!(parse(&args), None);
+        }
+    }
+
+    #[test]
     fn benchmark_tokenizer_env_is_paired_validated_and_bridge_scoped() {
         let temp = TempDir::new().expect("tempdir");
         let request = temp.path().join("tokenizer-request.json");
@@ -3622,7 +3709,7 @@ mod tests {
         for (key, value) in [
             ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
             ("TOKENPLACE_BUILD_ID", "build-test"),
-            ("TOKENPLACE_APP_VERSION", "0.1.15"),
+            ("TOKENPLACE_APP_VERSION", "0.1.16"),
             ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
             ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
             ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),
@@ -3647,7 +3734,7 @@ mod tests {
         for (key, value) in [
             ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
             ("TOKENPLACE_BUILD_ID", "build-test"),
-            ("TOKENPLACE_APP_VERSION", "0.1.15"),
+            ("TOKENPLACE_APP_VERSION", "0.1.16"),
             ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
             ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
             ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),

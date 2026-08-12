@@ -40,6 +40,42 @@ const BENCHMARK_TOKENIZER_REQUEST_ENV: &str =
     "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST";
 const BENCHMARK_TOKENIZER_EVIDENCE_ENV: &str =
     "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE";
+const BENCHMARK_TOKENIZER_REQUEST_ARG: &str =
+    "--token-place-long-context-benchmark-tokenizer-request=";
+const BENCHMARK_TOKENIZER_EVIDENCE_ARG: &str =
+    "--token-place-long-context-benchmark-tokenizer-evidence=";
+
+fn benchmark_tokenizer_handoff<I>(
+    args: I,
+    request_env: Option<OsString>,
+    evidence_env: Option<OsString>,
+) -> (Option<OsString>, Option<OsString>)
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut request_arg = None;
+    let mut evidence_arg = None;
+    let mut invalid_args = false;
+    for arg in args {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if let Some(value) = arg.strip_prefix(BENCHMARK_TOKENIZER_REQUEST_ARG) {
+            invalid_args |=
+                request_arg.replace(OsString::from(value)).is_some() || value.is_empty();
+        } else if let Some(value) = arg.strip_prefix(BENCHMARK_TOKENIZER_EVIDENCE_ARG) {
+            invalid_args |=
+                evidence_arg.replace(OsString::from(value)).is_some() || value.is_empty();
+        }
+    }
+    if invalid_args || request_arg.is_some() != evidence_arg.is_some() {
+        return (None, None);
+    }
+    match (request_arg, evidence_arg) {
+        (Some(request), Some(evidence)) => (Some(request), Some(evidence)),
+        _ => (request_env, evidence_env),
+    }
+}
 
 fn metadata_is_alias(metadata: &std::fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
@@ -2689,11 +2725,12 @@ pub async fn start_compute_node(
         bridge_command.env("TOKENPLACE_INTERPRETER_BASENAME", basename);
         bridge_command.env("TOKENPLACE_RUNTIME_ID", runtime_id);
     }
-    apply_benchmark_tokenizer_env(
-        &mut bridge_command,
+    let (tokenizer_request, tokenizer_evidence) = benchmark_tokenizer_handoff(
+        std::env::args_os(),
         std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
         std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
     );
+    apply_benchmark_tokenizer_env(&mut bridge_command, tokenizer_request, tokenizer_evidence);
 
     isolate_bridge_process_tree(&mut bridge_command);
 
@@ -3729,6 +3766,57 @@ mod tests {
             apply_benchmark_tokenizer_env(&mut rejected, request_value, evidence_value);
             assert_eq!(rejected.value(BENCHMARK_TOKENIZER_REQUEST_ENV), None);
             assert_eq!(rejected.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV), None);
+        }
+    }
+
+    #[test]
+    fn benchmark_tokenizer_command_line_handoff_is_paired_and_authoritative() {
+        let request_arg = OsString::from(format!(
+            "{BENCHMARK_TOKENIZER_REQUEST_ARG}C:\\benchmark\\request.json"
+        ));
+        let evidence_arg = OsString::from(format!(
+            "{BENCHMARK_TOKENIZER_EVIDENCE_ARG}C:\\benchmark\\evidence.json"
+        ));
+        let env_request = Some(OsString::from("environment-request"));
+        let env_evidence = Some(OsString::from("environment-evidence"));
+
+        assert_eq!(
+            benchmark_tokenizer_handoff(
+                [request_arg.clone(), evidence_arg.clone()],
+                env_request.clone(),
+                env_evidence.clone(),
+            ),
+            (
+                Some(OsString::from("C:\\benchmark\\request.json")),
+                Some(OsString::from("C:\\benchmark\\evidence.json")),
+            )
+        );
+        assert_eq!(
+            benchmark_tokenizer_handoff([], env_request.clone(), env_evidence.clone()),
+            (env_request, env_evidence)
+        );
+        for invalid in [
+            vec![request_arg.clone()],
+            vec![evidence_arg.clone()],
+            vec![
+                request_arg.clone(),
+                request_arg.clone(),
+                evidence_arg.clone(),
+            ],
+            vec![
+                OsString::from(BENCHMARK_TOKENIZER_REQUEST_ARG),
+                evidence_arg.clone(),
+            ],
+        ] {
+            assert_eq!(
+                benchmark_tokenizer_handoff(
+                    invalid,
+                    Some(OsString::from("environment-request")),
+                    Some(OsString::from("environment-evidence")),
+                ),
+                (None, None),
+                "invalid application arguments must fail closed rather than use the environment"
+            );
         }
     }
 

@@ -25,12 +25,14 @@ def desktop_runner():
         "_populate_and_submit_packaged_prompt", "_is_windows_sharing_violation", "_write_benchmark_phase",
         "_is_windows_checkpoint_contention",
         "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver",
-        "_read_primary_tokenizer_observation"}
+        "_read_primary_tokenizer_observation", "tokenizer_handoff_args",
+        "tauri_driver_environment", "start_driver"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ModuleType("desktop_runner_under_test")
     namespace = module.__dict__
-    namespace.update({"webdriver": SimpleNamespace(Chrome=object), "ActionChains": object,
+    namespace.update({"webdriver": SimpleNamespace(Chrome=object, Remote=object,
+        ChromeOptions=object), "ActionChains": object,
         "time": time, "By": SimpleNamespace(CSS_SELECTOR="css"),
         "os": os, "json": json, "tempfile": __import__("tempfile"),
         "shutil": __import__("shutil"), "Path": Path,
@@ -38,11 +40,73 @@ def desktop_runner():
         "psutil": __import__("psutil"),
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
-        "WebDriverWait": object,
+        "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
         "apply_benchmark_context_tier": h.apply_benchmark_context_tier})
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
     return module
+
+
+def test_packaged_tokenizer_handoff_uses_paired_application_arguments(desktop_runner, tmp_path):
+    request = tmp_path / "request with spaces.json"
+    evidence = tmp_path / "evidence with spaces.json"
+    assert desktop_runner.tokenizer_handoff_args(request, evidence) == [
+        f"--token-place-long-context-benchmark-tokenizer-request={request}",
+        f"--token-place-long-context-benchmark-tokenizer-evidence={evidence}",
+    ]
+    assert desktop_runner.tokenizer_handoff_args() == []
+    with pytest.raises(ValueError, match="must be paired"):
+        desktop_runner.tokenizer_handoff_args(request, None)
+    with pytest.raises(ValueError, match="must be paired"):
+        desktop_runner.tokenizer_handoff_args(None, evidence)
+
+
+def test_start_driver_passes_resolved_application_and_tokenizer_arguments(
+        desktop_runner, tmp_path):
+    capabilities = {}
+    remote_calls = []
+
+    class FakeChromeOptions:
+        def set_capability(self, name, value):
+            capabilities[name] = value
+
+    def fake_remote(**kwargs):
+        remote_calls.append(kwargs)
+        return "driver"
+
+    desktop_runner.webdriver = SimpleNamespace(
+        ChromeOptions=FakeChromeOptions, Remote=fake_remote)
+    application = (tmp_path / "application with spaces.exe").resolve()
+    request = tmp_path / "request with spaces.json"
+    evidence = tmp_path / "evidence with spaces.json"
+    arguments = desktop_runner.tokenizer_handoff_args(request, evidence)
+
+    assert desktop_runner.start_driver(application, application_args=arguments) == "driver"
+    assert capabilities["tauri:options"] == {
+        "application": str(application),
+        "args": [
+            f"--token-place-long-context-benchmark-tokenizer-request={request}",
+            f"--token-place-long-context-benchmark-tokenizer-evidence={evidence}",
+        ],
+    }
+    assert remote_calls == [{
+        "command_executor": "http://127.0.0.1:4444",
+        "options": remote_calls[0]["options"],
+    }]
+
+
+def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
+        desktop_runner, monkeypatch, tmp_path):
+    keys = (
+        "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST",
+        "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE",
+    )
+    for key in keys:
+        monkeypatch.setenv(key, f"poisoned {key}")
+
+    env = desktop_runner.tauri_driver_environment(tmp_path / "isolated home")
+
+    assert all(key not in env for key in keys)
 
 
 def _phase_write(desktop_runner, path, *, clock, sleeper, platform_name="nt"):
@@ -2238,7 +2302,7 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     tree = ast.parse(source)
     wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
         "_write_benchmark_phase", "_remove_owned_path",
-        "run_long_context_packaged_mode"}
+        "tauri_driver_environment", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
@@ -2273,7 +2337,7 @@ def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):
     tree = ast.parse(source)
     wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
         "_write_benchmark_phase", "_remove_owned_path",
-        "run_long_context_packaged_mode"}
+        "tauri_driver_environment", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
@@ -2308,7 +2372,7 @@ def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowanc
     tree = ast.parse(source)
     wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
         "_write_benchmark_phase",
-        "_remove_owned_path", "run_long_context_packaged_mode"}
+        "_remove_owned_path", "tauri_driver_environment", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     now = [0.0]
@@ -2364,7 +2428,7 @@ def test_packaged_runner_log_close_failure_preserves_primary_and_finishes_cleanu
     """A log-close fault cannot interrupt owned cleanup or final reporting."""
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"run_long_context_packaged_mode"}
+    wanted = {"tauri_driver_environment", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     events = []

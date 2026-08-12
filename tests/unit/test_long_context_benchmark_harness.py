@@ -2302,7 +2302,7 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     tree = ast.parse(source)
     wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
         "_write_benchmark_phase", "_remove_owned_path",
-        "run_long_context_packaged_mode"}
+        "tauri_driver_environment", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
@@ -2337,7 +2337,7 @@ def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):
     tree = ast.parse(source)
     wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
         "_write_benchmark_phase", "_remove_owned_path",
-        "run_long_context_packaged_mode"}
+        "tauri_driver_environment", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
@@ -2372,7 +2372,7 @@ def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowanc
     tree = ast.parse(source)
     wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
         "_write_benchmark_phase",
-        "_remove_owned_path", "run_long_context_packaged_mode"}
+        "_remove_owned_path", "tauri_driver_environment", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     now = [0.0]
@@ -2428,7 +2428,7 @@ def test_packaged_runner_log_close_failure_preserves_primary_and_finishes_cleanu
     """A log-close fault cannot interrupt owned cleanup or final reporting."""
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"run_long_context_packaged_mode"}
+    wanted = {"tauri_driver_environment", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     events = []

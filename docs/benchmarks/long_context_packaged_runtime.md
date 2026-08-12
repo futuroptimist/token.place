@@ -10,7 +10,7 @@ run multi-minute inference.
 Physical packaged-runtime mode is intentionally fail-closed. Run it only on a machine with:
 
 - a built or installed token.place desktop application at version `0.1.16`;
-- the existing pinned `llama-cpp-python==0.3.32` packaged runtime;
+- the existing pinned `llama_cpp_python==0.3.32` packaged runtime;
 - Qwen3 8B Q4_K_M or another explicitly recorded local model artifact;
 - macOS Apple Silicon with Metal or Windows with NVIDIA/CUDA for GPU validation, with CPU only where
   the desktop runtime already supports it;
@@ -77,7 +77,7 @@ the subprocess boundary and are orchestration evidence, never physical Metal/CUD
 
 This #1566 physical-validation follow-up to #1631 and #1634 does not claim Windows/CUDA success from
 unit tests. After merge, rerun the same one-cell Windows/CUDA `small-8k` / `single-needle` /
-`64k-full` physical gate against unchanged desktop `0.1.16` and `llama-cpp-python==0.3.32` before
+`64k-full` physical gate against unchanged desktop `0.1.16` and `llama_cpp_python==0.3.32` before
 attempting `8k-fast` classification or the six-cell matrix. Physical macOS/Metal validation also
 remains outstanding.
 

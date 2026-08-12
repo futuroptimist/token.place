@@ -31,6 +31,26 @@ def test_workflow_stages_tauri_bundle_and_blocks_legacy_markers() -> None:
     assert 'desktop/electron-builder.json' not in text
 
 
+def test_build_job_caches_only_runner_python_dependencies_used_on_macos() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding='utf-8'))
+    steps = workflow['jobs']['build']['steps']
+    setup_python = next(step for step in steps if step.get('name') == 'Setup Python')
+    embedded_windows_cache = next(
+        step
+        for step in steps
+        if step.get('name') == 'Cache embedded Windows CUDA Python runtime artifacts'
+    )
+
+    cache_input = setup_python['with']['cache']
+    assert cache_input == "${{ runner.os == 'macOS' && 'pip' || '' }}"
+    assert embedded_windows_cache['if'] == "runner.os == 'Windows'"
+    assert embedded_windows_cache['uses'] == 'actions/cache@v4'
+    assert 'desktop-tauri/.cache/windows-python-runtime' in embedded_windows_cache['with']['path']
+    assert all('continue-on-error' not in step for step in steps)
+
+
 def test_workflow_uses_obvious_apple_silicon_dmg_name() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'token.place-desktop-${version}-apple-silicon.dmg' in text

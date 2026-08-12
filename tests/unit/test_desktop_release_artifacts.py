@@ -35,10 +35,14 @@ def test_build_job_caches_runner_pip_only_on_macos_without_masking_failures() ->
     import yaml
 
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding='utf-8'))
-    steps = workflow['jobs']['build']['steps']
+    build_job = workflow['jobs']['build']
+    assert 'continue-on-error' not in build_job
+
+    steps = build_job['steps']
     steps_by_name = {step['name']: step for step in steps}
 
     setup_python = steps_by_name['Setup Python']
+    assert setup_python['uses'] == 'actions/setup-python@v5'
     assert setup_python['with']['cache'] == "${{ runner.os == 'macOS' && 'pip' || '' }}"
     assert setup_python['with']['cache-dependency-path'] == 'requirements.txt'
 
@@ -47,7 +51,13 @@ def test_build_job_caches_runner_pip_only_on_macos_without_masking_failures() ->
     assert windows_runtime_cache['uses'] == 'actions/cache@v4'
     assert 'desktop-tauri/.cache/windows-python-runtime' in windows_runtime_cache['with']['path']
 
-    assert all('continue-on-error' not in step for step in steps)
+    required_fail_closed_steps = (
+        'Setup Python',
+        'Build Tauri bundles',
+        'Validate macOS staged artifact guardrails',
+        'Validate Windows MSI and NSIS artifact contents',
+    )
+    assert all('continue-on-error' not in steps_by_name[name] for name in required_fail_closed_steps)
 
 
 def test_workflow_uses_obvious_apple_silicon_dmg_name() -> None:

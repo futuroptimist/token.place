@@ -501,14 +501,32 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
             pass
 
 
-def start_driver(app_binary: Path) -> webdriver.Remote:
+def tokenizer_handoff_args(request_path: Path | None = None,
+        evidence_path: Path | None = None) -> list[str]:
+    """Carry the paired handoff on the application command line on Windows.
+
+    WebView2 starts the packaged application itself, so environment inherited by
+    tauri-driver is not a deterministic application handoff on Windows.
+    """
+    if request_path is None and evidence_path is None:
+        return []
+    if request_path is None or evidence_path is None:
+        raise ValueError("tokenizer request and evidence paths must be paired")
+    return [
+        f"--token-place-long-context-benchmark-tokenizer-request={request_path}",
+        f"--token-place-long-context-benchmark-tokenizer-evidence={evidence_path}",
+    ]
+
+
+def start_driver(app_binary: Path, *, application_args: list[str] | None = None
+        ) -> webdriver.Remote:
     options = webdriver.ChromeOptions()
     options.set_capability("browserName", "wry")
     options.set_capability(
         "tauri:options",
         {
             "application": str(app_binary),
-            "args": [],
+            "args": application_args or [],
         },
     )
     return webdriver.Remote(command_executor=WEBDRIVER_URL, options=options)
@@ -1074,7 +1092,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             min(90, setup_remaining()))
         write_phase("webdriver_ready")
         setup_remaining()
-        driver = start_driver(app_binary.resolve(strict=True))
+        driver = start_driver(
+            app_binary.resolve(strict=True),
+            application_args=tokenizer_handoff_args(tokenizer_request, tokenizer_evidence),
+        )
         wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
         write_phase("desktop_ready")
         setup_remaining()

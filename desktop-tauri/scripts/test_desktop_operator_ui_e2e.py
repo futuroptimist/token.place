@@ -518,6 +518,28 @@ def tokenizer_handoff_args(request_path: Path | None = None,
     ]
 
 
+def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in (
+        "USE_MOCK_LLM",
+        "TOKEN_PLACE_PYTHON",
+        "TOKEN_PLACE_SIDECAR_PYTHON",
+        "PYTHONPATH",
+        "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST",
+        "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE",
+    ):
+        env.pop(key, None)
+    env.update(
+        {
+            "HOME": str(isolated_home),
+            "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+            "XDG_DATA_HOME": str(isolated_home / ".local/share"),
+            "APPDATA": str(isolated_home / "AppData/Roaming"),
+        }
+    )
+    return env
+
+
 def start_driver(app_binary: Path, *, application_args: list[str] | None = None
         ) -> webdriver.Remote:
     options = webdriver.ChromeOptions()
@@ -1069,14 +1091,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     }), encoding="utf-8")
     if hasattr(os, "chmod"):
         os.chmod(tokenizer_request, 0o600)
-    env = os.environ.copy()
-    for key in ("USE_MOCK_LLM", "TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON", "PYTHONPATH"):
-        env.pop(key, None)
-    env.update({"HOME": str(isolated_home), "XDG_CONFIG_HOME": str(isolated_home / ".config"),
-                "XDG_DATA_HOME": str(isolated_home / ".local/share"),
-                "APPDATA": str(isolated_home / "AppData/Roaming"),
-                "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST": str(tokenizer_request),
-                "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE": str(tokenizer_evidence)})
+    env = tauri_driver_environment(isolated_home)
     driver_log_handle = driver_log.open("w", encoding="utf-8")
     process: subprocess.Popen[str] | None = None
     driver: webdriver.Remote | None = None

@@ -40,6 +40,59 @@ const BENCHMARK_TOKENIZER_REQUEST_ENV: &str =
     "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST";
 const BENCHMARK_TOKENIZER_EVIDENCE_ENV: &str =
     "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE";
+const BENCHMARK_TOKENIZER_REQUEST_ARG: &str = "--token-place-benchmark-tokenizer-request";
+const BENCHMARK_TOKENIZER_EVIDENCE_ARG: &str = "--token-place-benchmark-tokenizer-evidence";
+
+fn benchmark_tokenizer_arg_pair<I>(args: I) -> Result<Option<(OsString, OsString)>, ()>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut request = None;
+    let mut evidence = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let destination = if arg == OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ARG) {
+            &mut request
+        } else if arg == OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ARG) {
+            &mut evidence
+        } else {
+            continue;
+        };
+        // Duplicate flags and flags without values are ambiguous and therefore
+        // disable the benchmark-only handoff rather than guessing.
+        if destination.is_some() {
+            return Err(());
+        }
+        let value = args.next().ok_or(())?;
+        if value == OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ARG)
+            || value == OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ARG)
+        {
+            return Err(());
+        }
+        *destination = Some(value);
+    }
+    match (request, evidence) {
+        (None, None) => Ok(None),
+        (Some(request), Some(evidence)) => Ok(Some((request, evidence))),
+        _ => Err(()),
+    }
+}
+
+fn benchmark_tokenizer_handoff() -> (Option<OsString>, Option<OsString>) {
+    // tauri-driver does not reliably propagate its own environment to the app
+    // process on Windows. Explicit application arguments are therefore the
+    // authoritative packaged-E2E transport; environment variables remain the
+    // development/direct-launch transport.
+    match benchmark_tokenizer_arg_pair(std::env::args_os().skip(1)) {
+        Ok(Some((request, evidence))) => return (Some(request), Some(evidence)),
+        Err(()) => return (None, None),
+        Ok(None) => {}
+    }
+    (
+        std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
+        std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+    )
+}
 
 fn metadata_is_alias(metadata: &std::fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
@@ -2689,11 +2742,8 @@ pub async fn start_compute_node(
         bridge_command.env("TOKENPLACE_INTERPRETER_BASENAME", basename);
         bridge_command.env("TOKENPLACE_RUNTIME_ID", runtime_id);
     }
-    apply_benchmark_tokenizer_env(
-        &mut bridge_command,
-        std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
-        std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
-    );
+    let (tokenizer_request, tokenizer_evidence) = benchmark_tokenizer_handoff();
+    apply_benchmark_tokenizer_env(&mut bridge_command, tokenizer_request, tokenizer_evidence);
 
     isolate_bridge_process_tree(&mut bridge_command);
 
@@ -3598,6 +3648,47 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+
+    #[test]
+    fn benchmark_tokenizer_arguments_require_one_complete_unambiguous_pair() {
+        let pair = benchmark_tokenizer_arg_pair([
+            "unrelated".into(),
+            BENCHMARK_TOKENIZER_REQUEST_ARG.into(),
+            "C:\\benchmark\\request.json".into(),
+            BENCHMARK_TOKENIZER_EVIDENCE_ARG.into(),
+            "C:\\benchmark\\evidence.json".into(),
+        ])
+        .expect("unambiguous arguments")
+        .expect("complete argument pair");
+        assert_eq!(pair.0, OsStr::new("C:\\benchmark\\request.json"));
+        assert_eq!(pair.1, OsStr::new("C:\\benchmark\\evidence.json"));
+
+        for args in [
+            vec![
+                BENCHMARK_TOKENIZER_REQUEST_ARG.into(),
+                "request.json".into(),
+            ],
+            vec![
+                BENCHMARK_TOKENIZER_EVIDENCE_ARG.into(),
+                "evidence.json".into(),
+            ],
+            vec![BENCHMARK_TOKENIZER_REQUEST_ARG.into()],
+            vec![
+                BENCHMARK_TOKENIZER_REQUEST_ARG.into(),
+                "first.json".into(),
+                BENCHMARK_TOKENIZER_REQUEST_ARG.into(),
+                "second.json".into(),
+                BENCHMARK_TOKENIZER_EVIDENCE_ARG.into(),
+                "evidence.json".into(),
+            ],
+        ] {
+            assert_eq!(benchmark_tokenizer_arg_pair(args), Err(()));
+        }
+        assert_eq!(
+            benchmark_tokenizer_arg_pair(Vec::<OsString>::new()),
+            Ok(None)
+        );
+    }
 
     #[test]
     fn benchmark_tokenizer_env_is_paired_validated_and_bridge_scoped() {

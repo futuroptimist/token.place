@@ -25,7 +25,7 @@ def desktop_runner():
         "_populate_and_submit_packaged_prompt", "_is_windows_sharing_violation", "_write_benchmark_phase",
         "_is_windows_checkpoint_contention",
         "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver",
-        "_read_primary_tokenizer_observation"}
+        "_read_primary_tokenizer_observation", "_benchmark_tokenizer_app_args"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ModuleType("desktop_runner_under_test")
@@ -43,6 +43,17 @@ def desktop_runner():
         "apply_benchmark_context_tier": h.apply_benchmark_context_tier})
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
     return module
+
+
+def test_packaged_tokenizer_handoff_uses_explicit_application_arguments(
+        desktop_runner, tmp_path):
+    request = tmp_path / "request.json"
+    evidence = tmp_path / "evidence.json"
+
+    assert desktop_runner._benchmark_tokenizer_app_args(request, evidence) == [
+        "--token-place-benchmark-tokenizer-request", str(request),
+        "--token-place-benchmark-tokenizer-evidence", str(evidence),
+    ]
 
 
 def _phase_write(desktop_runner, path, *, clock, sleeper, platform_name="nt"):

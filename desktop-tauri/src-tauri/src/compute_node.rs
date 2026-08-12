@@ -40,6 +40,56 @@ const BENCHMARK_TOKENIZER_REQUEST_ENV: &str =
     "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST";
 const BENCHMARK_TOKENIZER_EVIDENCE_ENV: &str =
     "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE";
+const BENCHMARK_TOKENIZER_REQUEST_ARG: &str =
+    "--token-place-long-context-benchmark-tokenizer-request";
+const BENCHMARK_TOKENIZER_EVIDENCE_ARG: &str =
+    "--token-place-long-context-benchmark-tokenizer-evidence";
+
+fn benchmark_tokenizer_paths_from_args<I>(args: I) -> Option<(OsString, OsString)>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let mut request = None;
+    let mut evidence = None;
+    while let Some(arg) = args.next() {
+        let destination = if arg == OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ARG) {
+            &mut request
+        } else if arg == OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ARG) {
+            &mut evidence
+        } else {
+            continue;
+        };
+        // Duplicate flags, missing values, and values that are another handoff
+        // flag are ambiguous. Fail closed instead of consulting the environment.
+        let value = args.next()?;
+        if destination.is_some()
+            || value == OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ARG)
+            || value == OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ARG)
+        {
+            return None;
+        }
+        *destination = Some(value);
+    }
+    Some((request?, evidence?))
+}
+
+fn benchmark_tokenizer_paths() -> (Option<OsString>, Option<OsString>) {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if let Some((request, evidence)) = benchmark_tokenizer_paths_from_args(args.clone()) {
+        return (Some(request), Some(evidence));
+    }
+    if args.iter().any(|arg| {
+        arg == OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ARG)
+            || arg == OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ARG)
+    }) {
+        return (None, None);
+    }
+    (
+        std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
+        std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
+    )
+}
 
 fn metadata_is_alias(metadata: &std::fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
@@ -2689,11 +2739,8 @@ pub async fn start_compute_node(
         bridge_command.env("TOKENPLACE_INTERPRETER_BASENAME", basename);
         bridge_command.env("TOKENPLACE_RUNTIME_ID", runtime_id);
     }
-    apply_benchmark_tokenizer_env(
-        &mut bridge_command,
-        std::env::var_os(BENCHMARK_TOKENIZER_REQUEST_ENV),
-        std::env::var_os(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
-    );
+    let (tokenizer_request, tokenizer_evidence) = benchmark_tokenizer_paths();
+    apply_benchmark_tokenizer_env(&mut bridge_command, tokenizer_request, tokenizer_evidence);
 
     isolate_bridge_process_tree(&mut bridge_command);
 
@@ -3622,7 +3669,7 @@ mod tests {
         for (key, value) in [
             ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
             ("TOKENPLACE_BUILD_ID", "build-test"),
-            ("TOKENPLACE_APP_VERSION", "0.1.15"),
+            ("TOKENPLACE_APP_VERSION", "0.1.16"),
             ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
             ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
             ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),
@@ -3647,7 +3694,7 @@ mod tests {
         for (key, value) in [
             ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
             ("TOKENPLACE_BUILD_ID", "build-test"),
-            ("TOKENPLACE_APP_VERSION", "0.1.15"),
+            ("TOKENPLACE_APP_VERSION", "0.1.16"),
             ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
             ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
             ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),
@@ -3730,6 +3777,46 @@ mod tests {
             assert_eq!(rejected.value(BENCHMARK_TOKENIZER_REQUEST_ENV), None);
             assert_eq!(rejected.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV), None);
         }
+    }
+
+    #[test]
+    fn benchmark_tokenizer_command_line_handoff_is_paired_and_unambiguous() {
+        let parse =
+            |args: &[&str]| benchmark_tokenizer_paths_from_args(args.iter().map(OsString::from));
+        assert_eq!(
+            parse(&[
+                "token-place",
+                BENCHMARK_TOKENIZER_REQUEST_ARG,
+                "C:\\request.json",
+                BENCHMARK_TOKENIZER_EVIDENCE_ARG,
+                "C:\\evidence.json",
+            ]),
+            Some((
+                OsString::from("C:\\request.json"),
+                OsString::from("C:\\evidence.json")
+            ))
+        );
+        assert_eq!(parse(&["token-place"]), None);
+        assert_eq!(
+            parse(&[
+                "token-place",
+                BENCHMARK_TOKENIZER_REQUEST_ARG,
+                "request.json"
+            ]),
+            None
+        );
+        assert_eq!(
+            parse(&[
+                "token-place",
+                BENCHMARK_TOKENIZER_REQUEST_ARG,
+                "first.json",
+                BENCHMARK_TOKENIZER_REQUEST_ARG,
+                "second.json",
+                BENCHMARK_TOKENIZER_EVIDENCE_ARG,
+                "evidence.json",
+            ]),
+            None
+        );
     }
 
     #[cfg(unix)]

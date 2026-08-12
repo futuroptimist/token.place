@@ -384,6 +384,18 @@ def test_desktop_runner_uses_evergreen_generation_settings_probe_name():
     assert source.count("__longContextBenchmarkGenerationSettings") == 3
 
 
+def test_packaged_runner_passes_tokenizer_handoff_directly_to_desktop_process():
+    source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
+        "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    runner = next(item for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name == "run_long_context_packaged_mode")
+    runner_source = ast.unparse(runner)
+    assert 'start_driver(app_binary.resolve(strict=True)' in runner_source
+    assert '--token-place-long-context-benchmark-tokenizer-request' in runner_source
+    assert '--token-place-long-context-benchmark-tokenizer-evidence' in runner_source
+
+
 def test_packaged_profile_fallback_normalizes_only_producer_absence_values():
     source = (Path(__file__).parents[2] / "desktop-tauri" / "scripts" /
         "test_desktop_operator_ui_e2e.py").read_text(encoding="utf-8")

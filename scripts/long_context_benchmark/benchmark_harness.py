@@ -70,6 +70,10 @@ PACKAGED_FAILURE_REASONS = frozenset({
     "local_telemetry_configuration_mismatch",
     "encrypted_progress_delivery_invalid",
 })
+# POSIX.1 signal numbers keep the injected POSIX cleanup seam portable to
+# host Python builds, such as Windows, that omit POSIX-only signal attributes.
+POSIX_SIGTERM = getattr(signal, "SIGTERM", 15)
+POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 
 _LOCAL_PROGRESS_RE = re.compile(
     r"api_v1\.local_progress request_id=(\S+) worker_generation=(\d+) sequence=(\d+) "
@@ -1564,19 +1568,19 @@ def _run_owned_runner(command: list[str], timeout_s: float,
                     process.wait(timeout=cleanup_remaining())
                 raise RuntimeError("owned_process_group_cleanup_unavailable") from None
             with contextlib.suppress(ProcessLookupError):
-                owned_killpg(process.pid, signal.SIGTERM)
+                owned_killpg(process.pid, POSIX_SIGTERM)
             try:
                 process.wait(timeout=cleanup_remaining())
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
-                    owned_killpg(process.pid, signal.SIGKILL)
+                    owned_killpg(process.pid, POSIX_SIGKILL)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=cleanup_remaining())
             # The leader can exit before its browser/driver descendants. Target
             # the whole owned group again and prove it is gone before claiming
             # successful cleanup in the bounded timeout diagnostic.
             with contextlib.suppress(ProcessLookupError):
-                owned_killpg(process.pid, signal.SIGKILL)
+                owned_killpg(process.pid, POSIX_SIGKILL)
             while clock() < cleanup_deadline:
                 try:
                     owned_killpg(process.pid, 0)

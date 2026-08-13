@@ -53,6 +53,10 @@ SENSITIVE_KEYS = {
 # not borrow from the inference request's independently measured allowance.
 PACKAGED_SETUP_BUDGET_S = 300.0
 PACKAGED_FINALIZATION_BUDGET_S = 120.0
+# Windows does not expose these POSIX-only signal attributes. Keep the injected
+# POSIX cleanup seam host-independent while preferring native signal constants.
+POSIX_SIGTERM = getattr(signal, "SIGTERM", 15)
+POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 PACKAGED_PHASE_STATUS_VERSION = "packaged-runner-phase-v2"
 PACKAGED_PHASES = (
     "runner_startup", "webdriver_ready", "desktop_ready", "operator_ready",
@@ -1564,19 +1568,19 @@ def _run_owned_runner(command: list[str], timeout_s: float,
                     process.wait(timeout=cleanup_remaining())
                 raise RuntimeError("owned_process_group_cleanup_unavailable") from None
             with contextlib.suppress(ProcessLookupError):
-                owned_killpg(process.pid, signal.SIGTERM)
+                owned_killpg(process.pid, POSIX_SIGTERM)
             try:
                 process.wait(timeout=cleanup_remaining())
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
-                    owned_killpg(process.pid, signal.SIGKILL)
+                    owned_killpg(process.pid, POSIX_SIGKILL)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=cleanup_remaining())
             # The leader can exit before its browser/driver descendants. Target
             # the whole owned group again and prove it is gone before claiming
             # successful cleanup in the bounded timeout diagnostic.
             with contextlib.suppress(ProcessLookupError):
-                owned_killpg(process.pid, signal.SIGKILL)
+                owned_killpg(process.pid, POSIX_SIGKILL)
             while clock() < cleanup_deadline:
                 try:
                     owned_killpg(process.pid, 0)

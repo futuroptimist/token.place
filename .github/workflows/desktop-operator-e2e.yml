@@ -194,6 +194,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
 
+      - name: Run long-context benchmark harness unit contracts
+        run: python -m pytest -q -p no:cacheprovider tests/unit/test_long_context_benchmark_harness.py
+
       - name: Smoke test long-context benchmark matrix plan
         run: python scripts/long_context_benchmark.py matrix-plan
 

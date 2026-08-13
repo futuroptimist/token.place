@@ -3962,6 +3962,30 @@ class RelayClient:
         evidence_name = os.getenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
         if not config_name or not evidence_name:
             return
+        output = Path(evidence_name)
+
+        def publish(payload: Dict[str, Any]) -> bool:
+            """Atomically publish bounded benchmark-only stage evidence."""
+            temporary = None
+            try:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                fd, temporary = tempfile.mkstemp(
+                    prefix=".long-context-tokenizer-", dir=output.parent)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+                os.replace(temporary, output)
+                temporary = None
+                return True
+            except (OSError, UnicodeError, TypeError, ValueError):
+                return False
+            finally:
+                if temporary is not None:
+                    Path(temporary).unlink(missing_ok=True)
+
+        publish({"status": "failed", "stage": "python_producer_invoked",
+                 "failure_category": "request_validation_failure"})
         try:
             raw = Path(config_name).read_text(encoding="utf-8")
             if len(raw.encode("utf-8")) > 16384:
@@ -3983,6 +4007,11 @@ class RelayClient:
             content_bytes = content.encode("utf-8")
             if hashlib.sha256(content_bytes).hexdigest() != config.get("fixture_sha256"):
                 return
+            runtime_render_tokenizer = getattr(llm_instance, "render_and_tokenize_chat", None)
+            failure_category = ("tokenization_failure" if callable(runtime_render_tokenizer)
+                                else "runtime_tokenizer_unavailable")
+            publish({"status": "failed", "stage": "request_validated",
+                     "failure_category": failure_category})
             counts: Dict[str, int] = {}
             for key, offset in sorted(target_offsets.items(), key=lambda item: item[1]):
                 if offset <= 0 or offset >= len(content_bytes):
@@ -3996,6 +4025,8 @@ class RelayClient:
                 if count is None:
                     return
                 counts[key] = count
+            publish({"status": "failed", "stage": "tokenization_completed",
+                     "failure_category": "runtime_identity_unavailable"})
             runtime_identity = os.getenv("TOKENPLACE_RUNTIME_ID", "")
             if not runtime_identity:
                 return
@@ -4004,6 +4035,8 @@ class RelayClient:
                 "fixture_sha256": config["fixture_sha256"],
                 "total_prompt_tokens": full_prompt_tokens,
                 "target_offsets_tokens": counts}
+            publish({"status": "failed", "stage": "publication_started",
+                     "failure_category": "atomic_publication_failure"})
             applicability = getattr(llm_instance, "_token_place_benchmark_kv_applicability", None)
             if isinstance(applicability, dict):
                 evidence["kv_applicability"] = dict(applicability)
@@ -4023,17 +4056,11 @@ class RelayClient:
                         "conservative_fallback_used": memory.get("conservative_fallback_used"),
                     }
                     evidence["kv_runtime"] = dict(runtime_diagnostic)
-            output = Path(evidence_name)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            fd, temporary = tempfile.mkstemp(prefix=".long-context-tokenizer-", dir=output.parent)
-            try:
-                if hasattr(os, "fchmod"):
-                    os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(evidence, handle, sort_keys=True, separators=(",", ":"))
-                os.replace(temporary, output)
-            finally:
-                Path(temporary).unlink(missing_ok=True)
+            evidence.update({"status": "published", "stage": "evidence_published"})
+            if not publish(evidence):
+                # Publication failures remain fail closed. No raw I/O detail is
+                # logged or returned through the relay surface.
+                return
         except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             return
 

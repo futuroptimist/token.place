@@ -1797,8 +1797,8 @@ def test_primary_tokenizer_evidence_snapshot_survives_recovery_overwrite(
 
 
 @pytest.mark.parametrize(("contents", "runtime_identity", "expected"), [
-    (None, "bundled", "authoritative_target_depth_unavailable"),
-    ("not-json", "bundled", "authoritative_target_depth_unavailable"),
+    (None, "bundled", "tokenizer_application_handoff_absent_or_malformed"),
+    ("not-json", "bundled", "tokenizer_application_handoff_absent_or_malformed"),
     ('{"runtime_identity":"other","fixture_sha256":"fixture"}', "bundled",
      "authoritative_target_depth_mismatched"),
 ])
@@ -1810,6 +1810,22 @@ def test_primary_tokenizer_evidence_snapshot_preserves_failure_classifications(
     with pytest.raises(RuntimeError, match=expected):
         desktop_runner._read_primary_tokenizer_observation(
             evidence_path, runtime_identity, "fixture")
+
+
+@pytest.mark.parametrize("category", [
+    "request_validation_failure", "runtime_tokenizer_unavailable",
+    "runtime_identity_unavailable", "tokenization_failure",
+    "atomic_publication_failure", "python_producer_not_invoked",
+    "rust_python_handoff_failure",
+])
+def test_primary_tokenizer_stage_failures_are_bounded_and_categorical(
+        desktop_runner, tmp_path, category):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(json.dumps({"status": "failed", "stage": "bounded_stage",
+        "failure_category": category, "path": "C:/Users/private/secret"}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match=f"^{category}$"):
+        desktop_runner._read_primary_tokenizer_observation(
+            evidence_path, "bundled", "fixture")
 
 
 def test_packaged_runtime_requires_physical_prerequisites():

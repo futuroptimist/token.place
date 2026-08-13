@@ -226,6 +226,9 @@ jobs:
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml no_child_startup_failure
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Install tauri-driver for production-shaped tokenizer handoff
+        run: cargo install tauri-driver
+
       - name: Set up Node.js for Windows package
         uses: actions/setup-node@v4
         with:
@@ -259,6 +262,21 @@ jobs:
       - name: Build current-head Windows NSIS release package
         working-directory: desktop-tauri
         run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Provision deterministic tokenizer-handoff integration model
+        shell: bash
+        env:
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+        run: bash scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
+
+      - name: Cross tauri-driver argv through the authoritative tokenizer producer
+        shell: pwsh
+        run: |
+          $app = 'desktop-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/token-place-desktop-tauri.exe'
+          $model = '.ci-models/stories15M-q4_0.gguf'
+          python desktop-tauri/scripts/test_desktop_operator_ui_e2e.py `
+            --tokenizer-handoff-integration --app-binary $app --model $model
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Hosted-Windows packaged-start gate for installed current package
         shell: pwsh

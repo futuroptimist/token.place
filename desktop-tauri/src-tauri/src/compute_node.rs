@@ -102,6 +102,30 @@ fn canonical_non_alias_directory(path: &Path) -> Option<PathBuf> {
     path.canonicalize().ok()
 }
 
+fn publish_benchmark_tokenizer_handoff(evidence_path: &Path) -> bool {
+    let Some(parent) = evidence_path.parent() else {
+        return false;
+    };
+    let temporary = parent.join(format!(
+        ".long-context-tokenizer-handoff-{}.json",
+        std::process::id()
+    ));
+    let payload = br#"{"failure_category":"python_producer_not_invoked","stage":"application_argument_handoff_accepted","status":"failed"}"#;
+    let published = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(payload)?;
+            file.sync_all()
+        })
+        .and_then(|_| std::fs::rename(&temporary, evidence_path))
+        .is_ok();
+    let _ = std::fs::remove_file(temporary);
+    published
+}
+
 fn apply_benchmark_tokenizer_env<C>(
     command: &mut C,
     request: Option<OsString>,
@@ -161,6 +185,9 @@ fn apply_benchmark_tokenizer_env<C>(
         Err(_) => return,
     }
 
+    if !publish_benchmark_tokenizer_handoff(&evidence_path) {
+        return;
+    }
     command.set_env(OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ENV), request);
     command.set_env(OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ENV), evidence);
 }
@@ -3659,7 +3686,7 @@ mod tests {
         for (key, value) in [
             ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
             ("TOKENPLACE_BUILD_ID", "build-test"),
-            ("TOKENPLACE_APP_VERSION", "0.1.16"),
+            ("TOKENPLACE_APP_VERSION", "0.1.17"),
             ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
             ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
             ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),
@@ -3681,10 +3708,15 @@ mod tests {
             command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
             Some(evidence.as_os_str())
         );
+        let handoff = std::fs::read_to_string(&evidence).expect("handoff attestation");
+        assert!(handoff.contains("application_argument_handoff_accepted"));
+        assert!(handoff.contains("python_producer_not_invoked"));
+        assert!(!handoff.contains(request.to_string_lossy().as_ref()));
+        assert!(!handoff.contains(evidence.to_string_lossy().as_ref()));
         for (key, value) in [
             ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
             ("TOKENPLACE_BUILD_ID", "build-test"),
-            ("TOKENPLACE_APP_VERSION", "0.1.16"),
+            ("TOKENPLACE_APP_VERSION", "0.1.17"),
             ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
             ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
             ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),

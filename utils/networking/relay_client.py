@@ -3994,6 +3994,18 @@ class RelayClient:
                     llm_instance, prefix_messages, enable_thinking=enable_thinking,
                     model_profile=model_profile)
                 if count is None:
+                    rendered_prefix = cls._api_v1_render_chat_prompt(
+                        llm_instance,
+                        prefix_messages,
+                        enable_thinking=enable_thinking,
+                        allow_chat_format_fallback=True,
+                    )
+                    count = (
+                        cls._api_v1_tokenize_rendered_prompt(llm_instance, rendered_prefix)
+                        if rendered_prefix is not None
+                        else None
+                    )
+                if count is None:
                     return
                 counts[key] = count
             runtime_identity = os.getenv("TOKENPLACE_RUNTIME_ID", "")
@@ -4343,7 +4355,6 @@ class RelayClient:
             enable_thinking=admission_enable_thinking,
             model_profile=model_profile,
         )
-        admission_bridge_used = prompt_tokens is not None
         if prompt_tokens is None:
             rendered_prompt = self._api_v1_render_chat_prompt(
                 llm_instance,
@@ -4356,7 +4367,7 @@ class RelayClient:
                 if rendered_prompt is not None
                 else None
             )
-        if admission_bridge_used and prompt_tokens is not None:
+        if prompt_tokens is not None:
             self._api_v1_record_benchmark_tokenizer_observation(
                 llm_instance, messages, full_prompt_tokens=prompt_tokens,
                 enable_thinking=admission_enable_thinking, model_profile=model_profile)

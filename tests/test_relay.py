@@ -5475,3 +5475,39 @@ def test_long_context_benchmark_tokenizer_observation_is_inert_without_explicit_
         enable_thinking=None, model_profile={})
     assert called is False
     assert list(tmp_path.iterdir()) == []
+
+
+def test_long_context_benchmark_tokenizer_observation_uses_active_runtime_fallback(
+        tmp_path, monkeypatch):
+    content = "alpha target omega"
+
+    class Runtime:
+        def render_and_tokenize_chat(self, _messages, **_kwargs):
+            return None
+
+        def tokenize(self, rendered, **_kwargs):
+            return list(rendered)
+
+    request = tmp_path / "request.json"
+    evidence = tmp_path / "evidence.json"
+    cut = len("alpha ".encode())
+    request.write_text(json.dumps({
+        "fixture_sha256": __import__("hashlib").sha256(content.encode()).hexdigest(),
+        "target_prefix_utf8_bytes": {"needle": cut},
+    }))
+    monkeypatch.setenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", str(request))
+    monkeypatch.setenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", str(evidence))
+    monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "bundled-test")
+    monkeypatch.setattr(
+        RelayClient,
+        "_api_v1_render_chat_prompt",
+        staticmethod(lambda _runtime, messages, **_kwargs: messages[-1]["content"]),
+    )
+
+    RelayClient._api_v1_record_benchmark_tokenizer_observation(
+        Runtime(), [{"role": "user", "content": content}], full_prompt_tokens=len(content),
+        enable_thinking=None, model_profile={})
+
+    payload = json.loads(evidence.read_text())
+    assert payload["target_offsets_tokens"] == {"needle": cut}
+    assert content not in evidence.read_text()

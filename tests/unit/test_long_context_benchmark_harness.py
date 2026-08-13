@@ -2,7 +2,6 @@ import ast
 import copy
 import json
 import os
-import signal
 import subprocess
 import sys
 import textwrap
@@ -2145,7 +2144,7 @@ def test_report_only_only_accepts_semantic_failure(tmp_path, report_only, semant
 def test_packaged_temp_permissions_do_not_require_fchmod(tmp_path, monkeypatch):
     model = tmp_path / "model.gguf"; model.write_bytes(b"x")
     app = tmp_path / "app"; app.write_text("x"); app.chmod(0o700)
-    monkeypatch.delattr(h.os, "fchmod")
+    monkeypatch.delattr(h.os, "fchmod", raising=False)
     def failed_runner(command, **kwargs):
         _write_phase(h.Path(command[command.index("--benchmark-phase-status") + 1]),
             "cleanup", 0.0, failure_reason="packaged_runner_failure", cleanup_succeeded=True)
@@ -2780,7 +2779,7 @@ def test_owned_runner_work_timeout_does_not_borrow_cleanup_window(tmp_path):
     signals = []
     def kill_group(pid, sig):
         signals.append(sig)
-        if sig == signal.SIGTERM:
+        if sig == h.POSIX_SIGTERM:
             process.killed = True
         if sig == 0:
             raise ProcessLookupError
@@ -2789,7 +2788,7 @@ def test_owned_runner_work_timeout_does_not_borrow_cleanup_window(tmp_path):
             popen=lambda _command, **_kwargs: process, phase_status_path=phase,
             killpg=kill_group, platform_name="posix", clock=lambda: clock[0])
     assert raised.value.timeout == 10
-    assert signal.SIGTERM in signals
+    assert h.POSIX_SIGTERM in signals
     assert raised.value.cleanup_succeeded is True
 
 
@@ -2811,7 +2810,7 @@ def test_owned_runner_cleanup_overrun_is_bounded_and_fails_closed(tmp_path):
             killpg=lambda _pid, sig: signals.append(sig), platform_name="posix",
             clock=lambda: clock[0])
     assert 5.0 <= clock[0] < 10.0
-    assert signal.SIGKILL in signals
+    assert h.POSIX_SIGKILL in signals
     assert raised.value.cleanup_succeeded is False
 
 
@@ -2829,8 +2828,8 @@ def test_owned_runner_posix_terminates_exact_process_group(monkeypatch):
             popen=lambda command, **kwargs: launched.update(kwargs) or process,
             killpg=kill_group, platform_name="posix", phase_poll_interval_s=10)
     assert launched["start_new_session"] is True
-    assert signals == [(731, signal.SIGTERM), (731, signal.SIGKILL),
-        (731, signal.SIGKILL)]
+    assert signals == [(731, h.POSIX_SIGTERM), (731, h.POSIX_SIGKILL),
+        (731, h.POSIX_SIGKILL)]
     assert raised.value.cleanup_succeeded is False
 
 
@@ -2846,7 +2845,7 @@ def test_owned_runner_posix_does_not_claim_cleanup_while_group_survives(monkeypa
     process.stdout = type("Output", (), {"read": lambda self, size: b""})()
     monkeypatch.setattr(h.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     def surviving_group(_pid, sig):
-        if sig == signal.SIGTERM:
+        if sig == h.POSIX_SIGTERM:
             process.killed = True
     with pytest.raises(subprocess.TimeoutExpired) as raised:
         h._run_owned_runner(["runner"], 1, 2,

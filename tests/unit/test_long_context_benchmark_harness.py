@@ -25,6 +25,7 @@ def desktop_runner():
         "_is_windows_checkpoint_contention",
         "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver",
         "_read_primary_tokenizer_observation", "tokenizer_handoff_args",
+        "tokenizer_stage_path", "_write_tokenizer_stage", "_read_tokenizer_stage",
         "tauri_driver_environment", "start_driver"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
@@ -106,6 +107,26 @@ def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
     env = desktop_runner.tauri_driver_environment(tmp_path / "isolated home")
 
     assert all(key not in env for key in keys)
+
+
+def test_tokenizer_stage_is_bounded_atomic_and_rearmed(desktop_runner, tmp_path):
+    evidence = tmp_path / "sentinel-private-path-payload.json"
+    desktop_runner._write_tokenizer_stage(evidence, "python_producer_not_invoked", 35)
+    stage = desktop_runner.tokenizer_stage_path(evidence)
+    assert json.loads(stage.read_text(encoding="utf-8")) == {
+        "version": 1, "stage": 35, "category": "python_producer_not_invoked"}
+    assert "sentinel-private-path-payload" not in stage.read_text(encoding="utf-8")
+    assert desktop_runner._read_tokenizer_stage(evidence) == "python_producer_not_invoked"
+    assert not list(tmp_path.glob(".tokenizer-runner-stage-*.tmp"))
+
+
+@pytest.mark.parametrize("value", [[], "malformed", None, 7, {"version": 1}])
+def test_tokenizer_stage_rejects_non_object_or_malformed_json(
+        desktop_runner, tmp_path, value):
+    evidence = tmp_path / "evidence.json"
+    desktop_runner.tokenizer_stage_path(evidence).write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="rust_python_handoff_failed"):
+        desktop_runner._read_tokenizer_stage(evidence)
 
 
 def _phase_write(desktop_runner, path, *, clock, sleeper, platform_name="nt"):

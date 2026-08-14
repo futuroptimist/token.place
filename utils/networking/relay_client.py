@@ -1157,6 +1157,7 @@ class RelayClient:
         self._polling_stopped_by_request = False
         self._api_v1_control_wakeup = threading.Event()
         self._registration_token: Optional[str] = None
+        self._api_v1_write_benchmark_stage("python_handoff_received")
         configured_servers: List[Any] = []
         self._cluster_only = False
 
@@ -3948,6 +3949,36 @@ class RelayClient:
         return None
 
     @classmethod
+    def _api_v1_write_benchmark_stage(cls, category: str, stage: int = 30) -> bool:
+        """Atomically publish only a bounded, privacy-safe benchmark stage."""
+        allowed = {
+            "python_handoff_received", "request_validation_failure",
+            "fixture_hash_validation_failure", "active_runtime_tokenizer_unavailable",
+            "runtime_identity_unavailable", "tokenization_failure",
+            "evidence_publication_failure", "authoritative_evidence_published",
+        }
+        evidence_name = os.getenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
+        if category not in allowed or not evidence_name:
+            return False
+        output = Path(f"{evidence_name}.stage.json")
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=".tokenizer-stage-", suffix=".tmp",
+                dir=output.parent)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump({"version": 1, "stage": stage, "category": category}, handle,
+                        sort_keys=True, separators=(",", ":"))
+                os.replace(temporary, output)
+                return True
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return False
+
+    @classmethod
     def _api_v1_record_benchmark_tokenizer_observation(
         cls,
         llm_instance: Any,
@@ -3965,12 +3996,21 @@ class RelayClient:
         try:
             raw = Path(config_name).read_text(encoding="utf-8")
             if len(raw.encode("utf-8")) > 16384:
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
                 return
-            config = json.loads(raw)
+            try:
+                config = json.loads(raw)
+            except json.JSONDecodeError:
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                return
+            if not isinstance(config, dict):
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                return
             target_offsets = config.get("target_prefix_utf8_bytes")
-            if (not isinstance(config, dict) or not isinstance(target_offsets, dict)
+            if (not isinstance(target_offsets, dict)
                     or not target_offsets or not all(isinstance(k, str) and isinstance(v, int)
                     for k, v in target_offsets.items())):
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
                 return
             user_indexes = [index for index, message in enumerate(messages)
                 if isinstance(message, dict) and message.get("role") == "user"]
@@ -3982,6 +4022,7 @@ class RelayClient:
                 return
             content_bytes = content.encode("utf-8")
             if hashlib.sha256(content_bytes).hexdigest() != config.get("fixture_sha256"):
+                cls._api_v1_write_benchmark_stage("fixture_hash_validation_failure", 50)
                 return
             counts: Dict[str, int] = {}
             for key, offset in sorted(target_offsets.items(), key=lambda item: item[1]):
@@ -4006,10 +4047,13 @@ class RelayClient:
                         else None
                     )
                 if count is None:
+                    cls._api_v1_write_benchmark_stage(
+                        "active_runtime_tokenizer_unavailable", 60)
                     return
                 counts[key] = count
             runtime_identity = os.getenv("TOKENPLACE_RUNTIME_ID", "")
             if not runtime_identity:
+                cls._api_v1_write_benchmark_stage("runtime_identity_unavailable", 70)
                 return
             evidence = {"method": "packaged_admission_render_and_tokenize_chat",
                 "runtime_identity": runtime_identity,
@@ -4044,9 +4088,11 @@ class RelayClient:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(evidence, handle, sort_keys=True, separators=(",", ":"))
                 os.replace(temporary, output)
+                cls._api_v1_write_benchmark_stage("authoritative_evidence_published", 100)
             finally:
                 Path(temporary).unlink(missing_ok=True)
-        except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+            cls._api_v1_write_benchmark_stage("evidence_publication_failure", 90)
             return
 
     @staticmethod

@@ -61,6 +61,11 @@ PACKAGED_PHASES = (
 )
 PACKAGED_FAILURE_REASONS = frozenset({
     "cleanup_failure",
+    "application_arguments_absent", "application_arguments_malformed",
+    "rust_python_handoff_failed", "python_producer_not_invoked",
+    "request_validation_failure", "fixture_hash_validation_failure",
+    "active_runtime_tokenizer_unavailable", "runtime_identity_unavailable",
+    "tokenization_failure", "evidence_publication_failure",
     "vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
     "requested_context_tier_not_applied", "message_input_not_populated",
     "send_button_not_enabled", "packaged_runner_failure",

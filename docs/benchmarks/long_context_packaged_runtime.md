@@ -131,6 +131,17 @@ identity; neither writes prompt text, rendered text, target values, ciphertext, 
 request identifiers. The seam is inert unless the manual long-context benchmark runner explicitly
 supplies both environment variables.
 
+A separate atomically replaced `evidence.json.stage.json` sibling carries the production-boundary
+handshake. Its closed schema contains only a schema version, a monotonic stage number, and an
+allowlisted low-cardinality category. Rust records argument parsing and validated handoff; Python
+acknowledges receipt and records validation, tokenizer, identity, and publication outcomes. The
+runner verifies that handshake, then re-arms it immediately before the benchmark submission so a
+readiness request cannot masquerade as benchmark activity. The stage file never contains paths,
+prompts, responses, payloads, identifiers, secrets, credentials, or exception text. Missing
+post-arm producer activity is classified as `python_producer_not_invoked`; all other failures retain
+their most specific safe category and produce a `not_run` report with zero completed trials and no
+semantic or performance claim.
+
 The harness requires method `packaged_admission_render_and_tokenize_chat`, matching bundled runtime
 identity and total/progress counts, the exact target key set, unique ordered positive prefix counts,
 and ratios within an absolute 0.03 tolerance of the controlled fixture placements. Missing,

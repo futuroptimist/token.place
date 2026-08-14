@@ -45,6 +45,45 @@ const BENCHMARK_TOKENIZER_REQUEST_ARG: &str =
 const BENCHMARK_TOKENIZER_EVIDENCE_ARG: &str =
     "--token-place-long-context-benchmark-tokenizer-evidence=";
 
+fn benchmark_stage_path(evidence: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.stage.json", evidence.display()))
+}
+
+fn publish_benchmark_stage(evidence: &Path, stage: u8, category: &str) -> std::io::Result<()> {
+    const ALLOWED: &[&str] = &[
+        "application_arguments_absent",
+        "application_arguments_malformed",
+        "application_arguments_accepted",
+        "rust_python_handoff_failed",
+        "rust_python_handoff_accepted",
+    ];
+    if !ALLOWED.contains(&category) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid category",
+        ));
+    }
+    let output = benchmark_stage_path(evidence);
+    let parent = output
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".tokenizer-stage-{nonce}-{}.tmp",
+        current_time_ms()
+    ));
+    let body = serde_json::json!({"version": 1, "stage": stage, "category": category});
+    let encoded = serde_json::to_vec(&body)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stage encoding"))?;
+    std::fs::write(&temporary, encoded)?;
+    let result = std::fs::rename(&temporary, output);
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
 fn benchmark_tokenizer_handoff<I>(
     args: I,
     request_env: Option<OsString>,
@@ -69,10 +108,18 @@ where
         }
     }
     if invalid_args || request_arg.is_some() != evidence_arg.is_some() {
+        if let Some(evidence) = evidence_arg.as_ref() {
+            let _ =
+                publish_benchmark_stage(Path::new(evidence), 10, "application_arguments_malformed");
+        }
         return (None, None);
     }
     match (request_arg, evidence_arg) {
-        (Some(request), Some(evidence)) => (Some(request), Some(evidence)),
+        (Some(request), Some(evidence)) => {
+            let _ =
+                publish_benchmark_stage(Path::new(&evidence), 10, "application_arguments_accepted");
+            (Some(request), Some(evidence))
+        }
         _ => (request_env, evidence_env),
     }
 }
@@ -162,7 +209,8 @@ fn apply_benchmark_tokenizer_env<C>(
     }
 
     command.set_env(OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ENV), request);
-    command.set_env(OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ENV), evidence);
+    command.set_env(OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ENV), &evidence);
+    let _ = publish_benchmark_stage(&evidence_path, 20, "rust_python_handoff_accepted");
 }
 
 const EXPECTED_MODEL_ARTIFACT_FILENAME: &str = "Qwen3-8B-Q4_K_M.gguf";

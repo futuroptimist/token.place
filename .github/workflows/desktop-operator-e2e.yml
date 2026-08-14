@@ -122,6 +122,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
+          pip install selenium
           python -m pip install "$(sed -n '/^llama_cpp_python==/p' requirements.txt)"
           pip install selenium
 
@@ -193,6 +194,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
+          pip install selenium
 
       - name: Run long-context benchmark harness unit contracts
         run: python -m pytest -q -p no:cacheprovider tests/unit/test_long_context_benchmark_harness.py
@@ -202,6 +204,9 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tauri-driver for Windows production-boundary tests
+        run: cargo install tauri-driver --locked
 
       - name: Run Windows packaged-start unit regressions with poisoned host Python state
         shell: pwsh
@@ -288,6 +293,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify Windows application-argument tokenizer production boundary
+        run: |
+          cargo test --locked --manifest-path desktop-tauri/src-tauri/Cargo.toml benchmark_tokenizer -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest -q -p no:cacheprovider tests/unit/test_long_context_benchmark_harness.py -k "tokenizer_stage or tokenizer_handoff or start_driver"
 
       - name: Upload desktop relay parity logs on failure (Windows)
         if: failure()

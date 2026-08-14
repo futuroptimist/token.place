@@ -119,12 +119,17 @@ needle occurs once and deterministic similar-but-distinct markers are decoys. Th
 heading/prose ambiguity. Its canary literal is not disclosed by the instructions and occurs once.
 
 In explicit long-context benchmark mode, the packaged runner passes only the fixture hash, validated UTF-8 prefix cut
-points, and an owner-only evidence location to the bundled sidecar. During normal authoritative
-admission, the sidecar verifies the actual final user message against that hash and sends the full
-message and every prefix through the same loaded `llm_instance`, `render_and_tokenize_chat` bridge,
-chat-template policy, and thinking option. It atomically writes bounded counts and runtime identity;
-it never writes prompt text, target values, ciphertext, credentials, or request identifiers. The
-seam is inert unless the manual long-context benchmark runner explicitly supplies both environment variables.
+points, and an owner-only evidence location to the bundled sidecar. During authoritative admission,
+the sidecar verifies the actual final user message against that hash and first sends the full message
+and every prefix through the same loaded `llm_instance`, `render_and_tokenize_chat` bridge,
+chat-template policy, and thinking option. If that bridge is unavailable, each message is instead
+rendered and tokenized by the active runtime used for admission; evidence is published only when an
+authoritative count is available for the full message and every prefix. If either active-runtime
+operation cannot produce a count, evidence generation fails closed rather than substituting an
+estimate or partial observation. Both paths atomically write only bounded counts and runtime
+identity; neither writes prompt text, rendered text, target values, ciphertext, credentials, or
+request identifiers. The seam is inert unless the manual long-context benchmark runner explicitly
+supplies both environment variables.
 
 The harness requires method `packaged_admission_render_and_tokenize_chat`, matching bundled runtime
 identity and total/progress counts, the exact target key set, unique ordered positive prefix counts,

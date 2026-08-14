@@ -26,6 +26,8 @@ def desktop_runner():
         "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver",
         "_read_primary_tokenizer_observation", "tokenizer_handoff_args",
         "tokenizer_stage_path", "_write_tokenizer_stage", "_read_tokenizer_stage",
+        "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
+        "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "start_driver"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
@@ -149,6 +151,53 @@ def test_tokenizer_stage_rejects_bool_or_mismatched_stage(desktop_runner, tmp_pa
         encoding="utf-8")
     with pytest.raises(RuntimeError, match="application_arguments_malformed"):
         desktop_runner._read_tokenizer_stage(evidence)
+
+
+def test_tokenizer_stage_runner_boundaries_are_directly_enforced(desktop_runner, tmp_path):
+    evidence = tmp_path / "evidence.json"
+    stage_path = desktop_runner.tokenizer_stage_path(evidence)
+
+    def publish(category, stage):
+        stage_path.write_text(json.dumps({
+            "version": 1, "stage": stage, "category": category,
+        }), encoding="utf-8")
+
+    def fail_closed(reason):
+        raise RuntimeError(reason)
+
+    for category, stage, expected in (
+        ("application_arguments_absent", 0, "application_arguments_absent"),
+        ("application_arguments_malformed", 10, "application_arguments_malformed"),
+        ("application_arguments_accepted", 10, "rust_python_handoff_failed"),
+    ):
+        publish(category, stage)
+        with pytest.raises(RuntimeError, match=expected):
+            desktop_runner._validate_operator_tokenizer_handoff(evidence, fail_closed)
+
+    publish("python_handoff_received", 30)
+    desktop_runner._validate_operator_tokenizer_handoff(evidence, fail_closed)
+    stage_path.unlink()
+    with pytest.raises(RuntimeError, match="application_arguments_absent"):
+        desktop_runner._validate_operator_tokenizer_handoff(evidence, fail_closed)
+    recorded = []
+    desktop_runner._validate_operator_tokenizer_handoff(evidence, recorded.append)
+    assert recorded == ["application_arguments_absent"]
+
+    driver_log = tmp_path / "driver.log"
+    driver_log.write_bytes(b"bounded-log")
+    assert desktop_runner._rearm_tokenizer_stage(evidence, driver_log) == 11
+    assert desktop_runner._read_tokenizer_stage(evidence) == "python_producer_not_invoked"
+
+    with pytest.raises(RuntimeError, match="python_producer_not_invoked"):
+        desktop_runner._validate_final_tokenizer_stage(evidence, fail_closed)
+    publish("authoritative_evidence_published", 100)
+    desktop_runner._validate_final_tokenizer_stage(evidence, fail_closed)
+    stage_path.write_text("not-json", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="application_arguments_absent"):
+        desktop_runner._validate_final_tokenizer_stage(evidence, fail_closed)
+    recorded.clear()
+    desktop_runner._validate_final_tokenizer_stage(evidence, recorded.append)
+    assert recorded == ["application_arguments_absent"]
 
 
 def _phase_write(desktop_runner, path, *, clock, sleeper, platform_name="nt"):

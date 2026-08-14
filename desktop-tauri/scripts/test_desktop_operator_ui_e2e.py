@@ -563,6 +563,36 @@ def _read_tokenizer_stage(evidence_path: Path) -> str:
     return value["category"]
 
 
+def _validate_operator_tokenizer_handoff(evidence_path: Path,
+        fail_closed: Callable[[str], None]) -> None:
+    try:
+        category = _read_tokenizer_stage(evidence_path)
+    except RuntimeError as exc:
+        fail_closed(str(exc))
+        return
+    if category in {"application_arguments_absent", "application_arguments_malformed"}:
+        fail_closed(category)
+    elif category != "python_handoff_received":
+        fail_closed("rust_python_handoff_failed")
+
+
+def _rearm_tokenizer_stage(evidence_path: Path, driver_log: Path) -> int:
+    _write_tokenizer_stage(evidence_path, "python_producer_not_invoked", 35)
+    return driver_log.stat().st_size
+
+
+def _validate_final_tokenizer_stage(evidence_path: Path,
+        fail_closed: Callable[[str], None]) -> None:
+    try:
+        category = _read_tokenizer_stage(evidence_path)
+    except RuntimeError as exc:
+        fail_closed(str(exc))
+        return
+    if category != "authoritative_evidence_published":
+        fail_closed(category if category in PACKAGED_FAILURE_REASONS
+            else "python_producer_not_invoked")
+
+
 def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
     env = os.environ.copy()
     for key in (
@@ -1179,14 +1209,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             lambda d: _status_value(d, "Registered").lower().startswith("yes"))
         write_phase("operator_ready")
 
-        try:
-            handoff_stage = _read_tokenizer_stage(tokenizer_evidence)
-        except RuntimeError as exc:
-            fail_closed(str(exc))
-        if handoff_stage in {"application_arguments_absent", "application_arguments_malformed"}:
-            fail_closed(handoff_stage)
-        if handoff_stage != "python_handoff_received":
-            fail_closed("rust_python_handoff_failed")
+        _validate_operator_tokenizer_handoff(tokenizer_evidence, fail_closed)
 
         runtime = {label: _status_value(driver, label) for label in
             ("App version", "Build ID", "Runtime ID", "Bundled runtime ID", "Launcher source",
@@ -1260,8 +1283,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         driver_log_boundary = 0
         def capture_driver_log_boundary() -> None:
             nonlocal driver_log_boundary
-            _write_tokenizer_stage(tokenizer_evidence, "python_producer_not_invoked", 35)
-            driver_log_boundary = driver_log.stat().st_size
+            driver_log_boundary = _rearm_tokenizer_stage(tokenizer_evidence, driver_log)
         started = _populate_and_submit_packaged_prompt(browser, request["prompt"],
             setup_remaining, fail_closed, write_phase,
             before_submit=capture_driver_log_boundary)
@@ -1325,13 +1347,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         post_terminal = [item for item in observe_post_terminal(post_terminal_poll,
             window_s=min(0.1, finalization_remaining())) if item is not None]
         finalization_remaining()
-        try:
-            stage_category = _read_tokenizer_stage(tokenizer_evidence)
-        except RuntimeError as exc:
-            fail_closed(str(exc))
-        if stage_category != "authoritative_evidence_published":
-            fail_closed(stage_category if stage_category in PACKAGED_FAILURE_REASONS
-                else "python_producer_not_invoked")
+        _validate_final_tokenizer_stage(tokenizer_evidence, fail_closed)
         tokenizer_observation = _read_primary_tokenizer_observation(
             tokenizer_evidence, runtime["Runtime ID"], request["manifest"]["fixture_sha256"])
         finalization_remaining()

@@ -56,6 +56,8 @@ try:
         benchmark_operator_mode,
         OwnedProcessTreeMemorySampler,
         PACKAGED_FAILURE_REASONS,
+        generate_fixture,
+        invoke_packaged_runtime_adapter,
         parse_packaged_local_telemetry,
         packaged_phase_remaining,
         prefill_cancellation_trigger_state,
@@ -1582,9 +1584,58 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
         "post_restart_followup_s": followup_s}}
 
 
+def run_packaged_windows_tokenizer_boundary(app_binary: Path, model: Path,
+        *, adapter=invoke_packaged_runtime_adapter) -> int:
+    """Exercise the packaged Windows argv-to-authoritative-evidence boundary."""
+    app_binary = app_binary.resolve(strict=True)
+    model = model.resolve(strict=True)
+    if app_binary.suffix.lower() != ".exe":
+        raise ValueError("packaged Windows tokenizer boundary requires an application .exe")
+
+    relay_port = reserve_free_port()
+    relay_url = f"http://127.0.0.1:{relay_port}"
+    relay_log = LOGS_DIR / "packaged-windows-tokenizer-boundary-relay.log"
+    relay_env = os.environ.copy()
+    relay_env["USE_MOCK_LLM"] = "1"
+    relay = subprocess.Popen(  # noqa: S603
+        [sys.executable, str(REPO_ROOT / "relay.py"), "--host", "127.0.0.1",
+         "--port", str(relay_port), "--use_mock_llm"],
+        cwd=REPO_ROOT, env=relay_env,
+        stdout=relay_log.open("w", encoding="utf-8"),
+        stderr=subprocess.STDOUT, text=True)
+    try:
+        wait_for_http_200(f"{relay_url}/livez")
+        evidence = adapter(
+            fixture_id="small-8k", scenario="structured-extraction", timeout_s=180.0,
+            cleanup_timeout_s=30.0, app_binary=str(app_binary), model=str(model),
+            backend="cpu", relay_url=relay_url, context_tier="8k-fast",
+            report_only=True)
+        fixture = evidence.get("fixture")
+        prompt, manifest = generate_fixture("small-8k", scenario="structured-extraction")
+        if not evidence.get("runtime_contract_pass"):
+            raise RuntimeError(
+                f"packaged Windows tokenizer boundary failed: {evidence.get('code', 'unknown')}")
+        if (not isinstance(fixture, dict)
+                or fixture.get("sha256") != manifest["fixture_sha256"]
+                or not isinstance(fixture.get("authoritative_prompt_tokens"), int)
+                or not isinstance(fixture.get("authoritative_target_offsets_tokens"), dict)
+                or not fixture["authoritative_target_offsets_tokens"]):
+            raise RuntimeError("packaged Windows tokenizer boundary evidence unavailable")
+        serialized = json.dumps(evidence, sort_keys=True)
+        if any(sentinel in serialized for sentinel in (
+                prompt, str(app_binary), str(model),
+                "TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON")):
+            raise RuntimeError("packaged Windows tokenizer boundary leaked private input")
+        print("packaged_windows_tokenizer_boundary=passed")
+        return 0
+    finally:
+        terminate_process(relay)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packaged-windows-nvidia-hardware", action="store_true")
+    parser.add_argument("--packaged-windows-tokenizer-boundary", action="store_true")
     parser.add_argument("--app-binary", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
@@ -1592,6 +1643,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--benchmark-evidence", type=Path)
     parser.add_argument("--benchmark-phase-status", type=Path)
     args = parser.parse_args(argv)
+    if args.packaged_windows_tokenizer_boundary:
+        if args.app_binary is None or args.model is None:
+            parser.error("packaged Windows tokenizer boundary requires --app-binary and --model")
+        if (args.benchmark_request or args.benchmark_evidence
+                or args.benchmark_phase_status or args.packaged_windows_nvidia_hardware):
+            parser.error("packaged Windows tokenizer boundary cannot be combined with other modes")
+        return run_packaged_windows_tokenizer_boundary(args.app_binary, args.model)
     if args.benchmark_request or args.benchmark_evidence or args.benchmark_phase_status:
         if not (args.benchmark_request and args.benchmark_evidence
                 and args.benchmark_phase_status and args.app_binary):

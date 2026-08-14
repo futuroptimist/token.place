@@ -28,7 +28,8 @@ def desktop_runner():
         "tokenizer_stage_path", "_write_tokenizer_stage", "_read_tokenizer_stage",
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
-        "tauri_driver_environment", "start_driver"}
+        "tauri_driver_environment", "start_driver",
+        "run_packaged_windows_tokenizer_boundary", "main"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ModuleType("desktop_runner_under_test")
@@ -37,6 +38,7 @@ def desktop_runner():
         ChromeOptions=object), "ActionChains": object,
         "time": time, "By": SimpleNamespace(CSS_SELECTOR="css"),
         "os": os, "json": json, "tempfile": __import__("tempfile"),
+        "argparse": __import__("argparse"),
         "shutil": __import__("shutil"), "Path": Path,
         "subprocess": subprocess, "Callable": __import__("typing").Callable,
         "psutil": __import__("psutil"),
@@ -44,7 +46,9 @@ def desktop_runner():
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
         "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
-        "apply_benchmark_context_tier": h.apply_benchmark_context_tier})
+        "apply_benchmark_context_tier": h.apply_benchmark_context_tier,
+        "generate_fixture": h.generate_fixture,
+        "invoke_packaged_runtime_adapter": h.invoke_packaged_runtime_adapter})
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
     return module
 
@@ -102,6 +106,8 @@ def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
     keys = (
         "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST",
         "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE",
+        "TOKEN_PLACE_PYTHON",
+        "TOKEN_PLACE_SIDECAR_PYTHON",
     )
     for key in keys:
         monkeypatch.setenv(key, f"poisoned {key}")
@@ -109,6 +115,65 @@ def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
     env = desktop_runner.tauri_driver_environment(tmp_path / "isolated home")
 
     assert all(key not in env for key in keys)
+
+
+def test_packaged_windows_tokenizer_boundary_uses_packaged_adapter_contract(
+        desktop_runner, monkeypatch, tmp_path):
+    application = tmp_path / "token-place-desktop-tauri.exe"
+    model = tmp_path / "tiny.gguf"
+    application.write_bytes(b"application")
+    model.write_bytes(b"model")
+    calls = []
+    process = SimpleNamespace()
+
+    desktop_runner.REPO_ROOT = tmp_path
+    desktop_runner.LOGS_DIR = tmp_path
+    desktop_runner.sys = sys
+    desktop_runner.reserve_free_port = lambda: 43123
+    desktop_runner.wait_for_http_200 = lambda url: calls.append(("ready", url))
+    desktop_runner.terminate_process = lambda value: calls.append(("terminate", value))
+    desktop_runner.subprocess = SimpleNamespace(
+        Popen=lambda *args, **kwargs: calls.append(("popen", args, kwargs)) or process,
+        STDOUT=subprocess.STDOUT)
+    monkeypatch.setenv("TOKEN_PLACE_PYTHON", "poisoned-python")
+    monkeypatch.setenv("TOKEN_PLACE_SIDECAR_PYTHON", "poisoned-sidecar")
+
+    def adapter(**kwargs):
+        calls.append(("adapter", kwargs))
+        return {"runtime_contract_pass": True, "fixture": {
+            "sha256": h.generate_fixture(
+                "small-8k", scenario="structured-extraction")[1]["fixture_sha256"],
+            "authoritative_prompt_tokens": 42,
+            "authoritative_target_offsets_tokens": {"near": 7}}}
+
+    assert desktop_runner.run_packaged_windows_tokenizer_boundary(
+        application, model, adapter=adapter) == 0
+    adapter_kwargs = next(item[1] for item in calls if item[0] == "adapter")
+    assert adapter_kwargs == {
+        "fixture_id": "small-8k", "scenario": "structured-extraction",
+        "timeout_s": 180.0, "cleanup_timeout_s": 30.0,
+        "app_binary": str(application.resolve()), "model": str(model.resolve()),
+        "backend": "cpu", "relay_url": "http://127.0.0.1:43123",
+        "context_tier": "8k-fast", "report_only": True}
+    popen_env = next(item[2]["env"] for item in calls if item[0] == "popen")
+    assert popen_env["USE_MOCK_LLM"] == "1"
+    assert calls[-1] == ("terminate", process)
+
+
+def test_packaged_windows_tokenizer_boundary_cli_requires_explicit_inputs(
+        desktop_runner, tmp_path):
+    calls = []
+    desktop_runner.run_packaged_windows_tokenizer_boundary = (
+        lambda application, model: calls.append((application, model)) or 17)
+    application = tmp_path / "current-head.exe"
+    model = tmp_path / "tiny.gguf"
+
+    assert desktop_runner.main([
+        "--packaged-windows-tokenizer-boundary", "--app-binary", str(application),
+        "--model", str(model)]) == 17
+    assert calls == [(application, model)]
+    with pytest.raises(SystemExit):
+        desktop_runner.main(["--packaged-windows-tokenizer-boundary"])
 
 
 def test_tokenizer_stage_is_bounded_atomic_and_rearmed(desktop_runner, tmp_path):

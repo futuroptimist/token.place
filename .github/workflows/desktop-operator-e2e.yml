@@ -196,6 +196,16 @@ jobs:
           pip install -r config/requirements_codex_verification.txt
           pip install selenium
 
+      - name: Restore cached tiny real GGUF for Windows tokenizer boundary
+        uses: actions/cache@v4
+        with:
+          path: .ci-models/stories15M-q4_0.gguf
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
+
+      - name: Provision tiny real GGUF for Windows tokenizer boundary
+        shell: bash
+        run: bash scripts/provision-ci-tiny-gguf.sh "$GITHUB_WORKSPACE/.ci-models/stories15M-q4_0.gguf"
+
       - name: Run long-context benchmark harness unit contracts
         run: python -m pytest -q -p no:cacheprovider tests/unit/test_long_context_benchmark_harness.py
 
@@ -295,6 +305,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify Windows application-argument tokenizer production boundary
+        run: |
+          $applications = @(Get-ChildItem 'desktop-tauri/src-tauri/target/x86_64-pc-windows-msvc/release' -Filter '*.exe' -File | Where-Object { $_.Name -notmatch 'setup' })
+          if ($applications.Count -ne 1) { throw "Expected exactly one current-head release application, found $($applications.Count)." }
+          python desktop-tauri/scripts/test_desktop_operator_ui_e2e.py --packaged-windows-tokenizer-boundary --app-binary $applications[0].FullName --model "$env:GITHUB_WORKSPACE/.ci-models/stories15M-q4_0.gguf"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run Windows tokenizer boundary regressions
         run: |
           cargo test --locked --manifest-path desktop-tauri/src-tauri/Cargo.toml benchmark_tokenizer -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

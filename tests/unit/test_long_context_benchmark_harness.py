@@ -181,6 +181,8 @@ def test_packaged_windows_tokenizer_boundary_cli_requires_explicit_inputs(
      "packaged Windows tokenizer boundary failed: bounded-failure"),
     ({"runtime_contract_pass": True, "fixture": None},
      "packaged Windows tokenizer boundary evidence unavailable"),
+    ({"runtime_contract_pass": True, "fixture": []},
+     "packaged Windows tokenizer boundary evidence unavailable"),
     ({"runtime_contract_pass": True, "fixture": {
         "sha256": "wrong", "authoritative_prompt_tokens": 42,
         "authoritative_target_offsets_tokens": {"near": 7}}},
@@ -210,8 +212,12 @@ def test_packaged_windows_tokenizer_boundary_rejects_invalid_adapter_evidence(
     assert terminated == [process]
 
 
-def test_packaged_windows_tokenizer_boundary_rejects_private_input_and_non_exe(
-        desktop_runner, tmp_path):
+@pytest.mark.parametrize("private_input", [
+    "prompt", "application", "model", "TOKEN_PLACE_PYTHON",
+    "TOKEN_PLACE_SIDECAR_PYTHON",
+])
+def test_packaged_windows_tokenizer_boundary_rejects_private_input(
+        desktop_runner, tmp_path, private_input):
     application = tmp_path / "current-head.exe"
     model = tmp_path / "tiny.gguf"
     application.write_bytes(b"application")
@@ -226,17 +232,32 @@ def test_packaged_windows_tokenizer_boundary_rejects_private_input_and_non_exe(
     desktop_runner.terminate_process = terminated.append
     desktop_runner.subprocess = SimpleNamespace(
         Popen=lambda *_args, **_kwargs: process, STDOUT=subprocess.STDOUT)
-    _, manifest = h.generate_fixture("small-8k", scenario="structured-extraction")
+    _, manifest = h.generate_fixture(
+        "small-8k", scenario="structured-extraction")
+    prompt = "private prompt sentinel"
+    desktop_runner.generate_fixture = lambda *_args, **_kwargs: (prompt, manifest)
+    sentinels = {
+        "prompt": prompt,
+        "application": str(application.resolve()),
+        "model": str(model.resolve()),
+        "TOKEN_PLACE_PYTHON": "TOKEN_PLACE_PYTHON",
+        "TOKEN_PLACE_SIDECAR_PYTHON": "TOKEN_PLACE_SIDECAR_PYTHON",
+    }
     evidence = {"runtime_contract_pass": True, "fixture": {
         "sha256": manifest["fixture_sha256"], "authoritative_prompt_tokens": 42,
         "authoritative_target_offsets_tokens": {"near": 7}},
-        "private": str(model.resolve())}
+        "private": sentinels[private_input]}
 
     with pytest.raises(RuntimeError, match="leaked private input"):
         desktop_runner.run_packaged_windows_tokenizer_boundary(
             application, model, adapter=lambda **_kwargs: evidence)
     assert terminated == [process]
 
+
+def test_packaged_windows_tokenizer_boundary_rejects_non_exe(
+        desktop_runner, tmp_path):
+    model = tmp_path / "tiny.gguf"
+    model.write_bytes(b"model")
     non_exe = tmp_path / "application"
     non_exe.write_bytes(b"application")
     with pytest.raises(ValueError, match="requires an application .exe"):

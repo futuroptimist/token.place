@@ -200,6 +200,49 @@ def test_tokenizer_stage_runner_boundaries_are_directly_enforced(desktop_runner,
     assert recorded == ["application_arguments_absent"]
 
 
+@pytest.mark.parametrize(("category", "stage"), [
+    ("application_arguments_accepted", 10),
+    ("rust_python_handoff_failed", 20),
+    ("rust_python_handoff_accepted", 20),
+])
+def test_tokenizer_handoff_converts_incomplete_stages_to_specific_failure(
+        desktop_runner, tmp_path, category, stage):
+    evidence = tmp_path / "private-request-path.json"
+    desktop_runner.tokenizer_stage_path(evidence).write_text(json.dumps({
+        "version": 1, "stage": stage, "category": category,
+    }), encoding="utf-8")
+    failures = []
+
+    desktop_runner._validate_operator_tokenizer_handoff(evidence, failures.append)
+
+    assert failures == ["rust_python_handoff_failed"]
+    assert "private-request-path" not in failures[0]
+
+
+@pytest.mark.parametrize(("category", "stage"), [
+    ("python_producer_not_invoked", 35),
+    ("request_validation_failure", 40),
+    ("fixture_hash_validation_failure", 50),
+    ("active_runtime_tokenizer_unavailable", 60),
+    ("tokenization_failure", 65),
+    ("runtime_identity_unavailable", 70),
+    ("evidence_publication_failure", 90),
+])
+def test_tokenizer_stage_finalization_preserves_allowlisted_producer_failure(
+        desktop_runner, tmp_path, category, stage):
+    evidence = tmp_path / "payload-secret-exception-text.json"
+    desktop_runner.tokenizer_stage_path(evidence).write_text(json.dumps({
+        "version": 1, "stage": stage, "category": category,
+    }), encoding="utf-8")
+    failures = []
+
+    desktop_runner._validate_final_tokenizer_stage(evidence, failures.append)
+
+    assert failures == [category]
+    assert all(sentinel not in failures[0]
+        for sentinel in ("payload", "secret", "exception", str(evidence)))
+
+
 def _phase_write(desktop_runner, path, *, clock, sleeper, platform_name="nt"):
     desktop_runner._write_benchmark_phase(path, "runner_startup", 0.0,
         h.PACKAGED_PHASE_STATUS_VERSION, h.PACKAGED_PHASES,
@@ -2000,6 +2043,7 @@ def test_nonzero_normal_exit_requires_final_cleanup_checkpoint(
 @pytest.mark.parametrize(("primary_reason", "expected_reason"), [
     (None, "cleanup_failure"),
     ("send_button_not_enabled", "send_button_not_enabled"),
+    ("tokenization_failure", "tokenization_failure"),
 ])
 def test_nonzero_cleanup_failure_is_categorical_and_preserves_primary(
         tmp_path, primary_reason, expected_reason):
@@ -2015,6 +2059,10 @@ def test_nonzero_cleanup_failure_is_categorical_and_preserves_primary(
         cleanup_timeout_s=1, subprocess_run=failed_runner)
     assert result["failure_reason"] == expected_reason
     assert result["cleanup_succeeded"] is False
+    if primary_reason == "tokenization_failure":
+        assert result["pass"] is False
+        assert "semantic" not in result
+        assert "performance" not in result
 
 
 @pytest.mark.parametrize(("contents", "expected"), [

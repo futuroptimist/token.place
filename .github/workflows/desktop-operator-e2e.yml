@@ -204,7 +204,9 @@ jobs:
 
       - name: Provision tiny real GGUF for Windows tokenizer boundary
         shell: bash
-        run: bash scripts/provision-ci-tiny-gguf.sh "$GITHUB_WORKSPACE/.ci-models/stories15M-q4_0.gguf"
+        run: |
+          model_path="$(cygpath -u "$GITHUB_WORKSPACE")/.ci-models/stories15M-q4_0.gguf"
+          bash scripts/provision-ci-tiny-gguf.sh "$model_path"
 
       - name: Run long-context benchmark harness unit contracts
         run: python -m pytest -q -p no:cacheprovider tests/unit/test_long_context_benchmark_harness.py

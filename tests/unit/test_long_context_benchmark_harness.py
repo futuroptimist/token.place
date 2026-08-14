@@ -120,6 +120,18 @@ def test_tokenizer_stage_is_bounded_atomic_and_rearmed(desktop_runner, tmp_path)
     assert not list(tmp_path.glob(".tokenizer-runner-stage-*.tmp"))
 
 
+def test_tokenizer_stage_rejects_non_allowlisted_category(desktop_runner, tmp_path):
+    with pytest.raises(ValueError, match="invalid tokenizer stage category"):
+        desktop_runner._write_tokenizer_stage(
+            tmp_path / "evidence.json", "sentinel-private-category", 35)
+    assert not list(tmp_path.iterdir())
+
+
+def test_tokenizer_stage_rejects_missing_file(desktop_runner, tmp_path):
+    with pytest.raises(RuntimeError, match="rust_python_handoff_failed"):
+        desktop_runner._read_tokenizer_stage(tmp_path / "missing-evidence.json")
+
+
 @pytest.mark.parametrize("value", [[], "malformed", None, 7, {"version": 1}])
 def test_tokenizer_stage_rejects_non_object_or_malformed_json(
         desktop_runner, tmp_path, value):

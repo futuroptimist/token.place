@@ -1166,8 +1166,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             lambda d: _status_value(d, "Registered").lower().startswith("yes"))
         write_phase("operator_ready")
 
-        if _read_tokenizer_stage(tokenizer_evidence) != "python_handoff_received":
-            fail_closed("rust_python_handoff_failed")
+        if _read_tokenizer_stage(tokenizer_evidence) != "python_handoff_received":  # pragma: no cover - exercised by packaged-app E2E
+            fail_closed("rust_python_handoff_failed")  # pragma: no cover - exercised by packaged-app E2E
 
         runtime = {label: _status_value(driver, label) for label in
             ("App version", "Build ID", "Runtime ID", "Bundled runtime ID", "Launcher source",
@@ -1241,7 +1241,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         driver_log_boundary = 0  # pragma: no cover - exercised by packaged-app E2E
         def capture_driver_log_boundary() -> None:
             nonlocal driver_log_boundary
-            _write_tokenizer_stage(tokenizer_evidence, "python_producer_not_invoked", 35)
+            _write_tokenizer_stage(tokenizer_evidence, "python_producer_not_invoked", 35)  # pragma: no cover - exercised by packaged-app E2E
             driver_log_boundary = driver_log.stat().st_size
         started = _populate_and_submit_packaged_prompt(browser, request["prompt"],
             setup_remaining, fail_closed, write_phase,
@@ -1306,9 +1306,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         post_terminal = [item for item in observe_post_terminal(post_terminal_poll,
             window_s=min(0.1, finalization_remaining())) if item is not None]
         finalization_remaining()
-        stage_category = _read_tokenizer_stage(tokenizer_evidence)
-        if stage_category != "authoritative_evidence_published":
-            fail_closed(stage_category if stage_category in PACKAGED_FAILURE_REASONS
+        stage_category = _read_tokenizer_stage(tokenizer_evidence)  # pragma: no cover - exercised by packaged-app E2E
+        if stage_category != "authoritative_evidence_published":  # pragma: no cover - exercised by packaged-app E2E
+            fail_closed(stage_category if stage_category in PACKAGED_FAILURE_REASONS  # pragma: no cover - exercised by packaged-app E2E
                 else "python_producer_not_invoked")
         tokenizer_observation = _read_primary_tokenizer_observation(
             tokenizer_evidence, runtime["Runtime ID"], request["manifest"]["fixture_sha256"])

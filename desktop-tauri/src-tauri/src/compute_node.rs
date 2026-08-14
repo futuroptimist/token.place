@@ -49,6 +49,33 @@ fn benchmark_stage_path(evidence: &Path) -> PathBuf {
     PathBuf::from(format!("{}.stage.json", evidence.display()))
 }
 
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH provides replacement
+    // semantics that std::fs::rename does not guarantee on Windows.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0x1 | 0x8) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
 fn publish_benchmark_stage(evidence: &Path, stage: u8, category: &str) -> std::io::Result<()> {
     const ALLOWED: &[&str] = &[
         "application_arguments_absent",
@@ -78,8 +105,19 @@ fn publish_benchmark_stage(evidence: &Path, stage: u8, category: &str) -> std::i
     let body = serde_json::json!({"version": 1, "stage": stage, "category": category});
     let encoded = serde_json::to_vec(&body)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stage encoding"))?;
-    std::fs::write(&temporary, encoded)?;
-    let result = std::fs::rename(&temporary, output);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    use std::io::Write;
+    let mut file = options.open(&temporary)?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    drop(file);
+    let result = replace_file(&temporary, &output);
     let _ = std::fs::remove_file(temporary);
     result
 }
@@ -109,15 +147,21 @@ where
     }
     if invalid_args || request_arg.is_some() != evidence_arg.is_some() {
         if let Some(evidence) = evidence_arg.as_ref() {
-            let _ =
-                publish_benchmark_stage(Path::new(evidence), 10, "application_arguments_malformed");
+            if publish_benchmark_stage(Path::new(evidence), 10, "application_arguments_malformed")
+                .is_err()
+            {
+                return (None, None);
+            }
         }
         return (None, None);
     }
     match (request_arg, evidence_arg) {
         (Some(request), Some(evidence)) => {
-            let _ =
-                publish_benchmark_stage(Path::new(&evidence), 10, "application_arguments_accepted");
+            if publish_benchmark_stage(Path::new(&evidence), 10, "application_arguments_accepted")
+                .is_err()
+            {
+                return (None, None);
+            }
             (Some(request), Some(evidence))
         }
         _ => (request_env, evidence_env),
@@ -208,9 +252,11 @@ fn apply_benchmark_tokenizer_env<C>(
         Err(_) => return,
     }
 
+    if publish_benchmark_stage(&evidence_path, 20, "rust_python_handoff_accepted").is_err() {
+        return;
+    }
     command.set_env(OsStr::new(BENCHMARK_TOKENIZER_REQUEST_ENV), request);
     command.set_env(OsStr::new(BENCHMARK_TOKENIZER_EVIDENCE_ENV), &evidence);
-    let _ = publish_benchmark_stage(&evidence_path, 20, "rust_python_handoff_accepted");
 }
 
 const EXPECTED_MODEL_ARTIFACT_FILENAME: &str = "Qwen3-8B-Q4_K_M.gguf";
@@ -3866,6 +3912,26 @@ mod tests {
                 "invalid application arguments must fail closed rather than use the environment"
             );
         }
+
+        let temp = TempDir::new().expect("tempdir");
+        let evidence = temp.path().join("evidence.json");
+        std::fs::write(benchmark_stage_path(&evidence), b"stale").expect("stale stage");
+        publish_benchmark_stage(&evidence, 10, "application_arguments_accepted")
+            .expect("replace stage");
+        publish_benchmark_stage(&evidence, 20, "rust_python_handoff_accepted")
+            .expect("replace stage again");
+        let stage: Value = serde_json::from_slice(
+            &std::fs::read(benchmark_stage_path(&evidence)).expect("stage state"),
+        )
+        .expect("valid stage JSON");
+        assert_eq!(stage["category"], "rust_python_handoff_accepted");
+        assert!(std::fs::read_dir(temp.path())
+            .expect("temporary directory")
+            .all(|entry| !entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")));
     }
 
     #[cfg(unix)]

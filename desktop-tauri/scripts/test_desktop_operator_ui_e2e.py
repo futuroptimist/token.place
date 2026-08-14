@@ -524,8 +524,8 @@ def tokenizer_stage_path(evidence_path: Path) -> Path:
 
 def _write_tokenizer_stage(evidence_path: Path, category: str, stage: int) -> None:
     """Publish a bounded stage marker without copying any application data."""
-    allowed = {"python_producer_not_invoked"}
-    if category not in allowed:
+    allowed = {"application_arguments_absent": 0, "python_producer_not_invoked": 35}
+    if allowed.get(category) != stage or isinstance(stage, bool):
         raise ValueError("invalid tokenizer stage category")
     output = tokenizer_stage_path(evidence_path)
     fd, temporary = tempfile.mkstemp(prefix=".tokenizer-runner-stage-", suffix=".tmp",
@@ -540,14 +540,26 @@ def _write_tokenizer_stage(evidence_path: Path, category: str, stage: int) -> No
 
 
 def _read_tokenizer_stage(evidence_path: Path) -> str:
+    pairings = {
+        "application_arguments_absent": 0, "application_arguments_malformed": 10,
+        "application_arguments_accepted": 10, "rust_python_handoff_failed": 20,
+        "rust_python_handoff_accepted": 20, "python_handoff_received": 30,
+        "python_producer_not_invoked": 35, "request_validation_failure": 40,
+        "fixture_hash_validation_failure": 50,
+        "active_runtime_tokenizer_unavailable": 60, "tokenization_failure": 65,
+        "runtime_identity_unavailable": 70, "evidence_publication_failure": 90,
+        "authoritative_evidence_published": 100,
+    }
     try:
         value = json.loads(tokenizer_stage_path(evidence_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError("rust_python_handoff_failed") from exc
+        raise RuntimeError("application_arguments_absent") from exc
     if (not isinstance(value, dict) or set(value) != {"version", "stage", "category"}
             or value.get("version") != 1 or not isinstance(value.get("stage"), int)
-            or not isinstance(value.get("category"), str)):
-        raise RuntimeError("rust_python_handoff_failed")
+            or isinstance(value.get("stage"), bool)
+            or value.get("category") not in pairings
+            or pairings[value["category"]] != value["stage"]):
+        raise RuntimeError("application_arguments_malformed")
     return value["category"]
 
 
@@ -1117,6 +1129,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     tokenizer_dir = Path(tempfile.mkdtemp(prefix="long-context-tokenizer-observation-"))
     tokenizer_request = tokenizer_dir / "request.json"
     tokenizer_evidence = tokenizer_dir / "evidence.json"
+    _write_tokenizer_stage(tokenizer_evidence, "application_arguments_absent", 0)
     tokenizer_request.write_text(json.dumps({
         "fixture_sha256": request["manifest"]["fixture_sha256"],
         "target_prefix_utf8_bytes": {name: target["target_prefix_utf8_bytes"]
@@ -1166,8 +1179,14 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             lambda d: _status_value(d, "Registered").lower().startswith("yes"))
         write_phase("operator_ready")
 
-        if _read_tokenizer_stage(tokenizer_evidence) != "python_handoff_received":  # pragma: no cover - exercised by packaged-app E2E
-            fail_closed("rust_python_handoff_failed")  # pragma: no cover - exercised by packaged-app E2E
+        try:
+            handoff_stage = _read_tokenizer_stage(tokenizer_evidence)
+        except RuntimeError as exc:
+            fail_closed(str(exc))
+        if handoff_stage in {"application_arguments_absent", "application_arguments_malformed"}:
+            fail_closed(handoff_stage)
+        if handoff_stage != "python_handoff_received":
+            fail_closed("rust_python_handoff_failed")
 
         runtime = {label: _status_value(driver, label) for label in
             ("App version", "Build ID", "Runtime ID", "Bundled runtime ID", "Launcher source",
@@ -1238,10 +1257,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         """)
         # The child writes directly to this file descriptor. Capture the exact byte
         # boundary immediately before submission.
-        driver_log_boundary = 0  # pragma: no cover - exercised by packaged-app E2E
+        driver_log_boundary = 0
         def capture_driver_log_boundary() -> None:
             nonlocal driver_log_boundary
-            _write_tokenizer_stage(tokenizer_evidence, "python_producer_not_invoked", 35)  # pragma: no cover - exercised by packaged-app E2E
+            _write_tokenizer_stage(tokenizer_evidence, "python_producer_not_invoked", 35)
             driver_log_boundary = driver_log.stat().st_size
         started = _populate_and_submit_packaged_prompt(browser, request["prompt"],
             setup_remaining, fail_closed, write_phase,
@@ -1306,9 +1325,12 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         post_terminal = [item for item in observe_post_terminal(post_terminal_poll,
             window_s=min(0.1, finalization_remaining())) if item is not None]
         finalization_remaining()
-        stage_category = _read_tokenizer_stage(tokenizer_evidence)  # pragma: no cover - exercised by packaged-app E2E
-        if stage_category != "authoritative_evidence_published":  # pragma: no cover - exercised by packaged-app E2E
-            fail_closed(stage_category if stage_category in PACKAGED_FAILURE_REASONS  # pragma: no cover - exercised by packaged-app E2E
+        try:
+            stage_category = _read_tokenizer_stage(tokenizer_evidence)
+        except RuntimeError as exc:
+            fail_closed(str(exc))
+        if stage_category != "authoritative_evidence_published":
+            fail_closed(stage_category if stage_category in PACKAGED_FAILURE_REASONS
                 else "python_producer_not_invoked")
         tokenizer_observation = _read_primary_tokenizer_observation(
             tokenizer_evidence, runtime["Runtime ID"], request["manifest"]["fixture_sha256"])

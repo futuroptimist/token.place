@@ -1584,6 +1584,19 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
         "post_restart_followup_s": followup_s}}
 
 
+def _contains_private_input(value, sentinels: tuple[str, ...]) -> bool:
+    """Return whether a nested JSON-compatible value contains a private sentinel."""
+    if isinstance(value, str):
+        return any(sentinel in value for sentinel in sentinels)
+    if isinstance(value, dict):
+        return any(
+            _contains_private_input(item, sentinels)
+            for pair in value.items() for item in pair)
+    if isinstance(value, (list, tuple)):
+        return any(_contains_private_input(item, sentinels) for item in value)
+    return False
+
+
 def run_packaged_windows_tokenizer_boundary(app_binary: Path, model: Path,
         *, adapter=invoke_packaged_runtime_adapter) -> int:
     """Exercise the packaged Windows argv-to-authoritative-evidence boundary."""
@@ -1621,8 +1634,7 @@ def run_packaged_windows_tokenizer_boundary(app_binary: Path, model: Path,
                 or not isinstance(fixture.get("authoritative_target_offsets_tokens"), dict)
                 or not fixture["authoritative_target_offsets_tokens"]):
             raise RuntimeError("packaged Windows tokenizer boundary evidence unavailable")
-        serialized = json.dumps(evidence, sort_keys=True)
-        if any(sentinel in serialized for sentinel in (
+        if _contains_private_input(evidence, (
                 prompt, str(app_binary), str(model),
                 "TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON")):
             raise RuntimeError("packaged Windows tokenizer boundary leaked private input")

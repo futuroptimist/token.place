@@ -29,7 +29,7 @@ def desktop_runner():
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "start_driver",
-        "run_packaged_windows_tokenizer_boundary", "main"}
+        "_contains_private_input", "run_packaged_windows_tokenizer_boundary", "main"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ModuleType("desktop_runner_under_test")
@@ -218,8 +218,11 @@ def test_packaged_windows_tokenizer_boundary_rejects_invalid_adapter_evidence(
 ])
 def test_packaged_windows_tokenizer_boundary_rejects_private_input(
         desktop_runner, tmp_path, private_input):
-    application = tmp_path / "current-head.exe"
-    model = tmp_path / "tiny.gguf"
+    application = tmp_path / (
+        r"C:\private\current-head.exe"
+        if private_input == "application" else "current-head.exe")
+    model = tmp_path / (
+        r"D:\private\tiny.gguf" if private_input == "model" else "tiny.gguf")
     application.write_bytes(b"application")
     model.write_bytes(b"model")
     process = SimpleNamespace()
@@ -246,7 +249,7 @@ def test_packaged_windows_tokenizer_boundary_rejects_private_input(
     evidence = {"runtime_contract_pass": True, "fixture": {
         "sha256": manifest["fixture_sha256"], "authoritative_prompt_tokens": 42,
         "authoritative_target_offsets_tokens": {"near": 7}},
-        "private": sentinels[private_input]}
+        "nested": [{sentinels[private_input]: "private mapping key"}]}
 
     with pytest.raises(RuntimeError, match="leaked private input"):
         desktop_runner.run_packaged_windows_tokenizer_boundary(

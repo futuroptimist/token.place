@@ -218,11 +218,8 @@ def test_packaged_windows_tokenizer_boundary_rejects_invalid_adapter_evidence(
 ])
 def test_packaged_windows_tokenizer_boundary_rejects_private_input(
         desktop_runner, tmp_path, private_input):
-    application = tmp_path / (
-        r"C:\private\current-head.exe"
-        if private_input == "application" else "current-head.exe")
-    model = tmp_path / (
-        r"D:\private\tiny.gguf" if private_input == "model" else "tiny.gguf")
+    application = tmp_path / "current-head.exe"
+    model = tmp_path / "tiny.gguf"
     application.write_bytes(b"application")
     model.write_bytes(b"model")
     process = SimpleNamespace()
@@ -255,6 +252,16 @@ def test_packaged_windows_tokenizer_boundary_rejects_private_input(
         desktop_runner.run_packaged_windows_tokenizer_boundary(
             application, model, adapter=lambda **_kwargs: evidence)
     assert terminated == [process]
+
+
+def test_contains_private_input_handles_nested_windows_shaped_strings(desktop_runner):
+    application = r"C:\private\current-head.exe"
+    model = r"D:\private\tiny.gguf"
+
+    assert desktop_runner._contains_private_input(
+        {application: {"nested": [model]}}, (application, model))
+    assert not desktop_runner._contains_private_input(
+        {"application": {"nested": ["tiny.gguf"]}}, (application, model))
 
 
 def test_packaged_windows_tokenizer_boundary_rejects_non_exe(

@@ -28,7 +28,7 @@ def desktop_runner():
         "tokenizer_stage_path", "_write_tokenizer_stage", "_read_tokenizer_stage",
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
-        "tauri_driver_environment", "start_driver",
+        "tauri_driver_environment", "tauri_driver_command", "start_driver",
         "_contains_private_input", "_packaged_boundary_failure_diagnostics",
         "run_packaged_windows_tokenizer_boundary", "main"}
     functions = [node for node in tree.body
@@ -101,6 +101,51 @@ def test_start_driver_passes_resolved_application_and_tokenizer_arguments(
         "command_executor": "http://127.0.0.1:4444",
         "options": remote_calls[0]["options"],
     }]
+
+
+def test_tauri_driver_command_selects_explicit_windows_native_driver(
+        desktop_runner, monkeypatch, tmp_path):
+    edge_dir = tmp_path / "edge driver"
+    edge_dir.mkdir()
+    edge_driver = edge_dir / "msedgedriver.exe"
+    edge_driver.write_bytes(b"driver")
+    monkeypatch.setenv("EDGEWEBDRIVER", str(edge_dir))
+    desktop_runner.os = SimpleNamespace(name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
+    monkeypatch.setattr(desktop_runner.shutil, "which",
+        lambda name: "tauri-driver.exe" if name == "tauri-driver" else None)
+
+    assert desktop_runner.tauri_driver_command() == [
+        "tauri-driver.exe", "--port", "4444", "--native-driver",
+        str(edge_driver.resolve()),
+    ]
+
+
+def test_tauri_driver_command_uses_verified_windows_path_fallback(
+        desktop_runner, monkeypatch, tmp_path):
+    edge_driver = tmp_path / "msedgedriver.exe"
+    edge_driver.write_bytes(b"driver")
+    monkeypatch.delenv("EDGEWEBDRIVER", raising=False)
+    desktop_runner.os = SimpleNamespace(name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
+    monkeypatch.setattr(desktop_runner.shutil, "which", lambda name: {
+        "tauri-driver": "tauri-driver.exe",
+        "msedgedriver.exe": str(edge_driver),
+    }.get(name))
+
+    assert desktop_runner.tauri_driver_command()[-2:] == [
+        "--native-driver", str(edge_driver.resolve())]
+
+
+def test_tauri_driver_command_fails_bounded_when_windows_driver_missing(
+        desktop_runner, monkeypatch, tmp_path):
+    private = str(tmp_path / "private-edge-location")
+    monkeypatch.setenv("EDGEWEBDRIVER", private)
+    desktop_runner.os = SimpleNamespace(name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
+    monkeypatch.setattr(desktop_runner.shutil, "which",
+        lambda name: "tauri-driver.exe" if name == "tauri-driver" else None)
+
+    with pytest.raises(RuntimeError, match="^native_driver_unavailable$") as raised:
+        desktop_runner.tauri_driver_command()
+    assert private not in str(raised.value)
 
 
 def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
@@ -2686,6 +2731,71 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     assert checkpoint["phase"] == "cleanup"
     assert checkpoint["failure_reason"] == "packaged_runner_failure"
     assert checkpoint["cleanup_succeeded"] is True
+
+
+@pytest.mark.parametrize(("start_error", "ready_error", "expected_reason", "expected_phase"), [
+    (RuntimeError("private session exception /secret/path"), None,
+        "webdriver_session_creation_failed", "webdriver_ready"),
+    (None, RuntimeError("private readiness exception /secret/path"),
+        "desktop_ui_not_ready", "desktop_session_started"),
+])
+def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
+        tmp_path, start_error, ready_error, expected_reason, expected_phase):
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {"tauri_driver_environment", "tokenizer_stage_path",
+        "_write_tokenizer_stage", "run_long_context_packaged_mode"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    checkpoints = []
+    process = SimpleNamespace(pid=1234)
+    driver = SimpleNamespace()
+
+    def start(*_args, **_kwargs):
+        if start_error:
+            raise start_error
+        return driver
+
+    def ready(*_args, **_kwargs):
+        if ready_error:
+            raise ready_error
+
+    namespace = {
+        "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
+        "os": os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
+        "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
+        "OwnedProcessTreeMemorySampler": lambda _pid: object(),
+        "wait_for_port": lambda *_args, **_kwargs: None,
+        "start_driver": start, "tokenizer_handoff_args": lambda *_args: [],
+        "wait_for_ui_ready": ready,
+        "_validate_packaged_failure_reason": lambda reason: reason,
+        "_write_benchmark_phase": lambda *_args, **kwargs: checkpoints.append(dict(kwargs)),
+        "_cleanup_owned_process_tree": lambda *_args: True,
+        "_quit_webdriver": lambda *_args: True,
+        "_remove_owned_path": lambda *_args, **_kwargs: True,
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
+        namespace)
+    app = tmp_path / "current-head.exe"
+    app.write_bytes(b"app")
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps({
+        "phase_status_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase_status_phases": list(h.PACKAGED_PHASES), "setup_timeout_s": 10,
+        "cleanup_timeout_s": 1,
+        "manifest": {"fixture_sha256": "0" * 64, "targets": {}},
+    }))
+
+    with pytest.raises(RuntimeError, match=f"^{expected_reason}$") as raised:
+        namespace["run_long_context_packaged_mode"](
+            request_path, tmp_path / "evidence.json", tmp_path / "phase.json", app)
+
+    assert raised.value.__cause__ is None
+    assert "private" not in str(raised.value)
+    assert checkpoints[-1]["last_safe_phase"] == expected_phase
+    assert checkpoints[-1]["failure_reason"] == expected_reason
+    assert checkpoints[-1]["cleanup_succeeded"] is True
 
 
 def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):

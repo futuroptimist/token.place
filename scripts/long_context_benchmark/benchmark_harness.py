@@ -55,7 +55,7 @@ PACKAGED_SETUP_BUDGET_S = 300.0
 PACKAGED_FINALIZATION_BUDGET_S = 120.0
 PACKAGED_PHASE_STATUS_VERSION = "packaged-runner-phase-v2"
 PACKAGED_PHASES = (
-    "runner_startup", "webdriver_ready", "desktop_ready", "operator_ready",
+    "runner_startup", "webdriver_ready", "desktop_session_started", "desktop_ready", "operator_ready",
     "landing_page_ready", "request_active", "response_received",
     "cancellation_validation", "evidence_finalization", "cleanup",
 )
@@ -69,6 +69,8 @@ PACKAGED_FAILURE_REASONS = frozenset({
     "vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
     "requested_context_tier_not_applied", "message_input_not_populated",
     "send_button_not_enabled", "packaged_runner_failure",
+    "native_driver_unavailable", "webdriver_session_creation_failed",
+    "desktop_ui_not_ready",
     "authoritative_local_progress_missing", "local_prefill_phase_missing",
     "local_generating_phase_missing", "positive_generated_token_progress_missing",
     "local_timing_record_malformed", "response_usage_missing_or_inconsistent",

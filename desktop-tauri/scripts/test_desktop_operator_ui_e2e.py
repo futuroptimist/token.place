@@ -678,6 +678,26 @@ def wait_for_operator_log_stop_markers(
 
 def tauri_driver_command() -> list[str]:
     tauri_driver_bin = shutil.which("tauri-driver")
+    if os.name == "nt":
+        edge_location = os.environ.get("EDGEWEBDRIVER")
+        edge_driver = None
+        if edge_location:
+            candidate = Path(edge_location)
+            if candidate.is_dir():
+                candidate = candidate / "msedgedriver.exe"
+            if candidate.is_file():
+                edge_driver = str(candidate.resolve())
+        if edge_driver is None:
+            discovered = shutil.which("msedgedriver.exe")
+            if discovered is not None and Path(discovered).is_file():
+                edge_driver = str(Path(discovered).resolve())
+        if edge_driver is None:
+            raise RuntimeError("native_driver_unavailable")
+        if tauri_driver_bin is not None:
+            return [tauri_driver_bin, "--port", "4444", "--native-driver", edge_driver]
+        raise RuntimeError(
+            "tauri-driver binary not found on PATH; install it with `cargo install tauri-driver`"
+        )
     webkit_driver_bin = shutil.which("WebKitWebDriver") or shutil.which("webkit2gtk-driver")
     if webkit_driver_bin is None:
         for candidate in (
@@ -1146,7 +1166,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     def fail_closed(reason: str) -> None:
         nonlocal failure_reason
         failure_reason = _validate_packaged_failure_reason(reason)
-        raise RuntimeError(reason)
+        raise RuntimeError(reason) from None
     setup_deadline = runner_started + float(request["setup_timeout_s"])
     def setup_remaining() -> float:
         remaining = setup_deadline - time.monotonic()
@@ -1179,18 +1199,31 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     primary_failed = False
     try:
         setup_remaining()
-        process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
+        try:
+            driver_command = tauri_driver_command()
+        except RuntimeError as exc:
+            if str(exc) == "native_driver_unavailable":
+                fail_closed("native_driver_unavailable")
+            raise
+        process = subprocess.Popen(driver_command, cwd=TAURI_ROOT, env=env,
             stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
         memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
         wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log,
             min(90, setup_remaining()))
         write_phase("webdriver_ready")
         setup_remaining()
-        driver = start_driver(
-            app_binary.resolve(strict=True),
-            application_args=tokenizer_handoff_args(tokenizer_request, tokenizer_evidence),
-        )
-        wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
+        try:
+            driver = start_driver(
+                app_binary.resolve(strict=True),
+                application_args=tokenizer_handoff_args(tokenizer_request, tokenizer_evidence),
+            )
+        except Exception:
+            fail_closed("webdriver_session_creation_failed")
+        write_phase("desktop_session_started")
+        try:
+            wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
+        except Exception:
+            fail_closed("desktop_ui_not_ready")
         write_phase("desktop_ready")
         setup_remaining()
         fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))

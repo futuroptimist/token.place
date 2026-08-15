@@ -29,7 +29,8 @@ def desktop_runner():
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "start_driver",
-        "_contains_private_input", "run_packaged_windows_tokenizer_boundary", "main"}
+        "_contains_private_input", "_packaged_boundary_failure_diagnostics",
+        "run_packaged_windows_tokenizer_boundary", "main"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ModuleType("desktop_runner_under_test")
@@ -46,6 +47,7 @@ def desktop_runner():
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
         "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "PACKAGED_PHASES": h.PACKAGED_PHASES,
         "apply_benchmark_context_tier": h.apply_benchmark_context_tier,
         "generate_fixture": h.generate_fixture,
         "invoke_packaged_runtime_adapter": h.invoke_packaged_runtime_adapter})
@@ -178,7 +180,7 @@ def test_packaged_windows_tokenizer_boundary_cli_requires_explicit_inputs(
 
 @pytest.mark.parametrize(("evidence", "message"), [
     ({"runtime_contract_pass": False, "code": "bounded-failure"},
-     "packaged Windows tokenizer boundary failed: bounded-failure"),
+     "packaged Windows tokenizer boundary failed: code=unavailable"),
     ({"runtime_contract_pass": True, "fixture": None},
      "packaged Windows tokenizer boundary evidence unavailable"),
     ({"runtime_contract_pass": True, "fixture": []},
@@ -210,6 +212,46 @@ def test_packaged_windows_tokenizer_boundary_rejects_invalid_adapter_evidence(
             application, model, adapter=lambda **_kwargs: evidence)
 
     assert terminated == [process]
+
+
+def test_packaged_windows_tokenizer_boundary_reports_only_bounded_failure_diagnostics(
+        desktop_runner, tmp_path):
+    application = tmp_path / "current-head.exe"
+    model = tmp_path / "tiny.gguf"
+    application.write_bytes(b"application")
+    model.write_bytes(b"model")
+    process = SimpleNamespace()
+    terminated = []
+    desktop_runner.REPO_ROOT = tmp_path
+    desktop_runner.LOGS_DIR = tmp_path
+    desktop_runner.sys = sys
+    desktop_runner.reserve_free_port = lambda: 43123
+    desktop_runner.wait_for_http_200 = lambda _url: None
+    desktop_runner.terminate_process = terminated.append
+    desktop_runner.subprocess = SimpleNamespace(
+        Popen=lambda *_args, **_kwargs: process, STDOUT=subprocess.STDOUT)
+    evidence = {"runtime_contract_pass": False, "code": "packaged_runner_failed",
+        "last_safe_phase": "request_active", "failure_reason": "tokenization_failure",
+        "cleanup_succeeded": False}
+
+    with pytest.raises(RuntimeError) as raised:
+        desktop_runner.run_packaged_windows_tokenizer_boundary(
+            application, model, adapter=lambda **_kwargs: evidence)
+
+    assert str(raised.value) == ("packaged Windows tokenizer boundary failed: "
+        "code=packaged_runner_failed last_safe_phase=request_active "
+        "failure_reason=tokenization_failure cleanup_succeeded=false")
+    assert terminated == [process]
+
+
+def test_packaged_boundary_failure_diagnostics_redacts_hostile_values(desktop_runner):
+    private = "PRIVATE_PROMPT_PATH_MODEL_ENV_SENTINEL"
+    diagnostics = desktop_runner._packaged_boundary_failure_diagnostics({
+        "code": private, "last_safe_phase": private, "failure_reason": private,
+        "cleanup_succeeded": private, "exception": private})
+
+    assert diagnostics == "code=unavailable"
+    assert private not in diagnostics
 
 
 @pytest.mark.parametrize("private_input", [

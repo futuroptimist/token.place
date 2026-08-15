@@ -56,6 +56,7 @@ try:
         benchmark_operator_mode,
         OwnedProcessTreeMemorySampler,
         PACKAGED_FAILURE_REASONS,
+        PACKAGED_PHASES,
         generate_fixture,
         invoke_packaged_runtime_adapter,
         parse_packaged_local_telemetry,
@@ -1597,6 +1598,28 @@ def _contains_private_input(value, sentinels: tuple[str, ...]) -> bool:
     return False
 
 
+def _packaged_boundary_failure_diagnostics(evidence: object) -> str:
+    """Format only adapter-validated, low-cardinality failure diagnostics."""
+    if not isinstance(evidence, dict):
+        return "code=unavailable"
+    code = evidence.get("code")
+    fields = [f"code={code}" if isinstance(code, str)
+        and code in {"packaged_contract_failed", "packaged_runner_failed",
+            "packaged_runner_timeout", "packaged_evidence_malformed",
+            "authoritative_target_depth_unavailable"}
+        else "code=unavailable"]
+    phase = evidence.get("last_safe_phase")
+    if phase in PACKAGED_PHASES:
+        fields.append(f"last_safe_phase={phase}")
+    reason = evidence.get("failure_reason")
+    if reason in PACKAGED_FAILURE_REASONS:
+        fields.append(f"failure_reason={reason}")
+    cleanup = evidence.get("cleanup_succeeded")
+    if isinstance(cleanup, bool):
+        fields.append(f"cleanup_succeeded={str(cleanup).lower()}")
+    return " ".join(fields)
+
+
 def run_packaged_windows_tokenizer_boundary(app_binary: Path, model: Path,
         *, adapter=invoke_packaged_runtime_adapter) -> int:
     """Exercise the packaged Windows argv-to-authoritative-evidence boundary."""
@@ -1627,7 +1650,8 @@ def run_packaged_windows_tokenizer_boundary(app_binary: Path, model: Path,
         prompt, manifest = generate_fixture("small-8k", scenario="structured-extraction")
         if not evidence.get("runtime_contract_pass"):
             raise RuntimeError(
-                f"packaged Windows tokenizer boundary failed: {evidence.get('code', 'unknown')}")
+                "packaged Windows tokenizer boundary failed: "
+                f"{_packaged_boundary_failure_diagnostics(evidence)}")
         if (not isinstance(fixture, dict)
                 or fixture.get("sha256") != manifest["fixture_sha256"]
                 or not isinstance(fixture.get("authoritative_prompt_tokens"), int)

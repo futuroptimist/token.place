@@ -3865,12 +3865,13 @@ mod tests {
 
     #[test]
     fn benchmark_tokenizer_command_line_handoff_is_paired_and_authoritative() {
-        let request_arg = OsString::from(format!(
-            "{BENCHMARK_TOKENIZER_REQUEST_ARG}C:\\benchmark\\request.json"
-        ));
-        let evidence_arg = OsString::from(format!(
-            "{BENCHMARK_TOKENIZER_EVIDENCE_ARG}C:\\benchmark\\evidence.json"
-        ));
+        let temp = TempDir::new().expect("tempdir");
+        let request = temp.path().join("request.json").into_os_string();
+        let evidence = temp.path().join("evidence.json").into_os_string();
+        let mut request_arg = OsString::from(BENCHMARK_TOKENIZER_REQUEST_ARG);
+        request_arg.push(&request);
+        let mut evidence_arg = OsString::from(BENCHMARK_TOKENIZER_EVIDENCE_ARG);
+        evidence_arg.push(&evidence);
         let env_request = Some(OsString::from("environment-request"));
         let env_evidence = Some(OsString::from("environment-evidence"));
 
@@ -3880,10 +3881,7 @@ mod tests {
                 env_request.clone(),
                 env_evidence.clone(),
             ),
-            (
-                Some(OsString::from("C:\\benchmark\\request.json")),
-                Some(OsString::from("C:\\benchmark\\evidence.json")),
-            )
+            (Some(request.clone()), Some(evidence.clone()))
         );
         assert_eq!(
             benchmark_tokenizer_handoff([], env_request.clone(), env_evidence.clone()),
@@ -3913,8 +3911,7 @@ mod tests {
             );
         }
 
-        let temp = TempDir::new().expect("tempdir");
-        let evidence = temp.path().join("evidence.json");
+        let evidence = PathBuf::from(evidence);
         std::fs::write(benchmark_stage_path(&evidence), b"stale").expect("stale stage");
         publish_benchmark_stage(&evidence, 10, "application_arguments_accepted")
             .expect("replace stage");

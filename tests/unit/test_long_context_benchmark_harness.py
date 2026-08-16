@@ -149,32 +149,32 @@ def test_packaged_tokenizer_handoff_uses_paired_application_arguments(desktop_ru
 
 def test_start_driver_passes_resolved_application_and_tokenizer_arguments(
         desktop_runner, tmp_path):
-    capabilities = {}
     remote_calls = []
-
-    class FakeChromeOptions:
-        def set_capability(self, name, value):
-            capabilities[name] = value
 
     def fake_remote(**kwargs):
         remote_calls.append(kwargs)
         return "driver"
 
-    desktop_runner.webdriver = SimpleNamespace(
-        ChromeOptions=FakeChromeOptions, Remote=fake_remote)
+    desktop_runner.webdriver = SimpleNamespace(Remote=fake_remote)
     application = (tmp_path / "application with spaces.exe").resolve()
     request = tmp_path / "request with spaces.json"
     evidence = tmp_path / "evidence with spaces.json"
     arguments = desktop_runner.tokenizer_handoff_args(request, evidence)
 
     assert desktop_runner.start_driver(application, application_args=arguments) == "driver"
-    assert capabilities["tauri:options"] == {
-        "application": str(application),
-        "args": [
-            f"--token-place-long-context-benchmark-tokenizer-request={request}",
-            f"--token-place-long-context-benchmark-tokenizer-evidence={evidence}",
-        ],
+    options = remote_calls[0]["options"]
+    assert options.to_capabilities() == {
+        "browserName": "wry",
+        "tauri:options": {
+            "application": str(application),
+            "args": [
+                f"--token-place-long-context-benchmark-tokenizer-request={request}",
+                f"--token-place-long-context-benchmark-tokenizer-evidence={evidence}",
+            ],
+        },
     }
+    assert "goog:chromeOptions" not in options.to_capabilities()
+    assert options._ignore_local_proxy is False
     assert remote_calls == [{
         "command_executor": "http://127.0.0.1:4444",
         "options": remote_calls[0]["options"],
@@ -274,6 +274,15 @@ def test_webdriver_session_failure_transport_and_safe_fallback(desktop_runner):
     hostile = SimpleNamespace(msg="C:\\private\\prompt MODEL_SENTINEL")
     assert desktop_runner._classify_webdriver_session_failure(
         hostile, SimpleNamespace(poll=lambda: None))[0] == "webdriver_session_creation_failed"
+
+
+def test_webdriver_session_timeout_is_bounded_and_redacted(desktop_runner):
+    private = "C:\\private\\application.exe --secret-prompt"
+    timeout = SimpleNamespace(msg=f"HTTP connection read timed out while opening {private}")
+    category, state = desktop_runner._classify_webdriver_session_failure(
+        timeout, SimpleNamespace(poll=lambda: None))
+    assert (category, state) == ("webdriver_transport_failure", "running")
+    assert private not in category
 
 
 def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(

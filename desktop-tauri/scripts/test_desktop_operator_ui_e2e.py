@@ -648,15 +648,21 @@ def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
 
 def start_driver(app_binary: Path, *, application_args: list[str] | None = None
         ) -> webdriver.Remote:
-    options = webdriver.ChromeOptions()
-    options.set_capability("browserName", "wry")
-    options.set_capability(
-        "tauri:options",
-        {
-            "application": str(app_binary),
-            "args": application_args or [],
-        },
-    )
+    class TauriOptions:
+        """Minimal Selenium options without browser-vendor capabilities."""
+
+        _ignore_local_proxy = False
+
+        def to_capabilities(self) -> dict[str, object]:
+            return {
+                "browserName": "wry",
+                "tauri:options": {
+                    "application": str(app_binary.resolve()),
+                    "args": list(application_args or []),
+                },
+            }
+
+    options = TauriOptions()
     return webdriver.Remote(command_executor=WEBDRIVER_URL, options=options)
 
 
@@ -762,7 +768,8 @@ def _classify_webdriver_session_failure(exc: Exception, process: object) -> tupl
             "unrecognized capability", "invalid capabilities", "invalid argument: capability")):
         return "webdriver_capabilities_rejected", "running"
     if any(pattern in message for pattern in (
-            "connection refused", "failed to establish a new connection", "connection aborted")):
+            "connection refused", "failed to establish a new connection", "connection aborted",
+            "read timed out", "read timeout")):
         return "webdriver_transport_failure", "running"
     if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
             "failed to launch", "failed to start", "application failed")):

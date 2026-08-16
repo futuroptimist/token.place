@@ -10,11 +10,24 @@ from types import ModuleType, SimpleNamespace
 from pathlib import Path
 
 import pytest
-from selenium.common.exceptions import InvalidArgumentException, SessionNotCreatedException
 
 from scripts.long_context_benchmark import benchmark_harness as h
 
 RUNNER_SOURCE = Path(__file__).parents[2] / "desktop-tauri/scripts/test_desktop_operator_ui_e2e.py"
+
+
+class _WebDriverException(Exception):
+    def __init__(self, message):
+        super().__init__(message)
+        self.msg = message
+
+
+class InvalidArgumentException(_WebDriverException):
+    pass
+
+
+class SessionNotCreatedException(_WebDriverException):
+    pass
 
 
 @pytest.fixture

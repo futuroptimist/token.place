@@ -42,7 +42,8 @@ def desktop_runner():
         "tokenizer_stage_path", "_write_tokenizer_stage", "_read_tokenizer_stage",
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
-        "tauri_driver_environment", "tauri_driver_command", "start_driver",
+        "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
+        "start_driver",
         "_classify_webdriver_session_failure", "_write_webdriver_diagnostic",
         "_contains_private_input", "_packaged_boundary_failure_diagnostics",
         "run_packaged_windows_tokenizer_boundary", "main"}
@@ -61,6 +62,7 @@ def desktop_runner():
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
         "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
+        "urlopen": None,
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
         "PACKAGED_PHASES": h.PACKAGED_PHASES,
         "SessionNotCreatedException": SessionNotCreatedException,
@@ -73,6 +75,62 @@ def desktop_runner():
         "invoke_packaged_runtime_adapter": h.invoke_packaged_runtime_adapter})
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
     return module
+
+
+def test_webdriver_readiness_requires_valid_native_status(desktop_runner, monkeypatch):
+    responses = iter([
+        OSError("hostile refused C:\\private\\prompt"),
+        {"value": {"ready": False, "message": "hostile MODEL_SENTINEL"}},
+        {"value": "malformed C:\\private\\path"},
+        {"value": {"ready": True}},
+    ])
+    calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps(self.payload).encode()
+
+    def open_status(url, timeout):
+        calls.append((url, timeout))
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return Response(result)
+
+    monkeypatch.setattr(desktop_runner, "urlopen", open_status)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    desktop_runner.wait_for_webdriver_ready(
+        SimpleNamespace(poll=lambda: None), timeout_seconds=10)
+    assert len(calls) == 4
+    assert all(url == "http://127.0.0.1:4444/status" for url, _ in calls)
+
+
+@pytest.mark.parametrize(("process_exit", "expected"), [
+    (7, "tauri_driver_exited"),
+    (None, "webdriver_transport_failure"),
+])
+def test_webdriver_readiness_failure_is_bounded(
+        desktop_runner, monkeypatch, process_exit, expected):
+    clock = SimpleNamespace(value=-1.0)
+    def monotonic():
+        clock.value += 1.0
+        return clock.value
+    monkeypatch.setattr(desktop_runner.time, "monotonic", monotonic)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(desktop_runner, "urlopen", lambda *_args, **_kwargs: None)
+    with pytest.raises(RuntimeError, match=f"^{expected}$") as raised:
+        desktop_runner.wait_for_webdriver_ready(
+            SimpleNamespace(poll=lambda: process_exit), timeout_seconds=0.5)
+    assert "private" not in str(raised.value)
 
 
 def test_packaged_tokenizer_handoff_uses_paired_application_arguments(desktop_runner, tmp_path):
@@ -2822,14 +2880,18 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     assert checkpoint["cleanup_succeeded"] is True
 
 
-@pytest.mark.parametrize(("start_error", "ready_error", "expected_reason", "expected_phase"), [
-    (RuntimeError("private session exception /secret/path"), None,
+@pytest.mark.parametrize(("gate_error", "start_error", "ready_error", "expected_reason", "expected_phase"), [
+    (None, RuntimeError("private session exception /secret/path"), None,
         "webdriver_session_creation_failed", "webdriver_ready"),
-    (None, RuntimeError("private readiness exception /secret/path"),
+    (None, None, RuntimeError("private readiness exception /secret/path"),
         "desktop_ui_not_ready", "desktop_session_started"),
+    (RuntimeError("tauri_driver_exited"), None, None,
+        "tauri_driver_exited", "runner_startup"),
+    (RuntimeError("webdriver_transport_failure"), None, None,
+        "webdriver_transport_failure", "runner_startup"),
 ])
 def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
-        tmp_path, start_error, ready_error, expected_reason, expected_phase):
+        tmp_path, gate_error, start_error, ready_error, expected_reason, expected_phase):
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
     wanted = {"tauri_driver_environment", "tokenizer_stage_path",
@@ -2839,11 +2901,17 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     checkpoints = []
     process = SimpleNamespace(pid=1234)
     driver = SimpleNamespace()
+    start_calls = []
 
     def start(*_args, **_kwargs):
+        start_calls.append(True)
         if start_error:
             raise start_error
         return driver
+
+    def webdriver_ready(*_args, **_kwargs):
+        if gate_error:
+            raise gate_error
 
     def ready(*_args, **_kwargs):
         if ready_error:
@@ -2857,7 +2925,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
         "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
         "OwnedProcessTreeMemorySampler": lambda _pid: object(),
-        "wait_for_port": lambda *_args, **_kwargs: None,
+        "wait_for_webdriver_ready": webdriver_ready,
         "start_driver": start, "tokenizer_handoff_args": lambda *_args: [],
         "wait_for_ui_ready": ready,
         "_validate_packaged_failure_reason": lambda reason: reason,
@@ -2887,6 +2955,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     assert checkpoints[-1]["last_safe_phase"] == expected_phase
     assert checkpoints[-1]["failure_reason"] == expected_reason
     assert checkpoints[-1]["cleanup_succeeded"] is True
+    assert len(start_calls) == (0 if gate_error else 1)
 
 
 def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):
@@ -3030,7 +3099,7 @@ def test_packaged_runner_log_close_failure_preserves_primary_and_finishes_cleanu
         "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
         "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
         "OwnedProcessTreeMemorySampler": lambda _pid: object(),
-        "wait_for_port": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        "wait_for_webdriver_ready": lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("primary packaged failure")),
         "_write_benchmark_phase": lambda *_args, **kwargs: checkpoints.append(dict(kwargs)),
         "_cleanup_owned_process_tree": lambda owned, _remaining: (

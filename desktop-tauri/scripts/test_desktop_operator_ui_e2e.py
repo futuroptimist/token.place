@@ -162,6 +162,32 @@ def wait_for_port(
     raise RuntimeError(f"timeout waiting for {host}:{port}")
 
 
+def wait_for_webdriver_ready(
+    process: subprocess.Popen[str], timeout_seconds: float,
+) -> None:
+    """Wait for the native WebDriver behind tauri-driver to report readiness."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("tauri_driver_exited") from None
+        remaining = deadline - time.monotonic()
+        try:
+            with urlopen(  # nosec B310 - fixed loopback WebDriver endpoint
+                    f"{WEBDRIVER_URL}/status",
+                    timeout=max(0.05, min(remaining, 0.5))) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if (isinstance(payload, dict)
+                    and isinstance(payload.get("value"), dict)
+                    and payload["value"].get("ready") is True):
+                return
+        except Exception:
+            pass
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if process.poll() is not None:
+        raise RuntimeError("tauri_driver_exited") from None
+    raise RuntimeError("webdriver_transport_failure") from None
+
+
 def ensure_alive(process: subprocess.Popen[str], label: str) -> None:
     if process.poll() is None:
         return
@@ -1265,8 +1291,16 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         process = subprocess.Popen(driver_command, cwd=TAURI_ROOT, env=env,
             stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
         memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
-        wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log,
-            min(90, setup_remaining()))
+        try:
+            wait_for_webdriver_ready(process, min(90, setup_remaining()))
+        except RuntimeError as exc:
+            reason = str(exc)
+            if reason in {"tauri_driver_exited", "webdriver_transport_failure"}:
+                webdriver_failure_category = reason
+                tauri_driver_state = (
+                    "exited" if reason == "tauri_driver_exited" else "running")
+                fail_closed(reason)
+            raise
         tauri_driver_state = "running"
         write_phase("webdriver_ready")
         setup_remaining()

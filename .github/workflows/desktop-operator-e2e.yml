@@ -220,6 +220,27 @@ jobs:
       - name: Install tauri-driver for Windows production-boundary tests
         run: cargo install tauri-driver --locked
 
+      - name: Check Edge and EdgeDriver compatibility
+        shell: pwsh
+        run: |
+          $result = 'unknown'
+          $edge = Get-ItemProperty 'HKCU:\Software\Microsoft\Edge\BLBeacon', 'HKLM:\Software\Microsoft\Edge\BLBeacon' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty version
+          $driverCommand = Get-Command msedgedriver.exe -ErrorAction SilentlyContinue
+          if ($env:EDGEWEBDRIVER) {
+            $candidate = $env:EDGEWEBDRIVER
+            if (Test-Path $candidate -PathType Container) { $candidate = Join-Path $candidate 'msedgedriver.exe' }
+            if (Test-Path $candidate -PathType Leaf) { $driverCommand = Get-Item $candidate }
+          }
+          if ($edge -and $driverCommand) {
+            $driverExecutable = if ($driverCommand.Path) { $driverCommand.Path } else { $driverCommand.FullName }
+            $driverVersionOutput = & $driverExecutable --version 2>$null
+            if ($driverVersionOutput -match '(\d+)\.\d+\.\d+\.\d+') {
+              $result = if ($edge.Split('.')[0] -eq $Matches[1]) { 'match' } else { 'mismatch' }
+            }
+          }
+          "TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY=$result" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Output "browser_driver_compatibility=$result"
+
       - name: Run Windows packaged-start unit regressions with poisoned host Python state
         shell: pwsh
         env:

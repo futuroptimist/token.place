@@ -10,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 from pathlib import Path
 
 import pytest
+from selenium.common.exceptions import InvalidArgumentException, SessionNotCreatedException
 
 from scripts.long_context_benchmark import benchmark_harness as h
 
@@ -29,6 +30,7 @@ def desktop_runner():
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "tauri_driver_command", "start_driver",
+        "_classify_webdriver_session_failure", "_write_webdriver_diagnostic",
         "_contains_private_input", "_packaged_boundary_failure_diagnostics",
         "run_packaged_windows_tokenizer_boundary", "main"}
     functions = [node for node in tree.body
@@ -48,6 +50,11 @@ def desktop_runner():
         "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
         "PACKAGED_PHASES": h.PACKAGED_PHASES,
+        "SessionNotCreatedException": SessionNotCreatedException,
+        "InvalidArgumentException": InvalidArgumentException,
+        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v1",
+        "WEBDRIVER_COMPATIBILITY_RESULTS": frozenset({"match", "mismatch", "unknown"}),
+        "LOGS_DIR": Path.cwd() / ".desktop-e2e-logs",
         "apply_benchmark_context_tier": h.apply_benchmark_context_tier,
         "generate_fixture": h.generate_fixture,
         "invoke_packaged_runtime_adapter": h.invoke_packaged_runtime_adapter})
@@ -146,6 +153,50 @@ def test_tauri_driver_command_fails_bounded_when_windows_driver_missing(
     with pytest.raises(RuntimeError, match="^native_driver_unavailable$") as raised:
         desktop_runner.tauri_driver_command()
     assert private not in str(raised.value)
+
+
+@pytest.mark.parametrize(("exception", "process_exit", "expected"), [
+    (SessionNotCreatedException("This version of msedgedriver only supports Microsoft Edge version 1"),
+        None, "webdriver_driver_version_mismatch"),
+    (InvalidArgumentException("hostile C:\\private\\prompt capability"),
+        None, "webdriver_capabilities_rejected"),
+    (Exception("ignored"), 1, "tauri_driver_exited"),
+    (SessionNotCreatedException("application failed to launch C:\\private\\model"),
+        None, "webdriver_application_startup_failed"),
+])
+def test_webdriver_session_failure_categories_are_bounded(
+        desktop_runner, exception, process_exit, expected):
+    category, state = desktop_runner._classify_webdriver_session_failure(
+        exception, SimpleNamespace(poll=lambda: process_exit))
+    assert category == expected
+    assert state == ("exited" if process_exit is not None else "running")
+    assert "private" not in category
+
+
+def test_webdriver_session_failure_transport_and_safe_fallback(desktop_runner):
+    transport = SimpleNamespace(msg="connection refused C:\\private\\prompt")
+    assert desktop_runner._classify_webdriver_session_failure(
+        transport, SimpleNamespace(poll=lambda: None))[0] == "webdriver_transport_failure"
+    hostile = SimpleNamespace(msg="C:\\private\\prompt MODEL_SENTINEL")
+    assert desktop_runner._classify_webdriver_session_failure(
+        hostile, SimpleNamespace(poll=lambda: None))[0] == "webdriver_session_creation_failed"
+
+
+def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
+        desktop_runner, tmp_path):
+    desktop_runner.LOGS_DIR = tmp_path
+    desktop_runner._write_webdriver_diagnostic(
+        "C:\\private\\prompt", "MODEL_SENTINEL", "SECRET_EXCEPTION")
+    artifact = tmp_path / "packaged-webdriver-diagnostic.json"
+    assert json.loads(artifact.read_text()) == {
+        "schema_version": "packaged-webdriver-diagnostic-v1",
+        "browser_driver_compatibility": "unknown",
+        "tauri_driver_state": "unknown",
+        "webdriver_failure_category": "webdriver_session_creation_failed",
+    }
+    assert not list(tmp_path.glob("*.tmp"))
+    assert "private" not in artifact.read_text()
+    assert "SENTINEL" not in artifact.read_text()
 
 
 def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
@@ -2710,6 +2761,8 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS, "psutil": __import__("psutil"),
+        "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
+        "_write_webdriver_diagnostic": lambda *_args: None,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
         namespace)
@@ -2763,6 +2816,8 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
+        "_write_webdriver_diagnostic": lambda *_args: None,
         "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
         "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
         "OwnedProcessTreeMemorySampler": lambda _pid: object(),
@@ -2811,6 +2866,8 @@ def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS, "psutil": __import__("psutil"),
+        "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
+        "_write_webdriver_diagnostic": lambda *_args: None,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
         namespace)
@@ -2850,6 +2907,9 @@ def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowanc
         "tempfile": __import__("tempfile"), "os": os,
         "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "_classify_webdriver_session_failure": lambda _exc, _process: (
+            "webdriver_session_creation_failed", "running"),
+        "_write_webdriver_diagnostic": lambda *_args: None,
         "psutil": __import__("psutil"), "sys": sys,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
@@ -2929,6 +2989,8 @@ def test_packaged_runner_log_close_failure_preserves_primary_and_finishes_cleanu
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
+        "_write_webdriver_diagnostic": lambda *_args: None,
         "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
         "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
         "OwnedProcessTreeMemorySampler": lambda _pid: object(),

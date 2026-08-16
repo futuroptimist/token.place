@@ -37,8 +37,10 @@ if str(REPO_ROOT) not in sys.path:
 try:
     from selenium import webdriver
     from selenium.common.exceptions import (
+        InvalidArgumentException,
         NoSuchElementException,
         NoSuchFrameException,
+        SessionNotCreatedException,
         StaleElementReferenceException,
         TimeoutException,
         WebDriverException,
@@ -719,6 +721,58 @@ def tauri_driver_command() -> list[str]:
     )
 
 
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v1"
+WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
+
+
+def _classify_webdriver_session_failure(exc: Exception, process: object) -> tuple[str, str]:
+    """Return only low-cardinality evidence about WebDriver session creation."""
+    poll = getattr(process, "poll", None)
+    if callable(poll) and poll() is not None:
+        return "tauri_driver_exited", "exited"
+    message = str(getattr(exc, "msg", "")).lower()
+    if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
+            "only supports microsoft edge version", "this version of msedgedriver")):
+        return "webdriver_driver_version_mismatch", "running"
+    if isinstance(exc, InvalidArgumentException) or any(pattern in message for pattern in (
+            "unrecognized capability", "invalid capabilities", "invalid argument: capability")):
+        return "webdriver_capabilities_rejected", "running"
+    if any(pattern in message for pattern in (
+            "connection refused", "failed to establish a new connection", "connection aborted")):
+        return "webdriver_transport_failure", "running"
+    if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
+            "failed to launch", "failed to start", "application failed")):
+        return "webdriver_application_startup_failed", "running"
+    return "webdriver_session_creation_failed", "running"
+
+
+def _write_webdriver_diagnostic(
+        compatibility: str, process_state: str, failure_category: str) -> None:
+    """Atomically retain the bounded session diagnostic while raw logs are discarded."""
+    if compatibility not in WEBDRIVER_COMPATIBILITY_RESULTS:
+        compatibility = "unknown"
+    if process_state not in {"running", "exited", "unknown"}:
+        process_state = "unknown"
+    if failure_category not in PACKAGED_FAILURE_REASONS | {"none"}:
+        failure_category = "webdriver_session_creation_failed"
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=".packaged-webdriver-diagnostic-", suffix=".tmp", dir=LOGS_DIR)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({
+                "schema_version": WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION,
+                "browser_driver_compatibility": compatibility,
+                "tauri_driver_state": process_state,
+                "webdriver_failure_category": failure_category,
+            }, handle, sort_keys=True)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _status_value(driver: webdriver.Remote, label: str) -> str:
     return driver.find_element(
         By.XPATH, f"//p[contains(.,'{label}:')]//*[self::code or self::strong][1]"
@@ -1197,6 +1251,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     browser: webdriver.Chrome | None = None
     cleanup_ok = True
     primary_failed = False
+    webdriver_failure_category = "none"
+    tauri_driver_state = "unknown"
     try:
         setup_remaining()
         try:
@@ -1210,6 +1266,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
         wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log,
             min(90, setup_remaining()))
+        tauri_driver_state = "running"
         write_phase("webdriver_ready")
         setup_remaining()
         try:
@@ -1217,8 +1274,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 app_binary.resolve(strict=True),
                 application_args=tokenizer_handoff_args(tokenizer_request, tokenizer_evidence),
             )
-        except Exception:
-            fail_closed("webdriver_session_creation_failed")
+        except Exception as exc:
+            webdriver_failure_category, tauri_driver_state = (
+                _classify_webdriver_session_failure(exc, process))
+            fail_closed(webdriver_failure_category)
         write_phase("desktop_session_started")
         try:
             wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
@@ -1437,6 +1496,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             failure_reason = "packaged_runner_failure"
         raise
     finally:
+        _write_webdriver_diagnostic(
+            os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
+            tauri_driver_state, webdriver_failure_category)
         cleanup_deadline = time.monotonic() + cleanup_timeout
         def cleanup_remaining() -> float:
             return max(0.0, cleanup_deadline - time.monotonic())

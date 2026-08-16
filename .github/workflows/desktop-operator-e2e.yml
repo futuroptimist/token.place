@@ -220,26 +220,58 @@ jobs:
       - name: Install tauri-driver for Windows production-boundary tests
         run: cargo install tauri-driver --locked
 
-      - name: Check Edge and EdgeDriver compatibility
+      - name: Provision matching WebView2 EdgeDriver
         shell: pwsh
         run: |
-          $result = 'unknown'
-          $edge = Get-ItemProperty 'HKCU:\Software\Microsoft\Edge\BLBeacon', 'HKLM:\Software\Microsoft\Edge\BLBeacon' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty version
-          $driverCommand = Get-Command msedgedriver.exe -ErrorAction SilentlyContinue
-          if ($env:EDGEWEBDRIVER) {
-            $candidate = $env:EDGEWEBDRIVER
-            if (Test-Path $candidate -PathType Container) { $candidate = Join-Path $candidate 'msedgedriver.exe' }
-            if (Test-Path $candidate -PathType Leaf) { $driverCommand = Get-Item $candidate }
+          $ErrorActionPreference = 'Stop'
+          $runtimeExecutable = @(
+            Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe" -ErrorAction SilentlyContinue
+            Get-ChildItem "$env:ProgramFiles\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe" -ErrorAction SilentlyContinue
+          ) | Sort-Object { [version]$_.VersionInfo.ProductVersion } -Descending | Select-Object -First 1
+          if (-not $runtimeExecutable) { throw 'WebView2 runtime evidence is missing' }
+          $runtimeVersionText = $runtimeExecutable.VersionInfo.ProductVersion
+          $runtimeVersion = $null
+          if (-not [version]::TryParse($runtimeVersionText, [ref]$runtimeVersion) -or
+              $runtimeVersion.Revision -lt 0) { throw 'WebView2 runtime evidence is malformed' }
+
+          function Get-DriverVersion([string]$path) {
+            if (-not ($path -and (Test-Path $path -PathType Leaf))) { return $null }
+            $output = & $path --version 2>$null
+            if ($LASTEXITCODE -ne 0 -or $output -notmatch '(\d+\.\d+\.\d+\.\d+)') { return $null }
+            $parsed = $null
+            if (-not [version]::TryParse($Matches[1], [ref]$parsed)) { return $null }
+            return $parsed
           }
-          if ($edge -and $driverCommand) {
-            $driverExecutable = if ($driverCommand.Path) { $driverCommand.Path } else { $driverCommand.FullName }
-            $driverVersionOutput = & $driverExecutable --version 2>$null
-            if ($driverVersionOutput -match '(\d+)\.\d+\.\d+\.\d+') {
-              $result = if ($edge.Split('.')[0] -eq $Matches[1]) { 'match' } else { 'mismatch' }
-            }
+          function Test-Compatible([version]$runtime, [version]$driver) {
+            return $driver -and $runtime.Major -eq $driver.Major -and
+              $runtime.Minor -eq $driver.Minor -and $runtime.Build -eq $driver.Build
           }
-          "TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY=$result" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Output "browser_driver_compatibility=$result"
+
+          $candidate = $env:EDGEWEBDRIVER
+          if ($candidate -and (Test-Path $candidate -PathType Container)) {
+            $candidate = Join-Path $candidate 'msedgedriver.exe'
+          }
+          if (-not ($candidate -and (Test-Path $candidate -PathType Leaf))) {
+            $command = Get-Command msedgedriver.exe -ErrorAction SilentlyContinue
+            $candidate = if ($command) { $command.Source } else { $null }
+          }
+          $driverVersion = Get-DriverVersion $candidate
+          if (-not (Test-Compatible $runtimeVersion $driverVersion)) {
+            $driverRoot = Join-Path $env:RUNNER_TEMP 'token-place-matched-edgedriver'
+            $archive = Join-Path $env:RUNNER_TEMP 'token-place-matched-edgedriver.zip'
+            Remove-Item $driverRoot -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item $driverRoot -ItemType Directory | Out-Null
+            Invoke-WebRequest "https://msedgedriver.microsoft.com/$runtimeVersionText/edgedriver_win64.zip" -OutFile $archive
+            Expand-Archive $archive -DestinationPath $driverRoot -Force
+            $candidate = Join-Path $driverRoot 'msedgedriver.exe'
+            $driverVersion = Get-DriverVersion $candidate
+          }
+          if (-not (Test-Compatible $runtimeVersion $driverVersion)) {
+            throw 'WebView2 and EdgeDriver evidence does not match'
+          }
+          "EDGEWEBDRIVER=$candidate" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY=match" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Output 'browser_driver_compatibility=match'
 
       - name: Run Windows packaged-start unit regressions with poisoned host Python state
         shell: pwsh

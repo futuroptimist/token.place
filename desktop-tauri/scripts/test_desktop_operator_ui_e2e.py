@@ -681,6 +681,8 @@ def wait_for_operator_log_stop_markers(
 def tauri_driver_command() -> list[str]:
     tauri_driver_bin = shutil.which("tauri-driver")
     if os.name == "nt":
+        if os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY") != "match":
+            raise RuntimeError("native_driver_unavailable")
         edge_location = os.environ.get("EDGEWEBDRIVER")
         edge_driver = None
         if edge_location:
@@ -689,10 +691,6 @@ def tauri_driver_command() -> list[str]:
                 candidate = candidate / "msedgedriver.exe"
             if candidate.is_file():
                 edge_driver = str(candidate.resolve())
-        if edge_driver is None:
-            discovered = shutil.which("msedgedriver.exe")
-            if discovered is not None and Path(discovered).is_file():
-                edge_driver = str(Path(discovered).resolve())
         if edge_driver is None:
             raise RuntimeError("native_driver_unavailable")
         if tauri_driver_bin is not None:
@@ -742,6 +740,9 @@ def _classify_webdriver_session_failure(exc: Exception, process: object) -> tupl
         return "webdriver_transport_failure", "running"
     if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
             "failed to launch", "failed to start", "application failed")):
+        return "webdriver_application_startup_failed", "running"
+    if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
+            "cannot find microsoft edge", "no edge binary", "executable needs to be available")):
         return "webdriver_application_startup_failed", "running"
     return "webdriver_session_creation_failed", "running"
 

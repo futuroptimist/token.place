@@ -130,6 +130,7 @@ def test_tauri_driver_command_selects_explicit_windows_native_driver(
     edge_driver = edge_dir / "msedgedriver.exe"
     edge_driver.write_bytes(b"driver")
     monkeypatch.setenv("EDGEWEBDRIVER", str(edge_dir))
+    monkeypatch.setenv("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "match")
     desktop_runner.os = SimpleNamespace(name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
     monkeypatch.setattr(desktop_runner.shutil, "which",
         lambda name: "tauri-driver.exe" if name == "tauri-driver" else None)
@@ -140,25 +141,27 @@ def test_tauri_driver_command_selects_explicit_windows_native_driver(
     ]
 
 
-def test_tauri_driver_command_uses_verified_windows_path_fallback(
+def test_tauri_driver_command_requires_exported_verified_windows_path(
         desktop_runner, monkeypatch, tmp_path):
     edge_driver = tmp_path / "msedgedriver.exe"
     edge_driver.write_bytes(b"driver")
     monkeypatch.delenv("EDGEWEBDRIVER", raising=False)
+    monkeypatch.setenv("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "match")
     desktop_runner.os = SimpleNamespace(name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
     monkeypatch.setattr(desktop_runner.shutil, "which", lambda name: {
         "tauri-driver": "tauri-driver.exe",
         "msedgedriver.exe": str(edge_driver),
     }.get(name))
 
-    assert desktop_runner.tauri_driver_command()[-2:] == [
-        "--native-driver", str(edge_driver.resolve())]
+    with pytest.raises(RuntimeError, match="^native_driver_unavailable$"):
+        desktop_runner.tauri_driver_command()
 
 
 def test_tauri_driver_command_fails_bounded_when_windows_driver_missing(
         desktop_runner, monkeypatch, tmp_path):
     private = str(tmp_path / "private-edge-location")
     monkeypatch.setenv("EDGEWEBDRIVER", private)
+    monkeypatch.setenv("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "match")
     desktop_runner.os = SimpleNamespace(name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
     monkeypatch.setattr(desktop_runner.shutil, "which",
         lambda name: "tauri-driver.exe" if name == "tauri-driver" else None)
@@ -168,6 +171,24 @@ def test_tauri_driver_command_fails_bounded_when_windows_driver_missing(
     assert private not in str(raised.value)
 
 
+@pytest.mark.parametrize("compatibility", [None, "unknown", "mismatch", "hostile-private-path"])
+def test_tauri_driver_command_fails_closed_without_verified_compatibility(
+        desktop_runner, monkeypatch, tmp_path, compatibility):
+    driver = tmp_path / "msedgedriver.exe"
+    driver.write_bytes(b"driver")
+    monkeypatch.setenv("EDGEWEBDRIVER", str(driver))
+    if compatibility is None:
+        monkeypatch.delenv("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", raising=False)
+    else:
+        monkeypatch.setenv("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", compatibility)
+    desktop_runner.os = SimpleNamespace(
+        name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
+
+    with pytest.raises(RuntimeError, match="^native_driver_unavailable$") as raised:
+        desktop_runner.tauri_driver_command()
+    assert str(tmp_path) not in str(raised.value)
+
+
 @pytest.mark.parametrize(("exception", "process_exit", "expected"), [
     (SessionNotCreatedException("This version of msedgedriver only supports Microsoft Edge version 1"),
         None, "webdriver_driver_version_mismatch"),
@@ -175,6 +196,8 @@ def test_tauri_driver_command_fails_bounded_when_windows_driver_missing(
         None, "webdriver_capabilities_rejected"),
     (Exception("ignored"), 1, "tauri_driver_exited"),
     (SessionNotCreatedException("application failed to launch C:\\private\\model"),
+        None, "webdriver_application_startup_failed"),
+    (SessionNotCreatedException("cannot find Microsoft Edge binary C:\\private\\model"),
         None, "webdriver_application_startup_failed"),
 ])
 def test_webdriver_session_failure_categories_are_bounded(

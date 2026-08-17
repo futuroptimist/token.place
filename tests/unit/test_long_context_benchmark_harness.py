@@ -79,6 +79,7 @@ def desktop_runner():
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
         "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
+        "NATIVE_WEBDRIVER_URL": "http://127.0.0.1:4445",
         "urlopen": None,
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
         "PACKAGED_PHASES": h.PACKAGED_PHASES,
@@ -207,6 +208,32 @@ def test_start_driver_passes_resolved_application_and_tokenizer_arguments(
     }]
 
 
+def test_start_driver_uses_exact_windows_native_webview2_capabilities(
+        desktop_runner, tmp_path):
+    remote_calls = []
+    desktop_runner.webdriver = SimpleNamespace(
+        Remote=lambda **kwargs: remote_calls.append(kwargs) or "driver")
+    desktop_runner.os = SimpleNamespace(name="nt")
+    application = (tmp_path / "current head.exe").resolve()
+    arguments = ["--request=private value", "--evidence=private value"]
+
+    assert desktop_runner.start_driver(
+        application, application_args=arguments) == "driver"
+    options = remote_calls[0]["options"]
+    assert remote_calls[0]["command_executor"] == "http://127.0.0.1:4445"
+    assert options.to_capabilities() == {
+        "browserName": "webview2",
+        "ms:edgeChromium": True,
+        "ms:edgeOptions": {
+            "binary": str(application),
+            "args": arguments,
+        },
+    }
+    assert options.to_capabilities()["ms:edgeOptions"]["args"] is not arguments
+    assert "tauri:options" not in options.to_capabilities()
+    assert "goog:chromeOptions" not in options.to_capabilities()
+
+
 def test_tauri_driver_command_selects_explicit_windows_native_driver(
         desktop_runner, monkeypatch, tmp_path):
     edge_dir = tmp_path / "edge driver"
@@ -220,9 +247,32 @@ def test_tauri_driver_command_selects_explicit_windows_native_driver(
         lambda name: "tauri-driver.exe" if name == "tauri-driver" else None)
 
     assert desktop_runner.tauri_driver_command() == [
-        "tauri-driver.exe", "--port", "4444", "--native-driver",
+        "tauri-driver.exe", "--port", "4444", "--native-port", "4445", "--native-driver",
         str(edge_driver.resolve()),
     ]
+
+
+def test_webdriver_readiness_uses_explicit_windows_native_endpoint(
+        desktop_runner, monkeypatch):
+    requested = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"value":{"ready":true}}'
+
+    desktop_runner.os = SimpleNamespace(name="nt")
+    monkeypatch.setattr(desktop_runner, "urlopen",
+        lambda url, **_kwargs: requested.append(url) or Response())
+    desktop_runner.wait_for_webdriver_ready(
+        SimpleNamespace(poll=lambda: None), timeout_seconds=1)
+
+    assert requested == ["http://127.0.0.1:4445/status"]
 
 
 def test_tauri_driver_command_requires_exported_verified_windows_path(

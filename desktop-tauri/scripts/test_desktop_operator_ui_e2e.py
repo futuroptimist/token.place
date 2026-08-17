@@ -30,6 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPO_ROOT / "desktop-tauri"
 TAURI_ROOT = DESKTOP_ROOT / "src-tauri"
 WEBDRIVER_URL = "http://127.0.0.1:4444"
+NATIVE_WEBDRIVER_URL = "http://127.0.0.1:4445"
 LOGS_DIR = REPO_ROOT / ".desktop-e2e-logs"
 BOOTSTRAP_LOG = LOGS_DIR / "bootstrap.log"
 
@@ -171,6 +172,7 @@ def wait_for_webdriver_ready(
     process: subprocess.Popen[str], timeout_seconds: float,
 ) -> None:
     """Wait for the native WebDriver behind tauri-driver to report readiness."""
+    status_url = NATIVE_WEBDRIVER_URL if os.name == "nt" else WEBDRIVER_URL
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -178,7 +180,7 @@ def wait_for_webdriver_ready(
         remaining = deadline - time.monotonic()
         try:
             with urlopen(  # nosec B310 - fixed loopback WebDriver endpoint
-                    f"{WEBDRIVER_URL}/status",
+                    f"{status_url}/status",
                     timeout=max(0.05, min(remaining, 0.5))) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             if (isinstance(payload, dict)
@@ -653,6 +655,27 @@ def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
 
 def start_driver(app_binary: Path, *, application_args: list[str] | None = None
         ) -> webdriver.Remote:
+    if os.name == "nt":
+        class NativeWebView2Options:
+            """Capabilities equivalent to tauri-driver's Windows mapping."""
+
+            _ignore_local_proxy = False
+
+            def to_capabilities(self) -> dict[str, object]:
+                return {
+                    "browserName": "webview2",
+                    "ms:edgeChromium": True,
+                    "ms:edgeOptions": {
+                        "binary": str(app_binary.resolve()),
+                        "args": list(application_args or []),
+                    },
+                }
+
+        return webdriver.Remote(
+            command_executor=NATIVE_WEBDRIVER_URL,
+            options=NativeWebView2Options(),
+        )
+
     class TauriOptions:
         """Minimal Selenium options without browser-vendor capabilities."""
 
@@ -731,7 +754,8 @@ def tauri_driver_command() -> list[str]:
         if edge_driver is None:
             raise RuntimeError("native_driver_unavailable")
         if tauri_driver_bin is not None:
-            return [tauri_driver_bin, "--port", "4444", "--native-driver", edge_driver]
+            return [tauri_driver_bin, "--port", "4444", "--native-port", "4445",
+                "--native-driver", edge_driver]
         raise RuntimeError(
             "tauri-driver binary not found on PATH; install it with `cargo install tauri-driver`"
         )

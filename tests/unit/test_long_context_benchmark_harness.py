@@ -303,6 +303,20 @@ def test_webdriver_session_failure_transport_and_safe_fallback(desktop_runner):
         hostile, SimpleNamespace(poll=lambda: None))[0] == "webdriver_session_creation_failed"
 
 
+@pytest.mark.parametrize("exception_type", [
+    ConnectTimeoutError,
+    NewConnectionError,
+    ProtocolError,
+])
+def test_webdriver_dependency_transport_failures_are_bounded(
+        desktop_runner, exception_type):
+    failure = exception_type("hostile C:\\private\\prompt MODEL_SENTINEL")
+
+    assert desktop_runner._classify_webdriver_session_failure(
+        failure, SimpleNamespace(poll=lambda: None)) == (
+            "webdriver_transport_failure", "running", "connection_failure")
+
+
 def test_webdriver_session_timeout_is_bounded_and_redacted(desktop_runner):
     private = "C:\\private\\application.exe --secret-prompt"
     timeout = SimpleNamespace(msg=f"HTTP connection read timed out while opening {private}")
@@ -364,6 +378,22 @@ def test_webdriver_process_posture_and_elapsed_are_bounded(
         (1, 5, 30, 90, "hostile")] == [
             "under_5_seconds", "5_to_29_seconds", "30_to_89_seconds",
             "90_seconds_or_more", "unknown"]
+
+
+def test_webdriver_process_posture_handles_bounded_edge_cases(
+        desktop_runner, monkeypatch, tmp_path):
+    app = tmp_path / "private application.exe"
+    process = SimpleNamespace(pid=17, poll=lambda: 1)
+    assert desktop_runner._webdriver_process_posture(process, app) == "tauri_driver_exited"
+
+    process.poll = lambda: None
+    monkeypatch.setattr(desktop_runner.psutil, "Process",
+        lambda _pid: SimpleNamespace(children=lambda recursive: []))
+    assert desktop_runner._webdriver_process_posture(process, app) == "unknown"
+
+    monkeypatch.setattr(desktop_runner.psutil, "Process",
+        lambda _pid: (_ for _ in ()).throw(desktop_runner.psutil.Error("private sentinel")))
+    assert desktop_runner._webdriver_process_posture(process, app) == "unknown"
 
 
 def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(

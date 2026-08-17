@@ -516,9 +516,20 @@ def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
     for key in keys:
         monkeypatch.setenv(key, f"poisoned {key}")
 
-    env = desktop_runner.tauri_driver_environment(tmp_path / "isolated home")
+    isolated_home = tmp_path / "isolated home"
+    env = desktop_runner.tauri_driver_environment(isolated_home)
 
     assert all(key not in env for key in keys)
+    assert env["HOME"] == str(isolated_home)
+    assert env["XDG_CONFIG_HOME"] == str(isolated_home / ".config")
+    assert env["XDG_DATA_HOME"] == str(isolated_home / ".local/share")
+    assert env["APPDATA"] == str(isolated_home / "AppData/Roaming")
+    assert all(path.is_dir() for path in (
+        isolated_home,
+        isolated_home / ".config",
+        isolated_home / ".local/share",
+        isolated_home / "AppData/Roaming",
+    ))
 
 
 def test_packaged_windows_tokenizer_boundary_uses_packaged_adapter_contract(

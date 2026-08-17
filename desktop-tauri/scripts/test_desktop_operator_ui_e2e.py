@@ -632,6 +632,16 @@ def _validate_final_tokenizer_stage(evidence_path: Path,
 
 
 def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
+    # WebView2 and the packaged sidecar resolve state beneath these directories
+    # during session creation. Create them before EdgeDriver launches the app so
+    # a fresh isolated profile cannot make the application exit before attach.
+    for directory in (
+        isolated_home,
+        isolated_home / ".config",
+        isolated_home / ".local/share",
+        isolated_home / "AppData/Roaming",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     for key in (
         "USE_MOCK_LLM",

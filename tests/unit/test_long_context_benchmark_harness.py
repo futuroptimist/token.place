@@ -105,6 +105,7 @@ def desktop_runner():
 
 
 def test_webdriver_readiness_requires_valid_native_status(desktop_runner, monkeypatch):
+    desktop_runner.os = SimpleNamespace(name="posix")
     responses = iter([
         OSError("hostile refused C:\\private\\prompt"),
         {"value": {"ready": False, "message": "hostile MODEL_SENTINEL"}},
@@ -176,6 +177,7 @@ def test_packaged_tokenizer_handoff_uses_paired_application_arguments(desktop_ru
 
 def test_start_driver_passes_resolved_application_and_tokenizer_arguments(
         desktop_runner, tmp_path):
+    desktop_runner.os = SimpleNamespace(name="posix")
     remote_calls = []
 
     def fake_remote(**kwargs):

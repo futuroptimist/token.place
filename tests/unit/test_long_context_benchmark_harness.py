@@ -217,10 +217,13 @@ def test_start_driver_uses_exact_windows_native_webview2_capabilities(
         Remote=lambda **kwargs: remote_calls.append(kwargs) or "driver")
     desktop_runner.os = SimpleNamespace(name="nt")
     application = (tmp_path / "current head.exe").resolve()
+    user_data_dir = tmp_path / "isolated WebView2 profile"
+    user_data_dir.mkdir()
     arguments = ["--request=private value", "--evidence=private value"]
 
     assert desktop_runner.start_driver(
-        application, application_args=arguments) == "driver"
+        application, application_args=arguments,
+        webview_user_data_dir=user_data_dir) == "driver"
     options = remote_calls[0]["options"]
     assert remote_calls[0]["command_executor"] == "http://127.0.0.1:4445"
     assert options.to_capabilities() == {
@@ -229,6 +232,9 @@ def test_start_driver_uses_exact_windows_native_webview2_capabilities(
         "ms:edgeOptions": {
             "binary": str(application),
             "args": arguments,
+            "webviewOptions": {
+                "userDataFolder": str(user_data_dir.resolve()),
+            },
         },
     }
     assert options.to_capabilities()["ms:edgeOptions"]["args"] is not arguments
@@ -529,6 +535,7 @@ def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
         isolated_home / ".config",
         isolated_home / ".local/share",
         isolated_home / "AppData/Roaming",
+        isolated_home / "WebView2",
     ))
 
 

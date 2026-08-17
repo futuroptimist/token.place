@@ -640,6 +640,7 @@ def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
         isolated_home / ".config",
         isolated_home / ".local/share",
         isolated_home / "AppData/Roaming",
+        isolated_home / "WebView2",
     ):
         directory.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -663,7 +664,8 @@ def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
     return env
 
 
-def start_driver(app_binary: Path, *, application_args: list[str] | None = None
+def start_driver(app_binary: Path, *, application_args: list[str] | None = None,
+        webview_user_data_dir: Path | None = None
         ) -> webdriver.Remote:
     if os.name == "nt":
         class NativeWebView2Options:
@@ -672,13 +674,18 @@ def start_driver(app_binary: Path, *, application_args: list[str] | None = None
             _ignore_local_proxy = False
 
             def to_capabilities(self) -> dict[str, object]:
+                edge_options: dict[str, object] = {
+                    "binary": str(app_binary.resolve()),
+                    "args": list(application_args or []),
+                }
+                if webview_user_data_dir is not None:
+                    edge_options["webviewOptions"] = {
+                        "userDataFolder": str(webview_user_data_dir.resolve()),
+                    }
                 return {
                     "browserName": "webview2",
                     "ms:edgeChromium": True,
-                    "ms:edgeOptions": {
-                        "binary": str(app_binary.resolve()),
-                        "args": list(application_args or []),
-                    },
+                    "ms:edgeOptions": edge_options,
                 }
 
         return webdriver.Remote(
@@ -1428,6 +1435,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             driver = start_driver(
                 app_binary.resolve(strict=True),
                 application_args=tokenizer_handoff_args(tokenizer_request, tokenizer_evidence),
+                webview_user_data_dir=isolated_home / "WebView2",
             )
         except Exception as exc:
             webdriver_session_elapsed_bucket = _webdriver_session_elapsed_bucket(

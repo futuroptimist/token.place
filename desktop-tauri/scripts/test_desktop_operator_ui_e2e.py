@@ -19,6 +19,12 @@ from pathlib import Path
 from urllib.request import urlopen
 
 import psutil
+from urllib3.exceptions import (
+    ConnectTimeoutError,
+    NewConnectionError,
+    ProtocolError,
+    ReadTimeoutError,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPO_ROOT / "desktop-tauri"
@@ -49,7 +55,6 @@ try:
     from selenium.webdriver.common.action_chains import ActionChains  # pragma: no cover
     from selenium.webdriver.common.keys import Keys  # pragma: no cover
     from selenium.webdriver.support.ui import WebDriverWait
-
     from utils.crypto_helpers import CryptoClient
     from scripts.long_context_benchmark.benchmark_harness import (
         apply_benchmark_context_tier,
@@ -751,37 +756,98 @@ def tauri_driver_command() -> list[str]:
     )
 
 
-WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v1"
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v2"
 WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
+WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
+    "read_timeout", "connection_failure", "capability_rejection",
+    "driver_version_mismatch", "application_startup_failure",
+    "tauri_driver_exit", "unknown",
+})
+WEBDRIVER_PROCESS_POSTURES = frozenset({
+    "tauri_driver_exited", "native_driver_only", "application_present",
+    "webview_descendants_present", "unknown",
+})
+WEBDRIVER_SESSION_ELAPSED_BUCKETS = frozenset({
+    "under_5_seconds", "5_to_29_seconds", "30_to_89_seconds",
+    "90_seconds_or_more", "unknown",
+})
 
 
-def _classify_webdriver_session_failure(exc: Exception, process: object) -> tuple[str, str]:
+def _classify_webdriver_session_failure(exc: Exception, process: object) -> tuple[str, str, str]:
     """Return only low-cardinality evidence about WebDriver session creation."""
     poll = getattr(process, "poll", None)
     if callable(poll) and poll() is not None:
-        return "tauri_driver_exited", "exited"
-    message = str(getattr(exc, "msg", "")).lower()
+        return "tauri_driver_exited", "exited", "tauri_driver_exit"
+    if isinstance(exc, ReadTimeoutError):
+        return "webdriver_transport_failure", "running", "read_timeout"
+    if isinstance(exc, (ConnectTimeoutError, NewConnectionError, ProtocolError)):
+        return "webdriver_transport_failure", "running", "connection_failure"
+    message_value = getattr(exc, "msg", None)
+    message = (message_value if isinstance(message_value, str) else str(exc)).lower()
     if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
             "only supports microsoft edge version", "this version of msedgedriver")):
-        return "webdriver_driver_version_mismatch", "running"
+        return "webdriver_driver_version_mismatch", "running", "driver_version_mismatch"
     if isinstance(exc, InvalidArgumentException) or any(pattern in message for pattern in (
             "unrecognized capability", "invalid capabilities", "invalid argument: capability")):
-        return "webdriver_capabilities_rejected", "running"
+        return "webdriver_capabilities_rejected", "running", "capability_rejection"
+    if any(pattern in message for pattern in ("read timed out", "read timeout")):
+        return "webdriver_transport_failure", "running", "read_timeout"
     if any(pattern in message for pattern in (
-            "connection refused", "failed to establish a new connection", "connection aborted",
-            "read timed out", "read timeout")):
-        return "webdriver_transport_failure", "running"
+            "connection refused", "failed to establish a new connection", "connection aborted")):
+        return "webdriver_transport_failure", "running", "connection_failure"
     if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
             "failed to launch", "failed to start", "application failed")):
-        return "webdriver_application_startup_failed", "running"
+        return "webdriver_application_startup_failed", "running", "application_startup_failure"
     if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
             "cannot find microsoft edge", "no edge binary", "executable needs to be available")):
-        return "webdriver_application_startup_failed", "running"
-    return "webdriver_session_creation_failed", "running"
+        return "webdriver_application_startup_failed", "running", "application_startup_failure"
+    return "webdriver_session_creation_failed", "running", "unknown"
+
+
+def _webdriver_process_posture(process: object, app_binary: Path) -> str:
+    """Inspect process identity in memory and return only an allowlisted posture."""
+    poll = getattr(process, "poll", None)
+    if callable(poll) and poll() is not None:
+        return "tauri_driver_exited"
+    try:
+        descendants = psutil.Process(process.pid).children(recursive=True)
+        application = None
+        expected = app_binary.resolve()
+        for descendant in descendants:
+            try:
+                if Path(descendant.exe()).resolve() == expected:
+                    application = descendant
+                    break
+            except (OSError, psutil.Error):
+                continue
+        if application is not None:
+            try:
+                if application.children(recursive=True):
+                    return "webview_descendants_present"
+            except (psutil.Error, OSError):
+                pass
+            return "application_present"
+        return "native_driver_only" if descendants else "unknown"
+    except (AttributeError, OSError, psutil.Error):
+        return "unknown"
+
+
+def _webdriver_session_elapsed_bucket(elapsed_seconds: object) -> str:
+    if not isinstance(elapsed_seconds, (int, float)) or isinstance(elapsed_seconds, bool):
+        return "unknown"
+    if elapsed_seconds < 5:
+        return "under_5_seconds"
+    if elapsed_seconds < 30:
+        return "5_to_29_seconds"
+    if elapsed_seconds < 90:
+        return "30_to_89_seconds"
+    return "90_seconds_or_more"
 
 
 def _write_webdriver_diagnostic(
-        compatibility: str, process_state: str, failure_category: str) -> None:
+        compatibility: str, process_state: str, failure_category: str,
+        exception_family: str = "unknown", process_posture: str = "unknown",
+        session_elapsed_bucket: str = "unknown") -> None:
     """Atomically retain the bounded session diagnostic while raw logs are discarded."""
     if compatibility not in WEBDRIVER_COMPATIBILITY_RESULTS:
         compatibility = "unknown"
@@ -789,6 +855,12 @@ def _write_webdriver_diagnostic(
         process_state = "unknown"
     if failure_category not in PACKAGED_FAILURE_REASONS | {"none"}:
         failure_category = "webdriver_session_creation_failed"
+    if exception_family not in WEBDRIVER_EXCEPTION_FAMILIES:
+        exception_family = "unknown"
+    if process_posture not in WEBDRIVER_PROCESS_POSTURES:
+        process_posture = "unknown"
+    if session_elapsed_bucket not in WEBDRIVER_SESSION_ELAPSED_BUCKETS:
+        session_elapsed_bucket = "unknown"
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
     fd, temporary_name = tempfile.mkstemp(
@@ -801,6 +873,9 @@ def _write_webdriver_diagnostic(
                 "browser_driver_compatibility": compatibility,
                 "tauri_driver_state": process_state,
                 "webdriver_failure_category": failure_category,
+                "exception_family": exception_family,
+                "process_posture": process_posture,
+                "session_elapsed_bucket": session_elapsed_bucket,
             }, handle, sort_keys=True)
         os.replace(temporary, destination)
     finally:
@@ -1287,6 +1362,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     primary_failed = False
     webdriver_failure_category = "none"
     tauri_driver_state = "unknown"
+    webdriver_exception_family = "unknown"
+    webdriver_process_posture = "unknown"
+    webdriver_session_elapsed_bucket = "unknown"
     try:
         setup_remaining()
         try:
@@ -1311,13 +1389,17 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         tauri_driver_state = "running"
         write_phase("webdriver_ready")
         setup_remaining()
+        session_started = time.monotonic()
         try:
             driver = start_driver(
                 app_binary.resolve(strict=True),
                 application_args=tokenizer_handoff_args(tokenizer_request, tokenizer_evidence),
             )
         except Exception as exc:
-            webdriver_failure_category, tauri_driver_state = (
+            webdriver_session_elapsed_bucket = _webdriver_session_elapsed_bucket(
+                time.monotonic() - session_started)
+            webdriver_process_posture = _webdriver_process_posture(process, app_binary)
+            webdriver_failure_category, tauri_driver_state, webdriver_exception_family = (
                 _classify_webdriver_session_failure(exc, process))
             fail_closed(webdriver_failure_category)
         write_phase("desktop_session_started")
@@ -1540,7 +1622,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     finally:
         _write_webdriver_diagnostic(
             os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
-            tauri_driver_state, webdriver_failure_category)
+            tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
+            webdriver_process_posture, webdriver_session_elapsed_bucket)
         cleanup_deadline = time.monotonic() + cleanup_timeout
         def cleanup_remaining() -> float:
             return max(0.0, cleanup_deadline - time.monotonic())

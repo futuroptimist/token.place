@@ -30,6 +30,22 @@ class SessionNotCreatedException(_WebDriverException):
     pass
 
 
+class ReadTimeoutError(Exception):
+    """Dependency-free stand-in for urllib3.exceptions.ReadTimeoutError."""
+
+
+class ConnectTimeoutError(Exception):
+    pass
+
+
+class NewConnectionError(Exception):
+    pass
+
+
+class ProtocolError(Exception):
+    pass
+
+
 @pytest.fixture
 def desktop_runner():
     tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
@@ -44,7 +60,8 @@ def desktop_runner():
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
         "start_driver",
-        "_classify_webdriver_session_failure", "_write_webdriver_diagnostic",
+        "_classify_webdriver_session_failure", "_webdriver_process_posture",
+        "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
         "_contains_private_input", "_packaged_boundary_failure_diagnostics",
         "run_packaged_windows_tokenizer_boundary", "main"}
     functions = [node for node in tree.body
@@ -67,8 +84,17 @@ def desktop_runner():
         "PACKAGED_PHASES": h.PACKAGED_PHASES,
         "SessionNotCreatedException": SessionNotCreatedException,
         "InvalidArgumentException": InvalidArgumentException,
-        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v1",
+        "ReadTimeoutError": ReadTimeoutError, "ConnectTimeoutError": ConnectTimeoutError,
+        "NewConnectionError": NewConnectionError, "ProtocolError": ProtocolError,
+        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v2",
         "WEBDRIVER_COMPATIBILITY_RESULTS": frozenset({"match", "mismatch", "unknown"}),
+        "WEBDRIVER_EXCEPTION_FAMILIES": frozenset({"read_timeout", "connection_failure",
+            "capability_rejection", "driver_version_mismatch", "application_startup_failure",
+            "tauri_driver_exit", "unknown"}),
+        "WEBDRIVER_PROCESS_POSTURES": frozenset({"tauri_driver_exited", "native_driver_only",
+            "application_present", "webview_descendants_present", "unknown"}),
+        "WEBDRIVER_SESSION_ELAPSED_BUCKETS": frozenset({"under_5_seconds",
+            "5_to_29_seconds", "30_to_89_seconds", "90_seconds_or_more", "unknown"}),
         "LOGS_DIR": Path.cwd() / ".desktop-e2e-logs",
         "apply_benchmark_context_tier": h.apply_benchmark_context_tier,
         "generate_fixture": h.generate_fixture,
@@ -260,7 +286,7 @@ def test_tauri_driver_command_fails_closed_without_verified_compatibility(
 ])
 def test_webdriver_session_failure_categories_are_bounded(
         desktop_runner, exception, process_exit, expected):
-    category, state = desktop_runner._classify_webdriver_session_failure(
+    category, state, _family = desktop_runner._classify_webdriver_session_failure(
         exception, SimpleNamespace(poll=lambda: process_exit))
     assert category == expected
     assert state == ("exited" if process_exit is not None else "running")
@@ -270,7 +296,8 @@ def test_webdriver_session_failure_categories_are_bounded(
 def test_webdriver_session_failure_transport_and_safe_fallback(desktop_runner):
     transport = SimpleNamespace(msg="connection refused C:\\private\\prompt")
     assert desktop_runner._classify_webdriver_session_failure(
-        transport, SimpleNamespace(poll=lambda: None))[0] == "webdriver_transport_failure"
+        transport, SimpleNamespace(poll=lambda: None)) == (
+            "webdriver_transport_failure", "running", "connection_failure")
     hostile = SimpleNamespace(msg="C:\\private\\prompt MODEL_SENTINEL")
     assert desktop_runner._classify_webdriver_session_failure(
         hostile, SimpleNamespace(poll=lambda: None))[0] == "webdriver_session_creation_failed"
@@ -279,23 +306,81 @@ def test_webdriver_session_failure_transport_and_safe_fallback(desktop_runner):
 def test_webdriver_session_timeout_is_bounded_and_redacted(desktop_runner):
     private = "C:\\private\\application.exe --secret-prompt"
     timeout = SimpleNamespace(msg=f"HTTP connection read timed out while opening {private}")
-    category, state = desktop_runner._classify_webdriver_session_failure(
+    category, state, family = desktop_runner._classify_webdriver_session_failure(
         timeout, SimpleNamespace(poll=lambda: None))
-    assert (category, state) == ("webdriver_transport_failure", "running")
+    assert (category, state, family) == (
+        "webdriver_transport_failure", "running", "read_timeout")
     assert private not in category
+
+
+@pytest.mark.parametrize("exception", [
+    ReadTimeoutError("hostile C:\\private\\model --secret-prompt"),
+    Exception("HTTP connection read timed out at C:\\private\\application.exe"),
+])
+def test_webdriver_read_timeout_without_msg_is_classified(desktop_runner, exception):
+    assert not hasattr(exception, "msg")
+    assert desktop_runner._classify_webdriver_session_failure(
+        exception, SimpleNamespace(poll=lambda: None)) == (
+            "webdriver_transport_failure", "running", "read_timeout")
+
+
+def test_real_urllib3_read_timeout_without_msg_is_classified(desktop_runner):
+    from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
+
+    timeout = Urllib3ReadTimeoutError(None, None, "C:\\private\\prompt timed out")
+    assert not hasattr(timeout, "msg")
+    desktop_runner.ReadTimeoutError = Urllib3ReadTimeoutError
+    assert desktop_runner._classify_webdriver_session_failure(
+        timeout, SimpleNamespace(poll=lambda: None)) == (
+            "webdriver_transport_failure", "running", "read_timeout")
+
+
+def test_webdriver_process_posture_and_elapsed_are_bounded(
+        desktop_runner, monkeypatch, tmp_path):
+    application_path = (tmp_path / "private application.exe").resolve()
+
+    class Child:
+        def __init__(self, executable, children=()):
+            self.executable = executable
+            self._children = list(children)
+
+        def exe(self):
+            return str(self.executable)
+
+        def children(self, recursive):
+            assert recursive is True
+            return self._children
+
+    webview = Child(tmp_path / "private WebView sentinel.exe")
+    application = Child(application_path, [webview])
+    native = Child(tmp_path / "private native driver.exe")
+    monkeypatch.setattr(desktop_runner.psutil, "Process",
+        lambda _pid: SimpleNamespace(children=lambda recursive: [native, application]))
+    process = SimpleNamespace(pid=17, poll=lambda: None)
+
+    assert desktop_runner._webdriver_process_posture(process, application_path) == (
+        "webview_descendants_present")
+    assert [desktop_runner._webdriver_session_elapsed_bucket(value) for value in
+        (1, 5, 30, 90, "hostile")] == [
+            "under_5_seconds", "5_to_29_seconds", "30_to_89_seconds",
+            "90_seconds_or_more", "unknown"]
 
 
 def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
         desktop_runner, tmp_path):
     desktop_runner.LOGS_DIR = tmp_path
     desktop_runner._write_webdriver_diagnostic(
-        "C:\\private\\prompt", "MODEL_SENTINEL", "SECRET_EXCEPTION")
+        "C:\\private\\prompt", "MODEL_SENTINEL", "SECRET_EXCEPTION",
+        "read_timeout", "application_present", "30_to_89_seconds")
     artifact = tmp_path / "packaged-webdriver-diagnostic.json"
     assert json.loads(artifact.read_text()) == {
-        "schema_version": "packaged-webdriver-diagnostic-v1",
+        "schema_version": "packaged-webdriver-diagnostic-v2",
         "browser_driver_compatibility": "unknown",
         "tauri_driver_state": "unknown",
         "webdriver_failure_category": "webdriver_session_creation_failed",
+        "exception_family": "read_timeout",
+        "process_posture": "application_present",
+        "session_elapsed_bucket": "30_to_89_seconds",
     }
     assert not list(tmp_path.glob("*.tmp"))
     assert "private" not in artifact.read_text()
@@ -2904,7 +2989,8 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
     wanted = {"tauri_driver_environment", "tokenizer_stage_path",
-        "_write_tokenizer_stage", "run_long_context_packaged_mode"}
+        "_write_tokenizer_stage", "_webdriver_session_elapsed_bucket",
+        "_webdriver_process_posture", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     checkpoints = []
@@ -2929,8 +3015,10 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
-        "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
+        "_classify_webdriver_session_failure": lambda _exc, _process: (
+            "webdriver_session_creation_failed", "running", "unknown"),
         "_write_webdriver_diagnostic": lambda *_args: None,
+        "psutil": __import__("psutil"),
         "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
         "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
         "OwnedProcessTreeMemorySampler": lambda _pid: object(),

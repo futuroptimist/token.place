@@ -308,7 +308,7 @@ def test_webdriver_session_failure_transport_and_safe_fallback(desktop_runner):
     NewConnectionError,
     ProtocolError,
 ])
-def test_webdriver_dependency_transport_failures_are_bounded(
+def test_webdriver_session_dependency_transport_failures_are_bounded(
         desktop_runner, exception_type):
     failure = exception_type("hostile C:\\private\\prompt MODEL_SENTINEL")
 
@@ -391,6 +391,20 @@ def test_webdriver_process_posture_handles_bounded_edge_cases(
         lambda _pid: SimpleNamespace(children=lambda recursive: []))
     assert desktop_runner._webdriver_process_posture(process, app) == "unknown"
 
+    native = SimpleNamespace(exe=lambda: str(tmp_path / "private native driver.exe"))
+    monkeypatch.setattr(desktop_runner.psutil, "Process",
+        lambda _pid: SimpleNamespace(children=lambda recursive: [native]))
+    assert desktop_runner._webdriver_process_posture(process, app) == "native_driver_only"
+
+    unreadable = SimpleNamespace(exe=lambda: (_ for _ in ()).throw(
+        desktop_runner.psutil.Error("private process sentinel")))
+    application = SimpleNamespace(exe=lambda: str(app.resolve()),
+        children=lambda recursive: (_ for _ in ()).throw(
+            desktop_runner.psutil.Error("private child sentinel")))
+    monkeypatch.setattr(desktop_runner.psutil, "Process",
+        lambda _pid: SimpleNamespace(children=lambda recursive: [unreadable, application]))
+    assert desktop_runner._webdriver_process_posture(process, app) == "application_present"
+
     monkeypatch.setattr(desktop_runner.psutil, "Process",
         lambda _pid: (_ for _ in ()).throw(desktop_runner.psutil.Error("private sentinel")))
     assert desktop_runner._webdriver_process_posture(process, app) == "unknown"
@@ -415,6 +429,28 @@ def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
     assert not list(tmp_path.glob("*.tmp"))
     assert "private" not in artifact.read_text()
     assert "SENTINEL" not in artifact.read_text()
+
+
+def test_webdriver_diagnostic_clamps_invalid_v2_enums(desktop_runner, tmp_path):
+    desktop_runner.LOGS_DIR = tmp_path
+    hostile = "C:\\private\\application.exe --secret-prompt MODEL_SENTINEL"
+
+    desktop_runner._write_webdriver_diagnostic(
+        "match", "running", "none", hostile, hostile, hostile)
+
+    artifact = json.loads(
+        (tmp_path / "packaged-webdriver-diagnostic.json").read_text())
+    assert artifact == {
+        "schema_version": "packaged-webdriver-diagnostic-v2",
+        "browser_driver_compatibility": "match",
+        "tauri_driver_state": "running",
+        "webdriver_failure_category": "none",
+        "exception_family": "unknown",
+        "process_posture": "unknown",
+        "session_elapsed_bucket": "unknown",
+    }
+    assert "private" not in json.dumps(artifact)
+    assert "SENTINEL" not in json.dumps(artifact)
 
 
 def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(

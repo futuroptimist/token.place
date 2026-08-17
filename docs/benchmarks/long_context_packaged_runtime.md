@@ -1,9 +1,10 @@
 # Long-context packaged-runtime benchmark harness
 
 The long-context harness turns the long-context macOS Metal evidence from #1566 into a repeatable,
-privacy-safe benchmark surface for downstream comparisons. Ordinary CI runs only deterministic unit and
-contract tests; it does **not** download a model, require a GPU, launch a packaged desktop app, or
-run multi-minute inference.
+privacy-safe benchmark surface for downstream comparisons. Broad unit and contract CI remains
+deterministic and GPU-independent. The specialized `Desktop operator app e2e` workflow also
+provisions a checksum-pinned tiny real GGUF and launches desktop binaries for hosted application
+contract checks; these checks do not run physical-GPU or multi-minute benchmark validation.
 
 ## Prerequisites for physical runs
 
@@ -479,7 +480,7 @@ only failure. Strict/default mode and every runtime-contract failure exit nonzer
 
 ## CI versus hardware validation
 
-Ordinary CI should run:
+Broad deterministic, GPU-independent CI should run:
 
 ```bash
 python -m pytest -q tests/unit/test_long_context_benchmark_harness.py
@@ -489,9 +490,17 @@ git diff --check
 ./run_all_tests.sh PR
 ```
 
-Physical Metal/CUDA validation is manual and should attach only sanitized reports to #1566, #1608,
-or downstream validation. Do not claim 0.1.17 release validation or general semantic correctness
-from a report-only baseline.
+The specialized `Desktop operator app e2e` workflow additionally provisions a checksum-pinned tiny
+real GGUF and launches desktop binaries. Its hosted-Windows job builds the current-head Windows
+package and exercises the application-argument tokenizer boundary through the matched
+WebView2/EdgeDriver path. This is a production-shaped hosted contract check, not physical hardware
+or benchmark evidence.
+
+Physical Metal/CUDA validation remains manual and should attach only sanitized reports to #1566,
+#1608, or downstream validation. Hosted CI does not prove physical Metal or CUDA operation, P8,
+long-context semantic correctness, or performance. A fresh physical Windows/CUDA or macOS/Metal
+validation is still required; do not claim 0.1.17 release validation or general semantic correctness
+from a hosted contract check or report-only baseline.
 
 ### Qwen 64K KV allocation diagnostics
 

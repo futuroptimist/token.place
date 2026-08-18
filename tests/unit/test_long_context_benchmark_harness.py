@@ -3269,7 +3269,8 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         assert app_kwargs["env"]["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] == (
             "--remote-debugging-port=49152")
         webview2_user_data = Path(app_kwargs["env"]["WEBVIEW2_USER_DATA_FOLDER"])
-        assert webview2_user_data == Path(app_kwargs["env"]["HOME"]) / "WebView2"
+        assert webview2_user_data.resolve(strict=True) == (
+            Path(app_kwargs["env"]["HOME"]) / "WebView2").resolve(strict=True)
         assert webview2_user_data.is_absolute()
         assert webview2_user_data.is_dir()
         assert app_kwargs["env"]["TAURI_AUTOMATION"] == "true"

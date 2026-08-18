@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App, normalizeDesktopConfig } from './App';
 
@@ -260,7 +260,7 @@ describe('desktop app start failure handling', () => {
 
 
   it.each(['desktop_python_runtime_missing', 'desktop_python_runtime_invalid'])(
-    'keeps Start operator enabled after mount-time %s model inspection failure',
+    'fails initialization after mount-time %s model inspection failure',
     async (code) => {
       invokeMock.mockImplementation((command: string) => {
         if (command === 'detect_backend') {
@@ -303,7 +303,7 @@ describe('desktop app start failure handling', () => {
         return Promise.resolve(undefined);
       });
 
-      render(<App />);
+      const { container } = render(<App />);
 
       await screen.findByText(/The bundled token\.place runtime is missing or damaged/);
       expect(document.body.textContent ?? '').toContain(`Diagnostic code: ${code}`);
@@ -311,11 +311,10 @@ describe('desktop app start failure handling', () => {
       expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
       expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
       const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
-      await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
-
-      fireEvent.click(startOperatorButton);
-
-      await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('start_compute_node', expect.any(Object)));
+      expect(startOperatorButton.disabled).toBe(true);
+      expect((container.querySelector('main') as HTMLElement).dataset.applicationInitialization)
+        .toBe('failed');
+      expect(invokeMock).not.toHaveBeenCalledWith('start_compute_node', expect.any(Object));
     }
   );
 
@@ -2580,6 +2579,84 @@ describe('desktop app start failure handling', () => {
     expect(contextSelect.disabled).toBe(true);
   });
 
+});
+
+describe('desktop application initialization barrier', () => {
+  const deferred = <T,>() => {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+  };
+
+  afterEach(() => cleanup());
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+    listenMock.mockResolvedValue(() => {});
+  });
+
+  it('stays pending until every required initialization result is committed', async () => {
+    const backend = deferred<Record<string, unknown>>();
+    const config = deferred<Record<string, unknown>>();
+    const status = deferred<Record<string, unknown>>();
+    const artifact = deferred<Record<string, unknown>>();
+    invokeMock.mockImplementation((command: string) => ({
+      detect_backend: backend.promise,
+      load_config: config.promise,
+      get_compute_node_status: status.promise,
+      inspect_model_artifact: artifact.promise,
+    }[command] ?? Promise.resolve(undefined)));
+
+    const { container } = render(<App />);
+    const shell = container.querySelector('main') as HTMLElement;
+    expect(shell.dataset.applicationInitialization).toBe('pending');
+
+    await act(async () => backend.resolve({ availability_label: 'CPU available' }));
+    expect(shell.dataset.applicationInitialization).toBe('pending');
+    await act(async () => config.resolve({ model_path: '/persisted.gguf', relay_base_url: 'https://token.place' }));
+    expect(shell.dataset.applicationInitialization).toBe('pending');
+    await act(async () => status.resolve({ running: false, registered: false }));
+    expect(shell.dataset.applicationInitialization).toBe('pending');
+    await act(async () => artifact.resolve({ filename: 'persisted.gguf', exists: true }));
+
+    await waitFor(() => expect(shell.dataset.applicationInitialization).toBe('ready'));
+    expect((screen.getByLabelText('Model GGUF path') as HTMLInputElement).value).toBe('/persisted.gguf');
+  });
+
+  it('does not overwrite automation input after readiness', async () => {
+    invokeMock.mockImplementation((command: string) => Promise.resolve({
+      detect_backend: { availability_label: 'CPU available' },
+      load_config: { model_path: '/persisted.gguf', relay_base_url: 'https://token.place' },
+      get_compute_node_status: { running: false, registered: false },
+      inspect_model_artifact: { filename: 'persisted.gguf', exists: true },
+    }[command]));
+    const { container } = render(<App />);
+    await waitFor(() => expect(
+      (container.querySelector('main') as HTMLElement).dataset.applicationInitialization
+    ).toBe('ready'));
+    const modelInput = screen.getByLabelText('Model GGUF path') as HTMLInputElement;
+    fireEvent.change(modelInput, { target: { value: '/automation.gguf' } });
+    await act(async () => Promise.resolve());
+    expect(modelInput.value).toBe('/automation.gguf');
+  });
+
+  it('fails closed when a required initialization operation rejects', async () => {
+    invokeMock.mockImplementation((command: string) => command === 'get_compute_node_status'
+      ? Promise.reject(new Error('status unavailable'))
+      : Promise.resolve(command === 'load_config'
+        ? { model_path: '', relay_base_url: 'https://token.place' }
+        : {}));
+    const { container } = render(<App />);
+    await waitFor(() => expect(
+      (container.querySelector('main') as HTMLElement).dataset.applicationInitialization
+    ).toBe('failed'));
+    expect(screen.getByText(/Error:/).textContent).toContain('status unavailable');
+  });
 });
 
 describe('desktop Python runtime error normalization', () => {

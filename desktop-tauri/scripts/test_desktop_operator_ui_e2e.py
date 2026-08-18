@@ -351,6 +351,13 @@ def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -
                             "//h1[normalize-space()='token.place desktop compute node']"):
                         last_category = "missing_shell"
                         continue
+                    initialization = d.execute_script(
+                        "return document.querySelector('main')?.dataset.applicationInitialization")
+                    if initialization == "failed":
+                        raise RuntimeError("application_initialization_failed")
+                    if initialization != "ready":
+                        last_category = "initialization_pending"
+                        continue
                     model_input_ready = bool(d.find_elements(
                         By.XPATH,
                         "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]"))
@@ -822,7 +829,7 @@ def tauri_driver_command() -> list[str]:
     )
 
 
-WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v3"
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v4"
 WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
 WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
     "read_timeout", "connection_failure", "capability_rejection",
@@ -840,7 +847,8 @@ WEBDRIVER_SESSION_ELAPSED_BUCKETS = frozenset({
 WEBDRIVER_TARGET_CATEGORIES = frozenset({"attachable_target", "no_target", "unknown"})
 WEBDRIVER_READINESS_CATEGORIES = frozenset({
     "ready", "no_window_handle", "wrong_handle", "missing_shell",
-    "missing_required_controls", "webdriver_failure", "unknown"})
+    "missing_required_controls", "initialization_pending",
+    "application_initialization_failed", "webdriver_failure", "unknown"})
 
 
 def _classify_webdriver_session_failure(exc: Exception, process: object) -> tuple[str, str, str]:
@@ -927,7 +935,7 @@ def _write_webdriver_diagnostic(
         compatibility: str, process_state: str, failure_category: str,
         exception_family: str = "unknown", process_posture: str = "unknown",
         session_elapsed_bucket: str = "unknown", target_category: str = "unknown",
-        readiness_category: str = "unknown") -> None:
+        readiness_category: str = "unknown", operator_progress: str = "not_started") -> None:
     """Atomically retain the bounded session diagnostic while raw logs are discarded."""
     if compatibility not in WEBDRIVER_COMPATIBILITY_RESULTS:
         compatibility = "unknown"
@@ -945,6 +953,10 @@ def _write_webdriver_diagnostic(
         target_category = "unknown"
     if readiness_category not in WEBDRIVER_READINESS_CATEGORIES:
         readiness_category = "unknown"
+    if operator_progress not in {
+            "not_started", "model_input_set", "relay_input_set", "operator_enabled",
+            "operator_started", "operator_running", "operator_registered"}:
+        operator_progress = "not_started"
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
     fd, temporary_name = tempfile.mkstemp(
@@ -962,6 +974,7 @@ def _write_webdriver_diagnostic(
                 "session_elapsed_bucket": session_elapsed_bucket,
                 "target_category": target_category,
                 "readiness_category": readiness_category,
+                "operator_progress": operator_progress,
             }, handle, sort_keys=True)
         os.replace(temporary, destination)
     finally:
@@ -1454,6 +1467,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     webdriver_session_elapsed_bucket = "unknown"
     webdriver_target_category = "unknown"
     webdriver_readiness_category = "unknown"
+    operator_progress = "not_started"
     try:
         setup_remaining()
         try:
@@ -1545,8 +1559,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         write_phase("desktop_ready")
         setup_remaining()
         fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
+        operator_progress = "model_input_set"
         setup_remaining()
         fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
+        operator_progress = "relay_input_set"
         setup_remaining()
         mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
         compute_mode = benchmark_operator_mode(request["backend"])
@@ -1555,12 +1571,16 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", tier, request["context_tier"])
         wait_for_start_operator_enabled(driver, driver_log, driver_log,
             timeout_seconds=setup_remaining())
+        operator_progress = "operator_enabled"
         setup_remaining()
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
+        operator_progress = "operator_started"
         wait_for_running_stability(driver, "yes", stable_seconds=3,
             timeout_seconds=setup_remaining())
+        operator_progress = "operator_running"
         WebDriverWait(driver, setup_remaining()).until(
             lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+        operator_progress = "operator_registered"
         write_phase("operator_ready")
 
         _validate_operator_tokenizer_handoff(tokenizer_evidence, fail_closed)
@@ -1759,7 +1779,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
             tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
             webdriver_process_posture, webdriver_session_elapsed_bucket,
-            webdriver_target_category, webdriver_readiness_category)
+            webdriver_target_category, webdriver_readiness_category, operator_progress)
         cleanup_deadline = time.monotonic() + cleanup_timeout
         def cleanup_remaining() -> float:
             return max(0.0, cleanup_deadline - time.monotonic())

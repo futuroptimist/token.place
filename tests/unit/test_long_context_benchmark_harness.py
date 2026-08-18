@@ -90,7 +90,7 @@ def desktop_runner():
         "InvalidArgumentException": InvalidArgumentException,
         "ReadTimeoutError": ReadTimeoutError, "ConnectTimeoutError": ConnectTimeoutError,
         "NewConnectionError": NewConnectionError, "ProtocolError": ProtocolError,
-        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v3",
+        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v4",
         "WEBDRIVER_COMPATIBILITY_RESULTS": frozenset({"match", "mismatch", "unknown"}),
         "WEBDRIVER_EXCEPTION_FAMILIES": frozenset({"read_timeout", "connection_failure",
             "capability_rejection", "driver_version_mismatch", "application_startup_failure",
@@ -102,6 +102,7 @@ def desktop_runner():
         "WEBDRIVER_TARGET_CATEGORIES": frozenset({"attachable_target", "no_target", "unknown"}),
         "WEBDRIVER_READINESS_CATEGORIES": frozenset({"ready", "no_window_handle",
             "wrong_handle", "missing_shell", "missing_required_controls",
+            "initialization_pending", "application_initialization_failed",
             "webdriver_failure", "unknown"}),
         "LOGS_DIR": Path.cwd() / ".desktop-e2e-logs",
         "apply_benchmark_context_tier": h.apply_benchmark_context_tier,
@@ -314,6 +315,8 @@ def test_ui_ready_selects_application_handle_without_optional_artifact_panel(
             return [] if self.handle_reads == 1 else ["unrelated", "application"]
 
         def execute_script(self, _script):
+            if "applicationInitialization" in _script:
+                return "ready"
             return ("token.place desktop MVP"
                 if "document.title" in _script and self.current == "application"
                 else "unrelated" if "document.title" in _script else "complete")
@@ -352,7 +355,8 @@ def test_ui_ready_failure_is_bounded_and_preserves_deadline(
         window_handles=handles,
         switch_to=SimpleNamespace(window=lambda _handle: None, default_content=lambda: None),
         execute_script=lambda script: (
-            "unrelated" if "document.title" in script else "complete"),
+            "ready" if "applicationInitialization" in script
+            else "unrelated" if "document.title" in script else "complete"),
         find_elements=lambda *_args: [],
     )
     desktop_runner.WebDriverWait = Wait
@@ -389,7 +393,8 @@ def test_ui_ready_classifies_application_shell_and_controls(
         window_handles=["application"],
         switch_to=SimpleNamespace(window=lambda _handle: None, default_content=lambda: None),
         execute_script=lambda script: (
-            "token.place desktop MVP" if "document.title" in script else "complete"),
+            "ready" if "applicationInitialization" in script
+            else "token.place desktop MVP" if "document.title" in script else "complete"),
         find_elements=find_elements,
     )
     with pytest.raises(RuntimeError, match=f"^{expected}$"):
@@ -426,6 +431,8 @@ def test_ui_ready_classifies_transient_webdriver_failures(
         def execute_script(self, script):
             if failure_point == "window_switch":
                 raise desktop_runner.WebDriverException("private session sentinel")
+            if "applicationInitialization" in script:
+                return "ready"
             return "loading" if "readyState" in script else "token.place desktop MVP"
 
         def find_elements(self, *_args):
@@ -437,6 +444,35 @@ def test_ui_ready_classifies_transient_webdriver_failures(
     with pytest.raises(RuntimeError, match=f"^{expected}$") as exc_info:
         desktop_runner.wait_for_ui_ready(Driver(), timeout_seconds=2)
     assert "private" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(("initialization", "expected"), [
+    ("pending", "initialization_pending"),
+    ("failed", "application_initialization_failed"),
+])
+def test_ui_ready_requires_completed_application_initialization(
+        desktop_runner, initialization, expected):
+    class Wait:
+        def __init__(self, driver, timeout, poll_frequency):
+            self.driver = driver
+
+        def until(self, condition):
+            return condition(self.driver)
+
+    def execute_script(script):
+        if "applicationInitialization" in script:
+            return initialization
+        return "token.place desktop MVP" if "document.title" in script else "complete"
+
+    desktop_runner.WebDriverWait = Wait
+    driver = SimpleNamespace(
+        window_handles=["application"],
+        switch_to=SimpleNamespace(window=lambda _handle: None, default_content=lambda: None),
+        execute_script=execute_script,
+        find_elements=lambda *_args: [object()],
+    )
+    with pytest.raises(RuntimeError, match=f"^{expected}$"):
+        desktop_runner.wait_for_ui_ready(driver, timeout_seconds=2)
 
 
 @pytest.mark.parametrize(("poll", "expected"), [
@@ -692,7 +728,7 @@ def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
         "C:\\private\\target", "SECRET_READINESS")
     artifact = tmp_path / "packaged-webdriver-diagnostic.json"
     assert json.loads(artifact.read_text()) == {
-        "schema_version": "packaged-webdriver-diagnostic-v3",
+        "schema_version": "packaged-webdriver-diagnostic-v4",
         "browser_driver_compatibility": "unknown",
         "tauri_driver_state": "unknown",
         "webdriver_failure_category": "webdriver_session_creation_failed",
@@ -701,6 +737,7 @@ def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
         "session_elapsed_bucket": "30_to_89_seconds",
         "target_category": "unknown",
         "readiness_category": "unknown",
+        "operator_progress": "not_started",
     }
     assert not list(tmp_path.glob("*.tmp"))
     assert "private" not in artifact.read_text()
@@ -718,7 +755,7 @@ def test_webdriver_diagnostic_clamps_invalid_v3_enums(desktop_runner, tmp_path):
     artifact = json.loads(
         (tmp_path / "packaged-webdriver-diagnostic.json").read_text())
     assert artifact == {
-        "schema_version": "packaged-webdriver-diagnostic-v3",
+        "schema_version": "packaged-webdriver-diagnostic-v4",
         "browser_driver_compatibility": "match",
         "tauri_driver_state": "running",
         "webdriver_failure_category": "none",
@@ -727,9 +764,22 @@ def test_webdriver_diagnostic_clamps_invalid_v3_enums(desktop_runner, tmp_path):
         "session_elapsed_bucket": "unknown",
         "target_category": "attachable_target",
         "readiness_category": "ready",
+        "operator_progress": "not_started",
     }
     assert "private" not in json.dumps(artifact)
     assert "SENTINEL" not in json.dumps(artifact)
+
+
+def test_webdriver_diagnostic_clamps_hostile_operator_progress(desktop_runner, tmp_path):
+    desktop_runner.LOGS_DIR = tmp_path
+    desktop_runner._write_webdriver_diagnostic(
+        "match", "running", "none", target_category="attachable_target",
+        readiness_category="ready", operator_progress="C:\\private\\prompt SECRET")
+    artifact = json.loads(
+        (tmp_path / "packaged-webdriver-diagnostic.json").read_text())
+    assert artifact["operator_progress"] == "not_started"
+    assert "private" not in json.dumps(artifact)
+    assert "SECRET" not in json.dumps(artifact)
 
 
 def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(

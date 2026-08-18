@@ -1,12 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
 type BackendMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
 type ContextTier = '8k-fast' | '64k-full';
 type Qwen64kBatchProfile = 'safe' | 'balanced' | 'experimental';
+type ApplicationInitializationState = 'pending' | 'ready' | 'failed';
 
 // Context tiers intentionally use static, duplicated profile constants instead of
 // runtime codegen/manifest loading. Keep these IDs and token counts
@@ -862,6 +863,9 @@ export function selectedModelPath(selection: string | string[] | null): string {
 }
 
 export function App() {
+  const [applicationInitialization, setApplicationInitialization] =
+    useState<ApplicationInitializationState>('pending');
+  const [applicationInitializationLoaded, setApplicationInitializationLoaded] = useState(false);
   const [backend, setBackend] = useState<BackendInfo | null>(null);
   const [config, setConfig] = useState<DesktopConfig>({
     model_path: '',
@@ -900,32 +904,37 @@ export function App() {
   const computeStatusRef = useRef<ComputeNodeStatus>(defaultComputeStatus);
   const computeNodeStartAttemptRef = useRef(0);
 
-  useEffect(() => {
-    invoke<BackendInfo>('detect_backend')
-      .then(setBackend)
-      .catch((e) => setError(formatErrorMessage(e)));
+  useLayoutEffect(() => {
+    if (applicationInitializationLoaded) {
+      setApplicationInitialization('ready');
+    }
+  }, [applicationInitializationLoaded]);
 
-    const initializeConfigAndArtifact = async () => {
+  useEffect(() => {
+    const initializeApplication = async () => {
       try {
+        const detectedBackend = await invoke<BackendInfo>('detect_backend');
         const loadedConfig = await invoke<PartialDesktopConfig>('load_config');
         const normalizedConfig = normalizeDesktopConfig(loadedConfig);
+        const nodeStatus = { ...defaultComputeStatus, ...(await invoke<Partial<ComputeNodeStatus>>('get_compute_node_status')) };
+        const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
+
+        setBackend(detectedBackend);
         setConfig(normalizedConfig);
         if (JSON.stringify(loadedConfig) !== JSON.stringify(normalizedConfig)) {
           invoke('save_config', { config: normalizedConfig }).catch((e) => setError(formatErrorMessage(e)));
         }
-        const nodeStatus = { ...defaultComputeStatus, ...(await invoke<Partial<ComputeNodeStatus>>('get_compute_node_status')) };
         computeStatusRef.current = nodeStatus;
         setComputeStatus(nodeStatus);
-
-        const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
         setArtifact(info);
-
+        setApplicationInitializationLoaded(true);
       } catch (e) {
         setError(formatErrorMessage(e));
+        setApplicationInitialization('failed');
       }
     };
 
-    initializeConfigAndArtifact();
+    initializeApplication();
   }, []);
 
   useEffect(() => {
@@ -1263,7 +1272,10 @@ export function App() {
   };
 
   return (
-    <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
+    <main
+      data-application-initialization={applicationInitialization}
+      style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}
+    >
       <h1>token.place desktop compute node</h1>
       <p>Platform GPU availability: <strong>{backend?.availability_label ?? 'loading...'}</strong></p>
       <label htmlFor="model-path-input">Model GGUF path</label>

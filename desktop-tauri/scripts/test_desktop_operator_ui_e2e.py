@@ -543,8 +543,8 @@ def tokenizer_handoff_args(request_path: Path | None = None,
         evidence_path: Path | None = None) -> list[str]:
     """Carry the paired handoff on the application command line on Windows.
 
-    WebView2 starts the packaged application itself, so environment inherited by
-    tauri-driver is not a deterministic application handoff on Windows.
+    The owned Windows launch and the non-Windows Tauri launch both pass these
+    values directly to the packaged application.
     """
     if request_path is None and evidence_path is None:
         return []
@@ -1470,12 +1470,14 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             application_env.update({
                 "TAURI_AUTOMATION": "true",
                 "TAURI_WEBVIEW_AUTOMATION": "true",
-                "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS": (
-                    f"--remote-debugging-port={devtools_port}"),
             })
+            webview2_automation_arg = (
+                "--edge-webview-switches="
+                f"--remote-debugging-port={devtools_port}")
             try:
                 application_process = subprocess.Popen(
-                    [str(app_binary.resolve(strict=True)), *application_args],
+                    [str(app_binary.resolve(strict=True)), webview2_automation_arg,
+                        *application_args],
                     cwd=app_binary.resolve(strict=True).parent, env=application_env,
                     stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
             except (OSError, ValueError):

@@ -203,6 +203,8 @@ def test_start_driver_passes_resolved_application_and_tokenizer_arguments(
         },
     }
     assert "goog:chromeOptions" not in options.to_capabilities()
+    assert all(not argument.startswith("--edge-webview-switches=")
+        for argument in options.to_capabilities()["tauri:options"]["args"])
     assert options._ignore_local_proxy is False
     assert remote_calls == [{
         "command_executor": "http://127.0.0.1:4444",
@@ -3264,10 +3266,10 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     if not gate_error and not launch_error:
         app_args, app_kwargs = popen_calls[1]
         assert app_args == [str(app.resolve()),
+            "--edge-webview-switches=--remote-debugging-port=49152",
             "--tokenizer-request=request.json", "--tokenizer-evidence=evidence.json"]
         assert app_kwargs["cwd"] == app.parent
-        assert app_kwargs["env"]["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] == (
-            "--remote-debugging-port=49152")
+        assert "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS" not in app_kwargs["env"]
         webview2_user_data = Path(app_kwargs["env"]["WEBVIEW2_USER_DATA_FOLDER"])
         assert webview2_user_data.resolve(strict=True) == (
             Path(app_kwargs["env"]["HOME"]) / "WebView2").resolve(strict=True)
@@ -3275,7 +3277,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         assert webview2_user_data.is_dir()
         assert app_kwargs["env"]["TAURI_AUTOMATION"] == "true"
         assert app_kwargs["env"]["TAURI_WEBVIEW_AUTOMATION"] == "true"
-        assert start_calls[0][1]["application_args"] == app_args[1:]
+        assert start_calls[0][1]["application_args"] == app_args[2:]
         assert start_calls[0][1]["debugger_address"] == "127.0.0.1:49152"
         assert memory_roots == [1235]
         assert sorted(cleaned_pids) == [1234, 1235]

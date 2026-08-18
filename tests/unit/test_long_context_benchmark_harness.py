@@ -59,7 +59,7 @@ def desktop_runner():
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
-        "start_driver", "wait_for_webview2_devtools",
+        "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
         "_contains_private_input", "_packaged_boundary_failure_diagnostics",
@@ -70,7 +70,7 @@ def desktop_runner():
     namespace = module.__dict__
     namespace.update({"webdriver": SimpleNamespace(Chrome=object, Remote=object,
         ChromeOptions=object), "ActionChains": object,
-        "time": time, "By": SimpleNamespace(CSS_SELECTOR="css"),
+        "time": time, "By": SimpleNamespace(CSS_SELECTOR="css", XPATH="xpath"),
         "os": os, "json": json, "tempfile": __import__("tempfile"),
         "argparse": __import__("argparse"),
         "shutil": __import__("shutil"), "Path": Path,
@@ -78,6 +78,9 @@ def desktop_runner():
         "psutil": __import__("psutil"),
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
+        "NoSuchFrameException": _WebDriverException,
+        "StaleElementReferenceException": _WebDriverException,
+        "WebDriverException": _WebDriverException,
         "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
         "NATIVE_WEBDRIVER_URL": "http://127.0.0.1:4445",
         "urlopen": None,
@@ -87,7 +90,7 @@ def desktop_runner():
         "InvalidArgumentException": InvalidArgumentException,
         "ReadTimeoutError": ReadTimeoutError, "ConnectTimeoutError": ConnectTimeoutError,
         "NewConnectionError": NewConnectionError, "ProtocolError": ProtocolError,
-        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v2",
+        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v3",
         "WEBDRIVER_COMPATIBILITY_RESULTS": frozenset({"match", "mismatch", "unknown"}),
         "WEBDRIVER_EXCEPTION_FAMILIES": frozenset({"read_timeout", "connection_failure",
             "capability_rejection", "driver_version_mismatch", "application_startup_failure",
@@ -96,6 +99,10 @@ def desktop_runner():
             "application_present", "webview_descendants_present", "unknown"}),
         "WEBDRIVER_SESSION_ELAPSED_BUCKETS": frozenset({"under_5_seconds",
             "5_to_29_seconds", "30_to_89_seconds", "90_seconds_or_more", "unknown"}),
+        "WEBDRIVER_TARGET_CATEGORIES": frozenset({"attachable_target", "no_target", "unknown"}),
+        "WEBDRIVER_READINESS_CATEGORIES": frozenset({"ready", "no_window_handle",
+            "wrong_handle", "missing_shell", "missing_required_controls",
+            "webdriver_failure", "unknown"}),
         "LOGS_DIR": Path.cwd() / ".desktop-e2e-logs",
         "apply_benchmark_context_tier": h.apply_benchmark_context_tier,
         "generate_fixture": h.generate_fixture,
@@ -241,9 +248,10 @@ def test_start_driver_uses_exact_windows_native_webview2_capabilities(
 def test_webview2_devtools_waits_for_owned_application(desktop_runner, monkeypatch):
     responses = iter([
         OSError("hostile C:\\private\\prompt"),
-        {"Browser": "WebView2"},
-        {"webSocketDebuggerUrl": ""},
-        {"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/id"},
+        {"Browser": "WebView2", "webSocketDebuggerUrl": "ws://browser"},
+        [{"type": "page", "webSocketDebuggerUrl": ""}],
+        [{"type": "browser", "webSocketDebuggerUrl": "ws://browser"}],
+        [{"type": "page", "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/id"}],
     ])
     requested = []
 
@@ -271,7 +279,121 @@ def test_webview2_devtools_waits_for_owned_application(desktop_runner, monkeypat
     monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
     desktop_runner.wait_for_webview2_devtools(
         SimpleNamespace(poll=lambda: None), 49152, 5)
-    assert requested == ["http://127.0.0.1:49152/json/version"] * 4
+    assert requested == ["http://127.0.0.1:49152/json/list"] * 5
+
+
+def test_ui_ready_selects_application_handle_without_optional_artifact_panel(
+        desktop_runner):
+    class Wait:
+        def __init__(self, driver, timeout, poll_frequency):
+            self.driver = driver
+
+        def until(self, condition):
+            return condition(self.driver) or condition(self.driver)
+
+    class SwitchTo:
+        def __init__(self, driver):
+            self.driver = driver
+
+        def window(self, handle):
+            self.driver.current = handle
+
+        def default_content(self):
+            return None
+
+    class Driver:
+        current = None
+        handle_reads = 0
+
+        def __init__(self):
+            self.switch_to = SwitchTo(self)
+
+        @property
+        def window_handles(self):
+            self.handle_reads += 1
+            return [] if self.handle_reads == 1 else ["unrelated", "application"]
+
+        def execute_script(self, _script):
+            return ("token.place desktop MVP"
+                if "document.title" in _script and self.current == "application"
+                else "unrelated" if "document.title" in _script else "complete")
+
+        def find_elements(self, _by, locator):
+            if self.current != "application":
+                return []
+            if "Runtime resolved path" in locator:
+                raise AssertionError("optional artifact panel must not be queried")
+            return [object()]
+
+    desktop_runner.WebDriverWait = Wait
+    driver = Driver()
+    desktop_runner.wait_for_ui_ready(driver, timeout_seconds=3)
+    assert driver.current == "application"
+
+
+@pytest.mark.parametrize(("handles", "expected"), [
+    ([], "no_window_handle"),
+    (["unrelated"], "wrong_handle"),
+])
+def test_ui_ready_failure_is_bounded_and_preserves_deadline(
+        desktop_runner, handles, expected):
+    waits = []
+
+    class Wait:
+        def __init__(self, driver, timeout, poll_frequency):
+            waits.append((timeout, poll_frequency))
+            self.driver = driver
+
+        def until(self, condition):
+            condition(self.driver)
+            return False
+
+    driver = SimpleNamespace(
+        window_handles=handles,
+        switch_to=SimpleNamespace(window=lambda _handle: None, default_content=lambda: None),
+        execute_script=lambda script: (
+            "unrelated" if "document.title" in script else "complete"),
+        find_elements=lambda *_args: [],
+    )
+    desktop_runner.WebDriverWait = Wait
+    with pytest.raises(RuntimeError, match=f"^{expected}$"):
+        desktop_runner.wait_for_ui_ready(driver, timeout_seconds=7.5)
+    assert waits == [(7.5, 0.25)]
+
+
+@pytest.mark.parametrize(("available", "expected"), [
+    (set(), "missing_shell"),
+    ({"shell"}, "missing_required_controls"),
+])
+def test_ui_ready_classifies_application_shell_and_controls(
+        desktop_runner, available, expected):
+    class Wait:
+        def __init__(self, driver, timeout, poll_frequency):
+            self.driver = driver
+
+        def until(self, condition):
+            condition(self.driver)
+            return False
+
+    def find_elements(_by, locator):
+        if "//h1" in locator:
+            return [object()] if "shell" in available else []
+        if "Model GGUF path" in locator:
+            return [object()] if "model" in available else []
+        if "Relay URL 1" in locator:
+            return [object()] if "relay" in available else []
+        return []
+
+    desktop_runner.WebDriverWait = Wait
+    driver = SimpleNamespace(
+        window_handles=["application"],
+        switch_to=SimpleNamespace(window=lambda _handle: None, default_content=lambda: None),
+        execute_script=lambda script: (
+            "token.place desktop MVP" if "document.title" in script else "complete"),
+        find_elements=find_elements,
+    )
+    with pytest.raises(RuntimeError, match=f"^{expected}$"):
+        desktop_runner.wait_for_ui_ready(driver, timeout_seconds=2)
 
 
 @pytest.mark.parametrize(("poll", "expected"), [
@@ -523,39 +645,45 @@ def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
     desktop_runner.LOGS_DIR = tmp_path
     desktop_runner._write_webdriver_diagnostic(
         "C:\\private\\prompt", "MODEL_SENTINEL", "SECRET_EXCEPTION",
-        "read_timeout", "application_present", "30_to_89_seconds")
+        "read_timeout", "application_present", "30_to_89_seconds",
+        "C:\\private\\target", "SECRET_READINESS")
     artifact = tmp_path / "packaged-webdriver-diagnostic.json"
     assert json.loads(artifact.read_text()) == {
-        "schema_version": "packaged-webdriver-diagnostic-v2",
+        "schema_version": "packaged-webdriver-diagnostic-v3",
         "browser_driver_compatibility": "unknown",
         "tauri_driver_state": "unknown",
         "webdriver_failure_category": "webdriver_session_creation_failed",
         "exception_family": "read_timeout",
         "process_posture": "application_present",
         "session_elapsed_bucket": "30_to_89_seconds",
+        "target_category": "unknown",
+        "readiness_category": "unknown",
     }
     assert not list(tmp_path.glob("*.tmp"))
     assert "private" not in artifact.read_text()
     assert "SENTINEL" not in artifact.read_text()
 
 
-def test_webdriver_diagnostic_clamps_invalid_v2_enums(desktop_runner, tmp_path):
+def test_webdriver_diagnostic_clamps_invalid_v3_enums(desktop_runner, tmp_path):
     desktop_runner.LOGS_DIR = tmp_path
     hostile = "C:\\private\\application.exe --secret-prompt MODEL_SENTINEL"
 
     desktop_runner._write_webdriver_diagnostic(
-        "match", "running", "none", hostile, hostile, hostile)
+        "match", "running", "none", hostile, hostile, hostile,
+        "attachable_target", "ready")
 
     artifact = json.loads(
         (tmp_path / "packaged-webdriver-diagnostic.json").read_text())
     assert artifact == {
-        "schema_version": "packaged-webdriver-diagnostic-v2",
+        "schema_version": "packaged-webdriver-diagnostic-v3",
         "browser_driver_compatibility": "match",
         "tauri_driver_state": "running",
         "webdriver_failure_category": "none",
         "exception_family": "unknown",
         "process_posture": "unknown",
         "session_elapsed_bucket": "unknown",
+        "target_category": "attachable_target",
+        "readiness_category": "ready",
     }
     assert "private" not in json.dumps(artifact)
     assert "SENTINEL" not in json.dumps(artifact)
@@ -3219,6 +3347,9 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": fake_os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "WEBDRIVER_READINESS_CATEGORIES": frozenset({"ready", "no_window_handle",
+            "wrong_handle", "missing_shell", "missing_required_controls",
+            "webdriver_failure", "unknown"}),
         "_classify_webdriver_session_failure": lambda _exc, _process: (
             "webdriver_session_creation_failed", "running", "unknown"),
         "_write_webdriver_diagnostic": lambda *_args: None,

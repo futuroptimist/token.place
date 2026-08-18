@@ -326,60 +326,57 @@ def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -
 
 
 def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> None:
-    recovery_attempts = 0
-    last_recovery_at = 0.0
+    """Select the application WebView and wait for its required operator controls."""
+    last_category = "no_window_handle"
 
     def _ready(d: webdriver.Remote) -> bool:
-        nonlocal recovery_attempts
-        nonlocal last_recovery_at
+        nonlocal last_category
         try:
-            with contextlib.suppress(WebDriverException):
-                d.switch_to.default_content()
-            state = d.execute_script("return document.readyState")
-            if state != "complete":
+            handles = list(d.window_handles)
+            if not handles:
+                last_category = "no_window_handle"
                 return False
-            model_label_ready = bool(
-                d.find_elements(By.XPATH, "//label[normalize-space()='Model GGUF path']")
-            )
-            relay_input_ready = bool(
-                d.find_elements(
-                    By.XPATH,
-                    "(//label[normalize-space()='Relay URL 1']/following::input[1])[1]",
-                )
-            )
-            runtime_path_ready = bool(
-                d.find_elements(
-                    By.XPATH,
-                    "//div[contains(normalize-space(),'Runtime resolved path:')]/code",
-                )
-            )
-            if model_label_ready and relay_input_ready and runtime_path_ready:
-                return True
-
-            page_source = ""
-            with contextlib.suppress(WebDriverException):
-                page_source = d.page_source
-            if (
-                recovery_attempts < 4
-                and "could not connect to localhost" in page_source.lower()
-                and (time.time() - last_recovery_at) >= 1.0
-            ):
-                recovery_attempts += 1
-                last_recovery_at = time.time()
-                with contextlib.suppress(WebDriverException):
-                    d.get("tauri://localhost/")
-                with contextlib.suppress(WebDriverException):
-                    d.get("tauri://localhost/index.html")
+            last_category = "wrong_handle"
+            for handle in handles:
+                try:
+                    d.switch_to.window(handle)
+                    d.switch_to.default_content()
+                    if d.execute_script("return document.readyState") != "complete":
+                        continue
+                    title = d.execute_script("return document.title")
+                    if not isinstance(title, str) or "token.place" not in title.lower():
+                        continue
+                    if not d.find_elements(
+                            By.XPATH,
+                            "//h1[normalize-space()='token.place desktop compute node']"):
+                        last_category = "missing_shell"
+                        continue
+                    model_input_ready = bool(d.find_elements(
+                        By.XPATH,
+                        "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]"))
+                    relay_input_ready = bool(d.find_elements(
+                        By.XPATH,
+                        "(//label[normalize-space()='Relay URL 1']/following::input[1])[1]"))
+                    if model_input_ready and relay_input_ready:
+                        return True
+                    last_category = "missing_required_controls"
+                except (
+                    NoSuchFrameException,
+                    StaleElementReferenceException,
+                    WebDriverException,
+                ):
+                    last_category = "webdriver_failure"
             return False
         except (
             NoSuchFrameException,
             StaleElementReferenceException,
             WebDriverException,
         ):
+            last_category = "webdriver_failure"
             return False
 
     if not WebDriverWait(driver, timeout_seconds, poll_frequency=0.25).until(_ready):
-        raise RuntimeError("desktop UI never became ready")
+        raise RuntimeError(last_category) from None
 
 
 def wait_for_inference_result(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> str:
@@ -712,9 +709,9 @@ def start_driver(app_binary: Path, *, application_args: list[str] | None = None,
 def wait_for_webview2_devtools(
         application_process: subprocess.Popen[str], port: int,
         timeout_seconds: float) -> None:
-    """Wait for an owned WebView2 application's loopback DevTools endpoint."""
+    """Wait for an attachable page/WebView target, not merely a browser endpoint."""
     deadline = time.monotonic() + timeout_seconds
-    url = f"http://127.0.0.1:{port}/json/version"
+    url = f"http://127.0.0.1:{port}/json/list"
     while time.monotonic() < deadline:
         if application_process.poll() is not None:
             raise RuntimeError("webdriver_application_startup_failed") from None
@@ -723,8 +720,13 @@ def wait_for_webview2_devtools(
             with urlopen(  # nosec B310 - reserved loopback DevTools endpoint
                     url, timeout=max(0.05, min(remaining, 0.5))) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            debugger_url = payload.get("webSocketDebuggerUrl") if isinstance(payload, dict) else None
-            if isinstance(debugger_url, str) and debugger_url.strip():
+            attachable = isinstance(payload, list) and any(
+                isinstance(target, dict)
+                and target.get("type") in {"page", "webview"}
+                and isinstance(target.get("webSocketDebuggerUrl"), str)
+                and bool(target["webSocketDebuggerUrl"].strip())
+                for target in payload)
+            if attachable:
                 return
         except Exception:
             pass
@@ -820,7 +822,7 @@ def tauri_driver_command() -> list[str]:
     )
 
 
-WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v2"
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v3"
 WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
 WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
     "read_timeout", "connection_failure", "capability_rejection",
@@ -835,6 +837,10 @@ WEBDRIVER_SESSION_ELAPSED_BUCKETS = frozenset({
     "under_5_seconds", "5_to_29_seconds", "30_to_89_seconds",
     "90_seconds_or_more", "unknown",
 })
+WEBDRIVER_TARGET_CATEGORIES = frozenset({"attachable_target", "no_target", "unknown"})
+WEBDRIVER_READINESS_CATEGORIES = frozenset({
+    "ready", "no_window_handle", "wrong_handle", "missing_shell",
+    "missing_required_controls", "webdriver_failure", "unknown"})
 
 
 def _classify_webdriver_session_failure(exc: Exception, process: object) -> tuple[str, str, str]:
@@ -920,7 +926,8 @@ def _webdriver_session_elapsed_bucket(elapsed_seconds: object) -> str:
 def _write_webdriver_diagnostic(
         compatibility: str, process_state: str, failure_category: str,
         exception_family: str = "unknown", process_posture: str = "unknown",
-        session_elapsed_bucket: str = "unknown") -> None:
+        session_elapsed_bucket: str = "unknown", target_category: str = "unknown",
+        readiness_category: str = "unknown") -> None:
     """Atomically retain the bounded session diagnostic while raw logs are discarded."""
     if compatibility not in WEBDRIVER_COMPATIBILITY_RESULTS:
         compatibility = "unknown"
@@ -934,6 +941,10 @@ def _write_webdriver_diagnostic(
         process_posture = "unknown"
     if session_elapsed_bucket not in WEBDRIVER_SESSION_ELAPSED_BUCKETS:
         session_elapsed_bucket = "unknown"
+    if target_category not in WEBDRIVER_TARGET_CATEGORIES:
+        target_category = "unknown"
+    if readiness_category not in WEBDRIVER_READINESS_CATEGORIES:
+        readiness_category = "unknown"
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
     fd, temporary_name = tempfile.mkstemp(
@@ -949,6 +960,8 @@ def _write_webdriver_diagnostic(
                 "exception_family": exception_family,
                 "process_posture": process_posture,
                 "session_elapsed_bucket": session_elapsed_bucket,
+                "target_category": target_category,
+                "readiness_category": readiness_category,
             }, handle, sort_keys=True)
         os.replace(temporary, destination)
     finally:
@@ -1439,6 +1452,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     webdriver_exception_family = "unknown"
     webdriver_process_posture = "unknown"
     webdriver_session_elapsed_bucket = "unknown"
+    webdriver_target_category = "unknown"
+    webdriver_readiness_category = "unknown"
     try:
         setup_remaining()
         try:
@@ -1488,8 +1503,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             try:
                 wait_for_webview2_devtools(
                     application_process, devtools_port, setup_remaining())
+                webdriver_target_category = "attachable_target"
             except RuntimeError as exc:
                 reason = str(exc)
+                webdriver_target_category = "no_target"
                 webdriver_failure_category = reason
                 webdriver_exception_family = (
                     "application_startup_failure"
@@ -1519,7 +1536,11 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         write_phase("desktop_session_started")
         try:
             wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
-        except Exception:
+            webdriver_readiness_category = "ready"
+        except Exception as exc:
+            category = str(exc)
+            webdriver_readiness_category = (category
+                if category in WEBDRIVER_READINESS_CATEGORIES else "webdriver_failure")
             fail_closed("desktop_ui_not_ready")
         write_phase("desktop_ready")
         setup_remaining()
@@ -1737,7 +1758,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         _write_webdriver_diagnostic(
             os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
             tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
-            webdriver_process_posture, webdriver_session_elapsed_bucket)
+            webdriver_process_posture, webdriver_session_elapsed_bucket,
+            webdriver_target_category, webdriver_readiness_category)
         cleanup_deadline = time.monotonic() + cleanup_timeout
         def cleanup_remaining() -> float:
             return max(0.0, cleanup_deadline - time.monotonic())

@@ -396,6 +396,49 @@ def test_ui_ready_classifies_application_shell_and_controls(
         desktop_runner.wait_for_ui_ready(driver, timeout_seconds=2)
 
 
+@pytest.mark.parametrize("failure_point", [
+    "document_loading",
+    "window_switch",
+    "window_handles",
+])
+def test_ui_ready_classifies_transient_webdriver_failures(
+        desktop_runner, failure_point):
+    class Wait:
+        def __init__(self, driver, timeout, poll_frequency):
+            self.driver = driver
+
+        def until(self, condition):
+            condition(self.driver)
+            return False
+
+    class Driver:
+        switch_to = SimpleNamespace(
+            window=lambda _handle: None,
+            default_content=lambda: None,
+        )
+
+        @property
+        def window_handles(self):
+            if failure_point == "window_handles":
+                raise desktop_runner.WebDriverException("private window sentinel")
+            return ["application"]
+
+        def execute_script(self, script):
+            if failure_point == "window_switch":
+                raise desktop_runner.WebDriverException("private session sentinel")
+            return "loading" if "readyState" in script else "token.place desktop MVP"
+
+        def find_elements(self, *_args):
+            raise AssertionError("controls must not be queried before document readiness")
+
+    desktop_runner.WebDriverWait = Wait
+    expected = ("wrong_handle" if failure_point == "document_loading"
+        else "webdriver_failure")
+    with pytest.raises(RuntimeError, match=f"^{expected}$") as exc_info:
+        desktop_runner.wait_for_ui_ready(Driver(), timeout_seconds=2)
+    assert "private" not in str(exc_info.value)
+
+
 @pytest.mark.parametrize(("poll", "expected"), [
     (7, "webdriver_application_startup_failed"),
     (None, "webdriver_transport_failure"),

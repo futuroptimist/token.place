@@ -3157,18 +3157,22 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     assert checkpoint["cleanup_succeeded"] is True
 
 
-@pytest.mark.parametrize(("gate_error", "start_error", "ready_error", "expected_reason", "expected_phase"), [
-    (None, RuntimeError("private session exception /secret/path"), None,
+@pytest.mark.parametrize(("gate_error", "launch_error", "start_error", "ready_error",
+    "expected_reason", "expected_phase"), [
+    (None, None, RuntimeError("private session exception /secret/path"), None,
         "webdriver_session_creation_failed", "webdriver_ready"),
-    (None, None, RuntimeError("private readiness exception /secret/path"),
+    (None, OSError("private launch exception /secret/path"), None, None,
+        "webdriver_application_startup_failed", "webdriver_ready"),
+    (None, None, None, RuntimeError("private readiness exception /secret/path"),
         "desktop_ui_not_ready", "desktop_session_started"),
-    (RuntimeError("tauri_driver_exited"), None, None,
+    (RuntimeError("tauri_driver_exited"), None, None, None,
         "tauri_driver_exited", "runner_startup"),
-    (RuntimeError("webdriver_transport_failure"), None, None,
+    (RuntimeError("webdriver_transport_failure"), None, None, None,
         "webdriver_transport_failure", "runner_startup"),
 ])
 def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
-        tmp_path, gate_error, start_error, ready_error, expected_reason, expected_phase):
+        tmp_path, gate_error, launch_error, start_error, ready_error, expected_reason,
+        expected_phase):
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
     wanted = {"tauri_driver_environment", "tokenizer_stage_path",
@@ -3187,6 +3191,8 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
 
     def popen(args, **kwargs):
         popen_calls.append((args, kwargs))
+        if args != ["tauri-driver"] and launch_error:
+            raise launch_error
         return process if args == ["tauri-driver"] else application_process
 
     def start(*args, **kwargs):
@@ -3251,8 +3257,8 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     assert checkpoints[-1]["last_safe_phase"] == expected_phase
     assert checkpoints[-1]["failure_reason"] == expected_reason
     assert checkpoints[-1]["cleanup_succeeded"] is True
-    assert len(start_calls) == (0 if gate_error else 1)
-    if not gate_error:
+    assert len(start_calls) == (0 if gate_error or launch_error else 1)
+    if not gate_error and not launch_error:
         app_args, app_kwargs = popen_calls[1]
         assert app_args == [str(app.resolve()),
             "--tokenizer-request=request.json", "--tokenizer-evidence=evidence.json"]

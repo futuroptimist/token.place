@@ -240,6 +240,7 @@ def test_webview2_devtools_waits_for_owned_application(desktop_runner, monkeypat
     responses = iter([
         OSError("hostile C:\\private\\prompt"),
         {"Browser": "WebView2"},
+        {"webSocketDebuggerUrl": ""},
         {"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/id"},
     ])
     requested = []
@@ -268,7 +269,7 @@ def test_webview2_devtools_waits_for_owned_application(desktop_runner, monkeypat
     monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
     desktop_runner.wait_for_webview2_devtools(
         SimpleNamespace(poll=lambda: None), 49152, 5)
-    assert requested == ["http://127.0.0.1:49152/json/version"] * 3
+    assert requested == ["http://127.0.0.1:49152/json/version"] * 4
 
 
 @pytest.mark.parametrize(("poll", "expected"), [
@@ -577,6 +578,8 @@ def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
     assert env["XDG_CONFIG_HOME"] == str(isolated_home / ".config")
     assert env["XDG_DATA_HOME"] == str(isolated_home / ".local/share")
     assert env["APPDATA"] == str(isolated_home / "AppData/Roaming")
+    assert env["WEBVIEW2_USER_DATA_FOLDER"] == str(
+        (isolated_home / "WebView2").resolve(strict=True))
     assert all(path.is_dir() for path in (
         isolated_home,
         isolated_home / ".config",
@@ -3265,6 +3268,10 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         assert app_kwargs["cwd"] == app.parent
         assert app_kwargs["env"]["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] == (
             "--remote-debugging-port=49152")
+        webview2_user_data = Path(app_kwargs["env"]["WEBVIEW2_USER_DATA_FOLDER"])
+        assert webview2_user_data == Path(app_kwargs["env"]["HOME"]) / "WebView2"
+        assert webview2_user_data.is_absolute()
+        assert webview2_user_data.is_dir()
         assert app_kwargs["env"]["TAURI_AUTOMATION"] == "true"
         assert app_kwargs["env"]["TAURI_WEBVIEW_AUTOMATION"] == "true"
         assert start_calls[0][1]["application_args"] == app_args[1:]

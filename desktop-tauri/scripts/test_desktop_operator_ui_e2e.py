@@ -659,6 +659,10 @@ def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
             "XDG_CONFIG_HOME": str(isolated_home / ".config"),
             "XDG_DATA_HOME": str(isolated_home / ".local/share"),
             "APPDATA": str(isolated_home / "AppData/Roaming"),
+            # Chromium remote debugging must not reuse the default profile.
+            # WebView2 consumes this before its environment is created.
+            "WEBVIEW2_USER_DATA_FOLDER": str(
+                (isolated_home / "WebView2").resolve(strict=True)),
         }
     )
     return env
@@ -719,7 +723,8 @@ def wait_for_webview2_devtools(
             with urlopen(  # nosec B310 - reserved loopback DevTools endpoint
                     url, timeout=max(0.05, min(remaining, 0.5))) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            if isinstance(payload, dict) and isinstance(payload.get("webSocketDebuggerUrl"), str):
+            debugger_url = payload.get("webSocketDebuggerUrl") if isinstance(payload, dict) else None
+            if isinstance(debugger_url, str) and debugger_url.strip():
                 return
         except Exception:
             pass

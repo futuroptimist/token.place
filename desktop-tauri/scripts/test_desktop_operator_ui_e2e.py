@@ -665,7 +665,7 @@ def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
 
 
 def start_driver(app_binary: Path, *, application_args: list[str] | None = None,
-        webview_user_data_dir: Path | None = None
+        debugger_address: str | None = None
         ) -> webdriver.Remote:
     if os.name == "nt":
         class NativeWebView2Options:
@@ -674,18 +674,12 @@ def start_driver(app_binary: Path, *, application_args: list[str] | None = None,
             _ignore_local_proxy = False
 
             def to_capabilities(self) -> dict[str, object]:
-                edge_options: dict[str, object] = {
-                    "binary": str(app_binary.resolve()),
-                    "args": list(application_args or []),
-                }
-                if webview_user_data_dir is not None:
-                    edge_options["webviewOptions"] = {
-                        "userDataFolder": str(webview_user_data_dir.resolve()),
-                    }
+                if not debugger_address:
+                    raise RuntimeError("webdriver_application_startup_failed")
                 return {
                     "browserName": "webview2",
                     "ms:edgeChromium": True,
-                    "ms:edgeOptions": edge_options,
+                    "ms:edgeOptions": {"debuggerAddress": debugger_address},
                 }
 
         return webdriver.Remote(
@@ -709,6 +703,30 @@ def start_driver(app_binary: Path, *, application_args: list[str] | None = None,
 
     options = TauriOptions()
     return webdriver.Remote(command_executor=WEBDRIVER_URL, options=options)
+
+
+def wait_for_webview2_devtools(
+        application_process: subprocess.Popen[str], port: int,
+        timeout_seconds: float) -> None:
+    """Wait for an owned WebView2 application's loopback DevTools endpoint."""
+    deadline = time.monotonic() + timeout_seconds
+    url = f"http://127.0.0.1:{port}/json/version"
+    while time.monotonic() < deadline:
+        if application_process.poll() is not None:
+            raise RuntimeError("webdriver_application_startup_failed") from None
+        remaining = deadline - time.monotonic()
+        try:
+            with urlopen(  # nosec B310 - reserved loopback DevTools endpoint
+                    url, timeout=max(0.05, min(remaining, 0.5))) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("webSocketDebuggerUrl"), str):
+                return
+        except Exception:
+            pass
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if application_process.poll() is not None:
+        raise RuntimeError("webdriver_application_startup_failed") from None
+    raise RuntimeError("webdriver_transport_failure") from None
 
 
 def start_landing_driver() -> webdriver.Chrome:
@@ -845,12 +863,21 @@ def _classify_webdriver_session_failure(exc: Exception, process: object) -> tupl
     return "webdriver_session_creation_failed", "running", "unknown"
 
 
-def _webdriver_process_posture(process: object, app_binary: Path) -> str:
+def _webdriver_process_posture(process: object, app_binary: Path,
+        application_process: object | None = None) -> str:
     """Inspect process identity in memory and return only an allowlisted posture."""
     poll = getattr(process, "poll", None)
     if callable(poll) and poll() is not None:
         return "tauri_driver_exited"
     try:
+        if (application_process is not None
+                and getattr(application_process, "poll", lambda: 1)() is None):
+            application = psutil.Process(application_process.pid)
+            try:
+                return ("webview_descendants_present"
+                    if application.children(recursive=True) else "application_present")
+            except (psutil.Error, OSError):
+                return "application_present"
         descendants = psutil.Process(process.pid).children(recursive=True)
         application = None
         expected = app_binary.resolve()
@@ -1397,6 +1424,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     env = tauri_driver_environment(isolated_home)
     driver_log_handle = driver_log.open("w", encoding="utf-8")
     process: subprocess.Popen[str] | None = None
+    application_process: subprocess.Popen[str] | None = None
     driver: webdriver.Remote | None = None
     browser: webdriver.Chrome | None = None
     cleanup_ok = True
@@ -1416,7 +1444,6 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             raise
         process = subprocess.Popen(driver_command, cwd=TAURI_ROOT, env=env,
             stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
-        memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
         try:
             wait_for_webdriver_ready(process, min(90, setup_remaining()))
         except RuntimeError as exc:
@@ -1430,17 +1457,55 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         tauri_driver_state = "running"
         write_phase("webdriver_ready")
         setup_remaining()
+        application_args = tokenizer_handoff_args(tokenizer_request, tokenizer_evidence)
+        debugger_address = None
+        if os.name == "nt":
+            devtools_port = reserve_free_port()
+            application_env = env.copy()
+            application_env.update({
+                "TAURI_AUTOMATION": "true",
+                "TAURI_WEBVIEW_AUTOMATION": "true",
+                "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS": (
+                    f"--remote-debugging-port={devtools_port}"),
+            })
+            try:
+                application_process = subprocess.Popen(
+                    [str(app_binary.resolve(strict=True)), *application_args],
+                    cwd=app_binary.resolve(strict=True).parent, env=application_env,
+                    stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
+            except (OSError, ValueError):
+                webdriver_failure_category = "webdriver_application_startup_failed"
+                webdriver_exception_family = "application_startup_failure"
+                fail_closed(webdriver_failure_category)
+            memory_sampler = OwnedProcessTreeMemorySampler(application_process.pid)
+            try:
+                wait_for_webview2_devtools(
+                    application_process, devtools_port, setup_remaining())
+            except RuntimeError as exc:
+                reason = str(exc)
+                webdriver_failure_category = reason
+                webdriver_exception_family = (
+                    "application_startup_failure"
+                    if reason == "webdriver_application_startup_failed"
+                    else "connection_failure")
+                webdriver_process_posture = _webdriver_process_posture(
+                    process, app_binary, application_process)
+                fail_closed(reason)
+            debugger_address = f"127.0.0.1:{devtools_port}"
+        else:
+            memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
         session_started = time.monotonic()
         try:
             driver = start_driver(
                 app_binary.resolve(strict=True),
-                application_args=tokenizer_handoff_args(tokenizer_request, tokenizer_evidence),
-                webview_user_data_dir=isolated_home / "WebView2",
+                application_args=application_args,
+                debugger_address=debugger_address,
             )
         except Exception as exc:
             webdriver_session_elapsed_bucket = _webdriver_session_elapsed_bucket(
                 time.monotonic() - session_started)
-            webdriver_process_posture = _webdriver_process_posture(process, app_binary)
+            webdriver_process_posture = _webdriver_process_posture(
+                process, app_binary, application_process)
             webdriver_failure_category, tauri_driver_state, webdriver_exception_family = (
                 _classify_webdriver_session_failure(exc, process))
             fail_closed(webdriver_failure_category)
@@ -1688,6 +1753,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             allowance = cleanup_allowance()
             cleanup_ok = (allowance is not None
                 and _quit_webdriver(driver, allowance) and cleanup_ok)
+        if application_process is not None:
+            cleanup_ok = (_cleanup_owned_process_tree(application_process, cleanup_remaining)
+                and cleanup_ok)
         if process is not None:
             cleanup_ok = (_cleanup_owned_process_tree(process, cleanup_remaining)
                 and cleanup_ok)

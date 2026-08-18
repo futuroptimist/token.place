@@ -59,7 +59,7 @@ def desktop_runner():
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
-        "start_driver",
+        "start_driver", "wait_for_webview2_devtools",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
         "_contains_private_input", "_packaged_boundary_failure_diagnostics",
@@ -217,29 +217,76 @@ def test_start_driver_uses_exact_windows_native_webview2_capabilities(
         Remote=lambda **kwargs: remote_calls.append(kwargs) or "driver")
     desktop_runner.os = SimpleNamespace(name="nt")
     application = (tmp_path / "current head.exe").resolve()
-    user_data_dir = tmp_path / "isolated WebView2 profile"
-    user_data_dir.mkdir()
     arguments = ["--request=private value", "--evidence=private value"]
 
     assert desktop_runner.start_driver(
         application, application_args=arguments,
-        webview_user_data_dir=user_data_dir) == "driver"
+        debugger_address="127.0.0.1:49152") == "driver"
     options = remote_calls[0]["options"]
     assert remote_calls[0]["command_executor"] == "http://127.0.0.1:4445"
     assert options.to_capabilities() == {
         "browserName": "webview2",
         "ms:edgeChromium": True,
-        "ms:edgeOptions": {
-            "binary": str(application),
-            "args": arguments,
-            "webviewOptions": {
-                "userDataFolder": str(user_data_dir.resolve()),
-            },
-        },
+        "ms:edgeOptions": {"debuggerAddress": "127.0.0.1:49152"},
     }
-    assert options.to_capabilities()["ms:edgeOptions"]["args"] is not arguments
+    assert "binary" not in options.to_capabilities()["ms:edgeOptions"]
+    assert "args" not in options.to_capabilities()["ms:edgeOptions"]
+    assert "webviewOptions" not in options.to_capabilities()["ms:edgeOptions"]
     assert "tauri:options" not in options.to_capabilities()
     assert "goog:chromeOptions" not in options.to_capabilities()
+
+
+def test_webview2_devtools_waits_for_owned_application(desktop_runner, monkeypatch):
+    responses = iter([
+        OSError("hostile C:\\private\\prompt"),
+        {"Browser": "WebView2"},
+        {"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/id"},
+    ])
+    requested = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode()
+
+    def open_devtools(url, **_kwargs):
+        requested.append(url)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return Response(result)
+
+    monkeypatch.setattr(desktop_runner, "urlopen", open_devtools)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    desktop_runner.wait_for_webview2_devtools(
+        SimpleNamespace(poll=lambda: None), 49152, 5)
+    assert requested == ["http://127.0.0.1:49152/json/version"] * 3
+
+
+@pytest.mark.parametrize(("poll", "expected"), [
+    (7, "webdriver_application_startup_failed"),
+    (None, "webdriver_transport_failure"),
+])
+def test_webview2_devtools_failure_is_bounded(
+        desktop_runner, monkeypatch, poll, expected):
+    clock = SimpleNamespace(value=-1.0)
+    def monotonic():
+        clock.value += 1.0
+        return clock.value
+    monkeypatch.setattr(desktop_runner.time, "monotonic", monotonic)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(desktop_runner, "urlopen", lambda *_args, **_kwargs: None)
+    with pytest.raises(RuntimeError, match=f"^{expected}$"):
+        desktop_runner.wait_for_webview2_devtools(
+            SimpleNamespace(poll=lambda: poll), 49152, 0.5)
 
 
 def test_tauri_driver_command_selects_explicit_windows_native_driver(
@@ -3131,11 +3178,19 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     checkpoints = []
     process = SimpleNamespace(pid=1234)
+    application_process = SimpleNamespace(pid=1235)
     driver = SimpleNamespace()
     start_calls = []
+    popen_calls = []
+    cleaned_pids = []
+    memory_roots = []
 
-    def start(*_args, **_kwargs):
-        start_calls.append(True)
+    def popen(args, **kwargs):
+        popen_calls.append((args, kwargs))
+        return process if args == ["tauri-driver"] else application_process
+
+    def start(*args, **kwargs):
+        start_calls.append((args, kwargs))
         if start_error:
             raise start_error
         return driver
@@ -3148,22 +3203,30 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         if ready_error:
             raise ready_error
 
+    fake_os = SimpleNamespace(**vars(os))
+    fake_os.name = "nt"
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
-        "os": os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "os": fake_os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
         "_classify_webdriver_session_failure": lambda _exc, _process: (
             "webdriver_session_creation_failed", "running", "unknown"),
         "_write_webdriver_diagnostic": lambda *_args: None,
         "psutil": __import__("psutil"),
-        "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
+        "subprocess": SimpleNamespace(
+            Popen=popen, STDOUT=-2),
         "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
-        "OwnedProcessTreeMemorySampler": lambda _pid: object(),
+        "OwnedProcessTreeMemorySampler": lambda pid: (
+            memory_roots.append(pid) or object()),
         "wait_for_webdriver_ready": webdriver_ready,
-        "start_driver": start, "tokenizer_handoff_args": lambda *_args: [],
+        "wait_for_webview2_devtools": lambda *_args, **_kwargs: None,
+        "reserve_free_port": lambda: 49152,
+        "start_driver": start, "tokenizer_handoff_args": lambda *_args: [
+            "--tokenizer-request=request.json", "--tokenizer-evidence=evidence.json"],
         "wait_for_ui_ready": ready,
         "_validate_packaged_failure_reason": lambda reason: reason,
         "_write_benchmark_phase": lambda *_args, **kwargs: checkpoints.append(dict(kwargs)),
-        "_cleanup_owned_process_tree": lambda *_args: True,
+        "_cleanup_owned_process_tree": lambda owned, *_args: (
+            cleaned_pids.append(owned.pid) or True),
         "_quit_webdriver": lambda *_args: True,
         "_remove_owned_path": lambda *_args, **_kwargs: True,
     }
@@ -3189,6 +3252,19 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     assert checkpoints[-1]["failure_reason"] == expected_reason
     assert checkpoints[-1]["cleanup_succeeded"] is True
     assert len(start_calls) == (0 if gate_error else 1)
+    if not gate_error:
+        app_args, app_kwargs = popen_calls[1]
+        assert app_args == [str(app.resolve()),
+            "--tokenizer-request=request.json", "--tokenizer-evidence=evidence.json"]
+        assert app_kwargs["cwd"] == app.parent
+        assert app_kwargs["env"]["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] == (
+            "--remote-debugging-port=49152")
+        assert app_kwargs["env"]["TAURI_AUTOMATION"] == "true"
+        assert app_kwargs["env"]["TAURI_WEBVIEW_AUTOMATION"] == "true"
+        assert start_calls[0][1]["application_args"] == app_args[1:]
+        assert start_calls[0][1]["debugger_address"] == "127.0.0.1:49152"
+        assert memory_roots == [1235]
+        assert sorted(cleaned_pids) == [1234, 1235]
 
 
 def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):

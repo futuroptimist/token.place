@@ -3384,21 +3384,23 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
 
 
 @pytest.mark.parametrize(("gate_error", "launch_error", "start_error", "ready_error",
-    "expected_reason", "expected_phase"), [
-    (None, None, RuntimeError("private session exception /secret/path"), None,
-        "webdriver_session_creation_failed", "webdriver_ready"),
-    (None, OSError("private launch exception /secret/path"), None, None,
-        "webdriver_application_startup_failed", "webdriver_ready"),
-    (None, None, None, RuntimeError("private readiness exception /secret/path"),
-        "desktop_ui_not_ready", "desktop_session_started"),
-    (RuntimeError("tauri_driver_exited"), None, None, None,
-        "tauri_driver_exited", "runner_startup"),
-    (RuntimeError("webdriver_transport_failure"), None, None, None,
-        "webdriver_transport_failure", "runner_startup"),
+    "operator_error", "expected_reason", "expected_phase", "expected_progress"), [
+    (None, None, RuntimeError("private session exception /secret/path"), None, None,
+        "webdriver_session_creation_failed", "webdriver_ready", "not_started"),
+    (None, OSError("private launch exception /secret/path"), None, None, None,
+        "webdriver_application_startup_failed", "webdriver_ready", "not_started"),
+    (None, None, None, RuntimeError("private readiness exception /secret/path"), None,
+        "desktop_ui_not_ready", "desktop_session_started", "not_started"),
+    (None, None, None, None, RuntimeError("packaged_runner_failure"),
+        "packaged_runner_failure", "desktop_ready", "relay_input_set"),
+    (RuntimeError("tauri_driver_exited"), None, None, None, None,
+        "tauri_driver_exited", "runner_startup", "not_started"),
+    (RuntimeError("webdriver_transport_failure"), None, None, None, None,
+        "webdriver_transport_failure", "runner_startup", "not_started"),
 ])
 def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
-        tmp_path, gate_error, launch_error, start_error, ready_error, expected_reason,
-        expected_phase):
+        tmp_path, gate_error, launch_error, start_error, ready_error, operator_error,
+        expected_reason, expected_phase, expected_progress):
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
     wanted = {"tauri_driver_environment", "tokenizer_stage_path",
@@ -3409,7 +3411,10 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     checkpoints = []
     process = SimpleNamespace(pid=1234)
     application_process = SimpleNamespace(pid=1235)
-    driver = SimpleNamespace()
+    driver = SimpleNamespace(
+        find_element=lambda *_args: object(),
+        execute_script=lambda *_args: None,
+    )
     start_calls = []
     popen_calls = []
     cleaned_pids = []
@@ -3437,15 +3442,17 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
 
     fake_os = SimpleNamespace(**vars(os))
     fake_os.name = "nt"
+    diagnostics = []
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": fake_os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "By": SimpleNamespace(XPATH="xpath"),
         "WEBDRIVER_READINESS_CATEGORIES": frozenset({"ready", "no_window_handle",
             "wrong_handle", "missing_shell", "missing_required_controls",
             "webdriver_failure", "unknown"}),
         "_classify_webdriver_session_failure": lambda _exc, _process: (
             "webdriver_session_creation_failed", "running", "unknown"),
-        "_write_webdriver_diagnostic": lambda *_args: None,
+        "_write_webdriver_diagnostic": lambda *args: diagnostics.append(args),
         "psutil": __import__("psutil"),
         "subprocess": SimpleNamespace(
             Popen=popen, STDOUT=-2),
@@ -3458,6 +3465,10 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "start_driver": start, "tokenizer_handoff_args": lambda *_args: [
             "--tokenizer-request=request.json", "--tokenizer-evidence=evidence.json"],
         "wait_for_ui_ready": ready,
+        "fill_input_by_label": lambda *_args: None,
+        "benchmark_operator_mode": lambda _backend: "cpu",
+        "wait_for_start_operator_enabled": lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(operator_error) if operator_error else None),
         "_validate_packaged_failure_reason": lambda reason: reason,
         "_write_benchmark_phase": lambda *_args, **kwargs: checkpoints.append(dict(kwargs)),
         "_cleanup_owned_process_tree": lambda owned, *_args: (
@@ -3469,11 +3480,15 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         namespace)
     app = tmp_path / "current-head.exe"
     app.write_bytes(b"app")
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"model")
     request_path = tmp_path / "request.json"
     request_path.write_text(json.dumps({
         "phase_status_version": h.PACKAGED_PHASE_STATUS_VERSION,
         "phase_status_phases": list(h.PACKAGED_PHASES), "setup_timeout_s": 10,
         "cleanup_timeout_s": 1,
+        "model": str(model), "relay_url": "https://relay.example",
+        "backend": "cpu", "context_tier": "8k-fast",
         "manifest": {"fixture_sha256": "0" * 64, "targets": {}},
     }))
 
@@ -3486,6 +3501,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     assert checkpoints[-1]["last_safe_phase"] == expected_phase
     assert checkpoints[-1]["failure_reason"] == expected_reason
     assert checkpoints[-1]["cleanup_succeeded"] is True
+    assert diagnostics[-1][-1] == expected_progress
     assert len(start_calls) == (0 if gate_error or launch_error else 1)
     if not gate_error and not launch_error:
         app_args, app_kwargs = popen_calls[1]

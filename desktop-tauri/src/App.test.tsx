@@ -1089,6 +1089,31 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
   });
 
+  it('shows the attached bridge as running before its startup event arrives', async () => {
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: false,
+        operator_session_id: 'attached-bridge-session',
+        sequence: 0,
+        worker_state: 'starting',
+        last_error: null,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Worker state:/).textContent).toContain('starting');
+  });
+
   it('surfaces a fresh restart startup error while ignoring stale old-session events', async () => {
     mockInitialComputeStatus({
       running: false,

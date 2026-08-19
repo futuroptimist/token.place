@@ -582,6 +582,16 @@ async fn publish_running_if_bridge_record_still_running(
     true
 }
 
+fn running_status_event(status: &ComputeNodeStatus) -> Value {
+    let mut payload =
+        serde_json::to_value(status).expect("ComputeNodeStatus must remain serializable");
+    payload
+        .as_object_mut()
+        .expect("ComputeNodeStatus must serialize as an object")
+        .insert("type".into(), Value::String("status".into()));
+    payload
+}
+
 #[derive(Clone, Default)]
 pub struct ComputeNodeState {
     // Legacy slots are retained for focused tests that install synthetic child
@@ -2981,7 +2991,21 @@ pub async fn start_compute_node(
             launcher_source: launcher_metadata.as_ref().map(|m| m.0.clone()),
             interpreter_basename: launcher_metadata.as_ref().map(|m| m.1.clone()),
         };
-        publish_running_if_bridge_record_still_running(&state, &session_id, running_status).await;
+        if publish_running_if_bridge_record_still_running(
+            &state,
+            &session_id,
+            running_status.clone(),
+        )
+        .await
+            && app
+                .emit("compute_node_event", running_status_event(&running_status))
+                .is_err()
+        {
+            eprintln!(
+                "desktop.compute_node.event_emit_error operator_session_id={}",
+                session_id
+            );
+        }
     }
 
     let log_policy = SubprocessLogPolicy::from_env();
@@ -5757,6 +5781,29 @@ mod tests {
         assert!(!status.running);
         assert_eq!(status.relay_runtime_state.as_deref(), Some("stopped"));
         assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn running_publication_event_exposes_the_attached_bridge_state() {
+        let status = ComputeNodeStatus {
+            running: true,
+            registered: false,
+            operator_session_id: Some("running-publication-session".into()),
+            sequence: Some(0),
+            worker_state: Some("starting".into()),
+            ..ComputeNodeStatus::default()
+        };
+
+        let payload = running_status_event(&status);
+        assert_eq!(payload["type"], "status");
+        assert_eq!(payload["running"], true);
+        assert_eq!(payload["registered"], false);
+        assert_eq!(
+            payload["operator_session_id"],
+            "running-publication-session"
+        );
+        assert_eq!(payload["sequence"], 0);
+        assert_eq!(payload["worker_state"], "starting");
     }
 
     #[tokio::test]

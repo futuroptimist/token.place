@@ -52,7 +52,7 @@ jobs:
           set -euo pipefail
           attempt=0
           max_attempts=2
-          until timeout 4m python -m playwright install --with-deps chromium; do
+          until timeout --signal=TERM --kill-after=15s 4m python -m playwright install --with-deps chromium; do
             attempt=$((attempt + 1))
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "::error::playwright install --with-deps chromium timed out or failed after $attempt attempts" >&2

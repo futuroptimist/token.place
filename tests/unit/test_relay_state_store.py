@@ -13,6 +13,10 @@ import pytest
 from relay_state_store import ComputeNodeCapabilities
 from relay_state_store import ComputeNodeRegistration
 from relay_state_store import InMemoryRelayStateStore
+from relay_state_store import EncryptedRequestEnvelope
+from relay_state_store import RelayStateConflict
+from relay_state_store import RelayStateNoEligibleNode
+from relay_state_store import RelayStateReservationRejected
 from relay_state_store import RelayStateCapacityExceeded
 from relay_state_store import RelayStateCredentialMismatch
 from relay_state_store import RelayStateStore
@@ -372,3 +376,148 @@ def test_concurrent_registration_and_renewal_never_duplicate_or_tear_state(
     assert records[0].node_id == "node-a"
     assert records[0].capabilities in snapshots
     assert records[0].control_credential_digest == owner_digest
+
+
+def encrypted_envelope(ciphertext="ciphertext"):
+    return EncryptedRequestEnvelope("e2ee", "v1", ciphertext, "cipherkey", "iv")
+
+
+def test_selection_reserves_idempotently_and_enqueue_consumes_once(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(clock=clock)
+    store.register("node-a", capabilities, digest("a"))
+    selected = store.select_and_reserve(
+        "client-key", "request-1", "qwen3-8b-instruct", "8k-fast", clock.value + 30
+    )
+    repeated = store.select_and_reserve(
+        "client-key", "request-1", "qwen3-8b-instruct", "8k-fast", clock.value + 30
+    )
+    assert selected.reservation_token and len(selected.reservation_token) >= 43
+    assert repeated.reservation_token is None and repeated.retry
+    assert selected.reservation_token not in repr(store.__dict__)
+    with pytest.raises(RelayStateConflict):
+        store.select_and_reserve(
+            "client-key", "request-1", "other", "8k-fast", clock.value + 30
+        )
+
+    result = store.consume_reservation_and_enqueue(
+        "client-key",
+        "request-1",
+        selected.reservation_token,
+        "node-a",
+        "qwen3-8b-instruct",
+        "8k-fast",
+        clock.value + 30,
+        encrypted_envelope(),
+    )
+    retry = store.consume_reservation_and_enqueue(
+        "client-key",
+        "request-1",
+        selected.reservation_token,
+        "node-a",
+        "qwen3-8b-instruct",
+        "8k-fast",
+        clock.value + 30,
+        encrypted_envelope(),
+    )
+    assert retry.retry and retry.queued_at_epoch == result.queued_at_epoch
+    assert len(store.queued("node-a")) == 1
+    with pytest.raises(RelayStateConflict):
+        store.consume_reservation_and_enqueue(
+            "client-key",
+            "request-1",
+            selected.reservation_token,
+            "node-a",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            clock.value + 30,
+            encrypted_envelope("different"),
+        )
+
+
+def test_reservation_is_identity_bound_and_expires_inclusively(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(clock=clock, reservation_ttl_seconds=2)
+    store.register("node-a", capabilities, digest("a"))
+    selected = store.select_and_reserve(
+        "client", "request", "qwen3-8b-instruct", "8k-fast", clock.value + 30
+    )
+    with pytest.raises(RelayStateReservationRejected, match="reservation rejected"):
+        store.consume_reservation_and_enqueue(
+            "other",
+            "request",
+            selected.reservation_token,
+            "node-a",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            clock.value + 30,
+            encrypted_envelope(),
+        )
+    clock.value = selected.reservation_expires_at_epoch
+    with pytest.raises(RelayStateReservationRejected, match="reservation rejected"):
+        store.consume_reservation_and_enqueue(
+            "client",
+            "request",
+            selected.reservation_token,
+            "node-a",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            clock.value + 28,
+            encrypted_envelope(),
+        )
+    assert store.select_and_reserve(
+        "client-2", "request-2", "qwen3-8b-instruct", "8k-fast", clock.value + 30
+    )
+
+
+def test_scheduler_smallest_tier_load_fairness_and_health(store_factory, capabilities):
+    clock = EpochClock()
+    store = store_factory(clock=clock)
+    full = replace(
+        capabilities, active_context_tier="64k-full", maximum_total_context_tokens=65536
+    )
+    for node, caps in (
+        ("fast-a", capabilities),
+        ("fast-b", capabilities),
+        ("full", full),
+    ):
+        store.register(node, caps, digest(node))
+    first = store.select_and_reserve(
+        "c1", "r1", "qwen3-8b-instruct", "8k-fast", clock.value + 30
+    )
+    second = store.select_and_reserve(
+        "c2", "r2", "qwen3-8b-instruct", "8k-fast", clock.value + 30
+    )
+    assert {first.node_id, second.node_id} == {"fast-a", "fast-b"}
+    store.set_node_status("full", digest("full"), healthy=False, draining=False)
+    with pytest.raises(RelayStateNoEligibleNode):
+        store.select_and_reserve(
+            "c3", "r3", "qwen3-8b-instruct", "64k-full", clock.value + 30
+        )
+
+
+def test_strict_envelope_type_and_size_bound(store_factory, capabilities):
+    clock = EpochClock()
+    store = store_factory(clock=clock, max_envelope_bytes=20)
+    store.register("node-a", capabilities, digest("a"))
+    selected = store.select_and_reserve(
+        "client", "request", "qwen3-8b-instruct", "8k-fast", clock.value + 30
+    )
+    with pytest.raises(TypeError):
+        EncryptedRequestEnvelope("e2ee", "v1", "x", "y", "z", prompt="plaintext")
+    with pytest.raises(RelayStateCapacityExceeded, match="envelope"):
+        store.consume_reservation_and_enqueue(
+            "client",
+            "request",
+            selected.reservation_token,
+            "node-a",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            clock.value + 30,
+            encrypted_envelope("x" * 30),
+        )
+    assert store.queued("node-a") == ()

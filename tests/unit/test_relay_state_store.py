@@ -58,16 +58,18 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def test_register_lookup_and_duplicate_preserve_owner_digest(
-    store_factory, capabilities
-):
+def test_register_lookup_and_duplicate_require_owner_digest(store_factory, capabilities):
     clock = EpochClock()
     store = store_factory(clock=clock, lease_ttl_seconds=30)
     assert isinstance(store, RelayStateStore)
 
     first = store.register("node-a", capabilities, digest("owner"))
     clock.value += 5
-    duplicate = store.register("node-a", capabilities, digest("attacker"))
+    with pytest.raises(RelayStateCredentialMismatch):
+        store.register("node-a", capabilities, digest("attacker"))
+
+    assert store.get("node-a") == first
+    duplicate = store.register("node-a", capabilities, digest("owner"))
 
     assert duplicate.registered_at_epoch == first.registered_at_epoch
     assert duplicate.lease_expires_at_epoch == clock.value + 30
@@ -123,6 +125,21 @@ def test_expire_returns_each_removed_record_once(store_factory, capabilities):
     assert store.expire() == ()
 
 
+def test_list_and_expire_are_sorted_by_node_id(store_factory, capabilities):
+    clock = EpochClock()
+    store = store_factory(clock=clock, lease_ttl_seconds=1)
+    registered = {
+        node_id: store.register(node_id, capabilities, digest(node_id))
+        for node_id in ("node-c", "node-a", "node-b")
+    }
+
+    assert store.list() == tuple(registered[node_id] for node_id in sorted(registered))
+    clock.value += 1
+    assert store.expire() == tuple(
+        registered[node_id] for node_id in sorted(registered)
+    )
+
+
 def test_unregister_and_unknown_node_behavior(store_factory, capabilities):
     store = store_factory()
     store.register("node-a", capabilities, digest("owner"))
@@ -146,6 +163,22 @@ def test_schema_ttl_and_record_bounds_are_validated():
         RelayStateStoreConfig(namespace="test", lease_ttl_seconds=0)
     with pytest.raises(RelayStateStoreError, match="bound"):
         RelayStateStoreConfig(namespace="test", max_compute_nodes=0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_compute_nodes", 1.5),
+        ("max_compute_nodes", True),
+        ("max_compute_nodes", "10"),
+        ("max_node_id_bytes", 1.5),
+        ("max_node_id_bytes", True),
+        ("max_node_id_bytes", "10"),
+    ],
+)
+def test_integer_record_bounds_reject_invalid_types(field, value):
+    with pytest.raises(RelayStateStoreError, match="bound"):
+        RelayStateStoreConfig(namespace="test", **{field: value})
 
 
 def test_capacity_and_node_id_bounds(store_factory, capabilities):

@@ -62,6 +62,7 @@ class RelayStateStoreConfig:
             raise RelayStateStoreError("lease TTL must be a finite positive number")
         if (
             isinstance(self.max_compute_nodes, bool)
+            or not isinstance(self.max_compute_nodes, int)
             or not 1 <= self.max_compute_nodes <= 1_000_000
         ):
             raise RelayStateStoreError(
@@ -69,6 +70,7 @@ class RelayStateStoreConfig:
             )
         if (
             isinstance(self.max_node_id_bytes, bool)
+            or not isinstance(self.max_node_id_bytes, int)
             or not 1 <= self.max_node_id_bytes <= 65_536
         ):
             raise RelayStateStoreError(
@@ -240,6 +242,8 @@ class InMemoryRelayStateStore:
                 raise RelayStateCapacityExceeded(
                     "compute-node registration capacity reached"
                 )
+            if existing is not None:
+                self._require_digest(existing, control_credential_digest)
             record = ComputeNodeRegistration(
                 node_id=node_id,
                 capabilities=capabilities,
@@ -292,7 +296,9 @@ class InMemoryRelayStateStore:
     def list(self) -> tuple[ComputeNodeRegistration, ...]:
         with self._lock:
             self._expire_locked(self._now())
-            return tuple(replace(record) for record in self._records.values())
+            return tuple(
+                replace(self._records[node_id]) for node_id in sorted(self._records)
+            )
 
     def expire(self) -> tuple[ComputeNodeRegistration, ...]:
         with self._lock:
@@ -311,11 +317,14 @@ class InMemoryRelayStateStore:
             return True
 
     def _expire_locked(self, now: float) -> list[ComputeNodeRegistration]:
-        expired = [
-            record
-            for record in self._records.values()
-            if record.lease_expires_at_epoch <= now
-        ]
+        expired = sorted(
+            (
+                record
+                for record in self._records.values()
+                if record.lease_expires_at_epoch <= now
+            ),
+            key=lambda record: record.node_id,
+        )
         for record in expired:
             del self._records[record.node_id]
         return expired

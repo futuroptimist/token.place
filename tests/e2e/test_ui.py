@@ -1564,9 +1564,16 @@ def test_landing_chat_cancel_network_failure_is_visible(
 
 
 def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
-    """The chat UI should render markdown formatting returned by the assistant."""
+    """The chat UI should render fenced code without leaking its placeholders."""
 
-    markdown_reply = "**Bold** introduction\n\n- First item\n- Second item\n\nHere is `inline` code and:\n```\nblock example\n```"
+    user_markdown = "**User bold** and fenced code:\n```text\nuser_*_code <script>userBad()</script>\n```"
+    markdown_reply = (
+        "**Bold** introduction\n\n- First item\n- Second item\n\n"
+        "Here is `inline` code and two blocks:\n"
+        "```python\nfirst_*_block <script>firstBad()</script>\n```\n"
+        "Between blocks with *emphasis*.\n"
+        "```\nsecond__block**literal**\n```"
+    )
     route_landing_relay_chat(page, assistant_content=markdown_reply)
 
     page.goto(base_url)
@@ -1574,7 +1581,7 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     patch_landing_crypto_for_visible_envelopes(page)
 
     textarea = page.locator("textarea").first
-    textarea.fill("Show markdown please")
+    textarea.fill(user_markdown)
     wait_for_landing_send_enabled(page).click()
 
     user_message = page.locator(".user-message").last
@@ -1584,7 +1591,9 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     expect(user_message).not_to_have_attribute("v-cloak", "")
     expect(assistant_message).not_to_have_attribute("v-cloak", "")
 
+    assert user_message.locator("strong").inner_text() == "User bold"
     assert assistant_message.locator("strong").inner_text() == "Bold"
+    assert assistant_message.locator("em").inner_text() == "emphasis"
 
     list_items = assistant_message.locator("li")
     assert list_items.count() == 2
@@ -1594,11 +1603,22 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     inline_code = assistant_message.locator("code").first
     assert inline_code.inner_text() == "inline"
 
-    block_code = assistant_message.locator("pre code").first
-    assert "block example" in block_code.inner_text()
+    all_blocks = page.locator(".user-message pre code, .assistant-message pre code")
+    assert all_blocks.count() == 3
+    assert all_blocks.all_inner_texts() == [
+        "text\nuser_*_code <script>userBad()</script>",
+        "python\nfirst_*_block <script>firstBad()</script>",
+        "\nsecond__block**literal**",
+    ]
 
-    # Ensure raw HTML isn't rendered unsanitized
-    assert assistant_message.locator("script").count() == 0
+    # Raw HTML stays literal, and neither the old nor current internal markers leak.
+    assert page.locator(".user-message script, .assistant-message script").count() == 0
+    visible_chat = page.locator(".user-message, .assistant-message").all_inner_texts()
+    visible_text = "\n".join(visible_chat)
+    assert "CODEBLOCK0" not in visible_text
+    assert "CODEBLOCK1" not in visible_text
+    assert "codeblockplaceholder" not in visible_text.lower()
+
 
 def test_landing_chat_uses_api_v1_only_non_streaming(
     page: Page,

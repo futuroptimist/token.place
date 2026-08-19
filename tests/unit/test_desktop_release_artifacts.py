@@ -4150,6 +4150,76 @@ def test_windows_installer_identity_remediates_exact_captured_stale_shortcut(mon
     assert not shortcut_path.exists()
 
 
+@pytest.mark.parametrize('blocked_by', ['missing-captured-authority', 'live-target', 'registry', 'process'])
+def test_windows_installer_identity_stale_shortcut_remediation_requires_no_other_authority(
+    monkeypatch, tmp_path, blocked_by
+) -> None:
+    guard = _load_windows_installer_identity()
+    target = tmp_path / 'installed' / 'token.place.exe'
+    shortcut_path = tmp_path / 'Desktop' / 'token.place desktop.lnk'
+    shortcut_path.parent.mkdir()
+    shortcut_path.write_bytes(b'captured product shortcut')
+    shortcut = guard.Shortcut(shortcut_path, target)
+    captured_targets = [] if blocked_by == 'missing-captured-authority' else [target]
+    before = guard.AuthoritySnapshot(
+        guard.ShortcutInventory([shortcut], captured_targets, []), [])
+    registry = [object()] if blocked_by == 'registry' else []
+    current = guard.AuthoritySnapshot(
+        guard.ShortcutInventory([shortcut], [], [target]), registry)
+    if blocked_by == 'live-target':
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b'live executable')
+    monkeypatch.setattr(guard, '_processes_running_targets',
+        lambda targets: [object()] if blocked_by == 'process' else [])
+
+    assert guard.remediate_captured_stale_shortcuts(before, current) is False
+    assert shortcut_path.exists()
+
+
+def test_windows_installer_identity_reports_persistent_shortcut_after_removal(
+    monkeypatch, tmp_path
+) -> None:
+    guard = _load_windows_installer_identity()
+    target = tmp_path / 'installed' / 'token.place.exe'
+    shortcut_path = tmp_path / 'Desktop' / 'token.place desktop.lnk'
+    shortcut_path.parent.mkdir()
+    shortcut_path.write_bytes(b'captured product shortcut')
+    shortcut = guard.Shortcut(shortcut_path, target)
+    before = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [target], []), [])
+    current = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [], [target]), [])
+    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [])
+    monkeypatch.setattr(Path, 'unlink', lambda self: None)
+
+    with pytest.raises(guard.InstallerIdentityError,
+            match='captured stale product shortcut remains after exact-path removal'):
+        guard.remediate_captured_stale_shortcuts(before, current)
+    assert shortcut_path.exists()
+
+
+def test_windows_installer_identity_cleanup_reinventories_after_remediation(
+    monkeypatch, tmp_path
+) -> None:
+    guard = _load_windows_installer_identity()
+    target = tmp_path / 'installed' / 'token.place.exe'
+    shortcut_path = tmp_path / 'Desktop' / 'token.place desktop.lnk'
+    shortcut_path.parent.mkdir()
+    shortcut_path.write_bytes(b'captured product shortcut')
+    shortcut = guard.Shortcut(shortcut_path, target)
+    before = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [target], []), [])
+    current = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [], [target]), [])
+    categories = iter([['shortcuts'], []])
+    captures = []
+    monkeypatch.setattr(guard, 'residual_authority_categories', lambda _before: next(categories))
+    monkeypatch.setattr(guard, 'capture_authority_snapshot',
+        lambda: captures.append(True) or current)
+    monkeypatch.setattr(guard, 'remediate_captured_stale_shortcuts',
+        lambda captured, observed: captured is before and observed is current)
+
+    guard.wait_for_cleanup_convergence(
+        before, monotonic=lambda: 0.0, sleeper=lambda _seconds: None)
+    assert len(captures) == 1
+
+
 @pytest.mark.parametrize('unsafe_kind', ['foreign-path', 'retargeted', 'newly-created', 'existing-target'])
 def test_windows_installer_identity_rejects_unsafe_stale_shortcut_remediation(
     monkeypatch, tmp_path, unsafe_kind

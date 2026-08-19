@@ -49,6 +49,12 @@ class ProtocolError(Exception):
 @pytest.fixture
 def desktop_runner():
     tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
+    assignments = {
+        "NATIVE_WEBDRIVER_URL", "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION",
+        "WEBDRIVER_COMPATIBILITY_RESULTS", "WEBDRIVER_EXCEPTION_FAMILIES",
+        "WEBDRIVER_PROCESS_POSTURES", "WEBDRIVER_SESSION_ELAPSED_BUCKETS",
+        "WEBDRIVER_TARGET_CATEGORIES", "WEBDRIVER_READINESS_CATEGORIES",
+    }
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
         "_populate_and_submit_packaged_prompt", "_is_windows_sharing_violation", "_write_benchmark_phase",
@@ -66,7 +72,12 @@ def desktop_runner():
         "_contains_private_input", "_packaged_boundary_failure_diagnostics",
         "run_packaged_windows_tokenizer_boundary", "main"}
     functions = [node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in names]
+        if (isinstance(node, ast.FunctionDef) and node.name in names)
+        or (isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(isinstance(target, ast.Name) and target.id in assignments
+                for target in (node.targets if isinstance(node, ast.Assign)
+                    else [node.target])))
+        ]
     module = ModuleType("desktop_runner_under_test")
     namespace = module.__dict__
     namespace.update({"webdriver": SimpleNamespace(Chrome=object, Remote=object,
@@ -167,6 +178,20 @@ def test_webdriver_readiness_failure_is_bounded(
     with pytest.raises(RuntimeError, match=f"^{expected}$") as raised:
         desktop_runner.wait_for_webdriver_ready(
             SimpleNamespace(poll=lambda: process_exit), timeout_seconds=0.5)
+    assert "private" not in str(raised.value)
+
+
+def test_webdriver_readiness_detects_driver_exit_after_transient_status(
+        desktop_runner, monkeypatch):
+    polls = iter([None, 9])
+    monkeypatch.setattr(desktop_runner, "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("private response")))
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="^tauri_driver_exited$") as raised:
+        desktop_runner.wait_for_webdriver_ready(
+            SimpleNamespace(poll=lambda: next(polls)), timeout_seconds=10)
+
     assert "private" not in str(raised.value)
 
 
@@ -720,6 +745,43 @@ def test_webdriver_process_posture_handles_bounded_edge_cases(
     assert desktop_runner._webdriver_process_posture(process, app) == "unknown"
 
 
+def test_webdriver_changed_safety_branches_are_bounded(
+        desktop_runner, monkeypatch, tmp_path):
+    desktop_runner.os = SimpleNamespace(name="nt")
+
+    def remote(**kwargs):
+        kwargs["options"].to_capabilities()
+
+    desktop_runner.webdriver = SimpleNamespace(Remote=remote)
+    with pytest.raises(RuntimeError, match="^webdriver_application_startup_failed$"):
+        desktop_runner.start_driver(tmp_path / "private application.exe")
+
+    edge_driver = tmp_path / "msedgedriver.exe"
+    edge_driver.write_bytes(b"driver")
+    desktop_runner.os = SimpleNamespace(name="nt", environ={
+        "TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY": "match",
+        "EDGEWEBDRIVER": str(edge_driver),
+    })
+    monkeypatch.setattr(desktop_runner.shutil, "which", lambda _name: None)
+    with pytest.raises(RuntimeError, match="tauri-driver binary not found"):
+        desktop_runner.tauri_driver_command()
+
+    process = SimpleNamespace(pid=17, poll=lambda: None)
+    application_process = SimpleNamespace(pid=23, poll=lambda: None)
+    application = SimpleNamespace(children=lambda recursive: [object()])
+    monkeypatch.setattr(desktop_runner.psutil, "Process", lambda _pid: application)
+    assert desktop_runner._webdriver_process_posture(
+        process, tmp_path / "private application.exe", application_process
+    ) == "webview_descendants_present"
+    application.children = lambda recursive: (_ for _ in ()).throw(
+        desktop_runner.psutil.Error("private child sentinel"))
+    assert desktop_runner._webdriver_process_posture(
+        process, tmp_path / "private application.exe", application_process
+    ) == "application_present"
+
+    assert desktop_runner._packaged_boundary_failure_diagnostics(
+        ["private path", "prompt payload"]) == "code=unavailable"
+
 def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
         desktop_runner, tmp_path):
     desktop_runner.LOGS_DIR = tmp_path
@@ -1270,6 +1332,25 @@ def test_phase_checkpoint_windows_permission_deadline_is_bounded_and_sanitized(
     assert len(attempts) == 4
     assert "private" not in str(raised.value)
     assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
+
+
+def test_webview2_devtools_detects_owned_application_exit_after_poll(
+        desktop_runner, monkeypatch):
+    polls = iter([None, 7])
+    clock = SimpleNamespace(value=0.0)
+    def monotonic():
+        clock.value += 0.01
+        return clock.value
+    monkeypatch.setattr(desktop_runner.time, "monotonic", monotonic)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(desktop_runner, "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("private response")))
+
+    with pytest.raises(RuntimeError, match="^webdriver_application_startup_failed$") as raised:
+        desktop_runner.wait_for_webview2_devtools(
+            SimpleNamespace(poll=lambda: next(polls)), 49152, 1)
+
+    assert "private" not in str(raised.value)
 
 
 def test_phase_checkpoint_does_not_retry_unrelated_error(

@@ -3383,24 +3383,31 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     assert checkpoint["cleanup_succeeded"] is True
 
 
-@pytest.mark.parametrize(("gate_error", "launch_error", "start_error", "ready_error",
-    "operator_error", "expected_reason", "expected_phase", "expected_progress"), [
-    (None, None, RuntimeError("private session exception /secret/path"), None, None,
-        "webdriver_session_creation_failed", "webdriver_ready", "not_started"),
-    (None, OSError("private launch exception /secret/path"), None, None, None,
+@pytest.mark.parametrize(("command_error", "gate_error", "launch_error", "devtools_error",
+    "start_error", "ready_error", "operator_error", "expected_reason", "expected_phase",
+    "expected_progress"), [
+    (None, None, None, None, RuntimeError("private session exception /secret/path"),
+        None, None, "webdriver_session_creation_failed", "webdriver_ready", "not_started"),
+    (None, None, OSError("private launch exception /secret/path"), None, None, None, None,
         "webdriver_application_startup_failed", "webdriver_ready", "not_started"),
-    (None, None, None, RuntimeError("private readiness exception /secret/path"), None,
-        "desktop_ui_not_ready", "desktop_session_started", "not_started"),
-    (None, None, None, None, RuntimeError("packaged_runner_failure"),
+    (None, None, None, RuntimeError("webdriver_application_startup_failed"), None, None,
+        None, "webdriver_application_startup_failed", "webdriver_ready", "not_started"),
+    (None, None, None, RuntimeError("webdriver_transport_failure"), None, None, None,
+        "webdriver_transport_failure", "webdriver_ready", "not_started"),
+    (None, None, None, None, None, RuntimeError("private readiness exception /secret/path"),
+        None, "desktop_ui_not_ready", "desktop_session_started", "not_started"),
+    (None, None, None, None, None, None, RuntimeError("packaged_runner_failure"),
         "packaged_runner_failure", "desktop_ready", "relay_input_set"),
-    (RuntimeError("tauri_driver_exited"), None, None, None, None,
+    (None, RuntimeError("tauri_driver_exited"), None, None, None, None, None,
         "tauri_driver_exited", "runner_startup", "not_started"),
-    (RuntimeError("webdriver_transport_failure"), None, None, None, None,
+    (None, RuntimeError("webdriver_transport_failure"), None, None, None, None, None,
         "webdriver_transport_failure", "runner_startup", "not_started"),
+    (RuntimeError("native_driver_unavailable"), None, None, None, None, None, None,
+        "native_driver_unavailable", "runner_startup", "not_started"),
 ])
 def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
-        tmp_path, gate_error, launch_error, start_error, ready_error, operator_error,
-        expected_reason, expected_phase, expected_progress):
+        tmp_path, command_error, gate_error, launch_error, devtools_error, start_error,
+        ready_error, operator_error, expected_reason, expected_phase, expected_progress):
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
     wanted = {"tauri_driver_environment", "tokenizer_stage_path",
@@ -3436,6 +3443,15 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         if gate_error:
             raise gate_error
 
+    def webview2_ready(*_args, **_kwargs):
+        if devtools_error:
+            raise devtools_error
+
+    def driver_command():
+        if command_error:
+            raise command_error
+        return ["tauri-driver"]
+
     def ready(*_args, **_kwargs):
         if ready_error:
             raise ready_error
@@ -3456,11 +3472,11 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "psutil": __import__("psutil"),
         "subprocess": SimpleNamespace(
             Popen=popen, STDOUT=-2),
-        "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
+        "tauri_driver_command": driver_command, "TAURI_ROOT": tmp_path,
         "OwnedProcessTreeMemorySampler": lambda pid: (
             memory_roots.append(pid) or object()),
         "wait_for_webdriver_ready": webdriver_ready,
-        "wait_for_webview2_devtools": lambda *_args, **_kwargs: None,
+        "wait_for_webview2_devtools": webview2_ready,
         "reserve_free_port": lambda: 49152,
         "start_driver": start, "tokenizer_handoff_args": lambda *_args: [
             "--tokenizer-request=request.json", "--tokenizer-evidence=evidence.json"],
@@ -3502,8 +3518,9 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     assert checkpoints[-1]["failure_reason"] == expected_reason
     assert checkpoints[-1]["cleanup_succeeded"] is True
     assert diagnostics[-1][-1] == expected_progress
-    assert len(start_calls) == (0 if gate_error or launch_error else 1)
-    if not gate_error and not launch_error:
+    assert len(start_calls) == (
+        0 if command_error or gate_error or launch_error or devtools_error else 1)
+    if not command_error and not gate_error and not launch_error:
         app_args, app_kwargs = popen_calls[1]
         assert app_args == [str(app.resolve()),
             "--edge-webview-switches=--remote-debugging-port=49152",
@@ -3517,8 +3534,9 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         assert webview2_user_data.is_dir()
         assert app_kwargs["env"]["TAURI_AUTOMATION"] == "true"
         assert app_kwargs["env"]["TAURI_WEBVIEW_AUTOMATION"] == "true"
-        assert start_calls[0][1]["application_args"] == app_args[2:]
-        assert start_calls[0][1]["debugger_address"] == "127.0.0.1:49152"
+        if not devtools_error:
+            assert start_calls[0][1]["application_args"] == app_args[2:]
+            assert start_calls[0][1]["debugger_address"] == "127.0.0.1:49152"
         assert memory_roots == [1235]
         assert sorted(cleaned_pids) == [1234, 1235]
 

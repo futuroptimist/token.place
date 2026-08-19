@@ -706,7 +706,7 @@ new Vue({
             let escaped = this.escapeHtml(raw);
 
             escaped = escaped.replace(/```([\s\S]*?)```/g, (_, code) => {
-                const token = `__CODE_BLOCK_${codeBlocks.length}__`;
+                const token = `<!--tokenplacecodeblock${codeBlocks.length}-->`;
                 codeBlocks.push(`<pre><code>${code.replace(/\r?\n$/, '')}</code></pre>`);
                 return token;
             });
@@ -732,7 +732,7 @@ new Vue({
 
             for (const line of lines) {
                 const trimmed = line.trim();
-                const placeholderMatch = /^__CODE_BLOCK_(\d+)__$/.exec(trimmed);
+                const placeholderMatch = /^<!--tokenplacecodeblock(\d+)-->$/.exec(trimmed);
                 if (placeholderMatch) {
                     flushList();
                     const idx = Number(placeholderMatch[1]);

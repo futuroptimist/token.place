@@ -52,7 +52,11 @@ class RelayStateStoreConfig:
             raise RelayStateStoreError(
                 "namespace must be 1-128 lowercase routing-safe characters"
             )
-        if self.schema_version != RELAY_STATE_SCHEMA_VERSION:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != RELAY_STATE_SCHEMA_VERSION
+        ):
             raise RelayStateStoreError("unsupported relay state schema version")
         if (
             isinstance(self.lease_ttl_seconds, bool)
@@ -244,6 +248,7 @@ class InMemoryRelayStateStore:
             raise RelayStateStoreError("capabilities must be ComputeNodeCapabilities")
         with self._lock:
             now = self._now()
+            lease_deadline = self._lease_deadline(now)
             self._expire_locked(now)
             existing = self._records.get(node_id)
             if existing is None and len(self._records) >= self.config.max_compute_nodes:
@@ -261,7 +266,7 @@ class InMemoryRelayStateStore:
                     else control_credential_digest
                 ),
                 registered_at_epoch=(existing.registered_at_epoch if existing else now),
-                lease_expires_at_epoch=now + self.config.lease_ttl_seconds,
+                lease_expires_at_epoch=lease_deadline,
             )
             self._records[node_id] = record
             return replace(record)
@@ -281,6 +286,7 @@ class InMemoryRelayStateStore:
             raise RelayStateStoreError("capabilities must be ComputeNodeCapabilities")
         with self._lock:
             now = self._now()
+            lease_deadline = self._lease_deadline(now)
             self._expire_locked(now)
             existing = self._records.get(node_id)
             if existing is None:
@@ -289,7 +295,7 @@ class InMemoryRelayStateStore:
             renewed = replace(
                 existing,
                 capabilities=capabilities or existing.capabilities,
-                lease_expires_at_epoch=now + self.config.lease_ttl_seconds,
+                lease_expires_at_epoch=lease_deadline,
             )
             self._records[node_id] = renewed
             return replace(renewed)
@@ -346,6 +352,12 @@ class InMemoryRelayStateStore:
         ):
             raise RelayStateStoreError("epoch clock must return a finite number")
         return float(value)
+
+    def _lease_deadline(self, now: float) -> float:
+        deadline = now + self.config.lease_ttl_seconds
+        if not math.isfinite(deadline):
+            raise RelayStateStoreError("lease deadline must be finite")
+        return deadline
 
     def _validate_node_id(self, node_id: str) -> None:
         if (

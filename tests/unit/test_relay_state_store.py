@@ -161,13 +161,45 @@ def test_namespace_is_bounded_and_validated(namespace):
         RelayStateStoreConfig(namespace=namespace)
 
 
-def test_schema_ttl_and_record_bounds_are_validated():
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1", 2])
+def test_schema_version_requires_the_supported_non_boolean_integer(schema_version):
     with pytest.raises(RelayStateStoreError, match="schema"):
-        RelayStateStoreConfig(namespace="test", schema_version=2)
+        RelayStateStoreConfig(namespace="test", schema_version=schema_version)
+
+    assert RelayStateStoreConfig(namespace="test", schema_version=1).schema_version == 1
+
+
+def test_ttl_and_record_bounds_are_validated():
     with pytest.raises(RelayStateStoreError, match="TTL"):
         RelayStateStoreConfig(namespace="test", lease_ttl_seconds=0)
     with pytest.raises(RelayStateStoreError, match="bound"):
         RelayStateStoreConfig(namespace="test", max_compute_nodes=0)
+
+
+def test_registration_rejects_an_infinite_computed_deadline(
+    store_factory, capabilities
+):
+    store = store_factory(clock=EpochClock(1e308), lease_ttl_seconds=1e308)
+
+    with pytest.raises(RelayStateStoreError, match="deadline"):
+        store.register("node-a", capabilities, digest("owner"))
+
+    assert store.list() == ()
+
+
+def test_renewal_rejects_an_infinite_deadline_without_mutating_live_record(
+    store_factory, capabilities
+):
+    clock = EpochClock(0.0)
+    store = store_factory(clock=clock, lease_ttl_seconds=1e308)
+    original = store.register("node-a", capabilities, digest("owner"))
+    clock.value = 9e307
+
+    with pytest.raises(RelayStateStoreError, match="deadline"):
+        store.renew("node-a", digest("owner"))
+
+    clock.value = 0.0
+    assert store.get("node-a") == original
 
 
 @pytest.mark.parametrize(

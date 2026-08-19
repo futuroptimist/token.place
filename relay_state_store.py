@@ -696,7 +696,12 @@ class InMemoryRelayStateStore:
             queued = self._queued.get(identity)
             if queued is not None:
                 self._require_same_parameters(queued, model_id, tier, deadline)
-                lifecycle_state = "claimed" if identity in self._claims else "queued"
+                claim = self._claims.get(identity)
+                lifecycle_state = (
+                    "claimed"
+                    if claim is not None and claim.lease_expires_at_epoch > now
+                    else "queued"
+                )
                 return SelectionResult(
                     queued.selected_node_id,
                     model_id,
@@ -837,7 +842,14 @@ class InMemoryRelayStateStore:
                 ):
                     raise RelayStateInvalidReservation("reservation invalid")
                 return self._enqueue_result(
-                    existing, False, "claimed" if identity in self._claims else "queued"
+                    existing,
+                    False,
+                    (
+                        "claimed"
+                        if identity in self._claims
+                        and self._claims[identity].lease_expires_at_epoch > now
+                        else "queued"
+                    ),
                 )
             if deadline <= now:
                 raise RelayStateInvalidReservation("reservation invalid")
@@ -896,12 +908,23 @@ class InMemoryRelayStateStore:
     def queued_requests(self, node_id: str) -> tuple[QueuedRequest, ...]:
         self._validate_node_id(node_id)
         with self._lock:
-            self._reap_locked(self._now())
+            now = self._now()
+            self._reap_locked(now)
             return tuple(
                 replace(record)
                 for record in self._node_queues.get(node_id, ())
-                if (record.client_identity_digest, record.request_identity_digest)
-                not in self._claims
+                if (
+                    (
+                        claim := self._claims.get(
+                            (
+                                record.client_identity_digest,
+                                record.request_identity_digest,
+                            )
+                        )
+                    )
+                    is None
+                    or claim.lease_expires_at_epoch <= now
+                )
             )
 
     def claim_queued_request(
@@ -920,8 +943,13 @@ class InMemoryRelayStateStore:
             if registration is None:
                 raise RelayStateCredentialMismatch("claim owner is invalid")
             self._require_digest(registration, control_credential_digest)
+            active_claims = tuple(
+                claim
+                for claim in self._claims.values()
+                if claim.lease_expires_at_epoch > now
+            )
             node_claims = sum(
-                claim.selected_node_id == node_id for claim in self._claims.values()
+                claim.selected_node_id == node_id for claim in active_claims
             )
             for queued in self._node_queues.get(node_id, ()):
                 identity = (
@@ -932,7 +960,7 @@ class InMemoryRelayStateStore:
                 if existing is not None and existing.lease_expires_at_epoch > now:
                     continue
                 if existing is None and (
-                    len(self._claims) >= self.config.max_claims
+                    len(active_claims) >= self.config.max_claims
                     or node_claims >= self.config.max_claims_per_node
                 ):
                     raise RelayStateCapacityExceeded("claim capacity reached")
@@ -1013,13 +1041,15 @@ class InMemoryRelayStateStore:
     def active_claims(self, node_id: str) -> tuple[ClaimRecord, ...]:
         self._validate_node_id(node_id)
         with self._lock:
-            self._reap_locked(self._now())
+            now = self._now()
+            self._reap_locked(now)
             return tuple(
                 replace(claim)
                 for claim in sorted(
                     self._claims.values(), key=lambda item: item.sequence
                 )
                 if claim.selected_node_id == node_id
+                and claim.lease_expires_at_epoch > now
             )
 
     def _expire_locked(self, now: float) -> list[ComputeNodeRegistration]:

@@ -109,9 +109,11 @@ def enqueue(store, selection, request_id="request-a", **overrides):
     return store.enqueue_encrypted_request(**values)
 
 
-def registered_store(store_factory, capabilities, clock=None, node_id="node-a"):
+def registered_store(
+    store_factory, capabilities, clock=None, node_id="node-a", **config_overrides
+):
     clock = clock or EpochClock()
-    store = store_factory(clock=clock, claim_ttl_seconds=10)
+    store = store_factory(clock=clock, claim_ttl_seconds=10, **config_overrides)
     store.register(node_id, capabilities, digest("owner"))
     return store, clock
 
@@ -196,6 +198,47 @@ def test_claim_reclaim_is_inclusive_and_fences_old_generation(
     )
     assert stale.state == "stale_generation"
     assert store.active_claims("node-a")[0].generation == second.generation
+
+
+def test_expired_claim_is_reclaimable_not_active_or_capacity_consuming(
+    store_factory, capabilities
+):
+    store, clock = registered_store(
+        store_factory, capabilities, max_claims=1, max_claims_per_node=1
+    )
+    store.register("node-b", capabilities, digest("owner-b"))
+    queued_work(store, "request-a")
+    first = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+
+    clock.value = first.lease_expires_at_epoch
+    assert store.active_claims("node-a") == ()
+    assert [item.request_id for item in store.queued_requests("node-a")] == [
+        "request-a"
+    ]
+
+    selection = reserve(store, "request-b")
+    assert selection.selected_node_id == "node-b"
+    enqueue(store, selection, "request-b")
+    second = store.claim_queued_request("node-b", digest("owner-b"), "worker-b")
+    assert second.state == "claimed"
+
+
+def test_claimed_idempotent_results_have_claimed_state_and_no_new_token(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    queued, selection = queued_work(store)
+    store.claim_queued_request("node-a", digest("owner"), "worker")
+
+    selected_retry = reserve(store)
+    assert selected_retry.state == "claimed"
+    assert selected_retry.reservation_token is None
+    assert not selected_retry.created
+
+    enqueue_retry = enqueue(store, selection)
+    assert enqueue_retry.state == "claimed"
+    assert not enqueue_retry.created
+    assert enqueue_retry.sequence == queued.sequence
 
 
 def test_claim_renewal_auth_identity_and_deadline_bounds(store_factory, capabilities):

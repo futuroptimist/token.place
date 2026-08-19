@@ -12,9 +12,13 @@ import pytest
 # isort: off
 from relay_state_store import ComputeNodeCapabilities
 from relay_state_store import ComputeNodeRegistration
+from relay_state_store import EncryptedRequestEnvelope
 from relay_state_store import InMemoryRelayStateStore
 from relay_state_store import RelayStateCapacityExceeded
 from relay_state_store import RelayStateCredentialMismatch
+from relay_state_store import RelayStateConflict
+from relay_state_store import RelayStateNoEligibleNode
+from relay_state_store import RelayStateReservationInvalid
 from relay_state_store import RelayStateStore
 from relay_state_store import RelayStateStoreConfig
 from relay_state_store import RelayStateStoreError
@@ -372,3 +376,264 @@ def test_concurrent_registration_and_renewal_never_duplicate_or_tear_state(
     assert records[0].node_id == "node-a"
     assert records[0].capabilities in snapshots
     assert records[0].control_credential_digest == owner_digest
+
+
+def scheduler_capabilities(*, models=("model-a",), tier="8k-fast", concurrency=2):
+    return ComputeNodeCapabilities(
+        supported_model_ids=models,
+        active_context_tier=tier,
+        maximum_total_context_tokens=65536 if tier == "64k-full" else 8192,
+        default_output_token_reservation=1,
+        maximum_output_tokens=1,
+        max_concurrency=concurrency,
+    )
+
+
+def envelope(ciphertext="ciphertext"):
+    return EncryptedRequestEnvelope(
+        protocol="tokenplace_api_v1_relay_e2ee",
+        version=1,
+        ciphertext=ciphertext,
+        cipherkey="cipherkey",
+        iv="iv",
+    )
+
+
+def reserve(store, request_id="request-a", **overrides):
+    values = {
+        "client_public_key": "client-key",
+        "request_id": request_id,
+        "model_id": "model-a",
+        "context_tier": "8k-fast",
+        "deadline_epoch": 1_700_000_100.0,
+    }
+    values.update(overrides)
+    return store.select_and_reserve(**values)
+
+
+def test_selection_uses_compatibility_smallest_tier_least_load_and_fairness(
+    store_factory,
+):
+    store = store_factory()
+    for node, caps in (
+        (
+            "full",
+            scheduler_capabilities(models=("model-a", "model-b"), tier="64k-full"),
+        ),
+        ("fast-a", scheduler_capabilities()),
+        ("fast-b", scheduler_capabilities()),
+    ):
+        store.register(node, caps, digest(node))
+
+    first = reserve(store, "one")
+    second = reserve(store, "two")
+    third = reserve(store, "three")
+    full = reserve(store, "full", context_tier="64k-full")
+
+    assert [
+        first.reservation.node_id,
+        second.reservation.node_id,
+        third.reservation.node_id,
+    ] == ["fast-a", "fast-b", "fast-a"]
+    assert full.reservation.node_id == "full"
+    with pytest.raises(RelayStateNoEligibleNode):
+        reserve(store, "missing", model_id="missing")
+
+
+def test_unhealthy_draining_expired_incompatible_and_full_nodes_are_ineligible(
+    store_factory,
+):
+    clock = EpochClock()
+    store = store_factory(clock=clock, lease_ttl_seconds=5, max_queue_depth_per_node=1)
+    store.register("expired", scheduler_capabilities(concurrency=1), digest("expired"))
+    clock.value += 5
+    for node in ("unhealthy", "draining", "full"):
+        store.register(node, scheduler_capabilities(concurrency=1), digest(node))
+    store.set_scheduler_state(
+        "unhealthy", digest("unhealthy"), healthy=False, draining=False
+    )
+    store.set_scheduler_state(
+        "draining", digest("draining"), healthy=True, draining=True
+    )
+    reserve(
+        store, "occupy", client_public_key="other", deadline_epoch=clock.value + 100
+    )
+    with pytest.raises(RelayStateNoEligibleNode):
+        reserve(store, deadline_epoch=clock.value + 100)
+    assert store.get("expired") is None
+
+
+def test_selection_retry_is_idempotent_conflicts_and_does_not_disclose_token(
+    store_factory,
+):
+    store = store_factory()
+    store.register("node-a", scheduler_capabilities(), digest("node-a"))
+    first = reserve(store)
+    repeated = reserve(store)
+    assert repeated.created is False and repeated.reservation_token is None
+    assert repeated.reservation == first.reservation
+    assert len(store.reservations()) == 1
+    with pytest.raises(RelayStateConflict, match="different parameters"):
+        reserve(store, model_id="model-b")
+    raw_token = first.reservation_token
+    assert raw_token and len(raw_token) == 64
+    assert raw_token not in repr(first)
+    assert raw_token not in repr(store.reservations())
+    assert raw_token not in repr(vars(store))
+    assert (
+        first.reservation.token_digest == hashlib.sha256(raw_token.encode()).hexdigest()
+    )
+
+
+def test_reservation_expiry_is_inclusive_releases_once_without_rewinding_cursor(
+    store_factory,
+):
+    clock = EpochClock()
+    store = store_factory(clock=clock, reservation_ttl_seconds=5)
+    store.register("node-a", scheduler_capabilities(concurrency=1), digest("a"))
+    store.register("node-b", scheduler_capabilities(concurrency=1), digest("b"))
+    first = reserve(store, deadline_epoch=clock.value + 100)
+    clock.value = first.reservation.expires_at_epoch
+    assert store.reservations() == ()
+    assert (
+        reserve(store, "next", deadline_epoch=clock.value + 100).reservation.node_id
+        == "node-b"
+    )
+
+
+def test_enqueue_consumes_once_and_identical_retry_is_safe(store_factory):
+    store = store_factory()
+    store.register("node-a", scheduler_capabilities(), digest("node-a"))
+    selected = reserve(store)
+    args = dict(
+        client_public_key="client-key",
+        request_id="request-a",
+        reservation_token=selected.reservation_token,
+        node_id="node-a",
+        model_id="model-a",
+        context_tier="8k-fast",
+        deadline_epoch=1_700_000_100.0,
+        envelope=envelope(),
+    )
+    first = store.enqueue_encrypted_request(**args)
+    repeated = store.enqueue_encrypted_request(**args)
+    assert first.created is True and repeated.created is False
+    assert first.request == repeated.request and len(store.queued()) == 1
+    assert store.reservations() == ()
+
+
+def test_enqueue_conflict_wrong_cross_identity_cross_node_and_reused_tokens_fail_closed(
+    store_factory,
+):
+    store = store_factory()
+    store.register("node-a", scheduler_capabilities(), digest("node-a"))
+    store.register("node-b", scheduler_capabilities(), digest("node-b"))
+    selected = reserve(store)
+    base = dict(
+        client_public_key="client-key",
+        request_id="request-a",
+        reservation_token=selected.reservation_token,
+        node_id=selected.reservation.node_id,
+        model_id="model-a",
+        context_tier="8k-fast",
+        deadline_epoch=1_700_000_100.0,
+        envelope=envelope(),
+    )
+    for change in (
+        {"reservation_token": "0" * 64},
+        {"client_public_key": "other-client"},
+        {"request_id": "other-request"},
+        {"node_id": "node-b"},
+    ):
+        with pytest.raises(RelayStateReservationInvalid):
+            store.enqueue_encrypted_request(**{**base, **change})
+    assert store.queued() == () and len(store.reservations()) == 1
+    store.enqueue_encrypted_request(**base)
+    with pytest.raises(RelayStateConflict):
+        store.enqueue_encrypted_request(**{**base, "envelope": envelope("different")})
+    with pytest.raises(RelayStateReservationInvalid):
+        store.enqueue_encrypted_request(**{**base, "request_id": "new-request"})
+    assert len(store.queued()) == 1
+
+
+def test_expired_token_and_deadline_fail_at_inclusive_epoch_boundary(store_factory):
+    clock = EpochClock()
+    store = store_factory(clock=clock, reservation_ttl_seconds=5)
+    store.register("node-a", scheduler_capabilities(), digest("node-a"))
+    selected = reserve(store, deadline_epoch=clock.value + 5)
+    clock.value += 5
+    with pytest.raises((RelayStateStoreError, RelayStateReservationInvalid)):
+        store.enqueue_encrypted_request(
+            "client-key",
+            "request-a",
+            selected.reservation_token,
+            "node-a",
+            "model-a",
+            "8k-fast",
+            clock.value,
+            envelope(),
+        )
+    assert store.reservations() == () and store.queued() == ()
+
+
+def test_strict_envelope_allowlist_immutability_and_byte_bound(store_factory):
+    store = store_factory(max_envelope_bytes=64)
+    store.register("node-a", scheduler_capabilities(), digest("node-a"))
+    with pytest.raises(TypeError):
+        EncryptedRequestEnvelope(
+            protocol="tokenplace_api_v1_relay_e2ee",
+            version=1,
+            ciphertext="c",
+            cipherkey="k",
+            iv="i",
+            messages=[{"content": "plaintext"}],  # type: ignore[call-arg]
+        )
+    selected = reserve(store)
+    with pytest.raises(RelayStateCapacityExceeded):
+        store.enqueue_encrypted_request(
+            "client-key",
+            "request-a",
+            selected.reservation_token,
+            "node-a",
+            "model-a",
+            "8k-fast",
+            1_700_000_100.0,
+            envelope("x" * 100),
+        )
+    assert store.queued() == ()
+
+
+def test_concurrent_idempotency_and_admission_never_overreserve(store_factory):
+    store = store_factory(max_queue_depth_per_node=2, max_reservations_per_node=2)
+    store.register("node-a", scheduler_capabilities(concurrency=2), digest("node-a"))
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        same = list(pool.map(lambda _index: reserve(store), range(20)))
+    assert sum(item.created for item in same) == 1 and len(store.reservations()) == 1
+    token = next(item.reservation_token for item in same if item.reservation_token)
+    enqueue_args = (
+        "client-key",
+        "request-a",
+        token,
+        "node-a",
+        "model-a",
+        "8k-fast",
+        1_700_000_100.0,
+        envelope(),
+    )
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        enqueued = list(
+            pool.map(
+                lambda _index: store.enqueue_encrypted_request(*enqueue_args), range(20)
+            )
+        )
+    assert sum(item.created for item in enqueued) == 1 and len(store.queued()) == 1
+
+    def attempt(index):
+        try:
+            return reserve(store, f"other-{index}", client_public_key=f"client-{index}")
+        except RelayStateNoEligibleNode:
+            return None
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(attempt, range(50)))
+    assert len(store.queued()) + len(store.reservations()) <= 2

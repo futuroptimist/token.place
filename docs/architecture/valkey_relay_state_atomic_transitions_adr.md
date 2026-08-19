@@ -223,8 +223,12 @@ identity-bound reservation for every new request; cached-node reuse cannot bypas
 reuse another request's token. Adding these selection parameters and response/request token fields is
 compatible with the wire schema, but shared-state multi-worker mode fails closed for clients that
 omit them; legacy clients remain supported only in single-process memory mode until upgraded. Raw
-selection identity values are validated and held only for the request; the reservation stores their
-digests, the token is never logged, and only its digest is stored.
+selection identity values are validated and bounded. Reservations store their canonical digests;
+queued lifecycle records retain the exact public key and request ID as the minimum routing metadata
+needed to deliver and correlate ciphertext. They do not accept arbitrary payload fields. The token
+is never logged, and only its digest is stored. Enqueue retains that consumed digest in private
+idempotency state for the queued lifecycle, so only the original token with the identical canonical
+request can repeat successfully; cleanup removes the digest with its queued record.
 
 Reservations count toward node concurrency and queue bounds. Enqueue consumes one; cancellation,
 deadline expiry, or the short reservation TTL releases it through the same bounded reaper. A retry

@@ -66,6 +66,10 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def digest_with_domain(value: str, domain: bytes) -> str:
+    return hashlib.sha256(domain + value.encode()).hexdigest()
+
+
 def envelope(ciphertext="ciphertext"):
     return EncryptedRequestEnvelope(
         protocol="tokenplace_api_v1_relay_e2ee",
@@ -503,12 +507,15 @@ def test_enqueue_consumes_once_and_identical_retry_is_safe(store_factory, capabi
     assert result.created and not retry.created and result.sequence == retry.sequence
     assert store.list_reservations() == ()
     assert len(store.queued_requests("node-a")) == 1
+    with pytest.raises(RelayStateInvalidReservation):
+        enqueue(store, selection, reservation_token="0" * 64)
+    assert len(store.queued_requests("node-a")) == 1
     with pytest.raises(RelayStateConflict):
         enqueue(store, selection, envelope=envelope("different"))
     assert len(store.queued_requests("node-a")) == 1
 
 
-def test_selection_retry_after_enqueue_reports_enqueue_time(
+def test_selection_retry_after_enqueue_reports_explicit_queued_state(
     store_factory, capabilities
 ):
     clock = EpochClock()
@@ -520,8 +527,10 @@ def test_selection_retry_after_enqueue_reports_enqueue_time(
 
     retry = reserve(store)
 
-    assert retry.reservation_expires_at_epoch == clock.value
-    assert retry.reservation_expires_at_epoch != retry.request_deadline_epoch
+    assert retry.state == "queued"
+    assert retry.reservation_expires_at_epoch is None
+    assert retry.reservation_token is None
+    assert not retry.created
 
 
 @pytest.mark.parametrize("teardown", ["unregister", "expire"])
@@ -538,8 +547,8 @@ def test_node_teardown_removes_queued_work(store_factory, capabilities, teardown
         assert store.expire()
 
     assert store.queued_requests("node-a") == ()
-    store.register("node-b", capabilities, digest("replacement"))
-    assert reserve(store).selected_node_id == "node-b"
+    store.register("node-a", capabilities, digest("replacement"))
+    assert reserve(store).selected_node_id == "node-a"
 
 
 def test_wrong_cross_identity_cross_node_expired_and_reused_tokens_fail(
@@ -658,6 +667,107 @@ def test_scheduler_reads_are_immutable_defensive_copies(store_factory, capabilit
     assert store.queued_requests("node-a")[0].envelope.ciphertext == "ciphertext"
 
 
+def test_queue_preserves_only_exact_safe_routing_identity(store_factory, capabilities):
+    store = store_factory()
+    store.register("node-a", capabilities, digest("owner"))
+    selection = reserve(
+        store, request_id="Request-Exact", client_public_key="Key-Exact"
+    )
+    enqueue(
+        store,
+        selection,
+        request_id="Request-Exact",
+        client_public_key="Key-Exact",
+    )
+
+    queued = store.queued_requests("node-a")[0]
+    assert queued.client_public_key == "Key-Exact"
+    assert queued.request_id == "Request-Exact"
+    assert queued.client_identity_digest == digest_with_domain("Key-Exact", b"client\0")
+    assert queued.request_identity_digest == digest_with_domain(
+        "Request-Exact", b"request\0"
+    )
+    assert {field.name for field in fields(type(queued))}.isdisjoint(
+        {"prompt", "messages", "credentials", "url", "headers", "payload"}
+    )
+    assert selection.reservation_token not in repr(queued)
+
+
+def test_reservation_expiry_preserves_fairness_cursor(store_factory, capabilities):
+    clock = EpochClock()
+    store = store_factory(clock=clock, reservation_ttl_seconds=1)
+    for node_id in ("node-a", "node-b"):
+        store.register(node_id, capabilities, digest(node_id))
+    assert reserve(store).selected_node_id == "node-a"
+    clock.value += 1
+    assert reserve(store, "request-b").selected_node_id == "node-b"
+
+
+def test_fingerprint_bound_evicts_inactive_lru_but_not_active(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock, max_scheduler_fingerprints=2, reservation_ttl_seconds=1
+    )
+    store.register(
+        "node-a",
+        replace(
+            capabilities,
+            supported_model_ids=("model-a", "model-b", "model-c"),
+            max_concurrency=3,
+        ),
+        digest("owner"),
+    )
+    reserve(store, "a", requested_model_id="model-a")
+    reserve(store, "b", requested_model_id="model-b")
+    before = store.list_reservations()
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store, "c", requested_model_id="model-c")
+    assert store.list_reservations() == before
+    clock.value += 1
+    assert reserve(store, "c", requested_model_id="model-c").created
+
+
+def test_global_lifecycle_and_queue_bounds_reject_without_mutation(
+    store_factory, capabilities
+):
+    store = store_factory(max_request_lifecycles=1, max_queued_requests=1)
+    store.register("node-a", replace(capabilities, max_concurrency=3), digest("owner"))
+    first = reserve(store)
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store, "request-b")
+    assert store.list_reservations()[0].request_identity_digest == digest_with_domain(
+        "request-a", b"request\0"
+    )
+    enqueue(store, first)
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store, "request-b")
+    assert len(store.queued_requests("node-a")) == 1
+
+
+def test_concurrent_per_client_queued_boundary(store_factory, capabilities):
+    store = store_factory(
+        max_reservations_per_client=8, max_queued_requests_per_client=2
+    )
+    store.register("node-a", replace(capabilities, max_concurrency=8), digest("owner"))
+    selections = [reserve(store, f"request-{index}") for index in range(8)]
+
+    def attempt(selection):
+        try:
+            return enqueue(
+                store, selection, request_id=f"request-{selections.index(selection)}"
+            )
+        except RelayStateNoCapacity:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(attempt, selections))
+    assert sum(result is not None for result in results) == 2
+    assert len(store.queued_requests("node-a")) == 2
+    assert len(store.list_reservations()) == 6
+
+
 def test_context_requirement_and_claimed_work_count_toward_capacity(
     store_factory, capabilities
 ):
@@ -741,6 +851,9 @@ def test_inactive_fairness_fingerprints_are_reclaimed(store_factory, capabilitie
         ("max_reservations_per_client", 0),
         ("max_reservations_per_node", 0),
         ("max_queue_depth_per_node", 0),
+        ("max_request_lifecycles", 0),
+        ("max_queued_requests", 0),
+        ("max_queued_requests_per_client", 0),
         ("max_identity_bytes", 0),
         ("max_model_id_bytes", 0),
         ("max_scheduler_fingerprints", 0),

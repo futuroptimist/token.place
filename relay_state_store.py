@@ -65,6 +65,9 @@ class RelayStateStoreConfig:
     max_reservations_per_client: int = 8
     max_reservations_per_node: int = 128
     max_queue_depth_per_node: int = 128
+    max_request_lifecycles: int = 4096
+    max_queued_requests: int = 4096
+    max_queued_requests_per_client: int = 8
     max_identity_bytes: int = 8192
     max_model_id_bytes: int = 128
     max_scheduler_fingerprints: int = 4096
@@ -117,6 +120,13 @@ class RelayStateStoreConfig:
             (self.max_reservations_per_client, "per-client reservation bound", 10_000),
             (self.max_reservations_per_node, "per-node reservation bound", 10_000),
             (self.max_queue_depth_per_node, "per-node queue bound", 1_000_000),
+            (self.max_request_lifecycles, "request lifecycle bound", 1_000_000),
+            (self.max_queued_requests, "global queue bound", 1_000_000),
+            (
+                self.max_queued_requests_per_client,
+                "per-client queued-work bound",
+                10_000,
+            ),
             (self.max_identity_bytes, "identity byte bound", 65_536),
             (self.max_model_id_bytes, "model-id byte bound", 1024),
             (self.max_scheduler_fingerprints, "scheduler fingerprint bound", 1_000_000),
@@ -306,17 +316,18 @@ class SelectionResult:
     An idempotent retry returns the same metadata with ``None``: the store cannot
     reconstruct a raw token from the only persisted value, its digest. Callers must
     retain the first token or retry selection after the short reservation expiry.
-    Once a request is queued, ``reservation_expires_at_epoch`` reports its stable
-    enqueue time rather than implying that a consumed reservation remains valid.
+    ``state`` distinguishes a live reservation from an already queued lifecycle.
+    Queued results never expose a token or reservation expiry.
     """
 
     selected_node_id: str
     requested_model_id: str
     requested_context_tier: str
     request_deadline_epoch: float
-    reservation_expires_at_epoch: float
+    reservation_expires_at_epoch: float | None
     reservation_token: str | None
     created: bool
+    state: str = "reserved"
 
     def __repr__(self) -> str:
         return (
@@ -325,7 +336,8 @@ class SelectionResult:
             f"requested_context_tier={self.requested_context_tier!r}, "
             f"request_deadline_epoch={self.request_deadline_epoch!r}, "
             f"reservation_expires_at_epoch={self.reservation_expires_at_epoch!r}, "
-            f"token_present={self.reservation_token is not None}, created={self.created!r})"
+            f"token_present={self.reservation_token is not None}, created={self.created!r}, "
+            f"state={self.state!r})"
         )
 
 
@@ -357,6 +369,8 @@ class QueuedRequest:
 
     client_identity_digest: str
     request_identity_digest: str
+    client_public_key: str
+    request_id: str
     selected_node_id: str
     requested_model_id: str
     requested_context_tier: str
@@ -445,8 +459,10 @@ class InMemoryRelayStateStore:
         self._next_registration_order = 0
         self._reservations: dict[tuple[str, str], ReservationRecord] = {}
         self._queued: dict[tuple[str, str], QueuedRequest] = {}
+        self._queued_token_digests: dict[tuple[str, str], str] = {}
         self._node_queues: dict[str, list[QueuedRequest]] = {}
-        self._fairness_cursors: dict[str, str] = {}
+        self._fairness_cursors: dict[str, tuple[str, int]] = {}
+        self._fairness_activity = 0
         self._next_queue_sequence = 0
         self._lock = threading.RLock()
 
@@ -554,7 +570,6 @@ class InMemoryRelayStateStore:
             self._registration_order.pop(node_id, None)
             self._remove_node_reservations_locked(node_id)
             self._remove_node_queue_locked(node_id)
-            self._reap_fairness_cursors_locked()
             return True
 
     def set_scheduler_state(
@@ -604,15 +619,21 @@ class InMemoryRelayStateStore:
                     model_id,
                     tier,
                     deadline,
-                    queued.enqueued_at_epoch,
+                    None,
                     None,
                     False,
+                    "queued",
                 )
             existing = self._reservations.get(identity)
             if existing is not None:
                 self._require_same_parameters(existing, model_id, tier, deadline)
                 return self._selection_result(existing, None, False)
             if len(self._reservations) >= self.config.max_reservations:
+                raise RelayStateNoCapacity("no scheduler capacity")
+            if (
+                len(self._reservations) + len(self._queued)
+                >= self.config.max_request_lifecycles
+            ):
                 raise RelayStateNoCapacity("no scheduler capacity")
             client_lifecycle_count = sum(
                 item.client_identity_digest == client_digest
@@ -664,7 +685,8 @@ class InMemoryRelayStateStore:
             tied = sorted(
                 (item for item in eligible if item[1] == least_load), key=lambda x: x[2]
             )
-            cursor = self._fairness_cursors.get(fingerprint)
+            cursor_record = self._fairness_cursors.get(fingerprint)
+            cursor = cursor_record[0] if cursor_record is not None else None
             selected = tied[0]
             if cursor is not None:
                 cursor_order = self._registration_order.get(cursor, -1)
@@ -672,6 +694,7 @@ class InMemoryRelayStateStore:
                     (item for item in tied if item[2] > cursor_order), tied[0]
                 )
             node_id = selected[3]
+            evicted_fingerprint = self._cursor_eviction_candidate_locked(fingerprint)
             raw_token = secrets.token_hex(32)
             expires = min(now + self.config.reservation_ttl_seconds, deadline)
             if not math.isfinite(expires):
@@ -687,15 +710,11 @@ class InMemoryRelayStateStore:
                 expires,
                 hashlib.sha256(raw_token.encode("ascii")).hexdigest(),
             )
+            if evicted_fingerprint is not None:
+                del self._fairness_cursors[evicted_fingerprint]
             self._reservations[identity] = record
-            if (
-                fingerprint not in self._fairness_cursors
-                and len(self._fairness_cursors)
-                >= self.config.max_scheduler_fingerprints
-            ):
-                del self._reservations[identity]
-                raise RelayStateNoCapacity("no scheduler capacity")
-            self._fairness_cursors[fingerprint] = node_id
+            self._fairness_activity += 1
+            self._fairness_cursors[fingerprint] = (node_id, self._fairness_activity)
             return self._selection_result(record, raw_token, True)
 
     def enqueue_encrypted_request(
@@ -730,6 +749,10 @@ class InMemoryRelayStateStore:
                     or existing.envelope != envelope
                 ):
                     raise RelayStateConflict("request identity conflict")
+                if not hmac.compare_digest(
+                    self._queued_token_digests[identity], token_digest
+                ):
+                    raise RelayStateInvalidReservation("reservation invalid")
                 return self._enqueue_result(existing, False)
             if deadline <= now:
                 raise RelayStateInvalidReservation("reservation invalid")
@@ -751,10 +774,21 @@ class InMemoryRelayStateStore:
                 >= self.config.max_queue_depth_per_node
             ):
                 raise RelayStateNoCapacity("no scheduler capacity")
+            queued_for_client = sum(
+                item.client_identity_digest == client_digest
+                for item in self._queued.values()
+            )
+            if (
+                len(self._queued) >= self.config.max_queued_requests
+                or queued_for_client >= self.config.max_queued_requests_per_client
+            ):
+                raise RelayStateNoCapacity("no scheduler capacity")
             self._next_queue_sequence += 1
             queued = QueuedRequest(
                 client_digest,
                 request_digest,
+                client_public_key,
+                request_id,
                 selected_node_id,
                 model_id,
                 tier,
@@ -764,6 +798,7 @@ class InMemoryRelayStateStore:
                 self._next_queue_sequence,
             )
             self._queued[identity] = queued
+            self._queued_token_digests[identity] = token_digest
             self._node_queues.setdefault(selected_node_id, []).append(queued)
             del self._reservations[identity]
             return self._enqueue_result(queued, True)
@@ -796,8 +831,6 @@ class InMemoryRelayStateStore:
             self._registration_order.pop(record.node_id, None)
             self._remove_node_reservations_locked(record.node_id)
             self._remove_node_queue_locked(record.node_id)
-        if expired:
-            self._reap_fairness_cursors_locked()
         return expired
 
     def _reap_locked(self, now: float) -> None:
@@ -811,11 +844,11 @@ class InMemoryRelayStateStore:
         for identity, queued in tuple(self._queued.items()):
             if queued.request_deadline_epoch <= now:
                 del self._queued[identity]
+                del self._queued_token_digests[identity]
                 queue = self._node_queues.get(queued.selected_node_id, [])
                 self._node_queues[queued.selected_node_id] = [
                     item for item in queue if item != queued
                 ]
-        self._reap_fairness_cursors_locked()
 
     def _remove_node_reservations_locked(self, node_id: str) -> None:
         for identity, reservation in tuple(self._reservations.items()):
@@ -829,8 +862,9 @@ class InMemoryRelayStateStore:
                 queued.request_identity_digest,
             )
             self._queued.pop(identity, None)
+            self._queued_token_digests.pop(identity, None)
 
-    def _reap_fairness_cursors_locked(self) -> None:
+    def _active_fairness_fingerprints_locked(self) -> set[str]:
         active_fingerprints = {
             reservation.scheduler_fingerprint
             for reservation in self._reservations.values()
@@ -841,9 +875,28 @@ class InMemoryRelayStateStore:
             )
             for queued in self._queued.values()
         )
-        for fingerprint in tuple(self._fairness_cursors):
-            if fingerprint not in active_fingerprints:
-                del self._fairness_cursors[fingerprint]
+        return active_fingerprints
+
+    def _cursor_eviction_candidate_locked(self, fingerprint: str) -> str | None:
+        if fingerprint in self._fairness_cursors:
+            return None
+        if len(self._fairness_cursors) < self.config.max_scheduler_fingerprints:
+            return None
+        active = self._active_fairness_fingerprints_locked()
+        candidate = min(
+            (
+                (activity, existing_fingerprint)
+                for existing_fingerprint, (
+                    _,
+                    activity,
+                ) in self._fairness_cursors.items()
+                if existing_fingerprint not in active
+            ),
+            default=None,
+        )
+        if candidate is None:
+            raise RelayStateNoCapacity("no scheduler capacity")
+        return candidate[1]
 
     def _identity(self, client_public_key: str, request_id: str) -> tuple[str, str]:
         return (

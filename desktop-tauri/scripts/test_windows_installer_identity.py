@@ -708,6 +708,48 @@ def verify_authority_removed(before: AuthoritySnapshot) -> None:
         raise InstallerIdentityError(f"authority remains after uninstall: {', '.join(categories)}")
 
 
+def remediate_captured_stale_shortcuts(before: AuthoritySnapshot, current: AuthoritySnapshot) -> bool:
+    """Remove only unchanged, captured product shortcuts orphaned by uninstall.
+
+    Windows Explorer can retain an NSIS-created shortcut after the uninstaller has
+    removed every other installed authority.  Remediation is intentionally limited
+    to the exact path/target pairs captured before uninstall; anything new or
+    retargeted remains evidence of unsafe residual authority.
+    """
+    if not before.canonical_targets or not current.shortcuts.shortcuts or current.registry:
+        return False
+    if any(target.exists() for target in before.canonical_targets):
+        return False
+    if _processes_running_targets(before.canonical_targets):
+        return False
+
+    captured = {
+        (_canonical_path(shortcut.path), _canonical_path(shortcut.target))
+        for shortcut in before.shortcuts.shortcuts
+    }
+    remaining = current.shortcuts.shortcuts
+    if any(
+        not shortcut.path.exists()
+        or shortcut.target.exists()
+        or (_canonical_path(shortcut.path), _canonical_path(shortcut.target)) not in captured
+        for shortcut in remaining
+    ):
+        return False
+
+    for shortcut in remaining:
+        try:
+            shortcut.path.unlink()
+        except OSError as exc:
+            raise InstallerIdentityError(
+                f"failed to remove captured stale product shortcut: path={shortcut.path}"
+            ) from exc
+        if shortcut.path.exists():
+            raise InstallerIdentityError(
+                f"captured stale product shortcut remains after exact-path removal: path={shortcut.path}"
+            )
+    return True
+
+
 def wait_for_cleanup_convergence(
     before: AuthoritySnapshot,
     *,
@@ -723,6 +765,10 @@ def wait_for_cleanup_convergence(
     reported_milestones: set[int] = set()
     while True:
         last_categories = residual_authority_categories(before)
+        if last_categories == ["shortcuts"] and before.canonical_targets:
+            current = capture_authority_snapshot()
+            if remediate_captured_stale_shortcuts(before, current):
+                continue
         if not last_categories:
             if artifact_directory is not None:
                 _persist_snapshot(artifact_directory, "final", capture_authority_snapshot())

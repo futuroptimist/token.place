@@ -51,7 +51,8 @@ prerequisite only: it does **not** make the relay horizontally scalable and does
 The following remain future design and implementation work:
 
 - migration of runtime routes or rate-limit ownership lookups;
-- queues, claims/reclaim, responses, cancellation, tombstones, and outcome deduplication;
+- terminal transitions (completion, failure, and cancellation), queues, claims/reclaim, responses,
+  tombstones, and outcome deduplication;
 - scheduler reservations and cursors, shared rate limits, and functional availability;
 - Valkey data structures, transactions/server-side scripts, and failure semantics;
 - Sentinel discovery and HA deployment topology;

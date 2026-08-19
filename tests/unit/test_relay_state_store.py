@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 
 import pytest
 
-from relay_state_store import (
-    ComputeNodeCapabilities,
-    InMemoryRelayStateStore,
-    RelayStateCapacityExceeded,
-    RelayStateCredentialMismatch,
-    RelayStateStore,
-    RelayStateStoreConfig,
-    RelayStateStoreError,
-)
+# isort: off
+from relay_state_store import ComputeNodeCapabilities
+from relay_state_store import ComputeNodeRegistration
+from relay_state_store import InMemoryRelayStateStore
+from relay_state_store import RelayStateCapacityExceeded
+from relay_state_store import RelayStateCredentialMismatch
+from relay_state_store import RelayStateStore
+from relay_state_store import RelayStateStoreConfig
+from relay_state_store import RelayStateStoreError
+
+# isort: on
 
 
 class EpochClock:
@@ -58,7 +61,9 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def test_register_lookup_and_duplicate_require_owner_digest(store_factory, capabilities):
+def test_register_lookup_and_duplicate_require_owner_digest(
+    store_factory, capabilities
+):
     clock = EpochClock()
     store = store_factory(clock=clock, lease_ttl_seconds=30)
     assert isinstance(store, RelayStateStore)
@@ -199,6 +204,23 @@ def test_capability_bounds_reuse_current_scheduler_limits(capabilities):
         replace(capabilities, maximum_total_context_tokens=1)
 
 
+def test_capabilities_match_api_v1_canonical_normalisation():
+    normalized = ComputeNodeCapabilities(
+        supported_model_ids=(" QWEN3-8B ", "qwen3-8b", " Llama-3 ", "QWEN3-8B"),
+        active_context_tier=" 8K-FAST ",
+        maximum_total_context_tokens=8192,
+        default_output_token_reservation=1,
+        maximum_output_tokens=1,
+        max_concurrency=1,
+        backend_class=" CUDA ",
+    )
+
+    assert normalized.supported_model_ids == ("qwen3-8b", "llama-3")
+    assert normalized.active_context_tier == "8k-fast"
+    assert normalized.backend_class == "cuda"
+    assert replace(normalized, backend_class=" Unsupported ").backend_class == "unknown"
+
+
 def test_records_are_immutable_and_reads_do_not_expose_mutable_state(
     store_factory, capabilities
 ):
@@ -232,24 +254,70 @@ def test_raw_credentials_and_application_payloads_are_outside_the_typed_contract
         store.register("node-a", payload, digest("owner"))  # type: ignore[arg-type]
 
 
+def test_plaintext_and_arbitrary_payload_fields_are_absent_from_typed_api():
+    forbidden = {
+        "control_credential",
+        "prompt",
+        "messages",
+        "tools",
+        "tool_data",
+        "model_output",
+        "relay_private_key",
+        "payload",
+    }
+    typed_fields = {
+        field.name
+        for record_type in (
+            RelayStateStoreConfig,
+            ComputeNodeCapabilities,
+            ComputeNodeRegistration,
+        )
+        for field in fields(record_type)
+    }
+    public_parameters = {
+        parameter
+        for method in (RelayStateStore.register, RelayStateStore.renew)
+        for parameter in inspect.signature(method).parameters
+    }
+
+    assert forbidden.isdisjoint(typed_fields)
+    assert forbidden.isdisjoint(public_parameters)
+
+
 def test_concurrent_registration_and_renewal_never_duplicate_or_tear_state(
     store_factory, capabilities
 ):
     store = store_factory(lease_ttl_seconds=30)
     owner_digest = digest("owner")
 
+    snapshots = tuple(
+        replace(
+            capabilities,
+            supported_model_ids=(f"model-{index}", f"shared-{index}"),
+            max_concurrency=index + 1,
+            backend_class=("cuda" if index % 2 else "metal"),
+        )
+        for index in range(8)
+    )
+
     def transition(index: int):
+        snapshot = snapshots[index % len(snapshots)]
         if index % 2:
-            return store.register("node-a", capabilities, owner_digest)
-        return store.renew("node-a", owner_digest, capabilities=capabilities)
+            return store.register("node-a", snapshot, owner_digest)
+        return store.renew("node-a", owner_digest, capabilities=snapshot)
 
     store.register("node-a", capabilities, owner_digest)
     with ThreadPoolExecutor(max_workers=16) as pool:
         results = list(pool.map(transition, range(200)))
 
-    assert all(result is not None for result in results)
+    assert all(
+        result is not None
+        and result.capabilities in snapshots
+        and result.control_credential_digest == owner_digest
+        for result in results
+    )
     records = store.list()
     assert len(records) == 1
     assert records[0].node_id == "node-a"
-    assert records[0].capabilities == capabilities
+    assert records[0].capabilities in snapshots
     assert records[0].control_credential_digest == owner_digest

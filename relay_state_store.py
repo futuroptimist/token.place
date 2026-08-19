@@ -6,6 +6,7 @@ small registration/lease contract that future shared backends must implement.
 
 from __future__ import annotations
 
+import hmac
 import math
 import re
 import threading
@@ -102,6 +103,7 @@ class ComputeNodeCapabilities:
                 "supported model IDs must be a tuple containing 1-64 values"
             )
         normalized: list[str] = []
+        seen: set[str] = set()
         for model_id in self.supported_model_ids:
             if (
                 not isinstance(model_id, str)
@@ -112,12 +114,18 @@ class ComputeNodeCapabilities:
                     "model IDs must be non-empty strings of at most 128 characters"
                 )
             value = model_id.strip().lower()
-            if value in normalized:
-                raise RelayStateStoreError("supported model IDs must be unique")
-            normalized.append(value)
+            if value not in seen:
+                normalized.append(value)
+                seen.add(value)
         object.__setattr__(self, "supported_model_ids", tuple(normalized))
-        if self.active_context_tier not in CONTEXT_TIER_TOKEN_BOUNDS:
+        normalized_tier = (
+            self.active_context_tier.strip().lower()
+            if isinstance(self.active_context_tier, str)
+            else ""
+        )
+        if normalized_tier not in CONTEXT_TIER_TOKEN_BOUNDS:
             raise RelayStateStoreError("unsupported active context tier")
+        object.__setattr__(self, "active_context_tier", normalized_tier)
         self._validate_positive_int(
             self.maximum_total_context_tokens, "maximum context tokens"
         )
@@ -358,7 +366,7 @@ class InMemoryRelayStateStore:
 
     @staticmethod
     def _require_digest(record: ComputeNodeRegistration, digest: str) -> None:
-        if record.control_credential_digest != digest:
+        if not hmac.compare_digest(record.control_credential_digest, digest):
             raise RelayStateCredentialMismatch(
                 "control credential digest does not own this registration"
             )

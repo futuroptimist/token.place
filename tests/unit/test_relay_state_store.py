@@ -202,6 +202,25 @@ def test_renewal_rejects_an_infinite_deadline_without_mutating_live_record(
     assert store.get("node-a") == original
 
 
+def test_unknown_renewal_ignores_an_infinite_computed_deadline(
+    store_factory, capabilities
+):
+    store = store_factory(clock=EpochClock(1e308), lease_ttl_seconds=1e308)
+
+    assert store.renew("missing", digest("owner"), capabilities=capabilities) is None
+
+
+def test_boundary_expired_renewal_ignores_an_infinite_computed_deadline(
+    store_factory, capabilities
+):
+    clock = EpochClock(0.0)
+    store = store_factory(clock=clock, lease_ttl_seconds=1e308)
+    store.register("node-a", capabilities, digest("owner"))
+    clock.value = 1e308
+
+    assert store.renew("node-a", digest("owner")) is None
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

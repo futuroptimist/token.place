@@ -286,12 +286,12 @@ class InMemoryRelayStateStore:
             raise RelayStateStoreError("capabilities must be ComputeNodeCapabilities")
         with self._lock:
             now = self._now()
-            lease_deadline = self._lease_deadline(now)
             self._expire_locked(now)
             existing = self._records.get(node_id)
             if existing is None:
                 return None
             self._require_digest(existing, control_credential_digest)
+            lease_deadline = self._lease_deadline(now)
             renewed = replace(
                 existing,
                 capabilities=capabilities or existing.capabilities,

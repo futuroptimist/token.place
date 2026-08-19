@@ -11,6 +11,9 @@ import pytest
 
 # isort: off
 from relay_state_store import ComputeNodeCapabilities
+from relay_state_store import ClaimRecord
+from relay_state_store import ClaimRenewalResult
+from relay_state_store import ClaimResult
 from relay_state_store import ComputeNodeRegistration
 from relay_state_store import EncryptedRequestEnvelope
 from relay_state_store import InMemoryRelayStateStore
@@ -863,3 +866,355 @@ def test_inactive_fairness_fingerprints_are_reclaimed(store_factory, capabilitie
 def test_scheduler_configuration_bounds_are_explicit(field, value):
     with pytest.raises(RelayStateStoreError):
         RelayStateStoreConfig(namespace="test", **{field: value})
+
+
+def prepared_claim_store(store_factory, capabilities, *, clock=None, **config):
+    clock = clock or EpochClock()
+    store = store_factory(clock=clock, **config)
+    store.register("node-a", capabilities, digest("owner-a"))
+    selection = reserve(store)
+    enqueue(store, selection)
+    return store, clock
+
+
+def test_claim_fifo_empty_poll_and_capacity_is_unchanged(store_factory, capabilities):
+    store, _ = prepared_claim_store(store_factory, capabilities)
+    second = reserve(store, "request-b")
+    enqueue(store, second, "request-b", envelope=envelope("ciphertext-b"))
+
+    first_claim = store.claim_next_request("node-a", digest("owner-a"), "worker-a")
+    second_claim = store.claim_next_request("node-a", digest("owner-a"), "worker-a")
+
+    assert isinstance(first_claim, ClaimResult)
+    assert first_claim.state == "claimed" and first_claim.claim is not None
+    assert second_claim.claim is not None
+    assert (first_claim.claim.request_id, second_claim.claim.request_id) == (
+        "request-a",
+        "request-b",
+    )
+    assert (
+        store.claim_next_request("node-a", digest("owner-a"), "worker-a").state
+        == "empty"
+    )
+    assert len(store.queued_requests("node-a")) == 2
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store, "request-c")
+
+
+def test_claim_queues_are_independent_and_owner_authenticated(
+    store_factory, capabilities
+):
+    store = store_factory()
+    store.register("node-a", capabilities, digest("owner-a"))
+    store.register("node-b", capabilities, digest("owner-b"))
+    first = reserve(store)
+    enqueue(store, first)
+    second = reserve(store, "request-b", client_public_key="client-b")
+    enqueue(store, second, "request-b", client_public_key="client-b")
+
+    with pytest.raises(RelayStateCredentialMismatch):
+        store.claim_next_request("node-a", digest("wrong"), "worker")
+    claimed_a = store.claim_next_request("node-a", digest("owner-a"), "worker")
+    claimed_b = store.claim_next_request("node-b", digest("owner-b"), "worker")
+    assert claimed_a.claim is not None and claimed_a.claim.selected_node_id == "node-a"
+    assert claimed_b.claim is not None and claimed_b.claim.selected_node_id == "node-b"
+
+
+def test_simultaneous_claim_has_one_generation_winner(store_factory, capabilities):
+    store, _ = prepared_claim_store(store_factory, capabilities)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda worker: store.claim_next_request(
+                    "node-a", digest("owner-a"), f"worker-{worker}"
+                ),
+                range(8),
+            )
+        )
+    winners = [result for result in results if result.state == "claimed"]
+    assert len(winners) == 1
+    assert winners[0].claim is not None and winners[0].claim.generation == 1
+
+
+def test_claim_reclaim_is_inclusive_and_generations_increase(
+    store_factory, capabilities
+):
+    store, clock = prepared_claim_store(
+        store_factory, capabilities, claim_ttl_seconds=10
+    )
+    first = store.claim_next_request("node-a", digest("owner-a"), "worker-a").claim
+    assert first is not None
+    clock.value = first.claim_expires_at_epoch - 0.001
+    assert (
+        store.claim_next_request("node-a", digest("owner-a"), "worker-b").state
+        == "empty"
+    )
+    clock.value = first.claim_expires_at_epoch
+    second = store.claim_next_request("node-a", digest("owner-a"), "worker-b").claim
+    assert second is not None and second.generation == first.generation + 1
+    clock.value = second.claim_expires_at_epoch
+    third = store.claim_next_request("node-a", digest("owner-a"), "worker-c").claim
+    assert third is not None and third.generation == second.generation + 1
+    assert third.envelope is first.envelope
+    assert third.sequence == first.sequence
+    assert third.request_deadline_epoch == first.request_deadline_epoch
+
+
+def test_renewal_fences_stale_wrong_owner_node_consumer_and_identity(
+    store_factory, capabilities
+):
+    store, clock = prepared_claim_store(
+        store_factory, capabilities, claim_ttl_seconds=10
+    )
+    claim = store.claim_next_request("node-a", digest("owner-a"), "worker-a").claim
+    assert claim is not None
+    clock.value = claim.claim_expires_at_epoch
+    current = store.claim_next_request("node-a", digest("owner-a"), "worker-b").claim
+    assert current is not None
+
+    before = store.active_claims("node-a")
+    cases = [
+        store.renew_claim(
+            "node-a",
+            digest("owner-a"),
+            "worker-b",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ),
+        store.renew_claim(
+            "node-a",
+            digest("wrong"),
+            "worker-b",
+            "client-key",
+            "request-a",
+            current.generation,
+        ),
+        store.renew_claim(
+            "node-a",
+            digest("owner-a"),
+            "worker-a",
+            "client-key",
+            "request-a",
+            current.generation,
+        ),
+        store.renew_claim(
+            "node-a",
+            digest("owner-a"),
+            "worker-b",
+            "client-key",
+            "wrong-request",
+            current.generation,
+        ),
+    ]
+    assert [item.state for item in cases] == [
+        "stale_generation",
+        "owner_mismatch",
+        "owner_mismatch",
+        "missing",
+    ]
+    assert store.active_claims("node-a") == before
+
+
+def test_renewal_and_reclaim_are_deadline_bounded(store_factory, capabilities):
+    clock = EpochClock()
+    store, _ = prepared_claim_store(
+        store_factory,
+        capabilities,
+        clock=clock,
+        claim_ttl_seconds=300,
+        lease_ttl_seconds=300,
+    )
+    claim = store.claim_next_request("node-a", digest("owner-a"), "worker").claim
+    assert (
+        claim is not None
+        and claim.claim_expires_at_epoch == claim.request_deadline_epoch
+    )
+    clock.value = claim.request_deadline_epoch - 1
+    renewed = store.renew_claim(
+        "node-a",
+        digest("owner-a"),
+        "worker",
+        "client-key",
+        "request-a",
+        claim.generation,
+    )
+    assert isinstance(renewed, ClaimRenewalResult)
+    assert renewed.state == "continued"
+    assert renewed.claim_expires_at_epoch == claim.request_deadline_epoch
+    clock.value = claim.request_deadline_epoch
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("owner-a"),
+            "worker",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "missing"
+    )
+    assert (
+        store.claim_next_request("node-a", digest("owner-a"), "worker").state == "empty"
+    )
+
+
+def test_unregister_expiry_and_node_reuse_never_restore_old_generation(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = prepared_claim_store(
+        store_factory, capabilities, clock=clock, lease_ttl_seconds=10
+    )
+    old = store.claim_next_request("node-a", digest("owner-a"), "worker").claim
+    assert old is not None
+    assert store.unregister("node-a", digest("owner-a"))
+    store.register("node-a", capabilities, digest("owner-new"))
+    replacement = reserve(store)
+    enqueue(store, replacement)
+    new = store.claim_next_request("node-a", digest("owner-new"), "worker-new").claim
+    assert new is not None and new.generation > old.generation
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("owner-new"),
+            "worker",
+            "client-key",
+            "request-a",
+            old.generation,
+        ).state
+        == "stale_generation"
+    )
+
+
+def test_claim_records_are_immutable_defensive_and_relay_blind(
+    store_factory, capabilities
+):
+    store, _ = prepared_claim_store(store_factory, capabilities)
+    result = store.claim_next_request("node-a", digest("owner-a"), "unsafe-consumer")
+    claim = result.claim
+    assert isinstance(claim, ClaimRecord)
+    with pytest.raises(FrozenInstanceError):
+        claim.generation = 99
+    assert store.active_claims("node-a")[0] == claim
+    assert set(field.name for field in fields(ClaimRecord)) == {
+        "client_identity_digest",
+        "request_identity_digest",
+        "consumer_identity_digest",
+        "client_public_key",
+        "request_id",
+        "selected_node_id",
+        "requested_model_id",
+        "requested_context_tier",
+        "request_deadline_epoch",
+        "envelope",
+        "sequence",
+        "generation",
+        "claim_expires_at_epoch",
+    }
+    rendered = repr(result) + repr(claim)
+    for unsafe in (
+        "unsafe-consumer",
+        "client-key",
+        "request-a",
+        "node-a",
+        "ciphertext",
+    ):
+        assert unsafe not in rendered
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("claim_ttl_seconds", 0),
+        ("claim_ttl_seconds", 301),
+        ("max_claims", 0),
+        ("max_claims_per_node", 0),
+        ("max_claim_generations", 0),
+        ("max_consumer_identity_bytes", 0),
+    ],
+)
+def test_claim_configuration_bounds_are_explicit(field, value):
+    with pytest.raises(RelayStateStoreError):
+        RelayStateStoreConfig(namespace="test", **{field: value})
+
+
+def test_concurrent_renewal_versus_reclaim_is_atomic(store_factory, capabilities):
+    store, clock = prepared_claim_store(
+        store_factory, capabilities, claim_ttl_seconds=10, lease_ttl_seconds=100
+    )
+    old = store.claim_next_request("node-a", digest("owner-a"), "worker-a").claim
+    assert old is not None
+    clock.value = old.claim_expires_at_epoch
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        renewal_future = pool.submit(
+            store.renew_claim,
+            "node-a",
+            digest("owner-a"),
+            "worker-a",
+            "client-key",
+            "request-a",
+            old.generation,
+        )
+        reclaim_future = pool.submit(
+            store.claim_next_request,
+            "node-a",
+            digest("owner-a"),
+            "worker-b",
+        )
+    renewal = renewal_future.result()
+    reclaimed = reclaim_future.result()
+
+    assert renewal.state == "missing"
+    assert reclaimed.claim is not None
+    assert reclaimed.claim.generation == old.generation + 1
+    assert store.active_claims("node-a") == (reclaimed.claim,)
+
+
+def test_registration_expiry_and_wrong_node_fence_claim_renewal(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = prepared_claim_store(
+        store_factory, capabilities, clock=clock, lease_ttl_seconds=10
+    )
+    store.register("node-b", capabilities, digest("owner-b"))
+    claim = store.claim_next_request("node-a", digest("owner-a"), "worker").claim
+    assert claim is not None
+    assert (
+        store.renew_claim(
+            "node-b",
+            digest("owner-b"),
+            "worker",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "owner_mismatch"
+    )
+
+    clock.value += 10
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("owner-a"),
+            "worker",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "owner_mismatch"
+    )
+    store.register("node-a", capabilities, digest("new-owner"))
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("new-owner"),
+            "worker",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "missing"
+    )

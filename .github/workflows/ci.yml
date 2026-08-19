@@ -9,6 +9,7 @@ jobs:
   test:
     name: Run tests + relay landing-page real desktop-bridge API v1 guardrail
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
@@ -53,7 +54,20 @@ jobs:
           python -m pip install -r requirements.txt
       - name: Install Playwright browsers and system dependencies
         if: steps.prep.outputs.rc != '2'
-        run: python -m playwright install --with-deps chromium
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          attempt=0
+          max_attempts=2
+          until timeout 4m python -m playwright install --with-deps chromium; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::playwright install --with-deps chromium timed out or failed after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "playwright install attempt $attempt timed out or failed; retrying in 15s..." >&2
+            sleep 15
+          done
       - name: Install Node.js dependencies
         if: steps.prep.outputs.rc != '2'
         run: npm ci

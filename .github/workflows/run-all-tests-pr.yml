@@ -47,7 +47,20 @@ jobs:
         run: npm ci
 
       - name: Install Playwright Chromium with Linux system dependencies
-        run: python -m playwright install --with-deps chromium
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          attempt=0
+          max_attempts=2
+          until timeout 4m python -m playwright install --with-deps chromium; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::playwright install --with-deps chromium timed out or failed after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "playwright install attempt $attempt timed out or failed; retrying in 15s..." >&2
+            sleep 15
+          done
 
       - name: Restore cached tiny real GGUF for relay landing-page desktop-bridge API v1 guardrail
         uses: actions/cache@v4

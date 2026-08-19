@@ -1564,9 +1564,15 @@ def test_landing_chat_cancel_network_failure_is_visible(
 
 
 def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
-    """The chat UI should render markdown formatting returned by the assistant."""
+    """Fenced Markdown stays literal and renders for both chat participants."""
 
-    markdown_reply = "**Bold** introduction\n\n- First item\n- Second item\n\nHere is `inline` code and:\n```\nblock example\n```"
+    markdown_reply = (
+        "**Bold** introduction\n\n- First item\n- Second item\n\n"
+        "Here is `inline` code and two blocks:\n"
+        "```python\nfirst_value = '*literal*'\n<script>assistantOne()</script>\n```\n"
+        "Formatting _between_ blocks.\n"
+        "```\nsecond_value = **also_literal**\n<div>assistant two</div>\n```"
+    )
     route_landing_relay_chat(page, assistant_content=markdown_reply)
 
     page.goto(base_url)
@@ -1574,7 +1580,11 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     patch_landing_crypto_for_visible_envelopes(page)
 
     textarea = page.locator("textarea").first
-    textarea.fill("Show markdown please")
+    textarea.fill(
+        "**User bold** outside.\n"
+        "```text\nuser_value = _literal_\n<script>userCode()</script>\n```\n"
+        "<script>outsideUser()</script>"
+    )
     wait_for_landing_send_enabled(page).click()
 
     user_message = page.locator(".user-message").last
@@ -1584,7 +1594,9 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     expect(user_message).not_to_have_attribute("v-cloak", "")
     expect(assistant_message).not_to_have_attribute("v-cloak", "")
 
+    assert user_message.locator("strong").inner_text() == "User bold"
     assert assistant_message.locator("strong").inner_text() == "Bold"
+    assert assistant_message.locator("em").inner_text() == "between"
 
     list_items = assistant_message.locator("li")
     assert list_items.count() == 2
@@ -1594,11 +1606,24 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     inline_code = assistant_message.locator("code").first
     assert inline_code.inner_text() == "inline"
 
-    block_code = assistant_message.locator("pre code").first
-    assert "block example" in block_code.inner_text()
+    block_code = page.locator(".message pre code")
+    assert block_code.count() == 3
+    assert [block_code.nth(index).text_content() for index in range(3)] == [
+        "user_value = _literal_\n<script>userCode()</script>",
+        "first_value = '*literal*'\n<script>assistantOne()</script>",
+        "second_value = **also_literal**\n<div>assistant two</div>",
+    ]
 
-    # Ensure raw HTML isn't rendered unsanitized
-    assert assistant_message.locator("script").count() == 0
+    # Raw HTML remains escaped both inside and outside fenced blocks.
+    assert page.locator(".message script").count() == 0
+    visible_chat = page.locator(".message").all_inner_texts()
+    visible_text = "\n".join(visible_chat)
+    assert "<script>outsideUser()</script>" in visible_text
+    assert "CODEBLOCK0" not in visible_text
+    assert "CODEBLOCK1" not in visible_text
+    assert "codeblock0" not in visible_text
+    assert "codeblock1" not in visible_text
+
 
 def test_landing_chat_uses_api_v1_only_non_streaming(
     page: Page,

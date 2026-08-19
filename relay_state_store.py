@@ -959,7 +959,7 @@ class InMemoryRelayStateStore:
                 existing = self._claims.get(identity)
                 if existing is not None and existing.lease_expires_at_epoch > now:
                     continue
-                if existing is None and (
+                if (
                     len(active_claims) >= self.config.max_claims
                     or node_claims >= self.config.max_claims_per_node
                 ):

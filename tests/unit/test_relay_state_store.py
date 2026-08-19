@@ -222,6 +222,49 @@ def test_expired_claim_is_reclaimable_not_active_or_capacity_consuming(
     second = store.claim_queued_request("node-b", digest("owner-b"), "worker-b")
     assert second.state == "claimed"
 
+    with pytest.raises(RelayStateCapacityExceeded):
+        store.claim_queued_request("node-a", digest("owner"), "worker-new")
+
+
+def test_expired_claim_releases_per_node_capacity_for_reclaim(
+    store_factory, capabilities
+):
+    store, clock = registered_store(
+        store_factory, capabilities, max_claims=2, max_claims_per_node=1
+    )
+    queued_work(store, "request-a")
+    first = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+
+    clock.value = first.lease_expires_at_epoch
+    reclaimed = store.claim_queued_request(
+        "node-a", digest("owner"), "worker-new"
+    )
+
+    assert reclaimed.state == "reclaimed"
+    assert reclaimed.generation > first.generation
+
+
+def test_multiple_reclaims_strictly_increase_generation(store_factory, capabilities):
+    store, clock = registered_store(
+        store_factory, capabilities, lease_ttl_seconds=60
+    )
+    queued_work(store)
+    claims = [store.claim_queued_request("node-a", digest("owner"), "worker-0")]
+
+    for attempt in range(1, 4):
+        clock.value = claims[-1].lease_expires_at_epoch
+        claims.append(
+            store.claim_queued_request(
+                "node-a", digest("owner"), f"worker-{attempt}"
+            )
+        )
+
+    assert [claim.state for claim in claims] == ["claimed"] + ["reclaimed"] * 3
+    assert all(
+        newer.generation > older.generation
+        for older, newer in zip(claims, claims[1:])
+    )
+
 
 def test_claimed_idempotent_results_have_claimed_state_and_no_new_token(
     store_factory, capabilities
@@ -294,6 +337,52 @@ def test_claim_renewal_auth_identity_and_deadline_bounds(store_factory, capabili
     assert store.active_claims("node-a") == ()
 
 
+def test_exact_request_deadline_prevents_renewal_and_reclaim(
+    store_factory, capabilities
+):
+    store, clock = registered_store(store_factory, capabilities)
+    deadline = clock.value + 5
+    queued_work(store, request_deadline_epoch=deadline)
+    claim = store.claim_queued_request("node-a", digest("owner"), "worker")
+
+    clock.value = deadline
+
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("owner"),
+            "worker",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "missing_or_expired"
+    )
+    assert store.claim_queued_request(
+        "node-a", digest("owner"), "worker-new"
+    ).state == "empty"
+
+
+def test_wrong_node_renewal_fails_closed_without_mutation(store_factory, capabilities):
+    store, _ = registered_store(store_factory, capabilities)
+    store.register("node-b", capabilities, digest("owner-b"))
+    queued_work(store)
+    claim = store.claim_queued_request("node-a", digest("owner"), "worker")
+    before = store.active_claims("node-a")
+
+    result = store.renew_claim(
+        "node-b",
+        digest("owner-b"),
+        "worker",
+        "client-key",
+        "request-a",
+        claim.generation,
+    )
+
+    assert result.state == "owner_mismatch"
+    assert store.active_claims("node-a") == before
+
+
 def test_claim_records_are_defensive_ciphertext_only_and_redacted(
     store_factory, capabilities
 ):
@@ -320,6 +409,35 @@ def test_unregister_and_node_id_reuse_cannot_restore_old_generation(
     store.register("node-a", capabilities, digest("new-owner"))
     queued_work(store)
     new = store.claim_queued_request("node-a", digest("new-owner"), "new-worker")
+    assert new.generation > old.generation
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("new-owner"),
+            "worker",
+            "client-key",
+            "request-a",
+            old.generation,
+        ).state
+        == "stale_generation"
+    )
+
+
+def test_registration_expiry_and_node_id_reuse_cannot_restore_old_generation(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory, capabilities, clock=clock, lease_ttl_seconds=5
+    )
+    queued_work(store)
+    old = store.claim_queued_request("node-a", digest("owner"), "worker")
+
+    clock.value += 5
+    store.register("node-a", capabilities, digest("new-owner"))
+    queued_work(store)
+    new = store.claim_queued_request("node-a", digest("new-owner"), "new-worker")
+
     assert new.generation > old.generation
     assert (
         store.renew_claim(

@@ -1564,9 +1564,20 @@ def test_landing_chat_cancel_network_failure_is_visible(
 
 
 def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
-    """The chat UI should render markdown formatting returned by the assistant."""
+    """The chat UI should render markdown formatting for both chat participants."""
 
-    markdown_reply = "**Bold** introduction\n\n- First item\n- Second item\n\nHere is `inline` code and:\n```\nblock example\n```"
+    user_markdown = (
+        "**User bold** outside code\n"
+        "```text\nuser_*literal*_ <script>userUnsafe()</script>\n```"
+    )
+    markdown_reply = (
+        "**Bold** introduction\n\n"
+        "- First item\n- Second item\n\n"
+        "Here is `inline` code and two blocks:\n"
+        "```python\nfirst_value = '**literal**'\n<script>assistantUnsafe()</script>\n```\n"
+        "*Between blocks* remains formatted.\n"
+        "```\nsecond_value_with_underscores = *literal*\n```"
+    )
     route_landing_relay_chat(page, assistant_content=markdown_reply)
 
     page.goto(base_url)
@@ -1574,7 +1585,7 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     patch_landing_crypto_for_visible_envelopes(page)
 
     textarea = page.locator("textarea").first
-    textarea.fill("Show markdown please")
+    textarea.fill(user_markdown)
     wait_for_landing_send_enabled(page).click()
 
     user_message = page.locator(".user-message").last
@@ -1584,7 +1595,9 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     expect(user_message).not_to_have_attribute("v-cloak", "")
     expect(assistant_message).not_to_have_attribute("v-cloak", "")
 
+    assert user_message.locator("strong").inner_text() == "User bold"
     assert assistant_message.locator("strong").inner_text() == "Bold"
+    assert assistant_message.locator("em").inner_text() == "Between blocks"
 
     list_items = assistant_message.locator("li")
     assert list_items.count() == 2
@@ -1594,10 +1607,26 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     inline_code = assistant_message.locator("code").first
     assert inline_code.inner_text() == "inline"
 
-    block_code = assistant_message.locator("pre code").first
-    assert "block example" in block_code.inner_text()
+    block_code = page.locator(".user-message pre code, .assistant-message pre code")
+    assert block_code.count() == 3
+    assert block_code.nth(0).inner_text() == (
+        "text\nuser_*literal*_ <script>userUnsafe()</script>"
+    )
+    assert block_code.nth(1).inner_text() == (
+        "python\nfirst_value = '**literal**'\n<script>assistantUnsafe()</script>"
+    )
+    assert block_code.nth(2).inner_text() == (
+        "\nsecond_value_with_underscores = *literal*"
+    )
+
+    visible_chat = page.locator(".user-message, .assistant-message").all_inner_texts()
+    visible_text = "\n".join(visible_chat)
+    assert "CODEBLOCK0" not in visible_text
+    assert "CODEBLOCK1" not in visible_text
+    assert "codeblockplaceholder" not in visible_text
 
     # Ensure raw HTML isn't rendered unsanitized
+    assert user_message.locator("script").count() == 0
     assert assistant_message.locator("script").count() == 0
 
 def test_landing_chat_uses_api_v1_only_non_streaming(

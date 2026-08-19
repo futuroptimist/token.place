@@ -72,6 +72,10 @@ class RelayStateStoreConfig:
     max_model_id_bytes: int = 128
     max_scheduler_fingerprints: int = 4096
     max_envelope_bytes: int = 1_048_576
+    claim_ttl_seconds: float = 30.0
+    max_claims: int = 4096
+    max_claims_per_node: int = 128
+    max_consumer_identity_bytes: int = 256
 
     def __post_init__(self) -> None:
         if not isinstance(self.namespace, str) or not _NAMESPACE_RE.fullmatch(
@@ -115,6 +119,7 @@ class RelayStateStoreConfig:
         self._validate_float_bound(
             self.max_request_ttl_seconds, "request TTL", 0.001, 86_400.0
         )
+        self._validate_float_bound(self.claim_ttl_seconds, "claim TTL", 0.001, 300.0)
         for value, name, maximum in (
             (self.max_reservations, "reservation bound", 1_000_000),
             (self.max_reservations_per_client, "per-client reservation bound", 10_000),
@@ -134,6 +139,13 @@ class RelayStateStoreConfig:
                 self.max_envelope_bytes,
                 "encrypted-envelope byte bound",
                 64 * 1024 * 1024,
+            ),
+            (self.max_claims, "claim bound", 1_000_000),
+            (self.max_claims_per_node, "per-node claim bound", 10_000),
+            (
+                self.max_consumer_identity_bytes,
+                "consumer identity byte bound",
+                65_536,
             ),
         ):
             self._validate_int_bound(value, name, maximum)
@@ -391,6 +403,75 @@ class EnqueueResult:
     created: bool
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class ClaimRecord:
+    """Immutable active claim; consumer identity is retained only as a digest."""
+
+    client_identity_digest: str
+    request_identity_digest: str
+    consumer_identity_digest: str
+    selected_node_id: str
+    generation: int
+    lease_expires_at_epoch: float
+    request_deadline_epoch: float
+    sequence: int
+
+    def __repr__(self) -> str:
+        return (
+            "ClaimRecord(client_identity_digest=<redacted>, "
+            "request_identity_digest=<redacted>, consumer_identity_digest=<redacted>, "
+            "selected_node_id=<redacted>, "
+            f"generation={self.generation!r}, "
+            f"lease_expires_at_epoch={self.lease_expires_at_epoch!r}, "
+            f"request_deadline_epoch={self.request_deadline_epoch!r}, "
+            f"sequence={self.sequence!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ClaimResult:
+    """Fixed claim result containing only compute-protocol ciphertext and routing data."""
+
+    state: str
+    client_public_key: str | None = None
+    request_id: str | None = None
+    selected_node_id: str | None = None
+    requested_model_id: str | None = None
+    requested_context_tier: str | None = None
+    request_deadline_epoch: float | None = None
+    envelope: EncryptedRequestEnvelope | None = None
+    generation: int | None = None
+    lease_expires_at_epoch: float | None = None
+    sequence: int | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"ClaimResult(state={self.state!r}, identity=<redacted>, "
+            "selected_node_id=<redacted>, envelope=<redacted>, "
+            f"generation={self.generation!r}, "
+            f"lease_expires_at_epoch={self.lease_expires_at_epoch!r}, "
+            f"request_deadline_epoch={self.request_deadline_epoch!r}, "
+            f"sequence={self.sequence!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ClaimRenewalResult:
+    """Fixed result for an authenticated in-flight renewal attempt."""
+
+    state: str
+    generation: int | None = None
+    lease_expires_at_epoch: float | None = None
+    request_deadline_epoch: float | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"ClaimRenewalResult(state={self.state!r}, generation={self.generation!r}, "
+            f"lease_expires_at_epoch={self.lease_expires_at_epoch!r}, "
+            f"request_deadline_epoch={self.request_deadline_epoch!r})"
+        )
+
+
 @runtime_checkable
 class RelayStateStore(Protocol):
     """Transition-oriented compute registration and lease state contract."""
@@ -440,6 +521,19 @@ class RelayStateStore(Protocol):
     ) -> EnqueueResult: ...
     def list_reservations(self) -> tuple[ReservationRecord, ...]: ...
     def queued_requests(self, node_id: str) -> tuple[QueuedRequest, ...]: ...
+    def claim_queued_work(
+        self, node_id: str, control_credential_digest: str, consumer_identity: str
+    ) -> ClaimResult: ...
+    def renew_claim(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+    ) -> ClaimRenewalResult: ...
+    def active_claims(self) -> tuple[ClaimRecord, ...]: ...
 
 
 class InMemoryRelayStateStore:
@@ -464,6 +558,8 @@ class InMemoryRelayStateStore:
         self._fairness_cursors: dict[str, tuple[str, int]] = {}
         self._fairness_activity = 0
         self._next_queue_sequence = 0
+        self._claims: dict[tuple[str, str], ClaimRecord] = {}
+        self._next_claim_generation = 0
         self._lock = threading.RLock()
 
     @property
@@ -816,6 +912,134 @@ class InMemoryRelayStateStore:
                 replace(record) for record in self._node_queues.get(node_id, ())
             )
 
+    def claim_queued_work(
+        self, node_id: str, control_credential_digest: str, consumer_identity: str
+    ) -> ClaimResult:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        consumer_digest = self._consumer_digest(consumer_identity)
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now)
+            registration = self._records.get(node_id)
+            if registration is None:
+                return ClaimResult("empty")
+            self._require_digest(registration, control_credential_digest)
+            candidates = []
+            for queued in self._node_queues.get(node_id, ()):
+                identity = self._queued_identity(queued)
+                claim = self._claims.get(identity)
+                if claim is None or claim.lease_expires_at_epoch <= now:
+                    candidates.append(queued)
+            if not candidates:
+                return ClaimResult("empty")
+            queued = min(candidates, key=lambda item: item.sequence)
+            identity = self._queued_identity(queued)
+            existing = self._claims.get(identity)
+            if existing is None:
+                if len(self._claims) >= self.config.max_claims:
+                    raise RelayStateCapacityExceeded("claim capacity reached")
+                node_claims = sum(
+                    claim.selected_node_id == node_id for claim in self._claims.values()
+                )
+                if node_claims >= self.config.max_claims_per_node:
+                    raise RelayStateCapacityExceeded("claim capacity reached")
+            self._next_claim_generation += 1
+            lease_expires = min(
+                now + self.config.claim_ttl_seconds, queued.request_deadline_epoch
+            )
+            if not math.isfinite(lease_expires):
+                raise RelayStateStoreError("claim deadline must be finite")
+            claim = ClaimRecord(
+                queued.client_identity_digest,
+                queued.request_identity_digest,
+                consumer_digest,
+                queued.selected_node_id,
+                self._next_claim_generation,
+                lease_expires,
+                queued.request_deadline_epoch,
+                queued.sequence,
+            )
+            self._claims[identity] = claim
+            return ClaimResult(
+                "claimed",
+                queued.client_public_key,
+                queued.request_id,
+                queued.selected_node_id,
+                queued.requested_model_id,
+                queued.requested_context_tier,
+                queued.request_deadline_epoch,
+                replace(queued.envelope),
+                claim.generation,
+                claim.lease_expires_at_epoch,
+                queued.sequence,
+            )
+
+    def renew_claim(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+    ) -> ClaimRenewalResult:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        consumer_digest = self._consumer_digest(consumer_identity)
+        identity = self._identity(client_public_key, request_id)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise RelayStateStoreError("claim generation is invalid")
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now)
+            registration = self._records.get(node_id)
+            if registration is None:
+                return ClaimRenewalResult("missing")
+            if not hmac.compare_digest(
+                registration.control_credential_digest, control_credential_digest
+            ):
+                return ClaimRenewalResult("owner_mismatch")
+            claim = self._claims.get(identity)
+            if claim is None:
+                return ClaimRenewalResult("missing")
+            if claim.selected_node_id != node_id or not hmac.compare_digest(
+                claim.consumer_identity_digest, consumer_digest
+            ):
+                return ClaimRenewalResult("owner_mismatch")
+            if claim.generation != generation:
+                return ClaimRenewalResult("stale_generation", claim.generation)
+            if (
+                claim.lease_expires_at_epoch <= now
+                or claim.request_deadline_epoch <= now
+            ):
+                return ClaimRenewalResult("missing")
+            lease_expires = min(
+                now + self.config.claim_ttl_seconds, claim.request_deadline_epoch
+            )
+            renewed = replace(claim, lease_expires_at_epoch=lease_expires)
+            self._claims[identity] = renewed
+            return ClaimRenewalResult(
+                "continued",
+                renewed.generation,
+                renewed.lease_expires_at_epoch,
+                renewed.request_deadline_epoch,
+            )
+
+    def active_claims(self) -> tuple[ClaimRecord, ...]:
+        with self._lock:
+            self._reap_locked(self._now())
+            return tuple(
+                replace(claim)
+                for claim in sorted(
+                    self._claims.values(), key=lambda item: item.sequence
+                )
+            )
+
     def _expire_locked(self, now: float) -> list[ComputeNodeRegistration]:
         expired = sorted(
             (
@@ -845,6 +1069,7 @@ class InMemoryRelayStateStore:
             if queued.request_deadline_epoch <= now:
                 del self._queued[identity]
                 del self._queued_token_digests[identity]
+                self._claims.pop(identity, None)
                 queue = self._node_queues.get(queued.selected_node_id, [])
                 self._node_queues[queued.selected_node_id] = [
                     item for item in queue if item != queued
@@ -863,6 +1088,19 @@ class InMemoryRelayStateStore:
             )
             self._queued.pop(identity, None)
             self._queued_token_digests.pop(identity, None)
+            self._claims.pop(identity, None)
+
+    @staticmethod
+    def _queued_identity(queued: QueuedRequest) -> tuple[str, str]:
+        return queued.client_identity_digest, queued.request_identity_digest
+
+    def _consumer_digest(self, value: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise RelayStateStoreError("consumer identity is invalid")
+        encoded = value.encode("utf-8")
+        if len(encoded) > self.config.max_consumer_identity_bytes:
+            raise RelayStateStoreError("consumer identity is invalid")
+        return hashlib.sha256(b"consumer\0" + encoded).hexdigest()
 
     def _active_fairness_fingerprints_locked(self) -> set[str]:
         active_fingerprints = {

@@ -1037,7 +1037,17 @@ def _read_primary_tokenizer_observation(evidence_path: Path, runtime_identity: s
     try:
         observation = json.loads(evidence_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError("authoritative_target_depth_unavailable") from exc
+        raise RuntimeError("tokenizer_application_handoff_absent_or_malformed") from exc
+    if observation.get("status") == "failed":
+        category = observation.get("failure_category")
+        allowed = {
+            "request_validation_failure", "runtime_tokenizer_unavailable",
+            "runtime_identity_unavailable", "tokenization_failure",
+            "atomic_publication_failure", "python_producer_not_invoked",
+            "rust_python_handoff_failure",
+        }
+        raise RuntimeError(category if category in allowed
+                           else "authoritative_target_depth_unavailable")
     if (not isinstance(observation, dict)
             or observation.get("runtime_identity") != runtime_identity
             or observation.get("fixture_sha256") != fixture_sha256):
@@ -1317,10 +1327,19 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         finalization_remaining()
         os.chmod(evidence_path, 0o600)
         return 0
-    except Exception:
+    except Exception as exc:
         primary_failed = True
         if failure_reason is None:
-            failure_reason = "packaged_runner_failure"
+            safe_categories = {
+                "tokenizer_application_handoff_absent_or_malformed",
+                "request_validation_failure", "runtime_tokenizer_unavailable",
+                "runtime_identity_unavailable", "tokenization_failure",
+                "atomic_publication_failure", "python_producer_not_invoked",
+                "rust_python_handoff_failure",
+            }
+            category = str(exc)
+            failure_reason = (category if category in safe_categories
+                              else "packaged_runner_failure")
         raise
     finally:
         cleanup_deadline = time.monotonic() + cleanup_timeout
@@ -1507,6 +1526,7 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packaged-windows-nvidia-hardware", action="store_true")
+    parser.add_argument("--tokenizer-handoff-integration", action="store_true")
     parser.add_argument("--app-binary", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
@@ -1531,18 +1551,20 @@ def main(argv: list[str] | None = None) -> int:
     driver_log = logs_dir / "tauri-driver.log"
 
     env = os.environ.copy()
+    if args.tokenizer_handoff_integration:
+        env.pop("USE_MOCK_LLM", None)
     if hardware_mode:
         for key in (
             "USE_MOCK_LLM", "TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON",
             "PYTHONPATH", "TOKEN_PLACE_DESKTOP_ENABLE_RUNTIME_BOOTSTRAP",
         ):
             env.pop(key, None)
-    else:
+    elif not args.tokenizer_handoff_integration:
         env["USE_MOCK_LLM"] = "1"
     # This harness is a confirmed DevSourceTree launch, so provide the explicit
     # interpreter override required by the fail-closed launcher policy without
     # restoring PATH probing for packaged/runtime launches.
-    if not hardware_mode:
+    if not hardware_mode and not args.tokenizer_handoff_integration:
         env["TOKEN_PLACE_PYTHON"] = sys.executable
         env["TOKEN_PLACE_SIDECAR_PYTHON"] = sys.executable
     env["TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"] = "120"
@@ -1590,7 +1612,16 @@ def main(argv: list[str] | None = None) -> int:
 
     driver: webdriver.Remote | None = None
     landing_driver: webdriver.Chrome | None = None
-    model_path = args.model.resolve(strict=True) if hardware_mode else resolve_real_e2e_model_path()
+    model_path = args.model.resolve(strict=True) if args.model else resolve_real_e2e_model_path()
+    tokenizer_dir = Path(tempfile.mkdtemp(prefix="token-place-tokenizer-handoff-e2e-"))
+    tokenizer_request = tokenizer_dir / "request.json"
+    tokenizer_evidence = tokenizer_dir / "evidence.json"
+    integration_prompt = "alpha beta"
+    if args.tokenizer_handoff_integration:
+        tokenizer_request.write_text(json.dumps({
+            "fixture_sha256": hashlib.sha256(integration_prompt.encode()).hexdigest(),
+            "target_prefix_utf8_bytes": {"prefix": len("alpha ".encode())},
+        }), encoding="utf-8")
     try:
         wait_for_http_200(f"{relay_url}/livez")
         ensure_alive(relay, "relay")
@@ -1606,13 +1637,15 @@ def main(argv: list[str] | None = None) -> int:
         ensure_alive(tauri_driver, "tauri-driver")
 
         suffix = ".exe" if sys.platform == "win32" else ""
-        app_binary = args.app_binary.resolve(strict=True) if hardware_mode else (
+        app_binary = args.app_binary.resolve(strict=True) if args.app_binary else (
             TAURI_ROOT / "target" / "debug" / f"token-place-desktop-tauri{suffix}"
         )
         if not app_binary.exists():
             raise RuntimeError(f"missing desktop binary: {app_binary}")
 
-        driver = start_driver(app_binary)
+        application_args = (tokenizer_handoff_args(tokenizer_request, tokenizer_evidence)
+                            if args.tokenizer_handoff_integration else [])
+        driver = start_driver(app_binary, application_args=application_args)
         wait = WebDriverWait(driver, 45)
         wait_for_ui_ready(driver)
 
@@ -1677,7 +1710,7 @@ def main(argv: list[str] | None = None) -> int:
             By.XPATH,
             "//label[normalize-space()='Prompt']/following-sibling::textarea[1]",
         )
-        inference_prompt = (
+        inference_prompt = integration_prompt if args.tokenizer_handoff_integration else (
             "Return a short hardware acceptance response." if hardware_mode else "say hello from mock"
         )
         prompt.send_keys(inference_prompt)
@@ -1688,6 +1721,13 @@ def main(argv: list[str] | None = None) -> int:
 
         output_text = wait_for_inference_result(driver)
         assert output_text, "inference output is empty"
+        if args.tokenizer_handoff_integration:
+            runtime_identity = _status_value(driver, "Runtime ID")
+            observation = _read_primary_tokenizer_observation(
+                tokenizer_evidence, runtime_identity,
+                hashlib.sha256(integration_prompt.encode()).hexdigest())
+            assert observation["status"] == "published"
+            assert observation["target_offsets_tokens"]["prefix"] > 0
 
         last_error_text = driver.find_element(By.XPATH, "//p[contains(.,'Last error:')]").text
         lowered_last_error = last_error_text.lower()
@@ -1771,6 +1811,7 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.suppress(Exception):
             terminate_process(relay)
         shutil.rmtree(isolated_home, ignore_errors=True)
+        shutil.rmtree(tokenizer_dir, ignore_errors=True)
 
     return 0
 

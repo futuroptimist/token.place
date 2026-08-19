@@ -53,7 +53,7 @@ by each process; no metric registry is coordination state.
 | `POST /api/v1/relay/requests/cancel` | `cancel_or_expire_request` |
 | `POST /api/v1/relay/responses` | `accept_response_and_finish` |
 | `POST /api/v1/relay/progress` | `replace_encrypted_progress_if_claimed` |
-| `POST /api/v1/relay/responses/retrieve` | `retrieve_response` or `read_pending_or_terminal`; successful retrieval atomically marks/consumes retrieval state |
+| `POST /api/v1/relay/responses/retrieve` | `retrieve_or_ack_response` or `read_pending_or_terminal`; an acknowledgement token confirms a prior delivery, while an unacknowledged encrypted response remains replayable |
 
 Registration validation and fixed-schema HTTP validation remain outside the store. Owner-authenticated
 rate-limit identity lookup becomes a bounded store lookup rather than direct `known_servers` access.
@@ -78,14 +78,24 @@ explicit environment/cluster boundary. IDs placed in suffixes
 are fixed-length SHA-256 digests of canonical identifiers. Raw public keys and request IDs are
 record fields only where the API must return them; they are never key names.
 
-`...:schema` is a non-expiring manifest containing schema major, minimum/maximum compatible writer,
-and a migration epoch. A process performs a backend and schema health check before readiness and
-before every reconnect. It may read/write only when its supported major equals the manifest major
-and its writer range includes the active writer. Additive fields must have defaults and old writers
-must preserve unknown fields. Removing/renaming fields, changing their meaning, key layout, script
-contract, or encoding requires a new major prefix. An incompatible process returns bounded HTTP 503
-and performs no mutation. A rolling release may span only explicitly declared compatible writers;
-there is no opportunistic cross-major read, dual-write, or lazy conversion.
+`...:schema` is a non-expiring manifest containing the schema major, active schema revision, active
+writer revision, minimum/maximum supported reader revisions, minimum/maximum supported writer
+revisions, script digests, and a migration epoch. Each relay declares its own reader and writer
+revision. Before readiness and before every reconnect, it verifies that the manifest major matches,
+that its reader revision is inside the manifest's supported reader range, that the active schema
+revision is inside the relay's supported schema-read range, and that its writer revision and the
+manifest's active writer revision are both inside the manifest's supported writer range and the
+relay's supported writer range. A read-only health probe must pass the reader checks; any operation
+that can mutate must pass both reader and writer checks immediately before dispatch.
+
+Additive fields must have defaults understood by every supported reader, and supported writers must
+preserve unknown fields. Removing/renaming fields, changing their meaning, key layout, script
+contract, or encoding requires a new major prefix. A relay with an incompatible reader or writer
+returns bounded HTTP 503 `state_schema_incompatible`, performs no read that could be interpreted as
+protocol state, and performs no mutation. A rolling release may span only the explicitly declared
+reader and writer intersections; operators update the manifest ranges/active revisions only through
+a reviewed compatibility transition proven against every version in those ranges. There is no
+opportunistic cross-major read, dual-write, or lazy conversion.
 
 ### Families and limits
 
@@ -103,7 +113,7 @@ operator knobs.
 | `queue:{node_digest}` plus consumer group | exact validated API-v1 encrypted request envelope and safe routing/deadline metadata | per-node configured depth and envelope-byte limit; approximate `MAXLEN` is forbidden for live work; enqueue rejects at the hard bound; entry is deleted only by a terminal/requeue transition |
 | `request:{client_digest}:{request_digest}`, `requests:deadline` | canonical identity, state (`reserved`, `queued`, `claimed`, `response_ready`, or terminal), node, queue entry, claim generation, cancellation-token digest, UTC deadline | global/per-client request cap; request deadline is authoritative; lifecycle retained through response/terminal TTL |
 | `claim:{client_digest}:{request_digest}`, `claims:expiry` | canonical client/request identity, node and owner digest, consumer/claim generation, lease epoch; expiry members contain both identity digests | one per canonical client/request pair; claim lease TTL bounded by absolute request deadline; expired claims are reclaimable |
-| `response:{client_digest}:{request_digest}`, `responses:expiry` | exact validated encrypted response envelope, retrieval state and accepted epoch | one bounded envelope per request; TTL is the lesser of configured response retention and total lifecycle maximum |
+| `response:{client_digest}:{request_digest}`, `responses:expiry` | exact validated encrypted response envelope, accepted epoch, retrieval acknowledgement-token digest, acknowledgement state, and replay deadline | one bounded envelope per request; unacknowledged responses remain idempotently replayable until the lesser of the configured response-retention deadline and total lifecycle maximum; acknowledgement deletes or marks the envelope consumed atomically |
 | `progress:{client_digest}:{request_digest}` | latest exact validated encrypted progress envelope | one bounded envelope, replacement only; expires no later than the request |
 | `control:{node_digest}:{client_digest}:{request_digest}`, `control:expiry` | fixed terminal status/reason, canonical client/request identity, owner digest, acknowledgement state; expiry members contain the node and both identity digests | one per affected claim; configured tombstone TTL capped at five minutes |
 | `node_tombstone:{node_digest}`, `node_tombstones:expiry` | unregistered/expired marker and owner digest | at most recent-node capacity; five-minute maximum TTL |
@@ -154,7 +164,10 @@ health source, or terminal-state authority.
 6. **Accept response and finalize.** Authenticate owner and generation; win a CAS from active to
    `response_ready`; store one bounded encrypted response; remove claim/queue/progress state; create
    the terminal/dedup record with `completed`; and increment the outcome only once. Competing
-   response, cancellation, expiry, or unregister receives the existing terminal result.
+   response, cancellation, expiry, or unregister receives the existing terminal result. Generate a
+   bounded retrieval acknowledgement token deterministically from the canonical identity, accepted
+   epoch, and response digest using a shared injected acknowledgement key; store only the token
+   digest with the response and return the raw token only with authenticated retrieval responses.
 7. **Cancel, expire, unregister, or evict.** Win the same lifecycle CAS, remove reservation/queue/
    claim/progress state as applicable, release capacity, and apply a fixed terminal status/reason.
    Unregister/evict processes only a bounded batch and records continuation work; the node becomes
@@ -168,6 +181,25 @@ health source, or terminal-state authority.
 10. **Advance fairness cursor.** Selection stores the selected node as the next scan anchor (not a
     fragile numeric list index) in the same atomic script that creates its reservation. Reclaiming an
     unused reservation releases capacity but does not rewind the cursor, preventing crash/retry bias.
+
+### Failure-safe response retrieval
+
+Retrieval is a two-phase, bounded protocol because Valkey cannot know whether an HTTP response
+reached its client. An authenticated retrieval without an acknowledgement returns the exact stored
+encrypted response and its opaque acknowledgement token but does not consume or delete the record.
+Any relay can reproduce the token without storing it, and repeating that retrieval returns the same
+response and token until its replay deadline. A later authenticated retrieval call may echo that
+token as an acknowledgement; the store compares its digest and canonical client/request identity,
+then atomically marks the response acknowledged and
+removes the envelope and retrieval-expiry member. Duplicate acknowledgements return the same safe
+consumed result. A missing, wrong, expired, or cross-request token never consumes a response.
+
+A connection failure before the client receives the first response or its acknowledgement result is
+therefore recoverable by retry. The replay deadline remains authoritative even after one or more
+reads: reads do not shorten or refresh it. Once that bounded deadline expires, the reaper atomically
+removes the encrypted envelope and records the fixed terminal retrieval-expired result; expiry is
+allowed to make an unacknowledged response unavailable. Raw acknowledgement tokens are never stored,
+logged, included in keys, or exposed to a different canonical identity.
 
 ### Selection, enqueue, and abandoned reservations
 
@@ -316,6 +348,15 @@ renewal, scheduler choice/reservation, queue ordering and wakeup loss, claim/rec
 cancellation/unregister/expiry races, tombstones, terminal deduplication, bounds, and server-time
 deadlines. Independently constructed relay instances sharing one store must prove register on A,
 select/enqueue on B, poll/control on C, response on A, and retrieve/cancel on B or C.
+
+Retrieval contract cases must simulate disconnects before and after the response bytes are written,
+prove retry returns the identical encrypted envelope and acknowledgement token, prove only the
+matching identity/token consumes it, prove duplicate acknowledgement is idempotent, and prove an
+unacknowledged response remains replayable until (but not after) its fixed replay deadline. Rolling
+compatibility cases must exercise every supported old/new relay pairing as both reader and writer,
+including additive unknown-field preservation, and prove out-of-range readers and writers remain
+unready and fail closed without mutation. Reservation plus idempotent enqueue is the next
+implementation slice; these contract gates precede runtime or HA rollout.
 
 Concurrency/failure tests must cover duplicate identities, simultaneous claim, capacity reservation,
 response-versus-cancel, unregister-versus-poll, lease/deadline expiry, pod termination, store network

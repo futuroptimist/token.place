@@ -865,6 +865,16 @@ function mergeAuthoritativeComputeStatus(
   }
 
   if (payloadSession === prev.operator_session_id) {
+    // Events can carry only a partial view of a native status transition. If
+    // the corresponding authoritative snapshot has the same sequence, allow
+    // it to promote the active session to Running exactly once. Older
+    // snapshots and duplicate events still use the normal monotonic merge.
+    if (payloadSequence === prev.sequence && !prev.running) {
+      return mergeComputeStatusEvent(
+        { ...prev, sequence: null },
+        { ...payload, type: 'status' }
+      );
+    }
     return mergeComputeStatusEvent(prev, { ...payload, type: 'status' });
   }
 

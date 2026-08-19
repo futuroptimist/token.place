@@ -1193,6 +1193,50 @@ describe('desktop app start failure handling', () => {
     expect(statusCalls).toBeGreaterThanOrEqual(2);
   });
 
+  it('accepts an authoritative running snapshot that completes a partial event sequence', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({
+          running: statusCalls > 1,
+          registered: false,
+          operator_session_id: statusCalls === 1 ? 'previous-session' : 'current-session',
+          sequence: statusCalls === 1 ? 8 : 1,
+          worker_state: 'starting',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    await act(async () => {
+      eventHandlers.get('compute_node_event')?.({
+        payload: {
+          type: 'started',
+          operator_session_id: 'current-session',
+          sequence: 1,
+          worker_state: 'starting',
+        },
+      });
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    expect(statusCalls).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+    vi.useRealTimers();
+  });
+
   it('continues reconciling the active start after ten seconds', async () => {
     let statusCalls = 0;
     invokeMock.mockImplementation((command: string) => {

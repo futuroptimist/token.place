@@ -191,7 +191,7 @@ def test_response_retry_is_once_only_and_conflicts_fail_closed(
     assert (store.response_records(), store.terminal_records()) == before
 
 
-def test_response_retry_uses_retained_terminal_after_owner_unregisters(
+def test_response_retry_requires_current_registered_owner(
     store_factory, capabilities
 ):
     store, _ = registered_store(store_factory, capabilities)
@@ -199,10 +199,12 @@ def test_response_retry_uses_retained_terminal_after_owner_unregisters(
     first = accept_response(store, claim)
     assert store.unregister("node-a", digest("owner"))
 
-    assert accept_response(store, claim) == replace(first, new_outcome=False)
+    with pytest.raises(RelayStateConflict):
+        accept_response(store, claim)
+    assert first.new_outcome
 
 
-def test_response_retry_uses_retained_terminal_after_registration_expires(
+def test_response_retry_rejects_expired_registration(
     store_factory, capabilities
 ):
     store, clock = registered_store(store_factory, capabilities)
@@ -210,7 +212,9 @@ def test_response_retry_uses_retained_terminal_after_registration_expires(
     first = accept_response(store, claim)
     clock.value += store.config.lease_ttl_seconds
 
-    assert accept_response(store, claim) == replace(first, new_outcome=False)
+    with pytest.raises(RelayStateConflict):
+        accept_response(store, claim)
+    assert first.new_outcome
 
 
 @pytest.mark.parametrize(
@@ -299,20 +303,39 @@ def test_terminal_fences_unregister_and_node_id_reuse(store_factory, capabilitie
     assert store.terminal_records()[0].generation == claim.generation
 
 
-def test_response_and_terminal_bounds_fail_closed(store_factory, capabilities):
-    store, _ = registered_store(
-        store_factory,
-        replace(capabilities, max_concurrency=2),
-        max_responses=1,
-        max_terminal_records=1,
-        max_responses_per_client=1,
-        max_terminal_records_per_client=1,
-    )
+@pytest.mark.parametrize(
+    "limited_bound,same_client",
+    [
+        ("max_responses", False),
+        ("max_responses_per_client", True),
+        ("max_terminal_records", False),
+        ("max_terminal_records_per_client", True),
+    ],
+)
+def test_response_and_terminal_bounds_are_independent(
+    store_factory, capabilities, limited_bound, same_client
+):
+    bounds = {
+        "max_responses": 4,
+        "max_responses_per_client": 4,
+        "max_terminal_records": 4,
+        "max_terminal_records_per_client": 4,
+        limited_bound: 1,
+    }
+    store, _ = registered_store(store_factory, capabilities, **bounds)
     first = claimed_work(store)
-    second = claimed_work(store, "request-b", consumer="worker-a")
+    second_client = "client-key" if same_client else "client-key-b"
+    selection = reserve(store, "request-b", client_public_key=second_client)
+    enqueue(
+        store,
+        selection,
+        "request-b",
+        client_public_key=second_client,
+    )
+    second = store.claim_queued_request("node-a", digest("owner"), "worker-a")
     accept_response(store, first)
     with pytest.raises(RelayStateCapacityExceeded):
-        accept_response(store, second)
+        accept_response(store, second, client_public_key=second_client)
     assert len(store.response_records()) == len(store.terminal_records()) == 1
     assert len(store.active_claims("node-a")) == 1
 
@@ -338,6 +361,83 @@ def test_response_and_terminal_expiry_are_inclusive_and_deterministic(
     assert store.queued_requests("node-a") == store.active_claims("node-a") == ()
 
 
+def test_terminal_is_authoritative_at_inclusive_response_expiry(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        clock=clock,
+        response_replay_ttl_seconds=2,
+        terminal_retention_seconds=3,
+    )
+    claim = claimed_work(store)
+    original = accept_response(store, claim)
+    terminal_before = store.terminal_records()[0]
+    clock.value = original.replay_expires_at_epoch
+
+    retry = accept_response(store, claim)
+
+    assert store.response_records() == ()
+    assert store.terminal_records() == (terminal_before,)
+    assert retry == replace(original, new_outcome=False)
+    with pytest.raises(RelayStateConflict):
+        accept_response(store, claim, envelope=response_envelope("conflict"))
+    assert store.response_records() == ()
+    assert store.terminal_records() == (terminal_before,)
+
+
+def test_terminal_retry_releases_capacity_exactly_once(store_factory, capabilities):
+    store, _ = registered_store(store_factory, capabilities)
+    completed = claimed_work(store)
+    first = accept_response(store, completed)
+    later = claimed_work(store, "request-b")
+
+    assert accept_response(store, completed) == replace(first, new_outcome=False)
+    active = store.active_claims("node-a")
+    assert len(active) == 1
+    assert (active[0].request_identity_digest, active[0].generation) == (
+        digest_with_domain("request-b", b"request\0"),
+        later.generation,
+    )
+
+
+def test_completed_identity_fencing_cleanup_and_node_id_reuse(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        clock=clock,
+        response_replay_ttl_seconds=2,
+        terminal_retention_seconds=3,
+    )
+    completed = claimed_work(store)
+    accept_response(store, completed)
+    with pytest.raises(RelayStateConflict, match="terminal"):
+        reserve(store)
+
+    assert store.unregister("node-a", digest("owner"))
+    store.register("node-a", capabilities, digest("replacement"))
+    clock.value += 3
+    assert store.terminal_records() == ()
+    selection = reserve(store)
+    enqueue(store, selection)
+    replacement = store.claim_queued_request(
+        "node-a", digest("replacement"), "worker-a"
+    )
+
+    assert replacement.generation > completed.generation
+    with pytest.raises(RelayStateConflict, match="generation"):
+        accept_response(
+            store,
+            completed,
+            control_credential_digest=digest("replacement"),
+        )
+
+
 def test_response_records_are_immutable_defensive_and_repr_redacted(
     store_factory, capabilities, caplog
 ):
@@ -356,6 +456,8 @@ def test_response_records_are_immutable_defensive_and_repr_redacted(
     result = accept_response(store, claim)
     response = store.response_records()[0]
     terminal = store.terminal_records()[0]
+    assert terminal.replay_expires_at_epoch == result.replay_expires_at_epoch
+    assert store.terminal_records()[0] is not terminal
     with pytest.raises(FrozenInstanceError):
         response.envelope.ciphertext = "changed"
     rendered = repr(response) + repr(terminal) + repr(result) + repr(response.envelope)

@@ -552,6 +552,7 @@ class TerminalOutcomeRecord:
     generation: int
     response_digest: str
     accepted_at_epoch: float
+    replay_expires_at_epoch: float
     expires_at_epoch: float
     outcome: str = "completed"
 
@@ -559,6 +560,7 @@ class TerminalOutcomeRecord:
         return (
             "TerminalOutcomeRecord(identities=<redacted>, selected_node_id=<redacted>, "
             f"generation={self.generation!r}, accepted_at_epoch={self.accepted_at_epoch!r}, "
+            f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
             f"expires_at_epoch={self.expires_at_epoch!r}, outcome={self.outcome!r}, "
             "credentials=<redacted>, response_digest=<redacted>)"
         )
@@ -1231,9 +1233,15 @@ class InMemoryRelayStateStore:
             self._reap_locked(now)
             terminal = self._terminals.get(identity)
             if terminal is not None:
+                registration = self._records.get(node_id)
                 if (
-                    terminal.selected_node_id == node_id
+                    registration is not None
+                    and terminal.selected_node_id == node_id
                     and terminal.generation == generation
+                    and hmac.compare_digest(
+                        registration.control_credential_digest,
+                        control_credential_digest,
+                    )
                     and hmac.compare_digest(
                         terminal.control_credential_digest,
                         control_credential_digest,
@@ -1243,12 +1251,7 @@ class InMemoryRelayStateStore:
                     )
                     and hmac.compare_digest(terminal.response_digest, response_digest)
                 ):
-                    response = self._responses.get(identity)
-                    if response is None:
-                        raise RelayStateConflict(
-                            "response lifecycle is no longer replayable"
-                        )
-                    return self._response_result(response, False)
+                    return self._terminal_response_result(terminal)
                 raise RelayStateConflict("response lifecycle conflict")
 
             registration = self._records.get(node_id)
@@ -1320,6 +1323,7 @@ class InMemoryRelayStateStore:
                 generation,
                 response_digest,
                 now,
+                replay_expires,
                 terminal_expires,
             )
             self._responses[identity] = response
@@ -1570,6 +1574,18 @@ class InMemoryRelayStateStore:
             response.accepted_at_epoch,
             response.replay_expires_at_epoch,
             new_outcome,
+        )
+
+    @staticmethod
+    def _terminal_response_result(
+        terminal: TerminalOutcomeRecord,
+    ) -> ResponseAcceptanceResult:
+        return ResponseAcceptanceResult(
+            "response_ready",
+            terminal.generation,
+            terminal.accepted_at_epoch,
+            terminal.replay_expires_at_epoch,
+            False,
         )
 
     @staticmethod

@@ -260,7 +260,7 @@ describe('desktop app start failure handling', () => {
 
 
   it.each(['desktop_python_runtime_missing', 'desktop_python_runtime_invalid'])(
-    'fails initialization after mount-time %s model inspection failure',
+    'keeps operator setup ready after mount-time %s model inspection failure',
     async (code) => {
       invokeMock.mockImplementation((command: string) => {
         if (command === 'detect_backend') {
@@ -311,9 +311,11 @@ describe('desktop app start failure handling', () => {
       expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
       expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
       const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
-      expect(startOperatorButton.disabled).toBe(true);
+      expect(startOperatorButton.disabled).toBe(false);
+      expect((screen.getByLabelText('Model GGUF path') as HTMLInputElement).value)
+        .toBe('C:\\Users\\operator\\Models\\qwen.gguf');
       expect((container.querySelector('main') as HTMLElement).dataset.applicationInitialization)
-        .toBe('failed');
+        .toBe('ready');
       expect(invokeMock).not.toHaveBeenCalledWith('start_compute_node', expect.any(Object));
     }
   );
@@ -2600,7 +2602,7 @@ describe('desktop application initialization barrier', () => {
     listenMock.mockResolvedValue(() => {});
   });
 
-  it('stays pending until every required initialization result is committed', async () => {
+  it('stays pending until every mandatory initialization result is committed', async () => {
     const backend = deferred<Record<string, unknown>>();
     const config = deferred<Record<string, unknown>>();
     const status = deferred<Record<string, unknown>>();
@@ -2621,28 +2623,62 @@ describe('desktop application initialization barrier', () => {
     await act(async () => config.resolve({ model_path: '/persisted.gguf', relay_base_url: 'https://token.place' }));
     expect(shell.dataset.applicationInitialization).toBe('pending');
     await act(async () => status.resolve({ running: false, registered: false }));
-    expect(shell.dataset.applicationInitialization).toBe('pending');
-    await act(async () => artifact.resolve({ filename: 'persisted.gguf', exists: true }));
-
     await waitFor(() => expect(shell.dataset.applicationInitialization).toBe('ready'));
     expect((screen.getByLabelText('Model GGUF path') as HTMLInputElement).value).toBe('/persisted.gguf');
+    expect(screen.queryByText('Runtime GGUF filename:')).toBeNull();
+
+    await act(async () => artifact.resolve({ filename: 'persisted.gguf', exists: true }));
+    expect(await screen.findByText('persisted.gguf')).toBeTruthy();
   });
 
-  it('does not overwrite automation input after readiness', async () => {
-    invokeMock.mockImplementation((command: string) => Promise.resolve({
-      detect_backend: { availability_label: 'CPU available' },
-      load_config: { model_path: '/persisted.gguf', relay_base_url: 'https://token.place' },
-      get_compute_node_status: { running: false, registered: false },
-      inspect_model_artifact: { filename: 'persisted.gguf', exists: true },
-    }[command]));
+  it('does not overwrite automation input when delayed artifact inspection completes', async () => {
+    const artifact = deferred<Record<string, unknown>>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'inspect_model_artifact') return artifact.promise;
+      return Promise.resolve({
+        detect_backend: { availability_label: 'CPU available' },
+        load_config: { model_path: '/persisted.gguf', relay_base_url: 'https://token.place' },
+        get_compute_node_status: { running: false, registered: false },
+      }[command]);
+    });
     const { container } = render(<App />);
     await waitFor(() => expect(
       (container.querySelector('main') as HTMLElement).dataset.applicationInitialization
     ).toBe('ready'));
     const modelInput = screen.getByLabelText('Model GGUF path') as HTMLInputElement;
+    const relayInput = screen.getByLabelText('Relay URL 1') as HTMLInputElement;
+    const modeSelect = screen.getByText('Compute mode').nextElementSibling as HTMLSelectElement;
+    const tierSelect = screen.getByLabelText('Context tier') as HTMLSelectElement;
     fireEvent.change(modelInput, { target: { value: '/automation.gguf' } });
-    await act(async () => Promise.resolve());
+    fireEvent.change(relayInput, { target: { value: 'https://automation.token.place' } });
+    fireEvent.change(modeSelect, { target: { value: 'cpu' } });
+    fireEvent.change(tierSelect, { target: { value: '64k-full' } });
+    await act(async () => artifact.resolve({ filename: 'persisted.gguf', exists: true }));
     expect(modelInput.value).toBe('/automation.gguf');
+    expect(relayInput.value).toBe('https://automation.token.place');
+    expect(modeSelect.value).toBe('cpu');
+    expect(tierSelect.value).toBe('64k-full');
+  });
+
+  it('keeps ready initialization after optional artifact inspection rejects', async () => {
+    const artifact = deferred<Record<string, unknown>>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'inspect_model_artifact') return artifact.promise;
+      return Promise.resolve(command === 'load_config'
+        ? { model_path: '/persisted.gguf', relay_base_url: 'https://token.place' }
+        : command === 'get_compute_node_status'
+          ? { running: false, registered: false }
+          : { availability_label: 'CPU available' });
+    });
+    const { container } = render(<App />);
+    const shell = container.querySelector('main') as HTMLElement;
+    await waitFor(() => expect(shell.dataset.applicationInitialization).toBe('ready'));
+
+    await act(async () => artifact.reject(new Error('artifact inspection unavailable')));
+
+    expect(shell.dataset.applicationInitialization).toBe('ready');
+    expect(screen.getByText(/Error:/).textContent).toContain('artifact inspection unavailable');
+    expect((screen.getByText('Start operator') as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('fails closed when a required initialization operation rejects', async () => {

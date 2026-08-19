@@ -912,12 +912,18 @@ export function App() {
 
   useEffect(() => {
     const initializeApplication = async () => {
+      void invoke<ModelArtifactInfo>('inspect_model_artifact')
+        .then((info) => setArtifact(info))
+        .catch((e) => setError(formatErrorMessage(e)));
+
       try {
-        const detectedBackend = await invoke<BackendInfo>('detect_backend');
-        const loadedConfig = await invoke<PartialDesktopConfig>('load_config');
+        const [detectedBackend, loadedConfig, loadedNodeStatus] = await Promise.all([
+          invoke<BackendInfo>('detect_backend'),
+          invoke<PartialDesktopConfig>('load_config'),
+          invoke<Partial<ComputeNodeStatus>>('get_compute_node_status'),
+        ]);
         const normalizedConfig = normalizeDesktopConfig(loadedConfig);
-        const nodeStatus = { ...defaultComputeStatus, ...(await invoke<Partial<ComputeNodeStatus>>('get_compute_node_status')) };
-        const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
+        const nodeStatus = { ...defaultComputeStatus, ...loadedNodeStatus };
 
         setBackend(detectedBackend);
         setConfig(normalizedConfig);
@@ -926,7 +932,6 @@ export function App() {
         }
         computeStatusRef.current = nodeStatus;
         setComputeStatus(nodeStatus);
-        setArtifact(info);
         setApplicationInitializationLoaded(true);
       } catch (e) {
         setError(formatErrorMessage(e));

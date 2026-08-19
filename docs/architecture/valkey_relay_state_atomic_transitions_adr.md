@@ -210,7 +210,12 @@ public key and request ID in addition to model and context tier; the relay deriv
 `(client_digest, request_digest)` identity rather than trusting client-supplied digests. Selection
 creates a bounded, single-use reservation token for that identity and returns the token alongside the
 selected public key. Retrying selection with the same identity and compatible parameters returns the
-unconsumed reservation and selected node; conflicting parameters fail with a fixed error.
+unconsumed reservation and selected node; conflicting parameters fail with a fixed error. Because only the
+token digest is persisted, only the transition that first creates a reservation can return its raw token. An
+identical selection retry reports the existing reservation without a token: the client must retain the original
+token or wait for the short, inclusive reservation expiry before selecting again. The store never reconstructs a
+raw token from its digest, and selection retries neither extend the expiry nor reserve capacity or advance the
+fairness cursor again.
 
 `/requests` must echo the token and the same identity, and enqueue consumes it only after all fields
 match. A client may cache node metadata for display or encryption, but it must obtain a fresh

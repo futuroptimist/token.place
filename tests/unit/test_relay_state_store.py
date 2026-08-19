@@ -12,6 +12,8 @@ import pytest
 # isort: off
 from relay_state_store import ComputeNodeCapabilities
 from relay_state_store import ComputeNodeRegistration
+from relay_state_store import ClaimRecord
+from relay_state_store import ClaimResult
 from relay_state_store import EncryptedRequestEnvelope
 from relay_state_store import InMemoryRelayStateStore
 from relay_state_store import RelayStateCapacityExceeded
@@ -105,6 +107,226 @@ def enqueue(store, selection, request_id="request-a", **overrides):
     }
     values.update(overrides)
     return store.enqueue_encrypted_request(**values)
+
+
+def registered_store(store_factory, capabilities, clock=None, node_id="node-a"):
+    clock = clock or EpochClock()
+    store = store_factory(clock=clock, claim_ttl_seconds=10)
+    store.register(node_id, capabilities, digest("owner"))
+    return store, clock
+
+
+def queued_work(store, request_id="request-a", **overrides):
+    selection = reserve(store, request_id=request_id, **overrides)
+    return enqueue(store, selection, request_id=request_id), selection
+
+
+def test_claim_fifo_empty_poll_and_capacity_is_unchanged(store_factory, capabilities):
+    store, _ = registered_store(store_factory, capabilities)
+    queued_work(store, "request-a")
+    queued_work(store, "request-b")
+
+    first = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+    second = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+
+    assert first.state == second.state == "claimed"
+    assert (first.request_id, second.request_id) == ("request-a", "request-b")
+    assert store.queued_requests("node-a") == ()
+    assert len(store.active_claims("node-a")) == 2
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store, "request-c")
+    assert store.claim_queued_request(
+        "node-a", digest("owner"), "worker-a"
+    ) == ClaimResult("empty")
+
+
+def test_claims_are_node_local_and_owner_authenticated(store_factory, capabilities):
+    store, _ = registered_store(store_factory, capabilities)
+    store.register("node-b", capabilities, digest("owner-b"))
+    queued_work(store)
+    with pytest.raises(RelayStateCredentialMismatch):
+        store.claim_queued_request("node-a", digest("wrong"), "worker")
+    assert (
+        store.claim_queued_request("node-b", digest("owner-b"), "worker").state
+        == "empty"
+    )
+    assert (
+        store.claim_queued_request("node-a", digest("owner"), "worker").request_id
+        == "request-a"
+    )
+
+
+def test_concurrent_claim_has_one_winner_per_item(store_factory, capabilities):
+    store, _ = registered_store(store_factory, capabilities)
+    queued_work(store)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda _: store.claim_queued_request(
+                    "node-a", digest("owner"), "worker"
+                ),
+                range(8),
+            )
+        )
+    assert sum(result.state == "claimed" for result in results) == 1
+    assert sum(result.state == "empty" for result in results) == 7
+
+
+def test_claim_reclaim_is_inclusive_and_fences_old_generation(
+    store_factory, capabilities
+):
+    store, clock = registered_store(store_factory, capabilities)
+    queued_work(store)
+    first = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+    clock.value = first.lease_expires_at_epoch - 0.001
+    assert (
+        store.claim_queued_request("node-a", digest("owner"), "worker-b").state
+        == "empty"
+    )
+    clock.value = first.lease_expires_at_epoch
+    second = store.claim_queued_request("node-a", digest("owner"), "worker-b")
+    assert second.state == "reclaimed" and second.generation > first.generation
+    stale = store.renew_claim(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        first.generation,
+    )
+    assert stale.state == "stale_generation"
+    assert store.active_claims("node-a")[0].generation == second.generation
+
+
+def test_claim_renewal_auth_identity_and_deadline_bounds(store_factory, capabilities):
+    store, clock = registered_store(store_factory, capabilities)
+    queued_work(store, request_deadline_epoch=clock.value + 12)
+    claim = store.claim_queued_request("node-a", digest("owner"), "worker")
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("wrong"),
+            "worker",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "owner_mismatch"
+    )
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("owner"),
+            "other",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "owner_mismatch"
+    )
+    assert (
+        store.renew_claim(
+            "node-a", digest("owner"), "worker", "client-key", "wrong", claim.generation
+        ).state
+        == "missing_or_expired"
+    )
+    clock.value += 5
+    renewed = store.renew_claim(
+        "node-a", digest("owner"), "worker", "client-key", "request-a", claim.generation
+    )
+    assert renewed.state == "continued"
+    assert renewed.lease_expires_at_epoch == clock.value + 7
+    clock.value = renewed.lease_expires_at_epoch
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("owner"),
+            "worker",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "missing_or_expired"
+    )
+    assert store.active_claims("node-a") == ()
+
+
+def test_claim_records_are_defensive_ciphertext_only_and_redacted(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    queued_work(store)
+    result = store.claim_queued_request("node-a", digest("owner"), "unsafe-worker")
+    record = store.active_claims("node-a")[0]
+    assert isinstance(record, ClaimRecord)
+    assert record.envelope == envelope()
+    assert "unsafe-worker" not in repr(record)
+    assert "ciphertext" not in repr(record)
+    assert "client-key" not in repr(result) and "request-a" not in repr(result)
+    with pytest.raises(FrozenInstanceError):
+        record.generation = 99
+
+
+def test_unregister_and_node_id_reuse_cannot_restore_old_generation(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    queued_work(store)
+    old = store.claim_queued_request("node-a", digest("owner"), "worker")
+    assert store.unregister("node-a", digest("owner"))
+    store.register("node-a", capabilities, digest("new-owner"))
+    queued_work(store)
+    new = store.claim_queued_request("node-a", digest("new-owner"), "new-worker")
+    assert new.generation > old.generation
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("new-owner"),
+            "worker",
+            "client-key",
+            "request-a",
+            old.generation,
+        ).state
+        == "stale_generation"
+    )
+
+
+def test_concurrent_renewal_or_reclaim_has_one_serialized_result(
+    store_factory, capabilities
+):
+    store, clock = registered_store(store_factory, capabilities)
+    queued_work(store)
+    old = store.claim_queued_request("node-a", digest("owner"), "worker")
+    clock.value = old.lease_expires_at_epoch
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        renewal = pool.submit(
+            store.renew_claim,
+            "node-a",
+            digest("owner"),
+            "worker",
+            "client-key",
+            "request-a",
+            old.generation,
+        )
+        reclaim = pool.submit(
+            store.claim_queued_request, "node-a", digest("owner"), "worker-new"
+        )
+    assert renewal.result().state in {"missing_or_expired", "stale_generation"}
+    assert reclaim.result().state == "reclaimed"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("claim_ttl_seconds", 0),
+        ("max_claims", 0),
+        ("max_claims_per_node", 0),
+        ("max_consumer_identity_bytes", 0),
+    ],
+)
+def test_claim_configuration_bounds(field, value):
+    with pytest.raises(RelayStateStoreError):
+        RelayStateStoreConfig(namespace="test", **{field: value})
 
 
 def test_register_lookup_and_duplicate_require_owner_digest(

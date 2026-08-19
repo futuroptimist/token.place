@@ -193,6 +193,7 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_cancelled_compute_error_renders_request_expired_message",
     "tests/e2e/test_ui.py::test_landing_chat_structured_error_without_safe_code_hides_raw_message",
     "tests/e2e/test_ui.py::test_landing_chat_decrypted_terminal_error_triggers_failover",
+    "tests/e2e/test_ui.py::test_markdown_rendering_stream_updates",
     "tests/e2e/test_ui.py::test_compute_node_count_renders_and_updates",
     "tests/e2e/test_ui.py::test_compute_node_count_failure_is_graceful",
     "tests/e2e/test_ui.py::test_compute_node_count_rejects_null_diagnostics",

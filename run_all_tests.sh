@@ -208,6 +208,12 @@ else
     echo "Skipping End-to-End Tests (set RUN_E2E=1 to enable)"
 fi
 
+# 8a. Always exercise fenced Markdown rendering on the relay landing page.
+run_test \
+    "Relay Landing Page Markdown Rendering" \
+    "$PYTHON_CMD -m pytest -q tests/e2e/test_ui.py::test_markdown_rendering_stream_updates -x $COVERAGE_ARGS" \
+    "Verifying user and assistant fenced code blocks render without leaking placeholders"
+
 # 8b. Relay landing-page real desktop-bridge API v1 guardrail (requires local GGUF model path)
 if [ -n "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ] && [ -f "${TOKENPLACE_REAL_E2E_MODEL_PATH}" ] && llama_cpp_runtime_available; then
     # Use a tiny real GGUF model here so CI still validates true inference plumbing

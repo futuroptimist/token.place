@@ -191,6 +191,28 @@ def test_response_retry_is_once_only_and_conflicts_fail_closed(
     assert (store.response_records(), store.terminal_records()) == before
 
 
+def test_response_retry_uses_retained_terminal_after_owner_unregisters(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    first = accept_response(store, claim)
+    assert store.unregister("node-a", digest("owner"))
+
+    assert accept_response(store, claim) == replace(first, new_outcome=False)
+
+
+def test_response_retry_uses_retained_terminal_after_registration_expires(
+    store_factory, capabilities
+):
+    store, clock = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    first = accept_response(store, claim)
+    clock.value += store.config.lease_ttl_seconds
+
+    assert accept_response(store, claim) == replace(first, new_outcome=False)
+
+
 @pytest.mark.parametrize(
     "override,error",
     [
@@ -339,6 +361,10 @@ def test_response_records_are_immutable_defensive_and_repr_redacted(
     rendered = repr(response) + repr(terminal) + repr(result) + repr(response.envelope)
     assert all(value not in rendered for value in secret_values)
     assert all(value not in caplog.text for value in secret_values)
+    assert "status='future_state'" in repr(replace(response, status="future_state"))
+    assert "outcome='future_outcome'" in repr(
+        replace(terminal, outcome="future_outcome")
+    )
 
 
 def test_response_envelope_allowlist_type_and_utf8_bytes(store_factory, capabilities):

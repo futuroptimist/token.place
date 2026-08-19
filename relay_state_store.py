@@ -535,7 +535,8 @@ class ResponseRecord:
             "ResponseRecord(identities=<redacted>, selected_node_id=<redacted>, "
             f"generation={self.generation!r}, accepted_at_epoch={self.accepted_at_epoch!r}, "
             f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
-            "response_digest=<redacted>, envelope=<redacted>, status='response_ready')"
+            "response_digest=<redacted>, envelope=<redacted>, "
+            f"status={self.status!r})"
         )
 
 
@@ -558,7 +559,7 @@ class TerminalOutcomeRecord:
         return (
             "TerminalOutcomeRecord(identities=<redacted>, selected_node_id=<redacted>, "
             f"generation={self.generation!r}, accepted_at_epoch={self.accepted_at_epoch!r}, "
-            f"expires_at_epoch={self.expires_at_epoch!r}, outcome='completed', "
+            f"expires_at_epoch={self.expires_at_epoch!r}, outcome={self.outcome!r}, "
             "credentials=<redacted>, response_digest=<redacted>)"
         )
 
@@ -1230,15 +1231,9 @@ class InMemoryRelayStateStore:
             self._reap_locked(now)
             terminal = self._terminals.get(identity)
             if terminal is not None:
-                registration = self._records.get(node_id)
                 if (
-                    registration is not None
-                    and terminal.selected_node_id == node_id
+                    terminal.selected_node_id == node_id
                     and terminal.generation == generation
-                    and hmac.compare_digest(
-                        registration.control_credential_digest,
-                        control_credential_digest,
-                    )
                     and hmac.compare_digest(
                         terminal.control_credential_digest,
                         control_credential_digest,
@@ -1562,6 +1557,7 @@ class InMemoryRelayStateStore:
             },
             separators=(",", ":"),
             ensure_ascii=False,
+            sort_keys=True,
         ).encode("utf-8")
 
     @staticmethod

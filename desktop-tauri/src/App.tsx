@@ -1016,6 +1016,9 @@ export function App() {
       if (next === previous) {
         return;
       }
+      if (payload.type === 'error' || payload.type === 'stopped') {
+        cancelComputeNodeReconciliation();
+      }
       computeStatusRef.current = next;
       setComputeStatus(next);
       if (payload.type === 'started' || payload.type === 'error' || payload.type === 'stopped') {

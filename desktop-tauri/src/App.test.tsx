@@ -1240,6 +1240,145 @@ describe('desktop app start failure handling', () => {
     vi.useRealTimers();
   });
 
+  it('stops authoritative reconciliation when an accepted error event terminates a pending start', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          operator_session_id: statusCalls === 1 ? null : 'current-session',
+          sequence: statusCalls === 1 ? null : statusCalls - 1,
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    await act(async () => {
+      eventHandlers.get('compute_node_event')?.({
+        payload: {
+          type: 'error',
+          running: false,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: statusCalls,
+          last_error: 'operator terminated',
+        },
+      });
+    });
+    const callsAfterError = statusCalls;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(statusCalls).toBe(callsAfterError);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+  });
+
+  it('stops authoritative reconciliation when an accepted stopped event follows a returned start', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          operator_session_id: statusCalls === 1 ? null : 'current-session',
+          sequence: statusCalls === 1 ? null : statusCalls - 1,
+        });
+      }
+      if (command === 'start_compute_node') {
+        return Promise.resolve(undefined);
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    await act(async () => {
+      eventHandlers.get('compute_node_event')?.({
+        payload: {
+          type: 'stopped',
+          running: false,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: statusCalls,
+        },
+      });
+    });
+    const callsAfterStopped = statusCalls;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(statusCalls).toBe(callsAfterStopped);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+  });
+
+  it('keeps reconciling a current start after rejecting a stale terminal event', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({
+          running: statusCalls >= 3,
+          registered: false,
+          operator_session_id: statusCalls === 1 ? 'previous-session' : 'current-session',
+          sequence: statusCalls === 1 ? 8 : statusCalls - 1,
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    await act(async () => {
+      eventHandlers.get('compute_node_event')?.({
+        payload: {
+          type: 'stopped',
+          running: false,
+          registered: false,
+          operator_session_id: 'previous-session',
+          sequence: 7,
+        },
+      });
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    expect(statusCalls).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+  });
+
   it('stops authoritative reconciliation when the component unmounts', async () => {
     let statusCalls = 0;
     invokeMock.mockImplementation((command: string) => {

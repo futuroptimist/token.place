@@ -76,6 +76,13 @@ class RelayStateStoreConfig:
     max_claims: int = 4096
     max_claims_per_node: int = 128
     max_consumer_identity_bytes: int = 1024
+    max_response_envelope_bytes: int = 1_048_576
+    max_responses: int = 4096
+    max_responses_per_client: int = 8
+    response_replay_ttl_seconds: float = 300.0
+    max_terminal_records: int = 4096
+    max_terminal_records_per_client: int = 8
+    terminal_retention_seconds: float = 3600.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.namespace, str) or not _NAMESPACE_RE.fullmatch(
@@ -120,6 +127,16 @@ class RelayStateStoreConfig:
             self.max_request_ttl_seconds, "request TTL", 0.001, 86_400.0
         )
         self._validate_float_bound(self.claim_ttl_seconds, "claim TTL", 0.001, 3600.0)
+        self._validate_float_bound(
+            self.response_replay_ttl_seconds, "response replay TTL", 0.001, 86_400.0
+        )
+        self._validate_float_bound(
+            self.terminal_retention_seconds, "terminal retention", 0.001, 604_800.0
+        )
+        if self.terminal_retention_seconds < self.response_replay_ttl_seconds:
+            raise RelayStateStoreError(
+                "terminal retention must cover response replay retention"
+            )
         for value, name, maximum in (
             (self.max_reservations, "reservation bound", 1_000_000),
             (self.max_reservations_per_client, "per-client reservation bound", 10_000),
@@ -143,6 +160,19 @@ class RelayStateStoreConfig:
             (self.max_claims, "claim bound", 1_000_000),
             (self.max_claims_per_node, "per-node claim bound", 10_000),
             (self.max_consumer_identity_bytes, "consumer identity byte bound", 65_536),
+            (
+                self.max_response_envelope_bytes,
+                "response encrypted-envelope byte bound",
+                64 * 1024 * 1024,
+            ),
+            (self.max_responses, "response bound", 1_000_000),
+            (self.max_responses_per_client, "per-client response bound", 10_000),
+            (self.max_terminal_records, "terminal-record bound", 1_000_000),
+            (
+                self.max_terminal_records_per_client,
+                "per-client terminal-record bound",
+                10_000,
+            ),
         ):
             self._validate_int_bound(value, name, maximum)
 
@@ -458,6 +488,100 @@ class ClaimRenewalResult:
         )
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class EncryptedResponseEnvelope:
+    """Exact API-v1 encrypted response allowlist, with no plaintext surface."""
+
+    protocol: str
+    version: int
+    ciphertext: str
+    cipherkey: str
+    iv: str
+
+    def __post_init__(self) -> None:
+        if self.protocol != "tokenplace_api_v1_relay_e2ee":
+            raise RelayStateStoreError("unsupported encrypted response protocol")
+        if isinstance(self.version, bool) or self.version != 1:
+            raise RelayStateStoreError("unsupported encrypted response version")
+        for value in (self.ciphertext, self.cipherkey, self.iv):
+            if not isinstance(value, str) or not value:
+                raise RelayStateStoreError(
+                    "encrypted response values must be non-empty strings"
+                )
+
+    def __repr__(self) -> str:
+        return "EncryptedResponseEnvelope(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ResponseRecord:
+    """One authoritative relay-blind response retained for later retrieval."""
+
+    client_identity_digest: str
+    request_identity_digest: str
+    client_public_key: str
+    request_id: str
+    selected_node_id: str
+    consumer_identity_digest: str
+    generation: int
+    envelope: EncryptedResponseEnvelope
+    accepted_at_epoch: float
+    response_digest: str
+    replay_expires_at_epoch: float
+    status: str = "response_ready"
+
+    def __repr__(self) -> str:
+        return (
+            "ResponseRecord(identities=<redacted>, selected_node_id=<redacted>, "
+            f"generation={self.generation!r}, accepted_at_epoch={self.accepted_at_epoch!r}, "
+            f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
+            "response_digest=<redacted>, envelope=<redacted>, status='response_ready')"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TerminalOutcomeRecord:
+    """Authoritative once-only completion and fencing record."""
+
+    client_identity_digest: str
+    request_identity_digest: str
+    selected_node_id: str
+    control_credential_digest: str
+    consumer_identity_digest: str
+    generation: int
+    response_digest: str
+    accepted_at_epoch: float
+    expires_at_epoch: float
+    outcome: str = "completed"
+
+    def __repr__(self) -> str:
+        return (
+            "TerminalOutcomeRecord(identities=<redacted>, selected_node_id=<redacted>, "
+            f"generation={self.generation!r}, accepted_at_epoch={self.accepted_at_epoch!r}, "
+            f"expires_at_epoch={self.expires_at_epoch!r}, outcome='completed', "
+            "credentials=<redacted>, response_digest=<redacted>)"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ResponseAcceptanceResult:
+    """Payload-free result suitable for exactly-once outcome accounting."""
+
+    state: str
+    generation: int
+    accepted_at_epoch: float
+    replay_expires_at_epoch: float
+    new_outcome: bool
+
+    def __repr__(self) -> str:
+        return (
+            f"ResponseAcceptanceResult(state={self.state!r}, generation={self.generation!r}, "
+            f"accepted_at_epoch={self.accepted_at_epoch!r}, "
+            f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
+            f"new_outcome={self.new_outcome!r})"
+        )
+
+
 @runtime_checkable
 class RelayStateStore(Protocol):
     """Transition-oriented compute registration and lease state contract."""
@@ -520,6 +644,18 @@ class RelayStateStore(Protocol):
         generation: int,
     ) -> ClaimRenewalResult: ...
     def active_claims(self, node_id: str) -> tuple[ClaimRecord, ...]: ...
+    def accept_encrypted_response(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        envelope: EncryptedResponseEnvelope,
+    ) -> ResponseAcceptanceResult: ...
+    def response_records(self) -> tuple[ResponseRecord, ...]: ...
+    def terminal_records(self) -> tuple[TerminalOutcomeRecord, ...]: ...
 
 
 class InMemoryRelayStateStore:
@@ -542,6 +678,8 @@ class InMemoryRelayStateStore:
         self._queued_token_digests: dict[tuple[str, str], str] = {}
         self._node_queues: dict[str, list[QueuedRequest]] = {}
         self._claims: dict[tuple[str, str], ClaimRecord] = {}
+        self._responses: dict[tuple[str, str], ResponseRecord] = {}
+        self._terminals: dict[tuple[str, str], TerminalOutcomeRecord] = {}
         self._next_claim_generation = 0
         self._fairness_cursors: dict[str, tuple[str, int]] = {}
         self._fairness_activity = 0
@@ -693,6 +831,8 @@ class InMemoryRelayStateStore:
                 raise RelayStateStoreError(
                     "request deadline exceeds its configured bound"
                 )
+            if identity in self._terminals:
+                raise RelayStateConflict("request lifecycle is terminal")
             queued = self._queued.get(identity)
             if queued is not None:
                 self._require_same_parameters(queued, model_id, tier, deadline)
@@ -829,6 +969,8 @@ class InMemoryRelayStateStore:
         with self._lock:
             now = self._now()
             self._reap_locked(now)
+            if identity in self._terminals:
+                raise RelayStateConflict("request lifecycle is terminal")
             existing = self._queued.get(identity)
             if existing is not None:
                 self._require_same_parameters(existing, model_id, tier, deadline)
@@ -1052,6 +1194,157 @@ class InMemoryRelayStateStore:
                 and claim.lease_expires_at_epoch > now
             )
 
+    def accept_encrypted_response(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        envelope: EncryptedResponseEnvelope,
+    ) -> ResponseAcceptanceResult:
+        """Atomically finalize the exact live fenced claim with one ciphertext."""
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        consumer_digest = self._consumer_digest(consumer_identity)
+        identity = self._identity(client_public_key, request_id)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise RelayStateStoreError("claim generation is invalid")
+        if not isinstance(envelope, EncryptedResponseEnvelope):
+            raise RelayStateStoreError(
+                "response envelope must be EncryptedResponseEnvelope"
+            )
+        serialized = self._serialized_response_envelope(envelope)
+        if len(serialized) > self.config.max_response_envelope_bytes:
+            raise RelayStateStoreError(
+                "encrypted response exceeds its configured byte bound"
+            )
+        response_digest = hashlib.sha256(serialized).hexdigest()
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now)
+            terminal = self._terminals.get(identity)
+            if terminal is not None:
+                registration = self._records.get(node_id)
+                if (
+                    registration is not None
+                    and terminal.selected_node_id == node_id
+                    and terminal.generation == generation
+                    and hmac.compare_digest(
+                        registration.control_credential_digest,
+                        control_credential_digest,
+                    )
+                    and hmac.compare_digest(
+                        terminal.control_credential_digest,
+                        control_credential_digest,
+                    )
+                    and hmac.compare_digest(
+                        terminal.consumer_identity_digest, consumer_digest
+                    )
+                    and hmac.compare_digest(terminal.response_digest, response_digest)
+                ):
+                    response = self._responses.get(identity)
+                    if response is None:
+                        raise RelayStateConflict(
+                            "response lifecycle is no longer replayable"
+                        )
+                    return self._response_result(response, False)
+                raise RelayStateConflict("response lifecycle conflict")
+
+            registration = self._records.get(node_id)
+            if registration is None or not hmac.compare_digest(
+                registration.control_credential_digest, control_credential_digest
+            ):
+                raise RelayStateCredentialMismatch("response owner is invalid")
+            claim = self._claims.get(identity)
+            if claim is None:
+                raise RelayStateConflict("response claim is missing or expired")
+            if claim.generation != generation:
+                raise RelayStateConflict("response claim generation is stale")
+            if claim.selected_node_id != node_id or not hmac.compare_digest(
+                claim.consumer_identity_digest, consumer_digest
+            ):
+                raise RelayStateCredentialMismatch("response owner is invalid")
+            if (
+                claim.lease_expires_at_epoch <= now
+                or claim.request_deadline_epoch <= now
+            ):
+                raise RelayStateConflict("response claim is missing or expired")
+            queued = self._queued.get(identity)
+            if (
+                queued is None
+                or queued.selected_node_id != node_id
+                or queued.client_public_key != client_public_key
+                or queued.request_id != request_id
+            ):
+                raise RelayStateConflict("response lifecycle identity conflict")
+            client_digest = identity[0]
+            if (
+                len(self._responses) >= self.config.max_responses
+                or sum(
+                    item.client_identity_digest == client_digest
+                    for item in self._responses.values()
+                )
+                >= self.config.max_responses_per_client
+                or len(self._terminals) >= self.config.max_terminal_records
+                or sum(
+                    item.client_identity_digest == client_digest
+                    for item in self._terminals.values()
+                )
+                >= self.config.max_terminal_records_per_client
+            ):
+                raise RelayStateCapacityExceeded("response lifecycle capacity reached")
+            replay_expires = now + self.config.response_replay_ttl_seconds
+            terminal_expires = now + self.config.terminal_retention_seconds
+            if not math.isfinite(replay_expires) or not math.isfinite(terminal_expires):
+                raise RelayStateStoreError("response retention deadline must be finite")
+            response = ResponseRecord(
+                identity[0],
+                identity[1],
+                queued.client_public_key,
+                queued.request_id,
+                node_id,
+                consumer_digest,
+                generation,
+                replace(envelope),
+                now,
+                response_digest,
+                replay_expires,
+            )
+            terminal = TerminalOutcomeRecord(
+                identity[0],
+                identity[1],
+                node_id,
+                registration.control_credential_digest,
+                consumer_digest,
+                generation,
+                response_digest,
+                now,
+                terminal_expires,
+            )
+            self._responses[identity] = response
+            self._terminals[identity] = terminal
+            self._remove_queued_identity_locked(identity, queued)
+            return self._response_result(response, True)
+
+    def response_records(self) -> tuple[ResponseRecord, ...]:
+        with self._lock:
+            self._reap_locked(self._now())
+            return tuple(
+                replace(record, envelope=replace(record.envelope))
+                for record in self._responses.values()
+            )
+
+    def terminal_records(self) -> tuple[TerminalOutcomeRecord, ...]:
+        with self._lock:
+            self._reap_locked(self._now())
+            return tuple(replace(record) for record in self._terminals.values())
+
     def _expire_locked(self, now: float) -> list[ComputeNodeRegistration]:
         expired = sorted(
             (
@@ -1071,6 +1364,12 @@ class InMemoryRelayStateStore:
 
     def _reap_locked(self, now: float) -> None:
         self._expire_locked(now)
+        for identity, response in tuple(self._responses.items()):
+            if response.replay_expires_at_epoch <= now:
+                del self._responses[identity]
+        for identity, terminal in tuple(self._terminals.items()):
+            if terminal.expires_at_epoch <= now:
+                del self._terminals[identity]
         for identity, reservation in tuple(self._reservations.items()):
             if (
                 reservation.reservation_expires_at_epoch <= now
@@ -1079,13 +1378,20 @@ class InMemoryRelayStateStore:
                 del self._reservations[identity]
         for identity, queued in tuple(self._queued.items()):
             if queued.request_deadline_epoch <= now:
-                del self._queued[identity]
-                del self._queued_token_digests[identity]
-                queue = self._node_queues.get(queued.selected_node_id, [])
-                self._node_queues[queued.selected_node_id] = [
-                    item for item in queue if item != queued
-                ]
-                self._claims.pop(identity, None)
+                self._remove_queued_identity_locked(identity, queued)
+
+    def _remove_queued_identity_locked(
+        self, identity: tuple[str, str], queued: QueuedRequest
+    ) -> None:
+        self._queued.pop(identity, None)
+        self._queued_token_digests.pop(identity, None)
+        queue = self._node_queues.get(queued.selected_node_id, [])
+        remaining = [item for item in queue if item != queued]
+        if remaining:
+            self._node_queues[queued.selected_node_id] = remaining
+        else:
+            self._node_queues.pop(queued.selected_node_id, None)
+        self._claims.pop(identity, None)
 
     def _remove_node_reservations_locked(self, node_id: str) -> None:
         for identity, reservation in tuple(self._reservations.items()):
@@ -1243,6 +1549,32 @@ class InMemoryRelayStateStore:
             raise RelayStateStoreError(
                 "encrypted envelope exceeds its configured byte bound"
             )
+
+    @staticmethod
+    def _serialized_response_envelope(envelope: EncryptedResponseEnvelope) -> bytes:
+        return json.dumps(
+            {
+                "protocol": envelope.protocol,
+                "version": envelope.version,
+                "ciphertext": envelope.ciphertext,
+                "cipherkey": envelope.cipherkey,
+                "iv": envelope.iv,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+    @staticmethod
+    def _response_result(
+        response: ResponseRecord, new_outcome: bool
+    ) -> ResponseAcceptanceResult:
+        return ResponseAcceptanceResult(
+            "response_ready",
+            response.generation,
+            response.accepted_at_epoch,
+            response.replay_expires_at_epoch,
+            new_outcome,
+        )
 
     @staticmethod
     def _token_digest(token: str) -> str:

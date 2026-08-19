@@ -76,6 +76,13 @@ class RelayStateStoreConfig:
     max_claims: int = 4096
     max_claims_per_node: int = 128
     max_consumer_identity_bytes: int = 1024
+    response_replay_ttl_seconds: float = 300.0
+    terminal_retention_seconds: float = 3600.0
+    max_response_envelope_bytes: int = 1_048_576
+    max_responses: int = 4096
+    max_responses_per_client: int = 8
+    max_terminal_records: int = 4096
+    max_terminal_records_per_client: int = 8
 
     def __post_init__(self) -> None:
         if not isinstance(self.namespace, str) or not _NAMESPACE_RE.fullmatch(
@@ -120,6 +127,16 @@ class RelayStateStoreConfig:
             self.max_request_ttl_seconds, "request TTL", 0.001, 86_400.0
         )
         self._validate_float_bound(self.claim_ttl_seconds, "claim TTL", 0.001, 3600.0)
+        self._validate_float_bound(
+            self.response_replay_ttl_seconds, "response replay TTL", 0.001, 86_400.0
+        )
+        self._validate_float_bound(
+            self.terminal_retention_seconds, "terminal retention", 0.001, 604_800.0
+        )
+        if self.terminal_retention_seconds < self.response_replay_ttl_seconds:
+            raise RelayStateStoreError(
+                "terminal retention must cover the response replay TTL"
+            )
         for value, name, maximum in (
             (self.max_reservations, "reservation bound", 1_000_000),
             (self.max_reservations_per_client, "per-client reservation bound", 10_000),
@@ -143,6 +160,19 @@ class RelayStateStoreConfig:
             (self.max_claims, "claim bound", 1_000_000),
             (self.max_claims_per_node, "per-node claim bound", 10_000),
             (self.max_consumer_identity_bytes, "consumer identity byte bound", 65_536),
+            (
+                self.max_response_envelope_bytes,
+                "response encrypted-envelope byte bound",
+                64 * 1024 * 1024,
+            ),
+            (self.max_responses, "response bound", 1_000_000),
+            (self.max_responses_per_client, "per-client response bound", 10_000),
+            (self.max_terminal_records, "terminal record bound", 1_000_000),
+            (
+                self.max_terminal_records_per_client,
+                "per-client terminal record bound",
+                10_000,
+            ),
         ):
             self._validate_int_bound(value, name, maximum)
 
@@ -458,6 +488,87 @@ class ClaimRenewalResult:
         )
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class ResponseRecord:
+    """One accepted relay-blind response retained for a later retrieval slice."""
+
+    client_identity_digest: str
+    request_identity_digest: str
+    client_public_key: str
+    request_id: str
+    selected_node_identity_digest: str
+    requested_model_id: str
+    requested_context_tier: str
+    request_deadline_epoch: float
+    envelope: EncryptedRequestEnvelope
+    sequence: int
+    claim_generation: int
+    accepted_at_epoch: float
+    response_digest: str
+    replay_expires_at_epoch: float
+    lifecycle_status: str = "response_ready"
+
+    def __repr__(self) -> str:
+        return (
+            "ResponseRecord(identities=<redacted>, selected_node=<redacted>, "
+            f"sequence={self.sequence!r}, claim_generation={self.claim_generation!r}, "
+            f"accepted_at_epoch={self.accepted_at_epoch!r}, "
+            f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
+            f"lifecycle_status={self.lifecycle_status!r}, envelope=<redacted>)"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TerminalRecord:
+    """Authoritative exactly-once completed-outcome and fencing record."""
+
+    client_identity_digest: str
+    request_identity_digest: str
+    selected_node_identity_digest: str
+    owner_credential_digest: str
+    consumer_identity_digest: str
+    requested_model_id: str
+    requested_context_tier: str
+    request_deadline_epoch: float
+    sequence: int
+    claim_generation: int
+    accepted_at_epoch: float
+    response_digest: str
+    replay_expires_at_epoch: float
+    terminal_expires_at_epoch: float
+    lifecycle_status: str = "completed"
+
+    def __repr__(self) -> str:
+        return (
+            "TerminalRecord(identities=<redacted>, authentication=<redacted>, "
+            f"sequence={self.sequence!r}, claim_generation={self.claim_generation!r}, "
+            f"accepted_at_epoch={self.accepted_at_epoch!r}, "
+            f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
+            f"terminal_expires_at_epoch={self.terminal_expires_at_epoch!r}, "
+            f"lifecycle_status={self.lifecycle_status!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ResponseAcceptanceResult:
+    """Fixed safe outcome suitable for exactly-once future metric accounting."""
+
+    state: str
+    new_outcome: bool
+    claim_generation: int | None = None
+    accepted_at_epoch: float | None = None
+    replay_expires_at_epoch: float | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"ResponseAcceptanceResult(state={self.state!r}, "
+            f"new_outcome={self.new_outcome!r}, "
+            f"claim_generation={self.claim_generation!r}, "
+            f"accepted_at_epoch={self.accepted_at_epoch!r}, "
+            f"replay_expires_at_epoch={self.replay_expires_at_epoch!r})"
+        )
+
+
 @runtime_checkable
 class RelayStateStore(Protocol):
     """Transition-oriented compute registration and lease state contract."""
@@ -520,6 +631,18 @@ class RelayStateStore(Protocol):
         generation: int,
     ) -> ClaimRenewalResult: ...
     def active_claims(self, node_id: str) -> tuple[ClaimRecord, ...]: ...
+    def accept_encrypted_response(
+        self,
+        client_public_key: str,
+        request_id: str,
+        selected_node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        claim_generation: int,
+        envelope: EncryptedRequestEnvelope,
+    ) -> ResponseAcceptanceResult: ...
+    def pending_responses(self) -> tuple[ResponseRecord, ...]: ...
+    def terminal_outcomes(self) -> tuple[TerminalRecord, ...]: ...
 
 
 class InMemoryRelayStateStore:
@@ -542,6 +665,8 @@ class InMemoryRelayStateStore:
         self._queued_token_digests: dict[tuple[str, str], str] = {}
         self._node_queues: dict[str, list[QueuedRequest]] = {}
         self._claims: dict[tuple[str, str], ClaimRecord] = {}
+        self._responses: dict[tuple[str, str], ResponseRecord] = {}
+        self._terminals: dict[tuple[str, str], TerminalRecord] = {}
         self._next_claim_generation = 0
         self._fairness_cursors: dict[str, tuple[str, int]] = {}
         self._fairness_activity = 0
@@ -1052,6 +1177,182 @@ class InMemoryRelayStateStore:
                 and claim.lease_expires_at_epoch > now
             )
 
+    def accept_encrypted_response(
+        self,
+        client_public_key: str,
+        request_id: str,
+        selected_node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        claim_generation: int,
+        envelope: EncryptedRequestEnvelope,
+    ) -> ResponseAcceptanceResult:
+        """Atomically finalize the exact live fenced claim with one ciphertext."""
+
+        identity = self._identity(client_public_key, request_id)
+        self._validate_node_id(selected_node_id)
+        self._validate_digest(control_credential_digest)
+        consumer_digest = self._consumer_digest(consumer_identity)
+        if (
+            isinstance(claim_generation, bool)
+            or not isinstance(claim_generation, int)
+            or claim_generation < 1
+        ):
+            raise RelayStateStoreError("claim generation is invalid")
+        if not isinstance(envelope, EncryptedRequestEnvelope):
+            raise RelayStateStoreError("envelope must be EncryptedRequestEnvelope")
+        self._validate_envelope_size(
+            envelope, maximum=self.config.max_response_envelope_bytes
+        )
+        response_digest = self._envelope_digest(envelope)
+        node_digest = self._identity_digest(selected_node_id, b"node\0")
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now)
+            terminal = self._terminals.get(identity)
+            if terminal is not None:
+                identical = (
+                    terminal.claim_generation == claim_generation
+                    and hmac.compare_digest(
+                        terminal.selected_node_identity_digest, node_digest
+                    )
+                    and hmac.compare_digest(
+                        terminal.owner_credential_digest, control_credential_digest
+                    )
+                    and hmac.compare_digest(
+                        terminal.consumer_identity_digest, consumer_digest
+                    )
+                    and hmac.compare_digest(terminal.response_digest, response_digest)
+                )
+                if not identical:
+                    return ResponseAcceptanceResult("conflict", False)
+                return ResponseAcceptanceResult(
+                    "response_ready",
+                    False,
+                    terminal.claim_generation,
+                    terminal.accepted_at_epoch,
+                    terminal.replay_expires_at_epoch,
+                )
+
+            registration = self._records.get(selected_node_id)
+            if registration is None or not hmac.compare_digest(
+                registration.control_credential_digest, control_credential_digest
+            ):
+                return ResponseAcceptanceResult("owner_mismatch", False)
+            claim = self._claims.get(identity)
+            if claim is None:
+                return ResponseAcceptanceResult("missing_or_expired", False)
+            if claim.generation != claim_generation:
+                return ResponseAcceptanceResult("stale_generation", False)
+            if (
+                claim.request_deadline_epoch <= now
+                or claim.lease_expires_at_epoch <= now
+            ):
+                return ResponseAcceptanceResult("missing_or_expired", False)
+            if claim.selected_node_id != selected_node_id or not hmac.compare_digest(
+                claim.consumer_identity_digest, consumer_digest
+            ):
+                return ResponseAcceptanceResult("owner_mismatch", False)
+            queued = self._queued.get(identity)
+            if (
+                queued is None
+                or queued.selected_node_id != selected_node_id
+                or queued.client_public_key != client_public_key
+                or queued.request_id != request_id
+            ):
+                return ResponseAcceptanceResult("identity_mismatch", False)
+
+            client_response_count = sum(
+                item.client_identity_digest == identity[0]
+                for item in self._responses.values()
+            )
+            client_terminal_count = sum(
+                item.client_identity_digest == identity[0]
+                for item in self._terminals.values()
+            )
+            if (
+                len(self._responses) >= self.config.max_responses
+                or client_response_count >= self.config.max_responses_per_client
+                or len(self._terminals) >= self.config.max_terminal_records
+                or client_terminal_count >= self.config.max_terminal_records_per_client
+            ):
+                raise RelayStateCapacityExceeded("response outcome capacity reached")
+
+            replay_expires = now + self.config.response_replay_ttl_seconds
+            terminal_expires = now + self.config.terminal_retention_seconds
+            if not math.isfinite(replay_expires) or not math.isfinite(terminal_expires):
+                raise RelayStateStoreError("response retention deadline must be finite")
+            response = ResponseRecord(
+                identity[0],
+                identity[1],
+                client_public_key,
+                request_id,
+                node_digest,
+                queued.requested_model_id,
+                queued.requested_context_tier,
+                queued.request_deadline_epoch,
+                replace(envelope),
+                queued.sequence,
+                claim_generation,
+                now,
+                response_digest,
+                replay_expires,
+            )
+            terminal = TerminalRecord(
+                identity[0],
+                identity[1],
+                node_digest,
+                control_credential_digest,
+                consumer_digest,
+                queued.requested_model_id,
+                queued.requested_context_tier,
+                queued.request_deadline_epoch,
+                queued.sequence,
+                claim_generation,
+                now,
+                response_digest,
+                replay_expires,
+                terminal_expires,
+            )
+            self._responses[identity] = response
+            self._terminals[identity] = terminal
+            self._claims.pop(identity, None)
+            self._queued.pop(identity, None)
+            self._queued_token_digests.pop(identity, None)
+            queue = self._node_queues.get(selected_node_id, ())
+            remaining = [item for item in queue if item != queued]
+            if remaining:
+                self._node_queues[selected_node_id] = remaining
+            else:
+                self._node_queues.pop(selected_node_id, None)
+            return ResponseAcceptanceResult(
+                "response_ready", True, claim_generation, now, replay_expires
+            )
+
+    def pending_responses(self) -> tuple[ResponseRecord, ...]:
+        """Return immutable defensive snapshots for backend contract verification."""
+
+        with self._lock:
+            self._reap_locked(self._now())
+            return tuple(
+                replace(record, envelope=replace(record.envelope))
+                for record in sorted(
+                    self._responses.values(), key=lambda item: item.sequence
+                )
+            )
+
+    def terminal_outcomes(self) -> tuple[TerminalRecord, ...]:
+        """Return immutable defensive snapshots of authoritative outcomes."""
+
+        with self._lock:
+            self._reap_locked(self._now())
+            return tuple(
+                replace(record)
+                for record in sorted(
+                    self._terminals.values(), key=lambda item: item.sequence
+                )
+            )
+
     def _expire_locked(self, now: float) -> list[ComputeNodeRegistration]:
         expired = sorted(
             (
@@ -1071,6 +1372,12 @@ class InMemoryRelayStateStore:
 
     def _reap_locked(self, now: float) -> None:
         self._expire_locked(now)
+        for identity, response in tuple(self._responses.items()):
+            if response.replay_expires_at_epoch <= now:
+                del self._responses[identity]
+        for identity, terminal in tuple(self._terminals.items()):
+            if terminal.terminal_expires_at_epoch <= now:
+                del self._terminals[identity]
         for identity, reservation in tuple(self._reservations.items()):
             if (
                 reservation.reservation_expires_at_epoch <= now
@@ -1227,8 +1534,8 @@ class InMemoryRelayStateStore:
             created,
         )
 
-    def _validate_envelope_size(self, envelope: EncryptedRequestEnvelope) -> None:
-        serialized = json.dumps(
+    def _serialize_envelope(self, envelope: EncryptedRequestEnvelope) -> bytes:
+        return json.dumps(
             {
                 "protocol": envelope.protocol,
                 "version": envelope.version,
@@ -1239,10 +1546,18 @@ class InMemoryRelayStateStore:
             separators=(",", ":"),
             ensure_ascii=False,
         ).encode("utf-8")
-        if len(serialized) > self.config.max_envelope_bytes:
+
+    def _validate_envelope_size(
+        self, envelope: EncryptedRequestEnvelope, *, maximum: int | None = None
+    ) -> None:
+        serialized = self._serialize_envelope(envelope)
+        if len(serialized) > (maximum or self.config.max_envelope_bytes):
             raise RelayStateStoreError(
                 "encrypted envelope exceeds its configured byte bound"
             )
+
+    def _envelope_digest(self, envelope: EncryptedRequestEnvelope) -> str:
+        return hashlib.sha256(self._serialize_envelope(envelope)).hexdigest()
 
     @staticmethod
     def _token_digest(token: str) -> str:

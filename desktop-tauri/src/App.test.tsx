@@ -20,6 +20,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 
 describe('desktop app start failure handling', () => {
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
   });
 
@@ -1161,6 +1162,112 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
     expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+  });
+
+  it('continues reconciling the active start after ten seconds', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        if (statusCalls < 45) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: statusCalls === 1 ? null : 'current-session',
+            sequence: statusCalls,
+          });
+        }
+        return Promise.resolve({
+          running: true,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: statusCalls,
+          worker_state: 'starting',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(12_000);
+    });
+
+    expect(statusCalls).toBeGreaterThanOrEqual(45);
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+    vi.useRealTimers();
+  });
+
+  it('stops authoritative reconciliation when the start fails', async () => {
+    let rejectStart: (reason: Error) => void = () => {};
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({ running: false, registered: false });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise((_, reject) => {
+          rejectStart = reject;
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => rejectStart(new Error('start failed')));
+    const callsAfterFailure = statusCalls;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(statusCalls).toBe(callsAfterFailure);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    vi.useRealTimers();
+  });
+
+  it('stops authoritative reconciliation when the component unmounts', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({ running: false, registered: false });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    const view = render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+    view.unmount();
+    const callsAfterUnmount = statusCalls;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(statusCalls).toBe(callsAfterUnmount);
+    vi.useRealTimers();
   });
 
   it('surfaces a fresh restart startup error while ignoring stale old-session events', async () => {

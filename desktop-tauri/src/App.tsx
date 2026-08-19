@@ -932,6 +932,15 @@ export function App() {
   const requestIdRef = useRef('');
   const computeStatusRef = useRef<ComputeNodeStatus>(defaultComputeStatus);
   const computeNodeStartAttemptRef = useRef(0);
+  const computeNodeReconciliationTimerRef = useRef<number | null>(null);
+
+  const cancelComputeNodeReconciliation = () => {
+    computeNodeStartAttemptRef.current += 1;
+    if (computeNodeReconciliationTimerRef.current !== null) {
+      window.clearTimeout(computeNodeReconciliationTimerRef.current);
+      computeNodeReconciliationTimerRef.current = null;
+    }
+  };
 
   useLayoutEffect(() => {
     if (applicationInitializationLoaded) {
@@ -1033,6 +1042,7 @@ export function App() {
 
   useEffect(() => {
     return () => {
+      cancelComputeNodeReconciliation();
       if (saveTimerRef.current !== null) {
         window.clearTimeout(saveTimerRef.current);
       }
@@ -1155,6 +1165,7 @@ export function App() {
   };
 
   const startComputeNode = async () => {
+    cancelComputeNodeReconciliation();
     const startAttempt = computeNodeStartAttemptRef.current + 1;
     computeNodeStartAttemptRef.current = startAttempt;
     const startSessionId = computeStatusRef.current.operator_session_id;
@@ -1209,11 +1220,9 @@ export function App() {
         },
       });
       void (async () => {
-        for (let attempt = 0; attempt < 40; attempt += 1) {
-          if (
-            computeNodeStartAttemptRef.current !== startAttempt ||
-            computeStatusRef.current.running
-          ) {
+        const reconcile = async (): Promise<void> => {
+          if (computeNodeStartAttemptRef.current !== startAttempt || computeStatusRef.current.running) {
+            computeNodeReconciliationTimerRef.current = null;
             return;
           }
           try {
@@ -1228,21 +1237,28 @@ export function App() {
               setComputeStatus(next);
             }
             if (next.running) {
+              computeNodeReconciliationTimerRef.current = null;
               return;
             }
           } catch {
-            // The start command remains authoritative; a later bounded poll
-            // can still reconcile a missed event without surfacing raw errors.
+            // The start command remains authoritative; a later lifecycle-bound
+            // poll can still reconcile a missed event without surfacing raw errors.
           }
-          await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
-        }
+          if (computeNodeStartAttemptRef.current === startAttempt) {
+            computeNodeReconciliationTimerRef.current = window.setTimeout(() => {
+              computeNodeReconciliationTimerRef.current = null;
+              void reconcile();
+            }, 250);
+          }
+        };
+        await reconcile();
       })();
       await startPromise;
     } catch (e) {
       if (computeNodeStartAttemptRef.current !== startAttempt) {
         return;
       }
-      computeNodeStartAttemptRef.current += 1;
+      cancelComputeNodeReconciliation();
       setIsStartingComputeNode(false);
       const message = formatErrorMessage(e);
       const failedStatus = {
@@ -1261,6 +1277,7 @@ export function App() {
   };
 
   const stopComputeNode = async () => {
+    cancelComputeNodeReconciliation();
     try {
       setIsStoppingComputeNode(true);
       setError('');

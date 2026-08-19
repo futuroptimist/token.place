@@ -933,9 +933,11 @@ export function App() {
   const computeStatusRef = useRef<ComputeNodeStatus>(defaultComputeStatus);
   const computeNodeStartAttemptRef = useRef(0);
   const computeNodeReconciliationTimerRef = useRef<number | null>(null);
+  const computeNodePriorSessionRef = useRef<string | null>(null);
 
   const cancelComputeNodeReconciliation = () => {
     computeNodeStartAttemptRef.current += 1;
+    computeNodePriorSessionRef.current = null;
     if (computeNodeReconciliationTimerRef.current !== null) {
       window.clearTimeout(computeNodeReconciliationTimerRef.current);
       computeNodeReconciliationTimerRef.current = null;
@@ -1011,6 +1013,14 @@ export function App() {
   useEffect(() => {
     const unlisten = listen<Record<string, unknown>>('compute_node_event', (evt) => {
       const payload = evt.payload;
+      // Native starts allocate a new session. Keep late events from the session
+      // that preceded this attempt from canceling or overwriting reconciliation.
+      if (
+        computeNodePriorSessionRef.current !== null &&
+        payload.operator_session_id === computeNodePriorSessionRef.current
+      ) {
+        return;
+      }
       const previous = computeStatusRef.current;
       const next = mergeComputeStatusEvent(previous, payload);
       if (next === previous) {
@@ -1172,6 +1182,7 @@ export function App() {
     const startAttempt = computeNodeStartAttemptRef.current + 1;
     computeNodeStartAttemptRef.current = startAttempt;
     const startSessionId = computeStatusRef.current.operator_session_id;
+    computeNodePriorSessionRef.current = startSessionId;
     try {
       setIsStartingComputeNode(true);
       setError('');
@@ -1180,7 +1191,6 @@ export function App() {
         running: false,
         registered: false,
         relay_runtime_state: 'starting',
-        sequence: computeStatusRef.current.operator_session_id ? Number.MAX_SAFE_INTEGER : null,
         active_relay_url: primaryRelayUrl(config),
         configured_relay_urls: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url),
         relay_statuses: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).map((relayUrl) => ({
@@ -1240,6 +1250,7 @@ export function App() {
               setComputeStatus(next);
             }
             if (next.running) {
+              computeNodePriorSessionRef.current = null;
               computeNodeReconciliationTimerRef.current = null;
               return;
             }

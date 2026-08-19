@@ -1130,8 +1130,8 @@ describe('desktop app start failure handling', () => {
         }
         if (statusCalls === 2) {
           return Promise.resolve({
-            running: true,
-            registered: true,
+            running: false,
+            registered: false,
             operator_session_id: 'previous-session',
             sequence: 9,
           });
@@ -1162,6 +1162,35 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
     expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+  });
+
+  it('accepts an authoritative same-session running snapshot after restart', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({
+          running: statusCalls > 1,
+          registered: false,
+          operator_session_id: 'existing-session',
+          sequence: statusCalls === 1 ? 8 : 9,
+          worker_state: statusCalls === 1 ? 'stopped' : 'starting',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('existing-session');
+    expect(statusCalls).toBeGreaterThanOrEqual(2);
   });
 
   it('continues reconciling the active start after ten seconds', async () => {

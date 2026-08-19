@@ -53,6 +53,10 @@ SENSITIVE_KEYS = {
 # not borrow from the inference request's independently measured allowance.
 PACKAGED_SETUP_BUDGET_S = 300.0
 PACKAGED_FINALIZATION_BUDGET_S = 120.0
+# Windows does not expose these POSIX-only signal attributes. Keep the injected
+# POSIX cleanup seam host-independent while preferring native signal constants.
+POSIX_SIGTERM = getattr(signal, "SIGTERM", 15)
+POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 PACKAGED_PHASE_STATUS_VERSION = "packaged-runner-phase-v2"
 PACKAGED_PHASES = (
     "runner_startup", "webdriver_ready", "desktop_ready", "operator_ready",

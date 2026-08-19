@@ -726,6 +726,38 @@ def test_desktop_operator_pr_validation_has_no_macos_jobs_and_linux_python39_ins
     assert "test_desktop_no_relay_autostart_e2e.py" not in linux_runs
 
 
+def test_desktop_operator_linux_apt_setup_is_bounded_and_has_safe_fallback() -> None:
+    workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-operator-e2e.yml")
+    job = workflow_data["jobs"]["desktop-operator-e2e"]
+    assert job["timeout-minutes"] == "20"
+
+    dependency_step = next(
+        step
+        for step in job["steps"]
+        if step.get("name") == "Install Linux desktop dependencies"
+    )
+    run = dependency_step["run"]
+    required_packages = {
+        "libwebkit2gtk-4.1-dev",
+        "webkit2gtk-driver",
+        "libgtk-3-dev",
+        "libayatana-appindicator3-dev",
+        "libsoup-3.0-dev",
+        "libjavascriptcoregtk-4.1-dev",
+        "patchelf",
+        "xvfb",
+    }
+    assert all(package in run for package in required_packages)
+    assert "Acquire::Retries=2" in run
+    assert "Acquire::http::Timeout=20" in run
+    assert "Acquire::https::Timeout=20" in run
+    assert run.count("timeout --signal=TERM --kill-after=10s 150s") == 2
+    assert "timeout --signal=TERM --kill-after=10s 240s" in run
+    assert "azure\\.archive\\.ubuntu\\.com" in run
+    assert "http://archive.ubuntu.com/ubuntu" in run
+    assert "Expected GitHub-hosted Ubuntu Azure mirror configuration was not found" in run
+
+
 def test_retired_legacy_electron_desktop_packaging_workflow_stays_removed() -> None:
     legacy_workflow = WORKFLOW_DIR / "desktop.yml"
     assert not legacy_workflow.exists(), (

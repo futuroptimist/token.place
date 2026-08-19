@@ -70,8 +70,38 @@ jobs:
 
       - name: Install Linux desktop dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          apt_options=(
+            -o Acquire::Retries=2
+            -o Acquire::http::Timeout=20
+            -o Acquire::https::Timeout=20
+          )
+          if ! timeout --signal=TERM --kill-after=10s 150s \
+            sudo apt-get "${apt_options[@]}" update; then
+            echo "Azure Ubuntu mirror update failed; validating canonical fallback eligibility"
+            azure_sources=()
+            for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+              if [[ -f "$source_file" ]] && grep -Eq \
+                'https?://azure\.archive\.ubuntu\.com/ubuntu/?' "$source_file"; then
+                azure_sources+=("$source_file")
+              fi
+            done
+            if (( ${#azure_sources[@]} == 0 )); then
+              echo "Expected GitHub-hosted Ubuntu Azure mirror configuration was not found"
+              exit 1
+            fi
+            sudo sed -i -E \
+              's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#http://archive.ubuntu.com/ubuntu#g' \
+              "${azure_sources[@]}"
+            if grep -E 'https?://azure\.archive\.ubuntu\.com/ubuntu/?' "${azure_sources[@]}"; then
+              echo "Azure mirror replacement was incomplete"
+              exit 1
+            fi
+            echo "Retrying update with canonical Ubuntu archive fallback"
+            timeout --signal=TERM --kill-after=10s 150s \
+              sudo apt-get "${apt_options[@]}" update
+          fi
+          timeout --signal=TERM --kill-after=10s 240s \
+            sudo apt-get "${apt_options[@]}" install -y \
             libwebkit2gtk-4.1-dev \
             webkit2gtk-driver \
             libgtk-3-dev \

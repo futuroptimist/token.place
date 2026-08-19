@@ -209,8 +209,13 @@ its opaque request ID **before** selection. Every `/servers/next` call supplies 
 public key and request ID in addition to model and context tier; the relay derives the canonical
 `(client_digest, request_digest)` identity rather than trusting client-supplied digests. Selection
 creates a bounded, single-use reservation token for that identity and returns the token alongside the
-selected public key. Retrying selection with the same identity and compatible parameters returns the
-unconsumed reservation and selected node; conflicting parameters fail with a fixed error.
+selected public key. Because only the token digest is persisted, an identical selection retry returns
+the unconsumed reservation metadata and selected node but cannot return or reconstruct the raw token.
+The client must retain the token returned by the creating call; if that response is lost, it waits for
+the short reservation expiry, after which selection may create a fresh token for the still-unqueued
+identity. Conflicting parameters fail with a fixed error. This deliberately resolves the otherwise
+contradictory requirements to return an existing raw token on retry while never persisting raw token
+material or a secret capable of reconstructing it.
 
 `/requests` must echo the token and the same identity, and enqueue consumes it only after all fields
 match. A client may cache node metadata for display or encryption, but it must obtain a fresh
@@ -218,8 +223,12 @@ identity-bound reservation for every new request; cached-node reuse cannot bypas
 reuse another request's token. Adding these selection parameters and response/request token fields is
 compatible with the wire schema, but shared-state multi-worker mode fails closed for clients that
 omit them; legacy clients remain supported only in single-process memory mode until upgraded. Raw
-selection identity values are validated and held only for the request; the reservation stores their
-digests, the token is never logged, and only its digest is stored.
+selection identity values are validated and bounded. Reservations store their canonical digests;
+queued lifecycle records retain the exact public key and request ID as the minimum routing metadata
+needed to deliver and correlate ciphertext. They do not accept arbitrary payload fields. The token
+is never logged, and only its digest is stored. Enqueue retains that consumed digest in private
+idempotency state for the queued lifecycle, so only the original token with the identical canonical
+request can repeat successfully; cleanup removes the digest with its queued record.
 
 Reservations count toward node concurrency and queue bounds. Enqueue consumes one; cancellation,
 deadline expiry, or the short reservation TTL releases it through the same bounded reaper. A retry

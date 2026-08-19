@@ -706,7 +706,10 @@ new Vue({
             let escaped = this.escapeHtml(raw);
 
             escaped = escaped.replace(/```([\s\S]*?)```/g, (_, code) => {
-                const token = `__CODE_BLOCK_${codeBlocks.length}__`;
+                // This marker is inserted only after raw HTML has been escaped, so
+                // message content cannot impersonate it. Unlike the old plaintext
+                // token, inline Markdown replacements cannot consume this element.
+                const token = `<codeblockplaceholder${codeBlocks.length}></codeblockplaceholder${codeBlocks.length}>`;
                 codeBlocks.push(`<pre><code>${code.replace(/\r?\n$/, '')}</code></pre>`);
                 return token;
             });
@@ -732,7 +735,7 @@ new Vue({
 
             for (const line of lines) {
                 const trimmed = line.trim();
-                const placeholderMatch = /^__CODE_BLOCK_(\d+)__$/.exec(trimmed);
+                const placeholderMatch = /^<codeblockplaceholder(\d+)><\/codeblockplaceholder\1>$/.exec(trimmed);
                 if (placeholderMatch) {
                     flushList();
                     const idx = Number(placeholderMatch[1]);

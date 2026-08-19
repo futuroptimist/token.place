@@ -198,6 +198,7 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_compute_node_count_rejects_null_diagnostics",
     "tests/e2e/test_ui.py::test_compute_node_count_ignores_stale_refresh",
     "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1",
+    "tests/e2e/test_ui.py::test_markdown_rendering_stream_updates",
 }
 REAL_DESKTOP_BRIDGE_E2E_NODEID = "tests/e2e/test_ui.py::test_landing_chat_real_inference_with_desktop_bridge_api_v1"
 

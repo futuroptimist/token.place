@@ -508,6 +508,40 @@ def test_enqueue_consumes_once_and_identical_retry_is_safe(store_factory, capabi
     assert len(store.queued_requests("node-a")) == 1
 
 
+def test_selection_retry_after_enqueue_reports_enqueue_time(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(clock=clock)
+    store.register("node-a", capabilities, digest("owner"))
+    selection = reserve(store)
+    clock.value += 1
+    enqueue(store, selection)
+
+    retry = reserve(store)
+
+    assert retry.reservation_expires_at_epoch == clock.value
+    assert retry.reservation_expires_at_epoch != retry.request_deadline_epoch
+
+
+@pytest.mark.parametrize("teardown", ["unregister", "expire"])
+def test_node_teardown_removes_queued_work(store_factory, capabilities, teardown):
+    clock = EpochClock()
+    store = store_factory(clock=clock, lease_ttl_seconds=1)
+    store.register("node-a", capabilities, digest("owner"))
+    enqueue(store, reserve(store))
+
+    if teardown == "unregister":
+        assert store.unregister("node-a", digest("owner"))
+    else:
+        clock.value += 1
+        assert store.expire()
+
+    assert store.queued_requests("node-a") == ()
+    store.register("node-b", capabilities, digest("replacement"))
+    assert reserve(store).selected_node_id == "node-b"
+
+
 def test_wrong_cross_identity_cross_node_expired_and_reused_tokens_fail(
     store_factory, capabilities
 ):
@@ -642,6 +676,60 @@ def test_context_requirement_and_claimed_work_count_toward_capacity(
     )
     with pytest.raises(RelayStateNoCapacity):
         reserve(store, "request-b")
+
+
+def test_active_context_tier_must_satisfy_request(store_factory, capabilities):
+    store = store_factory()
+    oversized_fast = replace(capabilities, maximum_total_context_tokens=65536)
+    full = replace(
+        capabilities,
+        active_context_tier="64k-full",
+        maximum_total_context_tokens=65536,
+    )
+    store.register("fast", oversized_fast, digest("fast"))
+    store.register("full", full, digest("full"))
+
+    assert reserve(store, requested_context_tier="64k-full").selected_node_id == "full"
+
+
+def test_queued_work_counts_toward_per_client_bound(store_factory, capabilities):
+    store = store_factory(max_reservations_per_client=1)
+    store.register("node-a", replace(capabilities, max_concurrency=2), digest("owner"))
+    enqueue(store, reserve(store))
+
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store, "request-b")
+    assert (
+        reserve(store, "request-c", client_public_key="other-client").selected_node_id
+        == "node-a"
+    )
+
+
+def test_inactive_fairness_fingerprints_are_reclaimed(store_factory, capabilities):
+    clock = EpochClock()
+    store = store_factory(clock=clock, max_scheduler_fingerprints=1)
+    store.register(
+        "node-a",
+        replace(capabilities, supported_model_ids=("model-a", "model-b")),
+        digest("owner"),
+    )
+    first = reserve(
+        store,
+        requested_model_id="model-a",
+        request_deadline_epoch=clock.value + 1,
+    )
+    enqueue(store, first)
+    clock.value += 1
+
+    assert (
+        reserve(
+            store,
+            "request-b",
+            requested_model_id="model-b",
+            request_deadline_epoch=clock.value + 10,
+        ).selected_node_id
+        == "node-a"
+    )
 
 
 @pytest.mark.parametrize(

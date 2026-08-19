@@ -306,6 +306,8 @@ class SelectionResult:
     An idempotent retry returns the same metadata with ``None``: the store cannot
     reconstruct a raw token from the only persisted value, its digest. Callers must
     retain the first token or retry selection after the short reservation expiry.
+    Once a request is queued, ``reservation_expires_at_epoch`` reports its stable
+    enqueue time rather than implying that a consumed reservation remains valid.
     """
 
     selected_node_id: str
@@ -551,6 +553,8 @@ class InMemoryRelayStateStore:
             self._scheduler_states.pop(node_id, None)
             self._registration_order.pop(node_id, None)
             self._remove_node_reservations_locked(node_id)
+            self._remove_node_queue_locked(node_id)
+            self._reap_fairness_cursors_locked()
             return True
 
     def set_scheduler_state(
@@ -600,7 +604,7 @@ class InMemoryRelayStateStore:
                     model_id,
                     tier,
                     deadline,
-                    queued.request_deadline_epoch,
+                    queued.enqueued_at_epoch,
                     None,
                     False,
                 )
@@ -610,28 +614,35 @@ class InMemoryRelayStateStore:
                 return self._selection_result(existing, None, False)
             if len(self._reservations) >= self.config.max_reservations:
                 raise RelayStateNoCapacity("no scheduler capacity")
-            if (
-                sum(
-                    r.client_identity_digest == client_digest
-                    for r in self._reservations.values()
-                )
-                >= self.config.max_reservations_per_client
-            ):
+            client_lifecycle_count = sum(
+                item.client_identity_digest == client_digest
+                for item in self._reservations.values()
+            ) + sum(
+                item.client_identity_digest == client_digest
+                for item in self._queued.values()
+            )
+            if client_lifecycle_count >= self.config.max_reservations_per_client:
                 raise RelayStateNoCapacity("no scheduler capacity")
 
             eligible: list[tuple[int, int, int, str]] = []
             requested_tokens = CONTEXT_TIER_TOKEN_BOUNDS[tier]
+            reservation_counts: dict[str, int] = {}
+            for reservation in self._reservations.values():
+                node_id = reservation.selected_node_id
+                reservation_counts[node_id] = reservation_counts.get(node_id, 0) + 1
             for node_id, record in self._records.items():
                 caps = record.capabilities
                 state = self._scheduler_states[node_id]
                 if (
                     model_id not in caps.supported_model_ids
+                    or CONTEXT_TIER_TOKEN_BOUNDS[caps.active_context_tier]
+                    < requested_tokens
                     or caps.maximum_total_context_tokens < requested_tokens
                     or not state.healthy
                     or state.draining
                 ):
                     continue
-                reservations = self._node_reservation_count(node_id)
+                reservations = reservation_counts.get(node_id, 0)
                 queued_count = len(self._node_queues.get(node_id, ()))
                 load = reservations + queued_count + state.claimed_work
                 if (
@@ -784,6 +795,9 @@ class InMemoryRelayStateStore:
             self._scheduler_states.pop(record.node_id, None)
             self._registration_order.pop(record.node_id, None)
             self._remove_node_reservations_locked(record.node_id)
+            self._remove_node_queue_locked(record.node_id)
+        if expired:
+            self._reap_fairness_cursors_locked()
         return expired
 
     def _reap_locked(self, now: float) -> None:
@@ -801,14 +815,35 @@ class InMemoryRelayStateStore:
                 self._node_queues[queued.selected_node_id] = [
                     item for item in queue if item != queued
                 ]
+        self._reap_fairness_cursors_locked()
 
     def _remove_node_reservations_locked(self, node_id: str) -> None:
         for identity, reservation in tuple(self._reservations.items()):
             if reservation.selected_node_id == node_id:
                 del self._reservations[identity]
 
-    def _node_reservation_count(self, node_id: str) -> int:
-        return sum(r.selected_node_id == node_id for r in self._reservations.values())
+    def _remove_node_queue_locked(self, node_id: str) -> None:
+        for queued in self._node_queues.pop(node_id, ()):
+            identity = (
+                queued.client_identity_digest,
+                queued.request_identity_digest,
+            )
+            self._queued.pop(identity, None)
+
+    def _reap_fairness_cursors_locked(self) -> None:
+        active_fingerprints = {
+            reservation.scheduler_fingerprint
+            for reservation in self._reservations.values()
+        }
+        active_fingerprints.update(
+            self._scheduler_fingerprint(
+                queued.requested_model_id, queued.requested_context_tier
+            )
+            for queued in self._queued.values()
+        )
+        for fingerprint in tuple(self._fairness_cursors):
+            if fingerprint not in active_fingerprints:
+                del self._fairness_cursors[fingerprint]
 
     def _identity(self, client_public_key: str, request_id: str) -> tuple[str, str]:
         return (

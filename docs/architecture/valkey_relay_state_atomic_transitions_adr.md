@@ -44,7 +44,7 @@ by each process; no metric registry is coordination state.
 
 | Route | Atomic store operation(s) |
 |---|---|
-| `GET /api/v1/relay/servers/next` | `select_and_reserve`; returns the selected public key and an opaque reservation token |
+| `GET /api/v1/relay/servers/next` | `select_and_reserve`; accepts the request identity generated before selection and returns the selected public key and an opaque reservation token |
 | `POST /api/v1/relay/servers/register` | `register_or_renew_node` |
 | `POST /api/v1/relay/servers/unregister` | `unregister_node_and_transition_work` |
 | `POST /api/v1/relay/servers/poll` | `claim_next_request`, followed by bounded blocking/retry when empty |
@@ -67,12 +67,14 @@ reservation.
 Every key begins with the configured, routing-safe prefix:
 
 ```text
-tokenplace:{environment}:{cluster}:relay:v{schema_version}:
+tokenplace:{<environment>:<cluster>}:relay:v<schema_version>:
 ```
 
 `environment` and `cluster` use the namespace validation established by the registration ADR and
-must not contain credentials or addresses. The braces form one Redis Cluster hash tag; this permits
-multi-key scripts while retaining an explicit environment/cluster boundary. IDs placed in suffixes
+must not contain credentials or addresses. The rendered pair inside the single brace pair (for
+example, `{staging:relay-a}`) is the one Redis Cluster hash tag; the angle-bracketed names above are
+template placeholders, not additional braces. This permits multi-key scripts while retaining an
+explicit environment/cluster boundary. IDs placed in suffixes
 are fixed-length SHA-256 digests of canonical identifiers. Raw public keys and request IDs are
 record fields only where the API must return them; they are never key names.
 
@@ -100,10 +102,10 @@ operator knobs.
 | `reservation:{token_digest}`, `reservations:expiry` | random 256-bit opaque token digest, node/client/request digests, requested model/tier, deadline | one per admitted request, capped globally and per client/node; short reservation TTL, no longer than request deadline |
 | `queue:{node_digest}` plus consumer group | exact validated API-v1 encrypted request envelope and safe routing/deadline metadata | per-node configured depth and envelope-byte limit; approximate `MAXLEN` is forbidden for live work; enqueue rejects at the hard bound; entry is deleted only by a terminal/requeue transition |
 | `request:{client_digest}:{request_digest}`, `requests:deadline` | canonical identity, state (`reserved`, `queued`, `claimed`, `response_ready`, or terminal), node, queue entry, claim generation, cancellation-token digest, UTC deadline | global/per-client request cap; request deadline is authoritative; lifecycle retained through response/terminal TTL |
-| `claim:{request_digest}`, `claims:expiry` | node and owner digest, consumer/claim generation, lease epoch | one per request; claim lease TTL bounded by absolute request deadline; expired claims are reclaimable |
+| `claim:{client_digest}:{request_digest}`, `claims:expiry` | canonical client/request identity, node and owner digest, consumer/claim generation, lease epoch; expiry members contain both identity digests | one per canonical client/request pair; claim lease TTL bounded by absolute request deadline; expired claims are reclaimable |
 | `response:{client_digest}:{request_digest}`, `responses:expiry` | exact validated encrypted response envelope, retrieval state and accepted epoch | one bounded envelope per request; TTL is the lesser of configured response retention and total lifecycle maximum |
 | `progress:{client_digest}:{request_digest}` | latest exact validated encrypted progress envelope | one bounded envelope, replacement only; expires no later than the request |
-| `control:{node_digest}:{request_digest}`, `control:expiry` | fixed terminal status/reason, safe identity digests, owner digest, acknowledgement state | one per affected claim; configured tombstone TTL capped at five minutes |
+| `control:{node_digest}:{client_digest}:{request_digest}`, `control:expiry` | fixed terminal status/reason, canonical client/request identity, owner digest, acknowledgement state; expiry members contain the node and both identity digests | one per affected claim; configured tombstone TTL capped at five minutes |
 | `node_tombstone:{node_digest}`, `node_tombstones:expiry` | unregistered/expired marker and owner digest | at most recent-node capacity; five-minute maximum TTL |
 | `terminal:{client_digest}:{request_digest}`, `terminals:expiry` | one fixed outcome/status/reason, accepted response digest when applicable, outcome-counted flag | one per request; configured terminal TTL; the record is the dedup authority |
 | `ratelimit:{route_class}:{identity_digest}:{window}` | fixed-window counter and window epoch | bounded route classes and digest identities; expires at window end plus clock-skew allowance |
@@ -170,12 +172,22 @@ health source, or terminal-state authority.
 ### Selection, enqueue, and abandoned reservations
 
 The current `/servers/next` selection advances cursors but does not reserve capacity; a later
-`/requests` enqueue can race another relay. Shared-state mode therefore requires a bounded,
-single-use reservation token. `/servers/next` returns the opaque token alongside the selected public
-key, and `/requests` must echo it. Adding this optional response/request field is compatible with the
-wire schema, but shared-state multi-worker mode fails closed for clients that omit it; legacy clients
-remain supported only in single-process memory mode until upgraded. The token is never logged and
-only its digest is stored.
+`/requests` enqueue can race another relay. Shared-state mode therefore requires the client to create
+its opaque request ID **before** selection. Every `/servers/next` call supplies the bounded client
+public key and request ID in addition to model and context tier; the relay derives the canonical
+`(client_digest, request_digest)` identity rather than trusting client-supplied digests. Selection
+creates a bounded, single-use reservation token for that identity and returns the token alongside the
+selected public key. Retrying selection with the same identity and compatible parameters returns the
+unconsumed reservation and selected node; conflicting parameters fail with a fixed error.
+
+`/requests` must echo the token and the same identity, and enqueue consumes it only after all fields
+match. A client may cache node metadata for display or encryption, but it must obtain a fresh
+identity-bound reservation for every new request; cached-node reuse cannot bypass `/servers/next` or
+reuse another request's token. Adding these selection parameters and response/request token fields is
+compatible with the wire schema, but shared-state multi-worker mode fails closed for clients that
+omit them; legacy clients remain supported only in single-process memory mode until upgraded. Raw
+selection identity values are validated and held only for the request; the reservation stores their
+digests, the token is never logged, and only its digest is stored.
 
 Reservations count toward node concurrency and queue bounds. Enqueue consumes one; cancellation,
 deadline expiry, or the short reservation TTL releases it through the same bounded reaper. A retry

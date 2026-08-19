@@ -73,6 +73,7 @@ PACKAGED_FAILURE_REASONS = frozenset({
     "webdriver_driver_version_mismatch", "webdriver_transport_failure",
     "webdriver_capabilities_rejected", "webdriver_application_startup_failed",
     "tauri_driver_exited", "desktop_ui_not_ready",
+    "operator_running_not_reached", "operator_registration_not_reached",
     "authoritative_local_progress_missing", "local_prefill_phase_missing",
     "local_generating_phase_missing", "positive_generated_token_progress_missing",
     "local_timing_record_malformed", "response_usage_missing_or_inconsistent",

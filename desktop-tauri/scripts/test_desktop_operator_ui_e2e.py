@@ -274,6 +274,23 @@ def wait_for_running_stability(
         time.sleep(0.2)
 
 
+def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining,
+        record_progress, fail_closed) -> None:
+    """Require the two ordered post-click operator boundaries fail closed."""
+    try:
+        wait_for_running_stability(driver, "yes", stable_seconds=3,
+            timeout_seconds=setup_remaining())
+    except Exception:
+        fail_closed("operator_running_not_reached")
+    record_progress("operator_running")
+    try:
+        WebDriverWait(driver, setup_remaining()).until(
+            lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+    except Exception:
+        fail_closed("operator_registration_not_reached")
+    record_progress("operator_registered")
+
+
 def landing_compute_node_status_matches(driver: webdriver.Remote, expected: str) -> bool:
     try:
         status = driver.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
@@ -1468,6 +1485,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     webdriver_target_category = "unknown"
     webdriver_readiness_category = "unknown"
     operator_progress = "not_started"
+    def record_operator_progress(progress: str) -> None:
+        nonlocal operator_progress
+        operator_progress = progress
     try:
         setup_remaining()
         try:
@@ -1575,12 +1595,8 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         setup_remaining()
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
         operator_progress = "operator_started"
-        wait_for_running_stability(driver, "yes", stable_seconds=3,
-            timeout_seconds=setup_remaining())
-        operator_progress = "operator_running"
-        WebDriverWait(driver, setup_remaining()).until(
-            lambda d: _status_value(d, "Registered").lower().startswith("yes"))
-        operator_progress = "operator_registered"
+        wait_for_post_start_operator_state(
+            driver, setup_remaining, record_operator_progress, fail_closed)
         write_phase("operator_ready")
 
         _validate_operator_tokenizer_handoff(tokenizer_evidence, fail_closed)

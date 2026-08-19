@@ -60,6 +60,7 @@ def desktop_runner():
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
         "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
+        "wait_for_post_start_operator_state",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
         "_contains_private_input", "_packaged_boundary_failure_diagnostics",
@@ -780,6 +781,67 @@ def test_webdriver_diagnostic_clamps_hostile_operator_progress(desktop_runner, t
     assert artifact["operator_progress"] == "not_started"
     assert "private" not in json.dumps(artifact)
     assert "SECRET" not in json.dumps(artifact)
+
+
+def test_post_start_operator_state_records_running_and_registration(desktop_runner):
+    progress = []
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
+    desktop_runner._status_value = lambda _driver, label: "yes" if label == "Registered" else "no"
+
+    class Wait:
+        def __init__(self, _driver, timeout):
+            assert timeout == 9
+
+        def until(self, predicate):
+            assert predicate(object()) is True
+
+    desktop_runner.WebDriverWait = Wait
+    desktop_runner.wait_for_post_start_operator_state(
+        object(), lambda: 9, progress.append, pytest.fail)
+
+    assert progress == ["operator_running", "operator_registered"]
+
+
+def test_post_start_operator_state_distinguishes_running_failure(desktop_runner):
+    private_error = "C:\\private\\model.gguf prompt-secret"
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError(private_error)))
+    failures = []
+
+    def fail_closed(reason):
+        failures.append(reason)
+        raise RuntimeError(reason) from None
+
+    with pytest.raises(RuntimeError, match="^operator_running_not_reached$") as raised:
+        desktop_runner.wait_for_post_start_operator_state(
+            object(), lambda: 9, pytest.fail, fail_closed)
+
+    assert failures == ["operator_running_not_reached"]
+    assert private_error not in str(raised.value)
+
+
+def test_post_start_operator_state_distinguishes_registration_failure(desktop_runner):
+    progress = []
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
+
+    class Wait:
+        def __init__(self, _driver, _timeout):
+            pass
+
+        def until(self, _predicate):
+            raise RuntimeError("https://private.example prompt-secret")
+
+    desktop_runner.WebDriverWait = Wait
+
+    def fail_closed(reason):
+        raise RuntimeError(reason) from None
+
+    with pytest.raises(RuntimeError, match="^operator_registration_not_reached$") as raised:
+        desktop_runner.wait_for_post_start_operator_state(
+            object(), lambda: 9, progress.append, fail_closed)
+
+    assert progress == ["operator_running"]
+    assert "private.example" not in str(raised.value)
 
 
 def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
@@ -3397,7 +3459,11 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     (None, None, None, None, None, RuntimeError("private readiness exception /secret/path"),
         None, "desktop_ui_not_ready", "desktop_session_started", "not_started"),
     (None, None, None, None, None, None, RuntimeError("packaged_runner_failure"),
-        "packaged_runner_failure", "desktop_ready", "relay_input_set"),
+        "packaged_runner_failure", "desktop_ready", "operator_started"),
+    (None, None, None, None, None, None, RuntimeError("operator_running_not_reached"),
+        "operator_running_not_reached", "desktop_ready", "operator_started"),
+    (None, None, None, None, None, None, RuntimeError("operator_registration_not_reached"),
+        "operator_registration_not_reached", "desktop_ready", "operator_running"),
     (None, RuntimeError("tauri_driver_exited"), None, None, None, None, None,
         "tauri_driver_exited", "runner_startup", "not_started"),
     (None, RuntimeError("webdriver_transport_failure"), None, None, None, None, None,
@@ -3419,7 +3485,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     process = SimpleNamespace(pid=1234)
     application_process = SimpleNamespace(pid=1235)
     driver = SimpleNamespace(
-        find_element=lambda *_args: object(),
+        find_element=lambda *_args: SimpleNamespace(click=lambda: None),
         execute_script=lambda *_args: None,
     )
     start_calls = []
@@ -3456,6 +3522,14 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         if ready_error:
             raise ready_error
 
+    def post_start(_driver, _remaining, record_progress, fail_closed):
+        if operator_error:
+            if str(operator_error) == "operator_registration_not_reached":
+                record_progress("operator_running")
+            if str(operator_error) in h.PACKAGED_FAILURE_REASONS:
+                fail_closed(str(operator_error))
+            raise operator_error
+
     fake_os = SimpleNamespace(**vars(os))
     fake_os.name = "nt"
     diagnostics = []
@@ -3483,8 +3557,8 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "wait_for_ui_ready": ready,
         "fill_input_by_label": lambda *_args: None,
         "benchmark_operator_mode": lambda _backend: "cpu",
-        "wait_for_start_operator_enabled": lambda *_args, **_kwargs: (
-            (_ for _ in ()).throw(operator_error) if operator_error else None),
+        "wait_for_start_operator_enabled": lambda *_args, **_kwargs: None,
+        "wait_for_post_start_operator_state": post_start,
         "_validate_packaged_failure_reason": lambda reason: reason,
         "_write_benchmark_phase": lambda *_args, **kwargs: checkpoints.append(dict(kwargs)),
         "_cleanup_owned_process_tree": lambda owned, *_args: (

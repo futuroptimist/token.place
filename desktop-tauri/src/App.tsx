@@ -852,6 +852,35 @@ function mergeComputeStatusEvent(
   };
 }
 
+function mergeAuthoritativeComputeStatus(
+  prev: ComputeNodeStatus,
+  payload: Record<string, unknown>,
+  startSessionId: string | null
+): ComputeNodeStatus {
+  const payloadSession =
+    typeof payload.operator_session_id === 'string' ? payload.operator_session_id : null;
+  const payloadSequence = typeof payload.sequence === 'number' ? payload.sequence : null;
+  if (!payload.running || payloadSession === null || payloadSequence === null) {
+    return prev;
+  }
+
+  if (payloadSession === prev.operator_session_id) {
+    return mergeComputeStatusEvent(prev, { ...payload, type: 'status' });
+  }
+
+  // A different session is authoritative for this start only while the UI is
+  // still on the session that was current when Start was clicked. Once an
+  // event has advanced the UI, a late snapshot cannot replace it.
+  if (prev.operator_session_id !== startSessionId || payloadSession === startSessionId) {
+    return prev;
+  }
+
+  return mergeComputeStatusEvent(
+    { ...prev, operator_session_id: null, sequence: null },
+    { ...payload, type: 'status' }
+  );
+}
+
 export function selectedModelPath(selection: string | string[] | null): string {
   if (typeof selection === 'string') {
     return selection;
@@ -1128,6 +1157,7 @@ export function App() {
   const startComputeNode = async () => {
     const startAttempt = computeNodeStartAttemptRef.current + 1;
     computeNodeStartAttemptRef.current = startAttempt;
+    const startSessionId = computeStatusRef.current.operator_session_id;
     try {
       setIsStartingComputeNode(true);
       setError('');
@@ -1168,7 +1198,7 @@ export function App() {
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
-      await invoke('start_compute_node', {
+      const startPromise = invoke('start_compute_node', {
         request: {
           model_path: config.model_path,
           relay_base_url: primaryRelayUrl(config),
@@ -1178,10 +1208,41 @@ export function App() {
           qwen_64k_batch_profile: config.qwen_64k_batch_profile,
         },
       });
+      void (async () => {
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+          if (
+            computeNodeStartAttemptRef.current !== startAttempt ||
+            computeStatusRef.current.running
+          ) {
+            return;
+          }
+          try {
+            const snapshot = await invoke<Partial<ComputeNodeStatus>>('get_compute_node_status');
+            if (computeNodeStartAttemptRef.current !== startAttempt) {
+              return;
+            }
+            const previous = computeStatusRef.current;
+            const next = mergeAuthoritativeComputeStatus(previous, snapshot, startSessionId);
+            if (next !== previous) {
+              computeStatusRef.current = next;
+              setComputeStatus(next);
+            }
+            if (next.running) {
+              return;
+            }
+          } catch {
+            // The start command remains authoritative; a later bounded poll
+            // can still reconcile a missed event without surfacing raw errors.
+          }
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
+        }
+      })();
+      await startPromise;
     } catch (e) {
       if (computeNodeStartAttemptRef.current !== startAttempt) {
         return;
       }
+      computeNodeStartAttemptRef.current += 1;
       setIsStartingComputeNode(false);
       const message = formatErrorMessage(e);
       const failedStatus = {

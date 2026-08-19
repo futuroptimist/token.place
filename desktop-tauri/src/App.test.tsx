@@ -1114,6 +1114,55 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Worker state:/).textContent).toContain('starting');
   });
 
+  it('reconciles authoritative running state when the running event is missed', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'previous-session',
+            sequence: 8,
+          });
+        }
+        if (statusCalls === 2) {
+          return Promise.resolve({
+            running: true,
+            registered: true,
+            operator_session_id: 'previous-session',
+            sequence: 9,
+          });
+        }
+        return Promise.resolve({
+          running: true,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: 0,
+          worker_state: 'starting',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() => expect(statusCalls).toBeGreaterThanOrEqual(2));
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+  });
+
   it('surfaces a fresh restart startup error while ignoring stale old-session events', async () => {
     mockInitialComputeStatus({
       running: false,

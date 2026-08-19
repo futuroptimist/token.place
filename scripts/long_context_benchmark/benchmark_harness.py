@@ -70,6 +70,10 @@ PACKAGED_FAILURE_REASONS = frozenset({
     "local_telemetry_configuration_mismatch",
     "encrypted_progress_delivery_invalid",
 })
+# POSIX.1 signal numbers keep the injected POSIX cleanup seam portable to
+# host Python builds, such as Windows, that omit POSIX-only signal attributes.
+POSIX_SIGTERM = getattr(signal, "SIGTERM", 15)
+POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
 
 # POSIX assigns these signal numbers; use native enum members when the host
 # exposes them while keeping the injected POSIX cleanup seam portable.

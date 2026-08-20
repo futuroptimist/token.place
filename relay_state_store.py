@@ -84,6 +84,10 @@ class RelayStateStoreConfig:
     max_terminal_records: int = 4096
     max_terminal_records_per_client: int = 8
     terminal_retention_seconds: float = 3600.0
+    max_cancellation_token_bytes: int = 1024
+    control_tombstone_ttl_seconds: float = 300.0
+    max_control_tombstones: int = 4096
+    max_control_tombstones_per_node: int = 128
 
     def __post_init__(self) -> None:
         if not isinstance(self.namespace, str) or not _NAMESPACE_RE.fullmatch(
@@ -134,6 +138,12 @@ class RelayStateStoreConfig:
         self._validate_float_bound(
             self.terminal_retention_seconds, "terminal retention", 0.001, 604_800.0
         )
+        self._validate_float_bound(
+            self.control_tombstone_ttl_seconds,
+            "control tombstone TTL",
+            0.001,
+            300.0,
+        )
         if self.terminal_retention_seconds < self.response_replay_ttl_seconds:
             raise RelayStateStoreError(
                 "terminal retention must cover response replay retention"
@@ -172,6 +182,13 @@ class RelayStateStoreConfig:
             (
                 self.max_terminal_records_per_client,
                 "per-client terminal-record bound",
+                10_000,
+            ),
+            (self.max_cancellation_token_bytes, "cancellation-token byte bound", 4096),
+            (self.max_control_tombstones, "control tombstone bound", 1_000_000),
+            (
+                self.max_control_tombstones_per_node,
+                "per-node control tombstone bound",
                 10_000,
             ),
         ):
@@ -345,6 +362,7 @@ class ReservationRecord:
     request_deadline_epoch: float
     reservation_expires_at_epoch: float
     token_digest: str
+    cancellation_proof_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -437,6 +455,7 @@ class ClaimRecord:
     client_identity_digest: str
     request_identity_digest: str
     consumer_identity_digest: str
+    control_credential_digest: str
     selected_node_id: str
     request_deadline_epoch: float
     envelope: EncryptedRequestEnvelope
@@ -487,6 +506,51 @@ class ClaimRenewalResult:
             f"ClaimRenewalResult(state={self.state!r}, generation={self.generation!r}, "
             f"lease_expires_at_epoch={self.lease_expires_at_epoch!r})"
         )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ControlTombstoneRecord:
+    """Bounded, owner-authenticated stop-work control message."""
+
+    client_identity_digest: str
+    request_identity_digest: str
+    selected_node_id: str
+    control_credential_digest: str
+    consumer_identity_digest: str
+    generation: int
+    status: str
+    reason: str
+    request_deadline_epoch: float
+    expires_at_epoch: float
+    acknowledged: bool = False
+
+    def __repr__(self) -> str:
+        return (
+            "ControlTombstoneRecord(identities=<redacted>, owner=<redacted>, "
+            f"generation={self.generation!r}, status={self.status!r}, "
+            f"reason={self.reason!r}, request_deadline_epoch={self.request_deadline_epoch!r}, "
+            f"expires_at_epoch={self.expires_at_epoch!r}, acknowledged={self.acknowledged!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RequestTransitionResult:
+    """Fixed cancellation/expiry result without routing or credential data."""
+
+    state: str
+    reason: str | None = None
+    new_outcome: bool = False
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ClaimControlResult:
+    """Fixed authenticated claim-renewal or terminal-control result."""
+
+    state: str
+    reason: str | None = None
+    generation: int | None = None
+    lease_expires_at_epoch: float | None = None
+    acknowledged: bool = False
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -559,6 +623,9 @@ class TerminalOutcomeRecord:
     retrieval_state: str = "response_ready"
     retrieval_credential_digest: str = ""
     acknowledgement_digest: str = ""
+    reason: str = "response_accepted"
+    request_deadline_epoch: float = 0.0
+    cancellation_proof_digest: str = ""
 
     def __repr__(self) -> str:
         return (
@@ -642,6 +709,7 @@ class RelayStateStore(Protocol):
         requested_model_id: str,
         requested_context_tier: str,
         request_deadline_epoch: float,
+        cancellation_proof: str | None = None,
     ) -> SelectionResult: ...
     def enqueue_encrypted_request(
         self,
@@ -653,6 +721,7 @@ class RelayStateStore(Protocol):
         requested_context_tier: str,
         request_deadline_epoch: float,
         envelope: EncryptedRequestEnvelope,
+        cancellation_proof: str | None = None,
     ) -> EnqueueResult: ...
     def list_reservations(self) -> tuple[ReservationRecord, ...]: ...
     def queued_requests(self, node_id: str) -> tuple[QueuedRequest, ...]: ...
@@ -688,6 +757,27 @@ class RelayStateStore(Protocol):
     ) -> ResponseRetrievalResult: ...
     def response_records(self) -> tuple[ResponseRecord, ...]: ...
     def terminal_records(self) -> tuple[TerminalOutcomeRecord, ...]: ...
+    def cancel_or_expire_request(
+        self,
+        client_public_key: str,
+        request_id: str,
+        *,
+        cancellation_proof: str | None = None,
+        status: str = "cancelled",
+        reason: str = "requester_cancelled",
+    ) -> RequestTransitionResult: ...
+    def renew_claim_or_read_control(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        *,
+        acknowledge: bool = False,
+    ) -> ClaimControlResult: ...
+    def control_tombstones(self) -> tuple[ControlTombstoneRecord, ...]: ...
 
 
 class InMemoryRelayStateStore:
@@ -714,10 +804,14 @@ class InMemoryRelayStateStore:
         self._reservations: dict[tuple[str, str], ReservationRecord] = {}
         self._queued: dict[tuple[str, str], QueuedRequest] = {}
         self._queued_token_digests: dict[tuple[str, str], str] = {}
+        self._cancellation_proof_digests: dict[tuple[str, str], str] = {}
         self._node_queues: dict[str, list[QueuedRequest]] = {}
         self._claims: dict[tuple[str, str], ClaimRecord] = {}
         self._responses: dict[tuple[str, str], ResponseRecord] = {}
         self._terminals: dict[tuple[str, str], TerminalOutcomeRecord] = {}
+        self._control_tombstones: dict[
+            tuple[str, str, str, int], ControlTombstoneRecord
+        ] = {}
         self._next_claim_generation = 0
         self._fairness_cursors: dict[str, tuple[str, int]] = {}
         self._fairness_activity = 0
@@ -853,6 +947,7 @@ class InMemoryRelayStateStore:
         requested_model_id: str,
         requested_context_tier: str,
         request_deadline_epoch: float,
+        cancellation_proof: str | None = None,
     ) -> SelectionResult:
         client_digest, request_digest = self._identity(client_public_key, request_id)
         model_id = self._model_id(requested_model_id)
@@ -860,6 +955,9 @@ class InMemoryRelayStateStore:
         deadline = self._deadline(request_deadline_epoch)
         fingerprint = self._scheduler_fingerprint(model_id, tier)
         identity = (client_digest, request_digest)
+        cancellation_digest = self._optional_cancellation_proof_digest(
+            cancellation_proof
+        )
         with self._lock:
             now = self._now()
             self._reap_locked(now)
@@ -874,6 +972,11 @@ class InMemoryRelayStateStore:
             queued = self._queued.get(identity)
             if queued is not None:
                 self._require_same_parameters(queued, model_id, tier, deadline)
+                if cancellation_proof is not None and not hmac.compare_digest(
+                    self._cancellation_proof_digests.get(identity, ""),
+                    cancellation_digest,
+                ):
+                    raise RelayStateConflict("request identity conflict")
                 claim = self._claims.get(identity)
                 lifecycle_state = (
                     "claimed"
@@ -893,6 +996,10 @@ class InMemoryRelayStateStore:
             existing = self._reservations.get(identity)
             if existing is not None:
                 self._require_same_parameters(existing, model_id, tier, deadline)
+                if not hmac.compare_digest(
+                    existing.cancellation_proof_digest, cancellation_digest
+                ):
+                    raise RelayStateConflict("request identity conflict")
                 return self._selection_result(existing, None, False)
             if len(self._reservations) >= self.config.max_reservations:
                 raise RelayStateNoCapacity("no scheduler capacity")
@@ -975,6 +1082,7 @@ class InMemoryRelayStateStore:
                 deadline,
                 expires,
                 hashlib.sha256(raw_token.encode("ascii")).hexdigest(),
+                cancellation_digest,
             )
             if evicted_fingerprint is not None:
                 del self._fairness_cursors[evicted_fingerprint]
@@ -993,6 +1101,7 @@ class InMemoryRelayStateStore:
         requested_context_tier: str,
         request_deadline_epoch: float,
         envelope: EncryptedRequestEnvelope,
+        cancellation_proof: str | None = None,
     ) -> EnqueueResult:
         client_digest, request_digest = self._identity(client_public_key, request_id)
         self._validate_node_id(selected_node_id)
@@ -1003,6 +1112,9 @@ class InMemoryRelayStateStore:
             raise RelayStateStoreError("envelope must be EncryptedRequestEnvelope")
         self._validate_envelope_size(envelope)
         token_digest = self._token_digest(reservation_token)
+        cancellation_digest = self._optional_cancellation_proof_digest(
+            cancellation_proof
+        )
         identity = (client_digest, request_digest)
         with self._lock:
             now = self._now()
@@ -1021,6 +1133,11 @@ class InMemoryRelayStateStore:
                     self._queued_token_digests[identity], token_digest
                 ):
                     raise RelayStateInvalidReservation("reservation invalid")
+                if not hmac.compare_digest(
+                    self._cancellation_proof_digests.get(identity, ""),
+                    cancellation_digest,
+                ):
+                    raise RelayStateConflict("request identity conflict")
                 return self._enqueue_result(
                     existing,
                     False,
@@ -1041,6 +1158,10 @@ class InMemoryRelayStateStore:
             if reservation is None:
                 raise RelayStateInvalidReservation("reservation invalid")
             self._require_same_parameters(reservation, model_id, tier, deadline)
+            if reservation.cancellation_proof_digest and not hmac.compare_digest(
+                reservation.cancellation_proof_digest, cancellation_digest
+            ):
+                raise RelayStateConflict("request identity conflict")
             if (
                 reservation.selected_node_id != selected_node_id
                 or not hmac.compare_digest(reservation.token_digest, token_digest)
@@ -1076,6 +1197,9 @@ class InMemoryRelayStateStore:
             )
             self._queued[identity] = queued
             self._queued_token_digests[identity] = token_digest
+            self._cancellation_proof_digests[identity] = (
+                cancellation_digest or reservation.cancellation_proof_digest
+            )
             self._node_queues.setdefault(selected_node_id, []).append(queued)
             del self._reservations[identity]
             return self._enqueue_result(queued, True)
@@ -1154,6 +1278,7 @@ class InMemoryRelayStateStore:
                     queued.client_identity_digest,
                     queued.request_identity_digest,
                     consumer_digest,
+                    registration.control_credential_digest,
                     node_id,
                     queued.request_deadline_epoch,
                     queued.envelope,
@@ -1232,6 +1357,118 @@ class InMemoryRelayStateStore:
                 and claim.lease_expires_at_epoch > now
             )
 
+    def renew_claim_or_read_control(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        *,
+        acknowledge: bool = False,
+    ) -> ClaimControlResult:
+        """Renew live work or authenticate and atomically acknowledge stop control."""
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        consumer_digest = self._consumer_digest(consumer_identity)
+        identity = self._identity(client_public_key, request_id)
+        self._validate_generation(generation)
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now)
+            key = (node_id, identity[0], identity[1], generation)
+            tombstone = self._control_tombstones.get(key)
+            if tombstone is not None:
+                if not (
+                    hmac.compare_digest(
+                        tombstone.control_credential_digest,
+                        control_credential_digest,
+                    )
+                    and hmac.compare_digest(
+                        tombstone.consumer_identity_digest, consumer_digest
+                    )
+                ):
+                    return ClaimControlResult("owner_mismatch")
+                if acknowledge and not tombstone.acknowledged:
+                    tombstone = replace(tombstone, acknowledged=True)
+                    self._control_tombstones[key] = tombstone
+                return ClaimControlResult(
+                    tombstone.status,
+                    tombstone.reason,
+                    generation,
+                    acknowledged=tombstone.acknowledged,
+                )
+            renewal = self._renew_claim_locked(
+                node_id,
+                control_credential_digest,
+                consumer_digest,
+                identity,
+                generation,
+                now,
+            )
+            return ClaimControlResult(
+                renewal.state,
+                generation=renewal.generation,
+                lease_expires_at_epoch=renewal.lease_expires_at_epoch,
+            )
+
+    def cancel_or_expire_request(
+        self,
+        client_public_key: str,
+        request_id: str,
+        *,
+        cancellation_proof: str | None = None,
+        status: str = "cancelled",
+        reason: str = "requester_cancelled",
+    ) -> RequestTransitionResult:
+        """CAS one live request into a fixed cancelled or expired outcome."""
+        if (status, reason) not in {
+            ("cancelled", "requester_cancelled"),
+            ("expired", "request_deadline_expired"),
+        }:
+            raise RelayStateStoreError("request terminal status or reason is invalid")
+        try:
+            identity = self._identity(client_public_key, request_id)
+        except RelayStateStoreError:
+            return RequestTransitionResult("invalid_cancellation_proof")
+        supplied_digest = self._safe_cancellation_proof_digest(cancellation_proof)
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now, skip_identity=identity)
+            existing = self._terminals.get(identity)
+            if existing is not None:
+                if (
+                    status == "cancelled"
+                    and existing.outcome != "completed"
+                    and not hmac.compare_digest(
+                        existing.cancellation_proof_digest, supplied_digest
+                    )
+                ):
+                    return RequestTransitionResult("invalid_cancellation_proof")
+                return RequestTransitionResult(existing.outcome, existing.reason, False)
+            if status == "cancelled":
+                expected = self._cancellation_digest_for_identity_locked(identity)
+                if not expected or not hmac.compare_digest(expected, supplied_digest):
+                    return RequestTransitionResult("invalid_cancellation_proof")
+            record = self._reservations.get(identity) or self._queued.get(identity)
+            if record is None:
+                return RequestTransitionResult(
+                    "invalid_cancellation_proof"
+                    if status == "cancelled"
+                    else "missing_or_completed"
+                )
+            if status == "expired" and record.request_deadline_epoch > now:
+                return RequestTransitionResult("not_expired")
+            return self._terminalize_locked(identity, status, reason, now)
+
+    def control_tombstones(self) -> tuple[ControlTombstoneRecord, ...]:
+        with self._lock:
+            self._reap_locked(self._now())
+            return tuple(
+                replace(record) for record in self._control_tombstones.values()
+            )
+
     def accept_encrypted_response(
         self,
         node_id: str,
@@ -1268,6 +1505,8 @@ class InMemoryRelayStateStore:
             self._reap_locked(now)
             terminal = self._terminals.get(identity)
             if terminal is not None:
+                if terminal.outcome != "completed":
+                    raise RelayStateConflict("response lifecycle expired or cancelled")
                 # The retained terminal authenticates an exact non-mutating retry
                 # after registration expiry or unregister; no live registration is needed.
                 if (
@@ -1359,6 +1598,10 @@ class InMemoryRelayStateStore:
                 retrieval_credential_digest=self._queued_token_digests[identity],
                 acknowledgement_digest=self._acknowledgement_digest(
                     self._derive_acknowledgement_token(identity, now, response_digest)
+                ),
+                request_deadline_epoch=claim.request_deadline_epoch,
+                cancellation_proof_digest=self._cancellation_proof_digests.get(
+                    identity, ""
                 ),
             )
             self._responses[identity] = response
@@ -1461,7 +1704,9 @@ class InMemoryRelayStateStore:
             self._remove_node_queue_locked(record.node_id)
         return expired
 
-    def _reap_locked(self, now: float) -> None:
+    def _reap_locked(
+        self, now: float, *, skip_identity: tuple[str, str] | None = None
+    ) -> None:
         self._expire_locked(now)
         for identity, response in tuple(self._responses.items()):
             if response.replay_expires_at_epoch <= now:
@@ -1478,20 +1723,110 @@ class InMemoryRelayStateStore:
             if terminal.expires_at_epoch <= now:
                 del self._terminals[identity]
         for identity, reservation in tuple(self._reservations.items()):
-            if (
-                reservation.reservation_expires_at_epoch <= now
-                or reservation.request_deadline_epoch <= now
-            ):
+            if identity == skip_identity:
+                continue
+            if reservation.request_deadline_epoch <= now:
+                self._terminalize_locked(
+                    identity, "expired", "request_deadline_expired", now
+                )
+            elif reservation.reservation_expires_at_epoch <= now:
                 del self._reservations[identity]
         for identity, queued in tuple(self._queued.items()):
-            if queued.request_deadline_epoch <= now:
-                self._remove_queued_identity_locked(identity, queued)
+            if identity != skip_identity and queued.request_deadline_epoch <= now:
+                self._terminalize_locked(
+                    identity, "expired", "request_deadline_expired", now
+                )
+        for key, tombstone in tuple(self._control_tombstones.items()):
+            if tombstone.expires_at_epoch <= now:
+                del self._control_tombstones[key]
+
+    def _terminalize_locked(
+        self,
+        identity: tuple[str, str],
+        status: str,
+        reason: str,
+        now: float,
+    ) -> RequestTransitionResult:
+        existing = self._terminals.get(identity)
+        if existing is not None:
+            return RequestTransitionResult(existing.outcome, existing.reason, False)
+        queued = self._queued.get(identity)
+        reservation = self._reservations.get(identity)
+        lifecycle = queued or reservation
+        if lifecycle is None:
+            return RequestTransitionResult("missing_or_completed")
+        claim = self._claims.get(identity)
+        client_digest = identity[0]
+        if (
+            len(self._terminals) >= self.config.max_terminal_records
+            or sum(
+                item.client_identity_digest == client_digest
+                for item in self._terminals.values()
+            )
+            >= self.config.max_terminal_records_per_client
+        ):
+            raise RelayStateCapacityExceeded("terminal lifecycle capacity reached")
+        if claim is not None:
+            per_node = sum(
+                item.selected_node_id == claim.selected_node_id
+                for item in self._control_tombstones.values()
+            )
+            if (
+                len(self._control_tombstones) >= self.config.max_control_tombstones
+                or per_node >= self.config.max_control_tombstones_per_node
+            ):
+                raise RelayStateCapacityExceeded("control tombstone capacity reached")
+        terminal_expires = now + self.config.terminal_retention_seconds
+        tombstone_expires = now + self.config.control_tombstone_ttl_seconds
+        if not math.isfinite(terminal_expires) or not math.isfinite(tombstone_expires):
+            raise RelayStateStoreError("terminal retention deadline must be finite")
+        node_id = lifecycle.selected_node_id
+        terminal = TerminalOutcomeRecord(
+            identity[0],
+            identity[1],
+            node_id,
+            claim.control_credential_digest if claim else "",
+            claim.consumer_identity_digest if claim else "",
+            claim.generation if claim else 0,
+            "",
+            now,
+            now,
+            terminal_expires,
+            outcome=status,
+            retrieval_state=status,
+            reason=reason,
+            request_deadline_epoch=lifecycle.request_deadline_epoch,
+            cancellation_proof_digest=self._cancellation_digest_for_identity_locked(
+                identity
+            ),
+        )
+        if claim is not None:
+            key = (node_id, identity[0], identity[1], claim.generation)
+            self._control_tombstones[key] = ControlTombstoneRecord(
+                identity[0],
+                identity[1],
+                node_id,
+                claim.control_credential_digest,
+                claim.consumer_identity_digest,
+                claim.generation,
+                status,
+                reason,
+                claim.request_deadline_epoch,
+                tombstone_expires,
+            )
+        self._terminals[identity] = terminal
+        self._reservations.pop(identity, None)
+        if queued is not None:
+            self._remove_queued_identity_locked(identity, queued)
+        self._cancellation_proof_digests.pop(identity, None)
+        return RequestTransitionResult(status, reason, True)
 
     def _remove_queued_identity_locked(
         self, identity: tuple[str, str], queued: QueuedRequest
     ) -> None:
         self._queued.pop(identity, None)
         self._queued_token_digests.pop(identity, None)
+        self._cancellation_proof_digests.pop(identity, None)
         queue = self._node_queues.get(queued.selected_node_id, [])
         remaining = [item for item in queue if item != queued]
         if remaining:
@@ -1513,6 +1848,7 @@ class InMemoryRelayStateStore:
             )
             self._queued.pop(identity, None)
             self._queued_token_digests.pop(identity, None)
+            self._cancellation_proof_digests.pop(identity, None)
             self._claims.pop(identity, None)
 
     def _active_fairness_fingerprints_locked(self) -> set[str]:
@@ -1748,6 +2084,69 @@ class InMemoryRelayStateStore:
         if not isinstance(credential, str) or not _SHA256_RE.fullmatch(credential):
             return "0" * 64
         return hashlib.sha256(credential.encode("ascii")).hexdigest()
+
+    def _optional_cancellation_proof_digest(self, proof: object) -> str:
+        if proof is None:
+            return ""
+        if not isinstance(proof, str) or not proof:
+            raise RelayStateStoreError("cancellation proof is invalid")
+        encoded = proof.encode("utf-8")
+        if len(encoded) > self.config.max_cancellation_token_bytes:
+            raise RelayStateStoreError("cancellation proof is invalid")
+        return hashlib.sha256(b"cancellation\0" + encoded).hexdigest()
+
+    def _safe_cancellation_proof_digest(self, proof: object) -> str:
+        try:
+            return self._optional_cancellation_proof_digest(proof)
+        except (RelayStateStoreError, UnicodeError):
+            return "0" * 64
+
+    def _cancellation_digest_for_identity_locked(
+        self, identity: tuple[str, str]
+    ) -> str:
+        queued_digest = self._cancellation_proof_digests.get(identity)
+        if queued_digest:
+            return queued_digest
+        reservation = self._reservations.get(identity)
+        return reservation.cancellation_proof_digest if reservation else ""
+
+    @staticmethod
+    def _validate_generation(generation: int) -> None:
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise RelayStateStoreError("claim generation is invalid")
+
+    def _renew_claim_locked(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_digest: str,
+        identity: tuple[str, str],
+        generation: int,
+        now: float,
+    ) -> ClaimRenewalResult:
+        registration = self._records.get(node_id)
+        if registration is None or not hmac.compare_digest(
+            registration.control_credential_digest, control_credential_digest
+        ):
+            return ClaimRenewalResult("owner_mismatch")
+        claim = self._claims.get(identity)
+        if claim is None or claim.request_deadline_epoch <= now:
+            return ClaimRenewalResult("missing_or_expired")
+        if claim.generation != generation:
+            return ClaimRenewalResult("stale_generation", claim.generation)
+        if claim.selected_node_id != node_id or not hmac.compare_digest(
+            claim.consumer_identity_digest, consumer_digest
+        ):
+            return ClaimRenewalResult("owner_mismatch")
+        if claim.lease_expires_at_epoch <= now:
+            return ClaimRenewalResult("missing_or_expired")
+        lease = min(now + self.config.claim_ttl_seconds, claim.request_deadline_epoch)
+        self._claims[identity] = replace(claim, lease_expires_at_epoch=lease)
+        return ClaimRenewalResult("continued", generation, lease)
 
     def _now(self) -> float:
         value = self._epoch_time()

@@ -22,6 +22,14 @@ class _WebDriverException(Exception):
         self.msg = message
 
 
+class NoSuchElementException(_WebDriverException):
+    pass
+
+
+class StaleElementReferenceException(_WebDriverException):
+    pass
+
+
 class InvalidArgumentException(_WebDriverException):
     pass
 
@@ -94,8 +102,9 @@ def desktop_runner():
         "psutil": __import__("psutil"),
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
+        "NoSuchElementException": NoSuchElementException,
         "NoSuchFrameException": _WebDriverException,
-        "StaleElementReferenceException": _WebDriverException,
+        "StaleElementReferenceException": StaleElementReferenceException,
         "WebDriverException": _WebDriverException,
         "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
         "NATIVE_WEBDRIVER_URL": "http://127.0.0.1:4445",
@@ -929,6 +938,39 @@ def test_native_startup_diagnostic_collects_and_clamps_fixed_values(desktop_runn
         "native_startup_outcome": "not_started",
         "native_startup_failure_category": "none",
     }
+
+
+@pytest.mark.parametrize("driver", [
+    None,
+    SimpleNamespace(find_element=lambda *_args: (_ for _ in ()).throw(
+        NoSuchElementException("private missing shell /secret/path"))),
+])
+def test_native_startup_diagnostic_defaults_without_available_shell(
+        desktop_runner, driver):
+    assert desktop_runner._read_native_startup_diagnostic(driver) == {
+        "native_startup_phase": "not_started",
+        "native_startup_outcome": "not_started",
+        "native_startup_failure_category": "none",
+    }
+
+
+@pytest.mark.parametrize("failure", [
+    StaleElementReferenceException("private stale shell /secret/path"),
+    _WebDriverException("private webdriver failure /secret/path"),
+])
+def test_native_startup_diagnostic_clamps_webdriver_failures(
+        desktop_runner, failure):
+    driver = SimpleNamespace(
+        find_element=lambda *_args: (_ for _ in ()).throw(failure))
+
+    diagnostic = desktop_runner._read_native_startup_diagnostic(driver)
+
+    assert diagnostic == {
+        "native_startup_phase": "not_started",
+        "native_startup_outcome": "not_started",
+        "native_startup_failure_category": "none",
+    }
+    assert "private" not in json.dumps(diagnostic)
 
 
 def test_native_startup_diagnostic_is_preserved_without_private_data(desktop_runner, tmp_path):
@@ -3754,7 +3796,11 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "_classify_webdriver_session_failure": lambda _exc, _process: (
             "webdriver_session_creation_failed", "running", "unknown"),
             "_write_webdriver_diagnostic": lambda *args: diagnostics.append(args),
-            "_read_native_startup_diagnostic": lambda _driver: {},
+            "_read_native_startup_diagnostic": lambda _driver: {
+                "native_startup_phase": "startup_task_failed",
+                "native_startup_outcome": "failed",
+                "native_startup_failure_category": "child_spawn_failed",
+            },
             "_read_operator_start_diagnostic": lambda _driver: {
                 "start_handler_state": "entered", "invocation_state": "resolved",
                 "native_event_observation": "running_rejected",
@@ -3810,6 +3856,11 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     assert checkpoints[-1]["cleanup_succeeded"] is True
     assert diagnostics[-1][-3] == expected_progress
     assert diagnostics[-1][-2]["start_handler_state"] == "entered"
+    assert diagnostics[-1][-1] == {
+        "native_startup_phase": "startup_task_failed",
+        "native_startup_outcome": "failed",
+        "native_startup_failure_category": "child_spawn_failed",
+    }
     assert len(start_calls) == (
         0 if command_error or gate_error or launch_error or devtools_error else 1)
     if not command_error and not gate_error and not launch_error:

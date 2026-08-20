@@ -557,6 +557,7 @@ class TerminalOutcomeRecord:
     expires_at_epoch: float
     outcome: str = "completed"
     retrieval_state: str = "response_ready"
+    retrieval_credential_digest: str = ""
     acknowledgement_digest: str = ""
 
     def __repr__(self) -> str:
@@ -682,6 +683,7 @@ class RelayStateStore(Protocol):
         self,
         client_public_key: str,
         request_id: str,
+        retrieval_credential: str,
         acknowledgement_token: str | None = None,
     ) -> ResponseRetrievalResult: ...
     def response_records(self) -> tuple[ResponseRecord, ...]: ...
@@ -1354,6 +1356,7 @@ class InMemoryRelayStateStore:
                 now,
                 replay_expires,
                 terminal_expires,
+                retrieval_credential_digest=self._queued_token_digests[identity],
                 acknowledgement_digest=self._acknowledgement_digest(
                     self._derive_acknowledgement_token(identity, now, response_digest)
                 ),
@@ -1367,6 +1370,7 @@ class InMemoryRelayStateStore:
         self,
         client_public_key: str,
         request_id: str,
+        retrieval_credential: str,
         acknowledgement_token: str | None = None,
     ) -> ResponseRetrievalResult:
         """Replay or atomically acknowledge one identity-bound encrypted response."""
@@ -1377,6 +1381,11 @@ class InMemoryRelayStateStore:
             terminal = self._terminals.get(identity)
             if terminal is None:
                 return ResponseRetrievalResult("unknown")
+            if not hmac.compare_digest(
+                self._safe_retrieval_credential_digest(retrieval_credential),
+                terminal.retrieval_credential_digest,
+            ):
+                return ResponseRetrievalResult("invalid_retrieval_credential")
             if terminal.retrieval_state != "response_ready":
                 if (
                     terminal.retrieval_state == "acknowledged"
@@ -1729,6 +1738,13 @@ class InMemoryRelayStateStore:
         if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
             raise RelayStateInvalidReservation("reservation invalid")
         return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+    @staticmethod
+    def _safe_retrieval_credential_digest(credential: object) -> str:
+        """Digest a bounded reservation credential without raising or retaining it."""
+        if not isinstance(credential, str) or not _SHA256_RE.fullmatch(credential):
+            return "0" * 64
+        return hashlib.sha256(credential.encode("ascii")).hexdigest()
 
     def _now(self) -> float:
         value = self._epoch_time()

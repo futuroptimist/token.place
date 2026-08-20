@@ -308,6 +308,113 @@ def test_request_deadline_expiry_is_terminal_and_tombstone_expiry_is_bounded(
     assert store.terminal_records()[0].outcome == "expired"
 
 
+@pytest.mark.parametrize("stage", ["reserved", "queued", "claimed"])
+def test_deadline_expiry_terminalizes_each_stage_once_and_releases_capacity(
+    store_factory, capabilities, stage
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock,
+        max_request_lifecycles=1,
+        max_reservations_per_node=1,
+        max_queue_depth_per_node=1,
+    )
+    store.register("node-a", replace(capabilities, max_concurrency=1), digest("owner"))
+    deadline = clock.value + 5
+    selection = reserve(store, request_deadline_epoch=deadline)
+    claim = None
+    if stage != "reserved":
+        enqueue(store, selection)
+    if stage == "claimed":
+        claim = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+
+    clock.value = deadline
+    # A public read triggers cleanup at the inclusive absolute deadline.
+    assert store.list_reservations() == ()
+
+    terminals = store.terminal_records()
+    assert len(terminals) == 1
+    assert (terminals[0].outcome, terminals[0].reason) == (
+        "expired",
+        "request_deadline_expired",
+    )
+    assert store.queued_requests("node-a") == ()
+    assert store.active_claims("node-a") == ()
+    tombstones = store.control_tombstones()
+    assert len(tombstones) == (1 if stage == "claimed" else 0)
+    if claim is not None:
+        assert (
+            tombstones[0].selected_node_id,
+            tombstones[0].generation,
+            tombstones[0].status,
+            tombstones[0].reason,
+        ) == (
+            "node-a",
+            claim.generation,
+            "expired",
+            "request_deadline_expired",
+        )
+
+    terminal_snapshot = lifecycle_snapshot(store)
+    # Repeated public cleanup and the typed transition are idempotent.
+    assert store.list_reservations() == ()
+    assert store.queued_requests("node-a") == ()
+    assert store.active_claims("node-a") == ()
+    retry = store.cancel_or_expire_request(
+        "client-key",
+        "request-a",
+        status="expired",
+        reason="request_deadline_expired",
+    )
+    assert (retry.state, retry.reason, retry.new_outcome) == (
+        "expired",
+        "request_deadline_expired",
+        False,
+    )
+    assert lifecycle_snapshot(store) == terminal_snapshot
+
+    replacement = reserve(
+        store, "replacement", request_deadline_epoch=clock.value + 10
+    )
+    assert replacement.created
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store, "over-capacity", request_deadline_epoch=clock.value + 10)
+    assert lifecycle_snapshot(store)[4:] == terminal_snapshot[4:]
+
+
+def test_short_reservation_ttl_releases_without_terminalizing_request(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock, reservation_ttl_seconds=2, max_request_lifecycles=1
+    )
+    store.register("node-a", replace(capabilities, max_concurrency=1), digest("owner"))
+    deadline = clock.value + 10
+    selection = reserve(
+        store,
+        request_deadline_epoch=deadline,
+        cancellation_token="first-proof",
+    )
+
+    clock.value = selection.reservation_expires_at_epoch
+    assert clock.value < deadline
+    assert store.list_reservations() == ()
+    assert store.terminal_records() == ()
+    assert store.control_tombstones() == ()
+
+    retry = reserve(
+        store,
+        request_deadline_epoch=deadline,
+        cancellation_token="fresh-proof",
+    )
+    assert retry.created
+    assert retry.request_deadline_epoch == deadline
+    assert len(store.list_reservations()) == 1
+    assert store.terminal_records() == ()
+    assert store.control_tombstones() == ()
+
+
 def test_deadline_reaping_reclaims_expired_terminal_and_tombstone_capacity(
     store_factory, capabilities
 ):

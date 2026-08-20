@@ -1380,7 +1380,10 @@ class InMemoryRelayStateStore:
             self._reap_locked(now)
             terminal = self._terminals.get(identity)
             if terminal is None:
-                return ResponseRetrievalResult("unknown")
+                # Retrieval is credential-gated even when no record exists.  A
+                # single failure prevents routing metadata from becoming an
+                # identity oracle and keeps cross-identity credentials safe.
+                return ResponseRetrievalResult("invalid_retrieval_credential")
             if not hmac.compare_digest(
                 self._safe_retrieval_credential_digest(retrieval_credential),
                 terminal.retrieval_credential_digest,

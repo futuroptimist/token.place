@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, fields, replace
 
@@ -40,23 +41,18 @@ class EpochClock:
         return self.value
 
 
-def acknowledgement_key(label: str = "primary") -> bytes:
-    """Deterministic non-secret test material; production callers must inject a secret."""
-    return hashlib.sha256(f"relay-state-test:{label}".encode()).digest()
-
-
 @pytest.fixture(params=["memory"])
 def store_factory(request):
     """Factory seam to parameterize over real Valkey in a future slice."""
 
-    def make(*, clock=None, **config_overrides):
+    def make(*, clock=None, acknowledgement_key=None, **config_overrides):
         assert request.param == "memory"
         config = RelayStateStoreConfig(
             namespace="testing.cluster-a", **config_overrides
         )
         return InMemoryRelayStateStore(
             config,
-            acknowledgement_key=acknowledgement_key(),
+            acknowledgement_key=acknowledgement_key or secrets.token_bytes(32),
             epoch_time=clock or EpochClock(),
         )
 
@@ -526,11 +522,12 @@ def retrieve_response(store, credential, acknowledgement_token=None, **identity)
 def test_response_retrieval_is_replayable_until_valid_acknowledgement(
     store_factory, capabilities
 ):
-    store, _, claim, acceptance, credential = completed_response(
+    store, clock, claim, acceptance, credential = completed_response(
         store_factory, capabilities
     )
 
     first = retrieve_response(store, credential)
+    clock.value += 1
     second = retrieve_response(store, credential)
 
     assert (
@@ -544,6 +541,7 @@ def test_response_retrieval_is_replayable_until_valid_acknowledgement(
         )
     )
     assert first.acknowledgement_token is not None
+    assert first.replay_expires_at_epoch == acceptance.replay_expires_at_epoch
     assert len(store.response_records()) == 1
     assert store.terminal_records()[0].outcome == "completed"
 
@@ -562,14 +560,10 @@ def test_response_retrieval_is_replayable_until_valid_acknowledgement(
 def test_response_retrieval_requires_the_original_client_credential(
     store_factory, capabilities, credential
 ):
-    store, _, _, _, valid_credential = completed_response(
-        store_factory, capabilities
-    )
+    store, _, _, _, valid_credential = completed_response(store_factory, capabilities)
 
     unauthenticated = retrieve_response(store, credential)
-    assert unauthenticated == ResponseRetrievalResult(
-        "invalid_retrieval_credential"
-    )
+    assert unauthenticated == ResponseRetrievalResult("invalid_retrieval_credential")
     assert unauthenticated.envelope is None
     assert unauthenticated.acknowledgement_token is None
     assert len(store.response_records()) == 1
@@ -600,34 +594,97 @@ def test_acknowledgements_are_identity_and_key_bound(store_factory, capabilities
         retrieve_response(
             store, credential, token, client_public_key="another-client"
         ).state
-        == "unknown"
+        == "invalid_retrieval_credential"
     )
     assert (
         retrieve_response(store, credential, token, request_id="another-request").state
-        == "unknown"
+        == "invalid_retrieval_credential"
     )
 
-    other = InMemoryRelayStateStore(
-        store.config,
-        acknowledgement_key=acknowledgement_key("other"),
-        epoch_time=EpochClock(),
+    other = store_factory(
+        acknowledgement_key=secrets.token_bytes(32),
+        clock=EpochClock(),
     )
     other.register("node-a", capabilities, digest("owner"))
     _, other_selection = queued_work(other)
     other_claim = other.claim_queued_request("node-a", digest("owner"), "worker-a")
     accept_response(other, other_claim)
     assert (
-        retrieve_response(
-            other, other_selection.reservation_token, token
-        ).state
+        retrieve_response(other, other_selection.reservation_token, token).state
         == "invalid_acknowledgement"
     )
     assert len(store.response_records()) == len(other.response_records()) == 1
 
 
+def test_cross_identity_credentials_and_tokens_expose_or_consume_nothing(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    _, first_selection = queued_work(store)
+    second_selection = reserve(store, "request-b", client_public_key="client-key-b")
+    enqueue(
+        store,
+        second_selection,
+        "request-b",
+        client_public_key="client-key-b",
+    )
+    first_claim = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+    second_claim = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+    accept_response(store, first_claim)
+    accept_response(store, second_claim, client_public_key="client-key-b")
+
+    first = retrieve_response(store, first_selection.reservation_token)
+    second = retrieve_response(
+        store,
+        second_selection.reservation_token,
+        client_public_key="client-key-b",
+        request_id="request-b",
+    )
+    before = (store.response_records(), store.terminal_records())
+    attempts = (
+        retrieve_response(store, second_selection.reservation_token),
+        retrieve_response(
+            store,
+            first_selection.reservation_token,
+            client_public_key="client-key-b",
+            request_id="request-b",
+        ),
+        retrieve_response(
+            store, first_selection.reservation_token, second.acknowledgement_token
+        ),
+        retrieve_response(
+            store,
+            second_selection.reservation_token,
+            first.acknowledgement_token,
+            client_public_key="client-key-b",
+            request_id="request-b",
+        ),
+    )
+    assert [attempt.state for attempt in attempts] == [
+        "invalid_retrieval_credential",
+        "invalid_retrieval_credential",
+        "invalid_acknowledgement",
+        "invalid_acknowledgement",
+    ]
+    assert all(attempt.envelope is None for attempt in attempts)
+    assert all(attempt.acknowledgement_token is None for attempt in attempts)
+    assert (store.response_records(), store.terminal_records()) == before
+
+
 def test_equivalent_store_clients_derive_the_same_token(store_factory, capabilities):
-    first, _, _, _, first_credential = completed_response(store_factory, capabilities)
-    second, _, _, _, second_credential = completed_response(store_factory, capabilities)
+    key = secrets.token_bytes(32)
+    first, _ = registered_store(store_factory, capabilities, acknowledgement_key=key)
+    second, _ = registered_store(store_factory, capabilities, acknowledgement_key=key)
+    _, first_selection = queued_work(first)
+    _, second_selection = queued_work(second)
+    accept_response(
+        first, first.claim_queued_request("node-a", digest("owner"), "worker-a")
+    )
+    accept_response(
+        second, second.claim_queued_request("node-a", digest("owner"), "worker-a")
+    )
+    first_credential = first_selection.reservation_token
+    second_credential = second_selection.reservation_token
     first_result = retrieve_response(first, first_credential)
     second_result = retrieve_response(second, second_credential)
     assert first_result.acknowledgement_token == second_result.acknowledgement_token
@@ -669,9 +726,7 @@ def test_retrieval_racing_acknowledgement_leaves_a_coherent_state(
         ack = pool.submit(retrieve_response, store, credential, token)
     assert read.result().state in {"response_ready", "acknowledged"}
     assert ack.result().state == "acknowledged"
-    assert (
-        retrieve_response(store, credential).state == "acknowledged"
-    )
+    assert retrieve_response(store, credential).state == "acknowledged"
 
 
 def test_retrieval_expiry_is_inclusive_fixed_and_preserves_completion(
@@ -692,9 +747,42 @@ def test_retrieval_expiry_is_inclusive_fixed_and_preserves_completion(
     assert accept_response(store, claim) == replace(acceptance, new_outcome=False)
     assert retrieve_response(store, credential) == expired
     clock.value += 1
-    assert (
-        retrieve_response(store, credential).state == "unknown"
+    assert retrieve_response(store, credential).state == "invalid_retrieval_credential"
+
+
+@pytest.mark.parametrize("terminal_state", ["acknowledged", "retrieval_expired"])
+def test_terminal_acceptance_retries_are_idempotent_and_release_response_capacity(
+    store_factory, capabilities, terminal_state
+):
+    store, clock, claim, acceptance, credential = completed_response(
+        store_factory,
+        capabilities,
+        max_responses=1,
+        response_replay_ttl_seconds=2,
+        terminal_retention_seconds=10,
     )
+    ready = retrieve_response(store, credential)
+    if terminal_state == "acknowledged":
+        assert (
+            retrieve_response(store, credential, ready.acknowledgement_token).state
+            == "acknowledged"
+        )
+    else:
+        clock.value = acceptance.replay_expires_at_epoch
+        assert retrieve_response(store, credential).state == "retrieval_expired"
+
+    assert accept_response(store, claim) == replace(acceptance, new_outcome=False)
+    before = (store.response_records(), store.terminal_records())
+    with pytest.raises(RelayStateConflict):
+        accept_response(store, claim, envelope=response_envelope("conflict"))
+    assert (store.response_records(), store.terminal_records()) == before
+    with pytest.raises(RelayStateConflict, match="terminal"):
+        reserve(store)
+
+    selection = reserve(store, "request-b")
+    enqueue(store, selection, "request-b")
+    later = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+    assert accept_response(store, later).new_outcome
 
 
 def test_acknowledgement_racing_expiry_has_one_coherent_terminal_state(
@@ -730,14 +818,66 @@ def test_acknowledgement_key_validation_and_sensitive_representations(
             InMemoryRelayStateStore(config, acknowledgement_key=invalid)
         assert repr(invalid) not in str(error.value)
 
-    store, _, _, _, credential = completed_response(store_factory, capabilities)
+    key = secrets.token_bytes(32)
+    store, _, _, _, credential = completed_response(
+        store_factory, capabilities, acknowledgement_key=key
+    )
     result = retrieve_response(store, credential)
     terminal = store.terminal_records()[0]
     rendered = repr(store) + repr(result) + repr(terminal)
     assert result.acknowledgement_token not in rendered
+    assert credential not in rendered
+    assert key.hex() not in rendered
+    assert repr(key) not in rendered
     assert terminal.acknowledgement_digest not in rendered
+    assert terminal.retrieval_credential_digest not in rendered
     assert "sealed-response" not in rendered
     assert "client-key" not in rendered
+    assert "request-a" not in rendered
+    assert "node-a" not in rendered
+
+
+def test_duplicate_acknowledgement_rederives_with_active_key(
+    store_factory, capabilities
+):
+    original_key = secrets.token_bytes(32)
+    store, _, _, _, credential = completed_response(
+        store_factory, capabilities, acknowledgement_key=original_key
+    )
+    token = retrieve_response(store, credential).acknowledgement_token
+    assert retrieve_response(store, credential, token).state == "acknowledged"
+    terminal_before = store.terminal_records()
+
+    store._acknowledgement_key = secrets.token_bytes(32)
+    assert retrieve_response(store, credential, token) == ResponseRetrievalResult(
+        "invalid_acknowledgement"
+    )
+    assert store.terminal_records() == terminal_before
+    store._acknowledgement_key = original_key
+    assert retrieve_response(store, credential, token).state == "acknowledged"
+
+
+@pytest.mark.parametrize("terminal_state", ["acknowledged", "retrieval_expired"])
+@pytest.mark.parametrize("credential", [None, "malformed", "0" * 64, b"not-text"])
+def test_terminal_retrieval_rejects_bad_credentials_without_mutation(
+    store_factory, capabilities, terminal_state, credential
+):
+    store, clock, _, acceptance, valid_credential = completed_response(
+        store_factory,
+        capabilities,
+        response_replay_ttl_seconds=2,
+        terminal_retention_seconds=4,
+    )
+    ready = retrieve_response(store, valid_credential)
+    if terminal_state == "acknowledged":
+        retrieve_response(store, valid_credential, ready.acknowledgement_token)
+    else:
+        clock.value = acceptance.replay_expires_at_epoch
+        assert retrieve_response(store, valid_credential).state == "retrieval_expired"
+    before = (store.response_records(), store.terminal_records())
+    result = retrieve_response(store, credential, ready.acknowledgement_token)
+    assert result == ResponseRetrievalResult("invalid_retrieval_credential")
+    assert (store.response_records(), store.terminal_records()) == before
 
 
 def test_claim_fifo_empty_poll_and_capacity_is_unchanged(store_factory, capabilities):

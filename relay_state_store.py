@@ -1750,6 +1750,27 @@ class InMemoryRelayStateStore:
         return expired
 
     def _reap_locked(self, now: float) -> None:
+        # Reclaim retained-result capacity before deadline terminalization.  A
+        # due lifecycle must not be blocked by terminal records or control
+        # tombstones whose retention windows have already elapsed.
+        for identity, response in tuple(self._responses.items()):
+            if response.replay_expires_at_epoch <= now:
+                del self._responses[identity]
+                terminal = self._terminals.get(identity)
+                if (
+                    terminal is not None
+                    and terminal.retrieval_state == "response_ready"
+                ):
+                    self._terminals[identity] = replace(
+                        terminal, retrieval_state="retrieval_expired"
+                    )
+        for identity, terminal in tuple(self._terminals.items()):
+            if terminal.expires_at_epoch <= now:
+                del self._terminals[identity]
+        for identity, tombstone in tuple(self._control_tombstones.items()):
+            if tombstone.expires_at_epoch <= now:
+                del self._control_tombstones[identity]
+
         # Absolute request deadlines are lifecycle authority and must win a CAS
         # before ordinary node/short-reservation housekeeping deletes state.
         due = [
@@ -1770,23 +1791,6 @@ class InMemoryRelayStateStore:
                     identity, record, "expired", "request_deadline_expired", now
                 )
         self._expire_locked(now)
-        for identity, response in tuple(self._responses.items()):
-            if response.replay_expires_at_epoch <= now:
-                del self._responses[identity]
-                terminal = self._terminals.get(identity)
-                if (
-                    terminal is not None
-                    and terminal.retrieval_state == "response_ready"
-                ):
-                    self._terminals[identity] = replace(
-                        terminal, retrieval_state="retrieval_expired"
-                    )
-        for identity, terminal in tuple(self._terminals.items()):
-            if terminal.expires_at_epoch <= now:
-                del self._terminals[identity]
-        for identity, tombstone in tuple(self._control_tombstones.items()):
-            if tombstone.expires_at_epoch <= now:
-                del self._control_tombstones[identity]
         for identity, reservation in tuple(self._reservations.items()):
             if reservation.reservation_expires_at_epoch <= now:
                 del self._reservations[identity]
@@ -1810,6 +1814,7 @@ class InMemoryRelayStateStore:
         for identity, reservation in tuple(self._reservations.items()):
             if reservation.selected_node_id == node_id:
                 del self._reservations[identity]
+                self._cancellation_token_digests.pop(identity, None)
 
     def _remove_node_queue_locked(self, node_id: str) -> None:
         for queued in self._node_queues.pop(node_id, ()):
@@ -1819,6 +1824,7 @@ class InMemoryRelayStateStore:
             )
             self._queued.pop(identity, None)
             self._queued_token_digests.pop(identity, None)
+            self._cancellation_token_digests.pop(identity, None)
             self._claims.pop(identity, None)
 
     def _active_fairness_fingerprints_locked(self) -> set[str]:

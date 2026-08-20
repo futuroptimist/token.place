@@ -258,6 +258,78 @@ def test_deadline_reaping_reclaims_expired_terminal_and_tombstone_capacity(
     assert len(store.control_tombstones()) == 1
 
 
+def test_full_retention_defers_deadline_without_wedging_or_losing_claim(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        clock=clock,
+        lease_ttl_seconds=1,
+        response_replay_ttl_seconds=1,
+        terminal_retention_seconds=5,
+        control_tombstone_ttl_seconds=5,
+        max_terminal_records=1,
+        max_terminal_records_per_client=1,
+        max_control_tombstones=1,
+        max_control_tombstones_per_node=1,
+    )
+    first = claimed_work(store)
+    due = claimed_work(store, "request-b", request_deadline_epoch=clock.value + 1)
+    assert store.cancel_or_expire_request(
+        "client-key", first.request_id, "cancel-proof-request-a"
+    ).new_outcome
+
+    clock.value += 1
+    # Reaping a genuinely full store remains usable, while expired work is
+    # neither exposed nor reclaimable and node expiry preserves its claim.
+    assert store.queued_requests("node-a") == ()
+    store.register("node-b", capabilities, digest("node-b"))
+    assert store.claim_queued_request(
+        "node-b", digest("node-b"), "other-worker"
+    ).state == "empty"
+    assert store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        due.request_id,
+        due.generation,
+    ).state == "owner_mismatch"
+    assert len(store.terminal_records()) == 1
+
+    clock.value += 4
+    terminals = store.terminal_records()
+    assert len(terminals) == 1
+    assert terminals[0].request_identity_digest == digest_with_domain(
+        "request-b", b"request\0"
+    )
+    assert terminals[0].outcome == "expired"
+    assert len(store.control_tombstones()) == 1
+    assert store.active_claims("node-a") == ()
+
+
+def test_cancellation_invalid_identity_and_queued_retry_proof_fail_closed(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    selection = reserve(store)
+    enqueue(store, selection)
+    before = store.queued_requests("node-a")
+
+    for client, request in (("\ud800", "request-a"), ("client-key", "\ud800")):
+        result = store.cancel_or_expire_request(client, request, "proof")
+        assert (result.state, result.reason, result.new_outcome) == (
+            "invalid_cancellation_proof",
+            "invalid_cancellation_proof",
+            False,
+        )
+    with pytest.raises(RelayStateConflict, match="^request identity conflict$"):
+        reserve(store, cancellation_token="conflicting-proof")
+    assert store.queued_requests("node-a") == before
+
+
 def test_response_acceptance_atomically_finalizes_claim(store_factory, capabilities):
     store, _ = registered_store(store_factory, capabilities)
     claim = claimed_work(store)

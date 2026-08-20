@@ -804,6 +804,7 @@ class InMemoryRelayStateStore:
         self._responses: dict[tuple[str, str], ResponseRecord] = {}
         self._terminals: dict[tuple[str, str], TerminalOutcomeRecord] = {}
         self._control_tombstones: dict[tuple[str, str], ControlTombstoneRecord] = {}
+        self._deferred_deadline_identities: set[tuple[str, str]] = set()
         self._next_claim_generation = 0
         self._fairness_cursors: dict[str, tuple[str, int]] = {}
         self._fairness_activity = 0
@@ -966,6 +967,17 @@ class InMemoryRelayStateStore:
             queued = self._queued.get(identity)
             if queued is not None:
                 self._require_same_parameters(queued, model_id, tier, deadline)
+                stored_cancellation_digest = self._cancellation_token_digests.get(
+                    identity
+                )
+                if (
+                    stored_cancellation_digest is not None
+                    and cancellation_digest is not None
+                    and not hmac.compare_digest(
+                        stored_cancellation_digest, cancellation_digest
+                    )
+                ):
+                    raise RelayStateConflict("request identity conflict")
                 claim = self._claims.get(identity)
                 lifecycle_state = (
                     "claimed"
@@ -1113,6 +1125,8 @@ class InMemoryRelayStateStore:
         with self._lock:
             now = self._now()
             self._reap_locked(now)
+            if deadline <= now:
+                raise RelayStateInvalidReservation("reservation invalid")
             if identity in self._terminals:
                 raise RelayStateConflict("request lifecycle is terminal")
             existing = self._queued.get(identity)
@@ -1141,8 +1155,6 @@ class InMemoryRelayStateStore:
                         else "queued"
                     ),
                 )
-            if deadline <= now:
-                raise RelayStateInvalidReservation("reservation invalid")
             if deadline > now + self.config.max_request_ttl_seconds:
                 raise RelayStateStoreError(
                     "request deadline exceeds its configured bound"
@@ -1200,8 +1212,13 @@ class InMemoryRelayStateStore:
 
     def list_reservations(self) -> tuple[ReservationRecord, ...]:
         with self._lock:
-            self._reap_locked(self._now())
-            return tuple(replace(record) for record in self._reservations.values())
+            now = self._now()
+            self._reap_locked(now)
+            return tuple(
+                replace(record)
+                for record in self._reservations.values()
+                if record.request_deadline_epoch > now
+            )
 
     def queued_requests(self, node_id: str) -> tuple[QueuedRequest, ...]:
         self._validate_node_id(node_id)
@@ -1211,6 +1228,7 @@ class InMemoryRelayStateStore:
             return tuple(
                 replace(record)
                 for record in self._node_queues.get(node_id, ())
+                if record.request_deadline_epoch > now
                 if (
                     (
                         claim := self._claims.get(
@@ -1254,6 +1272,8 @@ class InMemoryRelayStateStore:
                     queued.client_identity_digest,
                     queued.request_identity_digest,
                 )
+                if queued.request_deadline_epoch <= now:
+                    continue
                 existing = self._claims.get(identity)
                 if existing is not None and existing.lease_expires_at_epoch > now:
                     continue
@@ -1618,7 +1638,12 @@ class InMemoryRelayStateStore:
             ("expired", "request_deadline_expired"),
         }:
             raise RelayStateStoreError("terminal status or reason is invalid")
-        identity = self._identity(client_public_key, request_id)
+        try:
+            identity = self._identity(client_public_key, request_id)
+        except (RelayStateStoreError, UnicodeError):
+            return TerminalTransitionResult(
+                "invalid_cancellation_proof", "invalid_cancellation_proof", False
+            )
         supplied = self._safe_cancellation_token_digest(cancellation_token)
         with self._lock:
             now = self._now()
@@ -1730,6 +1755,7 @@ class InMemoryRelayStateStore:
             self._remove_queued_identity_locked(identity, queued)
         self._cancellation_token_digests.pop(identity, None)
         self._queued_token_digests.pop(identity, None)
+        self._deferred_deadline_identities.discard(identity)
         return TerminalTransitionResult(status, reason, True)
 
     def _expire_locked(self, now: float) -> list[ComputeNodeRegistration]:
@@ -1787,12 +1813,21 @@ class InMemoryRelayStateStore:
             if identity not in self._terminals and (
                 identity in self._reservations or identity in self._queued
             ):
-                self._terminalize_locked(
-                    identity, record, "expired", "request_deadline_expired", now
-                )
+                try:
+                    self._terminalize_locked(
+                        identity, record, "expired", "request_deadline_expired", now
+                    )
+                except RelayStateCapacityExceeded:
+                    # Keep the complete lifecycle for a later authoritative
+                    # transition, but do not let one capacity-bound identity
+                    # prevent reaping or unrelated store operations.
+                    self._deferred_deadline_identities.add(identity)
         self._expire_locked(now)
         for identity, reservation in tuple(self._reservations.items()):
-            if reservation.reservation_expires_at_epoch <= now:
+            if (
+                reservation.reservation_expires_at_epoch <= now
+                and identity not in self._deferred_deadline_identities
+            ):
                 del self._reservations[identity]
                 self._cancellation_token_digests.pop(identity, None)
 
@@ -1813,6 +1848,8 @@ class InMemoryRelayStateStore:
     def _remove_node_reservations_locked(self, node_id: str) -> None:
         for identity, reservation in tuple(self._reservations.items()):
             if reservation.selected_node_id == node_id:
+                if identity in self._deferred_deadline_identities:
+                    continue
                 del self._reservations[identity]
                 self._cancellation_token_digests.pop(identity, None)
 
@@ -1822,6 +1859,9 @@ class InMemoryRelayStateStore:
                 queued.client_identity_digest,
                 queued.request_identity_digest,
             )
+            if identity in self._deferred_deadline_identities:
+                self._node_queues.setdefault(node_id, []).append(queued)
+                continue
             self._queued.pop(identity, None)
             self._queued_token_digests.pop(identity, None)
             self._cancellation_token_digests.pop(identity, None)

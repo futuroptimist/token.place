@@ -187,6 +187,7 @@ FOCUSED_RELAY_E2E_NODEIDS = {
     "tests/e2e/test_ui.py::test_landing_chat_failover_skips_failed_replacements_until_live_candidate",
     "tests/e2e/test_ui.py::test_landing_chat_model_dropdown_uses_api_v1_models",
     "tests/e2e/test_ui.py::test_landing_chat_model_catalog_failure_uses_api_v1_fallback",
+    "tests/e2e/test_ui.py::test_markdown_rendering_stream_updates",
     "tests/e2e/test_ui.py::test_landing_chat_shows_no_servers_available_message",
     "tests/e2e/test_ui.py::test_landing_chat_structured_compute_error_renders_safe_message",
     "tests/e2e/test_ui.py::test_landing_chat_unknown_structured_compute_error_uses_generic_fallback",

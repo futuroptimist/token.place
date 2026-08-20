@@ -84,6 +84,10 @@ class RelayStateStoreConfig:
     max_terminal_records: int = 4096
     max_terminal_records_per_client: int = 8
     terminal_retention_seconds: float = 3600.0
+    max_cancellation_token_bytes: int = 1024
+    control_tombstone_ttl_seconds: float = 300.0
+    max_control_tombstones: int = 4096
+    max_control_tombstones_per_node: int = 128
 
     def __post_init__(self) -> None:
         if not isinstance(self.namespace, str) or not _NAMESPACE_RE.fullmatch(
@@ -134,6 +138,9 @@ class RelayStateStoreConfig:
         self._validate_float_bound(
             self.terminal_retention_seconds, "terminal retention", 0.001, 604_800.0
         )
+        self._validate_float_bound(
+            self.control_tombstone_ttl_seconds, "control tombstone TTL", 0.001, 300.0
+        )
         if self.terminal_retention_seconds < self.response_replay_ttl_seconds:
             raise RelayStateStoreError(
                 "terminal retention must cover response replay retention"
@@ -169,6 +176,17 @@ class RelayStateStoreConfig:
             (self.max_responses, "response bound", 1_000_000),
             (self.max_responses_per_client, "per-client response bound", 10_000),
             (self.max_terminal_records, "terminal-record bound", 1_000_000),
+            (
+                self.max_cancellation_token_bytes,
+                "cancellation-token byte bound",
+                65_536,
+            ),
+            (self.max_control_tombstones, "control-tombstone bound", 1_000_000),
+            (
+                self.max_control_tombstones_per_node,
+                "per-node control-tombstone bound",
+                10_000,
+            ),
             (
                 self.max_terminal_records_per_client,
                 "per-client terminal-record bound",
@@ -419,6 +437,44 @@ class QueuedRequest:
     sequence: int
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class ControlTombstoneRecord:
+    """Bounded, owner-authenticated stop-compute instruction."""
+
+    client_identity_digest: str
+    request_identity_digest: str
+    selected_node_id: str
+    control_credential_digest: str
+    consumer_identity_digest: str
+    generation: int
+    status: str
+    reason: str
+    request_deadline_epoch: float
+    acknowledged: bool
+    expires_at_epoch: float
+
+    def __repr__(self) -> str:
+        return (
+            "ControlTombstoneRecord(identities=<redacted>, selected_node_id=<redacted>, "
+            f"generation={self.generation!r}, status={self.status!r}, reason={self.reason!r}, "
+            f"request_deadline_epoch={self.request_deadline_epoch!r}, "
+            f"acknowledged={self.acknowledged!r}, expires_at_epoch={self.expires_at_epoch!r}, "
+            "credentials=<redacted>)"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TerminalTransitionResult:
+    """Safe result of a cancellation or authoritative deadline transition."""
+
+    state: str
+    reason: str
+    new_outcome: bool
+
+    def __repr__(self) -> str:
+        return f"TerminalTransitionResult(state={self.state!r}, reason={self.reason!r}, new_outcome={self.new_outcome!r})"
+
+
 @dataclass(frozen=True, slots=True)
 class EnqueueResult:
     """Safe idempotent lifecycle result."""
@@ -438,6 +494,7 @@ class ClaimRecord:
     request_identity_digest: str
     consumer_identity_digest: str
     selected_node_id: str
+    control_credential_digest: str
     request_deadline_epoch: float
     envelope: EncryptedRequestEnvelope
     sequence: int
@@ -481,6 +538,8 @@ class ClaimRenewalResult:
     state: str
     generation: int | None = None
     lease_expires_at_epoch: float | None = None
+    reason: str | None = None
+    acknowledged: bool = False
 
     def __repr__(self) -> str:
         return (
@@ -559,6 +618,8 @@ class TerminalOutcomeRecord:
     retrieval_state: str = "response_ready"
     retrieval_credential_digest: str = ""
     acknowledgement_digest: str = ""
+    reason: str = "response_completed"
+    cancellation_token_digest: str = ""
 
     def __repr__(self) -> str:
         return (
@@ -642,6 +703,7 @@ class RelayStateStore(Protocol):
         requested_model_id: str,
         requested_context_tier: str,
         request_deadline_epoch: float,
+        cancellation_token: str | None = None,
     ) -> SelectionResult: ...
     def enqueue_encrypted_request(
         self,
@@ -653,6 +715,7 @@ class RelayStateStore(Protocol):
         requested_context_tier: str,
         request_deadline_epoch: float,
         envelope: EncryptedRequestEnvelope,
+        cancellation_token: str,
     ) -> EnqueueResult: ...
     def list_reservations(self) -> tuple[ReservationRecord, ...]: ...
     def queued_requests(self, node_id: str) -> tuple[QueuedRequest, ...]: ...
@@ -668,6 +731,26 @@ class RelayStateStore(Protocol):
         request_id: str,
         generation: int,
     ) -> ClaimRenewalResult: ...
+    def renew_claim_or_read_control(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        *,
+        acknowledge: bool = False,
+    ) -> ClaimRenewalResult: ...
+    def cancel_or_expire_request(
+        self,
+        client_public_key: str,
+        request_id: str,
+        cancellation_token: str | None,
+        *,
+        status: str = "cancelled",
+        reason: str = "requester_cancelled",
+    ) -> TerminalTransitionResult: ...
     def active_claims(self, node_id: str) -> tuple[ClaimRecord, ...]: ...
     def accept_encrypted_response(
         self,
@@ -688,6 +771,7 @@ class RelayStateStore(Protocol):
     ) -> ResponseRetrievalResult: ...
     def response_records(self) -> tuple[ResponseRecord, ...]: ...
     def terminal_records(self) -> tuple[TerminalOutcomeRecord, ...]: ...
+    def control_tombstones(self) -> tuple[ControlTombstoneRecord, ...]: ...
 
 
 class InMemoryRelayStateStore:
@@ -714,10 +798,12 @@ class InMemoryRelayStateStore:
         self._reservations: dict[tuple[str, str], ReservationRecord] = {}
         self._queued: dict[tuple[str, str], QueuedRequest] = {}
         self._queued_token_digests: dict[tuple[str, str], str] = {}
+        self._cancellation_token_digests: dict[tuple[str, str], str] = {}
         self._node_queues: dict[str, list[QueuedRequest]] = {}
         self._claims: dict[tuple[str, str], ClaimRecord] = {}
         self._responses: dict[tuple[str, str], ResponseRecord] = {}
         self._terminals: dict[tuple[str, str], TerminalOutcomeRecord] = {}
+        self._control_tombstones: dict[tuple[str, str], ControlTombstoneRecord] = {}
         self._next_claim_generation = 0
         self._fairness_cursors: dict[str, tuple[str, int]] = {}
         self._fairness_activity = 0
@@ -853,6 +939,7 @@ class InMemoryRelayStateStore:
         requested_model_id: str,
         requested_context_tier: str,
         request_deadline_epoch: float,
+        cancellation_token: str | None = None,
     ) -> SelectionResult:
         client_digest, request_digest = self._identity(client_public_key, request_id)
         model_id = self._model_id(requested_model_id)
@@ -860,6 +947,11 @@ class InMemoryRelayStateStore:
         deadline = self._deadline(request_deadline_epoch)
         fingerprint = self._scheduler_fingerprint(model_id, tier)
         identity = (client_digest, request_digest)
+        cancellation_digest = (
+            self._cancellation_token_digest(cancellation_token)
+            if cancellation_token is not None
+            else None
+        )
         with self._lock:
             now = self._now()
             self._reap_locked(now)
@@ -893,6 +985,16 @@ class InMemoryRelayStateStore:
             existing = self._reservations.get(identity)
             if existing is not None:
                 self._require_same_parameters(existing, model_id, tier, deadline)
+                stored_cancellation_digest = self._cancellation_token_digests.get(
+                    identity
+                )
+                if stored_cancellation_digest is not None and (
+                    cancellation_digest is None
+                    or not hmac.compare_digest(
+                        stored_cancellation_digest, cancellation_digest
+                    )
+                ):
+                    raise RelayStateConflict("request identity conflict")
                 return self._selection_result(existing, None, False)
             if len(self._reservations) >= self.config.max_reservations:
                 raise RelayStateNoCapacity("no scheduler capacity")
@@ -979,6 +1081,8 @@ class InMemoryRelayStateStore:
             if evicted_fingerprint is not None:
                 del self._fairness_cursors[evicted_fingerprint]
             self._reservations[identity] = record
+            if cancellation_digest is not None:
+                self._cancellation_token_digests[identity] = cancellation_digest
             self._fairness_activity += 1
             self._fairness_cursors[fingerprint] = (node_id, self._fairness_activity)
             return self._selection_result(record, raw_token, True)
@@ -993,6 +1097,7 @@ class InMemoryRelayStateStore:
         requested_context_tier: str,
         request_deadline_epoch: float,
         envelope: EncryptedRequestEnvelope,
+        cancellation_token: str,
     ) -> EnqueueResult:
         client_digest, request_digest = self._identity(client_public_key, request_id)
         self._validate_node_id(selected_node_id)
@@ -1003,6 +1108,7 @@ class InMemoryRelayStateStore:
             raise RelayStateStoreError("envelope must be EncryptedRequestEnvelope")
         self._validate_envelope_size(envelope)
         token_digest = self._token_digest(reservation_token)
+        cancellation_digest = self._cancellation_token_digest(cancellation_token)
         identity = (client_digest, request_digest)
         with self._lock:
             now = self._now()
@@ -1021,6 +1127,10 @@ class InMemoryRelayStateStore:
                     self._queued_token_digests[identity], token_digest
                 ):
                     raise RelayStateInvalidReservation("reservation invalid")
+                if not hmac.compare_digest(
+                    self._cancellation_token_digests[identity], cancellation_digest
+                ):
+                    raise RelayStateConflict("request identity conflict")
                 return self._enqueue_result(
                     existing,
                     False,
@@ -1041,6 +1151,13 @@ class InMemoryRelayStateStore:
             if reservation is None:
                 raise RelayStateInvalidReservation("reservation invalid")
             self._require_same_parameters(reservation, model_id, tier, deadline)
+            reserved_cancellation_digest = self._cancellation_token_digests.get(
+                identity
+            )
+            if reserved_cancellation_digest is not None and not hmac.compare_digest(
+                reserved_cancellation_digest, cancellation_digest
+            ):
+                raise RelayStateConflict("request identity conflict")
             if (
                 reservation.selected_node_id != selected_node_id
                 or not hmac.compare_digest(reservation.token_digest, token_digest)
@@ -1076,6 +1193,7 @@ class InMemoryRelayStateStore:
             )
             self._queued[identity] = queued
             self._queued_token_digests[identity] = token_digest
+            self._cancellation_token_digests[identity] = cancellation_digest
             self._node_queues.setdefault(selected_node_id, []).append(queued)
             del self._reservations[identity]
             return self._enqueue_result(queued, True)
@@ -1155,6 +1273,7 @@ class InMemoryRelayStateStore:
                     queued.request_identity_digest,
                     consumer_digest,
                     node_id,
+                    registration.control_credential_digest,
                     queued.request_deadline_epoch,
                     queued.envelope,
                     queued.sequence,
@@ -1182,6 +1301,27 @@ class InMemoryRelayStateStore:
         request_id: str,
         generation: int,
     ) -> ClaimRenewalResult:
+        return self.renew_claim_or_read_control(
+            node_id,
+            control_credential_digest,
+            consumer_identity,
+            client_public_key,
+            request_id,
+            generation,
+        )
+
+    def renew_claim_or_read_control(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        *,
+        acknowledge: bool = False,
+    ) -> ClaimRenewalResult:
+        """Renew a live claim or atomically read/ack its owner-bound tombstone."""
         self._validate_node_id(node_id)
         self._validate_digest(control_credential_digest)
         consumer_digest = self._consumer_digest(consumer_identity)
@@ -1196,6 +1336,29 @@ class InMemoryRelayStateStore:
             now = self._now()
             self._reap_locked(now)
             registration = self._records.get(node_id)
+            tombstone = self._control_tombstones.get(identity)
+            if tombstone is not None:
+                if not (
+                    tombstone.selected_node_id == node_id
+                    and tombstone.generation == generation
+                    and hmac.compare_digest(
+                        tombstone.control_credential_digest, control_credential_digest
+                    )
+                    and hmac.compare_digest(
+                        tombstone.consumer_identity_digest, consumer_digest
+                    )
+                ):
+                    return ClaimRenewalResult("owner_mismatch")
+                if acknowledge and not tombstone.acknowledged:
+                    tombstone = replace(tombstone, acknowledged=True)
+                    self._control_tombstones[identity] = tombstone
+                return ClaimRenewalResult(
+                    "acknowledged" if tombstone.acknowledged else tombstone.status,
+                    generation,
+                    None,
+                    tombstone.reason,
+                    tombstone.acknowledged,
+                )
             if registration is None or not hmac.compare_digest(
                 registration.control_credential_digest, control_credential_digest
             ):
@@ -1360,6 +1523,7 @@ class InMemoryRelayStateStore:
                 acknowledgement_digest=self._acknowledgement_digest(
                     self._derive_acknowledgement_token(identity, now, response_digest)
                 ),
+                cancellation_token_digest=self._cancellation_token_digests[identity],
             )
             self._responses[identity] = response
             self._terminals[identity] = terminal
@@ -1439,10 +1603,134 @@ class InMemoryRelayStateStore:
                 for record in self._responses.values()
             )
 
+    def cancel_or_expire_request(
+        self,
+        client_public_key: str,
+        request_id: str,
+        cancellation_token: str | None,
+        *,
+        status: str = "cancelled",
+        reason: str = "requester_cancelled",
+    ) -> TerminalTransitionResult:
+        """Atomically cancel authenticated work or expire it at its deadline."""
+        if (status, reason) not in {
+            ("cancelled", "requester_cancelled"),
+            ("expired", "request_deadline_expired"),
+        }:
+            raise RelayStateStoreError("terminal status or reason is invalid")
+        identity = self._identity(client_public_key, request_id)
+        supplied = self._safe_cancellation_token_digest(cancellation_token)
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now)
+            terminal = self._terminals.get(identity)
+            if terminal is not None:
+                if status == "cancelled" and not hmac.compare_digest(
+                    terminal.cancellation_token_digest, supplied
+                ):
+                    return TerminalTransitionResult(
+                        "invalid_cancellation_proof",
+                        "invalid_cancellation_proof",
+                        False,
+                    )
+                return TerminalTransitionResult(
+                    terminal.outcome, terminal.reason, False
+                )
+            if status == "cancelled":
+                expected = self._cancellation_token_digests.get(identity)
+                if expected is None or not hmac.compare_digest(expected, supplied):
+                    return TerminalTransitionResult(
+                        "invalid_cancellation_proof",
+                        "invalid_cancellation_proof",
+                        False,
+                    )
+            record = self._reservations.get(identity) or self._queued.get(identity)
+            if record is None:
+                return TerminalTransitionResult(
+                    "invalid_cancellation_proof", "invalid_cancellation_proof", False
+                )
+            if status == "expired" and record.request_deadline_epoch > now:
+                return TerminalTransitionResult(
+                    "not_expired", "request_deadline_active", False
+                )
+            return self._terminalize_locked(identity, record, status, reason, now)
+
+    def control_tombstones(self) -> tuple[ControlTombstoneRecord, ...]:
+        with self._lock:
+            self._reap_locked(self._now())
+            return tuple(
+                replace(record) for record in self._control_tombstones.values()
+            )
+
     def terminal_records(self) -> tuple[TerminalOutcomeRecord, ...]:
         with self._lock:
             self._reap_locked(self._now())
             return tuple(replace(record) for record in self._terminals.values())
+
+    def _terminalize_locked(self, identity, record, status, reason, now):
+        claim = self._claims.get(identity)
+        if (
+            len(self._terminals) >= self.config.max_terminal_records
+            or sum(
+                t.client_identity_digest == identity[0]
+                for t in self._terminals.values()
+            )
+            >= self.config.max_terminal_records_per_client
+        ):
+            raise RelayStateCapacityExceeded("terminal lifecycle capacity reached")
+        if claim is not None:
+            node_count = sum(
+                t.selected_node_id == claim.selected_node_id
+                for t in self._control_tombstones.values()
+            )
+            if (
+                len(self._control_tombstones) >= self.config.max_control_tombstones
+                or node_count >= self.config.max_control_tombstones_per_node
+            ):
+                raise RelayStateCapacityExceeded("control tombstone capacity reached")
+        terminal = TerminalOutcomeRecord(
+            identity[0],
+            identity[1],
+            record.selected_node_id,
+            claim.control_credential_digest if claim else "",
+            claim.consumer_identity_digest if claim else "",
+            claim.generation if claim else 0,
+            "",
+            now,
+            now,
+            now + self.config.terminal_retention_seconds,
+            outcome=status,
+            retrieval_state="completed_unavailable",
+            reason=reason,
+            cancellation_token_digest=self._cancellation_token_digests.get(
+                identity, ""
+            ),
+        )
+        tombstone = None
+        if claim is not None:
+            tombstone = ControlTombstoneRecord(
+                identity[0],
+                identity[1],
+                claim.selected_node_id,
+                claim.control_credential_digest,
+                claim.consumer_identity_digest,
+                claim.generation,
+                status,
+                reason,
+                claim.request_deadline_epoch,
+                False,
+                min(now + self.config.control_tombstone_ttl_seconds, now + 300.0),
+            )
+        self._terminals[identity] = terminal
+        if tombstone is not None:
+            self._control_tombstones[identity] = tombstone
+        reservation = self._reservations.pop(identity, None)
+        queued = self._queued.get(identity)
+        if queued is not None:
+            self._remove_queued_identity_locked(identity, queued)
+        self._cancellation_token_digests.pop(identity, None)
+        self._queued_token_digests.pop(identity, None)
+        return TerminalTransitionResult(status, reason, True)
 
     def _expire_locked(self, now: float) -> list[ComputeNodeRegistration]:
         expired = sorted(
@@ -1462,6 +1750,25 @@ class InMemoryRelayStateStore:
         return expired
 
     def _reap_locked(self, now: float) -> None:
+        # Absolute request deadlines are lifecycle authority and must win a CAS
+        # before ordinary node/short-reservation housekeeping deletes state.
+        due = [
+            (identity, record)
+            for identity, record in tuple(self._reservations.items())
+            if record.request_deadline_epoch <= now
+        ]
+        due.extend(
+            (identity, record)
+            for identity, record in tuple(self._queued.items())
+            if record.request_deadline_epoch <= now
+        )
+        for identity, record in due:
+            if identity not in self._terminals and (
+                identity in self._reservations or identity in self._queued
+            ):
+                self._terminalize_locked(
+                    identity, record, "expired", "request_deadline_expired", now
+                )
         self._expire_locked(now)
         for identity, response in tuple(self._responses.items()):
             if response.replay_expires_at_epoch <= now:
@@ -1477,21 +1784,20 @@ class InMemoryRelayStateStore:
         for identity, terminal in tuple(self._terminals.items()):
             if terminal.expires_at_epoch <= now:
                 del self._terminals[identity]
+        for identity, tombstone in tuple(self._control_tombstones.items()):
+            if tombstone.expires_at_epoch <= now:
+                del self._control_tombstones[identity]
         for identity, reservation in tuple(self._reservations.items()):
-            if (
-                reservation.reservation_expires_at_epoch <= now
-                or reservation.request_deadline_epoch <= now
-            ):
+            if reservation.reservation_expires_at_epoch <= now:
                 del self._reservations[identity]
-        for identity, queued in tuple(self._queued.items()):
-            if queued.request_deadline_epoch <= now:
-                self._remove_queued_identity_locked(identity, queued)
+                self._cancellation_token_digests.pop(identity, None)
 
     def _remove_queued_identity_locked(
         self, identity: tuple[str, str], queued: QueuedRequest
     ) -> None:
         self._queued.pop(identity, None)
         self._queued_token_digests.pop(identity, None)
+        self._cancellation_token_digests.pop(identity, None)
         queue = self._node_queues.get(queued.selected_node_id, [])
         remaining = [item for item in queue if item != queued]
         if remaining:
@@ -1741,6 +2047,20 @@ class InMemoryRelayStateStore:
         if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
             raise RelayStateInvalidReservation("reservation invalid")
         return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+    def _cancellation_token_digest(self, token: object) -> str:
+        if not isinstance(token, str) or not token:
+            raise RelayStateStoreError("cancellation proof is invalid")
+        encoded = token.encode("utf-8")
+        if len(encoded) > self.config.max_cancellation_token_bytes:
+            raise RelayStateStoreError("cancellation proof is invalid")
+        return hashlib.sha256(b"cancel\0" + encoded).hexdigest()
+
+    def _safe_cancellation_token_digest(self, token: object) -> str:
+        try:
+            return self._cancellation_token_digest(token)
+        except (RelayStateStoreError, UnicodeError):
+            return "0" * 64
 
     @staticmethod
     def _safe_retrieval_credential_digest(credential: object) -> str:

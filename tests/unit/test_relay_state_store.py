@@ -122,6 +122,7 @@ def enqueue(store, selection, request_id="request-a", **overrides):
         "requested_context_tier": selection.requested_context_tier,
         "request_deadline_epoch": selection.request_deadline_epoch,
         "envelope": envelope(),
+        "cancellation_token": "cancel-proof-" + request_id,
     }
     values.update(overrides)
     return store.enqueue_encrypted_request(**values)
@@ -158,6 +159,70 @@ def accept_response(store, claim, **overrides):
     }
     values.update(overrides)
     return store.accept_encrypted_response(**values)
+
+
+def test_authenticated_cancellation_and_owner_bound_acknowledgement(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+
+    invalid = store.cancel_or_expire_request("client-key", "request-a", "wrong-proof")
+    assert invalid.state == "invalid_cancellation_proof"
+    assert store.active_claims("node-a")
+
+    cancelled = store.cancel_or_expire_request(
+        "client-key", "request-a", "cancel-proof-request-a"
+    )
+    assert cancelled.new_outcome
+    assert (
+        store.cancel_or_expire_request(
+            "client-key", "request-a", "cancel-proof-request-a"
+        ).new_outcome
+        is False
+    )
+    assert store.active_claims("node-a") == ()
+    tombstone = store.control_tombstones()[0]
+    assert tombstone.status == "cancelled"
+    control = store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+        acknowledge=True,
+    )
+    assert control.state == "acknowledged"
+    assert control.acknowledged
+    with pytest.raises(RelayStateConflict):
+        accept_response(store, claim)
+
+
+def test_request_deadline_expiry_is_terminal_and_tombstone_expiry_is_bounded(
+    store_factory, capabilities
+):
+    store, clock = registered_store(
+        store_factory, capabilities, control_tombstone_ttl_seconds=5
+    )
+    claim = claimed_work(store, request_deadline_epoch=clock.value + 5)
+    clock.value = claim.request_deadline_epoch
+
+    assert (
+        store.renew_claim_or_read_control(
+            "node-a",
+            digest("owner"),
+            "worker-a",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "expired"
+    )
+    assert store.terminal_records()[0].outcome == "expired"
+    clock.value += 5
+    assert store.control_tombstones() == ()
+    assert store.terminal_records()[0].outcome == "expired"
 
 
 def test_response_acceptance_atomically_finalizes_claim(store_factory, capabilities):
@@ -264,9 +329,10 @@ def test_missing_expired_claim_and_request_deadline_fail_without_mutation(
     store, clock = registered_store(store_factory, capabilities)
     claim = claimed_work(store, request_deadline_epoch=clock.value + 5)
     clock.value = claim.request_deadline_epoch
-    with pytest.raises(RelayStateConflict, match="expired"):
+    with pytest.raises(RelayStateConflict, match="conflict"):
         accept_response(store, claim)
-    assert store.response_records() == store.terminal_records() == ()
+    assert store.response_records() == ()
+    assert store.terminal_records()[0].outcome == "expired"
 
 
 def test_simultaneous_responses_have_one_new_outcome(store_factory, capabilities):
@@ -1082,7 +1148,7 @@ def test_claim_renewal_auth_identity_and_deadline_bounds(store_factory, capabili
             "request-a",
             claim.generation,
         ).state
-        == "missing_or_expired"
+        == "expired"
     )
     assert store.active_claims("node-a") == ()
 
@@ -1106,7 +1172,7 @@ def test_exact_request_deadline_prevents_renewal_and_reclaim(
             "request-a",
             claim.generation,
         ).state
-        == "missing_or_expired"
+        == "expired"
     )
     assert (
         store.claim_queued_request("node-a", digest("owner"), "worker-new").state

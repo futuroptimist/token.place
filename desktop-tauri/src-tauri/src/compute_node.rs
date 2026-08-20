@@ -5947,7 +5947,7 @@ mod tests {
         assert!(!status.running);
         assert_eq!(
             status.native_startup_outcome,
-            NativeStartupOutcome::PublicationSuppressed
+            NativeStartupOutcome::PublicationAccepted
         );
         assert_eq!(status.relay_runtime_state.as_deref(), Some("stopped"));
         assert!(status.last_error.is_none());
@@ -6023,6 +6023,10 @@ mod tests {
         );
         let status = state.status.lock().await.clone();
         assert!(!status.running);
+        assert_eq!(
+            status.native_startup_outcome,
+            NativeStartupOutcome::PublicationSuppressed
+        );
         let mut child_to_reap = state
             .bridge_process
             .lock()

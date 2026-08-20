@@ -191,20 +191,31 @@ def test_response_retry_is_once_only_and_conflicts_fail_closed(
     assert (store.response_records(), store.terminal_records()) == before
 
 
-def test_response_retry_requires_current_registered_owner(
+def test_response_retry_after_unregister_uses_retained_terminal(
     store_factory, capabilities
 ):
-    store, _ = registered_store(store_factory, capabilities)
+    store, clock = registered_store(
+        store_factory,
+        capabilities,
+        response_replay_ttl_seconds=1,
+        terminal_retention_seconds=2,
+    )
     claim = claimed_work(store)
     first = accept_response(store, claim)
     assert store.unregister("node-a", digest("owner"))
+    clock.value += 1
 
+    assert store.response_records() == ()
+    assert accept_response(store, claim) == replace(first, new_outcome=False)
+
+    store.register("node-a", capabilities, digest("replacement"))
     with pytest.raises(RelayStateConflict):
-        accept_response(store, claim)
-    assert first.new_outcome
+        accept_response(
+            store, claim, control_credential_digest=digest("replacement")
+        )
 
 
-def test_response_retry_rejects_expired_registration(
+def test_response_retry_after_registration_expiry_uses_retained_terminal(
     store_factory, capabilities
 ):
     store, clock = registered_store(store_factory, capabilities)
@@ -212,9 +223,7 @@ def test_response_retry_rejects_expired_registration(
     first = accept_response(store, claim)
     clock.value += store.config.lease_ttl_seconds
 
-    with pytest.raises(RelayStateConflict):
-        accept_response(store, claim)
-    assert first.new_outcome
+    assert accept_response(store, claim) == replace(first, new_outcome=False)
 
 
 @pytest.mark.parametrize(

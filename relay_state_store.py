@@ -1233,15 +1233,11 @@ class InMemoryRelayStateStore:
             self._reap_locked(now)
             terminal = self._terminals.get(identity)
             if terminal is not None:
-                registration = self._records.get(node_id)
+                # The retained terminal authenticates an exact non-mutating retry
+                # after registration expiry or unregister; no live registration is needed.
                 if (
-                    registration is not None
-                    and terminal.selected_node_id == node_id
+                    terminal.selected_node_id == node_id
                     and terminal.generation == generation
-                    and hmac.compare_digest(
-                        registration.control_credential_digest,
-                        control_credential_digest,
-                    )
                     and hmac.compare_digest(
                         terminal.control_credential_digest,
                         control_credential_digest,

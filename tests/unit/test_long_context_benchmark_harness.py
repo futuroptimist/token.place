@@ -916,6 +916,29 @@ def test_operator_start_diagnostic_collects_only_allowlisted_dom_values(desktop_
     }
 
 
+@pytest.mark.parametrize("driver", [
+    None,
+    SimpleNamespace(find_element=lambda *_args: (_ for _ in ()).throw(
+        NoSuchElementException("private missing shell /secret/path"))),
+    SimpleNamespace(find_element=lambda *_args: (_ for _ in ()).throw(
+        StaleElementReferenceException("private stale shell /secret/path"))),
+    SimpleNamespace(find_element=lambda *_args: (_ for _ in ()).throw(
+        _WebDriverException("private webdriver failure /secret/path"))),
+])
+def test_operator_start_diagnostic_defaults_without_available_shell(
+        desktop_runner, driver):
+    diagnostic = desktop_runner._read_operator_start_diagnostic(driver)
+
+    assert diagnostic == {
+        "start_handler_state": "not_entered",
+        "invocation_state": "not_started",
+        "native_event_observation": "none",
+        "polling_observation": "none",
+        "render_state": "not_running",
+    }
+    assert "private" not in json.dumps(diagnostic)
+
+
 def test_native_startup_diagnostic_collects_and_clamps_fixed_values(desktop_runner):
     values = {
         "data-native-startup-phase": "running_status_publication",
@@ -3723,6 +3746,14 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
         "webdriver_transport_failure", "runner_startup", "not_started"),
     (RuntimeError("native_driver_unavailable"), None, None, None, None, None, None,
         "native_driver_unavailable", "runner_startup", "not_started"),
+    (None, None, None, None, None, RuntimeError("posix readiness failure"), None,
+        "desktop_ui_not_ready", "desktop_session_started", "not_started"),
+    (None, None, None, None, None, None, RuntimeError("handoff_failure"),
+        "rust_python_handoff_failed", "operator_ready", "operator_registered"),
+    (None, None, None, None, None, None, RuntimeError("submit_failure"),
+        "packaged_runner_failure", "operator_ready", "operator_registered"),
+    (None, None, None, None, None, None, RuntimeError("final_stage_failure"),
+        "tokenization_failure", "response_received", "operator_registered"),
 ])
 def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         tmp_path, command_error, gate_error, launch_error, devtools_error, start_error,
@@ -3777,6 +3808,11 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
 
     def post_start(_driver, _remaining, record_progress, fail_closed):
         if operator_error:
+            if str(operator_error) in {
+                    "handoff_failure", "submit_failure", "final_stage_failure"}:
+                record_progress("operator_running")
+                record_progress("operator_registered")
+                return
             if str(operator_error) == "operator_registration_not_reached":
                 record_progress("operator_running")
             if str(operator_error) in h.PACKAGED_FAILURE_REASONS:
@@ -3784,8 +3820,40 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
             raise operator_error
 
     fake_os = SimpleNamespace(**vars(os))
-    fake_os.name = "nt"
+    fake_os.name = "posix" if str(ready_error) == "posix readiness failure" else "nt"
     diagnostics = []
+    class MemorySampler:
+        def __init__(self, pid):
+            memory_roots.append(pid)
+
+        def sample(self):
+            return True
+
+        def summary(self):
+            return {"peak_rss_bytes": 1}
+
+    class LandingBrowser:
+        def set_page_load_timeout(self, _timeout):
+            pass
+
+        def set_script_timeout(self, _timeout):
+            pass
+
+        def get(self, _url):
+            pass
+
+        def execute_script(self, script):
+            if "FinalMetadata" in script:
+                return {"prompt_tokens": 1, "completion_tokens": 1,
+                    "finish_reason": "stop"}
+            if "GenerationSettings" in script:
+                return {"supplied": {}, "omitted_runtime_default": []}
+            if "return {p:" in script:
+                return {"p": {"sequence": 1}, "h": [{"role": "assistant",
+                    "content": "bounded response", "isTyping": False,
+                    "finishReason": "stop"}], "b": False, "t": "8k-fast"}
+            return None
+
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": fake_os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
@@ -3810,8 +3878,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "subprocess": SimpleNamespace(
             Popen=popen, STDOUT=-2),
         "tauri_driver_command": driver_command, "TAURI_ROOT": tmp_path,
-        "OwnedProcessTreeMemorySampler": lambda pid: (
-            memory_roots.append(pid) or object()),
+        "OwnedProcessTreeMemorySampler": MemorySampler,
         "wait_for_webdriver_ready": webdriver_ready,
         "wait_for_webview2_devtools": webview2_ready,
         "reserve_free_port": lambda: 49152,
@@ -3822,6 +3889,29 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "benchmark_operator_mode": lambda _backend: "cpu",
         "wait_for_start_operator_enabled": lambda *_args, **_kwargs: None,
         "wait_for_post_start_operator_state": post_start,
+        "_validate_operator_tokenizer_handoff": lambda _evidence, fail_closed: (
+            fail_closed("rust_python_handoff_failed")
+            if str(operator_error) == "handoff_failure" else None),
+        "_status_value": lambda _driver, label: {
+            "Launcher source": "bundled", "Backend selected": "cpu",
+            "Backend used": "cpu", "Runtime ID": "runtime",
+        }.get(label, "bounded"),
+        "_readiness_diagnostics_map": lambda _driver: {},
+        "packaged_runtime_configuration": lambda *_args: {},
+        "start_landing_driver": LandingBrowser,
+        "_prepare_packaged_landing_page": lambda *_args: None,
+        "_rearm_tokenizer_stage": lambda _evidence, _log: 0,
+        "_populate_and_submit_packaged_prompt": lambda *_args, **kwargs: (
+            kwargs["before_submit"](),
+            (_ for _ in ()).throw(RuntimeError("packaged_runner_failure")),
+        )[-1] if str(operator_error) == "submit_failure" else (
+            kwargs["before_submit"]() or time.monotonic()),
+        "classify_benchmark_landing_state": h.classify_benchmark_landing_state,
+        "parse_packaged_local_telemetry": lambda _text: {},
+        "observe_post_terminal": lambda *_args, **_kwargs: [],
+        "_validate_final_tokenizer_stage": lambda _evidence, fail_closed: (
+            fail_closed("tokenization_failure")
+            if str(operator_error) == "final_stage_failure" else None),
         "_validate_packaged_failure_reason": lambda reason: reason,
         "_write_benchmark_phase": lambda *_args, **kwargs: checkpoints.append(dict(kwargs)),
         "_cleanup_owned_process_tree": lambda owned, *_args: (
@@ -3842,6 +3932,8 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "cleanup_timeout_s": 1,
         "model": str(model), "relay_url": "https://relay.example",
         "backend": "cpu", "context_tier": "8k-fast",
+        "request_timeout_s": 1, "finalization_timeout_s": 1,
+        "prompt": "bounded prompt",
         "manifest": {"fixture_sha256": "0" * 64, "targets": {}},
     }))
 
@@ -3863,7 +3955,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     }
     assert len(start_calls) == (
         0 if command_error or gate_error or launch_error or devtools_error else 1)
-    if not command_error and not gate_error and not launch_error:
+    if fake_os.name == "nt" and not command_error and not gate_error and not launch_error:
         app_args, app_kwargs = popen_calls[1]
         assert app_args == [str(app.resolve()),
             "--edge-webview-switches=--remote-debugging-port=49152",

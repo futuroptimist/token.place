@@ -528,6 +528,7 @@ class ResponseRecord:
     accepted_at_epoch: float
     response_digest: str
     replay_expires_at_epoch: float
+    acknowledgement_token_digest: str
     status: str = "response_ready"
 
     def __repr__(self) -> str:
@@ -536,6 +537,7 @@ class ResponseRecord:
             f"generation={self.generation!r}, accepted_at_epoch={self.accepted_at_epoch!r}, "
             f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
             "response_digest=<redacted>, envelope=<redacted>, "
+            "acknowledgement_token_digest=<redacted>, "
             f"status={self.status!r})"
         )
 
@@ -555,6 +557,8 @@ class TerminalOutcomeRecord:
     replay_expires_at_epoch: float
     expires_at_epoch: float
     outcome: str = "completed"
+    retrieval_state: str = "response_ready"
+    acknowledgement_token_digest: str = ""
 
     def __repr__(self) -> str:
         return (
@@ -562,7 +566,8 @@ class TerminalOutcomeRecord:
             f"generation={self.generation!r}, accepted_at_epoch={self.accepted_at_epoch!r}, "
             f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
             f"expires_at_epoch={self.expires_at_epoch!r}, outcome={self.outcome!r}, "
-            "credentials=<redacted>, response_digest=<redacted>)"
+            f"retrieval_state={self.retrieval_state!r}, credentials=<redacted>, "
+            "response_digest=<redacted>, acknowledgement_token_digest=<redacted>)"
         )
 
 
@@ -582,6 +587,23 @@ class ResponseAcceptanceResult:
             f"accepted_at_epoch={self.accepted_at_epoch!r}, "
             f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
             f"new_outcome={self.new_outcome!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ResponseRetrievalResult:
+    """Fixed retrieval transition result with sensitive values redacted from repr."""
+
+    state: str
+    envelope: EncryptedResponseEnvelope | None = None
+    acknowledgement_token: str | None = None
+    replay_expires_at_epoch: float | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"ResponseRetrievalResult(state={self.state!r}, envelope=<redacted>, "
+            f"acknowledgement_token_present={self.acknowledgement_token is not None}, "
+            f"replay_expires_at_epoch={self.replay_expires_at_epoch!r})"
         )
 
 
@@ -657,6 +679,12 @@ class RelayStateStore(Protocol):
         generation: int,
         envelope: EncryptedResponseEnvelope,
     ) -> ResponseAcceptanceResult: ...
+    def retrieve_encrypted_response(
+        self,
+        client_public_key: str,
+        request_id: str,
+        acknowledgement_token: str | None = None,
+    ) -> ResponseRetrievalResult: ...
     def response_records(self) -> tuple[ResponseRecord, ...]: ...
     def terminal_records(self) -> tuple[TerminalOutcomeRecord, ...]: ...
 
@@ -668,9 +696,15 @@ class InMemoryRelayStateStore:
         self,
         config: RelayStateStoreConfig,
         *,
+        acknowledgement_key: bytes,
         epoch_time: Callable[[], float] = time.time,
     ) -> None:
+        if not isinstance(acknowledgement_key, bytes) or len(acknowledgement_key) < 32:
+            raise RelayStateStoreError(
+                "acknowledgement key must be bytes containing at least 256 bits"
+            )
         self._config = config
+        self._acknowledgement_key = acknowledgement_key
         self._epoch_time = epoch_time
         self._records: dict[str, ComputeNodeRegistration] = {}
         self._scheduler_states: dict[str, SchedulerNodeState] = {}
@@ -1297,6 +1331,12 @@ class InMemoryRelayStateStore:
             terminal_expires = now + self.config.terminal_retention_seconds
             if not math.isfinite(replay_expires) or not math.isfinite(terminal_expires):
                 raise RelayStateStoreError("response retention deadline must be finite")
+            acknowledgement_token = self._acknowledgement_token(
+                identity, now, response_digest
+            )
+            acknowledgement_digest = hashlib.sha256(
+                acknowledgement_token.encode("ascii")
+            ).hexdigest()
             response = ResponseRecord(
                 identity[0],
                 identity[1],
@@ -1309,6 +1349,7 @@ class InMemoryRelayStateStore:
                 now,
                 response_digest,
                 replay_expires,
+                acknowledgement_digest,
             )
             terminal = TerminalOutcomeRecord(
                 identity[0],
@@ -1321,11 +1362,70 @@ class InMemoryRelayStateStore:
                 now,
                 replay_expires,
                 terminal_expires,
+                acknowledgement_token_digest=acknowledgement_digest,
             )
             self._responses[identity] = response
             self._terminals[identity] = terminal
             self._remove_queued_identity_locked(identity, queued)
             return self._response_result(response, True)
+
+    def retrieve_encrypted_response(
+        self,
+        client_public_key: str,
+        request_id: str,
+        acknowledgement_token: str | None = None,
+    ) -> ResponseRetrievalResult:
+        """Replay or atomically acknowledge an exact encrypted response."""
+        identity = self._identity(client_public_key, request_id)
+        if acknowledgement_token is not None and (
+            not isinstance(acknowledgement_token, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", acknowledgement_token)
+        ):
+            return ResponseRetrievalResult("invalid_acknowledgement")
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now)
+            terminal = self._terminals.get(identity)
+            if terminal is None:
+                return ResponseRetrievalResult("unknown")
+            if terminal.retrieval_state != "response_ready":
+                if (
+                    terminal.retrieval_state == "acknowledged"
+                    and acknowledgement_token is not None
+                    and not hmac.compare_digest(
+                        hashlib.sha256(
+                            acknowledgement_token.encode("ascii")
+                        ).hexdigest(),
+                        terminal.acknowledgement_token_digest,
+                    )
+                ):
+                    return ResponseRetrievalResult("invalid_acknowledgement")
+                return ResponseRetrievalResult(terminal.retrieval_state)
+            response = self._responses.get(identity)
+            if response is None:
+                return ResponseRetrievalResult("retrieval_expired")
+            token = self._acknowledgement_token(
+                identity, terminal.accepted_at_epoch, terminal.response_digest
+            )
+            if acknowledgement_token is None:
+                return ResponseRetrievalResult(
+                    "response_ready",
+                    replace(response.envelope),
+                    token,
+                    response.replay_expires_at_epoch,
+                )
+            supplied_digest = hashlib.sha256(
+                acknowledgement_token.encode("ascii")
+            ).hexdigest()
+            if not hmac.compare_digest(
+                supplied_digest, terminal.acknowledgement_token_digest
+            ):
+                return ResponseRetrievalResult("invalid_acknowledgement")
+            self._responses.pop(identity, None)
+            self._terminals[identity] = replace(
+                terminal, retrieval_state="acknowledged"
+            )
+            return ResponseRetrievalResult("acknowledged")
 
     def response_records(self) -> tuple[ResponseRecord, ...]:
         with self._lock:
@@ -1362,6 +1462,11 @@ class InMemoryRelayStateStore:
         for identity, response in tuple(self._responses.items()):
             if response.replay_expires_at_epoch <= now:
                 del self._responses[identity]
+                terminal = self._terminals.get(identity)
+                if terminal is not None and terminal.retrieval_state == "response_ready":
+                    self._terminals[identity] = replace(
+                        terminal, retrieval_state="retrieval_expired"
+                    )
         for identity, terminal in tuple(self._terminals.items()):
             if terminal.expires_at_epoch <= now:
                 del self._terminals[identity]
@@ -1442,6 +1547,23 @@ class InMemoryRelayStateStore:
             self._identity_digest(client_public_key, b"client\0"),
             self._identity_digest(request_id, b"request\0"),
         )
+
+    def _acknowledgement_token(
+        self, identity: tuple[str, str], accepted_at_epoch: float, response_digest: str
+    ) -> str:
+        """Derive a replica-stable, domain-separated token without persisting it."""
+        fields = (
+            identity[0].encode("ascii"),
+            identity[1].encode("ascii"),
+            accepted_at_epoch.hex().encode("ascii"),
+            response_digest.encode("ascii"),
+        )
+        canonical = b"".join(len(field).to_bytes(4, "big") + field for field in fields)
+        return hmac.new(
+            self._acknowledgement_key,
+            b"token.place/relay-response-ack/v1\0" + canonical,
+            hashlib.sha256,
+        ).hexdigest()
 
     def _identity_digest(self, value: str, domain: bytes) -> str:
         if not isinstance(value, str) or not value:

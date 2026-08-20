@@ -12,6 +12,7 @@ import json
 import math
 import re
 import secrets
+import struct
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -528,6 +529,7 @@ class ResponseRecord:
     accepted_at_epoch: float
     response_digest: str
     replay_expires_at_epoch: float
+    acknowledgement_token_digest: str
     status: str = "response_ready"
 
     def __repr__(self) -> str:
@@ -554,6 +556,8 @@ class TerminalOutcomeRecord:
     accepted_at_epoch: float
     replay_expires_at_epoch: float
     expires_at_epoch: float
+    acknowledgement_token_digest: str
+    retrieval_status: str = "response_ready"
     outcome: str = "completed"
 
     def __repr__(self) -> str:
@@ -562,7 +566,8 @@ class TerminalOutcomeRecord:
             f"generation={self.generation!r}, accepted_at_epoch={self.accepted_at_epoch!r}, "
             f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
             f"expires_at_epoch={self.expires_at_epoch!r}, outcome={self.outcome!r}, "
-            "credentials=<redacted>, response_digest=<redacted>)"
+            f"retrieval_status={self.retrieval_status!r}, credentials=<redacted>, "
+            "response_digest=<redacted>, acknowledgement=<redacted>)"
         )
 
 
@@ -582,6 +587,21 @@ class ResponseAcceptanceResult:
             f"accepted_at_epoch={self.accepted_at_epoch!r}, "
             f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
             f"new_outcome={self.new_outcome!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ResponseRetrievalResult:
+    """Identity-safe replay or acknowledgement result."""
+
+    state: str
+    envelope: EncryptedResponseEnvelope | None = None
+    acknowledgement_token: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"ResponseRetrievalResult(state={self.state!r}, "
+            "envelope=<redacted>, acknowledgement=<redacted>)"
         )
 
 
@@ -657,6 +677,12 @@ class RelayStateStore(Protocol):
         generation: int,
         envelope: EncryptedResponseEnvelope,
     ) -> ResponseAcceptanceResult: ...
+    def retrieve_encrypted_response(
+        self,
+        client_public_key: str,
+        request_id: str,
+        acknowledgement_token: str | None = None,
+    ) -> ResponseRetrievalResult: ...
     def response_records(self) -> tuple[ResponseRecord, ...]: ...
     def terminal_records(self) -> tuple[TerminalOutcomeRecord, ...]: ...
 
@@ -668,9 +694,15 @@ class InMemoryRelayStateStore:
         self,
         config: RelayStateStoreConfig,
         *,
+        acknowledgement_key: bytes,
         epoch_time: Callable[[], float] = time.time,
     ) -> None:
+        if not isinstance(acknowledgement_key, bytes) or len(acknowledgement_key) < 32:
+            raise RelayStateStoreError(
+                "acknowledgement key must be bytes containing at least 256 bits"
+            )
         self._config = config
+        self._acknowledgement_key = acknowledgement_key
         self._epoch_time = epoch_time
         self._records: dict[str, ComputeNodeRegistration] = {}
         self._scheduler_states: dict[str, SchedulerNodeState] = {}
@@ -1309,6 +1341,7 @@ class InMemoryRelayStateStore:
                 now,
                 response_digest,
                 replay_expires,
+                self._acknowledgement_token_digest(identity, now, response_digest),
             )
             terminal = TerminalOutcomeRecord(
                 identity[0],
@@ -1321,11 +1354,59 @@ class InMemoryRelayStateStore:
                 now,
                 replay_expires,
                 terminal_expires,
+                self._acknowledgement_token_digest(identity, now, response_digest),
             )
             self._responses[identity] = response
             self._terminals[identity] = terminal
             self._remove_queued_identity_locked(identity, queued)
             return self._response_result(response, True)
+
+    def retrieve_encrypted_response(
+        self,
+        client_public_key: str,
+        request_id: str,
+        acknowledgement_token: str | None = None,
+    ) -> ResponseRetrievalResult:
+        """Replay ciphertext or atomically acknowledge it without ambiguous mutation."""
+        identity = self._identity(client_public_key, request_id)
+        if acknowledgement_token is not None and (
+            not isinstance(acknowledgement_token, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", acknowledgement_token)
+        ):
+            return ResponseRetrievalResult("invalid_acknowledgement")
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now)
+            terminal = self._terminals.get(identity)
+            if terminal is None:
+                return ResponseRetrievalResult("unknown")
+            token = self._acknowledgement_token(
+                identity, terminal.accepted_at_epoch, terminal.response_digest
+            )
+            valid_token = acknowledgement_token is not None and hmac.compare_digest(
+                hashlib.sha256(acknowledgement_token.encode("ascii")).hexdigest(),
+                terminal.acknowledgement_token_digest,
+            )
+            if terminal.retrieval_status == "acknowledged":
+                return ResponseRetrievalResult(
+                    "acknowledged" if valid_token else "invalid_acknowledgement"
+                )
+            if terminal.retrieval_status == "retrieval_expired":
+                return ResponseRetrievalResult("retrieval_expired")
+            response = self._responses.get(identity)
+            if response is None:
+                return ResponseRetrievalResult("retrieval_expired")
+            if acknowledgement_token is not None:
+                if not valid_token:
+                    return ResponseRetrievalResult("invalid_acknowledgement")
+                self._responses.pop(identity, None)
+                self._terminals[identity] = replace(
+                    terminal, retrieval_status="acknowledged"
+                )
+                return ResponseRetrievalResult("acknowledged")
+            return ResponseRetrievalResult(
+                "response_ready", replace(response.envelope), token
+            )
 
     def response_records(self) -> tuple[ResponseRecord, ...]:
         with self._lock:
@@ -1362,6 +1443,14 @@ class InMemoryRelayStateStore:
         for identity, response in tuple(self._responses.items()):
             if response.replay_expires_at_epoch <= now:
                 del self._responses[identity]
+                terminal = self._terminals.get(identity)
+                if (
+                    terminal is not None
+                    and terminal.retrieval_status == "response_ready"
+                ):
+                    self._terminals[identity] = replace(
+                        terminal, retrieval_status="retrieval_expired"
+                    )
         for identity, terminal in tuple(self._terminals.items()):
             if terminal.expires_at_epoch <= now:
                 del self._terminals[identity]
@@ -1588,6 +1677,31 @@ class InMemoryRelayStateStore:
     def _token_digest(token: str) -> str:
         if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
             raise RelayStateInvalidReservation("reservation invalid")
+        return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+    def _acknowledgement_token(
+        self,
+        identity: tuple[str, str],
+        accepted_at_epoch: float,
+        response_digest: str,
+    ) -> str:
+        message = b"token.place/relay-response-ack/v1\0" + b"\0".join(
+            (identity[0].encode("ascii"), identity[1].encode("ascii"))
+        )
+        message += b"\0" + struct.pack(">d", accepted_at_epoch) + b"\0" + bytes.fromhex(
+            response_digest
+        )
+        return hmac.new(self._acknowledgement_key, message, hashlib.sha256).hexdigest()
+
+    def _acknowledgement_token_digest(
+        self,
+        identity: tuple[str, str],
+        accepted_at_epoch: float,
+        response_digest: str,
+    ) -> str:
+        token = self._acknowledgement_token(
+            identity, accepted_at_epoch, response_digest
+        )
         return hashlib.sha256(token.encode("ascii")).hexdigest()
 
     def _now(self) -> float:

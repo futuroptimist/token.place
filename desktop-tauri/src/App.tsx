@@ -8,6 +8,21 @@ type BackendMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
 type ContextTier = '8k-fast' | '64k-full';
 type Qwen64kBatchProfile = 'safe' | 'balanced' | 'experimental';
 type ApplicationInitializationState = 'pending' | 'ready' | 'failed';
+type OperatorStartDiagnostic = {
+  handler: 'not_entered' | 'entered';
+  invocation: 'not_started' | 'pending' | 'resolved' | 'rejected';
+  nativeEvent: 'none' | 'running_received' | 'running_accepted' | 'running_rejected';
+  polling: 'none' | 'not_running' | 'running_accepted' | 'running_rejected' | 'command_failed';
+  render: 'not_running' | 'running' | 'running_regressed';
+};
+
+const initialOperatorStartDiagnostic: OperatorStartDiagnostic = {
+  handler: 'not_entered',
+  invocation: 'not_started',
+  nativeEvent: 'none',
+  polling: 'none',
+  render: 'not_running',
+};
 
 // Context tiers intentionally use static, duplicated profile constants instead of
 // runtime codegen/manifest loading. Keep these IDs and token counts
@@ -927,6 +942,8 @@ export function App() {
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
   const [isStoppingComputeNode, setIsStoppingComputeNode] = useState(false);
+  const [operatorStartDiagnostic, setOperatorStartDiagnostic] =
+    useState<OperatorStartDiagnostic>(initialOperatorStartDiagnostic);
   const [operatorLogText, setOperatorLogText] = useState('');
   const [isDebugConsoleOpen, setIsDebugConsoleOpen] = useState(false);
   const relayRuntimeState =
@@ -944,6 +961,11 @@ export function App() {
   const computeNodeStartAttemptRef = useRef(0);
   const computeNodeReconciliationTimerRef = useRef<number | null>(null);
   const computeNodePriorSessionRef = useRef<string | null>(null);
+  const operatorRunningRenderedRef = useRef(false);
+
+  const updateOperatorStartDiagnostic = (update: Partial<OperatorStartDiagnostic>) => {
+    setOperatorStartDiagnostic((previous) => ({ ...previous, ...update }));
+  };
 
   const cancelComputeNodeReconciliation = () => {
     computeNodeStartAttemptRef.current += 1;
@@ -959,6 +981,15 @@ export function App() {
       setApplicationInitialization('ready');
     }
   }, [applicationInitializationLoaded]);
+
+  useEffect(() => {
+    if (computeStatus.running) {
+      operatorRunningRenderedRef.current = true;
+      updateOperatorStartDiagnostic({ render: 'running' });
+    } else if (operatorRunningRenderedRef.current) {
+      updateOperatorStartDiagnostic({ render: 'running_regressed' });
+    }
+  }, [computeStatus.running]);
 
   useEffect(() => {
     const initializeApplication = async () => {
@@ -1032,6 +1063,9 @@ export function App() {
         return;
       }
       const previous = computeStatusRef.current;
+      if (payload.running === true) {
+        updateOperatorStartDiagnostic({ nativeEvent: 'running_received' });
+      }
       const next =
         payload.type === 'status' &&
         payload.running === true &&
@@ -1043,7 +1077,15 @@ export function App() {
             )
           : mergeComputeStatusEvent(previous, payload);
       if (next === previous) {
+        if (payload.running === true) {
+          updateOperatorStartDiagnostic({ nativeEvent: 'running_rejected' });
+        }
         return;
+      }
+      if (payload.running === true) {
+        updateOperatorStartDiagnostic({
+          nativeEvent: next.running ? 'running_accepted' : 'running_rejected',
+        });
       }
       if (next.running || payload.type === 'error' || payload.type === 'stopped') {
         cancelComputeNodeReconciliation();
@@ -1197,6 +1239,11 @@ export function App() {
   };
 
   const startComputeNode = async () => {
+    operatorRunningRenderedRef.current = false;
+    setOperatorStartDiagnostic({
+      ...initialOperatorStartDiagnostic,
+      handler: 'entered',
+    });
     cancelComputeNodeReconciliation();
     const startAttempt = computeNodeStartAttemptRef.current + 1;
     computeNodeStartAttemptRef.current = startAttempt;
@@ -1241,6 +1288,7 @@ export function App() {
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
+      updateOperatorStartDiagnostic({ invocation: 'pending' });
       const startPromise = invoke('start_compute_node', {
         request: {
           model_path: config.model_path,
@@ -1264,6 +1312,15 @@ export function App() {
             }
             const previous = computeStatusRef.current;
             const next = mergeAuthoritativeComputeStatus(previous, snapshot, startSessionId);
+            if (snapshot.running !== true) {
+              updateOperatorStartDiagnostic({ polling: 'not_running' });
+            } else {
+              updateOperatorStartDiagnostic({
+                polling: next !== previous && next.running
+                  ? 'running_accepted'
+                  : 'running_rejected',
+              });
+            }
             if (next !== previous) {
               computeStatusRef.current = next;
               setComputeStatus(next);
@@ -1274,6 +1331,9 @@ export function App() {
               return;
             }
           } catch {
+            if (computeNodeStartAttemptRef.current === startAttempt) {
+              updateOperatorStartDiagnostic({ polling: 'command_failed' });
+            }
             // The start command remains authoritative; a later lifecycle-bound
             // poll can still reconcile a missed event without surfacing raw errors.
           }
@@ -1287,11 +1347,15 @@ export function App() {
         await reconcile();
       })();
       await startPromise;
+      if (computeNodeStartAttemptRef.current === startAttempt) {
+        updateOperatorStartDiagnostic({ invocation: 'resolved' });
+      }
     } catch (e) {
       if (computeNodeStartAttemptRef.current !== startAttempt) {
         return;
       }
       cancelComputeNodeReconciliation();
+      updateOperatorStartDiagnostic({ invocation: 'rejected' });
       setIsStartingComputeNode(false);
       const message = formatErrorMessage(e);
       const failedStatus = {
@@ -1390,6 +1454,11 @@ export function App() {
   return (
     <main
       data-application-initialization={applicationInitialization}
+      data-operator-start-handler={operatorStartDiagnostic.handler}
+      data-operator-start-invocation={operatorStartDiagnostic.invocation}
+      data-operator-start-native-event={operatorStartDiagnostic.nativeEvent}
+      data-operator-start-polling={operatorStartDiagnostic.polling}
+      data-operator-start-render={operatorStartDiagnostic.render}
       style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}
     >
       <h1>token.place desktop compute node</h1>

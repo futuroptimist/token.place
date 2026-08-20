@@ -846,7 +846,7 @@ def tauri_driver_command() -> list[str]:
     )
 
 
-WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v4"
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v5"
 WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
 WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
     "read_timeout", "connection_failure", "capability_rejection",
@@ -866,6 +866,44 @@ WEBDRIVER_READINESS_CATEGORIES = frozenset({
     "ready", "no_window_handle", "wrong_handle", "missing_shell",
     "missing_required_controls", "initialization_pending",
     "application_initialization_failed", "webdriver_failure", "unknown"})
+OPERATOR_START_DIAGNOSTIC_ALLOWLISTS = {
+    "start_handler_state": frozenset({"not_entered", "entered"}),
+    "invocation_state": frozenset({"not_started", "pending", "resolved", "rejected"}),
+    "native_event_observation": frozenset({
+        "none", "running_received", "running_accepted", "running_rejected"}),
+    "polling_observation": frozenset({
+        "none", "not_running", "running_accepted", "running_rejected", "command_failed"}),
+    "render_state": frozenset({"not_running", "running", "running_regressed"}),
+}
+OPERATOR_START_DIAGNOSTIC_DEFAULTS = {
+    "start_handler_state": "not_entered",
+    "invocation_state": "not_started",
+    "native_event_observation": "none",
+    "polling_observation": "none",
+    "render_state": "not_running",
+}
+
+
+def _read_operator_start_diagnostic(driver: webdriver.Remote | None) -> dict[str, str]:
+    defaults = OPERATOR_START_DIAGNOSTIC_DEFAULTS.copy()
+    if driver is None:
+        return defaults
+    attributes = {
+        "start_handler_state": "data-operator-start-handler",
+        "invocation_state": "data-operator-start-invocation",
+        "native_event_observation": "data-operator-start-native-event",
+        "polling_observation": "data-operator-start-polling",
+        "render_state": "data-operator-start-render",
+    }
+    try:
+        shell = driver.find_element(By.CSS_SELECTOR, "main[data-operator-start-handler]")
+        return {
+            field: (value if (value := shell.get_attribute(attribute))
+                    in OPERATOR_START_DIAGNOSTIC_ALLOWLISTS[field] else defaults[field])
+            for field, attribute in attributes.items()
+        }
+    except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+        return defaults
 
 
 def _classify_webdriver_session_failure(exc: Exception, process: object) -> tuple[str, str, str]:
@@ -952,7 +990,8 @@ def _write_webdriver_diagnostic(
         compatibility: str, process_state: str, failure_category: str,
         exception_family: str = "unknown", process_posture: str = "unknown",
         session_elapsed_bucket: str = "unknown", target_category: str = "unknown",
-        readiness_category: str = "unknown", operator_progress: str = "not_started") -> None:
+        readiness_category: str = "unknown", operator_progress: str = "not_started",
+        operator_start_diagnostic: dict[str, str] | None = None) -> None:
     """Atomically retain the bounded session diagnostic while raw logs are discarded."""
     if compatibility not in WEBDRIVER_COMPATIBILITY_RESULTS:
         compatibility = "unknown"
@@ -974,6 +1013,12 @@ def _write_webdriver_diagnostic(
             "not_started", "model_input_set", "relay_input_set", "operator_enabled",
             "operator_started", "operator_running", "operator_registered"}:
         operator_progress = "not_started"
+    supplied_start_diagnostic = operator_start_diagnostic or {}
+    safe_start_diagnostic = {
+        field: (value if (value := supplied_start_diagnostic.get(field)) in allowed
+                else OPERATOR_START_DIAGNOSTIC_DEFAULTS[field])
+        for field, allowed in OPERATOR_START_DIAGNOSTIC_ALLOWLISTS.items()
+    }
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
     fd, temporary_name = tempfile.mkstemp(
@@ -992,6 +1037,7 @@ def _write_webdriver_diagnostic(
                 "target_category": target_category,
                 "readiness_category": readiness_category,
                 "operator_progress": operator_progress,
+                **safe_start_diagnostic,
             }, handle, sort_keys=True)
         os.replace(temporary, destination)
     finally:
@@ -1791,11 +1837,13 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             failure_reason = "packaged_runner_failure"
         raise
     finally:
+        operator_start_diagnostic = _read_operator_start_diagnostic(driver)
         _write_webdriver_diagnostic(
             os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
             tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
             webdriver_process_posture, webdriver_session_elapsed_bucket,
-            webdriver_target_category, webdriver_readiness_category, operator_progress)
+            webdriver_target_category, webdriver_readiness_category, operator_progress,
+            operator_start_diagnostic)
         cleanup_deadline = time.monotonic() + cleanup_timeout
         def cleanup_remaining() -> float:
             return max(0.0, cleanup_deadline - time.monotonic())

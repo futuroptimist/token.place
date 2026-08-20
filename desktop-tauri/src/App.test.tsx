@@ -1118,6 +1118,12 @@ describe('desktop app start failure handling', () => {
     });
 
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    await waitFor(() => {
+      const shell = screen.getByRole('main');
+      expect(shell.getAttribute('data-operator-start-handler')).toBe('entered');
+      expect(shell.getAttribute('data-operator-start-native-event')).toBe('running_accepted');
+      expect(shell.getAttribute('data-operator-start-render')).toBe('running');
+    });
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
     expect(screen.getByText(/Worker state:/).textContent).toContain('starting');
 
@@ -1159,7 +1165,7 @@ describe('desktop app start failure handling', () => {
     computeHandler?.({
       payload: {
         type: 'status',
-        running: false,
+        running: true,
         registered: false,
         operator_session_id: 'attached-bridge-session',
         sequence: 2,
@@ -1168,6 +1174,11 @@ describe('desktop app start failure handling', () => {
 
     expect(screen.getByText(/Running:/).textContent).toContain('yes');
     expect(screen.getByText(/Registered:/).textContent).toContain('yes');
+    await waitFor(() => {
+      const shell = screen.getByRole('main');
+      expect(shell.getAttribute('data-operator-start-native-event')).toBe('running_rejected');
+      expect(shell.getAttribute('data-operator-start-render')).toBe('running');
+    });
   });
 
   it('reconciles authoritative running state when the running event is missed', async () => {
@@ -1215,6 +1226,12 @@ describe('desktop app start failure handling', () => {
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
 
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    await waitFor(() => {
+      const shell = screen.getByRole('main');
+      expect(shell.getAttribute('data-operator-start-invocation')).toBe('pending');
+      expect(shell.getAttribute('data-operator-start-polling')).toBe('running_accepted');
+      expect(shell.getAttribute('data-operator-start-render')).toBe('running');
+    });
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
     expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
   });
@@ -1246,6 +1263,53 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     expect(screen.getByText(/Operator session ID:/).textContent).toContain('existing-session');
     expect(statusCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  it('diagnoses a rejected polling snapshot before accepting the active session', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve(statusCalls < 4 ? {
+          running: statusCalls === 3,
+          registered: false,
+          operator_session_id: 'previous-session',
+          sequence: statusCalls === 1 ? 8 : statusCalls === 2 ? 9 : 7,
+        } : {
+          running: true,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: 0,
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    expect(screen.getByRole('main').getAttribute('data-operator-start-polling')).toBe('not_running');
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(screen.getByRole('main').getAttribute('data-operator-start-polling')).toBe('running_rejected');
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(screen.getByRole('main').getAttribute('data-operator-start-polling')).toBe('running_accepted');
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    vi.useRealTimers();
   });
 
   it('accepts an authoritative running snapshot that completes a partial event sequence', async () => {
@@ -1357,6 +1421,7 @@ describe('desktop app start failure handling', () => {
     vi.useFakeTimers();
     fireEvent.click(startOperatorButton);
     await act(async () => rejectStart(new Error('start failed')));
+    expect(screen.getByRole('main').getAttribute('data-operator-start-invocation')).toBe('rejected');
     const callsAfterFailure = statusCalls;
 
     await act(async () => {

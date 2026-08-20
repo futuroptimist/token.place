@@ -413,7 +413,9 @@ async fn start_compute_node(
     request: ComputeNodeRequest,
 ) -> Result<(), String> {
     let compute_state = state.compute_node.clone();
-    tokio::spawn(async move {
+    // This task must outlive the IPC command future that acknowledges Start.
+    // Use Tauri's application runtime rather than the command's Tokio context.
+    spawn_compute_node_start_task(async move {
         if let Err(err) =
             compute_node::start_compute_node(app.clone(), compute_state.clone(), request).await
         {
@@ -453,6 +455,10 @@ async fn start_compute_node(
         }
     });
     Ok(())
+}
+
+fn spawn_compute_node_start_task(task: impl std::future::Future<Output = ()> + Send + 'static) {
+    tauri::async_runtime::spawn(task);
 }
 
 #[tauri::command]
@@ -776,6 +782,19 @@ fn main() {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn compute_node_start_task_outlives_the_command_wrapper() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        spawn_compute_node_start_task(async move {
+            sender.send(()).expect("signal task execution");
+        });
+
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Tauri runtime should execute the detached start task");
+    }
 
     fn std_command_env_value(command: &std::process::Command, key: &str) -> Option<String> {
         command

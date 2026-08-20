@@ -206,6 +206,229 @@ def test_authenticated_cancellation_and_owner_bound_acknowledgement(
         accept_response(store, claim)
 
 
+def test_live_claim_control_read_renews_without_creating_tombstone(
+    store_factory, capabilities
+):
+    store, clock = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+
+    clock.value += 1
+    result = store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+    )
+
+    assert result.state == "continued"
+    assert result.lease_expires_at_epoch == clock.value + 10
+    assert store.control_tombstones() == ()
+
+
+@pytest.mark.parametrize("status", ["cancelled", "expired"])
+def test_claim_control_is_owner_bound_and_acknowledgement_is_idempotent(
+    store_factory, capabilities, status
+):
+    store, clock = registered_store(store_factory, capabilities)
+    deadline = clock.value + 5
+    claim = claimed_work(store, request_deadline_epoch=deadline)
+    if status == "cancelled":
+        store.cancel_or_expire_request(
+            "client-key", "request-a", "cancel-proof-request-a"
+        )
+        reason = "requester_cancelled"
+    else:
+        clock.value = deadline
+        store.terminal_records()
+        reason = "request_deadline_expired"
+
+    arguments = (
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+    )
+    read = store.renew_claim_or_read_control(*arguments)
+    terminal = store.terminal_records()
+    first = store.renew_claim_or_read_control(*arguments, acknowledge=True)
+    duplicate = store.renew_claim_or_read_control(*arguments, acknowledge=True)
+
+    assert (read.state, read.reason, read.acknowledged) == (status, reason, False)
+    assert first == duplicate
+    assert (first.state, first.reason, first.acknowledged) == (
+        "acknowledged",
+        reason,
+        True,
+    )
+    assert len(store.control_tombstones()) == 1
+    assert store.control_tombstones()[0].acknowledged
+    assert store.terminal_records() == terminal
+
+
+@pytest.mark.parametrize("acknowledge", [False, True])
+@pytest.mark.parametrize(
+    "argument,invalid_value",
+    [
+        ("node_id", "node-b"),
+        ("control_credential_digest", digest("wrong-owner")),
+        ("consumer_identity", "wrong-worker"),
+        ("client_public_key", "wrong-client"),
+        ("request_id", "wrong-request"),
+        ("generation", 999),
+    ],
+)
+def test_control_reads_reject_every_mismatched_binding_without_mutation(
+    store_factory, capabilities, acknowledge, argument, invalid_value
+):
+    store, _ = registered_store(store_factory, capabilities)
+    controlled = claimed_work(store)
+    live = claimed_work(store, "request-live", consumer="worker-live")
+    store.register("node-b", capabilities, digest("node-b-owner"))
+    store.cancel_or_expire_request("client-key", "request-a", "cancel-proof-request-a")
+    values = {
+        "node_id": "node-a",
+        "control_credential_digest": digest("owner"),
+        "consumer_identity": "worker-a",
+        "client_public_key": "client-key",
+        "request_id": "request-a",
+        "generation": controlled.generation,
+    }
+    values[argument] = invalid_value
+    before = lifecycle_snapshot(store)
+
+    result = store.renew_claim_or_read_control(**values, acknowledge=acknowledge)
+
+    assert result.state not in {"cancelled", "expired", "acknowledged"}
+    assert lifecycle_snapshot(store) == before
+    assert store.active_claims("node-a")[0].generation == live.generation
+
+
+@pytest.mark.parametrize("limit", ["global", "per_node"])
+def test_control_tombstone_bounds_fail_atomically(store_factory, capabilities, limit):
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        max_control_tombstones=1 if limit == "global" else 2,
+        max_control_tombstones_per_node=1,
+    )
+    first = claimed_work(store, "first")
+    if limit == "global":
+        store.register("node-b", capabilities, digest("owner-b"))
+        selection = reserve(store, "second")
+        enqueue(store, selection, "second")
+        second = store.claim_queued_request("node-b", digest("owner-b"), "worker-b")
+        second_node = "node-b"
+    else:
+        second = claimed_work(store, "second", consumer="worker-b")
+        second_node = "node-a"
+    store.cancel_or_expire_request("client-key", "first", "cancel-proof-first")
+    before = (
+        store.list_reservations(),
+        store.queued_requests(second_node),
+        store.active_claims(second_node),
+        store.terminal_records(),
+        store.control_tombstones(),
+    )
+
+    with pytest.raises(RelayStateCapacityExceeded, match="control tombstone"):
+        store.cancel_or_expire_request("client-key", "second", "cancel-proof-second")
+
+    assert before == (
+        store.list_reservations(),
+        store.queued_requests(second_node),
+        store.active_claims(second_node),
+        store.terminal_records(),
+        store.control_tombstones(),
+    )
+    assert first.generation < second.generation
+
+
+@pytest.mark.parametrize("status", ["cancelled", "expired"])
+def test_control_expiry_and_node_reuse_fence_stale_claim_authority(
+    store_factory, capabilities, status
+):
+    store, clock = registered_store(
+        store_factory,
+        capabilities,
+        response_replay_ttl_seconds=1,
+        terminal_retention_seconds=10,
+        control_tombstone_ttl_seconds=2,
+    )
+    deadline = clock.value + 1
+    claim = claimed_work(store, request_deadline_epoch=deadline)
+    if status == "cancelled":
+        store.cancel_or_expire_request(
+            "client-key", "request-a", "cancel-proof-request-a"
+        )
+    else:
+        clock.value = deadline
+        store.terminal_records()
+    terminal = store.terminal_records()
+    tombstone_expiry = store.control_tombstones()[0].expires_at_epoch
+
+    assert store.unregister("node-a", digest("owner"))
+    store.register("node-a", capabilities, digest("replacement-owner"))
+    for credential in (digest("owner"), digest("replacement-owner")):
+        result = store.renew_claim_or_read_control(
+            "node-a",
+            credential,
+            "worker-a",
+            "client-key",
+            "request-a",
+            claim.generation,
+            acknowledge=True,
+        )
+        assert result.state == "owner_mismatch"
+        with pytest.raises(RelayStateConflict):
+            accept_response(store, claim, control_credential_digest=credential)
+
+    clock.value = tombstone_expiry
+    assert store.control_tombstones() == ()
+    assert store.terminal_records() == terminal
+    assert store.renew_claim_or_read_control(
+        "node-a",
+        digest("replacement-owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+    ).state in {"missing_or_expired", "stale_generation"}
+    with pytest.raises(RelayStateConflict):
+        accept_response(
+            store, claim, control_credential_digest=digest("replacement-owner")
+        )
+
+
+def test_control_tombstone_reads_are_defensive_and_fully_redacted(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claimed_work(store)
+    store.cancel_or_expire_request("client-key", "request-a", "cancel-proof-request-a")
+
+    first = store.control_tombstones()[0]
+    second = store.control_tombstones()[0]
+    rendered = repr(first)
+
+    assert first is not second
+    with pytest.raises(FrozenInstanceError):
+        first.acknowledged = True
+    for secret in (
+        "owner",
+        "worker-a",
+        "client-key",
+        "request-a",
+        "node-a",
+        "ciphertext",
+        "cancel-proof-request-a",
+    ):
+        assert secret not in rendered
+
+
 @pytest.mark.parametrize("stage", ["reserved", "queued", "claimed"])
 def test_omitted_cancellation_proof_is_fixed_and_non_mutating(
     store_factory, capabilities, stage
@@ -255,9 +478,7 @@ def test_cancellation_of_expired_claim_does_not_consume_tombstone_capacity(
     claimed_work(store, "stale")
     clock.value += 10
 
-    result = store.cancel_or_expire_request(
-        "client-key", "stale", "cancel-proof-stale"
-    )
+    result = store.cancel_or_expire_request("client-key", "stale", "cancel-proof-stale")
 
     assert result.new_outcome
     assert len(store.control_tombstones()) == 1
@@ -265,16 +486,12 @@ def test_cancellation_of_expired_claim_does_not_consume_tombstone_capacity(
     assert store.active_claims("node-a") == ()
 
 
-@pytest.mark.parametrize(
-    "deadline_offset,expected_tombstones", [(100, 0), (5, 1)]
-)
+@pytest.mark.parametrize("deadline_offset,expected_tombstones", [(100, 0), (5, 1)])
 def test_deadline_expiry_only_controls_claims_owned_through_inclusive_deadline(
     store_factory, capabilities, deadline_offset, expected_tombstones
 ):
     store, clock = registered_store(store_factory, capabilities)
-    claim = claimed_work(
-        store, request_deadline_epoch=clock.value + deadline_offset
-    )
+    claim = claimed_work(store, request_deadline_epoch=clock.value + deadline_offset)
     clock.value = claim.request_deadline_epoch
 
     assert store.terminal_records()[0].outcome == "expired"
@@ -373,9 +590,7 @@ def test_deadline_expiry_terminalizes_each_stage_once_and_releases_capacity(
     )
     assert lifecycle_snapshot(store) == terminal_snapshot
 
-    replacement = reserve(
-        store, "replacement", request_deadline_epoch=clock.value + 10
-    )
+    replacement = reserve(store, "replacement", request_deadline_epoch=clock.value + 10)
     assert replacement.created
     with pytest.raises(RelayStateNoCapacity):
         reserve(store, "over-capacity", request_deadline_epoch=clock.value + 10)
@@ -476,17 +691,21 @@ def test_full_retention_defers_deadline_without_wedging_or_losing_claim(
     # neither exposed nor reclaimable and node expiry preserves its claim.
     assert store.queued_requests("node-a") == ()
     store.register("node-b", capabilities, digest("node-b"))
-    assert store.claim_queued_request(
-        "node-b", digest("node-b"), "other-worker"
-    ).state == "empty"
-    assert store.renew_claim_or_read_control(
-        "node-a",
-        digest("owner"),
-        "worker-a",
-        "client-key",
-        due.request_id,
-        due.generation,
-    ).state == "owner_mismatch"
+    assert (
+        store.claim_queued_request("node-b", digest("node-b"), "other-worker").state
+        == "empty"
+    )
+    assert (
+        store.renew_claim_or_read_control(
+            "node-a",
+            digest("owner"),
+            "worker-a",
+            "client-key",
+            due.request_id,
+            due.generation,
+        ).state
+        == "owner_mismatch"
+    )
     assert len(store.terminal_records()) == 1
 
     clock.value += 4
@@ -2198,9 +2417,7 @@ def test_node_teardown_removes_queued_work(store_factory, capabilities, teardown
 
     assert store.queued_requests("node-a") == ()
     store.register("node-a", capabilities, digest("replacement"))
-    replacement = reserve(
-        store, cancellation_token="replacement-cancellation-proof"
-    )
+    replacement = reserve(store, cancellation_token="replacement-cancellation-proof")
     assert replacement.selected_node_id == "node-a"
     assert enqueue(
         store,
@@ -2225,9 +2442,7 @@ def test_node_teardown_removes_reserved_cancellation_proof(
         assert store.expire()
 
     store.register("node-a", capabilities, digest("replacement"))
-    replacement = reserve(
-        store, cancellation_token="replacement-cancellation-proof"
-    )
+    replacement = reserve(store, cancellation_token="replacement-cancellation-proof")
     assert enqueue(
         store,
         replacement,
@@ -2594,9 +2809,7 @@ def test_observable_control_tombstone_always_has_terminal_outcome(
         control_tombstone_ttl_seconds=5,
     )
     claimed_work(store)
-    store.cancel_or_expire_request(
-        "client-key", "request-a", "cancel-proof-request-a"
-    )
+    store.cancel_or_expire_request("client-key", "request-a", "cancel-proof-request-a")
 
     clock.value += 4
     tombstones = store.control_tombstones()

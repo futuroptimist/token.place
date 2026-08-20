@@ -1363,7 +1363,12 @@ class InMemoryRelayStateStore:
             tombstone = self._control_tombstones.get(identity)
             if tombstone is not None:
                 if not (
-                    tombstone.selected_node_id == node_id
+                    registration is not None
+                    and hmac.compare_digest(
+                        registration.control_credential_digest,
+                        control_credential_digest,
+                    )
+                    and tombstone.selected_node_id == node_id
                     and tombstone.generation == generation
                     and hmac.compare_digest(
                         tombstone.control_credential_digest, control_credential_digest

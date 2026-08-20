@@ -1090,7 +1090,14 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
   });
 
-  it('shows the attached bridge as running before its startup event arrives', async () => {
+  it('accepts the native running status before later startup and registration events', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      operator_session_id: 'previous-session',
+      sequence: 8,
+    });
+
     render(<App />);
     const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
     await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
@@ -1113,6 +1120,54 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
     expect(screen.getByText(/Registered:/).textContent).toContain('no');
     expect(screen.getByText(/Worker state:/).textContent).toContain('starting');
+
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        operator_session_id: 'attached-bridge-session',
+        sequence: 1,
+        worker_state: 'starting',
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        operator_session_id: 'attached-bridge-session',
+        sequence: 2,
+        worker_state: 'ready',
+        relay_runtime_state: 'ready',
+        warm_load_state: 'ready',
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Worker state:/).textContent).toContain('ready');
+
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        operator_session_id: 'previous-session',
+        sequence: 9,
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: false,
+        registered: false,
+        operator_session_id: 'attached-bridge-session',
+        sequence: 2,
+      },
+    });
+
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(screen.getByText(/Registered:/).textContent).toContain('yes');
   });
 
   it('reconciles authoritative running state when the running event is missed', async () => {

@@ -1032,11 +1032,20 @@ export function App() {
         return;
       }
       const previous = computeStatusRef.current;
-      const next = mergeComputeStatusEvent(previous, payload);
+      const next =
+        payload.type === 'status' &&
+        payload.running === true &&
+        computeNodePriorSessionRef.current !== null
+          ? mergeAuthoritativeComputeStatus(
+              previous,
+              payload,
+              computeNodePriorSessionRef.current
+            )
+          : mergeComputeStatusEvent(previous, payload);
       if (next === previous) {
         return;
       }
-      if (payload.type === 'error' || payload.type === 'stopped') {
+      if (next.running || payload.type === 'error' || payload.type === 'stopped') {
         cancelComputeNodeReconciliation();
       }
       computeStatusRef.current = next;

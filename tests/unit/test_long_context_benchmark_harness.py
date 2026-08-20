@@ -56,6 +56,7 @@ def desktop_runner():
         "WEBDRIVER_TARGET_CATEGORIES", "WEBDRIVER_READINESS_CATEGORIES",
         "OPERATOR_START_DIAGNOSTIC_ALLOWLISTS",
         "OPERATOR_START_DIAGNOSTIC_DEFAULTS",
+        "NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS", "NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS",
     }
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
@@ -71,7 +72,7 @@ def desktop_runner():
         "wait_for_post_start_operator_state",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
-        "_read_operator_start_diagnostic",
+        "_read_operator_start_diagnostic", "_read_native_startup_diagnostic",
         "_contains_private_input", "_packaged_boundary_failure_diagnostics",
         "run_packaged_windows_tokenizer_boundary", "main"}
     functions = [node for node in tree.body
@@ -105,7 +106,7 @@ def desktop_runner():
         "InvalidArgumentException": InvalidArgumentException,
         "ReadTimeoutError": ReadTimeoutError, "ConnectTimeoutError": ConnectTimeoutError,
         "NewConnectionError": NewConnectionError, "ProtocolError": ProtocolError,
-        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v5",
+        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v6",
         "WEBDRIVER_COMPATIBILITY_RESULTS": frozenset({"match", "mismatch", "unknown"}),
         "WEBDRIVER_EXCEPTION_FAMILIES": frozenset({"read_timeout", "connection_failure",
             "capability_rejection", "driver_version_mismatch", "application_startup_failure",
@@ -806,7 +807,7 @@ def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
         "C:\\private\\target", "SECRET_READINESS")
     artifact = tmp_path / "packaged-webdriver-diagnostic.json"
     assert json.loads(artifact.read_text()) == {
-        "schema_version": "packaged-webdriver-diagnostic-v5",
+        "schema_version": "packaged-webdriver-diagnostic-v6",
         "browser_driver_compatibility": "unknown",
         "tauri_driver_state": "unknown",
         "webdriver_failure_category": "webdriver_session_creation_failed",
@@ -821,6 +822,9 @@ def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
         "native_event_observation": "none",
         "polling_observation": "none",
         "render_state": "not_running",
+        "native_startup_phase": "not_started",
+        "native_startup_outcome": "not_started",
+        "native_startup_failure_category": "none",
     }
     assert not list(tmp_path.glob("*.tmp"))
     assert "private" not in artifact.read_text()
@@ -838,7 +842,7 @@ def test_webdriver_diagnostic_clamps_invalid_v3_enums(desktop_runner, tmp_path):
     artifact = json.loads(
         (tmp_path / "packaged-webdriver-diagnostic.json").read_text())
     assert artifact == {
-        "schema_version": "packaged-webdriver-diagnostic-v5",
+        "schema_version": "packaged-webdriver-diagnostic-v6",
         "browser_driver_compatibility": "match",
         "tauri_driver_state": "running",
         "webdriver_failure_category": "none",
@@ -853,6 +857,9 @@ def test_webdriver_diagnostic_clamps_invalid_v3_enums(desktop_runner, tmp_path):
         "native_event_observation": "none",
         "polling_observation": "none",
         "render_state": "not_running",
+        "native_startup_phase": "not_started",
+        "native_startup_outcome": "not_started",
+        "native_startup_failure_category": "none",
     }
     assert "private" not in json.dumps(artifact)
     assert "SENTINEL" not in json.dumps(artifact)
@@ -898,6 +905,49 @@ def test_operator_start_diagnostic_collects_only_allowlisted_dom_values(desktop_
         "polling_observation": "none",
         "render_state": "not_running",
     }
+
+
+def test_native_startup_diagnostic_collects_and_clamps_fixed_values(desktop_runner):
+    values = {
+        "data-native-startup-phase": "running_status_publication",
+        "data-native-startup-outcome": "publication_suppressed",
+        "data-native-startup-failure": "none",
+    }
+    shell = SimpleNamespace(get_attribute=lambda name: values[name])
+    driver = SimpleNamespace(find_element=lambda *_args: shell)
+
+    assert desktop_runner._read_native_startup_diagnostic(driver) == {
+        "native_startup_phase": "running_status_publication",
+        "native_startup_outcome": "publication_suppressed",
+        "native_startup_failure_category": "none",
+    }
+
+    hostile = "C:\\private\\model.gguf prompt SECRET raw exception"
+    values.update({name: hostile for name in values})
+    assert desktop_runner._read_native_startup_diagnostic(driver) == {
+        "native_startup_phase": "not_started",
+        "native_startup_outcome": "not_started",
+        "native_startup_failure_category": "none",
+    }
+
+
+def test_native_startup_diagnostic_is_preserved_without_private_data(desktop_runner, tmp_path):
+    desktop_runner.LOGS_DIR = tmp_path
+    desktop_runner._write_webdriver_diagnostic(
+        "match", "running", "operator_running_not_reached",
+        native_startup_diagnostic={
+            "native_startup_phase": "startup_task_failed",
+            "native_startup_outcome": "failed",
+            "native_startup_failure_category": "child_spawn_failed",
+            "private": "C:\\private\\model.gguf prompt SECRET raw exception",
+        })
+    artifact_text = (tmp_path / "packaged-webdriver-diagnostic.json").read_text()
+    artifact = json.loads(artifact_text)
+    assert artifact["native_startup_phase"] == "startup_task_failed"
+    assert artifact["native_startup_outcome"] == "failed"
+    assert artifact["native_startup_failure_category"] == "child_spawn_failed"
+    assert "private" not in artifact_text
+    assert "SECRET" not in artifact_text
 
 
 def test_operator_start_diagnostic_is_preserved_in_failure_artifact(desktop_runner, tmp_path):
@@ -3582,6 +3632,7 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
         "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
         "_write_webdriver_diagnostic": lambda *_args: None,
         "_read_operator_start_diagnostic": lambda _driver: {},
+        "_read_native_startup_diagnostic": lambda _driver: {},
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
         namespace)
@@ -3703,6 +3754,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "_classify_webdriver_session_failure": lambda _exc, _process: (
             "webdriver_session_creation_failed", "running", "unknown"),
             "_write_webdriver_diagnostic": lambda *args: diagnostics.append(args),
+            "_read_native_startup_diagnostic": lambda _driver: {},
             "_read_operator_start_diagnostic": lambda _driver: {
                 "start_handler_state": "entered", "invocation_state": "resolved",
                 "native_event_observation": "running_rejected",
@@ -3756,8 +3808,8 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     assert checkpoints[-1]["last_safe_phase"] == expected_phase
     assert checkpoints[-1]["failure_reason"] == expected_reason
     assert checkpoints[-1]["cleanup_succeeded"] is True
-    assert diagnostics[-1][-2] == expected_progress
-    assert diagnostics[-1][-1]["start_handler_state"] == "entered"
+    assert diagnostics[-1][-3] == expected_progress
+    assert diagnostics[-1][-2]["start_handler_state"] == "entered"
     assert len(start_calls) == (
         0 if command_error or gate_error or launch_error or devtools_error else 1)
     if not command_error and not gate_error and not launch_error:
@@ -3797,6 +3849,7 @@ def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):
         "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
         "_write_webdriver_diagnostic": lambda *_args: None,
         "_read_operator_start_diagnostic": lambda _driver: {},
+        "_read_native_startup_diagnostic": lambda _driver: {},
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
         namespace)
@@ -3840,6 +3893,7 @@ def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowanc
             "webdriver_session_creation_failed", "running"),
         "_write_webdriver_diagnostic": lambda *_args: None,
         "_read_operator_start_diagnostic": lambda _driver: {},
+        "_read_native_startup_diagnostic": lambda _driver: {},
         "psutil": __import__("psutil"), "sys": sys,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
@@ -3922,6 +3976,7 @@ def test_packaged_runner_log_close_failure_preserves_primary_and_finishes_cleanu
         "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
         "_write_webdriver_diagnostic": lambda *_args: None,
         "_read_operator_start_diagnostic": lambda _driver: {},
+        "_read_native_startup_diagnostic": lambda _driver: {},
         "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
         "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
         "OwnedProcessTreeMemorySampler": lambda _pid: object(),

@@ -159,6 +159,9 @@ function safeReadinessDiagnosticValue(value: unknown): string | number | boolean
 }
 
 interface ComputeNodeStatus {
+  native_startup_phase: string;
+  native_startup_outcome: string;
+  native_startup_failure_category: string;
   running: boolean;
   registered: boolean;
   active_relay_url: string;
@@ -228,6 +231,9 @@ interface SidecarEvent {
 }
 
 const defaultComputeStatus: ComputeNodeStatus = {
+  native_startup_phase: 'not_started',
+  native_startup_outcome: 'not_started',
+  native_startup_failure_category: 'none',
   running: false,
   registered: false,
   active_relay_url: '',
@@ -277,6 +283,16 @@ const defaultComputeStatus: ComputeNodeStatus = {
   launcher_source: null,
   interpreter_basename: null,
 };
+
+const nativeStartupDiagnosticAllowlists = {
+  phase: new Set(['not_started', 'session_reserved', 'bridge_launch_prepared', 'command_constructed', 'child_spawn_attempted', 'child_spawn_completed', 'stdio_acquired', 'bridge_attached', 'running_status_publication', 'startup_task_failed']),
+  outcome: new Set(['not_started', 'pending', 'accepted', 'launcher_validated', 'attempted', 'completed', 'running', 'stopping', 'superseded', 'publication_accepted', 'publication_suppressed', 'failed']),
+  failure: new Set(['none', 'bridge_preparation_failed', 'command_construction_failed', 'launcher_validation_failed', 'child_spawn_failed', 'stdio_acquisition_failed', 'bridge_attachment_failed', 'startup_task_failed']),
+};
+
+function boundedNativeStartupValue(value: string | null | undefined, allowed: Set<string>, fallback: string): string {
+  return value && allowed.has(value) ? value : fallback;
+}
 
 type NormalizedDesktopError = { message: string; code: string | null; disablesPythonBridge: boolean };
 
@@ -1454,6 +1470,9 @@ export function App() {
   return (
     <main
       data-application-initialization={applicationInitialization}
+      data-native-startup-phase={boundedNativeStartupValue(computeStatus.native_startup_phase, nativeStartupDiagnosticAllowlists.phase, 'not_started')}
+      data-native-startup-outcome={boundedNativeStartupValue(computeStatus.native_startup_outcome, nativeStartupDiagnosticAllowlists.outcome, 'not_started')}
+      data-native-startup-failure={boundedNativeStartupValue(computeStatus.native_startup_failure_category, nativeStartupDiagnosticAllowlists.failure, 'none')}
       data-operator-start-handler={operatorStartDiagnostic.handler}
       data-operator-start-invocation={operatorStartDiagnostic.invocation}
       data-operator-start-native-event={operatorStartDiagnostic.nativeEvent}

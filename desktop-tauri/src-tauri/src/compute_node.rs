@@ -282,8 +282,62 @@ const OPERATOR_PREFLIGHT_CPU_SMOKE_EVENT_TIMEOUT: Duration = Duration::from_secs
 const OPERATOR_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 const OPERATOR_PREFLIGHT_EVENT_MAX_BYTES: usize = 2048;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeStartupPhase {
+    #[default]
+    NotStarted,
+    SessionReserved,
+    BridgeLaunchPrepared,
+    CommandConstructed,
+    ChildSpawnAttempted,
+    ChildSpawnCompleted,
+    StdioAcquired,
+    BridgeAttached,
+    RunningStatusPublication,
+    StartupTaskFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeStartupOutcome {
+    #[default]
+    NotStarted,
+    Pending,
+    Accepted,
+    LauncherValidated,
+    Attempted,
+    Completed,
+    Running,
+    Stopping,
+    Superseded,
+    PublicationAccepted,
+    PublicationSuppressed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeStartupFailureCategory {
+    #[default]
+    None,
+    BridgePreparationFailed,
+    CommandConstructionFailed,
+    LauncherValidationFailed,
+    ChildSpawnFailed,
+    StdioAcquisitionFailed,
+    BridgeAttachmentFailed,
+    StartupTaskFailed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComputeNodeStatus {
+    #[serde(default)]
+    pub native_startup_phase: NativeStartupPhase,
+    #[serde(default)]
+    pub native_startup_outcome: NativeStartupOutcome,
+    #[serde(default)]
+    pub native_startup_failure_category: NativeStartupFailureCategory,
     pub running: bool,
     pub registered: bool,
     pub active_relay_url: String,
@@ -444,6 +498,9 @@ async fn reserve_starting_bridge_process_for_session(
     *stdin_slot = None;
     *process = Some(BridgeProcessRecord::new(session_id.to_string(), None, None));
     status.operator_session_id = Some(session_id.to_string());
+    status.native_startup_phase = NativeStartupPhase::SessionReserved;
+    status.native_startup_outcome = NativeStartupOutcome::Accepted;
+    status.native_startup_failure_category = NativeStartupFailureCategory::None;
     status.log_file_path = None;
     status.last_error = None;
     status.updated_at_ms = Some(current_time_ms());
@@ -455,6 +512,22 @@ async fn reserve_starting_bridge_process_for_session(
     status.stop_cleanup_warning = None;
     *ack = None;
     Ok(())
+}
+
+async fn record_native_startup_state(
+    state: &ComputeNodeState,
+    session_id: &str,
+    phase: NativeStartupPhase,
+    outcome: NativeStartupOutcome,
+    failure_category: NativeStartupFailureCategory,
+) {
+    let mut status = state.status.lock().await;
+    if status.operator_session_id.as_deref() == Some(session_id) {
+        status.native_startup_phase = phase;
+        status.native_startup_outcome = outcome;
+        status.native_startup_failure_category = failure_category;
+        status.updated_at_ms = Some(current_time_ms());
+    }
 }
 
 struct StopSessionSnapshot {
@@ -561,7 +634,7 @@ async fn attach_spawned_bridge_process_for_session(
 async fn publish_running_if_bridge_record_still_running(
     state: &ComputeNodeState,
     session_id: &str,
-    status: ComputeNodeStatus,
+    mut status: ComputeNodeStatus,
 ) -> bool {
     // Serialize phase validation with the public Running write. Stop uses the
     // same bridge_process -> status order when finalizing, so a Stop transition
@@ -570,14 +643,18 @@ async fn publish_running_if_bridge_record_still_running(
     let still_running = process.as_ref().is_some_and(|record| {
         record.session_id == session_id && record.phase == BridgeProcessPhase::Running
     });
-    if !still_running {
-        return false;
-    }
-
     let mut current_status = state.status.lock().await;
-    if current_status.operator_session_id.as_deref() != Some(session_id) {
+    if !still_running || current_status.operator_session_id.as_deref() != Some(session_id) {
+        if current_status.operator_session_id.as_deref() == Some(session_id) {
+            current_status.native_startup_phase = NativeStartupPhase::RunningStatusPublication;
+            current_status.native_startup_outcome = NativeStartupOutcome::PublicationSuppressed;
+            current_status.native_startup_failure_category = NativeStartupFailureCategory::None;
+        }
         return false;
     }
+    status.native_startup_phase = NativeStartupPhase::RunningStatusPublication;
+    status.native_startup_outcome = NativeStartupOutcome::PublicationAccepted;
+    status.native_startup_failure_category = NativeStartupFailureCategory::None;
     *current_status = status;
     true
 }
@@ -1002,9 +1079,13 @@ fn startup_failure_status(
     last_error: String,
     operator_session_id: Option<String>,
     log_file_path: Option<String>,
+    failure_category: NativeStartupFailureCategory,
 ) -> ComputeNodeStatus {
     let build_identity = crate::build_identity::build_identity();
     ComputeNodeStatus {
+        native_startup_phase: NativeStartupPhase::StartupTaskFailed,
+        native_startup_outcome: NativeStartupOutcome::Failed,
+        native_startup_failure_category: failure_category,
         running: false,
         registered: false,
         active_relay_url: normalized_request_relay_urls(request)
@@ -1072,6 +1153,14 @@ async fn complete_no_child_startup_failure(
     code: &str,
     category: &str,
 ) {
+    let native_failure_category = match code {
+        "bridge_command_build_failed" => NativeStartupFailureCategory::CommandConstructionFailed,
+        "packaged_launcher_source_invalid" => {
+            NativeStartupFailureCategory::LauncherValidationFailed
+        }
+        "bridge_child_spawn_failed" => NativeStartupFailureCategory::ChildSpawnFailed,
+        _ => NativeStartupFailureCategory::BridgePreparationFailed,
+    };
     if let Some(path) = log_file_path.as_deref() {
         let line = format!(
             "desktop.compute_node.startup_failure stage={} code={} category={}",
@@ -1095,6 +1184,7 @@ async fn complete_no_child_startup_failure(
                 last_error,
                 Some(session_id.to_string()),
                 log_file_path,
+                native_failure_category,
             );
             failure_status.stop_cleanup_required = Some(false);
             failure_status.stop_cleanup_attempted = Some(false);
@@ -1165,6 +1255,10 @@ async fn complete_spawned_bridge_startup_failure(
             status.stop_cleanup_outcome = Some(outcome.into());
             status.stop_cleanup_warning = Some(warning.clone());
             status.updated_at_ms = Some(current_time_ms());
+            status.native_startup_phase = NativeStartupPhase::StartupTaskFailed;
+            status.native_startup_outcome = NativeStartupOutcome::Failed;
+            status.native_startup_failure_category =
+                NativeStartupFailureCategory::StdioAcquisitionFailed;
         }
         if let Some(record) = process
             .as_mut()
@@ -2710,6 +2804,14 @@ pub async fn start_compute_node(
             return Err(err.into());
         }
     };
+    record_native_startup_state(
+        &state,
+        &session_id,
+        NativeStartupPhase::BridgeLaunchPrepared,
+        NativeStartupOutcome::Accepted,
+        NativeStartupFailureCategory::None,
+    )
+    .await;
     let mut bridge_command = match preparation.command() {
         Ok(command) => command,
         Err(err) => {
@@ -2773,6 +2875,14 @@ pub async fn start_compute_node(
         .await;
         return Err(err.into());
     }
+    record_native_startup_state(
+        &state,
+        &session_id,
+        NativeStartupPhase::CommandConstructed,
+        NativeStartupOutcome::LauncherValidated,
+        NativeStartupFailureCategory::None,
+    )
+    .await;
 
     let interpreter = bridge_command
         .as_std()
@@ -2838,6 +2948,14 @@ pub async fn start_compute_node(
 
     isolate_bridge_process_tree(&mut bridge_command);
 
+    record_native_startup_state(
+        &state,
+        &session_id,
+        NativeStartupPhase::ChildSpawnAttempted,
+        NativeStartupOutcome::Attempted,
+        NativeStartupFailureCategory::None,
+    )
+    .await;
     let spawn_result = bridge_command
         .arg("--model")
         .arg(&request.model_path)
@@ -2876,6 +2994,14 @@ pub async fn start_compute_node(
             anyhow::bail!("failed to spawn compute-node bridge: {err}");
         }
     };
+    record_native_startup_state(
+        &state,
+        &session_id,
+        NativeStartupPhase::ChildSpawnCompleted,
+        NativeStartupOutcome::Completed,
+        NativeStartupFailureCategory::None,
+    )
+    .await;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -2903,12 +3029,28 @@ pub async fn start_compute_node(
             .await;
         }
     };
+    record_native_startup_state(
+        &state,
+        &session_id,
+        NativeStartupPhase::StdioAcquired,
+        NativeStartupOutcome::Accepted,
+        NativeStartupFailureCategory::None,
+    )
+    .await;
 
     let mut attachment =
         attach_spawned_bridge_process_for_session(&state, &session_id, child, stdin).await;
 
     match attachment.outcome {
         BridgeProcessAttachmentOutcome::Running => {
+            record_native_startup_state(
+                &state,
+                &session_id,
+                NativeStartupPhase::BridgeAttached,
+                NativeStartupOutcome::Running,
+                NativeStartupFailureCategory::None,
+            )
+            .await;
             eprintln!(
                 "desktop.compute_node.bridge_process.spawned operator_session_id={} relay={}",
                 session_id,
@@ -2916,11 +3058,27 @@ pub async fn start_compute_node(
             );
         }
         BridgeProcessAttachmentOutcome::Stopping => {
+            record_native_startup_state(
+                &state,
+                &session_id,
+                NativeStartupPhase::BridgeAttached,
+                NativeStartupOutcome::Stopping,
+                NativeStartupFailureCategory::BridgeAttachmentFailed,
+            )
+            .await;
             if let Some(notify) = attachment.notify.take() {
                 notify.notify_waiters();
             }
         }
         BridgeProcessAttachmentOutcome::Superseded => {
+            record_native_startup_state(
+                &state,
+                &session_id,
+                NativeStartupPhase::BridgeAttached,
+                NativeStartupOutcome::Superseded,
+                NativeStartupFailureCategory::BridgeAttachmentFailed,
+            )
+            .await;
             if let Some(notify) = attachment.notify.take() {
                 notify.notify_waiters();
             }
@@ -2939,6 +3097,9 @@ pub async fn start_compute_node(
     if attachment.outcome == BridgeProcessAttachmentOutcome::Running {
         let build_identity = crate::build_identity::build_identity();
         let running_status = ComputeNodeStatus {
+            native_startup_phase: NativeStartupPhase::RunningStatusPublication,
+            native_startup_outcome: NativeStartupOutcome::PublicationAccepted,
+            native_startup_failure_category: NativeStartupFailureCategory::None,
             running: true,
             registered: false,
             active_relay_url: primary_relay_url.clone(),
@@ -2991,12 +3152,13 @@ pub async fn start_compute_node(
             launcher_source: launcher_metadata.as_ref().map(|m| m.0.clone()),
             interpreter_basename: launcher_metadata.as_ref().map(|m| m.1.clone()),
         };
-        if publish_running_if_bridge_record_still_running(
+        let running_published = publish_running_if_bridge_record_still_running(
             &state,
             &session_id,
             running_status.clone(),
         )
-        .await
+        .await;
+        if running_published
             && app
                 .emit("compute_node_event", running_status_event(&running_status))
                 .is_err()
@@ -5752,6 +5914,10 @@ mod tests {
             published,
             "Running should publish while phase is still Running"
         );
+        assert_eq!(
+            state.status.lock().await.native_startup_outcome,
+            NativeStartupOutcome::PublicationAccepted
+        );
 
         {
             let mut process = state.bridge_process.lock().await;
@@ -5779,6 +5945,10 @@ mod tests {
         .expect("stop finalization after Running publication");
         let status = state.status.lock().await.clone();
         assert!(!status.running);
+        assert_eq!(
+            status.native_startup_outcome,
+            NativeStartupOutcome::PublicationSuppressed
+        );
         assert_eq!(status.relay_runtime_state.as_deref(), Some("stopped"));
         assert!(status.last_error.is_none());
     }
@@ -7021,6 +7191,15 @@ mod tests {
         assert_eq!(status.stop_cleanup_failure_count, Some(0));
         assert!(status.stop_cleanup_warning.is_none());
         assert_eq!(status.last_error.as_deref(), Some("bridge script missing"));
+        assert_eq!(
+            status.native_startup_phase,
+            NativeStartupPhase::StartupTaskFailed
+        );
+        assert_eq!(status.native_startup_outcome, NativeStartupOutcome::Failed);
+        assert_eq!(
+            status.native_startup_failure_category,
+            NativeStartupFailureCategory::BridgePreparationFailed
+        );
 
         reserve_starting_bridge_process_for_session(&state, "session-2")
             .await
@@ -7083,6 +7262,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_spawn_failure_records_allowlisted_native_category() {
+        let state = ComputeNodeState::default();
+        let request = sample_compute_node_request();
+        reserve_starting_bridge_process_for_session(&state, "spawn-failure-session")
+            .await
+            .expect("reserve session");
+
+        complete_no_child_startup_failure(
+            &state,
+            &request,
+            "spawn-failure-session",
+            None,
+            "private raw spawn error".into(),
+            "child_spawn",
+            "bridge_child_spawn_failed",
+            "child_spawn",
+        )
+        .await;
+
+        let status = state.status.lock().await.clone();
+        assert_eq!(
+            status.native_startup_phase,
+            NativeStartupPhase::StartupTaskFailed
+        );
+        assert_eq!(status.native_startup_outcome, NativeStartupOutcome::Failed);
+        assert_eq!(
+            status.native_startup_failure_category,
+            NativeStartupFailureCategory::ChildSpawnFailed
+        );
+    }
+
+    #[tokio::test]
     async fn delayed_no_child_failure_from_old_session_cannot_overwrite_replacement() {
         let state = ComputeNodeState::default();
         let request = sample_compute_node_request();
@@ -7135,6 +7346,7 @@ mod tests {
             "no usable Python 3 interpreter found for desktop Python subprocess".into(),
             Some("session-1".into()),
             Some("/tmp/operator.log".into()),
+            NativeStartupFailureCategory::BridgePreparationFailed,
         );
 
         assert!(!status.running);
@@ -7433,6 +7645,7 @@ mod tests {
             "unable to locate desktop Python bridge script 'compute_node_bridge.py'".into(),
             None,
             None,
+            NativeStartupFailureCategory::BridgePreparationFailed,
         );
 
         assert!(!status.running);

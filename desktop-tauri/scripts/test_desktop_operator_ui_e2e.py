@@ -846,7 +846,7 @@ def tauri_driver_command() -> list[str]:
     )
 
 
-WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v5"
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v6"
 WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
 WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
     "read_timeout", "connection_failure", "capability_rejection",
@@ -883,6 +883,30 @@ OPERATOR_START_DIAGNOSTIC_DEFAULTS = {
     "render_state": "not_running",
 }
 
+NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS = {
+    "native_startup_phase": frozenset({
+        "not_started", "session_reserved", "bridge_launch_prepared",
+        "command_constructed", "child_spawn_attempted", "child_spawn_completed",
+        "stdio_acquired", "bridge_attached", "running_status_publication",
+        "startup_task_failed",
+    }),
+    "native_startup_outcome": frozenset({
+        "not_started", "pending", "accepted", "launcher_validated", "attempted",
+        "completed", "running", "stopping", "superseded",
+        "publication_accepted", "publication_suppressed", "failed",
+    }),
+    "native_startup_failure_category": frozenset({
+        "none", "bridge_preparation_failed", "command_construction_failed",
+        "launcher_validation_failed", "child_spawn_failed",
+        "stdio_acquisition_failed", "bridge_attachment_failed", "startup_task_failed",
+    }),
+}
+NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS = {
+    "native_startup_phase": "not_started",
+    "native_startup_outcome": "not_started",
+    "native_startup_failure_category": "none",
+}
+
 
 def _read_operator_start_diagnostic(driver: webdriver.Remote | None) -> dict[str, str]:
     defaults = OPERATOR_START_DIAGNOSTIC_DEFAULTS.copy()
@@ -900,6 +924,26 @@ def _read_operator_start_diagnostic(driver: webdriver.Remote | None) -> dict[str
         return {
             field: (value if (value := shell.get_attribute(attribute))
                     in OPERATOR_START_DIAGNOSTIC_ALLOWLISTS[field] else defaults[field])
+            for field, attribute in attributes.items()
+        }
+    except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+        return defaults
+
+
+def _read_native_startup_diagnostic(driver: webdriver.Remote | None) -> dict[str, str]:
+    defaults = NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS.copy()
+    if driver is None:
+        return defaults
+    attributes = {
+        "native_startup_phase": "data-native-startup-phase",
+        "native_startup_outcome": "data-native-startup-outcome",
+        "native_startup_failure_category": "data-native-startup-failure",
+    }
+    try:
+        shell = driver.find_element(By.CSS_SELECTOR, "main[data-native-startup-phase]")
+        return {
+            field: (value if (value := shell.get_attribute(attribute))
+                    in NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS[field] else defaults[field])
             for field, attribute in attributes.items()
         }
     except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
@@ -991,7 +1035,8 @@ def _write_webdriver_diagnostic(
         exception_family: str = "unknown", process_posture: str = "unknown",
         session_elapsed_bucket: str = "unknown", target_category: str = "unknown",
         readiness_category: str = "unknown", operator_progress: str = "not_started",
-        operator_start_diagnostic: dict[str, str] | None = None) -> None:
+        operator_start_diagnostic: dict[str, str] | None = None,
+        native_startup_diagnostic: dict[str, str] | None = None) -> None:
     """Atomically retain the bounded session diagnostic while raw logs are discarded."""
     if compatibility not in WEBDRIVER_COMPATIBILITY_RESULTS:
         compatibility = "unknown"
@@ -1019,6 +1064,12 @@ def _write_webdriver_diagnostic(
                 else OPERATOR_START_DIAGNOSTIC_DEFAULTS[field])
         for field, allowed in OPERATOR_START_DIAGNOSTIC_ALLOWLISTS.items()
     }
+    supplied_native_diagnostic = native_startup_diagnostic or {}
+    safe_native_diagnostic = {
+        field: (value if (value := supplied_native_diagnostic.get(field)) in allowed
+                else NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS[field])
+        for field, allowed in NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS.items()
+    }
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
     fd, temporary_name = tempfile.mkstemp(
@@ -1038,6 +1089,7 @@ def _write_webdriver_diagnostic(
                 "readiness_category": readiness_category,
                 "operator_progress": operator_progress,
                 **safe_start_diagnostic,
+                **safe_native_diagnostic,
             }, handle, sort_keys=True)
         os.replace(temporary, destination)
     finally:
@@ -1838,12 +1890,13 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         raise
     finally:
         operator_start_diagnostic = _read_operator_start_diagnostic(driver)
+        native_startup_diagnostic = _read_native_startup_diagnostic(driver)
         _write_webdriver_diagnostic(
             os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
             tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
             webdriver_process_posture, webdriver_session_elapsed_bucket,
             webdriver_target_category, webdriver_readiness_category, operator_progress,
-            operator_start_diagnostic)
+            operator_start_diagnostic, native_startup_diagnostic)
         cleanup_deadline = time.monotonic() + cleanup_timeout
         def cleanup_remaining() -> float:
             return max(0.0, cleanup_deadline - time.monotonic())

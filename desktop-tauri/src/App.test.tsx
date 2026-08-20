@@ -195,6 +195,33 @@ describe('desktop app start failure handling', () => {
     });
   };
 
+  it('exposes bounded native startup attribution with safe defaults', async () => {
+    mockInitialComputeStatus({
+      native_startup_phase: 'bridge_attached',
+      native_startup_outcome: 'running',
+      native_startup_failure_category: 'none',
+    });
+
+    const { container } = render(<App />);
+    const shell = container.querySelector('main');
+    await waitFor(() => expect(shell?.getAttribute('data-application-initialization')).toBe('ready'));
+    expect(shell?.getAttribute('data-native-startup-phase')).toBe('bridge_attached');
+    expect(shell?.getAttribute('data-native-startup-outcome')).toBe('running');
+    expect(shell?.getAttribute('data-native-startup-failure')).toBe('none');
+
+    cleanup();
+    mockInitialComputeStatus({
+      native_startup_phase: 'C:\\private\\model.gguf',
+      native_startup_outcome: 'prompt SECRET',
+      native_startup_failure_category: 'raw exception',
+    });
+    const fallback = render(<App />).container.querySelector('main');
+    await waitFor(() => expect(fallback?.getAttribute('data-application-initialization')).toBe('ready'));
+    expect(fallback?.getAttribute('data-native-startup-phase')).toBe('not_started');
+    expect(fallback?.getAttribute('data-native-startup-outcome')).toBe('not_started');
+    expect(fallback?.getAttribute('data-native-startup-failure')).toBe('none');
+  });
+
   it('moves local inference from starting to failed when invoke rejects', async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'start_inference') {

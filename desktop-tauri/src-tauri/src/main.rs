@@ -418,12 +418,23 @@ async fn start_compute_node(
             compute_node::start_compute_node(app.clone(), compute_state.clone(), request).await
         {
             eprintln!("desktop.compute_node.start_failure error={}", err);
-            let log_file_path = {
+            let (log_file_path, native_startup_failure_category) = {
                 let mut status = compute_state.status.lock().await;
                 status.running = false;
                 status.registered = false;
                 status.last_error = Some(err.to_string());
-                status.log_file_path.clone()
+                status.native_startup_phase = compute_node::NativeStartupPhase::StartupTaskFailed;
+                status.native_startup_outcome = compute_node::NativeStartupOutcome::Failed;
+                if status.native_startup_failure_category
+                    == compute_node::NativeStartupFailureCategory::None
+                {
+                    status.native_startup_failure_category =
+                        compute_node::NativeStartupFailureCategory::StartupTaskFailed;
+                }
+                (
+                    status.log_file_path.clone(),
+                    status.native_startup_failure_category,
+                )
             };
             let _ = app.emit(
                 "compute_node_event",
@@ -434,6 +445,9 @@ async fn start_compute_node(
                     "last_error": err.to_string(),
                     "message": err.to_string(),
                     "log_file_path": log_file_path,
+                    "native_startup_phase": "startup_task_failed",
+                    "native_startup_outcome": "failed",
+                    "native_startup_failure_category": native_startup_failure_category,
                 }),
             );
         }

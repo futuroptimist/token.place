@@ -610,26 +610,33 @@ def test_expired_claim_releases_per_node_capacity_for_reclaim(
     first = store.claim_queued_request("node-a", digest("owner"), "worker-a")
 
     clock.value = first.lease_expires_at_epoch
-    reclaimed = store.claim_queued_request("node-a", digest("owner"), "worker-new")
+    reclaimed = store.claim_queued_request(
+        "node-a", digest("owner"), "worker-new"
+    )
 
     assert reclaimed.state == "reclaimed"
     assert reclaimed.generation > first.generation
 
 
 def test_multiple_reclaims_strictly_increase_generation(store_factory, capabilities):
-    store, clock = registered_store(store_factory, capabilities, lease_ttl_seconds=60)
+    store, clock = registered_store(
+        store_factory, capabilities, lease_ttl_seconds=60
+    )
     queued_work(store)
     claims = [store.claim_queued_request("node-a", digest("owner"), "worker-0")]
 
     for attempt in range(1, 4):
         clock.value = claims[-1].lease_expires_at_epoch
         claims.append(
-            store.claim_queued_request("node-a", digest("owner"), f"worker-{attempt}")
+            store.claim_queued_request(
+                "node-a", digest("owner"), f"worker-{attempt}"
+            )
         )
 
     assert [claim.state for claim in claims] == ["claimed"] + ["reclaimed"] * 3
     assert all(
-        newer.generation > older.generation for older, newer in zip(claims, claims[1:])
+        newer.generation > older.generation
+        for older, newer in zip(claims, claims[1:])
     )
 
 
@@ -725,10 +732,9 @@ def test_exact_request_deadline_prevents_renewal_and_reclaim(
         ).state
         == "missing_or_expired"
     )
-    assert (
-        store.claim_queued_request("node-a", digest("owner"), "worker-new").state
-        == "empty"
-    )
+    assert store.claim_queued_request(
+        "node-a", digest("owner"), "worker-new"
+    ).state == "empty"
 
 
 def test_wrong_node_renewal_fails_closed_without_mutation(store_factory, capabilities):

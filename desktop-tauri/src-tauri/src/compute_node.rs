@@ -32,7 +32,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-#[cfg(test)]
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Notify};
 
@@ -2722,6 +2721,15 @@ pub async fn start_compute_node(
     state: ComputeNodeState,
     request: ComputeNodeRequest,
 ) -> anyhow::Result<()> {
+    start_compute_node_with_entry_ack(app, state, request, None).await
+}
+
+pub async fn start_compute_node_with_entry_ack(
+    app: AppHandle,
+    state: ComputeNodeState,
+    request: ComputeNodeRequest,
+    entry_ack: Option<oneshot::Sender<()>>,
+) -> anyhow::Result<()> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let relay_base_urls = normalized_request_relay_urls(&request);
     let primary_relay_url = relay_base_urls
@@ -2735,6 +2743,11 @@ pub async fn start_compute_node(
     };
 
     reserve_starting_bridge_process_for_session(&state, &session_id).await?;
+    if let Some(entry_ack) = entry_ack {
+        // A successful command acknowledgement must prove that the session and
+        // its first native-startup status transition are already durable.
+        let _ = entry_ack.send(());
+    }
     state.stopped_event_ack_notify.notify_waiters();
     let log_sink = match OperatorLogSink::create(&app, &session_id) {
         Ok(log_sink) => Some(log_sink),

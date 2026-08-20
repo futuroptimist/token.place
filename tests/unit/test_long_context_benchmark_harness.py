@@ -54,6 +54,24 @@ class ProtocolError(Exception):
     pass
 
 
+def test_desktop_runner_imports_trusted_urllib3_transport_exceptions():
+    tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
+    transport_import = next(node for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "urllib3.exceptions")
+    namespace = {}
+    exec(compile(ast.Module(body=[transport_import], type_ignores=[]),
+        str(RUNNER_SOURCE), "exec"), namespace)
+
+    assert {name: value.__module__ for name, value in namespace.items()
+        if name in {"ConnectTimeoutError", "NewConnectionError", "ProtocolError",
+            "ReadTimeoutError"}} == {
+        "ConnectTimeoutError": "urllib3.exceptions",
+        "NewConnectionError": "urllib3.exceptions",
+        "ProtocolError": "urllib3.exceptions",
+        "ReadTimeoutError": "urllib3.exceptions",
+    }
+
+
 @pytest.fixture
 def desktop_runner():
     tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
@@ -3746,6 +3764,8 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
         "webdriver_transport_failure", "runner_startup", "not_started"),
     (RuntimeError("native_driver_unavailable"), None, None, None, None, None, None,
         "native_driver_unavailable", "runner_startup", "not_started"),
+    (RuntimeError("packaged_runner_failure"), None, None, None,
+        None, None, None, "packaged_runner_failure", "runner_startup", "not_started"),
     (None, None, None, None, None, RuntimeError("posix readiness failure"), None,
         "desktop_ui_not_ready", "desktop_session_started", "not_started"),
     (None, None, None, None, None, None, RuntimeError("handoff_failure"),

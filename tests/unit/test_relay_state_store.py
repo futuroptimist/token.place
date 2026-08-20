@@ -413,6 +413,161 @@ def test_cancellation_invalid_identity_and_queued_retry_proof_fail_closed(
     assert store.queued_requests("node-a") == before
 
 
+def lifecycle_snapshot(store):
+    return (
+        store.list_reservations(),
+        store.queued_requests("node-a"),
+        store.active_claims("node-a"),
+        store.response_records(),
+        store.terminal_records(),
+        store.control_tombstones(),
+    )
+
+
+@pytest.mark.parametrize("stage", ["reserved", "queued", "claimed"])
+def test_valid_cancellation_before_claim_is_once_only_and_releases_capacity(
+    store_factory, capabilities, stage
+):
+    store, _ = registered_store(store_factory, capabilities, max_request_lifecycles=1)
+    selection = reserve(store, cancellation_token="cancel-proof-request-a")
+    if stage != "reserved":
+        enqueue(store, selection)
+    if stage == "claimed":
+        store.claim_queued_request("node-a", digest("owner"), "worker-a")
+
+    first = store.cancel_or_expire_request(
+        "client-key", "request-a", "cancel-proof-request-a"
+    )
+    retry = store.cancel_or_expire_request(
+        "client-key", "request-a", "cancel-proof-request-a"
+    )
+
+    assert (first.state, first.reason, first.new_outcome) == (
+        "cancelled",
+        "requester_cancelled",
+        True,
+    )
+    assert retry == replace(first, new_outcome=False)
+    assert store.list_reservations() == ()
+    assert store.queued_requests("node-a") == ()
+    assert store.active_claims("node-a") == ()
+    assert len(store.control_tombstones()) == (1 if stage == "claimed" else 0)
+    assert len(store.terminal_records()) == 1
+    replacement = reserve(store, "request-b")
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store, "request-c")
+    assert replacement.created
+    assert len(store.terminal_records()) == 1
+
+
+@pytest.mark.parametrize(
+    "client_public_key,request_id,proof",
+    [
+        ("client-key", "request-a", ""),
+        ("client-key", "request-a", 1),
+        ("client-key", "request-a", "\ud800"),
+        ("client-key", "request-a", "x" * 1025),
+        ("client-key", "request-a", "wrong-proof"),
+        ("other-client", "request-a", "cancel-proof-request-a"),
+        ("client-key", "request-b", "cancel-proof-request-a"),
+    ],
+)
+def test_invalid_cancellation_proofs_share_fixed_non_mutating_result(
+    store_factory,
+    capabilities,
+    client_public_key,
+    request_id,
+    proof,
+):
+    store, _ = registered_store(store_factory, capabilities)
+    enqueue(store, reserve(store, cancellation_token="cancel-proof-request-a"))
+    before = lifecycle_snapshot(store)
+
+    result = store.cancel_or_expire_request(client_public_key, request_id, proof)
+
+    assert result.state == result.reason == "invalid_cancellation_proof"
+    assert result.new_outcome is False
+    assert lifecycle_snapshot(store) == before
+
+
+@pytest.mark.parametrize(
+    "status,reason",
+    [
+        ("completed", "response_completed"),
+        ("cancelled", "request_deadline_expired"),
+        ("expired", "requester_cancelled"),
+    ],
+)
+def test_invalid_cancellation_status_reason_is_fixed_and_non_mutating(
+    store_factory, capabilities, status, reason
+):
+    store, _ = registered_store(store_factory, capabilities)
+    reserve(store, cancellation_token="cancel-proof-request-a")
+    before = lifecycle_snapshot(store)
+
+    with pytest.raises(
+        RelayStateStoreError, match="^terminal status or reason is invalid$"
+    ):
+        store.cancel_or_expire_request(
+            "client-key",
+            "request-a",
+            "cancel-proof-request-a",
+            status=status,
+            reason=reason,
+        )
+    assert lifecycle_snapshot(store) == before
+
+
+def test_cancellation_persists_only_domain_separated_digest_and_is_redacted(
+    store_factory, capabilities, caplog
+):
+    raw_proof = "uniquely-sensitive-cancellation-proof"
+    store, _ = registered_store(store_factory, capabilities)
+    reserve(store, cancellation_token=raw_proof)
+
+    result = store.cancel_or_expire_request("client-key", "request-a", raw_proof)
+    terminal = store.terminal_records()[0]
+    rendered = repr((result, terminal, lifecycle_snapshot(store)))
+
+    assert terminal.cancellation_token_digest == digest_with_domain(
+        raw_proof, b"cancel\0"
+    )
+    assert raw_proof not in rendered
+    assert raw_proof not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "retrieval_state", ["response_ready", "acknowledged", "retrieval_expired"]
+)
+def test_completed_outcome_and_retrieval_survive_later_cancellation(
+    store_factory, capabilities, retrieval_state
+):
+    store, clock, _, _, credential = completed_response(
+        store_factory,
+        capabilities,
+        response_replay_ttl_seconds=2,
+        terminal_retention_seconds=5,
+    )
+    if retrieval_state == "acknowledged":
+        ready = retrieve_response(store, credential)
+        retrieve_response(store, credential, ready.acknowledgement_token)
+    elif retrieval_state == "retrieval_expired":
+        clock.value += 2
+        assert retrieve_response(store, credential).state == "retrieval_expired"
+    before = lifecycle_snapshot(store)
+
+    result = store.cancel_or_expire_request(
+        "client-key", "request-a", "cancel-proof-request-a"
+    )
+
+    assert (result.state, result.reason, result.new_outcome) == (
+        "completed",
+        "response_completed",
+        False,
+    )
+    assert lifecycle_snapshot(store) == before
+
+
 def test_response_acceptance_atomically_finalizes_claim(store_factory, capabilities):
     store, _ = registered_store(store_factory, capabilities)
     claim = claimed_work(store)

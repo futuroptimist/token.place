@@ -15,6 +15,7 @@ from relay_state_store import ComputeNodeCapabilities
 from relay_state_store import ComputeNodeRegistration
 from relay_state_store import ClaimRecord
 from relay_state_store import ClaimResult
+from relay_state_store import ControlTombstoneRecord
 from relay_state_store import EncryptedRequestEnvelope
 from relay_state_store import EncryptedResponseEnvelope
 from relay_state_store import InMemoryRelayStateStore
@@ -28,6 +29,7 @@ from relay_state_store import RelayStateStoreConfig
 from relay_state_store import RelayStateStoreError
 from relay_state_store import ResponseAcceptanceResult
 from relay_state_store import ResponseRetrievalResult
+from relay_state_store import RequestTerminalTransitionResult
 from relay_state_store import SchedulerNodeState
 
 # isort: on
@@ -107,6 +109,7 @@ def reserve(store, request_id="request-a", **overrides):
         "requested_model_id": "qwen3-8b-instruct",
         "requested_context_tier": "8k-fast",
         "request_deadline_epoch": 1_700_000_100.0,
+        "cancellation_proof": "cancel-proof",
     }
     values.update(overrides)
     return store.select_and_reserve(**values)
@@ -122,6 +125,7 @@ def enqueue(store, selection, request_id="request-a", **overrides):
         "requested_context_tier": selection.requested_context_tier,
         "request_deadline_epoch": selection.request_deadline_epoch,
         "envelope": envelope(),
+        "cancellation_proof": "cancel-proof",
     }
     values.update(overrides)
     return store.enqueue_encrypted_request(**values)
@@ -158,6 +162,222 @@ def accept_response(store, claim, **overrides):
     }
     values.update(overrides)
     return store.accept_encrypted_response(**values)
+
+
+def cancel(store, request_id="request-a", proof="cancel-proof", **overrides):
+    values = {
+        "client_public_key": "client-key",
+        "request_id": request_id,
+        "cancellation_proof": proof,
+        "status": "cancelled",
+        "reason": "requester_cancelled",
+    }
+    values.update(overrides)
+    return store.cancel_or_expire_request(**values)
+
+
+def test_authenticated_cancellation_terminalizes_reserved_and_queued_work(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    reserve(store, "reserved")
+    queued_work(store, "queued")
+
+    reserved = cancel(store, "reserved")
+    queued = cancel(store, "queued")
+
+    assert reserved == RequestTerminalTransitionResult("terminal", "cancelled", True)
+    assert queued == RequestTerminalTransitionResult("terminal", "cancelled", True)
+    assert store.list_reservations() == ()
+    assert store.queued_requests("node-a") == ()
+    assert {record.outcome for record in store.terminal_records()} == {"cancelled"}
+    assert store.control_tombstone_records() == ()
+
+
+@pytest.mark.parametrize("proof", [None, "", "wrong", 123, "x" * 257])
+def test_invalid_cancellation_proofs_share_safe_failure_without_mutation(
+    store_factory, capabilities, proof
+):
+    store, _ = registered_store(store_factory, capabilities)
+    queued_work(store)
+
+    result = cancel(store, proof=proof)
+
+    assert result == RequestTerminalTransitionResult("invalid_proof")
+    assert len(store.queued_requests("node-a")) == 1
+    assert store.terminal_records() == ()
+
+
+def test_cancellation_retry_and_conflicting_fixed_values(store_factory, capabilities):
+    store, _ = registered_store(store_factory, capabilities)
+    queued_work(store)
+    assert cancel(store).new_outcome
+    assert cancel(store) == RequestTerminalTransitionResult(
+        "terminal", "cancelled", False
+    )
+    with pytest.raises(RelayStateStoreError, match="status and reason"):
+        cancel(store, status="cancelled", reason="user supplied text")
+
+
+def test_claim_cancellation_creates_owner_bound_acknowledgeable_tombstone(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+
+    assert cancel(store).new_outcome
+    records = store.control_tombstone_records()
+    assert len(records) == 1 and isinstance(records[0], ControlTombstoneRecord)
+    assert records[0].status == "cancelled"
+    assert digest("owner") not in repr(records[0]) and "worker-a" not in repr(
+        records[0]
+    )
+    assert (
+        store.renew_claim_or_read_control(
+            "node-a",
+            digest("wrong"),
+            "worker-a",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "owner_mismatch"
+    )
+    control = store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+    )
+    assert control.state == "cancelled"
+    acknowledged = store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+        acknowledge=True,
+    )
+    assert acknowledged.state == "acknowledged"
+    assert (
+        store.renew_claim_or_read_control(
+            "node-a",
+            digest("owner"),
+            "worker-a",
+            "client-key",
+            "request-a",
+            claim.generation,
+            acknowledge=True,
+        ).state
+        == "acknowledged"
+    )
+
+
+def test_inclusive_deadline_expiry_is_authoritative_and_tombstone_is_bounded(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        clock=clock,
+        control_tombstone_ttl_seconds=5,
+    )
+    claim = claimed_work(store, request_deadline_epoch=clock.value + 2)
+    clock.value = claim.request_deadline_epoch
+
+    control = store.renew_claim(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+    )
+    assert control.state == "expired"
+    assert store.terminal_records()[0].outcome == "expired"
+    clock.value += 5
+    assert store.control_tombstone_records() == ()
+    assert store.terminal_records()[0].outcome == "expired"
+    assert (
+        store.renew_claim(
+            "node-a",
+            digest("owner"),
+            "worker-a",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "missing_or_expired"
+    )
+    with pytest.raises(RelayStateConflict):
+        accept_response(store, claim)
+
+
+def test_cancellation_proof_is_digest_only_and_conflicting_enqueue_is_atomic(
+    store_factory, capabilities
+):
+    raw = "unique-raw-cancellation-proof"
+    store, _ = registered_store(store_factory, capabilities)
+    selection = reserve(store, cancellation_proof=raw)
+    enqueue(store, selection, cancellation_proof=raw)
+    before = store.queued_requests("node-a")
+    assert raw not in repr(store.__dict__)
+    assert raw not in repr(before)
+    with pytest.raises(RelayStateConflict):
+        enqueue(store, selection, cancellation_proof="conflict")
+    assert store.queued_requests("node-a") == before
+
+
+def test_simultaneous_cancellation_has_one_authoritative_outcome(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    queued_work(store)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: cancel(store), range(8)))
+    assert sum(result.new_outcome for result in results) == 1
+    assert {result.outcome for result in results} == {"cancelled"}
+    assert len(store.terminal_records()) == 1
+
+
+def test_completed_response_wins_over_later_cancellation(store_factory, capabilities):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    accepted = accept_response(store, claim)
+    before = (store.response_records(), store.terminal_records())
+
+    cancelled = cancel(store)
+
+    assert cancelled == RequestTerminalTransitionResult("terminal", "completed", False)
+    assert (store.response_records(), store.terminal_records()) == before
+    assert accepted.new_outcome
+
+
+def test_control_tombstone_bound_fails_closed_without_partial_transition(
+    store_factory, capabilities
+):
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        max_control_tombstones=1,
+        max_control_tombstones_per_node=1,
+    )
+    first = claimed_work(store, "first")
+    assert cancel(store, "first").new_outcome
+    queued_work(store, "second")
+    second = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+
+    with pytest.raises(RelayStateCapacityExceeded, match="tombstone capacity"):
+        cancel(store, "second")
+
+    assert len(store.control_tombstone_records()) == 1
+    assert len(store.terminal_records()) == 1
+    assert store.active_claims("node-a")[0].generation == second.generation
+    assert first.generation != second.generation
 
 
 def test_response_acceptance_atomically_finalizes_claim(store_factory, capabilities):
@@ -266,7 +486,8 @@ def test_missing_expired_claim_and_request_deadline_fail_without_mutation(
     clock.value = claim.request_deadline_epoch
     with pytest.raises(RelayStateConflict, match="expired"):
         accept_response(store, claim)
-    assert store.response_records() == store.terminal_records() == ()
+    assert store.response_records() == ()
+    assert store.terminal_records()[0].outcome == "expired"
 
 
 def test_simultaneous_responses_have_one_new_outcome(store_factory, capabilities):
@@ -1082,7 +1303,7 @@ def test_claim_renewal_auth_identity_and_deadline_bounds(store_factory, capabili
             "request-a",
             claim.generation,
         ).state
-        == "missing_or_expired"
+        == "expired"
     )
     assert store.active_claims("node-a") == ()
 
@@ -1106,7 +1327,7 @@ def test_exact_request_deadline_prevents_renewal_and_reclaim(
             "request-a",
             claim.generation,
         ).state
-        == "missing_or_expired"
+        == "expired"
     )
     assert (
         store.claim_queued_request("node-a", digest("owner"), "worker-new").state

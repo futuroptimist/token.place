@@ -47,6 +47,13 @@ def store_factory(request):
 
     def make(*, clock=None, acknowledgement_key=None, **config_overrides):
         assert request.param == "memory"
+        if (
+            "terminal_retention_seconds" in config_overrides
+            and "control_tombstone_ttl_seconds" not in config_overrides
+        ):
+            config_overrides["control_tombstone_ttl_seconds"] = min(
+                300.0, config_overrides["terminal_retention_seconds"]
+            )
         config = RelayStateStoreConfig(
             namespace="testing.cluster-a", **config_overrides
         )
@@ -197,6 +204,82 @@ def test_authenticated_cancellation_and_owner_bound_acknowledgement(
     assert control.acknowledged
     with pytest.raises(RelayStateConflict):
         accept_response(store, claim)
+
+
+@pytest.mark.parametrize("stage", ["reserved", "queued", "claimed"])
+def test_omitted_cancellation_proof_is_fixed_and_non_mutating(
+    store_factory, capabilities, stage
+):
+    store, clock = registered_store(store_factory, capabilities)
+    selection = reserve(store, cancellation_token="cancel-proof-request-a")
+    if stage != "reserved":
+        enqueue(store, selection)
+    if stage == "claimed":
+        store.claim_queued_request("node-a", digest("owner"), "worker-a")
+
+    before = (
+        store.list_reservations(),
+        store.queued_requests("node-a"),
+        store.active_claims("node-a"),
+        store.terminal_records(),
+        store.control_tombstones(),
+    )
+    result = store.cancel_or_expire_request("client-key", "request-a")
+
+    assert (result.state, result.reason, result.new_outcome) == (
+        "invalid_cancellation_proof",
+        "invalid_cancellation_proof",
+        False,
+    )
+    assert clock.value == 1_700_000_000.0
+    assert before == (
+        store.list_reservations(),
+        store.queued_requests("node-a"),
+        store.active_claims("node-a"),
+        store.terminal_records(),
+        store.control_tombstones(),
+    )
+
+
+def test_cancellation_of_expired_claim_does_not_consume_tombstone_capacity(
+    store_factory, capabilities
+):
+    store, clock = registered_store(
+        store_factory,
+        capabilities,
+        max_control_tombstones=1,
+        max_control_tombstones_per_node=1,
+    )
+    claimed_work(store, "active")
+    store.cancel_or_expire_request("client-key", "active", "cancel-proof-active")
+    claimed_work(store, "stale")
+    clock.value += 10
+
+    result = store.cancel_or_expire_request(
+        "client-key", "stale", "cancel-proof-stale"
+    )
+
+    assert result.new_outcome
+    assert len(store.control_tombstones()) == 1
+    assert {record.outcome for record in store.terminal_records()} == {"cancelled"}
+    assert store.active_claims("node-a") == ()
+
+
+@pytest.mark.parametrize(
+    "deadline_offset,expected_tombstones", [(100, 0), (5, 1)]
+)
+def test_deadline_expiry_only_controls_claims_owned_through_inclusive_deadline(
+    store_factory, capabilities, deadline_offset, expected_tombstones
+):
+    store, clock = registered_store(store_factory, capabilities)
+    claim = claimed_work(
+        store, request_deadline_epoch=clock.value + deadline_offset
+    )
+    clock.value = claim.request_deadline_epoch
+
+    assert store.terminal_records()[0].outcome == "expired"
+    assert len(store.control_tombstones()) == expected_tombstones
+    assert store.active_claims("node-a") == ()
 
 
 def test_request_deadline_expiry_is_terminal_and_tombstone_expiry_is_bounded(
@@ -2218,3 +2301,48 @@ def test_terminal_retention_must_cover_response_replay_retention():
             response_replay_ttl_seconds=10,
             terminal_retention_seconds=9,
         )
+
+
+def test_terminal_retention_must_cover_control_tombstone_ttl():
+    with pytest.raises(RelayStateStoreError, match="must cover control tombstone"):
+        RelayStateStoreConfig(
+            namespace="test",
+            response_replay_ttl_seconds=1,
+            terminal_retention_seconds=4,
+            control_tombstone_ttl_seconds=5,
+        )
+
+    config = RelayStateStoreConfig(
+        namespace="test",
+        response_replay_ttl_seconds=1,
+        terminal_retention_seconds=5,
+        control_tombstone_ttl_seconds=5,
+    )
+    assert config.terminal_retention_seconds == config.control_tombstone_ttl_seconds
+
+
+def test_observable_control_tombstone_always_has_terminal_outcome(
+    store_factory, capabilities
+):
+    store, clock = registered_store(
+        store_factory,
+        capabilities,
+        response_replay_ttl_seconds=1,
+        terminal_retention_seconds=5,
+        control_tombstone_ttl_seconds=5,
+    )
+    claimed_work(store)
+    store.cancel_or_expire_request(
+        "client-key", "request-a", "cancel-proof-request-a"
+    )
+
+    clock.value += 4
+    tombstones = store.control_tombstones()
+    terminals = store.terminal_records()
+    assert len(tombstones) == 1
+    assert len(terminals) == 1
+    assert tombstones[0].request_identity_digest == terminals[0].request_identity_digest
+
+    clock.value += 1
+    assert store.control_tombstones() == ()
+    assert store.terminal_records() == ()

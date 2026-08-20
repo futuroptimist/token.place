@@ -145,6 +145,10 @@ class RelayStateStoreConfig:
             raise RelayStateStoreError(
                 "terminal retention must cover response replay retention"
             )
+        if self.terminal_retention_seconds < self.control_tombstone_ttl_seconds:
+            raise RelayStateStoreError(
+                "terminal retention must cover control tombstone TTL"
+            )
         for value, name, maximum in (
             (self.max_reservations, "reservation bound", 1_000_000),
             (self.max_reservations_per_client, "per-client reservation bound", 10_000),
@@ -746,7 +750,7 @@ class RelayStateStore(Protocol):
         self,
         client_public_key: str,
         request_id: str,
-        cancellation_token: str | None,
+        cancellation_token: str | None = None,
         *,
         status: str = "cancelled",
         reason: str = "requester_cancelled",
@@ -1627,7 +1631,7 @@ class InMemoryRelayStateStore:
         self,
         client_public_key: str,
         request_id: str,
-        cancellation_token: str | None,
+        cancellation_token: str | None = None,
         *,
         status: str = "cancelled",
         reason: str = "requester_cancelled",
@@ -1694,6 +1698,15 @@ class InMemoryRelayStateStore:
 
     def _terminalize_locked(self, identity, record, status, reason, now):
         claim = self._claims.get(identity)
+        tombstone_claim = None
+        if claim is not None and (
+            (status == "cancelled" and claim.lease_expires_at_epoch > now)
+            or (
+                status == "expired"
+                and claim.lease_expires_at_epoch >= record.request_deadline_epoch
+            )
+        ):
+            tombstone_claim = claim
         if (
             len(self._terminals) >= self.config.max_terminal_records
             or sum(
@@ -1703,9 +1716,9 @@ class InMemoryRelayStateStore:
             >= self.config.max_terminal_records_per_client
         ):
             raise RelayStateCapacityExceeded("terminal lifecycle capacity reached")
-        if claim is not None:
+        if tombstone_claim is not None:
             node_count = sum(
-                t.selected_node_id == claim.selected_node_id
+                t.selected_node_id == tombstone_claim.selected_node_id
                 for t in self._control_tombstones.values()
             )
             if (
@@ -1717,9 +1730,9 @@ class InMemoryRelayStateStore:
             identity[0],
             identity[1],
             record.selected_node_id,
-            claim.control_credential_digest if claim else "",
-            claim.consumer_identity_digest if claim else "",
-            claim.generation if claim else 0,
+            tombstone_claim.control_credential_digest if tombstone_claim else "",
+            tombstone_claim.consumer_identity_digest if tombstone_claim else "",
+            tombstone_claim.generation if tombstone_claim else 0,
             "",
             now,
             now,
@@ -1732,17 +1745,17 @@ class InMemoryRelayStateStore:
             ),
         )
         tombstone = None
-        if claim is not None:
+        if tombstone_claim is not None:
             tombstone = ControlTombstoneRecord(
                 identity[0],
                 identity[1],
-                claim.selected_node_id,
-                claim.control_credential_digest,
-                claim.consumer_identity_digest,
-                claim.generation,
+                tombstone_claim.selected_node_id,
+                tombstone_claim.control_credential_digest,
+                tombstone_claim.consumer_identity_digest,
+                tombstone_claim.generation,
                 status,
                 reason,
-                claim.request_deadline_epoch,
+                tombstone_claim.request_deadline_epoch,
                 False,
                 min(now + self.config.control_tombstone_ttl_seconds, now + 300.0),
             )

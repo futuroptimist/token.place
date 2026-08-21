@@ -7,6 +7,7 @@ import inspect
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, fields, replace
+from threading import Barrier
 
 import pytest
 
@@ -750,6 +751,21 @@ def lifecycle_snapshot(store):
     )
 
 
+def synchronized_results(*operations):
+    """Run operations after every worker reaches the same start boundary."""
+    barrier = Barrier(len(operations))
+
+    def invoke(operation):
+        barrier.wait()
+        try:
+            return operation()
+        except RelayStateConflict as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=len(operations)) as pool:
+        return tuple(pool.map(invoke, operations))
+
+
 @pytest.mark.parametrize("stage", ["reserved", "queued", "claimed"])
 def test_valid_cancellation_before_claim_is_once_only_and_releases_capacity(
     store_factory, capabilities, stage
@@ -1011,6 +1027,163 @@ def test_simultaneous_responses_have_one_new_outcome(store_factory, capabilities
         results = list(pool.map(lambda _: accept_response(store, claim), range(8)))
     assert sum(result.new_outcome for result in results) == 1
     assert len(store.response_records()) == len(store.terminal_records()) == 1
+
+
+def test_simultaneous_cancellation_has_one_authoritative_outcome(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claimed_work(store)
+
+    results = synchronized_results(
+        *(
+            lambda: store.cancel_or_expire_request(
+                "client-key", "request-a", "cancel-proof-request-a"
+            )
+            for _ in range(8)
+        )
+    )
+
+    assert {(result.state, result.reason) for result in results} == {
+        ("cancelled", "requester_cancelled")
+    }
+    assert sum(result.new_outcome for result in results) == 1
+    snapshot = lifecycle_snapshot(store)
+    assert snapshot[:3] == ((), (), ())
+    assert len(snapshot[4]) == len(snapshot[5]) == 1
+    assert lifecycle_snapshot(store) == snapshot
+
+
+def test_cancellation_versus_response_has_one_coherent_winner(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+
+    cancellation, response = synchronized_results(
+        lambda: store.cancel_or_expire_request(
+            "client-key", "request-a", "cancel-proof-request-a"
+        ),
+        lambda: accept_response(store, claim),
+    )
+
+    terminal = store.terminal_records()
+    assert len(terminal) == 1
+    assert store.active_claims("node-a") == ()
+    if terminal[0].outcome == "completed":
+        assert cancellation.state == "completed"
+        assert cancellation.new_outcome is False
+        assert response.new_outcome is True
+        assert len(store.response_records()) == 1
+        assert store.control_tombstones() == ()
+    else:
+        assert terminal[0].outcome == "cancelled"
+        assert cancellation.new_outcome is True
+        assert isinstance(response, RelayStateConflict)
+        assert str(response) == "response lifecycle conflict"
+        assert store.response_records() == ()
+        assert len(store.control_tombstones()) == 1
+    snapshot = lifecycle_snapshot(store)
+    assert lifecycle_snapshot(store) == snapshot
+
+
+def test_expiry_versus_response_at_deadline_is_authoritative(
+    store_factory, capabilities
+):
+    store, clock = registered_store(store_factory, capabilities)
+    claim = claimed_work(store, request_deadline_epoch=clock.value + 5)
+    clock.value = claim.request_deadline_epoch
+
+    expiry, response = synchronized_results(
+        lambda: store.cancel_or_expire_request(
+            "client-key",
+            "request-a",
+            status="expired",
+            reason="request_deadline_expired",
+        ),
+        lambda: accept_response(store, claim),
+    )
+
+    assert (expiry.state, expiry.reason, expiry.new_outcome) == (
+        "expired",
+        "request_deadline_expired",
+        False,
+    )
+    assert isinstance(response, RelayStateConflict)
+    assert str(response) == "response lifecycle conflict"
+    assert store.response_records() == ()
+    assert store.active_claims("node-a") == ()
+    assert len(store.terminal_records()) == len(store.control_tombstones()) == 1
+    snapshot = lifecycle_snapshot(store)
+    with pytest.raises(RelayStateConflict, match="^response lifecycle conflict$"):
+        accept_response(store, claim)
+    assert lifecycle_snapshot(store) == snapshot
+
+
+def test_cancellation_versus_renewal_ends_with_control(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    renew = lambda: store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+    )
+
+    cancellation, renewal = synchronized_results(
+        lambda: store.cancel_or_expire_request(
+            "client-key", "request-a", "cancel-proof-request-a"
+        ),
+        renew,
+    )
+
+    assert cancellation.new_outcome is True
+    assert renewal.state in {"continued", "cancelled"}
+    assert renew().state == "cancelled"
+    assert store.active_claims("node-a") == ()
+    assert len(store.terminal_records()) == len(store.control_tombstones()) == 1
+    snapshot = lifecycle_snapshot(store)
+    assert renew().state == "cancelled"
+    assert lifecycle_snapshot(store) == snapshot
+
+
+def test_expiry_versus_renewal_at_deadline_cannot_extend_claim(
+    store_factory, capabilities
+):
+    store, clock = registered_store(store_factory, capabilities)
+    claim = claimed_work(store, request_deadline_epoch=clock.value + 5)
+    clock.value = claim.request_deadline_epoch
+    renew = lambda: store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+    )
+
+    expiry, renewal = synchronized_results(
+        lambda: store.cancel_or_expire_request(
+            "client-key",
+            "request-a",
+            status="expired",
+            reason="request_deadline_expired",
+        ),
+        renew,
+    )
+
+    assert expiry.state == renewal.state == "expired"
+    assert expiry.new_outcome is False
+    assert renewal.lease_expires_at_epoch is None
+    assert store.active_claims("node-a") == ()
+    assert len(store.terminal_records()) == len(store.control_tombstones()) == 1
+    snapshot = lifecycle_snapshot(store)
+    assert renew().state == "expired"
+    assert lifecycle_snapshot(store) == snapshot
 
 
 def test_response_racing_renewal_leaves_coherent_terminal_state(

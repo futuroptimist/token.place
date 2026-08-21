@@ -1339,6 +1339,105 @@ describe('desktop app start failure handling', () => {
     vi.useRealTimers();
   });
 
+  it('retains bounded startup diagnostics from the active non-running replacement session', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'previous-session',
+            sequence: 8,
+          });
+        }
+        if (statusCalls === 2) {
+          return Promise.resolve({
+            running: false,
+            operator_session_id: 'previous-session',
+            sequence: 9,
+            native_startup_phase: 'startup_task_failed',
+            native_startup_outcome: 'failed',
+            native_startup_failure_category: 'startup_task_failed',
+          });
+        }
+        if (statusCalls === 3) {
+          return Promise.resolve({
+            running: false,
+            operator_session_id: 'current-session',
+            sequence: 1,
+            native_startup_phase: 'session_reserved',
+            native_startup_outcome: 'pending',
+            native_startup_failure_category: 'none',
+          });
+        }
+        if (statusCalls === 4) {
+          return Promise.resolve({
+            running: false,
+            operator_session_id: 'current-session',
+            sequence: 0,
+            native_startup_phase: 'startup_task_failed',
+            native_startup_outcome: 'failed',
+          });
+        }
+        if (statusCalls === 5) {
+          return Promise.resolve({
+            running: false,
+            operator_session_id: 'current-session',
+            sequence: 2,
+            native_startup_phase: 'bridge_launch_prepared',
+          });
+        }
+        return Promise.resolve({
+          running: true,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: 3,
+          worker_state: 'starting',
+          native_startup_phase: 'bridge_attached',
+          native_startup_outcome: 'running',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    const shell = screen.getByRole('main');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('previous-session');
+    expect(shell.getAttribute('data-native-startup-phase')).toBe('not_started');
+
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+    expect(shell.getAttribute('data-native-startup-phase')).toBe('session_reserved');
+    expect(shell.getAttribute('data-native-startup-outcome')).toBe('pending');
+    expect(shell.getAttribute('data-native-startup-failure')).toBe('none');
+
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(shell.getAttribute('data-native-startup-phase')).toBe('session_reserved');
+    expect(shell.getAttribute('data-native-startup-outcome')).toBe('pending');
+
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(shell.getAttribute('data-native-startup-phase')).toBe('bridge_launch_prepared');
+    expect(shell.getAttribute('data-native-startup-outcome')).toBe('pending');
+
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(shell.getAttribute('data-native-startup-phase')).toBe('bridge_attached');
+    expect(shell.getAttribute('data-native-startup-outcome')).toBe('running');
+    vi.useRealTimers();
+  });
+
   it('accepts an authoritative running snapshot that completes a partial event sequence', async () => {
     let statusCalls = 0;
     invokeMock.mockImplementation((command: string) => {

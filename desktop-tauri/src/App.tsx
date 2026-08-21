@@ -294,6 +294,14 @@ function boundedNativeStartupValue(value: string | null | undefined, allowed: Se
   return value && allowed.has(value) ? value : fallback;
 }
 
+function authoritativeNativeStartupValue(
+  value: unknown,
+  allowed: Set<string>,
+  previous: string
+): string {
+  return typeof value === 'string' && allowed.has(value) ? value : previous;
+}
+
 type NormalizedDesktopError = { message: string; code: string | null; disablesPythonBridge: boolean };
 
 const PACKAGED_RUNTIME_MESSAGE = 'The bundled token.place runtime is missing or damaged. Reinstall token.place desktop. You do not need to install Python or Xcode Command Line Tools.';
@@ -880,6 +888,63 @@ function mergeComputeStatusEvent(
         : typeof payload.interpreter_basename === 'string'
           ? payload.interpreter_basename
           : stoppedBase.interpreter_basename,
+    native_startup_phase: authoritativeNativeStartupValue(
+      payload.native_startup_phase,
+      nativeStartupDiagnosticAllowlists.phase,
+      stoppedBase.native_startup_phase
+    ),
+    native_startup_outcome: authoritativeNativeStartupValue(
+      payload.native_startup_outcome,
+      nativeStartupDiagnosticAllowlists.outcome,
+      stoppedBase.native_startup_outcome
+    ),
+    native_startup_failure_category: authoritativeNativeStartupValue(
+      payload.native_startup_failure_category,
+      nativeStartupDiagnosticAllowlists.failure,
+      stoppedBase.native_startup_failure_category
+    ),
+  };
+}
+
+function mergeAuthoritativeNonRunningStatus(
+  prev: ComputeNodeStatus,
+  payload: Record<string, unknown>,
+  startSessionId: string | null,
+  payloadSession: string,
+  payloadSequence: number
+): ComputeNodeStatus {
+  // A non-running snapshot can establish attribution for the replacement
+  // session, but the session that preceded Start is never current-attempt data.
+  if (payloadSession === startSessionId) {
+    return prev;
+  }
+  const isReplacementSession = prev.operator_session_id === startSessionId;
+  if (!isReplacementSession && payloadSession !== prev.operator_session_id) {
+    return prev;
+  }
+  if (!isReplacementSession && prev.sequence !== null && payloadSequence < prev.sequence) {
+    return prev;
+  }
+
+  return {
+    ...prev,
+    operator_session_id: payloadSession,
+    sequence: payloadSequence,
+    native_startup_phase: authoritativeNativeStartupValue(
+      payload.native_startup_phase,
+      nativeStartupDiagnosticAllowlists.phase,
+      prev.native_startup_phase
+    ),
+    native_startup_outcome: authoritativeNativeStartupValue(
+      payload.native_startup_outcome,
+      nativeStartupDiagnosticAllowlists.outcome,
+      prev.native_startup_outcome
+    ),
+    native_startup_failure_category: authoritativeNativeStartupValue(
+      payload.native_startup_failure_category,
+      nativeStartupDiagnosticAllowlists.failure,
+      prev.native_startup_failure_category
+    ),
   };
 }
 
@@ -891,7 +956,19 @@ function mergeAuthoritativeComputeStatus(
   const payloadSession =
     typeof payload.operator_session_id === 'string' ? payload.operator_session_id : null;
   const payloadSequence = typeof payload.sequence === 'number' ? payload.sequence : null;
-  if (!payload.running || payloadSession === null || payloadSequence === null) {
+  if (payloadSession === null || payloadSequence === null) {
+    return prev;
+  }
+  if (payload.running === false) {
+    return mergeAuthoritativeNonRunningStatus(
+      prev,
+      payload,
+      startSessionId,
+      payloadSession,
+      payloadSequence
+    );
+  }
+  if (payload.running !== true) {
     return prev;
   }
 

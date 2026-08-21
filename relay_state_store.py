@@ -891,7 +891,7 @@ class InMemoryRelayStateStore:
         self._control_tombstones: dict[tuple[str, str], ControlTombstoneRecord] = {}
         self._node_tombstones: dict[str, NodeTombstoneRecord] = {}
         self._pending_node_transitions: dict[str, _PendingNodeTransition] = {}
-        self._removed_owner_digests: dict[str, str] = {}
+        self._removed_owner_digests: dict[str, set[str]] = {}
         self._deferred_deadline_identities: set[tuple[str, str]] = set()
         self._next_claim_generation = 0
         self._fairness_cursors: dict[str, tuple[str, int]] = {}
@@ -926,9 +926,11 @@ class InMemoryRelayStateStore:
                 )
             if existing is not None:
                 self._require_digest(existing, control_credential_digest)
-            elif hmac.compare_digest(
-                self._removed_owner_digests.get(self._node_digest(node_id), "0" * 64),
-                control_credential_digest,
+            elif any(
+                hmac.compare_digest(removed_digest, control_credential_digest)
+                for removed_digest in self._removed_owner_digests.get(
+                    self._node_digest(node_id), ()
+                )
             ):
                 raise RelayStateCredentialMismatch(
                     "control credential digest has stale registration authority"
@@ -1005,6 +1007,10 @@ class InMemoryRelayStateStore:
         result = self.unregister_node_and_transition_work(
             node_id, control_credential_digest, cause="explicit_unregister"
         )
+        while result.continuation_required:
+            result = self.unregister_node_and_transition_work(
+                node_id, control_credential_digest, cause="explicit_unregister"
+            )
         return result.state not in {"not_found", "already_complete"}
 
     def unregister_node_and_transition_work(
@@ -1982,7 +1988,9 @@ class InMemoryRelayStateStore:
                 if cursor[0] == node_id:
                     del self._fairness_cursors[fingerprint]
             self._pending_node_transitions[node_id] = pending
-            self._removed_owner_digests[node_digest] = record.control_credential_digest
+            self._removed_owner_digests.setdefault(node_digest, set()).add(
+                record.control_credential_digest
+            )
             self._node_tombstones[node_digest] = NodeTombstoneRecord(
                 node_digest,
                 record.control_credential_digest,
@@ -2157,6 +2165,7 @@ class InMemoryRelayStateStore:
         for node_digest, tombstone in tuple(self._node_tombstones.items()):
             if tombstone.expires_at_epoch <= now:
                 del self._node_tombstones[node_digest]
+                self._removed_owner_digests.pop(node_digest, None)
 
     def _remove_queued_identity_locked(
         self, identity: tuple[str, str], queued: QueuedRequest

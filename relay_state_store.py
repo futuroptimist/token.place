@@ -88,6 +88,10 @@ class RelayStateStoreConfig:
     control_tombstone_ttl_seconds: float = 300.0
     max_control_tombstones: int = 4096
     max_control_tombstones_per_node: int = 128
+    node_transition_batch_size: int = 64
+    max_pending_node_transitions: int = 1024
+    max_node_tombstones: int = 1024
+    node_tombstone_ttl_seconds: float = 300.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.namespace, str) or not _NAMESPACE_RE.fullmatch(
@@ -141,6 +145,9 @@ class RelayStateStoreConfig:
         self._validate_float_bound(
             self.control_tombstone_ttl_seconds, "control tombstone TTL", 0.001, 300.0
         )
+        self._validate_float_bound(
+            self.node_tombstone_ttl_seconds, "node tombstone TTL", 0.001, 300.0
+        )
         if self.terminal_retention_seconds < self.response_replay_ttl_seconds:
             raise RelayStateStoreError(
                 "terminal retention must cover response replay retention"
@@ -186,6 +193,13 @@ class RelayStateStoreConfig:
                 65_536,
             ),
             (self.max_control_tombstones, "control-tombstone bound", 1_000_000),
+            (self.node_transition_batch_size, "node-transition batch bound", 10_000),
+            (
+                self.max_pending_node_transitions,
+                "pending node-transition bound",
+                1_000_000,
+            ),
+            (self.max_node_tombstones, "node-tombstone bound", 1_000_000),
             (
                 self.max_control_tombstones_per_node,
                 "per-node control-tombstone bound",
@@ -479,6 +493,59 @@ class TerminalTransitionResult:
         return f"TerminalTransitionResult(state={self.state!r}, reason={self.reason!r}, new_outcome={self.new_outcome!r})"
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class NodeTransitionResult:
+    """Bounded, cursor-free result for removal and work terminalization."""
+
+    state: str
+    cause: str
+    processed_count: int
+    terminalized_count: int
+    continuation_remaining: bool
+    transition_epoch: float
+
+    def __repr__(self) -> str:
+        return (
+            f"NodeTransitionResult(state={self.state!r}, cause={self.cause!r}, "
+            f"processed_count={self.processed_count!r}, "
+            f"terminalized_count={self.terminalized_count!r}, "
+            f"continuation_remaining={self.continuation_remaining!r}, "
+            f"transition_epoch={self.transition_epoch!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class NodeTombstoneRecord:
+    """Short-lived digest-only marker for a removed registration owner."""
+
+    node_identity_digest: str
+    control_credential_digest: str
+    cause: str
+    status: str
+    transition_epoch: float
+    completed: bool
+    expires_at_epoch: float
+
+    def __repr__(self) -> str:
+        return (
+            "NodeTombstoneRecord(identity=<redacted>, credential=<redacted>, "
+            f"cause={self.cause!r}, status={self.status!r}, "
+            f"transition_epoch={self.transition_epoch!r}, completed={self.completed!r}, "
+            f"expires_at_epoch={self.expires_at_epoch!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PendingNodeTransition:
+    node_identity_digest: str
+    control_credential_digest: str
+    cause: str
+    status: str
+    reason: str
+    transition_epoch: float
+    identities: tuple[tuple[str, str], ...]
+
+
 @dataclass(frozen=True, slots=True)
 class EnqueueResult:
     """Safe idempotent lifecycle result."""
@@ -697,6 +764,14 @@ class RelayStateStore(Protocol):
     def list(self) -> tuple[ComputeNodeRegistration, ...]: ...
     def expire(self) -> tuple[ComputeNodeRegistration, ...]: ...
     def unregister(self, node_id: str, control_credential_digest: str) -> bool: ...
+    def unregister_node_and_transition_work(
+        self,
+        node_id: str,
+        control_credential_digest: str | None = None,
+        *,
+        cause: str = "explicit_unregister",
+    ) -> NodeTransitionResult: ...
+    def node_tombstones(self) -> tuple[NodeTombstoneRecord, ...]: ...
     def set_scheduler_state(
         self, node_id: str, control_credential_digest: str, state: SchedulerNodeState
     ) -> bool: ...
@@ -808,6 +883,8 @@ class InMemoryRelayStateStore:
         self._responses: dict[tuple[str, str], ResponseRecord] = {}
         self._terminals: dict[tuple[str, str], TerminalOutcomeRecord] = {}
         self._control_tombstones: dict[tuple[str, str], ControlTombstoneRecord] = {}
+        self._pending_node_transitions: dict[str, _PendingNodeTransition] = {}
+        self._node_tombstones: dict[str, NodeTombstoneRecord] = {}
         self._deferred_deadline_identities: set[tuple[str, str]] = set()
         self._next_claim_generation = 0
         self._fairness_cursors: dict[str, tuple[str, int]] = {}
@@ -833,6 +910,8 @@ class InMemoryRelayStateStore:
             now = self._now()
             lease_deadline = self._lease_deadline(now)
             self._expire_locked(now)
+            if node_id in self._pending_node_transitions:
+                raise RelayStateConflict("node transition is incomplete")
             existing = self._records.get(node_id)
             if existing is None and len(self._records) >= self.config.max_compute_nodes:
                 raise RelayStateCapacityExceeded(
@@ -906,20 +985,37 @@ class InMemoryRelayStateStore:
             return tuple(replace(record) for record in self._expire_locked(self._now()))
 
     def unregister(self, node_id: str, control_credential_digest: str) -> bool:
+        result = self.unregister_node_and_transition_work(
+            node_id, control_credential_digest
+        )
+        return result.state != "missing"
+
+    def unregister_node_and_transition_work(
+        self,
+        node_id: str,
+        control_credential_digest: str | None = None,
+        *,
+        cause: str = "explicit_unregister",
+    ) -> NodeTransitionResult:
+        """Remove eligibility and terminalize at most one deterministic work batch."""
         self._validate_node_id(node_id)
-        self._validate_digest(control_credential_digest)
+        if cause not in {"explicit_unregister", "registration_lease_expired"}:
+            raise RelayStateStoreError("node transition cause is invalid")
+        if cause == "explicit_unregister":
+            self._validate_digest(control_credential_digest)
+        elif control_credential_digest is not None:
+            raise RelayStateStoreError("lease eviction does not accept owner authority")
         with self._lock:
-            self._expire_locked(self._now())
-            existing = self._records.get(node_id)
-            if existing is None:
-                return False
-            self._require_digest(existing, control_credential_digest)
-            del self._records[node_id]
-            self._scheduler_states.pop(node_id, None)
-            self._registration_order.pop(node_id, None)
-            self._remove_node_reservations_locked(node_id)
-            self._remove_node_queue_locked(node_id)
-            return True
+            return self._transition_node_locked(
+                node_id, control_credential_digest, cause, self._now()
+            )
+
+    def node_tombstones(self) -> tuple[NodeTombstoneRecord, ...]:
+        with self._lock:
+            self._reap_node_tombstones_locked(self._now())
+            return tuple(
+                replace(item) for _, item in sorted(self._node_tombstones.items())
+            )
 
     def set_scheduler_state(
         self, node_id: str, control_credential_digest: str, state: SchedulerNodeState
@@ -1166,6 +1262,8 @@ class InMemoryRelayStateStore:
             reservation = self._reservations.get(identity)
             if reservation is None:
                 raise RelayStateInvalidReservation("reservation invalid")
+            if selected_node_id not in self._records:
+                raise RelayStateInvalidReservation("reservation invalid")
             self._require_same_parameters(reservation, model_id, tier, deadline)
             reserved_cancellation_digest = self._cancellation_token_digests.get(
                 identity
@@ -1363,10 +1461,12 @@ class InMemoryRelayStateStore:
             tombstone = self._control_tombstones.get(identity)
             if tombstone is not None:
                 if not (
-                    registration is not None
-                    and hmac.compare_digest(
-                        registration.control_credential_digest,
-                        control_credential_digest,
+                    (
+                        registration is None
+                        or hmac.compare_digest(
+                            registration.control_credential_digest,
+                            control_credential_digest,
+                        )
                     )
                     and tombstone.selected_node_id == node_id
                     and tombstone.generation == generation
@@ -1706,6 +1806,7 @@ class InMemoryRelayStateStore:
         tombstone_claim = None
         if claim is not None and (
             (status == "cancelled" and claim.lease_expires_at_epoch > now)
+            or (status == "failed" and claim.lease_expires_at_epoch > now)
             or (
                 status == "expired"
                 and claim.lease_expires_at_epoch >= record.request_deadline_epoch
@@ -1786,14 +1887,132 @@ class InMemoryRelayStateStore:
             key=lambda record: record.node_id,
         )
         for record in expired:
-            del self._records[record.node_id]
-            self._scheduler_states.pop(record.node_id, None)
-            self._registration_order.pop(record.node_id, None)
-            self._remove_node_reservations_locked(record.node_id)
-            self._remove_node_queue_locked(record.node_id)
+            try:
+                self._transition_node_locked(
+                    record.node_id, None, "registration_lease_expired", now
+                )
+            except RelayStateCapacityExceeded:
+                # Eligibility was already removed; bounded continuation can
+                # resume after retained terminal capacity becomes available.
+                pass
         return expired
 
+    def _transition_node_locked(
+        self, node_id: str, supplied_digest: str | None, cause: str, now: float
+    ) -> NodeTransitionResult:
+        self._reap_node_tombstones_locked(now)
+        pending = self._pending_node_transitions.get(node_id)
+        if pending is None:
+            record = self._records.get(node_id)
+            if record is None:
+                return NodeTransitionResult("missing", cause, 0, 0, False, now)
+            if cause == "explicit_unregister":
+                assert supplied_digest is not None
+                self._require_digest(record, supplied_digest)
+            elif record.lease_expires_at_epoch > now:
+                return NodeTransitionResult("lease_active", cause, 0, 0, False, now)
+            if (
+                len(self._pending_node_transitions)
+                >= self.config.max_pending_node_transitions
+            ):
+                raise RelayStateCapacityExceeded(
+                    "pending node-transition capacity reached"
+                )
+            node_digest = self._node_identity_digest(node_id)
+            if (
+                node_digest not in self._node_tombstones
+                and len(self._node_tombstones) >= self.config.max_node_tombstones
+            ):
+                raise RelayStateCapacityExceeded("node tombstone capacity reached")
+            identities = sorted(
+                {
+                    identity
+                    for identity, item in self._reservations.items()
+                    if item.selected_node_id == node_id
+                }
+                | {
+                    identity
+                    for identity, item in self._queued.items()
+                    if item.selected_node_id == node_id
+                }
+            )
+            status = "failed"
+            reason = (
+                "server_unregistered"
+                if cause == "explicit_unregister"
+                else "registration_lease_expired"
+            )
+            pending = _PendingNodeTransition(
+                node_digest,
+                record.control_credential_digest,
+                cause,
+                status,
+                reason,
+                now,
+                tuple(identities),
+            )
+            self._pending_node_transitions[node_id] = pending
+            self._node_tombstones[node_digest] = NodeTombstoneRecord(
+                node_digest,
+                record.control_credential_digest,
+                cause,
+                status,
+                now,
+                not identities,
+                min(now + self.config.node_tombstone_ttl_seconds, now + 300.0),
+            )
+            del self._records[node_id]
+            self._scheduler_states.pop(node_id, None)
+            self._registration_order.pop(node_id, None)
+            for fingerprint, cursor in tuple(self._fairness_cursors.items()):
+                if cursor[0] == node_id:
+                    del self._fairness_cursors[fingerprint]
+        elif cause != pending.cause:
+            raise RelayStateConflict("node transition cause conflict")
+        elif cause == "explicit_unregister" and not hmac.compare_digest(
+            pending.control_credential_digest, supplied_digest or ""
+        ):
+            raise RelayStateCredentialMismatch(
+                "control credential does not own transition"
+            )
+
+        batch = pending.identities[: self.config.node_transition_batch_size]
+        terminalized = 0
+        for identity in batch:
+            record = self._reservations.get(identity) or self._queued.get(identity)
+            if record is not None and identity not in self._terminals:
+                result = self._terminalize_locked(
+                    identity, record, pending.status, pending.reason, now
+                )
+                terminalized += int(result.new_outcome)
+        remaining = pending.identities[len(batch) :]
+        if remaining:
+            self._pending_node_transitions[node_id] = replace(
+                pending, identities=remaining
+            )
+        else:
+            del self._pending_node_transitions[node_id]
+            tombstone = self._node_tombstones.get(pending.node_identity_digest)
+            if tombstone is not None:
+                self._node_tombstones[pending.node_identity_digest] = replace(
+                    tombstone, completed=True
+                )
+        return NodeTransitionResult(
+            "continuation_required" if remaining else "completed",
+            pending.cause,
+            len(batch),
+            terminalized,
+            bool(remaining),
+            pending.transition_epoch,
+        )
+
+    def _reap_node_tombstones_locked(self, now: float) -> None:
+        for digest, tombstone in tuple(self._node_tombstones.items()):
+            if tombstone.expires_at_epoch <= now:
+                del self._node_tombstones[digest]
+
     def _reap_locked(self, now: float) -> None:
+        self._reap_node_tombstones_locked(now)
         # Reclaim retained-result capacity before deadline terminalization.  A
         # due lifecycle must not be blocked by terminal records or control
         # tombstones whose retention windows have already elapsed.
@@ -1940,6 +2159,10 @@ class InMemoryRelayStateStore:
         if len(encoded) > self.config.max_consumer_identity_bytes:
             raise RelayStateStoreError("consumer identity is invalid")
         return hashlib.sha256(b"consumer\0" + encoded).hexdigest()
+
+    @staticmethod
+    def _node_identity_digest(node_id: str) -> str:
+        return hashlib.sha256(b"node\0" + node_id.encode("utf-8")).hexdigest()
 
     def _model_id(self, value: str) -> str:
         if not isinstance(value, str):

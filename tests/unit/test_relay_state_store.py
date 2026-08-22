@@ -169,6 +169,683 @@ def accept_response(store, claim, **overrides):
     return store.accept_encrypted_response(**values)
 
 
+def test_node_transition_authenticates_and_tombstones_without_work(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    before = store.get("node-a")
+    with pytest.raises(RelayStateCredentialMismatch):
+        store.unregister_node_and_transition_work("node-a", digest("wrong"))
+    assert store.get("node-a") == before
+    assert store.node_tombstones() == ()
+
+    result = store.unregister_node_and_transition_work("node-a", digest("owner"))
+    assert result.state == "complete"
+    assert result.processed_count == result.new_outcomes == 0
+    assert not result.continuation_required
+    tombstone = store.node_tombstones()[0]
+    assert tombstone.cause == "explicit_unregister"
+    assert tombstone.completed
+    assert "node-a" not in repr(tombstone) and digest("owner") not in repr(tombstone)
+    with pytest.raises(FrozenInstanceError):
+        tombstone.completed = False
+
+
+def test_lease_eviction_is_inclusive_and_uses_stored_owner(store_factory, capabilities):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory, capabilities, clock=clock, lease_ttl_seconds=5
+    )
+    active = store.unregister_node_and_transition_work(
+        "node-a", digest("wrong"), cause="registration_lease_expired"
+    )
+    assert active.state == "lease_active"
+    assert store.get("node-a") is not None
+    clock.value += 5
+    result = store.unregister_node_and_transition_work(
+        "node-a", digest("wrong"), cause="registration_lease_expired"
+    )
+    assert result.state == "complete"
+    assert store.get("node-a") is None
+    assert store.node_tombstones()[0].cause == "registration_lease_expired"
+
+
+def test_node_transition_batches_mixed_work_and_immediately_fences_node(
+    store_factory, capabilities
+):
+    store = store_factory(node_transition_batch_size=1)
+    store.register("node-a", replace(capabilities, max_concurrency=10), digest("owner"))
+    reserve(store, "reserved")
+    queued_work(store, "queued")
+    claim = claimed_work(store, "claimed")
+
+    results = [store.unregister_node_and_transition_work("node-a", digest("owner"))]
+    assert results[0].continuation_required
+    assert store.get("node-a") is None
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store, "new-work")
+    with pytest.raises(RelayStateConflict):
+        store.register("node-a", capabilities, digest("replacement"))
+    while results[-1].continuation_required:
+        results.append(
+            store.unregister_node_and_transition_work("node-a", digest("owner"))
+        )
+
+    assert [result.processed_count for result in results] == [1, 1, 1]
+    assert sum(result.new_outcomes for result in results) == 3
+    assert len(store.terminal_records()) == 3
+    control = store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        claim.request_id,
+        claim.generation,
+    )
+    assert control.state == "cancelled"
+    assert control.reason == "server_unregistered"
+    store.register("node-a", capabilities, digest("replacement"))
+    assert reserve(store, "replacement-work").selected_node_id == "node-a"
+    with pytest.raises(RelayStateCredentialMismatch):
+        store.renew("node-a", digest("owner"))
+
+
+def test_node_transition_bounds_fail_before_removing_registration(
+    store_factory, capabilities
+):
+    store = store_factory(max_pending_node_transitions=1, max_node_tombstones=1)
+    store.register("node-a", capabilities, digest("owner"))
+    store.register("node-b", capabilities, digest("owner-b"))
+    queued_work(store, "a")
+    first = store.unregister_node_and_transition_work("node-a", digest("owner"))
+    assert first.state == "complete"
+    with pytest.raises(RelayStateCapacityExceeded):
+        store.unregister_node_and_transition_work("node-b", digest("owner-b"))
+    assert store.get("node-b") is not None
+
+
+def test_node_transition_capacity_is_reclaimed_with_expired_tombstones(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock, max_node_tombstones=1, node_tombstone_ttl_seconds=1
+    )
+    store.register("node-a", capabilities, digest("owner-a"))
+    assert store.unregister("node-a", digest("owner-a"))
+
+    clock.value += 1
+    store.register("node-b", capabilities, digest("owner-b"))
+    assert store.unregister("node-b", digest("owner-b"))
+
+
+def test_expire_reaps_full_retained_capacity_at_inclusive_deadline(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock,
+        lease_ttl_seconds=1,
+        node_tombstone_ttl_seconds=1,
+        terminal_retention_seconds=1,
+        control_tombstone_ttl_seconds=1,
+        response_replay_ttl_seconds=1,
+        max_node_tombstones=1,
+        max_removed_owner_fences=1,
+    )
+    store.register("node-a", capabilities, digest("owner-a"))
+    assert store.unregister("node-a", digest("owner-a"))
+    store.register("node-b", capabilities, digest("owner-b"))
+
+    clock.value += 1
+    assert [record.node_id for record in store.expire()] == ["node-b"]
+    assert store.get("node-b") is None
+    assert store.list() == ()
+    assert store.expire() == ()
+
+
+def test_retained_reaping_is_linear_and_preserves_pending_authority(
+    store_factory, capabilities, monkeypatch
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock,
+        node_transition_batch_size=1,
+        max_reservations_per_client=100,
+        max_queued_requests_per_client=100,
+        terminal_retention_seconds=1,
+        control_tombstone_ttl_seconds=1,
+        response_replay_ttl_seconds=1,
+    )
+    pending_count = 8
+    for index in range(pending_count):
+        node_id = f"node-{index}"
+        owner_digest = digest(f"owner-{index}")
+        store.register(node_id, capabilities, owner_digest)
+        queued_work(store, f"{index}-a")
+        queued_work(store, f"{index}-b")
+        result = store.unregister_node_and_transition_work(node_id, owner_digest)
+        assert result.continuation_required
+
+    clock.value += 1
+    original_compare_digest = __import__("hmac").compare_digest
+    comparisons = 0
+
+    def counting_compare_digest(left, right):
+        nonlocal comparisons
+        comparisons += 1
+        return original_compare_digest(left, right)
+
+    monkeypatch.setattr("relay_state_store.hmac.compare_digest", counting_compare_digest)
+    store._reap_retained_locked(clock.value)
+
+    assert comparisons == pending_count
+    assert len(store._former_node_authorities) == pending_count
+
+
+@pytest.mark.parametrize("operation", ["response", "cancellation"])
+def test_terminal_operation_racing_unregister_is_exactly_once(
+    store_factory, capabilities, operation
+):
+    store, _ = registered_store(
+        store_factory, capabilities, max_request_lifecycles=1
+    )
+    claim = claimed_work(store)
+
+    def terminal_operation():
+        if operation == "response":
+            return accept_response(store, claim)
+        return store.cancel_or_expire_request(
+            "client-key", "request-a", "cancel-proof-request-a"
+        )
+
+    terminal_result, removal = synchronized_results(
+        terminal_operation,
+        lambda: store.unregister_node_and_transition_work(
+            "node-a", digest("owner")
+        ),
+    )
+
+    assert removal.state in {"complete", "already_complete"}
+    assert len(store.terminal_records()) == 1
+    terminal = store.terminal_records()[0]
+    assert terminal.outcome in {"completed", "cancelled"}
+    assert store.list_reservations() == ()
+    assert store.queued_requests("node-a") == ()
+    assert store.active_claims("node-a") == ()
+    assert removal.new_outcomes + bool(
+        getattr(terminal_result, "new_outcome", False)
+    ) == 1
+    if terminal.outcome == "completed":
+        assert operation == "response"
+        assert terminal_result.new_outcome
+        assert store.response_records()
+        assert store.control_tombstones() == ()
+    else:
+        assert terminal.reason in {"server_unregistered", "requester_cancelled"}
+        assert len(store.control_tombstones()) == 1
+        if operation == "response":
+            assert isinstance(terminal_result, RelayStateConflict)
+    before_retry = lifecycle_snapshot(store)
+    retry = store.unregister_node_and_transition_work("node-a", digest("owner"))
+    assert retry.state == "already_complete"
+    assert retry.new_outcomes == 0
+    assert lifecycle_snapshot(store) == before_retry
+    store.register("node-b", capabilities, digest("owner-b"))
+    assert reserve(store, "replacement").created
+
+
+def test_renewal_racing_inclusive_lease_eviction_cannot_extend_authority(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory, capabilities, clock=clock, lease_ttl_seconds=1
+    )
+    claim = claimed_work(store)
+    clock.value += 1
+
+    renewal, eviction = synchronized_results(
+        lambda: store.renew_claim_or_read_control(
+            "node-a",
+            digest("owner"),
+            "worker-a",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ),
+        lambda: store.unregister_node_and_transition_work(
+            "node-a", None, cause="registration_lease_expired"
+        ),
+    )
+
+    assert renewal.state == "cancelled"
+    assert eviction.state in {"complete", "already_complete"}
+    assert store.get("node-a") is None
+    assert len(store.terminal_records()) == len(store.control_tombstones()) == 1
+    assert store.terminal_records()[0].reason == "server_unregistered"
+
+
+def test_registration_renewal_racing_inclusive_lease_eviction_cannot_extend_authority(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory, capabilities, clock=clock, lease_ttl_seconds=1
+    )
+    changed_capabilities = replace(capabilities, backend_class="cpu")
+    clock.value += 1
+
+    renewal, eviction = synchronized_results(
+        lambda: store.renew(
+            "node-a", digest("owner"), capabilities=changed_capabilities
+        ),
+        lambda: store.unregister_node_and_transition_work(
+            "node-a", None, cause="registration_lease_expired"
+        ),
+    )
+
+    assert renewal is None
+    assert eviction.state in {"complete", "already_complete"}
+    assert store.get("node-a") is None
+    tombstones = store.node_tombstones()
+    assert len(tombstones) == 1
+    assert tombstones[0].cause == "registration_lease_expired"
+    before_retry = lifecycle_snapshot(store), tombstones
+    retry = store.unregister_node_and_transition_work(
+        "node-a", None, cause="registration_lease_expired"
+    )
+    assert retry.state == "already_complete"
+    assert (lifecycle_snapshot(store), store.node_tombstones()) == before_retry
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store)
+
+
+def test_claim_and_renewal_are_rejected_after_transition_starts(
+    store_factory, capabilities
+):
+    store = store_factory(node_transition_batch_size=1)
+    store.register("node-a", replace(capabilities, max_concurrency=3), digest("owner"))
+    reserve(store, "first")
+    claim = claimed_work(store, "claimed")
+    queued_work(store, "unclaimed")
+
+    started = store.unregister_node_and_transition_work("node-a", digest("owner"))
+
+    assert started.continuation_required
+    with pytest.raises(RelayStateCredentialMismatch, match="claim owner is invalid"):
+        store.claim_queued_request("node-a", digest("owner"), "worker-b")
+    renewal = store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "claimed",
+        claim.generation,
+    )
+    assert renewal.state == "owner_mismatch"
+
+
+@pytest.mark.parametrize(
+    "retrieval_state",
+    ["response_ready", "acknowledged", "retrieval_expired", "completed_unavailable"],
+)
+def test_response_retrieval_state_is_unchanged_by_node_removal(
+    store_factory, capabilities, retrieval_state
+):
+    if retrieval_state == "completed_unavailable":
+        store, clock = registered_store(store_factory, capabilities)
+        claimed_work(store)
+        cancelled = store.cancel_or_expire_request(
+            "client-key", "request-a", "cancel-proof-request-a"
+        )
+        assert cancelled.new_outcome
+    else:
+        store, clock, _, acceptance, credential = completed_response(
+            store_factory,
+            capabilities,
+            response_replay_ttl_seconds=2,
+            terminal_retention_seconds=5,
+        )
+        if retrieval_state == "acknowledged":
+            ready = retrieve_response(store, credential)
+            assert retrieve_response(
+                store, credential, ready.acknowledgement_token
+            ).state == "acknowledged"
+        elif retrieval_state == "retrieval_expired":
+            clock.value = acceptance.replay_expires_at_epoch
+            assert retrieve_response(store, credential).state == "retrieval_expired"
+    before = lifecycle_snapshot(store)
+
+    result = store.unregister_node_and_transition_work("node-a", digest("owner"))
+
+    assert result.new_outcomes == 0
+    assert lifecycle_snapshot(store) == before
+    assert store.terminal_records()[0].retrieval_state == retrieval_state
+
+
+def test_pending_transition_bound_fails_before_mutation_independent_of_tombstones(
+    store_factory, capabilities
+):
+    store = store_factory(
+        node_transition_batch_size=1,
+        max_pending_node_transitions=1,
+        max_node_tombstones=2,
+    )
+    store.register("node-a", capabilities, digest("owner-a"))
+    queued_work(store, "a-1")
+    queued_work(store, "a-2")
+    store.register("node-b", capabilities, digest("owner-b"))
+    assert store.unregister_node_and_transition_work(
+        "node-a", digest("owner-a")
+    ).continuation_required
+    before = store.get("node-b")
+
+    with pytest.raises(RelayStateCapacityExceeded, match="pending node-transition"):
+        store.unregister_node_and_transition_work("node-b", digest("owner-b"))
+
+    assert store.get("node-b") == before
+    assert len(store.node_tombstones()) == 1
+
+
+def test_claimed_removal_has_distinct_node_and_control_tombstone_lifecycles(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        clock=clock,
+        node_tombstone_ttl_seconds=1,
+        control_tombstone_ttl_seconds=3,
+        terminal_retention_seconds=3,
+        response_replay_ttl_seconds=3,
+    )
+    claim = claimed_work(store)
+
+    result = store.unregister_node_and_transition_work("node-a", digest("owner"))
+
+    assert result.claims_terminalized == result.new_outcomes == 1
+    assert len(store.node_tombstones()) == len(store.control_tombstones()) == 1
+    control = store.control_tombstones()[0]
+    clock.value += 1
+    assert store.node_tombstones() == ()
+    assert store.control_tombstones() == (control,)
+    assert store.terminal_records()[0].reason == "server_unregistered"
+    assert store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+    ).state == "cancelled"
+
+
+def test_removal_artifacts_errors_and_logs_are_redacted(
+    store_factory, capabilities, caplog
+):
+    node_id = "uniquely-sensitive-node"
+    owner = "uniquely-sensitive-owner"
+    client = "uniquely-sensitive-client"
+    request = "uniquely-sensitive-request"
+    worker = "uniquely-sensitive-worker"
+    ciphertext = "uniquely-sensitive-ciphertext"
+    token = "uniquely-sensitive-token"
+    store = store_factory(node_transition_batch_size=1)
+    store.register(node_id, capabilities, digest(owner))
+    selection = reserve(store, request, client_public_key=client)
+    enqueue(
+        store,
+        selection,
+        request,
+        client_public_key=client,
+        envelope=envelope(ciphertext),
+        cancellation_token=token,
+    )
+    claim = store.claim_queued_request(node_id, digest(owner), worker)
+
+    result = store.unregister_node_and_transition_work(node_id, digest(owner))
+    with pytest.raises(RelayStateCredentialMismatch) as captured:
+        store.unregister_node_and_transition_work(node_id, digest("wrong"))
+    rendered = repr(
+        (
+            result,
+            store.node_tombstones(),
+            store.control_tombstones(),
+            store.terminal_records(),
+            captured.value,
+        )
+    )
+
+    for secret in (node_id, owner, client, request, worker, ciphertext, token):
+        assert secret not in rendered
+        assert secret not in caplog.text
+    assert not ({"cursor", "offset", "identities"} & {f.name for f in fields(result)})
+    assert claim.request_id == request
+
+
+def test_node_reuse_retains_all_unexpired_owner_fences(store_factory, capabilities):
+    store, _ = registered_store(store_factory, capabilities)
+    assert store.unregister("node-a", digest("owner"))
+    store.register("node-a", capabilities, digest("replacement"))
+    assert store.unregister("node-a", digest("replacement"))
+
+    with pytest.raises(RelayStateCredentialMismatch):
+        store.register("node-a", capabilities, digest("owner"))
+    with pytest.raises(RelayStateCredentialMismatch):
+        store.register("node-a", capabilities, digest("replacement"))
+
+
+def test_compatibility_unregister_starts_bounded_transition_completed_by_sweeps(
+    store_factory, capabilities
+):
+    store = store_factory(node_transition_batch_size=1)
+    store.register("node-a", replace(capabilities, max_concurrency=3), digest("owner"))
+    for request_id in ("a", "b", "c"):
+        queued_work(store, request_id)
+
+    assert store.unregister("node-a", digest("owner"))
+    assert len(store.terminal_records()) == 1
+    assert not store.node_tombstones()[0].completed
+    store.expire()
+    store.expire()
+    assert len(store.terminal_records()) == 3
+    assert store.node_tombstones()[0].completed
+
+
+def test_completed_transition_survives_tombstone_expiry_and_fence_reaps_later(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock,
+        node_tombstone_ttl_seconds=1,
+        terminal_retention_seconds=3,
+        response_replay_ttl_seconds=3,
+        control_tombstone_ttl_seconds=3,
+    )
+    store.register("node-a", capabilities, digest("owner"))
+    assert store.unregister("node-a", digest("owner"))
+
+    clock.value += 1
+    assert store.node_tombstones() == ()
+    replay = store.unregister_node_and_transition_work("node-a", digest("owner"))
+    assert replay.state == "already_complete"
+    with pytest.raises(RelayStateCredentialMismatch):
+        store.register("node-a", capabilities, digest("owner"))
+
+    clock.value += 2
+    store.register("node-a", capabilities, digest("owner"))
+
+
+def test_long_lease_eviction_retains_reserved_fence_from_completion(
+    store_factory, capabilities, caplog
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock,
+        lease_ttl_seconds=1,
+        node_transition_batch_size=1,
+        node_tombstone_ttl_seconds=0.25,
+        terminal_retention_seconds=2,
+        control_tombstone_ttl_seconds=2,
+        response_replay_ttl_seconds=2,
+        max_removed_owner_fences=2,
+    )
+    store.register("node-a", replace(capabilities, max_concurrency=3), digest("owner"))
+    for request_id in ("a", "b", "c"):
+        queued_work(store, request_id)
+
+    clock.value += 1
+    first = store.unregister_node_and_transition_work(
+        "node-a", digest("caller-is-not-authority"), cause="registration_lease_expired"
+    )
+    assert first.continuation_required
+
+    clock.value += 1
+    store.register("node-b", capabilities, digest("owner-b"))
+    assert store.unregister("node-b", digest("owner-b"))
+
+    # The provisional deadline is inclusive, but pending cleanup retains its
+    # already-reserved fence even while all other fence capacity is occupied.
+    clock.value += 1
+    second = store.unregister_node_and_transition_work(
+        "node-a", digest("ignored-again"), cause="registration_lease_expired"
+    )
+    completed = store.unregister_node_and_transition_work(
+        "node-a", None, cause="registration_lease_expired"
+    )
+    assert second.continuation_required
+    assert completed.state == "complete"
+    assert sum(result.new_outcomes for result in (first, second, completed)) == 3
+    assert store.node_tombstones() == ()
+
+    clock.value += 1
+    retry = store.unregister_node_and_transition_work(
+        "node-a", digest("untrusted-caller"), cause="registration_lease_expired"
+    )
+    assert retry.state == "already_complete"
+    assert retry.transition_epoch == first.transition_epoch
+    assert retry.new_outcomes == 0
+    assert "node-a" not in repr(retry)
+    assert digest("owner") not in repr(retry)
+    assert digest("caller-is-not-authority") not in caplog.text
+
+    # A read-only retry did not refresh retention: capacity is reusable at the
+    # inclusive deadline measured from completion.
+    clock.value += 1
+    expired = store.unregister_node_and_transition_work(
+        "node-a", digest("ignored"), cause="registration_lease_expired"
+    )
+    assert expired.state == "not_found"
+    store.register("node-a", capabilities, digest("owner"))
+
+
+@pytest.mark.parametrize(
+    ("cause", "supplied_digest"),
+    [
+        ("explicit_unregister", digest("owner")),
+        ("registration_lease_expired", digest("not-owner")),
+    ],
+)
+def test_completed_transition_retry_survives_short_node_tombstone(
+    store_factory, capabilities, cause, supplied_digest
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        clock=clock,
+        lease_ttl_seconds=1,
+        node_tombstone_ttl_seconds=0.25,
+        terminal_retention_seconds=2,
+        control_tombstone_ttl_seconds=2,
+        response_replay_ttl_seconds=2,
+    )
+    if cause == "registration_lease_expired":
+        clock.value += 1
+    completed = store.unregister_node_and_transition_work(
+        "node-a", supplied_digest, cause=cause
+    )
+
+    clock.value += 0.25
+    assert store.node_tombstones() == ()
+    retry = store.unregister_node_and_transition_work(
+        "node-a", supplied_digest, cause=cause
+    )
+    assert retry.state == "already_complete"
+    assert retry.cause == cause
+    assert retry.transition_epoch == completed.transition_epoch
+
+
+def test_removed_owner_fence_bound_fails_closed_before_node_mutation(
+    store_factory, capabilities
+):
+    store = store_factory(max_removed_owner_fences=1)
+    store.register("node-a", capabilities, digest("owner-a"))
+    store.register("node-b", capabilities, digest("owner-b"))
+    assert store.unregister("node-a", digest("owner-a"))
+
+    with pytest.raises(RelayStateCapacityExceeded, match="fencing capacity"):
+        store.unregister("node-b", digest("owner-b"))
+    assert store.get("node-b") is not None
+
+
+def test_concurrent_node_continuations_terminalize_once(store_factory, capabilities):
+    store = store_factory(node_transition_batch_size=1)
+    store.register("node-a", replace(capabilities, max_concurrency=10), digest("owner"))
+    for request_id in ("a", "b", "c"):
+        queued_work(store, request_id)
+    first = store.unregister_node_and_transition_work("node-a", digest("owner"))
+    assert first.continuation_required
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda _: store.unregister_node_and_transition_work(
+                    "node-a", digest("owner")
+                ),
+                range(2),
+            )
+        )
+    assert sum(result.new_outcomes for result in (first, *results)) == 3
+    assert len(store.terminal_records()) == 3
+
+
+def test_transition_rejects_enqueue_without_consuming_remaining_reservation(
+    store_factory, capabilities
+):
+    store = store_factory(node_transition_batch_size=1)
+    store.register("node-a", replace(capabilities, max_concurrency=2), digest("owner"))
+    reserve(store, "first")
+    remaining = reserve(store, "remaining")
+
+    assert store.unregister("node-a", digest("owner"))
+    with pytest.raises(RelayStateInvalidReservation):
+        enqueue(store, remaining, request_id="remaining")
+    assert len(store.list_reservations()) == 1
+    store.expire()
+    assert store.list_reservations() == ()
+
+
+def test_transition_batch_uses_node_index_without_scanning_global_work(
+    store_factory, capabilities
+):
+    class NoItemsDict(dict):
+        def items(self):
+            raise AssertionError("global reservation scan")
+
+    store = store_factory(node_transition_batch_size=1)
+    store.register("node-a", capabilities, digest("owner"))
+    reserve(store, "target")
+    store._reservations = NoItemsDict(store._reservations)
+
+    result = store.unregister_node_and_transition_work("node-a", digest("owner"))
+    assert result.processed_count == 1
+    assert not result.continuation_required
+
+
 def test_authenticated_cancellation_and_owner_bound_acknowledgement(
     store_factory, capabilities
 ):
@@ -373,17 +1050,27 @@ def test_control_expiry_and_node_reuse_fence_stale_claim_authority(
 
     assert store.unregister("node-a", digest("owner"))
     store.register("node-a", capabilities, digest("replacement-owner"))
+    old_owner = store.renew_claim_or_read_control(
+        "node-a",
+        digest("owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+        acknowledge=True,
+    )
+    assert old_owner.state == "acknowledged"
+    replacement = store.renew_claim_or_read_control(
+        "node-a",
+        digest("replacement-owner"),
+        "worker-a",
+        "client-key",
+        "request-a",
+        claim.generation,
+        acknowledge=True,
+    )
+    assert replacement.state == "owner_mismatch"
     for credential in (digest("owner"), digest("replacement-owner")):
-        result = store.renew_claim_or_read_control(
-            "node-a",
-            credential,
-            "worker-a",
-            "client-key",
-            "request-a",
-            claim.generation,
-            acknowledge=True,
-        )
-        assert result.state == "owner_mismatch"
         with pytest.raises(RelayStateConflict):
             accept_response(store, claim, control_credential_digest=credential)
 
@@ -1120,9 +1807,7 @@ def test_expiry_versus_response_at_deadline_is_authoritative(
     assert lifecycle_snapshot(store) == snapshot
 
 
-def test_cancellation_versus_renewal_ends_with_control(
-    store_factory, capabilities
-):
+def test_cancellation_versus_renewal_ends_with_control(store_factory, capabilities):
     store, _ = registered_store(store_factory, capabilities)
     claim = claimed_work(store)
     renew = lambda: store.renew_claim_or_read_control(
@@ -2066,7 +2751,7 @@ def test_unregister_and_node_id_reuse_cannot_restore_old_generation(
     old = store.claim_queued_request("node-a", digest("owner"), "worker")
     assert store.unregister("node-a", digest("owner"))
     store.register("node-a", capabilities, digest("new-owner"))
-    queued_work(store)
+    queued_work(store, "request-b")
     new = store.claim_queued_request("node-a", digest("new-owner"), "new-worker")
     assert new.generation > old.generation
     assert (
@@ -2078,7 +2763,7 @@ def test_unregister_and_node_id_reuse_cannot_restore_old_generation(
             "request-a",
             old.generation,
         ).state
-        == "stale_generation"
+        == "owner_mismatch"
     )
 
 
@@ -2094,7 +2779,7 @@ def test_registration_expiry_and_node_id_reuse_cannot_restore_old_generation(
 
     clock.value += 5
     store.register("node-a", capabilities, digest("new-owner"))
-    queued_work(store)
+    queued_work(store, "request-b")
     new = store.claim_queued_request("node-a", digest("new-owner"), "new-worker")
 
     assert new.generation > old.generation
@@ -2107,7 +2792,7 @@ def test_registration_expiry_and_node_id_reuse_cannot_restore_old_generation(
             "request-a",
             old.generation,
         ).state
-        == "stale_generation"
+        == "owner_mismatch"
     )
 
 
@@ -2590,11 +3275,16 @@ def test_node_teardown_removes_queued_work(store_factory, capabilities, teardown
 
     assert store.queued_requests("node-a") == ()
     store.register("node-a", capabilities, digest("replacement"))
-    replacement = reserve(store, cancellation_token="replacement-cancellation-proof")
+    replacement = reserve(
+        store,
+        request_id="request-b",
+        cancellation_token="replacement-cancellation-proof",
+    )
     assert replacement.selected_node_id == "node-a"
     assert enqueue(
         store,
         replacement,
+        request_id="request-b",
         cancellation_token="replacement-cancellation-proof",
     ).created
 
@@ -2615,10 +3305,15 @@ def test_node_teardown_removes_reserved_cancellation_proof(
         assert store.expire()
 
     store.register("node-a", capabilities, digest("replacement"))
-    replacement = reserve(store, cancellation_token="replacement-cancellation-proof")
+    replacement = reserve(
+        store,
+        request_id="request-b",
+        cancellation_token="replacement-cancellation-proof",
+    )
     assert enqueue(
         store,
         replacement,
+        request_id="request-b",
         cancellation_token="replacement-cancellation-proof",
     ).created
 

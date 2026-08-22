@@ -1058,11 +1058,13 @@ def test_operator_start_diagnostic_is_preserved_in_failure_artifact(desktop_runn
 
 def test_post_start_operator_state_records_running_and_registration(desktop_runner):
     progress = []
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "entered", "invocation_state": "resolved"}
     desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
     desktop_runner._status_value = lambda _driver, label: "yes" if label == "Registered" else "no"
 
     class Wait:
-        def __init__(self, _driver, timeout):
+        def __init__(self, _driver, timeout, **_kwargs):
             assert timeout == 9
 
         def until(self, predicate):
@@ -1077,6 +1079,8 @@ def test_post_start_operator_state_records_running_and_registration(desktop_runn
 
 def test_post_start_operator_state_distinguishes_running_failure(desktop_runner):
     private_error = "C:\\private\\model.gguf prompt-secret"
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "entered", "invocation_state": "resolved"}
     desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: (
         (_ for _ in ()).throw(RuntimeError(private_error)))
     failures = []
@@ -1095,13 +1099,21 @@ def test_post_start_operator_state_distinguishes_running_failure(desktop_runner)
 
 def test_post_start_operator_state_distinguishes_registration_failure(desktop_runner):
     progress = []
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "entered", "invocation_state": "resolved"}
     desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
 
     class Wait:
-        def __init__(self, _driver, _timeout):
+        calls = 0
+
+        def __init__(self, _driver, _timeout, **_kwargs):
             pass
 
-        def until(self, _predicate):
+        def until(self, predicate):
+            type(self).calls += 1
+            if self.calls == 1:
+                assert predicate(object()) is True
+                return True
             raise RuntimeError("https://private.example prompt-secret")
 
     desktop_runner.WebDriverWait = Wait
@@ -1115,6 +1127,31 @@ def test_post_start_operator_state_distinguishes_registration_failure(desktop_ru
 
     assert progress == ["operator_running"]
     assert "private.example" not in str(raised.value)
+
+
+def test_post_start_operator_state_rejects_optimistic_running_without_active_attempt(
+        desktop_runner):
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "not_entered", "invocation_state": "not_started"}
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: pytest.fail(
+        "stale Running state must not be inspected before active-attempt evidence")
+
+    class Wait:
+        def __init__(self, _driver, _timeout, **_kwargs):
+            pass
+
+        def until(self, predicate):
+            assert predicate(object()) is False
+            raise RuntimeError("bounded active-attempt wait expired")
+
+    desktop_runner.WebDriverWait = Wait
+
+    def fail_closed(reason):
+        raise RuntimeError(reason) from None
+
+    with pytest.raises(RuntimeError, match="^operator_running_not_reached$"):
+        desktop_runner.wait_for_post_start_operator_state(
+            object(), lambda: 9, pytest.fail, fail_closed)
 
 
 def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(

@@ -278,6 +278,16 @@ def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining
         record_progress, fail_closed) -> None:
     """Require the two ordered post-click operator boundaries fail closed."""
     try:
+        WebDriverWait(driver, setup_remaining(), poll_frequency=0.25).until(
+            lambda d: (
+                (diagnostic := _read_operator_start_diagnostic(d))["start_handler_state"]
+                == "entered"
+                and diagnostic["invocation_state"] in {"pending", "resolved"}
+            )
+        )
+    except Exception:
+        fail_closed("operator_running_not_reached")
+    try:
         wait_for_running_stability(driver, "yes", stable_seconds=3,
             timeout_seconds=setup_remaining())
     except Exception:

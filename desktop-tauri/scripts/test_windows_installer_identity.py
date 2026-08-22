@@ -33,6 +33,11 @@ APP_PROCESS_NAMES = ("token.place", "tokenplace", "token-place")
 ACCEPTABLE_UNINSTALL_EXIT_CODES = frozenset({0, 1605, 1614, 3010})
 WINDOWS_UNINSTALL_CLEANUP_TIMEOUT_SECONDS = 90.0
 WINDOWS_UNINSTALL_REINVENTORY_PASSES = 3
+# The installed boundary starts its own relay (30s), then delegates to the
+# packaged adapter's setup, request, finalization, and cleanup windows.  Keep a
+# small fixed allowance for the child to atomically publish its final report.
+INSTALLED_BOUNDARY_SUPERVISOR_TIMEOUT_SECONDS = 30 + 300 + 180 + 120 + 30 + 15
+INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS = 15
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 EXPECTED_LLAMA_CPP_VERSION = "0.3.32"
 EXPECTED_LLAMA_CPP_WHEEL = "llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
@@ -1088,11 +1093,12 @@ def run_installed_tokenizer_boundary(
     exe: Path,
     model: Path,
     log_path: Path | None = None,
+    *,
+    platform_name: str | None = None,
 ) -> None:
     """Run the production tokenizer boundary against the validated installation."""
     runner = Path(__file__).with_name("test_desktop_operator_ui_e2e.py")
-    result = _run(
-        [
+    command = [
             sys.executable,
             str(runner),
             "--packaged-windows-tokenizer-boundary",
@@ -1100,26 +1106,66 @@ def run_installed_tokenizer_boundary(
             str(exe),
             "--model",
             str(model.resolve(strict=True)),
-        ],
-        timeout=240,
-        check=False,
-        separate_stderr=True,
-    )
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "boundary": "installed_package_tokenizer",
-                    "outcome": "passed" if result.returncode == 0 else "failed",
-                },
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
+        ]
+    owned_platform = os.name if platform_name is None else platform_name
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    outcome = "failed"
+    cleanup_succeeded = True
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(  # noqa: S603
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            creationflags=creationflags if owned_platform == "nt" else 0,
+            start_new_session=owned_platform != "nt",
         )
-    if result.returncode != 0:
+        returncode = process.wait(timeout=INSTALLED_BOUNDARY_SUPERVISOR_TIMEOUT_SECONDS)
+        outcome = "passed" if returncode == 0 else "failed"
+    except OSError:
+        outcome = "failed"
+        cleanup_succeeded = process is None
+    except subprocess.TimeoutExpired:
+        assert process is not None
+        outcome = "supervisor_timeout"
+        cleanup_succeeded = False
+        if owned_platform == "nt":
+            try:
+                killed = subprocess.run(  # noqa: S603
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS,
+                    check=False,
+                )
+                cleanup_succeeded = killed.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                cleanup_succeeded = False
+        if not cleanup_succeeded:
+            process.kill()
+        try:
+            process.wait(timeout=INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            cleanup_succeeded = False
+    finally:
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "boundary": "installed_package_tokenizer",
+                        "outcome": outcome,
+                        "cleanup_succeeded": cleanup_succeeded,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+    if outcome != "passed":
         raise InstallerIdentityError(
             "installed-package tokenizer production boundary failed; see bounded validation artifacts"
         )

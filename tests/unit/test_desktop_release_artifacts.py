@@ -5252,23 +5252,27 @@ def test_windows_installer_identity_boundary_invokes_installed_executable_and_bo
     exe.write_text('exe', encoding='utf-8')
     model.write_text('model', encoding='utf-8')
     calls = []
-    monkeypatch.setattr(
-        guard,
-        '_run',
-        lambda cmd, **kwargs: (calls.append((cmd, kwargs)) or subprocess.CompletedProcess(cmd, 0, 'passed', '')),
-    )
+    class Process:
+        pid = 731
+        def wait(self, timeout):
+            calls.append(('wait', timeout))
+            return 0
+    monkeypatch.setattr(guard.subprocess, 'Popen',
+        lambda cmd, **kwargs: (calls.append((cmd, kwargs)) or Process()))
 
     guard.run_installed_tokenizer_boundary(exe, model, log)
 
     cmd, kwargs = calls[0]
     assert cmd[cmd.index('--app-binary') + 1] == str(exe)
     assert cmd[cmd.index('--model') + 1] == str(model.resolve())
-    assert kwargs['separate_stderr'] is True
-    assert kwargs['check'] is False
+    assert kwargs['stdout'] is guard.subprocess.DEVNULL
+    assert kwargs['stderr'] is guard.subprocess.DEVNULL
+    assert calls[1] == ('wait', guard.INSTALLED_BOUNDARY_SUPERVISOR_TIMEOUT_SECONDS)
     assert json.loads(log.read_text(encoding='utf-8')) == {
         'boundary': 'installed_package_tokenizer',
+        'cleanup_succeeded': True,
         'outcome': 'passed',
-        'schema_version': 1,
+        'schema_version': 2,
     }
     assert str(exe) not in log.read_text(encoding='utf-8')
     assert str(model) not in log.read_text(encoding='utf-8')
@@ -5283,22 +5287,86 @@ def test_windows_installer_identity_boundary_failure_writes_only_bounded_artifac
     log = tmp_path / 'boundary.log'
     exe.write_text('exe', encoding='utf-8')
     model.write_text('model', encoding='utf-8')
-    monkeypatch.setattr(
-        guard,
-        '_run',
-        lambda cmd, **kwargs: subprocess.CompletedProcess(
-            cmd, 1, f'hostile {exe}', f'hostile {model}'
-        ),
-    )
+    class Process:
+        pid = 731
+        def wait(self, timeout):
+            return 1
+    monkeypatch.setattr(guard.subprocess, 'Popen', lambda cmd, **kwargs: Process())
 
     with pytest.raises(guard.InstallerIdentityError, match='bounded validation artifacts'):
         guard.run_installed_tokenizer_boundary(exe, model, log)
 
     assert json.loads(log.read_text(encoding='utf-8')) == {
         'boundary': 'installed_package_tokenizer',
+        'cleanup_succeeded': True,
         'outcome': 'failed',
-        'schema_version': 1,
+        'schema_version': 2,
     }
+
+
+def test_windows_installer_identity_boundary_launch_failure_still_writes_artifact(
+    monkeypatch, tmp_path
+) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'private-app.exe'
+    model = tmp_path / 'private-model.gguf'
+    log = tmp_path / 'boundary.log'
+    exe.write_text('exe', encoding='utf-8')
+    model.write_text('model', encoding='utf-8')
+    monkeypatch.setattr(guard.subprocess, 'Popen',
+        lambda cmd, **kwargs: (_ for _ in ()).throw(OSError('private launch failure')))
+
+    with pytest.raises(guard.InstallerIdentityError, match='bounded validation artifacts'):
+        guard.run_installed_tokenizer_boundary(exe, model, log)
+
+    assert json.loads(log.read_text(encoding='utf-8')) == {
+        'boundary': 'installed_package_tokenizer',
+        'cleanup_succeeded': True,
+        'outcome': 'failed',
+        'schema_version': 2,
+    }
+    assert 'private launch failure' not in log.read_text(encoding='utf-8')
+
+
+def test_windows_installer_identity_boundary_timeout_kills_owned_tree_and_reports_bounded_failure(
+    monkeypatch, tmp_path
+) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'private-app.exe'
+    model = tmp_path / 'private-model.gguf'
+    log = tmp_path / 'boundary.log'
+    exe.write_text('exe', encoding='utf-8')
+    model.write_text('model', encoding='utf-8')
+    waits = []
+    class Process:
+        pid = 731
+        def wait(self, timeout):
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise subprocess.TimeoutExpired('private command', timeout)
+            return 1
+        def kill(self):
+            pytest.fail('successful taskkill should not require direct kill')
+    taskkills = []
+    monkeypatch.setattr(guard.subprocess, 'Popen', lambda cmd, **kwargs: Process())
+    monkeypatch.setattr(guard.subprocess, 'run', lambda cmd, **kwargs:
+        (taskkills.append((cmd, kwargs)) or subprocess.CompletedProcess(cmd, 0)))
+
+    with pytest.raises(guard.InstallerIdentityError, match='bounded validation artifacts'):
+        guard.run_installed_tokenizer_boundary(exe, model, log, platform_name='nt')
+
+    assert taskkills[0][0] == ['taskkill', '/PID', '731', '/T', '/F']
+    assert waits == [guard.INSTALLED_BOUNDARY_SUPERVISOR_TIMEOUT_SECONDS,
+        guard.INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS]
+    artifact = json.loads(log.read_text(encoding='utf-8'))
+    assert artifact == {
+        'boundary': 'installed_package_tokenizer',
+        'cleanup_succeeded': True,
+        'outcome': 'supervisor_timeout',
+        'schema_version': 2,
+    }
+    assert str(exe) not in log.read_text(encoding='utf-8')
+    assert str(model) not in log.read_text(encoding='utf-8')
 
 
 

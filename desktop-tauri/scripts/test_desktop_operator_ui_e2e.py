@@ -19,11 +19,18 @@ from pathlib import Path
 from urllib.request import urlopen
 
 import psutil
+from urllib3.exceptions import (
+    ConnectTimeoutError,
+    NewConnectionError,
+    ProtocolError,
+    ReadTimeoutError,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPO_ROOT / "desktop-tauri"
 TAURI_ROOT = DESKTOP_ROOT / "src-tauri"
 WEBDRIVER_URL = "http://127.0.0.1:4444"
+NATIVE_WEBDRIVER_URL = "http://127.0.0.1:4445"
 LOGS_DIR = REPO_ROOT / ".desktop-e2e-logs"
 BOOTSTRAP_LOG = LOGS_DIR / "bootstrap.log"
 
@@ -37,8 +44,10 @@ if str(REPO_ROOT) not in sys.path:
 try:
     from selenium import webdriver
     from selenium.common.exceptions import (
+        InvalidArgumentException,
         NoSuchElementException,
         NoSuchFrameException,
+        SessionNotCreatedException,
         StaleElementReferenceException,
         TimeoutException,
         WebDriverException,
@@ -47,7 +56,6 @@ try:
     from selenium.webdriver.common.action_chains import ActionChains  # pragma: no cover
     from selenium.webdriver.common.keys import Keys  # pragma: no cover
     from selenium.webdriver.support.ui import WebDriverWait
-
     from utils.crypto_helpers import CryptoClient
     from scripts.long_context_benchmark.benchmark_harness import (
         apply_benchmark_context_tier,
@@ -56,6 +64,9 @@ try:
         benchmark_operator_mode,
         OwnedProcessTreeMemorySampler,
         PACKAGED_FAILURE_REASONS,
+        PACKAGED_PHASES,
+        generate_fixture,
+        invoke_packaged_runtime_adapter,
         parse_packaged_local_telemetry,
         packaged_phase_remaining,
         prefill_cancellation_trigger_state,
@@ -157,6 +168,33 @@ def wait_for_port(
     raise RuntimeError(f"timeout waiting for {host}:{port}")
 
 
+def wait_for_webdriver_ready(
+    process: subprocess.Popen[str], timeout_seconds: float,
+) -> None:
+    """Wait for the native WebDriver behind tauri-driver to report readiness."""
+    status_url = NATIVE_WEBDRIVER_URL if os.name == "nt" else WEBDRIVER_URL
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("tauri_driver_exited") from None
+        remaining = deadline - time.monotonic()
+        try:
+            with urlopen(  # nosec B310 - fixed loopback WebDriver endpoint
+                    f"{status_url}/status",
+                    timeout=max(0.05, min(remaining, 0.5))) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if (isinstance(payload, dict)
+                    and isinstance(payload.get("value"), dict)
+                    and payload["value"].get("ready") is True):
+                return
+        except Exception:
+            pass
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if process.poll() is not None:
+        raise RuntimeError("tauri_driver_exited") from None
+    raise RuntimeError("webdriver_transport_failure") from None
+
+
 def ensure_alive(process: subprocess.Popen[str], label: str) -> None:
     if process.poll() is None:
         return
@@ -236,6 +274,39 @@ def wait_for_running_stability(
         time.sleep(0.2)
 
 
+def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining,
+        record_progress, fail_closed) -> None:
+    """Require the two ordered post-click operator boundaries fail closed."""
+    active_attempt_ready = True
+    try:
+        WebDriverWait(driver, setup_remaining(), poll_frequency=0.25).until(
+            lambda d: (
+                (diagnostic := _read_operator_start_diagnostic(d))["start_handler_state"]
+                == "entered"
+                and diagnostic["invocation_state"] in {"pending", "resolved"}
+            )
+        )
+    except Exception:
+        active_attempt_ready = False
+    if not active_attempt_ready:
+        fail_closed("operator_running_not_reached")
+    running_stable = True
+    try:
+        wait_for_running_stability(driver, "yes", stable_seconds=3,
+            timeout_seconds=setup_remaining())
+    except Exception:
+        running_stable = False
+    if not running_stable:
+        fail_closed("operator_running_not_reached")
+    record_progress("operator_running")
+    try:
+        WebDriverWait(driver, setup_remaining()).until(
+            lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+    except Exception:
+        fail_closed("operator_registration_not_reached")
+    record_progress("operator_registered")
+
+
 def landing_compute_node_status_matches(driver: webdriver.Remote, expected: str) -> bool:
     try:
         status = driver.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
@@ -288,60 +359,64 @@ def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -
 
 
 def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> None:
-    recovery_attempts = 0
-    last_recovery_at = 0.0
+    """Select the application WebView and wait for its required operator controls."""
+    last_category = "no_window_handle"
 
     def _ready(d: webdriver.Remote) -> bool:
-        nonlocal recovery_attempts
-        nonlocal last_recovery_at
+        nonlocal last_category
         try:
-            with contextlib.suppress(WebDriverException):
-                d.switch_to.default_content()
-            state = d.execute_script("return document.readyState")
-            if state != "complete":
+            handles = list(d.window_handles)
+            if not handles:
+                last_category = "no_window_handle"
                 return False
-            model_label_ready = bool(
-                d.find_elements(By.XPATH, "//label[normalize-space()='Model GGUF path']")
-            )
-            relay_input_ready = bool(
-                d.find_elements(
-                    By.XPATH,
-                    "(//label[normalize-space()='Relay URL 1']/following::input[1])[1]",
-                )
-            )
-            runtime_path_ready = bool(
-                d.find_elements(
-                    By.XPATH,
-                    "//div[contains(normalize-space(),'Runtime resolved path:')]/code",
-                )
-            )
-            if model_label_ready and relay_input_ready and runtime_path_ready:
-                return True
-
-            page_source = ""
-            with contextlib.suppress(WebDriverException):
-                page_source = d.page_source
-            if (
-                recovery_attempts < 4
-                and "could not connect to localhost" in page_source.lower()
-                and (time.time() - last_recovery_at) >= 1.0
-            ):
-                recovery_attempts += 1
-                last_recovery_at = time.time()
-                with contextlib.suppress(WebDriverException):
-                    d.get("tauri://localhost/")
-                with contextlib.suppress(WebDriverException):
-                    d.get("tauri://localhost/index.html")
+            last_category = "wrong_handle"
+            for handle in handles:
+                try:
+                    d.switch_to.window(handle)
+                    d.switch_to.default_content()
+                    if d.execute_script("return document.readyState") != "complete":
+                        continue
+                    title = d.execute_script("return document.title")
+                    if not isinstance(title, str) or "token.place" not in title.lower():
+                        continue
+                    if not d.find_elements(
+                            By.XPATH,
+                            "//h1[normalize-space()='token.place desktop compute node']"):
+                        last_category = "missing_shell"
+                        continue
+                    initialization = d.execute_script(
+                        "return document.querySelector('main')?.dataset.applicationInitialization")
+                    if initialization == "failed":
+                        raise RuntimeError("application_initialization_failed")
+                    if initialization != "ready":
+                        last_category = "initialization_pending"
+                        continue
+                    model_input_ready = bool(d.find_elements(
+                        By.XPATH,
+                        "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]"))
+                    relay_input_ready = bool(d.find_elements(
+                        By.XPATH,
+                        "(//label[normalize-space()='Relay URL 1']/following::input[1])[1]"))
+                    if model_input_ready and relay_input_ready:
+                        return True
+                    last_category = "missing_required_controls"
+                except (
+                    NoSuchFrameException,
+                    StaleElementReferenceException,
+                    WebDriverException,
+                ):
+                    last_category = "webdriver_failure"
             return False
         except (
             NoSuchFrameException,
             StaleElementReferenceException,
             WebDriverException,
         ):
+            last_category = "webdriver_failure"
             return False
 
     if not WebDriverWait(driver, timeout_seconds, poll_frequency=0.25).until(_ready):
-        raise RuntimeError("desktop UI never became ready")
+        raise RuntimeError(last_category) from None
 
 
 def wait_for_inference_result(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> str:
@@ -505,8 +580,8 @@ def tokenizer_handoff_args(request_path: Path | None = None,
         evidence_path: Path | None = None) -> list[str]:
     """Carry the paired handoff on the application command line on Windows.
 
-    WebView2 starts the packaged application itself, so environment inherited by
-    tauri-driver is not a deterministic application handoff on Windows.
+    The owned Windows launch and the non-Windows Tauri launch both pass these
+    values directly to the packaged application.
     """
     if request_path is None and evidence_path is None:
         return []
@@ -518,7 +593,93 @@ def tokenizer_handoff_args(request_path: Path | None = None,
     ]
 
 
+def tokenizer_stage_path(evidence_path: Path) -> Path:
+    return Path(f"{evidence_path}.stage.json")
+
+
+def _write_tokenizer_stage(evidence_path: Path, category: str, stage: int) -> None:
+    """Publish a bounded stage marker without copying any application data."""
+    allowed = {"application_arguments_absent": 0, "python_producer_not_invoked": 35}
+    if allowed.get(category) != stage or isinstance(stage, bool):
+        raise ValueError("invalid tokenizer stage category")
+    output = tokenizer_stage_path(evidence_path)
+    fd, temporary = tempfile.mkstemp(prefix=".tokenizer-runner-stage-", suffix=".tmp",
+        dir=output.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "stage": stage, "category": category}, handle,
+                sort_keys=True, separators=(",", ":"))
+        os.replace(temporary, output)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _read_tokenizer_stage(evidence_path: Path) -> str:
+    pairings = {
+        "application_arguments_absent": 0, "application_arguments_malformed": 10,
+        "application_arguments_accepted": 10, "rust_python_handoff_failed": 20,
+        "rust_python_handoff_accepted": 20, "python_handoff_received": 30,
+        "python_producer_not_invoked": 35, "request_validation_failure": 40,
+        "fixture_hash_validation_failure": 50,
+        "active_runtime_tokenizer_unavailable": 60, "tokenization_failure": 65,
+        "runtime_identity_unavailable": 70, "evidence_publication_failure": 90,
+        "authoritative_evidence_published": 100,
+    }
+    try:
+        value = json.loads(tokenizer_stage_path(evidence_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("application_arguments_absent") from exc
+    if (not isinstance(value, dict) or set(value) != {"version", "stage", "category"}
+            or value.get("version") != 1 or not isinstance(value.get("stage"), int)
+            or isinstance(value.get("stage"), bool)
+            or value.get("category") not in pairings
+            or pairings[value["category"]] != value["stage"]):
+        raise RuntimeError("application_arguments_malformed")
+    return value["category"]
+
+
+def _validate_operator_tokenizer_handoff(evidence_path: Path,
+        fail_closed: Callable[[str], None]) -> None:
+    try:
+        category = _read_tokenizer_stage(evidence_path)
+    except RuntimeError as exc:
+        fail_closed(str(exc))
+        return
+    if category in {"application_arguments_absent", "application_arguments_malformed"}:
+        fail_closed(category)
+    elif category != "python_handoff_received":
+        fail_closed("rust_python_handoff_failed")
+
+
+def _rearm_tokenizer_stage(evidence_path: Path, driver_log: Path) -> int:
+    _write_tokenizer_stage(evidence_path, "python_producer_not_invoked", 35)
+    return driver_log.stat().st_size
+
+
+def _validate_final_tokenizer_stage(evidence_path: Path,
+        fail_closed: Callable[[str], None]) -> None:
+    try:
+        category = _read_tokenizer_stage(evidence_path)
+    except RuntimeError as exc:
+        fail_closed(str(exc))
+        return
+    if category != "authoritative_evidence_published":
+        fail_closed(category if category in PACKAGED_FAILURE_REASONS
+            else "python_producer_not_invoked")
+
+
 def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
+    # WebView2 and the packaged sidecar resolve state beneath these directories
+    # during session creation. Create them before EdgeDriver launches the app so
+    # a fresh isolated profile cannot make the application exit before attach.
+    for directory in (
+        isolated_home,
+        isolated_home / ".config",
+        isolated_home / ".local/share",
+        isolated_home / "AppData/Roaming",
+        isolated_home / "WebView2",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     for key in (
         "USE_MOCK_LLM",
@@ -535,23 +696,84 @@ def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
             "XDG_CONFIG_HOME": str(isolated_home / ".config"),
             "XDG_DATA_HOME": str(isolated_home / ".local/share"),
             "APPDATA": str(isolated_home / "AppData/Roaming"),
+            # Chromium remote debugging must not reuse the default profile.
+            # WebView2 consumes this before its environment is created.
+            "WEBVIEW2_USER_DATA_FOLDER": str(
+                (isolated_home / "WebView2").resolve(strict=True)),
         }
     )
     return env
 
 
-def start_driver(app_binary: Path, *, application_args: list[str] | None = None
+def start_driver(app_binary: Path, *, application_args: list[str] | None = None,
+        debugger_address: str | None = None
         ) -> webdriver.Remote:
-    options = webdriver.ChromeOptions()
-    options.set_capability("browserName", "wry")
-    options.set_capability(
-        "tauri:options",
-        {
-            "application": str(app_binary),
-            "args": application_args or [],
-        },
-    )
+    if os.name == "nt":
+        class NativeWebView2Options:
+            """Capabilities equivalent to tauri-driver's Windows mapping."""
+
+            _ignore_local_proxy = False
+
+            def to_capabilities(self) -> dict[str, object]:
+                if not debugger_address:
+                    raise RuntimeError("webdriver_application_startup_failed")
+                return {
+                    "browserName": "webview2",
+                    "ms:edgeChromium": True,
+                    "ms:edgeOptions": {"debuggerAddress": debugger_address},
+                }
+
+        return webdriver.Remote(
+            command_executor=NATIVE_WEBDRIVER_URL,
+            options=NativeWebView2Options(),
+        )
+
+    class TauriOptions:
+        """Minimal Selenium options without browser-vendor capabilities."""
+
+        _ignore_local_proxy = False
+
+        def to_capabilities(self) -> dict[str, object]:
+            return {
+                "browserName": "wry",
+                "tauri:options": {
+                    "application": str(app_binary.resolve()),
+                    "args": list(application_args or []),
+                },
+            }
+
+    options = TauriOptions()
     return webdriver.Remote(command_executor=WEBDRIVER_URL, options=options)
+
+
+def wait_for_webview2_devtools(
+        application_process: subprocess.Popen[str], port: int,
+        timeout_seconds: float) -> None:
+    """Wait for an attachable page/WebView target, not merely a browser endpoint."""
+    deadline = time.monotonic() + timeout_seconds
+    url = f"http://127.0.0.1:{port}/json/list"
+    while time.monotonic() < deadline:
+        if application_process.poll() is not None:
+            raise RuntimeError("webdriver_application_startup_failed") from None
+        remaining = deadline - time.monotonic()
+        try:
+            with urlopen(  # nosec B310 - reserved loopback DevTools endpoint
+                    url, timeout=max(0.05, min(remaining, 0.5))) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            attachable = isinstance(payload, list) and any(
+                isinstance(target, dict)
+                and target.get("type") in {"page", "webview"}
+                and isinstance(target.get("webSocketDebuggerUrl"), str)
+                and bool(target["webSocketDebuggerUrl"].strip())
+                for target in payload)
+            if attachable:
+                return
+        except Exception:
+            pass
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if application_process.poll() is not None:
+        raise RuntimeError("webdriver_application_startup_failed") from None
+    raise RuntimeError("webdriver_transport_failure") from None
 
 
 def start_landing_driver() -> webdriver.Chrome:
@@ -600,6 +822,25 @@ def wait_for_operator_log_stop_markers(
 
 def tauri_driver_command() -> list[str]:
     tauri_driver_bin = shutil.which("tauri-driver")
+    if os.name == "nt":
+        if os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY") != "match":
+            raise RuntimeError("native_driver_unavailable")
+        edge_location = os.environ.get("EDGEWEBDRIVER")
+        edge_driver = None
+        if edge_location:
+            candidate = Path(edge_location)
+            if candidate.is_dir():
+                candidate = candidate / "msedgedriver.exe"
+            if candidate.is_file():
+                edge_driver = str(candidate.resolve())
+        if edge_driver is None:
+            raise RuntimeError("native_driver_unavailable")
+        if tauri_driver_bin is not None:
+            return [tauri_driver_bin, "--port", "4444", "--native-port", "4445",
+                "--native-driver", edge_driver]
+        raise RuntimeError(
+            "tauri-driver binary not found on PATH; install it with `cargo install tauri-driver`"
+        )
     webkit_driver_bin = shutil.which("WebKitWebDriver") or shutil.which("webkit2gtk-driver")
     if webkit_driver_bin is None:
         for candidate in (
@@ -619,6 +860,257 @@ def tauri_driver_command() -> list[str]:
     raise RuntimeError(
         "tauri-driver binary not found on PATH; install it with `cargo install tauri-driver`"
     )
+
+
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v6"
+WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
+WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
+    "read_timeout", "connection_failure", "capability_rejection",
+    "driver_version_mismatch", "application_startup_failure",
+    "tauri_driver_exit", "unknown",
+})
+WEBDRIVER_PROCESS_POSTURES = frozenset({
+    "tauri_driver_exited", "native_driver_only", "application_present",
+    "webview_descendants_present", "unknown",
+})
+WEBDRIVER_SESSION_ELAPSED_BUCKETS = frozenset({
+    "under_5_seconds", "5_to_29_seconds", "30_to_89_seconds",
+    "90_seconds_or_more", "unknown",
+})
+WEBDRIVER_TARGET_CATEGORIES = frozenset({"attachable_target", "no_target", "unknown"})
+WEBDRIVER_READINESS_CATEGORIES = frozenset({
+    "ready", "no_window_handle", "wrong_handle", "missing_shell",
+    "missing_required_controls", "initialization_pending",
+    "application_initialization_failed", "webdriver_failure", "unknown"})
+OPERATOR_START_DIAGNOSTIC_ALLOWLISTS = {
+    "start_handler_state": frozenset({"not_entered", "entered"}),
+    "invocation_state": frozenset({"not_started", "pending", "resolved", "rejected"}),
+    "native_event_observation": frozenset({
+        "none", "running_received", "running_accepted", "running_rejected"}),
+    "polling_observation": frozenset({
+        "none", "not_running", "running_accepted", "running_rejected", "command_failed"}),
+    "render_state": frozenset({"not_running", "running", "running_regressed"}),
+}
+OPERATOR_START_DIAGNOSTIC_DEFAULTS = {
+    "start_handler_state": "not_entered",
+    "invocation_state": "not_started",
+    "native_event_observation": "none",
+    "polling_observation": "none",
+    "render_state": "not_running",
+}
+
+NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS = {
+    "native_startup_phase": frozenset({
+        "not_started", "session_reserved", "bridge_launch_prepared",
+        "command_constructed", "child_spawn_attempted", "child_spawn_completed",
+        "stdio_acquired", "bridge_attached", "running_status_publication",
+        "startup_task_failed",
+    }),
+    "native_startup_outcome": frozenset({
+        "not_started", "pending", "accepted", "launcher_validated", "attempted",
+        "completed", "running", "stopping", "superseded",
+        "publication_accepted", "publication_suppressed", "failed",
+    }),
+    "native_startup_failure_category": frozenset({
+        "none", "bridge_preparation_failed", "command_construction_failed",
+        "launcher_validation_failed", "child_spawn_failed",
+        "stdio_acquisition_failed", "bridge_attachment_failed",
+        "bridge_exited_before_startup_event", "startup_task_failed",
+    }),
+}
+NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS = {
+    "native_startup_phase": "not_started",
+    "native_startup_outcome": "not_started",
+    "native_startup_failure_category": "none",
+}
+
+
+def _read_operator_start_diagnostic(driver: webdriver.Remote | None) -> dict[str, str]:
+    defaults = OPERATOR_START_DIAGNOSTIC_DEFAULTS.copy()
+    if driver is None:
+        return defaults
+    attributes = {
+        "start_handler_state": "data-operator-start-handler",
+        "invocation_state": "data-operator-start-invocation",
+        "native_event_observation": "data-operator-start-native-event",
+        "polling_observation": "data-operator-start-polling",
+        "render_state": "data-operator-start-render",
+    }
+    try:
+        shell = driver.find_element(By.CSS_SELECTOR, "main[data-operator-start-handler]")
+        return {
+            field: (value if (value := shell.get_attribute(attribute))
+                    in OPERATOR_START_DIAGNOSTIC_ALLOWLISTS[field] else defaults[field])
+            for field, attribute in attributes.items()
+        }
+    except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+        return defaults
+
+
+def _read_native_startup_diagnostic(driver: webdriver.Remote | None) -> dict[str, str]:
+    defaults = NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS.copy()
+    if driver is None:
+        return defaults
+    attributes = {
+        "native_startup_phase": "data-native-startup-phase",
+        "native_startup_outcome": "data-native-startup-outcome",
+        "native_startup_failure_category": "data-native-startup-failure",
+    }
+    try:
+        shell = driver.find_element(By.CSS_SELECTOR, "main[data-native-startup-phase]")
+        return {
+            field: (value if (value := shell.get_attribute(attribute))
+                    in NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS[field] else defaults[field])
+            for field, attribute in attributes.items()
+        }
+    except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+        return defaults
+
+
+def _classify_webdriver_session_failure(exc: Exception, process: object) -> tuple[str, str, str]:
+    """Return only low-cardinality evidence about WebDriver session creation."""
+    poll = getattr(process, "poll", None)
+    if callable(poll) and poll() is not None:
+        return "tauri_driver_exited", "exited", "tauri_driver_exit"
+    if isinstance(exc, ReadTimeoutError):
+        return "webdriver_transport_failure", "running", "read_timeout"
+    if isinstance(exc, (ConnectTimeoutError, NewConnectionError, ProtocolError)):
+        return "webdriver_transport_failure", "running", "connection_failure"
+    message_value = getattr(exc, "msg", None)
+    message = (message_value if isinstance(message_value, str) else str(exc)).lower()
+    if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
+            "only supports microsoft edge version", "this version of msedgedriver")):
+        return "webdriver_driver_version_mismatch", "running", "driver_version_mismatch"
+    if isinstance(exc, InvalidArgumentException) or any(pattern in message for pattern in (
+            "unrecognized capability", "invalid capabilities", "invalid argument: capability")):
+        return "webdriver_capabilities_rejected", "running", "capability_rejection"
+    if any(pattern in message for pattern in ("read timed out", "read timeout")):
+        return "webdriver_transport_failure", "running", "read_timeout"
+    if any(pattern in message for pattern in (
+            "connection refused", "failed to establish a new connection", "connection aborted")):
+        return "webdriver_transport_failure", "running", "connection_failure"
+    if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
+            "failed to launch", "failed to start", "application failed")):
+        return "webdriver_application_startup_failed", "running", "application_startup_failure"
+    if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
+            "cannot find microsoft edge", "no edge binary", "executable needs to be available")):
+        return "webdriver_application_startup_failed", "running", "application_startup_failure"
+    return "webdriver_session_creation_failed", "running", "unknown"
+
+
+def _webdriver_process_posture(process: object, app_binary: Path,
+        application_process: object | None = None) -> str:
+    """Inspect process identity in memory and return only an allowlisted posture."""
+    poll = getattr(process, "poll", None)
+    if callable(poll) and poll() is not None:
+        return "tauri_driver_exited"
+    try:
+        if (application_process is not None
+                and getattr(application_process, "poll", lambda: 1)() is None):
+            application = psutil.Process(application_process.pid)
+            try:
+                return ("webview_descendants_present"
+                    if application.children(recursive=True) else "application_present")
+            except (psutil.Error, OSError):
+                return "application_present"
+        descendants = psutil.Process(process.pid).children(recursive=True)
+        application = None
+        expected = app_binary.resolve()
+        for descendant in descendants:
+            try:
+                if Path(descendant.exe()).resolve() == expected:
+                    application = descendant
+                    break
+            except (OSError, psutil.Error):
+                continue
+        if application is not None:
+            try:
+                if application.children(recursive=True):
+                    return "webview_descendants_present"
+            except (psutil.Error, OSError):
+                pass
+            return "application_present"
+        return "native_driver_only" if descendants else "unknown"
+    except (AttributeError, OSError, psutil.Error):
+        return "unknown"
+
+
+def _webdriver_session_elapsed_bucket(elapsed_seconds: object) -> str:
+    if not isinstance(elapsed_seconds, (int, float)) or isinstance(elapsed_seconds, bool):
+        return "unknown"
+    if elapsed_seconds < 5:
+        return "under_5_seconds"
+    if elapsed_seconds < 30:
+        return "5_to_29_seconds"
+    if elapsed_seconds < 90:
+        return "30_to_89_seconds"
+    return "90_seconds_or_more"
+
+
+def _write_webdriver_diagnostic(
+        compatibility: str, process_state: str, failure_category: str,
+        exception_family: str = "unknown", process_posture: str = "unknown",
+        session_elapsed_bucket: str = "unknown", target_category: str = "unknown",
+        readiness_category: str = "unknown", operator_progress: str = "not_started",
+        operator_start_diagnostic: dict[str, str] | None = None,
+        native_startup_diagnostic: dict[str, str] | None = None) -> None:
+    """Atomically retain the bounded session diagnostic while raw logs are discarded."""
+    if compatibility not in WEBDRIVER_COMPATIBILITY_RESULTS:
+        compatibility = "unknown"
+    if process_state not in {"running", "exited", "unknown"}:
+        process_state = "unknown"
+    if failure_category not in PACKAGED_FAILURE_REASONS | {"none"}:
+        failure_category = "webdriver_session_creation_failed"
+    if exception_family not in WEBDRIVER_EXCEPTION_FAMILIES:
+        exception_family = "unknown"
+    if process_posture not in WEBDRIVER_PROCESS_POSTURES:
+        process_posture = "unknown"
+    if session_elapsed_bucket not in WEBDRIVER_SESSION_ELAPSED_BUCKETS:
+        session_elapsed_bucket = "unknown"
+    if target_category not in WEBDRIVER_TARGET_CATEGORIES:
+        target_category = "unknown"
+    if readiness_category not in WEBDRIVER_READINESS_CATEGORIES:
+        readiness_category = "unknown"
+    if operator_progress not in {
+            "not_started", "model_input_set", "relay_input_set", "operator_enabled",
+            "operator_started", "operator_running", "operator_registered"}:
+        operator_progress = "not_started"
+    supplied_start_diagnostic = operator_start_diagnostic or {}
+    safe_start_diagnostic = {
+        field: (value if (value := supplied_start_diagnostic.get(field)) in allowed
+                else OPERATOR_START_DIAGNOSTIC_DEFAULTS[field])
+        for field, allowed in OPERATOR_START_DIAGNOSTIC_ALLOWLISTS.items()
+    }
+    supplied_native_diagnostic = native_startup_diagnostic or {}
+    safe_native_diagnostic = {
+        field: (value if (value := supplied_native_diagnostic.get(field)) in allowed
+                else NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS[field])
+        for field, allowed in NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS.items()
+    }
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=".packaged-webdriver-diagnostic-", suffix=".tmp", dir=LOGS_DIR)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({
+                "schema_version": WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION,
+                "browser_driver_compatibility": compatibility,
+                "tauri_driver_state": process_state,
+                "webdriver_failure_category": failure_category,
+                "exception_family": exception_family,
+                "process_posture": process_posture,
+                "session_elapsed_bucket": session_elapsed_bucket,
+                "target_category": target_category,
+                "readiness_category": readiness_category,
+                "operator_progress": operator_progress,
+                **safe_start_diagnostic,
+                **safe_native_diagnostic,
+            }, handle, sort_keys=True)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _status_value(driver: webdriver.Remote, label: str) -> str:
@@ -1068,7 +1560,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     def fail_closed(reason: str) -> None:
         nonlocal failure_reason
         failure_reason = _validate_packaged_failure_reason(reason)
-        raise RuntimeError(reason)
+        raise RuntimeError(reason) from None
     setup_deadline = runner_started + float(request["setup_timeout_s"])
     def setup_remaining() -> float:
         remaining = setup_deadline - time.monotonic()
@@ -1084,6 +1576,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     tokenizer_dir = Path(tempfile.mkdtemp(prefix="long-context-tokenizer-observation-"))
     tokenizer_request = tokenizer_dir / "request.json"
     tokenizer_evidence = tokenizer_dir / "evidence.json"
+    _write_tokenizer_stage(tokenizer_evidence, "application_arguments_absent", 0)
     tokenizer_request.write_text(json.dumps({
         "fixture_sha256": request["manifest"]["fixture_sha256"],
         "target_prefix_utf8_bytes": {name: target["target_prefix_utf8_bytes"]
@@ -1094,29 +1587,117 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     env = tauri_driver_environment(isolated_home)
     driver_log_handle = driver_log.open("w", encoding="utf-8")
     process: subprocess.Popen[str] | None = None
+    application_process: subprocess.Popen[str] | None = None
     driver: webdriver.Remote | None = None
     browser: webdriver.Chrome | None = None
     cleanup_ok = True
     primary_failed = False
+    webdriver_failure_category = "none"
+    tauri_driver_state = "unknown"
+    webdriver_exception_family = "unknown"
+    webdriver_process_posture = "unknown"
+    webdriver_session_elapsed_bucket = "unknown"
+    webdriver_target_category = "unknown"
+    webdriver_readiness_category = "unknown"
+    operator_progress = "not_started"
+    def record_operator_progress(progress: str) -> None:
+        nonlocal operator_progress
+        operator_progress = progress
     try:
         setup_remaining()
-        process = subprocess.Popen(tauri_driver_command(), cwd=TAURI_ROOT, env=env,
+        try:
+            driver_command = tauri_driver_command()
+        except RuntimeError as exc:
+            if str(exc) == "native_driver_unavailable":
+                fail_closed("native_driver_unavailable")
+            raise
+        process = subprocess.Popen(driver_command, cwd=TAURI_ROOT, env=env,
             stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
-        memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
-        wait_for_port("127.0.0.1", 4444, process, "tauri-driver", driver_log,
-            min(90, setup_remaining()))
+        try:
+            wait_for_webdriver_ready(process, min(90, setup_remaining()))
+        except RuntimeError as exc:
+            reason = str(exc)
+            if reason in {"tauri_driver_exited", "webdriver_transport_failure"}:
+                webdriver_failure_category = reason
+                tauri_driver_state = (
+                    "exited" if reason == "tauri_driver_exited" else "running")
+                fail_closed(reason)
+            raise
+        tauri_driver_state = "running"
         write_phase("webdriver_ready")
         setup_remaining()
-        driver = start_driver(
-            app_binary.resolve(strict=True),
-            application_args=tokenizer_handoff_args(tokenizer_request, tokenizer_evidence),
-        )
-        wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
+        application_args = tokenizer_handoff_args(tokenizer_request, tokenizer_evidence)
+        debugger_address = None
+        if os.name == "nt":
+            devtools_port = reserve_free_port()
+            application_env = env.copy()
+            application_env.update({
+                "TAURI_AUTOMATION": "true",
+                "TAURI_WEBVIEW_AUTOMATION": "true",
+            })
+            webview2_automation_arg = (
+                "--edge-webview-switches="
+                f"--remote-debugging-port={devtools_port}")
+            try:
+                application_process = subprocess.Popen(
+                    [str(app_binary.resolve(strict=True)), webview2_automation_arg,
+                        *application_args],
+                    cwd=app_binary.resolve(strict=True).parent, env=application_env,
+                    stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
+            except (OSError, ValueError):
+                webdriver_failure_category = "webdriver_application_startup_failed"
+                webdriver_exception_family = "application_startup_failure"
+                fail_closed(webdriver_failure_category)
+            memory_sampler = OwnedProcessTreeMemorySampler(application_process.pid)
+            try:
+                wait_for_webview2_devtools(
+                    application_process, devtools_port, setup_remaining())
+                webdriver_target_category = "attachable_target"
+            except RuntimeError as exc:
+                reason = str(exc)
+                webdriver_target_category = "no_target"
+                webdriver_failure_category = reason
+                webdriver_exception_family = (
+                    "application_startup_failure"
+                    if reason == "webdriver_application_startup_failed"
+                    else "connection_failure")
+                webdriver_process_posture = _webdriver_process_posture(
+                    process, app_binary, application_process)
+                fail_closed(reason)
+            debugger_address = f"127.0.0.1:{devtools_port}"
+        else:
+            memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
+        session_started = time.monotonic()
+        try:
+            driver = start_driver(
+                app_binary.resolve(strict=True),
+                application_args=application_args,
+                debugger_address=debugger_address,
+            )
+        except Exception as exc:
+            webdriver_session_elapsed_bucket = _webdriver_session_elapsed_bucket(
+                time.monotonic() - session_started)
+            webdriver_process_posture = _webdriver_process_posture(
+                process, app_binary, application_process)
+            webdriver_failure_category, tauri_driver_state, webdriver_exception_family = (
+                _classify_webdriver_session_failure(exc, process))
+            fail_closed(webdriver_failure_category)
+        write_phase("desktop_session_started")
+        try:
+            wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
+            webdriver_readiness_category = "ready"
+        except Exception as exc:
+            category = str(exc)
+            webdriver_readiness_category = (category
+                if category in WEBDRIVER_READINESS_CATEGORIES else "webdriver_failure")
+            fail_closed("desktop_ui_not_ready")
         write_phase("desktop_ready")
         setup_remaining()
         fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
+        operator_progress = "model_input_set"
         setup_remaining()
         fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
+        operator_progress = "relay_input_set"
         setup_remaining()
         mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
         compute_mode = benchmark_operator_mode(request["backend"])
@@ -1125,13 +1706,15 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", tier, request["context_tier"])
         wait_for_start_operator_enabled(driver, driver_log, driver_log,
             timeout_seconds=setup_remaining())
+        operator_progress = "operator_enabled"
         setup_remaining()
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
-        wait_for_running_stability(driver, "yes", stable_seconds=3,
-            timeout_seconds=setup_remaining())
-        WebDriverWait(driver, setup_remaining()).until(
-            lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+        operator_progress = "operator_started"
+        wait_for_post_start_operator_state(
+            driver, setup_remaining, record_operator_progress, fail_closed)
         write_phase("operator_ready")
+
+        _validate_operator_tokenizer_handoff(tokenizer_evidence, fail_closed)
 
         runtime = {label: _status_value(driver, label) for label in
             ("App version", "Build ID", "Runtime ID", "Bundled runtime ID", "Launcher source",
@@ -1202,10 +1785,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         """)
         # The child writes directly to this file descriptor. Capture the exact byte
         # boundary immediately before submission.
-        driver_log_boundary = 0  # pragma: no cover - exercised by packaged-app E2E
+        driver_log_boundary = 0
         def capture_driver_log_boundary() -> None:
             nonlocal driver_log_boundary
-            driver_log_boundary = driver_log.stat().st_size
+            driver_log_boundary = _rearm_tokenizer_stage(tokenizer_evidence, driver_log)
         started = _populate_and_submit_packaged_prompt(browser, request["prompt"],
             setup_remaining, fail_closed, write_phase,
             before_submit=capture_driver_log_boundary)
@@ -1269,9 +1852,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         post_terminal = [item for item in observe_post_terminal(post_terminal_poll,
             window_s=min(0.1, finalization_remaining())) if item is not None]
         finalization_remaining()
+        _validate_final_tokenizer_stage(tokenizer_evidence, fail_closed)
         tokenizer_observation = _read_primary_tokenizer_observation(
-            tokenizer_evidence, runtime["Runtime ID"],
-            request["manifest"]["fixture_sha256"])
+            tokenizer_evidence, runtime["Runtime ID"], request["manifest"]["fixture_sha256"])
         finalization_remaining()
         memory_sampler.sample()
         memory_evidence = memory_sampler.summary()
@@ -1323,6 +1906,14 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             failure_reason = "packaged_runner_failure"
         raise
     finally:
+        operator_start_diagnostic = _read_operator_start_diagnostic(driver)
+        native_startup_diagnostic = _read_native_startup_diagnostic(driver)
+        _write_webdriver_diagnostic(
+            os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
+            tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
+            webdriver_process_posture, webdriver_session_elapsed_bucket,
+            webdriver_target_category, webdriver_readiness_category, operator_progress,
+            operator_start_diagnostic, native_startup_diagnostic)
         cleanup_deadline = time.monotonic() + cleanup_timeout
         def cleanup_remaining() -> float:
             return max(0.0, cleanup_deadline - time.monotonic())
@@ -1345,6 +1936,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             allowance = cleanup_allowance()
             cleanup_ok = (allowance is not None
                 and _quit_webdriver(driver, allowance) and cleanup_ok)
+        if application_process is not None:
+            cleanup_ok = (_cleanup_owned_process_tree(application_process, cleanup_remaining)
+                and cleanup_ok)
         if process is not None:
             cleanup_ok = (_cleanup_owned_process_tree(process, cleanup_remaining)
                 and cleanup_ok)
@@ -1504,9 +2098,93 @@ def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: we
         "post_restart_followup_s": followup_s}}
 
 
+def _contains_private_input(value, sentinels: tuple[str, ...]) -> bool:
+    """Return whether a nested JSON-compatible value contains a private sentinel."""
+    if isinstance(value, str):
+        return any(sentinel in value for sentinel in sentinels)
+    if isinstance(value, dict):
+        return any(
+            _contains_private_input(item, sentinels)
+            for pair in value.items() for item in pair)
+    if isinstance(value, (list, tuple)):
+        return any(_contains_private_input(item, sentinels) for item in value)
+    return False
+
+
+def _packaged_boundary_failure_diagnostics(evidence: object) -> str:
+    """Format only adapter-validated, low-cardinality failure diagnostics."""
+    if not isinstance(evidence, dict):
+        return "code=unavailable"
+    code = evidence.get("code")
+    fields = [f"code={code}" if isinstance(code, str)
+        and code in {"packaged_contract_failed", "packaged_runner_failed",
+            "packaged_runner_timeout", "packaged_evidence_malformed",
+            "authoritative_target_depth_unavailable"}
+        else "code=unavailable"]
+    phase = evidence.get("last_safe_phase")
+    if phase in PACKAGED_PHASES:
+        fields.append(f"last_safe_phase={phase}")
+    reason = evidence.get("failure_reason")
+    if reason in PACKAGED_FAILURE_REASONS:
+        fields.append(f"failure_reason={reason}")
+    cleanup = evidence.get("cleanup_succeeded")
+    if isinstance(cleanup, bool):
+        fields.append(f"cleanup_succeeded={str(cleanup).lower()}")
+    return " ".join(fields)
+
+
+def run_packaged_windows_tokenizer_boundary(app_binary: Path, model: Path,
+        *, adapter=invoke_packaged_runtime_adapter) -> int:
+    """Exercise the packaged Windows argv-to-authoritative-evidence boundary."""
+    app_binary = app_binary.resolve(strict=True)
+    model = model.resolve(strict=True)
+    if app_binary.suffix.lower() != ".exe":
+        raise ValueError("packaged Windows tokenizer boundary requires an application .exe")
+
+    relay_port = reserve_free_port()
+    relay_url = f"http://127.0.0.1:{relay_port}"
+    relay_log = LOGS_DIR / "packaged-windows-tokenizer-boundary-relay.log"
+    relay_env = os.environ.copy()
+    relay_env["USE_MOCK_LLM"] = "1"
+    relay = subprocess.Popen(  # noqa: S603
+        [sys.executable, str(REPO_ROOT / "relay.py"), "--host", "127.0.0.1",
+         "--port", str(relay_port), "--use_mock_llm"],
+        cwd=REPO_ROOT, env=relay_env,
+        stdout=relay_log.open("w", encoding="utf-8"),
+        stderr=subprocess.STDOUT, text=True)
+    try:
+        wait_for_http_200(f"{relay_url}/livez")
+        evidence = adapter(
+            fixture_id="small-8k", scenario="structured-extraction", timeout_s=180.0,
+            cleanup_timeout_s=30.0, app_binary=str(app_binary), model=str(model),
+            backend="cpu", relay_url=relay_url, context_tier="8k-fast",
+            report_only=True)
+        fixture = evidence.get("fixture")
+        prompt, manifest = generate_fixture("small-8k", scenario="structured-extraction")
+        if not evidence.get("runtime_contract_pass"):
+            raise RuntimeError(
+                "packaged Windows tokenizer boundary failed: "
+                f"{_packaged_boundary_failure_diagnostics(evidence)}")
+        if (not isinstance(fixture, dict)
+                or fixture.get("sha256") != manifest["fixture_sha256"]
+                or not isinstance(fixture.get("authoritative_prompt_tokens"), int)
+                or not isinstance(fixture.get("authoritative_target_offsets_tokens"), dict)
+                or not fixture["authoritative_target_offsets_tokens"]):
+            raise RuntimeError("packaged Windows tokenizer boundary evidence unavailable")
+        if _contains_private_input(evidence, (
+                prompt, str(app_binary), str(model),
+                "TOKEN_PLACE_PYTHON", "TOKEN_PLACE_SIDECAR_PYTHON")):
+            raise RuntimeError("packaged Windows tokenizer boundary leaked private input")
+        print("packaged_windows_tokenizer_boundary=passed")
+        return 0
+    finally:
+        terminate_process(relay)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packaged-windows-nvidia-hardware", action="store_true")
+    parser.add_argument("--packaged-windows-tokenizer-boundary", action="store_true")
     parser.add_argument("--app-binary", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
@@ -1514,6 +2192,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--benchmark-evidence", type=Path)
     parser.add_argument("--benchmark-phase-status", type=Path)
     args = parser.parse_args(argv)
+    if args.packaged_windows_tokenizer_boundary:
+        if args.app_binary is None or args.model is None:
+            parser.error("packaged Windows tokenizer boundary requires --app-binary and --model")
+        if (args.benchmark_request or args.benchmark_evidence
+                or args.benchmark_phase_status or args.packaged_windows_nvidia_hardware):
+            parser.error("packaged Windows tokenizer boundary cannot be combined with other modes")
+        return run_packaged_windows_tokenizer_boundary(args.app_binary, args.model)
     if args.benchmark_request or args.benchmark_evidence or args.benchmark_phase_status:
         if not (args.benchmark_request and args.benchmark_evidence
                 and args.benchmark_phase_status and args.app_binary):

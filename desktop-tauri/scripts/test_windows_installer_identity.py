@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-EXPECTED_VERSION = "0.1.16"
+EXPECTED_VERSION = "0.1.17"
 EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 EXPECTED_TARGET_TRIPLE = "x86_64-pc-windows-msvc"
@@ -33,6 +33,11 @@ APP_PROCESS_NAMES = ("token.place", "tokenplace", "token-place")
 ACCEPTABLE_UNINSTALL_EXIT_CODES = frozenset({0, 1605, 1614, 3010})
 WINDOWS_UNINSTALL_CLEANUP_TIMEOUT_SECONDS = 90.0
 WINDOWS_UNINSTALL_REINVENTORY_PASSES = 3
+# The installed boundary starts its own relay (30s), then delegates to the
+# packaged adapter's setup, request, finalization, and cleanup windows.  Keep a
+# small fixed allowance for the child to atomically publish its final report.
+INSTALLED_BOUNDARY_SUPERVISOR_TIMEOUT_SECONDS = 30 + 300 + 180 + 120 + 30 + 15
+INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS = 15
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 EXPECTED_LLAMA_CPP_VERSION = "0.3.32"
 EXPECTED_LLAMA_CPP_WHEEL = "llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
@@ -708,6 +713,48 @@ def verify_authority_removed(before: AuthoritySnapshot) -> None:
         raise InstallerIdentityError(f"authority remains after uninstall: {', '.join(categories)}")
 
 
+def remediate_captured_stale_shortcuts(before: AuthoritySnapshot, current: AuthoritySnapshot) -> bool:
+    """Remove only unchanged, captured product shortcuts orphaned by uninstall.
+
+    Windows Explorer can retain an NSIS-created shortcut after the uninstaller has
+    removed every other installed authority.  Remediation is intentionally limited
+    to the exact path/target pairs captured before uninstall; anything new or
+    retargeted remains evidence of unsafe residual authority.
+    """
+    if not before.canonical_targets or not current.shortcuts.shortcuts or current.registry:
+        return False
+    if any(target.exists() for target in before.canonical_targets):
+        return False
+    if _processes_running_targets(before.canonical_targets):
+        return False
+
+    captured = {
+        (_canonical_path(shortcut.path), _canonical_path(shortcut.target))
+        for shortcut in before.shortcuts.shortcuts
+    }
+    remaining = current.shortcuts.shortcuts
+    if any(
+        not shortcut.path.exists()
+        or shortcut.target.exists()
+        or (_canonical_path(shortcut.path), _canonical_path(shortcut.target)) not in captured
+        for shortcut in remaining
+    ):
+        return False
+
+    for shortcut in remaining:
+        try:
+            shortcut.path.unlink()
+        except OSError as exc:
+            raise InstallerIdentityError(
+                f"failed to remove captured stale product shortcut: path={shortcut.path}"
+            ) from exc
+        if shortcut.path.exists():
+            raise InstallerIdentityError(
+                f"captured stale product shortcut remains after exact-path removal: path={shortcut.path}"
+            )
+    return True
+
+
 def wait_for_cleanup_convergence(
     before: AuthoritySnapshot,
     *,
@@ -723,6 +770,10 @@ def wait_for_cleanup_convergence(
     reported_milestones: set[int] = set()
     while True:
         last_categories = residual_authority_categories(before)
+        if last_categories == ["shortcuts"] and before.canonical_targets:
+            current = capture_authority_snapshot()
+            if remediate_captured_stale_shortcuts(before, current):
+                continue
         if not last_categories:
             if artifact_directory is not None:
                 _persist_snapshot(artifact_directory, "final", capture_authority_snapshot())
@@ -1038,12 +1089,99 @@ def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_di
         verify_config_preserved(config_path, seeded_config_values(tier))
 
 
+def run_installed_tokenizer_boundary(
+    exe: Path,
+    model: Path,
+    log_path: Path | None = None,
+    *,
+    platform_name: str | None = None,
+) -> None:
+    """Run the production tokenizer boundary against the validated installation."""
+    runner = Path(__file__).with_name("test_desktop_operator_ui_e2e.py")
+    command = [
+            sys.executable,
+            str(runner),
+            "--packaged-windows-tokenizer-boundary",
+            "--app-binary",
+            str(exe),
+            "--model",
+            str(model.resolve(strict=True)),
+        ]
+    owned_platform = os.name if platform_name is None else platform_name
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    outcome = "failed"
+    cleanup_succeeded = True
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(  # noqa: S603
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            creationflags=creationflags if owned_platform == "nt" else 0,
+            start_new_session=owned_platform != "nt",
+        )
+        returncode = process.wait(timeout=INSTALLED_BOUNDARY_SUPERVISOR_TIMEOUT_SECONDS)
+        outcome = "passed" if returncode == 0 else "failed"
+    except OSError:
+        outcome = "failed"
+        cleanup_succeeded = process is None
+    except subprocess.TimeoutExpired:
+        assert process is not None
+        outcome = "supervisor_timeout"
+        cleanup_succeeded = False
+        if owned_platform == "nt":
+            try:
+                killed = subprocess.run(  # noqa: S603
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS,
+                    check=False,
+                )
+                cleanup_succeeded = killed.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                cleanup_succeeded = False
+        if not cleanup_succeeded:
+            process.kill()
+        try:
+            process.wait(timeout=INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            cleanup_succeeded = False
+    finally:
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "boundary": "installed_package_tokenizer",
+                        "outcome": outcome,
+                        "cleanup_succeeded": cleanup_succeeded,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+    if outcome != "passed":
+        raise InstallerIdentityError(
+            "installed-package tokenizer production boundary failed; see bounded validation artifacts"
+        )
+
+
 def is_actionable_competing_installer_rejection(result: subprocess.CompletedProcess[str]) -> bool:
     text = result.stdout.lower()
     return result.returncode != 0 and ("competing" in text or "existing installation" in text or "remove" in text) and ("token.place" in text or "token place" in text or "token-place" in text)
 
 
-def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: ScenarioArtifactDir | None = None) -> None:
+def run_scenario(
+    scenario: Scenario,
+    expected_build_id: str,
+    artifact_dir: ScenarioArtifactDir | None = None,
+    tokenizer_boundary_model: Path | None = None,
+) -> None:
     _terminate_processes()
     uninstall_best_effort()
     config_path: Path | None = None
@@ -1081,6 +1219,12 @@ def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: Scena
                     if str(record.get(key)) != str(seeded[key]):
                         raise InstallerIdentityError(f"operator smoke did not preserve seeded config field {key}")
             validate_installed_context_tiers(shortcut.target, env, artifact_dir, scenario.name)
+            if tokenizer_boundary_model is not None:
+                run_installed_tokenizer_boundary(
+                    shortcut.target,
+                    tokenizer_boundary_model,
+                    artifact_dir.path(scenario.name, "tokenizer-production-boundary") if artifact_dir else None,
+                )
             if sentinel_log.exists() and sentinel_log.read_text(encoding="utf-8").strip():
                 raise InstallerIdentityError("host tool/Python sentinel was invoked during installed-app validation")
         finally:
@@ -1127,6 +1271,12 @@ def main() -> int:
     parser.add_argument("--expected-version", default=EXPECTED_VERSION)
     parser.add_argument("--expected-build-id", required=True)
     parser.add_argument("--artifact-dir", type=Path, default=None)
+    parser.add_argument(
+        "--tokenizer-boundary-model",
+        type=Path,
+        default=None,
+        help="Run the packaged tokenizer boundary against the installed executable before cleanup.",
+    )
     args = parser.parse_args()
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
@@ -1134,11 +1284,20 @@ def main() -> int:
         if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)):
             raise InstallerIdentityError("--pr-current-windows-nsis cannot be combined with full release scenario arguments")
         scenario = build_current_package_scenario(args.pr_current_windows_nsis, args.expected_version)
+        if args.tokenizer_boundary_model is None:
+            raise InstallerIdentityError(
+                "--pr-current-windows-nsis requires --tokenizer-boundary-model"
+            )
         if sys.platform != "win32":
             print("validated current-package Windows NSIS PR-gate contract; real install runs only on hosted Windows")
             return 0
         artifacts = ScenarioArtifactDir(args.artifact_dir) if args.artifact_dir else None
-        run_scenario(scenario, args.expected_build_id, artifacts)
+        run_scenario(
+            scenario,
+            args.expected_build_id,
+            artifacts,
+            tokenizer_boundary_model=args.tokenizer_boundary_model,
+        )
         print(f"validated current-package Windows NSIS for {args.expected_version} build {args.expected_build_id}")
         return 0
     required = {
@@ -1147,6 +1306,10 @@ def main() -> int:
         "--previous-windows-nsis": args.previous_windows_nsis,
         "--previous-windows-msi": args.previous_windows_msi,
     }
+    if args.tokenizer_boundary_model is not None:
+        raise InstallerIdentityError(
+            "--tokenizer-boundary-model is supported only with --pr-current-windows-nsis"
+        )
     missing = [name for name, value in required.items() if value is None]
     if missing:
         raise InstallerIdentityError(f"full release validation requires {', '.join(missing)}")

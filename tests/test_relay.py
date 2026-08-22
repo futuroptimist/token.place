@@ -5475,3 +5475,88 @@ def test_long_context_benchmark_tokenizer_observation_is_inert_without_explicit_
         enable_thinking=None, model_profile={})
     assert called is False
     assert list(tmp_path.iterdir()) == []
+
+
+def test_long_context_benchmark_tokenizer_observation_uses_active_runtime_fallback(
+        tmp_path, monkeypatch):
+    content = "alpha target omega"
+
+    class Runtime:
+        def render_and_tokenize_chat(self, _messages, **_kwargs):
+            return None
+
+        def tokenize(self, rendered, **_kwargs):
+            return list(rendered)
+
+    request = tmp_path / "request.json"
+    evidence = tmp_path / "evidence.json"
+    cut = len("alpha ".encode())
+    request.write_text(json.dumps({
+        "fixture_sha256": __import__("hashlib").sha256(content.encode()).hexdigest(),
+        "target_prefix_utf8_bytes": {"needle": cut},
+    }))
+    monkeypatch.setenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", str(request))
+    monkeypatch.setenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", str(evidence))
+    monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "bundled-test")
+    monkeypatch.setattr(
+        RelayClient,
+        "_api_v1_render_chat_prompt",
+        staticmethod(lambda _runtime, messages, **_kwargs: messages[-1]["content"]),
+    )
+
+    RelayClient._api_v1_record_benchmark_tokenizer_observation(
+        Runtime(), [{"role": "user", "content": content}], full_prompt_tokens=len(content),
+        enable_thinking=None, model_profile={})
+
+    payload = json.loads(evidence.read_text())
+    assert payload["target_offsets_tokens"] == {"needle": cut}
+    assert content not in evidence.read_text()
+
+
+@pytest.mark.parametrize(("case", "expected"), [
+    ("malformed_request", "request_validation_failure"),
+    ("hash_mismatch", "fixture_hash_validation_failure"),
+    ("tokenizer_unavailable", "active_runtime_tokenizer_unavailable"),
+    ("tokenization_failure", "tokenization_failure"),
+    ("runtime_identity", "runtime_identity_unavailable"),
+    ("publication", "evidence_publication_failure"),
+])
+def test_long_context_benchmark_tokenizer_observation_reports_specific_safe_stage(
+        case, expected, tmp_path, monkeypatch):
+    content = "private-payload-sentinel"
+    request = tmp_path / "request.json"
+    evidence = tmp_path / "evidence.json"
+    config = {"fixture_sha256": __import__("hashlib").sha256(content.encode()).hexdigest(),
+        "target_prefix_utf8_bytes": {"target": 7}}
+    request.write_text("{" if case == "malformed_request" else json.dumps(config))
+    monkeypatch.setenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", str(request))
+    monkeypatch.setenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", str(evidence))
+    if case not in {"runtime_identity"}:
+        monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "safe-runtime")
+    else:
+        monkeypatch.delenv("TOKENPLACE_RUNTIME_ID", raising=False)
+    if case == "hash_mismatch":
+        content = "different-private-payload"
+
+    class Runtime:
+        def render_and_tokenize_chat(self, _messages, **_kwargs):
+            if case == "tokenization_failure":
+                raise ValueError("private exception detail")
+            return None if case == "tokenizer_unavailable" else {"prompt_tokens": 9}
+
+    runtime = object() if case == "tokenizer_unavailable" else Runtime()
+    if case == "publication":
+        real_replace = os.replace
+        def fail_evidence_replace(source, destination):
+            if Path(destination) == evidence:
+                raise OSError("private temporary filename")
+            return real_replace(source, destination)
+        monkeypatch.setattr(os, "replace", fail_evidence_replace)
+    RelayClient._api_v1_record_benchmark_tokenizer_observation(
+        runtime, [{"role": "user", "content": content}], full_prompt_tokens=10,
+        enable_thinking=None, model_profile={})
+
+    stage = json.loads(Path(f"{evidence}.stage.json").read_text())
+    assert stage["category"] == expected
+    assert set(stage) == {"version", "stage", "category"}
+    assert "private" not in json.dumps(stage)

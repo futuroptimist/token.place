@@ -1,15 +1,16 @@
 # Long-context packaged-runtime benchmark harness
 
 The long-context harness turns the long-context macOS Metal evidence from #1566 into a repeatable,
-privacy-safe benchmark surface for downstream comparisons. Ordinary CI runs only deterministic unit and
-contract tests; it does **not** download a model, require a GPU, launch a packaged desktop app, or
-run multi-minute inference.
+privacy-safe benchmark surface for downstream comparisons. Broad unit and contract CI remains
+deterministic and GPU-independent. The specialized `Desktop operator app e2e` workflow also
+provisions a checksum-pinned tiny real GGUF and launches desktop binaries for hosted application
+contract checks; these checks do not run physical-GPU or multi-minute benchmark validation.
 
 ## Prerequisites for physical runs
 
 Physical packaged-runtime mode is intentionally fail-closed. Run it only on a machine with:
 
-- a built or installed token.place desktop application at version `0.1.16`;
+- a built or installed token.place desktop application at version `0.1.17`;
 - the existing pinned `llama_cpp_python==0.3.32` packaged runtime;
 - Qwen3 8B Q4_K_M or another explicitly recorded local model artifact;
 - macOS Apple Silicon with Metal or Windows with NVIDIA/CUDA for GPU validation, with CPU only where
@@ -77,7 +78,7 @@ the subprocess boundary and are orchestration evidence, never physical Metal/CUD
 
 This #1566 physical-validation follow-up to #1631 and #1634 does not claim Windows/CUDA success from
 unit tests. After merge, rerun the same one-cell Windows/CUDA `small-8k` / `single-needle` /
-`64k-full` physical gate against unchanged desktop `0.1.16` and `llama_cpp_python==0.3.32` before
+`64k-full` physical gate against unchanged desktop `0.1.17` and `llama_cpp_python==0.3.32` before
 attempting `8k-fast` classification or the six-cell matrix. Physical macOS/Metal validation also
 remains outstanding.
 
@@ -119,12 +120,28 @@ needle occurs once and deterministic similar-but-distinct markers are decoys. Th
 heading/prose ambiguity. Its canary literal is not disclosed by the instructions and occurs once.
 
 In explicit long-context benchmark mode, the packaged runner passes only the fixture hash, validated UTF-8 prefix cut
-points, and an owner-only evidence location to the bundled sidecar. During normal authoritative
-admission, the sidecar verifies the actual final user message against that hash and sends the full
-message and every prefix through the same loaded `llm_instance`, `render_and_tokenize_chat` bridge,
-chat-template policy, and thinking option. It atomically writes bounded counts and runtime identity;
-it never writes prompt text, target values, ciphertext, credentials, or request identifiers. The
-seam is inert unless the manual long-context benchmark runner explicitly supplies both environment variables.
+points, and an owner-only evidence location to the bundled sidecar. During authoritative admission,
+the sidecar verifies the actual final user message against that hash and first sends the full message
+and every prefix through the same loaded `llm_instance`, `render_and_tokenize_chat` bridge,
+chat-template policy, and thinking option. If that bridge is unavailable, each message is instead
+rendered and tokenized by the active runtime used for admission; evidence is published only when an
+authoritative count is available for the full message and every prefix. If either active-runtime
+operation cannot produce a count, evidence generation fails closed rather than substituting an
+estimate or partial observation. Both paths atomically write only bounded counts and runtime
+identity; neither writes prompt text, rendered text, target values, ciphertext, credentials, or
+request identifiers. The seam is inert unless the manual long-context benchmark runner explicitly
+supplies both environment variables.
+
+A separate atomically replaced `evidence.json.stage.json` sibling carries the production-boundary
+handshake. Its closed schema contains only a schema version, a monotonic stage number, and an
+allowlisted low-cardinality category. Rust records argument parsing and validated handoff; Python
+acknowledges receipt and records validation, tokenizer, identity, and publication outcomes. The
+runner verifies that handshake, then re-arms it immediately before the benchmark submission so a
+readiness request cannot masquerade as benchmark activity. The stage file never contains paths,
+prompts, responses, payloads, identifiers, secrets, credentials, or exception text. Missing
+post-arm producer activity is classified as `python_producer_not_invoked`; all other failures retain
+their most specific safe category and produce a `not_run` report with zero completed trials and no
+semantic or performance claim.
 
 The harness requires method `packaged_admission_render_and_tokenize_chat`, matching bundled runtime
 identity and total/progress counts, the exact target key set, unique ordered positive prefix counts,
@@ -385,7 +402,7 @@ unchanged worker session, restart failure, and malformed evidence are runtime-co
 `--report-only` cannot suppress them.
 
 The command above is the genuine-hardware procedure. It was not executed during development of
-this harness change; a packaged 0.1.16 application, model, relay, and supported hardware are
+this harness change; a packaged 0.1.17 application, model, relay, and supported hardware are
 required before recording physical evidence.
 
 ## Physical process-tree memory
@@ -463,7 +480,7 @@ only failure. Strict/default mode and every runtime-contract failure exit nonzer
 
 ## CI versus hardware validation
 
-Ordinary CI should run:
+Broad deterministic, GPU-independent CI should run:
 
 ```bash
 python -m pytest -q tests/unit/test_long_context_benchmark_harness.py
@@ -473,9 +490,17 @@ git diff --check
 ./run_all_tests.sh PR
 ```
 
-Physical Metal/CUDA validation is manual and should attach only sanitized reports to #1566, #1608,
-or downstream validation. Do not claim 0.1.16 release validation or general semantic correctness
-from a report-only baseline.
+The specialized `Desktop operator app e2e` workflow additionally provisions a checksum-pinned tiny
+real GGUF and launches desktop binaries. Its hosted-Windows job builds the current-head Windows
+package and exercises the application-argument tokenizer boundary through the matched
+WebView2/EdgeDriver path. This is a production-shaped hosted contract check, not physical hardware
+or benchmark evidence.
+
+Physical Metal/CUDA validation remains manual and should attach only sanitized reports to #1566,
+#1608, or downstream validation. Hosted CI does not prove physical Metal or CUDA operation, P8,
+long-context semantic correctness, or performance. A fresh physical Windows/CUDA or macOS/Metal
+validation is still required; do not claim 0.1.17 release validation or general semantic correctness
+from a hosted contract check or report-only baseline.
 
 ### Qwen 64K KV allocation diagnostics
 

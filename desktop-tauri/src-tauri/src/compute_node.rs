@@ -460,7 +460,7 @@ impl BridgeProcessRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BridgeProcessAttachmentOutcome {
-    Running,
+    Attached,
     Stopping,
     Superseded,
 }
@@ -599,9 +599,8 @@ async fn attach_spawned_bridge_process_for_session(
                 BridgeProcessPhase::Starting => {
                     record.child = pending_child.take();
                     record.stdin = pending_stdin.take();
-                    record.phase = BridgeProcessPhase::Running;
                     (
-                        BridgeProcessAttachmentOutcome::Running,
+                        BridgeProcessAttachmentOutcome::Attached,
                         Some(record.notify.clone()),
                     )
                 }
@@ -629,6 +628,35 @@ async fn attach_spawned_bridge_process_for_session(
         pending_stdin,
         notify,
     }
+}
+
+async fn promote_attached_bridge_after_startup_event(
+    state: &ComputeNodeState,
+    session_id: &str,
+    payload: &Value,
+) -> bool {
+    let mut process = state.bridge_process.lock().await;
+    let Some(record) = process
+        .as_mut()
+        .filter(|record| record.session_id == session_id)
+    else {
+        return false;
+    };
+    if !matches!(
+        record.phase,
+        BridgeProcessPhase::Starting | BridgeProcessPhase::Running
+    ) || record.child.is_none()
+    {
+        return false;
+    }
+    let mut status = state.status.lock().await;
+    if !update_status_from_event(&mut status, payload) {
+        return false;
+    }
+    if record.phase == BridgeProcessPhase::Starting {
+        record.phase = BridgeProcessPhase::Running;
+    }
+    true
 }
 
 async fn publish_running_if_bridge_record_still_running(
@@ -3068,12 +3096,12 @@ pub async fn start_compute_node_with_entry_ack(
         attach_spawned_bridge_process_for_session(&state, &session_id, child, stdin).await;
 
     match attachment.outcome {
-        BridgeProcessAttachmentOutcome::Running => {
+        BridgeProcessAttachmentOutcome::Attached => {
             record_native_startup_state(
                 &state,
                 &session_id,
                 NativeStartupPhase::BridgeAttached,
-                NativeStartupOutcome::Running,
+                NativeStartupOutcome::Accepted,
                 NativeStartupFailureCategory::None,
             )
             .await;
@@ -3120,82 +3148,6 @@ pub async fn start_compute_node_with_entry_ack(
         }
     }
 
-    if attachment.outcome == BridgeProcessAttachmentOutcome::Running {
-        let build_identity = crate::build_identity::build_identity();
-        let running_status = ComputeNodeStatus {
-            native_startup_phase: NativeStartupPhase::RunningStatusPublication,
-            native_startup_outcome: NativeStartupOutcome::PublicationAccepted,
-            native_startup_failure_category: NativeStartupFailureCategory::None,
-            running: true,
-            registered: false,
-            active_relay_url: primary_relay_url.clone(),
-            configured_relay_urls: relay_base_urls.clone(),
-            relay_statuses: Vec::new(),
-            registered_relay_count: 0,
-            configured_relay_count: relay_base_urls.len(),
-            registered_relay_urls: Vec::new(),
-            active_relay_urls: Vec::new(),
-            requested_mode: format!("{:?}", request.mode).to_lowercase(),
-            effective_mode: "cpu".into(),
-            backend_available: "unknown".into(),
-            backend_selected: "cpu".into(),
-            backend_used: "cpu".into(),
-            fallback_reason: None,
-            model_path: request.model_path.clone(),
-            last_error: None,
-            relay_runtime_state: Some("starting".into()),
-            warm_load_state: Some("not_started".into()),
-            warm_load_enabled: Some(true),
-            warm_load_duration_ms: None,
-            context_tier: Some(normalize_context_tier(&request.context_tier)),
-            context_window_tokens: context_profile(&normalize_context_tier(&request.context_tier))
-                .map(|profile| profile.total_context_tokens),
-            runtime_path: Some("bridge".into()),
-            relay_runtime_path: Some("bridge".into()),
-            worker_state: Some("starting".into()),
-            worker_generation: None,
-            worker_restart_count: None,
-            worker_alive: Some(false),
-            last_worker_error_code: None,
-            last_worker_exit_code: None,
-            last_worker_restart_at_ms: None,
-            stop_cleanup_required: None,
-            stop_cleanup_attempted: None,
-            stop_cleanup_outcome: None,
-            stop_cleanup_success_count: None,
-            stop_cleanup_failure_count: None,
-            stop_cleanup_warning: None,
-            operator_session_id: Some(session_id.clone()),
-            sequence: Some(0),
-            updated_at_ms: Some(current_time_ms()),
-            log_file_path: log_file_path.clone(),
-            readiness_diagnostics: Map::new(),
-            app_version: build_identity.app_version.into(),
-            build_id: build_identity.build_id.into(),
-            target_triple: build_identity.target_triple.into(),
-            bundled_runtime_id: build_identity.bundled_runtime_id.into(),
-            runtime_id: launcher_metadata.as_ref().map(|m| m.2.clone()),
-            launcher_source: launcher_metadata.as_ref().map(|m| m.0.clone()),
-            interpreter_basename: launcher_metadata.as_ref().map(|m| m.1.clone()),
-        };
-        let running_published = publish_running_if_bridge_record_still_running(
-            &state,
-            &session_id,
-            running_status.clone(),
-        )
-        .await;
-        if running_published
-            && app
-                .emit("compute_node_event", running_status_event(&running_status))
-                .is_err()
-        {
-            eprintln!(
-                "desktop.compute_node.event_emit_error operator_session_id={}",
-                session_id
-            );
-        }
-    }
-
     let log_policy = SubprocessLogPolicy::from_env();
     let stderr_log_sink = log_sink.clone();
     let stderr_task = tokio::spawn(async move {
@@ -3228,14 +3180,29 @@ pub async fn start_compute_node_with_entry_ack(
                 match parse_compute_node_event_line(&line) {
                     Ok(payload) => {
                         let payload = with_log_file_path(payload, log_file_path.as_deref());
-                        if !apply_compute_node_event_to_state(&state, &payload).await {
+                        let is_current_startup_event =
+                            payload.get("operator_session_id").and_then(Value::as_str)
+                                == Some(session_id.as_str())
+                                && payload.get("type").and_then(Value::as_str) == Some("started");
+                        if is_current_startup_event {
+                            if !promote_attached_bridge_after_startup_event(
+                                &state,
+                                &session_id,
+                                &payload,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                            saw_startup_event = true;
+                        } else if !apply_compute_node_event_to_state(&state, &payload).await {
                             continue;
                         }
                         if payload.get("operator_session_id").and_then(Value::as_str)
                             == Some(session_id.as_str())
                         {
                             match payload.get("type").and_then(Value::as_str) {
-                                Some("started") => saw_startup_event = true,
+                                Some("started") => {}
                                 Some("error") => saw_error_event = true,
                                 Some("stopped") => {}
                                 _ => {}
@@ -6026,11 +5993,11 @@ mod tests {
         let attachment =
             attach_spawned_bridge_process_for_session(&state, "publish-race-session", child, stdin)
                 .await;
-        assert_eq!(attachment.outcome, BridgeProcessAttachmentOutcome::Running);
+        assert_eq!(attachment.outcome, BridgeProcessAttachmentOutcome::Attached);
         {
             let mut process = state.bridge_process.lock().await;
             let record = process.as_mut().expect("process record");
-            assert_eq!(record.phase, BridgeProcessPhase::Running);
+            assert_eq!(record.phase, BridgeProcessPhase::Starting);
             record.phase = BridgeProcessPhase::Stopping;
         }
         let published = publish_running_if_bridge_record_still_running(
@@ -6084,7 +6051,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
-    async fn starting_to_running_attachment_path_installs_child() {
+    async fn attachment_waits_for_current_session_startup_event() {
         let state = ComputeNodeState::default();
         *state.bridge_process.lock().await = Some(BridgeProcessRecord::new(
             "attach-session".into(),
@@ -6103,9 +6070,41 @@ mod tests {
         let attachment =
             attach_spawned_bridge_process_for_session(&state, "attach-session", child, stdin).await;
 
-        assert_eq!(attachment.outcome, BridgeProcessAttachmentOutcome::Running);
+        assert_eq!(attachment.outcome, BridgeProcessAttachmentOutcome::Attached);
         assert!(attachment.pending_child.is_none());
         assert!(attachment.pending_stdin.is_none());
+        assert!(!state.status.lock().await.running);
+        let stale_event = serde_json::json!({
+            "type": "started",
+            "operator_session_id": "stale-session",
+            "sequence": 1,
+            "running": true,
+            "registered": false
+        });
+        assert!(
+            !promote_attached_bridge_after_startup_event(&state, "stale-session", &stale_event)
+                .await,
+            "a stale-session startup event must not promote the attached child"
+        );
+        let startup_event = serde_json::json!({
+            "type": "started",
+            "operator_session_id": "attach-session",
+            "sequence": 1,
+            "running": true,
+            "registered": false
+        });
+        assert!(
+            promote_attached_bridge_after_startup_event(&state, "attach-session", &startup_event)
+                .await,
+            "the current-session startup event should promote the attached child"
+        );
+        let status = state.status.lock().await.clone();
+        assert!(status.running);
+        assert!(!status.registered);
+        assert_eq!(
+            status.operator_session_id.as_deref(),
+            Some("attach-session")
+        );
         let mut child_to_reap = {
             let mut process = state.bridge_process.lock().await;
             let record = process.as_mut().expect("record remains installed");
@@ -7518,8 +7517,8 @@ mod tests {
     #[test]
     fn finalize_bridge_exit_emits_ui_error_payload_when_clean_exit_happens_before_startup_event() {
         let mut status = ComputeNodeStatus {
-            running: true,
-            registered: true,
+            running: false,
+            registered: false,
             operator_session_id: Some("current-session".into()),
             sequence: Some(7),
             ..ComputeNodeStatus::default()

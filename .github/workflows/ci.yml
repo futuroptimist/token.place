@@ -9,6 +9,7 @@ jobs:
   test:
     name: Run tests + relay landing-page real desktop-bridge API v1 guardrail
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
@@ -53,7 +54,12 @@ jobs:
           python -m pip install -r requirements.txt
       - name: Install Playwright browsers and system dependencies
         if: steps.prep.outputs.rc != '2'
-        run: python -m playwright install --with-deps chromium
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          python scripts/run_with_timeout_retry.py \
+            --timeout 240 --grace 15 --attempts 2 --delay 15 -- \
+            python -m playwright install --with-deps chromium
       - name: Install Node.js dependencies
         if: steps.prep.outputs.rc != '2'
         run: npm ci

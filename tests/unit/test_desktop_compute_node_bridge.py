@@ -3336,6 +3336,12 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
     assert "stop" not in events
     captured = capsys.readouterr()
     output_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+    assert not any(
+        event.get("type") == "started"
+        and event.get("running") is True
+        and event.get("runtime_provisioning_state") != "provisioning"
+        for event in output_events
+    )
     error_event = next(event for event in output_events if event.get("type") == "error")
     assert error_event["warm_load_state"] == "failed"
     assert error_event["relay_runtime_state"] == "failed"
@@ -3434,6 +3440,12 @@ def test_run_stops_when_pre_registration_runtime_warmup_fails(capsys, monkeypatc
     assert status == 1
     assert calls == ["warm"]
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert not any(
+        event.get("type") == "started"
+        and event.get("running") is True
+        and event.get("runtime_provisioning_state") != "provisioning"
+        for event in events
+    )
     payload = next(event for event in events if event.get("type") == "error")
     assert payload["type"] == "error"
 
@@ -3460,6 +3472,11 @@ def test_run_does_not_warm_when_disabled(capsys, monkeypatch):
     assert call_order == ["poll", "poll"]
     output = capsys.readouterr()
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    started_index = next(i for i, event in enumerate(events) if event.get("type") == "started")
+    registered_index = next(
+        i for i, event in enumerate(events) if event.get("registered") is True
+    )
+    assert started_index < registered_index
     status_events = [event for event in events if event.get("type") == "status"]
     assert any(event.get("registered") is True for event in status_events)
     assert all(event.get("relay_runtime_state") == "ready" for event in status_events)

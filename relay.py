@@ -19,6 +19,21 @@ from urllib.parse import urlparse
 from release_metadata import get_release_metadata, resolve_asset_version, resolve_deploy_ref
 from utils.llm.model_profiles import build_model_aliases
 from utils.inference_timeout import DEFAULT_INFERENCE_TIMEOUT_SECONDS
+from relay_state_store import (
+    ComputeNodeCapabilities,
+    EncryptedProgressEnvelope,
+    EncryptedRequestEnvelope,
+    EncryptedResponseEnvelope,
+    InMemoryRelayStateStore,
+    RelayStateCapacityExceeded,
+    RelayStateConflict,
+    RelayStateCredentialMismatch,
+    RelayStateInvalidReservation,
+    RelayStateNoCapacity,
+    RelayStateStore,
+    RelayStateStoreConfig,
+    RelayStateStoreError,
+)
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import (
@@ -107,6 +122,77 @@ def setup_logging() -> logging.Logger:
 
 
 LOGGER = setup_logging()
+
+
+def _build_relay_state_store() -> RelayStateStore:
+    """Construct the sole API-v1 correctness authority (single-process memory mode)."""
+    config = RelayStateStoreConfig(
+        namespace="tokenplace-relay-memory",
+        lease_ttl_seconds=(
+            float(_api_v1_lease_seconds())
+            if "_api_v1_lease_seconds" in globals()
+            else 30.0
+        ),
+        claim_ttl_seconds=(
+            float(_api_v1_in_flight_ttl_seconds())
+            if "_api_v1_in_flight_ttl_seconds" in globals()
+            else 30.0
+        ),
+        max_request_ttl_seconds=(
+            HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS
+            if "HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS" in globals()
+            else 3600.0
+        ),
+    )
+    return InMemoryRelayStateStore(config, acknowledgement_key=secrets.token_bytes(32))
+
+
+RELAY_STATE_STORE: RelayStateStore | None = None
+
+
+def _relay_state_store() -> RelayStateStore:
+    global RELAY_STATE_STORE
+    if RELAY_STATE_STORE is None:
+        RELAY_STATE_STORE = _build_relay_state_store()
+    return RELAY_STATE_STORE
+
+
+def _store_deadline_metadata(deadline_epoch: float | None) -> dict[str, float]:
+    if deadline_epoch is None:
+        return {}
+    remaining = max(deadline_epoch - time.time(), 0.0)
+    return {
+        "request_deadline_remaining_seconds": remaining,
+        "request_ttl_seconds": remaining,
+    }
+
+
+def _store_capabilities(value: dict[str, Any]) -> ComputeNodeCapabilities:
+    return ComputeNodeCapabilities(
+        supported_model_ids=tuple(value["supported_model_ids"] or DEFAULT_MODEL_IDS),
+        active_context_tier=value["active_context_tier"],
+        maximum_total_context_tokens=value["maximum_total_context_tokens"],
+        default_output_token_reservation=value["default_output_token_reservation"],
+        maximum_output_tokens=value["maximum_output_tokens"],
+        max_concurrency=value["max_concurrency"],
+        backend_class=value.get("backend_class", "unknown"),
+    )
+
+
+def _store_failure():
+    return (
+        jsonify(
+            {
+                "error": {
+                    "message": "Relay state backend unavailable",
+                    "code": "state_backend_unavailable",
+                }
+            }
+        ),
+        503,
+    )
+
+
 
 
 RELAY_METRICS_REGISTRY = CollectorRegistry()
@@ -1444,6 +1530,20 @@ def _evict_stale_servers() -> list[str]:
 
 def _live_server_diagnostics(*, api_v1_only: bool = False) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
+    if api_v1_only:
+        for registration in _relay_state_store().list():
+            caps = registration.capabilities
+            queued = len(_relay_state_store().queued_requests(registration.node_id))
+            claimed = len(_relay_state_store().active_claims(registration.node_id))
+            diagnostics.append({
+                "server_public_key": registration.node_id,
+                "age_seconds": 0.0,
+                "next_ping_in_x_seconds": max(registration.lease_expires_at_epoch - time.time(), 0.0),
+                "queue_depth": queued, "in_flight_count": claimed,
+                "max_concurrency": caps.max_concurrency, "load_score": queued + claimed,
+                "capabilities": {"api_version": caps.api_version, "supported_model_ids": list(caps.supported_model_ids), "active_context_tier": caps.active_context_tier, "maximum_total_context_tokens": caps.maximum_total_context_tokens, "default_output_token_reservation": caps.default_output_token_reservation, "maximum_output_tokens": caps.maximum_output_tokens, "max_concurrency": caps.max_concurrency, "backend_class": caps.backend_class},
+            })
+        return sorted(diagnostics, key=lambda node: node["server_public_key"])
     for server_public_key, payload in list(known_servers.items()):
         if api_v1_only and not bool(payload.get(API_V1_SERVER_MARKER)):
             continue
@@ -1984,105 +2084,102 @@ def _select_best_fit_server_key(*, model: str | None = None, context_tier: str =
 
 
 def _select_next_server_payload(*, api_v1: bool = False):
-    global server_round_robin_next_index
-    evicted = _evict_stale_servers()
-    with server_round_robin_lock:
-        if not known_servers:
-            server_round_robin_next_index = 0
-            if api_v1:
-                return jsonify({
-                    'error': {
-                        'message': 'No registered compute nodes are available on this relay.',
-                        'code': 'no_registered_compute_nodes',
-                    }
-                }), 503
-            return jsonify({'error': {'message': 'No servers available','code': 503}}), 503
-        if not api_v1:
-            server_public_key = secrets.choice(list(known_servers.keys()))
-            server_payload = dict(known_servers[server_public_key])
-            return jsonify({'server_public_key': server_payload['public_key']})
+    if not api_v1:
+        _evict_stale_servers()
+        with server_round_robin_lock:
+            if not known_servers:
+                return (
+                    jsonify(
+                        {"error": {"message": "No servers available", "code": 503}}
+                    ),
+                    503,
+                )
+            payload = secrets.choice(list(known_servers.values()))
+            return jsonify({"server_public_key": payload["public_key"]})
 
-    model = request.args.get("model") if api_v1 else None
-    if api_v1 and not (isinstance(model, str) and model.strip()):
-        model = DEFAULT_MODEL_IDS[0]
-    context_tier = request.args.get("context_tier") if api_v1 else None
-    context_tier = context_tier.strip() if isinstance(context_tier, str) and context_tier.strip() else DEFAULT_CONTEXT_TIER
-    if api_v1 and context_tier not in CONTEXT_TIER_ORDER:
-        return jsonify({'error': {'message': 'Unsupported context_tier', 'code': 'invalid_context_tier'}}), 400
-
-    server_public_key, selection, server_payload = _select_best_fit_server_key(
-        model=model,
-        context_tier=context_tier,
-    )
-    if not server_public_key or server_payload is None:
-        if selection.get("registered_api_v1_count", 0):
-            if selection.get("capacity_limited_node_count", 0):
-                return jsonify({
-                    'error': {
-                        'message': 'Registered compute nodes match the requested model/context tier, but all matching nodes are at capacity. Retry with backoff.',
-                        'code': 'no_available_capacity',
-                        'selection_policy': API_V1_SELECTION_POLICY,
-                        'requested_context_tier': context_tier,
-                        'requested_model': model,
-                        'eligible_node_count': selection.get("eligible_node_count", 0),
-                        'eligible_tier_counts': selection.get("eligible_tier_counts", {}),
-                        'capacity_limited_node_count': selection.get("capacity_limited_node_count", 0),
-                        'capacity_limited_tier_counts': selection.get("capacity_limited_tier_counts", {}),
+    model = request.args.get("model", DEFAULT_MODEL_IDS[0]).strip().lower()
+    model = MODEL_ALIASES.get(model, model)
+    tier = request.args.get("context_tier", DEFAULT_CONTEXT_TIER).strip()
+    client_key = request.args.get("client_public_key")
+    request_id = request.args.get("request_id")
+    cancel_token = request.args.get("cancel_token")
+    if tier not in CONTEXT_TIER_ORDER:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Unsupported context_tier",
+                        "code": "invalid_context_tier",
                     }
-                }), 503
-            return jsonify({
-                'error': {
-                    'message': 'Registered compute nodes are available, but none match the requested model/context tier.',
-                    'code': 'no_matching_compute_node',
-                    'selection_policy': API_V1_SELECTION_POLICY,
-                    'requested_context_tier': context_tier,
-                    'requested_model': model,
-                    'eligible_node_count': selection.get("eligible_node_count", 0),
-                    'eligible_tier_counts': selection.get("eligible_tier_counts", {}),
                 }
-            }), 503
-        return jsonify({
-            'error': {
-                'message': 'No registered compute nodes are available on this relay.',
-                'code': 'no_registered_compute_nodes',
-            }
-        }), 503
+            ),
+            400,
+        )
+    if not client_key or not request_id:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "client_public_key and request_id are required",
+                        "code": 400,
+                    }
+                }
+            ),
+            400,
+        )
+    deadline = time.time() + _api_v1_request_deadline_seconds()
+    try:
+        result = _relay_state_store().select_and_reserve(
+            client_key, request_id, model, tier, deadline, cancel_token
+        )
+        registration = _relay_state_store().get(result.selected_node_id)
+    except RelayStateNoCapacity:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "No matching compute node capacity is available.",
+                        "code": "no_available_capacity",
+                    }
+                }
+            ),
+            503,
+        )
+    except (RelayStateConflict, RelayStateInvalidReservation, RelayStateStoreError):
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Relay request selection was rejected",
+                        "code": "relay_state_conflict",
+                    }
+                }
+            ),
+            409,
+        )
+    except Exception:
+        LOGGER.error(
+            "relay.state_store.failure", extra={"operation": "select_and_reserve"}
+        )
+        return _store_failure()
+    if registration is None:
+        return _store_failure()
+    caps = registration.capabilities
+    payload = {
+        "server_public_key": result.selected_node_id,
+        "reservation_token": result.reservation_token,
+        "reservation_expires_at_epoch": result.reservation_expires_at_epoch,
+        "request_deadline_epoch": result.request_deadline_epoch,
+        "requested_context_tier": tier,
+        "requested_model": model,
+        "resolved_model": result.requested_model_id,
+        "selected_context_tier": caps.active_context_tier,
+        "selected_context_window_tokens": caps.maximum_total_context_tokens,
+        "selected_model_support": list(caps.supported_model_ids),
+        "selection_policy": API_V1_SELECTION_POLICY,
+    }
+    return jsonify(payload), 200
 
-    capabilities = server_payload.get("capabilities") if isinstance(server_payload, dict) else {}
-    LOGGER.info(
-        "relay.server_selected",
-        extra={
-            "server_fingerprint": _safe_key_fingerprint(server_public_key),
-            "selection_policy": API_V1_SELECTION_POLICY,
-            "round_robin_index": selection.get("round_robin_index"),
-            "round_robin_position": selection.get("round_robin_position"),
-            "requested_context_tier": context_tier,
-            "requested_model": model,
-            "eligible_count": selection.get("eligible_count"),
-            "selected_context_tier": capabilities.get("active_context_tier"),
-            "selected_load_score": selection.get("selected_load_score"),
-            "spillover": selection.get("spillover"),
-            "evicted_stale_count": len(evicted),
-            "api_v1": api_v1,
-        },
-    )
-    return jsonify({
-        'server_public_key': server_payload['public_key'],
-        'requested_context_tier': context_tier,
-        'requested_model': model,
-        'resolved_model': selection.get('requested_model'),
-        'selected_context_tier': capabilities.get("active_context_tier"),
-        'selected_context_window_tokens': capabilities.get("maximum_total_context_tokens"),
-        'selected_model_support': capabilities.get("supported_model_ids", []),
-        'selection_policy': API_V1_SELECTION_POLICY,
-        'eligible_node_count': selection.get("eligible_node_count", selection.get("eligible_count", 0)),
-        'eligible_tier_counts': selection.get("eligible_tier_counts", {}),
-        'selected_queue_depth': selection.get("selected_queue_depth", 0),
-        'selected_in_flight_count': selection.get("selected_in_flight_count", 0),
-        'selected_load_score': selection.get("selected_load_score", 0),
-        'spillover': bool(selection.get("spillover")),
-        **({'spillover_reason': selection.get("spillover_reason")} if selection.get("spillover_reason") else {}),
-    })
 
 @app.route('/next_server', methods=['GET'])
 def next_server():
@@ -2230,7 +2327,9 @@ def _payload_has_unexpected_relay_fields(payload, *, allow_server_public_key):
         "request_id",
         "protocol",
         "version",
-        "cancel_token",
+        "cancel_token", "reservation_token", "request_deadline_epoch",
+        "requested_model", "requested_context_tier", "server_public_key",
+        "control_credential", "consumer_identity", "claim_generation",
     }
     if allow_server_public_key:
         allowed_fields.add("server_public_key")
@@ -2794,658 +2893,664 @@ def _pop_client_response(client_public_key, request_id=None):
         return response
 
 
-@app.route('/api/v1/relay/servers/register', methods=['POST'])
+@app.route("/api/v1/relay/servers/register", methods=["POST"])
 def api_v1_relay_servers_register():
-    """Register or heartbeat a compute node for API v1 encrypted relay workloads."""
-    global server_round_robin_next_index
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
-
     data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
-
-    public_key = data.get('server_public_key')
-    if not public_key:
-        return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
-    capabilities, capability_error = _normalise_api_v1_capabilities(data.get('capabilities'))
-    if capability_error:
-        return jsonify({'error': {'message': capability_error, 'code': 'invalid_capabilities'}}), 400
-
-    lease_seconds = _api_v1_lease_seconds()
-    control_credential = ""
-    with server_round_robin_lock:
-        existing_payload = known_servers.get(public_key)
-        existing_api_v1_count = len(_api_v1_round_robin_keys())
-        if existing_payload and existing_payload.get(API_V1_SERVER_MARKER):
-            existing_payload['last_ping'] = datetime.now()
-            log_event = "server.reregister"
-        else:
-            if existing_api_v1_count == 0:
-                server_round_robin_next_index = 0
-            if existing_payload:
-                existing_payload['last_ping'] = datetime.now()
-                known_servers.pop(public_key, None)
-                known_servers[public_key] = existing_payload
-            else:
-                known_servers[public_key] = {
-                    'public_key': public_key,
-                    'last_ping': datetime.now(),
-                    'last_ping_duration': lease_seconds,
+    if not isinstance(data, dict) or not data.get("server_public_key"):
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
+    capabilities, error = _normalise_api_v1_capabilities(data.get("capabilities"))
+    if error:
+        return (
+            jsonify({"error": {"message": error, "code": "invalid_capabilities"}}),
+            400,
+        )
+    node = data["server_public_key"]
+    try:
+        existing = _relay_state_store().get(node)
+        credential = _new_api_v1_control_credential() if existing is None else ""
+        digest = (
+            existing.control_credential_digest
+            if existing
+            else _api_v1_control_credential_digest(credential)
+        )
+        _relay_state_store().register(node, _store_capabilities(capabilities), digest)
+    except RelayStateCredentialMismatch:
+        return (
+            jsonify(
+                {"error": {"message": "Registration authority conflict", "code": 403}}
+            ),
+            403,
+        )
+    except RelayStateCapacityExceeded:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Compute-node registration capacity reached",
+                        "code": "relay_capacity_exceeded",
+                    }
                 }
-            known_servers[public_key][API_V1_SERVER_MARKER] = True
-            log_event = "server.registered"
-        known_servers[public_key]['last_ping_duration'] = lease_seconds
-        known_servers[public_key][API_V1_SERVER_MARKER] = True
-        known_servers[public_key]['capabilities'] = capabilities
-        known_servers[public_key]['public_key'] = public_key
-        control_credential = _store_api_v1_control_credential(known_servers[public_key])
-    LOGGER.info(log_event, extra={"server_fingerprint": _safe_key_fingerprint(public_key)})
-
-    response_payload = {
-        'next_ping_in_x_seconds': lease_seconds,
-        'poll_wait_seconds': _api_v1_poll_wait_seconds(),
-        'relay_capabilities': {'encrypted_progress_v1': True},
+            ),
+            503,
+        )
+    except Exception:
+        LOGGER.error("relay.state_store.failure", extra={"operation": "register"})
+        return _store_failure()
+    payload = {
+        "next_ping_in_x_seconds": _api_v1_lease_seconds(),
+        "poll_wait_seconds": _api_v1_poll_wait_seconds(),
+        "relay_capabilities": {"encrypted_progress_v1": True},
     }
-    if control_credential:
-        response_payload['control_credential'] = control_credential
-    return jsonify(response_payload), 200
+    if credential:
+        payload["control_credential"] = credential
+    return jsonify(payload), 200
 
 
 def _handle_server_unregister_request(*, invalid_error_shape: str = "api_v1"):
-    """Handle idempotent compute-node unregister requests for relay routes."""
-
+    _ = invalid_error_shape  # Retained for the legacy alias response contract.
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
-
     data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        if invalid_error_shape == "legacy":
-            return jsonify({'error': 'Invalid request data'}), 400
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
+    if not isinstance(data, dict) or not data.get("server_public_key"):
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
+    credential = data.get("control_credential")
+    if not isinstance(credential, str) or not credential:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Missing or invalid relay server control credential",
+                        "code": 403,
+                    }
+                }
+            ),
+            403,
+        )
+    try:
+        result = _relay_state_store().unregister_node_and_transition_work(
+            data["server_public_key"], _api_v1_control_credential_digest(credential)
+        )
+    except RelayStateCredentialMismatch:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Missing or invalid relay server control credential",
+                        "code": 403,
+                    }
+                }
+            ),
+            403,
+        )
+    except Exception:
+        LOGGER.error("relay.state_store.failure", extra={"operation": "unregister"})
+        return _store_failure()
+    return (
+        jsonify(
+            {
+                "message": "Server unregistered",
+                "removed": result.state not in {"not_found", "already_complete"},
+            }
+        ),
+        200,
+    )
 
-    public_key = data.get('server_public_key')
-    if not isinstance(public_key, str) or not public_key.strip():
-        if invalid_error_shape == "legacy":
-            return jsonify({'error': 'Invalid public key'}), 400
-        return jsonify({'error': {'message': 'Invalid public key', 'code': 400}}), 400
 
-    removed = _unregister_server(public_key, owner_credential=data.get('control_credential'))
-    if removed is None:
-        return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
-    return jsonify({'message': 'Server unregistered', 'removed': removed}), 200
-
-
-@app.route('/api/v1/relay/servers/unregister', methods=['POST'])
+@app.route("/api/v1/relay/servers/unregister", methods=["POST"])
 def api_v1_relay_servers_unregister():
-    """Explicitly unregister an API v1 compute node and cancel its queued work."""
-
     return _handle_server_unregister_request()
 
 
-@app.route('/api/v1/relay/servers/poll', methods=['POST'])
+@app.route("/api/v1/relay/servers/poll", methods=["POST"])
 def api_v1_relay_servers_poll():
-    """Claim the next queued encrypted workload for a registered compute node."""
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
-
-    _evict_stale_servers()
     data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
-
-    public_key = data.get('server_public_key')
-    if not public_key:
-        return jsonify({'error': {'message': 'Missing server public key', 'code': 400}}), 400
-    capabilities = None
-    if 'capabilities' in data:
-        raw_capabilities = data.get('capabilities')
-        if raw_capabilities is not None:
-            capabilities, capability_error = _normalise_api_v1_capabilities(raw_capabilities)
-            if capability_error:
-                return jsonify({'error': {'message': capability_error, 'code': 'invalid_capabilities'}}), 400
-
-    poll_wait_seconds = _api_v1_poll_wait_seconds()
-    lease_seconds = _api_v1_lease_seconds()
-    with server_round_robin_lock:
-        server_payload = known_servers.get(public_key)
-        if server_payload is None:
-            return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
-        server_payload['last_ping'] = datetime.now()
-        server_payload['last_ping_duration'] = lease_seconds
-        if capabilities is not None:
-            server_payload['capabilities'] = capabilities
-        server_payload['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
-    LOGGER.info("server.heartbeat", extra={"server_fingerprint": _safe_key_fingerprint(public_key)})
-
-    def _mark_claimed_request_terminal(claimed_request):
-        if not isinstance(claimed_request, dict):
-            return
-        if bool(claimed_request.get('e2ee_v1')):
-            was_unregistered = _api_v1_server_was_recently_unregistered(public_key)
-            _cancel_api_v1_request(
-                claimed_request.get('client_public_key'),
-                claimed_request.get('request_id'),
-                status='cancelled' if was_unregistered else 'expired',
-                reason='server_unregistered' if was_unregistered else 'provider_timeout',
-            )
-
-    def _server_not_found_response(claimed_request=None):
-        _mark_claimed_request_terminal(claimed_request)
-        return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
-
-    first_request = None
-    deadline = time.monotonic() + poll_wait_seconds
-    while True:
-        server_missing = False
-        with server_round_robin_lock:
-            server_missing = public_key not in known_servers
-        if server_missing:
-            return _server_not_found_response(first_request)
-        with client_inference_requests_changed:
-            first_request = _pop_next_api_v1_request(public_key)
-            if first_request is not None:
-                request_deadline_monotonic = _valid_request_deadline_monotonic(first_request.get('_request_deadline_monotonic'))
-                if request_deadline_monotonic is not None and request_deadline_monotonic <= time.monotonic():
-                    first_request = dict(first_request)
-                else:
-                    break
-            if first_request is not None:
-                expired_request = first_request
-                first_request = None
-                # Drop expired queue heads and continue draining immediately.
-                should_continue = True
-            else:
-                expired_request = None
-                should_continue = False
-            remaining = deadline - time.monotonic()
-            if should_continue:
-                pass
-            elif poll_wait_seconds <= 0 or remaining <= 0:
-                break
-            else:
-                client_inference_requests_changed.wait(timeout=remaining)
-        if expired_request is not None:
-            _cancel_api_v1_request(
-                expired_request.get('client_public_key'),
-                expired_request.get('request_id'),
-                status='expired',
-                reason='provider_timeout',
-            )
-            continue
-
-    server_missing = False
-    with server_round_robin_lock:
-        server_payload = known_servers.get(public_key)
-        if server_payload is None:
-            server_missing = True
-        else:
-            server_payload.pop('polling_until_monotonic', None)
-
-            if first_request is None:
-                server_payload['last_ping'] = datetime.now()
-                return jsonify({
-                    'message': 'No requests available',
-                    'next_ping_in_x_seconds': 0 if poll_wait_seconds > 0 else max(server_payload['last_ping_duration'], 1),
-                    'poll_wait_seconds': poll_wait_seconds,
-                }), 200
-    if server_missing:
-        return _server_not_found_response(first_request)
-
-    queue_wait_ms = None
-    queued_at = first_request.pop('_queued_at', None)
-    if isinstance(queued_at, (int, float)):
-        queue_wait_ms = round(max((time.time() - float(queued_at)) * 1000.0, 0.0), 3)
-    request_id = first_request.get('request_id')
-    request_deadline_monotonic = _valid_request_deadline_monotonic(first_request.pop('_request_deadline_monotonic', None))
-    if request_deadline_monotonic is not None and request_deadline_monotonic <= time.monotonic():
-        _cancel_api_v1_request(
-            first_request.get('client_public_key'),
-            request_id,
-            status='expired',
-            reason='provider_timeout',
+    if not isinstance(data, dict) or not data.get("server_public_key"):
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
+    node, credential = data["server_public_key"], data.get("control_credential")
+    consumer = data.get("consumer_identity", node)
+    if not isinstance(credential, str) or not credential:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Missing or invalid relay server control credential",
+                        "code": 403,
+                    }
+                }
+            ),
+            403,
         )
-        return jsonify({
-            'message': 'No requests available',
-            'next_ping_in_x_seconds': 0 if poll_wait_seconds > 0 else lease_seconds,
-            'poll_wait_seconds': poll_wait_seconds,
-        }), 200
-    first_request.update(_api_v1_deadline_metadata(request_deadline_monotonic))
-    if isinstance(request_id, str) and request_id:
-        server_missing = False
-        with server_round_robin_lock:
-            server_payload = known_servers.get(public_key)
-            if server_payload is None:
-                server_missing = True
-            else:
-                with api_v1_in_flight_requests_lock:
-                    in_flight_requests = server_payload.setdefault('api_v1_in_flight_requests', {})
-                    if isinstance(in_flight_requests, dict):
-                        in_flight_requests[request_id] = {
-                            'expires_at': min(
-                                time.monotonic() + _api_v1_in_flight_ttl_seconds(),
-                                request_deadline_monotonic if request_deadline_monotonic is not None else time.monotonic() + _api_v1_in_flight_ttl_seconds(),
-                            ),
-                            'started_at_monotonic': time.monotonic(),
-                            'client_public_key': first_request.get('client_public_key'),
-                            'cancel_token': first_request.get('cancel_token'),
-                            'request_deadline_monotonic': request_deadline_monotonic,
-                        }
-        if server_missing:
-            return _server_not_found_response(first_request)
-
-    LOGGER.info(
-        "relay.api_v1.request_dispatched",
-        extra={
-            "server_fingerprint": _safe_key_fingerprint(public_key),
-            "queue_wait_ms": queue_wait_ms,
-        },
-    )
-    return jsonify(first_request), 200
-
-
-@app.route('/api/v1/relay/servers/control', methods=['POST'])
-def api_v1_relay_servers_control():
-    """Authenticated owner-only control poll for one in-flight API v1 request."""
-    auth_error = _validate_server_registration()
-    if auth_error:
-        return auth_error
-
-    _evict_stale_servers()
-    _prune_api_v1_control_tombstones()
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
-
-    public_key = data.get('server_public_key')
-    request_id = data.get('request_id')
-    control_credential = data.get('control_credential')
-    acknowledge = data.get('acknowledge') is True or data.get('ack') is True
-    if not public_key or not request_id:
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
-
-    lease_seconds = _api_v1_in_flight_ttl_seconds()
-    now = time.monotonic()
-    with api_v1_terminal_transition_lock:
-        deadline_expiry_target: tuple[str, str, Any] | None = None
-        with server_round_robin_lock:
-            server_payload = known_servers.get(public_key)
-            if server_payload is not None and bool(server_payload.get(API_V1_SERVER_MARKER)):
-                if not _api_v1_server_control_credential_valid(server_payload, control_credential):
-                    return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
-                with api_v1_in_flight_requests_lock:
-                    in_flight_requests = server_payload.get('api_v1_in_flight_requests')
-                    entry = in_flight_requests.get(request_id) if isinstance(in_flight_requests, dict) else None
-                    if isinstance(entry, dict):
-                        deadline_monotonic = _valid_request_deadline_monotonic(entry.get('request_deadline_monotonic'))
-                        if deadline_monotonic is not None and deadline_monotonic <= now:
-                            client_public_key = entry.get('client_public_key')
-                            if isinstance(client_public_key, str) and client_public_key:
-                                deadline_expiry_target = (client_public_key, request_id, deadline_monotonic)
-                        else:
-                            lease_deadline = now + lease_seconds
-                            if deadline_monotonic is not None:
-                                lease_deadline = min(lease_deadline, deadline_monotonic)
-                            entry['expires_at'] = lease_deadline
-                            _record_compute_control_state("active")
-                            _record_compute_control_lease_renewal()
-                            payload = {
-                                'status': 'active',
-                                'next_poll_seconds': _bounded_control_next_poll_seconds(hint=max(lease_seconds / 2.0, 1.0)),
-                                **_api_v1_deadline_metadata(deadline_monotonic, now_monotonic=now),
-                            }
-                            return jsonify(payload), 200
-
-        if deadline_expiry_target is not None:
-            client_public_key, deadline_request_id, deadline_monotonic = deadline_expiry_target
-            _cancel_api_v1_request(
-                client_public_key,
-                deadline_request_id,
-                status='expired',
-                reason='provider_timeout',
-            )
-            terminal = _get_terminal_request(client_public_key, deadline_request_id) or {}
-            terminal_status = _sanitize_terminal_status(terminal.get('status'))
-            control_status = terminal_status if terminal_status in {'cancelled', 'expired'} else 'completed/unavailable'
-            control_state = terminal_status if terminal_status in {'cancelled', 'expired'} else 'completed_unavailable'
-            _record_compute_control_state(control_state)
-            return jsonify({
-                'status': control_status,
-                'next_poll_seconds': _bounded_control_next_poll_seconds(),
-                **_api_v1_deadline_metadata(deadline_monotonic, now_monotonic=now),
-            }), 200
-
-    key = _control_tombstone_key(public_key, request_id)
-    tombstone_found = False
-    with api_v1_control_tombstones_lock:
-        tombstone = api_v1_control_tombstones.get(key)
-        if isinstance(tombstone, dict) and tombstone.get('expires_at_monotonic', 0) > time.monotonic():
-            tombstone_found = True
-            expected_digest = tombstone.get('control_credential_digest')
-            if not (
-                isinstance(expected_digest, str)
-                and isinstance(control_credential, str)
-                and control_credential
-                and secrets.compare_digest(_api_v1_control_credential_digest(control_credential), expected_digest)
-            ):
-                return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
-            status = tombstone.get('status')
-            if acknowledge:
-                removed = api_v1_control_tombstones.pop(key, None)
-                if removed is not None:
-                    _record_compute_control_state("acknowledged")
-                else:
-                    _record_compute_control_state(status if status in {"cancelled", "expired"} else "completed_unavailable")
-            else:
-                _record_compute_control_state(status if status in {"cancelled", "expired"} else "completed_unavailable")
-            return jsonify({
-                'status': status if status in {'cancelled', 'expired'} else 'completed/unavailable',
-                'next_poll_seconds': _bounded_control_next_poll_seconds(),
-                **_api_v1_deadline_metadata(tombstone.get('deadline_monotonic')),
-            }), 200
-
-    with server_round_robin_lock:
-        live_payload = known_servers.get(public_key)
-        live_owner_authenticated = (
-            live_payload is not None
-            and bool(live_payload.get(API_V1_SERVER_MARKER))
-            and _api_v1_server_control_credential_valid(live_payload, control_credential)
-        )
-    if not live_owner_authenticated and not tombstone_found:
-        return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
-
-    _record_compute_control_state("completed_unavailable")
-    return jsonify({
-        'status': 'completed/unavailable',
-        'next_poll_seconds': _bounded_control_next_poll_seconds(),
-    }), 200
-
-@app.route('/api/v1/relay/requests', methods=['POST'])
-def api_v1_relay_requests():
-    """Queue an encrypted API v1 relay request envelope for a target compute node."""
-    _evict_stale_servers()
-    data = request.get_json()
-    envelope, error = _extract_ciphertext_envelope(data, require_server_key=True)
-    if _payload_has_plaintext_fields(data):
-        return jsonify({'error': {'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
-    if _payload_has_unexpected_relay_fields(data, allow_server_public_key=True):
-        return jsonify({'error': {'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
-    if error:
-        msg, code = error
-        return jsonify({'error': {'message': msg, 'code': code}}), code
-
-    server_public_key = envelope.pop('server_public_key')
-
-    if not envelope.get('client_public_key'):
-        return jsonify({'error': {'message': 'Missing client public key', 'code': 400}}), 400
-
-    envelope['e2ee_v1'] = True
-    queued_at = time.time()
-    deadline_seconds = _api_v1_request_deadline_seconds()
-    deadline_monotonic = time.monotonic() + deadline_seconds
-    envelope['_queued_at'] = queued_at
-    envelope['request_deadline_remaining_seconds'] = deadline_seconds
-    envelope['request_ttl_seconds'] = deadline_seconds
-    envelope['_request_deadline_monotonic'] = deadline_monotonic
-    with server_round_robin_lock:
-        server_payload = known_servers.get(server_public_key)
-        if server_payload is None or not bool(server_payload.get(API_V1_SERVER_MARKER)):
-            return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
-        _mark_request_pending(
-            envelope.get('client_public_key'),
-            envelope.get('request_id'),
-            cancel_token=envelope.get('cancel_token'),
-            deadline_monotonic=deadline_monotonic,
-        )
-        with client_inference_requests_changed:
-            client_inference_requests.setdefault(server_public_key, []).append(envelope)
-            queue_depth = len(client_inference_requests.get(server_public_key, []))
-            client_inference_requests_changed.notify_all()
-    LOGGER.info(
-        "relay.api_v1.request_queued",
-        extra={
-            "server_fingerprint": _safe_key_fingerprint(server_public_key),
-            "queue_depth": queue_depth,
-        },
-    )
-    return jsonify({'message': 'Request received', **_api_v1_deadline_metadata(deadline_monotonic)}), 200
-
-
-
-@app.route('/api/v1/relay/requests/cancel', methods=['POST'])
-def api_v1_relay_requests_cancel():
-    """Cancel or expire an API v1 relay request with its requester proof token."""
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
-
-    client_public_key = data.get('client_public_key')
-    request_id = data.get('request_id')
-    if not client_public_key or not request_id:
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
-
-    expected_cancel_token = _cancel_token_for_queued_or_in_flight_request(client_public_key, request_id)
-    provided_cancel_token = data.get('cancel_token')
-    if not (
-        expected_cancel_token
-        and isinstance(provided_cancel_token, str)
-        and secrets.compare_digest(provided_cancel_token, expected_cancel_token)
-    ):
-        return jsonify({'error': {'message': 'Missing or invalid cancel proof', 'code': 403}}), 403
-
-    status = _sanitize_terminal_status(data.get('status'))
-    reason = _sanitize_terminal_reason(data.get('reason'), status)
-    removed = _cancel_api_v1_request(
-        client_public_key,
-        request_id,
-        status=status,
-        reason=reason,
-    )
-    return jsonify({'status': status, 'request_id': request_id, 'removed_from_queue': removed}), 200
-
-
-@app.route('/api/v1/relay/responses', methods=['POST'])
-def api_v1_relay_responses():
-    """Store an encrypted API v1 response envelope for client retrieval."""
-    auth_error = _validate_server_registration()
-    if auth_error:
-        return auth_error
-
-    data = request.get_json()
-    envelope, error = _extract_ciphertext_envelope(data, require_server_key=False)
-    if _payload_has_plaintext_fields(data):
-        return jsonify({'error': {'message': 'Plaintext relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
-    if _payload_has_unexpected_relay_fields(data, allow_server_public_key=False):
-        return jsonify({'error': {'message': 'Unexpected relay payload fields are forbidden; send ciphertext envelope only', 'code': 400}}), 400
-    if error:
-        msg, code = error
-        return jsonify({'error': {'message': msg, 'code': code}}), code
-
-    client_public_key = envelope.get('client_public_key')
-    if not client_public_key:
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
-
-    request_id = envelope.get('request_id')
-    if isinstance(request_id, str) and request_id:
-        with api_v1_terminal_transition_lock:
-            terminal = _get_terminal_request(client_public_key, request_id)
-            if terminal is not None:
-                status = terminal.get('status', 'cancelled')
-                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
-            if _has_client_response_for_request(client_public_key, request_id):
-                LOGGER.info(
-                    "relay.api_v1.duplicate_response_ignored",
-                    extra={
-                        "client_fingerprint": _safe_key_fingerprint(client_public_key),
-                    },
+    digest = _api_v1_control_credential_digest(credential)
+    try:
+        caps = None
+        if data.get("capabilities") is not None:
+            raw, error = _normalise_api_v1_capabilities(data["capabilities"])
+            if error:
+                return (
+                    jsonify(
+                        {"error": {"message": error, "code": "invalid_capabilities"}}
+                    ),
+                    400,
                 )
-                return jsonify({'message': 'Response already queued for client'}), 200
-            _expire_pending_request_if_stale(client_public_key, request_id)
-            terminal = _get_terminal_request(client_public_key, request_id)
-            if terminal is not None:
-                status = terminal.get('status', 'cancelled')
-                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
-            lifecycle_owned = False
-            with server_round_robin_lock:
-                with api_v1_in_flight_requests_lock:
-                    for server_payload in known_servers.values():
-                        in_flight_requests = server_payload.get('api_v1_in_flight_requests')
-                        if not isinstance(in_flight_requests, dict) or request_id not in in_flight_requests:
-                            continue
-                        if _in_flight_entry_matches_client(in_flight_requests.get(request_id), client_public_key):
-                            in_flight_requests.pop(request_id, None)
-                            lifecycle_owned = True
-                            if not in_flight_requests:
-                                server_payload.pop('api_v1_in_flight_requests', None)
-                            break
-            lifecycle_owned = _remove_request_from_server_queues(client_public_key, request_id) or lifecycle_owned
-            lifecycle_owned = _clear_pending_request(client_public_key, request_id) or lifecycle_owned
-            terminal = _get_terminal_request(client_public_key, request_id)
-            if terminal is not None:
-                status = terminal.get('status', 'cancelled')
-                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
-            if not lifecycle_owned:
-                if _has_request_terminal_outcome(client_public_key, request_id):
-                    return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': 'completed', 'status': 'completed'}}), 410
-                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': 'gone', 'status': 'gone'}}), 410
-            if lifecycle_owned and not _record_request_terminal_outcome_once(client_public_key, request_id, "completed"):
-                terminal = _get_terminal_request(client_public_key, request_id)
-                status = terminal.get('status', 'cancelled') if terminal else 'cancelled'
-                return jsonify({'error': {'message': 'Request is no longer waiting for a response', 'code': status, 'status': status}}), 410
-            _clear_client_progress(client_public_key, request_id)
-            _queue_client_response(client_public_key, envelope)
-    else:
-        _queue_client_response(client_public_key, envelope)
-    LOGGER.info(
-        "relay.api_v1.response_received",
-        extra={
-            "client_fingerprint": _safe_key_fingerprint(client_public_key),
-        },
+            caps = _store_capabilities(raw)
+        if _relay_state_store().renew(node, digest, capabilities=caps) is None:
+            return (
+                jsonify(
+                    {
+                        "error": {
+                            "message": "Server with the specified public key not found",
+                            "code": 404,
+                        }
+                    }
+                ),
+                404,
+            )
+        result = _relay_state_store().claim_queued_request(node, digest, consumer)
+    except RelayStateCredentialMismatch:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Missing or invalid relay server control credential",
+                        "code": 403,
+                    }
+                }
+            ),
+            403,
+        )
+    except Exception:
+        LOGGER.error("relay.state_store.failure", extra={"operation": "claim"})
+        return _store_failure()
+    if result.state == "empty":
+        return (
+            jsonify(
+                {
+                    "message": "No requests available",
+                    "next_ping_in_x_seconds": max(_api_v1_lease_seconds(), 1),
+                    "poll_wait_seconds": _api_v1_poll_wait_seconds(),
+                }
+            ),
+            200,
+        )
+    env = result.envelope
+    return (
+        jsonify(
+            {
+                "client_public_key": result.client_public_key,
+                "request_id": result.request_id,
+                "protocol": env.protocol,
+                "version": env.version,
+                "ciphertext": env.ciphertext,
+                "chat_history": env.ciphertext,
+                "cipherkey": env.cipherkey,
+                "iv": env.iv,
+                "claim_generation": result.generation,
+                "consumer_identity": consumer,
+                **_store_deadline_metadata(result.request_deadline_epoch),
+            }
+        ),
+        200,
     )
-    return jsonify({'message': 'Response received and queued for client'}), 200
+
+
+@app.route("/api/v1/relay/servers/control", methods=["POST"])
+def api_v1_relay_servers_control():
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+    data = request.get_json(silent=True)
+    required = (
+        "server_public_key",
+        "client_public_key",
+        "request_id",
+        "control_credential",
+        "claim_generation",
+    )
+    if not isinstance(data, dict) or any(data.get(k) is None for k in required):
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
+    try:
+        result = _relay_state_store().renew_claim_or_read_control(
+            data["server_public_key"],
+            _api_v1_control_credential_digest(data["control_credential"]),
+            data.get("consumer_identity", data["server_public_key"]),
+            data["client_public_key"],
+            data["request_id"],
+            data["claim_generation"],
+            acknowledge=bool(data.get("acknowledge")),
+        )
+    except (RelayStateCredentialMismatch, RelayStateStoreError):
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Missing or invalid relay server control credential",
+                        "code": 403,
+                    }
+                }
+            ),
+            403,
+        )
+    except Exception:
+        LOGGER.error("relay.state_store.failure", extra={"operation": "control"})
+        return _store_failure()
+    if result.state == "owner_mismatch":
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Missing or invalid relay server control credential",
+                        "code": 403,
+                    }
+                }
+            ),
+            403,
+        )
+    status = {
+        "continued": "active",
+        "missing_or_expired": "completed/unavailable",
+        "stale_generation": "completed/unavailable",
+        "acknowledged": "completed/unavailable",
+    }.get(result.state, result.state)
+    return (
+        jsonify(
+            {
+                "status": status,
+                "next_poll_seconds": _bounded_control_next_poll_seconds(),
+                **_store_deadline_metadata(result.lease_expires_at_epoch),
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/api/v1/relay/requests", methods=["POST"])
+def api_v1_relay_requests():
+    data = request.get_json(silent=True)
+    envelope, error = _extract_ciphertext_envelope(data, require_server_key=True)
+    if _payload_has_plaintext_fields(data) or _payload_has_unexpected_relay_fields(
+        data, allow_server_public_key=True
+    ):
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Unexpected relay payload fields are forbidden; send ciphertext envelope only",
+                        "code": 400,
+                    }
+                }
+            ),
+            400,
+        )
+    if error:
+        return jsonify({"error": {"message": error[0], "code": error[1]}}), error[1]
+    required = ("client_public_key", "request_id", "reservation_token", "cancel_token")
+    if any(not isinstance(data.get(k), str) or not data[k] for k in required):
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
+    deadline = float(
+        data.get(
+            "request_deadline_epoch", time.time() + _api_v1_request_deadline_seconds()
+        )
+    )
+    try:
+        result = _relay_state_store().enqueue_encrypted_request(
+            data["client_public_key"],
+            data["request_id"],
+            data["reservation_token"],
+            data["server_public_key"],
+            data.get("requested_model", DEFAULT_MODEL_IDS[0]),
+            data.get("requested_context_tier", DEFAULT_CONTEXT_TIER),
+            deadline,
+            EncryptedRequestEnvelope(
+                data.get("protocol"),
+                data.get("version"),
+                data.get("ciphertext", data.get("chat_history")),
+                data["cipherkey"],
+                data["iv"],
+            ),
+            data["cancel_token"],
+        )
+    except RelayStateInvalidReservation:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Invalid or stale reservation token",
+                        "code": "invalid_reservation",
+                    }
+                }
+            ),
+            409,
+        )
+    except (RelayStateConflict, RelayStateStoreError):
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Relay request was rejected",
+                        "code": "relay_state_conflict",
+                    }
+                }
+            ),
+            409,
+        )
+    except Exception:
+        LOGGER.error("relay.state_store.failure", extra={"operation": "enqueue"})
+        return _store_failure()
+    return (
+        jsonify(
+            {
+                "message": "Request received",
+                **_store_deadline_metadata(result.request_deadline_epoch),
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/api/v1/relay/requests/cancel", methods=["POST"])
+def api_v1_relay_requests_cancel():
+    data = request.get_json(silent=True)
+    if (
+        not isinstance(data, dict)
+        or not data.get("client_public_key")
+        or not data.get("request_id")
+    ):
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
+    try:
+        result = _relay_state_store().cancel_or_expire_request(
+            data["client_public_key"], data["request_id"], data.get("cancel_token")
+        )
+    except Exception:
+        LOGGER.error("relay.state_store.failure", extra={"operation": "cancel"})
+        return _store_failure()
+    if result.state == "invalid_cancellation_proof":
+        return (
+            jsonify(
+                {"error": {"message": "Missing or invalid cancel proof", "code": 403}}
+            ),
+            403,
+        )
+    return (
+        jsonify(
+            {
+                "status": result.state,
+                "request_id": data["request_id"],
+                "removed_from_queue": result.new_outcome,
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/api/v1/relay/responses", methods=["POST"])
+def api_v1_relay_responses():
+    auth_error = _validate_server_registration()
+    if auth_error:
+        return auth_error
+    data = request.get_json(silent=True)
+    if _payload_has_plaintext_fields(data) or _payload_has_unexpected_relay_fields(
+        data, allow_server_public_key=True
+    ):
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Unexpected relay payload fields are forbidden; send ciphertext envelope only",
+                        "code": 400,
+                    }
+                }
+            ),
+            400,
+        )
+    required = (
+        "server_public_key",
+        "client_public_key",
+        "request_id",
+        "control_credential",
+        "claim_generation",
+        "ciphertext",
+        "cipherkey",
+        "iv",
+    )
+    if not isinstance(data, dict) or any(data.get(k) is None for k in required):
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
+    try:
+        _relay_state_store().accept_encrypted_response(
+            data["server_public_key"],
+            _api_v1_control_credential_digest(data["control_credential"]),
+            data.get("consumer_identity", data["server_public_key"]),
+            data["client_public_key"],
+            data["request_id"],
+            data["claim_generation"],
+            EncryptedResponseEnvelope(
+                data.get("protocol"),
+                data.get("version"),
+                data["ciphertext"],
+                data["cipherkey"],
+                data["iv"],
+            ),
+        )
+    except RelayStateConflict:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Request is no longer waiting for a response",
+                        "code": "gone",
+                        "status": "gone",
+                    }
+                }
+            ),
+            410,
+        )
+    except RelayStateCredentialMismatch:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Missing or invalid relay server control credential",
+                        "code": 403,
+                    }
+                }
+            ),
+            403,
+        )
+    except Exception:
+        LOGGER.error("relay.state_store.failure", extra={"operation": "respond"})
+        return _store_failure()
+    return jsonify({"message": "Response received and queued for client"}), 200
 
 
 _API_V1_PROGRESS_FIELDS = {
-    "server_public_key", "client_public_key", "request_id", "control_credential",
-    "protocol", "version", "ciphertext", "cipherkey", "iv",
+    "server_public_key",
+    "client_public_key",
+    "request_id",
+    "control_credential",
+    "consumer_identity",
+    "claim_generation",
+    "protocol",
+    "version",
+    "ciphertext",
+    "cipherkey",
+    "iv",
 }
 _API_V1_PROGRESS_CLIENT_FIELDS = {
-    "client_public_key", "request_id", "protocol", "version", "ciphertext", "cipherkey", "iv",
+    "client_public_key",
+    "request_id",
+    "protocol",
+    "version",
+    "ciphertext",
+    "cipherkey",
+    "iv",
 }
 
 
-@app.route('/api/v1/relay/progress', methods=['POST'])
+@app.route("/api/v1/relay/progress", methods=["POST"])
 def api_v1_relay_progress():
-    """Accept one relay-blind, owner-authenticated encrypted progress update."""
-    # The control-plane before_request hook has already bounded and cached this
-    # body before its authentication-aware rate-limit identity lookup.
-    raw_body = request.get_data(cache=True)
     auth_error = _validate_server_registration()
     if auth_error:
         return auth_error
+    data = request.get_json(silent=True)
+    if (
+        not isinstance(data, dict)
+        or set(data) != _API_V1_PROGRESS_FIELDS
+        or _payload_has_plaintext_fields(data)
+    ):
+        return (
+            jsonify(
+                {"error": {"message": "Invalid encrypted progress schema", "code": 400}}
+            ),
+            400,
+        )
     try:
-        data = json.loads(raw_body)
-    except (TypeError, ValueError, UnicodeDecodeError):
-        data = None
-    if not isinstance(data, dict) or set(data) != _API_V1_PROGRESS_FIELDS:
-        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_schema"})
-        return jsonify({'error': {'message': 'Invalid encrypted progress schema', 'code': 400}}), 400
-    if _payload_has_plaintext_fields(data):
-        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_schema"})
-        return jsonify({'error': {'message': 'Plaintext progress is forbidden', 'code': 400}}), 400
-    server_key = data.get('server_public_key')
-    client_key = data.get('client_public_key')
-    request_id = data.get('request_id')
-    if data.get('protocol') != 'tokenplace_api_v1_relay_e2ee' or data.get('version') != 1:
-        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_schema"})
-        return jsonify({'error': {'message': 'Invalid encrypted progress protocol', 'code': 400}}), 400
-    if not all(isinstance(data.get(key), str) and data[key] for key in _API_V1_PROGRESS_FIELDS - {'version'}):
-        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_schema"})
-        return jsonify({'error': {'message': 'Invalid encrypted progress envelope', 'code': 400}}), 400
-    now = time.monotonic()
-    with api_v1_terminal_transition_lock:
-        with server_round_robin_lock:
-            server = known_servers.get(server_key)
-            if not (isinstance(server, dict) and server.get(API_V1_SERVER_MARKER)
-                    and _api_v1_server_control_credential_valid(server, data.get('control_credential'))):
-                LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_auth"})
-                return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
-            with api_v1_in_flight_requests_lock:
-                entries = server.get('api_v1_in_flight_requests')
-                entry = entries.get(request_id) if isinstance(entries, dict) else None
-                if not _in_flight_entry_matches_client(entry, client_key):
-                    LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_lifecycle"})
-                    return jsonify({'error': {'message': 'Progress request is not active for this owner', 'code': 410}}), 410
-                deadline = _valid_request_deadline_monotonic(entry.get('request_deadline_monotonic'))
-                if deadline is not None and deadline <= now:
-                    LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_lifecycle"})
-                    return jsonify({'error': {'message': 'Progress request has expired', 'code': 410}}), 410
-        envelope = {key: data[key] for key in _API_V1_PROGRESS_CLIENT_FIELDS}
-        with client_progress_lock:
-            replaced = (client_key, request_id) in client_progress
-            client_progress[(client_key, request_id)] = envelope
-    LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "replaced" if replaced else "accepted"})
-    return jsonify({'message': 'Encrypted progress accepted'}), 202
-
-
-@app.route('/api/v1/relay/responses/retrieve', methods=['POST'])
-def api_v1_relay_responses_retrieve():
-    """Retrieve an encrypted API v1 response envelope by client public key."""
-    data = request.get_json()
-    if not data or 'client_public_key' not in data:
-        return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
-
-    client_public_key = data['client_public_key']
-    request_id = data.get('request_id')
-    terminal = _get_terminal_request(client_public_key, request_id)
-    if terminal is not None:
-        _remove_client_responses_for_request(client_public_key, request_id)
-        status = terminal.get('status', 'cancelled')
-        return jsonify({'error': {'message': f'Request {status}', 'code': status, 'status': status, 'reason': terminal.get('reason', status)}}), 410
-
-    response = _pop_client_response(client_public_key, request_id)
-    if response is None:
-        _expire_pending_request_if_stale(client_public_key, request_id)
-        terminal = _get_terminal_request(client_public_key, request_id)
-        if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': f'Request {status}', 'code': status, 'status': status, 'reason': terminal.get('reason', status)}}), 410
-    if response is None:
-        # Pending recheck and latest-progress removal are one lifecycle
-        # transition.  Final/cancel paths take this lock before their nested
-        # state locks, so they can never interleave between these operations.
-        with api_v1_terminal_transition_lock:
-            is_pending = _is_request_pending(client_public_key, request_id)
-            deadline = _pending_request_deadline(client_public_key, request_id) if is_pending else None
-            progress = _pop_client_progress(client_public_key, request_id) if is_pending else None
-        if is_pending:
-            LOGGER.debug(
-                "relay.api_v1.response_pending",
-                extra={"client_fingerprint": _safe_key_fingerprint(client_public_key)},
-            )
-            return jsonify({
-                "status": "pending",
-                **_api_v1_deadline_metadata(deadline),
-                **({"encrypted_progress": progress} if progress else {}),
-            }), 202
-        terminal = _get_terminal_request(client_public_key, request_id)
-        if terminal is not None:
-            status = terminal.get('status', 'cancelled')
-            return jsonify({'error': {'message': f'Request {status}', 'code': status, 'status': status, 'reason': terminal.get('reason', status)}}), 410
-        if request_id:
-            return jsonify({'error': {'message': f'Unknown request_id: {request_id}', 'code': 404}}), 404
-        return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
-
-    LOGGER.info(
-        "relay.api_v1.response_retrieved",
-        extra={
-            "client_fingerprint": _safe_key_fingerprint(client_public_key),
-        },
+        result = _relay_state_store().replace_encrypted_progress_if_claimed(
+            data["server_public_key"],
+            _api_v1_control_credential_digest(data["control_credential"]),
+            data["consumer_identity"],
+            data["client_public_key"],
+            data["request_id"],
+            data["claim_generation"],
+            EncryptedProgressEnvelope(
+                data["protocol"],
+                data["version"],
+                data["ciphertext"],
+                data["cipherkey"],
+                data["iv"],
+            ),
+        )
+    except RelayStateCredentialMismatch:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Missing or invalid relay server control credential",
+                        "code": 403,
+                    }
+                }
+            ),
+            403,
+        )
+    except RelayStateConflict:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Progress request is not active for this owner",
+                        "code": 410,
+                    }
+                }
+            ),
+            410,
+        )
+    except Exception:
+        LOGGER.error("relay.state_store.failure", extra={"operation": "progress"})
+        return _store_failure()
+    return (
+        jsonify({"message": "Encrypted progress accepted", "state": result.state}),
+        202,
     )
-    return jsonify(response), 200
+
+
+@app.route("/api/v1/relay/responses/retrieve", methods=["POST"])
+def api_v1_relay_responses_retrieve():
+    data = request.get_json(silent=True)
+    required = ("client_public_key", "request_id", "retrieval_credential")
+    if not isinstance(data, dict) or any(not data.get(k) for k in required):
+        return jsonify({"error": {"message": "Invalid request data", "code": 400}}), 400
+    try:
+        result = _relay_state_store().retrieve_encrypted_response(
+            data["client_public_key"],
+            data["request_id"],
+            data["retrieval_credential"],
+            data.get("acknowledgement_token"),
+        )
+    except Exception:
+        LOGGER.error("relay.state_store.failure", extra={"operation": "retrieve"})
+        return _store_failure()
+    if result.state == "pending":
+        progress = result.progress
+        ep = (
+            None
+            if progress is None
+            else {
+                "client_public_key": data["client_public_key"],
+                "request_id": data["request_id"],
+                "protocol": progress.protocol,
+                "version": progress.version,
+                "ciphertext": progress.ciphertext,
+                "cipherkey": progress.cipherkey,
+                "iv": progress.iv,
+            }
+        )
+        return (
+            jsonify(
+                {
+                    "status": "pending",
+                    **_store_deadline_metadata(result.request_deadline_epoch),
+                    **({"encrypted_progress": ep} if ep else {}),
+                }
+            ),
+            202,
+        )
+    if result.state == "response_ready":
+        env = result.envelope
+        return (
+            jsonify(
+                {
+                    "client_public_key": data["client_public_key"],
+                    "request_id": data["request_id"],
+                    "protocol": env.protocol,
+                    "version": env.version,
+                    "ciphertext": env.ciphertext,
+                    "chat_history": env.ciphertext,
+                    "cipherkey": env.cipherkey,
+                    "iv": env.iv,
+                    "acknowledgement_token": result.acknowledgement_token,
+                }
+            ),
+            200,
+        )
+    if result.state == "acknowledged":
+        return jsonify({"status": "acknowledged"}), 200
+    if result.state == "invalid_acknowledgement":
+        return (
+            jsonify(
+                {"error": {"message": "Invalid acknowledgement token", "code": 403}}
+            ),
+            403,
+        )
+    if result.state == "invalid_retrieval_credential":
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "message": "Unknown request or invalid retrieval credential",
+                        "code": 404,
+                    }
+                }
+            ),
+            404,
+        )
+    return (
+        jsonify(
+            {
+                "error": {
+                    "message": "Request is no longer available",
+                    "code": result.state,
+                    "status": result.state,
+                }
+            }
+        ),
+        410,
+    )
+
 
 @app.route('/faucet', methods=['POST'])
 def faucet():

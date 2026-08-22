@@ -17,6 +17,7 @@ from relay_state_store import ComputeNodeRegistration
 from relay_state_store import ClaimRecord
 from relay_state_store import ClaimResult
 from relay_state_store import EncryptedRequestEnvelope
+from relay_state_store import EncryptedProgressEnvelope
 from relay_state_store import EncryptedResponseEnvelope
 from relay_state_store import InMemoryRelayStateStore
 from relay_state_store import RelayStateCapacityExceeded
@@ -108,6 +109,30 @@ def response_envelope(ciphertext="sealed-response"):
     )
 
 
+def progress_envelope(ciphertext="sealed-progress"):
+    return EncryptedProgressEnvelope(
+        protocol="tokenplace_api_v1_relay_e2ee",
+        version=1,
+        ciphertext=ciphertext,
+        cipherkey="progress-cipherkey",
+        iv="progress-iv",
+    )
+
+
+def replace_progress(store, claim, **overrides):
+    values = {
+        "node_id": "node-a",
+        "control_credential_digest": digest("owner"),
+        "consumer_identity": "worker-a",
+        "client_public_key": "client-key",
+        "request_id": claim.request_id,
+        "generation": claim.generation,
+        "envelope": progress_envelope(),
+    }
+    values.update(overrides)
+    return store.replace_encrypted_progress_if_claimed(**values)
+
+
 def reserve(store, request_id="request-a", **overrides):
     values = {
         "client_public_key": "client-key",
@@ -167,6 +192,268 @@ def accept_response(store, claim, **overrides):
     }
     values.update(overrides)
     return store.accept_encrypted_response(**values)
+
+
+def test_progress_replacement_and_one_shot_authenticated_pending_retrieval(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    _, selection = queued_work(store)
+    claim = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+    before_claim = store.active_claims("node-a")[0]
+
+    assert replace_progress(store, claim).state == "accepted"
+    assert (
+        replace_progress(store, claim, envelope=progress_envelope("latest")).state
+        == "replaced"
+    )
+    assert len(store.progress_records()) == 1
+    assert store.progress_records()[0].envelope.ciphertext == "latest"
+
+    pending = store.retrieve_encrypted_response(
+        "client-key", "request-a", selection.reservation_token
+    )
+    assert pending.state == "pending"
+    assert pending.request_deadline_epoch == claim.request_deadline_epoch
+    assert pending.encrypted_progress == progress_envelope("latest")
+    assert store.progress_records() == ()
+    second = store.retrieve_encrypted_response(
+        "client-key", "request-a", selection.reservation_token
+    )
+    assert second.state == "pending"
+    assert second.encrypted_progress is None
+    assert store.active_claims("node-a")[0] == before_claim
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"control_credential_digest": digest("wrong")}, RelayStateCredentialMismatch),
+        ({"consumer_identity": "wrong-worker"}, RelayStateCredentialMismatch),
+        ({"node_id": "node-b"}, RelayStateCredentialMismatch),
+        ({"client_public_key": "wrong-client"}, RelayStateConflict),
+        ({"request_id": "wrong-request"}, RelayStateConflict),
+        ({"generation": 999}, RelayStateConflict),
+    ],
+)
+def test_progress_requires_exact_claim_authority(
+    store_factory, capabilities, overrides, error
+):
+    store, _ = registered_store(store_factory, capabilities)
+    store.register("node-b", capabilities, digest("owner"))
+    claim = claimed_work(store)
+
+    with pytest.raises(error):
+        replace_progress(store, claim, **overrides)
+    assert store.progress_records() == ()
+
+
+def test_progress_is_rejected_without_live_claim_and_at_deadlines(
+    store_factory, capabilities
+):
+    store, clock = registered_store(store_factory, capabilities)
+    queued_work(store)
+    fake = ClaimResult(
+        "claimed", 1, clock.value + 1, clock.value + 100, "client-key", "request-a"
+    )
+    with pytest.raises(RelayStateConflict):
+        replace_progress(store, fake)
+    claim = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+    clock.value = claim.lease_expires_at_epoch
+    with pytest.raises((RelayStateConflict, RelayStateCredentialMismatch)):
+        replace_progress(store, claim)
+
+    store, clock = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    clock.value = claim.request_deadline_epoch
+    with pytest.raises((RelayStateConflict, RelayStateCredentialMismatch)):
+        replace_progress(store, claim)
+    assert store.progress_records() == ()
+    assert store.terminal_records()[0].outcome == "expired"
+
+
+@pytest.mark.parametrize("transition", ["response", "cancel", "unregister", "expiry"])
+def test_terminal_transitions_atomically_remove_progress(
+    store_factory, capabilities, transition
+):
+    store, clock = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    replace_progress(store, claim)
+    if transition == "response":
+        accept_response(store, claim)
+        assert store.terminal_records()[0].outcome == "completed"
+    elif transition == "cancel":
+        store.cancel_or_expire_request(
+            "client-key", "request-a", "cancel-proof-request-a"
+        )
+    elif transition == "unregister":
+        store.unregister_node_and_transition_work("node-a", digest("owner"))
+    else:
+        clock.value = claim.request_deadline_epoch
+        store.expire()
+    assert store.progress_records() == ()
+
+
+def test_progress_bounds_fail_closed_and_replacement_does_not_need_capacity(
+    store_factory, capabilities
+):
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        max_progress_records=1,
+        max_progress_records_per_client=1,
+        max_progress_envelope_bytes=150,
+    )
+    claim = claimed_work(store)
+    replace_progress(store, claim)
+    replace_progress(store, claim, envelope=progress_envelope("replacement"))
+    with pytest.raises(RelayStateStoreError, match="configured byte bound"):
+        replace_progress(store, claim, envelope=progress_envelope("x" * 1000))
+    assert store.progress_records()[0].envelope.ciphertext == "replacement"
+
+    store.register("node-b", capabilities, digest("owner-b"))
+    selection = reserve(store, "request-b", client_public_key="other-client")
+    enqueue(
+        store,
+        selection,
+        "request-b",
+        client_public_key="other-client",
+    )
+    other = store.claim_queued_request(
+        selection.selected_node_id,
+        digest("owner-b" if selection.selected_node_id == "node-b" else "owner"),
+        "worker-b",
+    )
+    with pytest.raises(RelayStateCapacityExceeded, match="progress capacity"):
+        replace_progress(
+            store,
+            other,
+            node_id=selection.selected_node_id,
+            control_credential_digest=digest(
+                "owner-b" if selection.selected_node_id == "node-b" else "owner"
+            ),
+            consumer_identity="worker-b",
+            client_public_key="other-client",
+        )
+    assert len(store.progress_records()) == 1
+
+
+def test_progress_envelope_is_strict_immutable_bounded_and_redacted(
+    store_factory, capabilities, caplog
+):
+    ciphertext = "sensitive-progress-ciphertext"
+    progress = progress_envelope(ciphertext)
+    with pytest.raises(FrozenInstanceError):
+        progress.ciphertext = "changed"
+    for kwargs in (
+        {},
+        {
+            "protocol": "wrong",
+            "version": 1,
+            "ciphertext": "x",
+            "cipherkey": "k",
+            "iv": "i",
+        },
+        {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "ciphertext": "",
+            "cipherkey": "k",
+            "iv": "i",
+        },
+    ):
+        with pytest.raises((TypeError, RelayStateStoreError)):
+            EncryptedProgressEnvelope(**kwargs)
+    with pytest.raises(TypeError):
+        EncryptedProgressEnvelope(
+            protocol="tokenplace_api_v1_relay_e2ee",
+            version=1,
+            ciphertext="x",
+            cipherkey="k",
+            iv="i",
+            plaintext="forbidden",
+        )
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    result = replace_progress(store, claim, envelope=progress)
+    rendered = repr((progress, result, store.progress_records()))
+    for secret in (
+        ciphertext,
+        "client-key",
+        "request-a",
+        "node-a",
+        "worker-a",
+        digest("owner"),
+    ):
+        assert secret not in rendered
+        assert secret not in caplog.text
+
+
+def test_wrong_pending_retrieval_credential_reveals_no_metadata(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claimed_work(store)
+    claim = store.active_claims("node-a")[0]
+    replace_progress(
+        store, ClaimResult("claimed", claim.generation, request_id="request-a")
+    )
+    for client, request, credential in (
+        ("client-key", "request-a", "malformed"),
+        ("wrong-client", "request-a", "0" * 64),
+        ("client-key", "wrong-request", "0" * 64),
+    ):
+        result = store.retrieve_encrypted_response(client, request, credential)
+        assert result.state == "invalid_retrieval_credential"
+        assert result.request_deadline_epoch is None
+        assert result.encrypted_progress is None
+    assert len(store.progress_records()) == 1
+
+
+def test_concurrent_progress_updates_leave_one_complete_envelope(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    candidates = tuple(progress_envelope(f"ciphertext-{index}") for index in range(16))
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        results = tuple(
+            executor.map(
+                lambda candidate: replace_progress(store, claim, envelope=candidate),
+                candidates,
+            )
+        )
+    records = store.progress_records()
+    assert len(records) == 1
+    assert records[0].envelope in candidates
+    assert sum(result.state == "accepted" for result in results) == 1
+
+
+def test_progress_racing_response_never_survives_completion(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    barrier = Barrier(2)
+
+    def progress_attempt():
+        barrier.wait()
+        try:
+            return replace_progress(store, claim).state
+        except (RelayStateConflict, RelayStateCredentialMismatch):
+            return "rejected"
+
+    def response_attempt():
+        barrier.wait()
+        return accept_response(store, claim).state
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        progress_future = executor.submit(progress_attempt)
+        response_future = executor.submit(response_attempt)
+    assert progress_future.result() in {"accepted", "rejected"}
+    assert response_future.result() == "response_ready"
+    assert store.terminal_records()[0].outcome == "completed"
+    assert store.progress_records() == ()
 
 
 def test_node_transition_authenticates_and_tombstones_without_work(
@@ -336,7 +623,9 @@ def test_retained_reaping_is_linear_and_preserves_pending_authority(
         comparisons += 1
         return original_compare_digest(left, right)
 
-    monkeypatch.setattr("relay_state_store.hmac.compare_digest", counting_compare_digest)
+    monkeypatch.setattr(
+        "relay_state_store.hmac.compare_digest", counting_compare_digest
+    )
     store._reap_retained_locked(clock.value)
 
     assert comparisons == pending_count
@@ -347,9 +636,7 @@ def test_retained_reaping_is_linear_and_preserves_pending_authority(
 def test_terminal_operation_racing_unregister_is_exactly_once(
     store_factory, capabilities, operation
 ):
-    store, _ = registered_store(
-        store_factory, capabilities, max_request_lifecycles=1
-    )
+    store, _ = registered_store(store_factory, capabilities, max_request_lifecycles=1)
     claim = claimed_work(store)
 
     def terminal_operation():
@@ -361,9 +648,7 @@ def test_terminal_operation_racing_unregister_is_exactly_once(
 
     terminal_result, removal = synchronized_results(
         terminal_operation,
-        lambda: store.unregister_node_and_transition_work(
-            "node-a", digest("owner")
-        ),
+        lambda: store.unregister_node_and_transition_work("node-a", digest("owner")),
     )
 
     assert removal.state in {"complete", "already_complete"}
@@ -373,9 +658,9 @@ def test_terminal_operation_racing_unregister_is_exactly_once(
     assert store.list_reservations() == ()
     assert store.queued_requests("node-a") == ()
     assert store.active_claims("node-a") == ()
-    assert removal.new_outcomes + bool(
-        getattr(terminal_result, "new_outcome", False)
-    ) == 1
+    assert (
+        removal.new_outcomes + bool(getattr(terminal_result, "new_outcome", False)) == 1
+    )
     if terminal.outcome == "completed":
         assert operation == "response"
         assert terminal_result.new_outcome
@@ -509,9 +794,10 @@ def test_response_retrieval_state_is_unchanged_by_node_removal(
         )
         if retrieval_state == "acknowledged":
             ready = retrieve_response(store, credential)
-            assert retrieve_response(
-                store, credential, ready.acknowledgement_token
-            ).state == "acknowledged"
+            assert (
+                retrieve_response(store, credential, ready.acknowledgement_token).state
+                == "acknowledged"
+            )
         elif retrieval_state == "retrieval_expired":
             clock.value = acceptance.replay_expires_at_epoch
             assert retrieve_response(store, credential).state == "retrieval_expired"
@@ -572,14 +858,17 @@ def test_claimed_removal_has_distinct_node_and_control_tombstone_lifecycles(
     assert store.node_tombstones() == ()
     assert store.control_tombstones() == (control,)
     assert store.terminal_records()[0].reason == "server_unregistered"
-    assert store.renew_claim_or_read_control(
-        "node-a",
-        digest("owner"),
-        "worker-a",
-        "client-key",
-        "request-a",
-        claim.generation,
-    ).state == "cancelled"
+    assert (
+        store.renew_claim_or_read_control(
+            "node-a",
+            digest("owner"),
+            "worker-a",
+            "client-key",
+            "request-a",
+            claim.generation,
+        ).state
+        == "cancelled"
+    )
 
 
 def test_removal_artifacts_errors_and_logs_are_redacted(

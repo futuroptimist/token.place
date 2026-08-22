@@ -1866,6 +1866,13 @@ class InMemoryRelayStateStore:
                         expected_digest,
                     )
                 ):
+                    # Deadline terminalization can be deferred when retained
+                    # terminal/control capacity is full.  The authenticated
+                    # credential still must not turn that retained internal
+                    # lifecycle into externally visible pending work.
+                    if queued.request_deadline_epoch <= now:
+                        self._progress.pop(identity, None)
+                        return ResponseRetrievalResult("retrieval_expired")
                     progress = self._progress.pop(identity, None)
                     return ResponseRetrievalResult(
                         "pending",

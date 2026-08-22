@@ -112,16 +112,22 @@ def response_envelope(ciphertext="sealed-response"):
 
 def progress_envelope(ciphertext="sealed-progress"):
     return EncryptedProgressEnvelope(
-        protocol="tokenplace_api_v1_relay_e2ee", version=1, ciphertext=ciphertext,
-        cipherkey="progress-cipherkey", iv="progress-iv",
+        protocol="tokenplace_api_v1_relay_e2ee",
+        version=1,
+        ciphertext=ciphertext,
+        cipherkey="progress-cipherkey",
+        iv="progress-iv",
     )
 
 
 def replace_progress(store, claim, **overrides):
     values = {
-        "node_id": "node-a", "control_credential_digest": digest("owner"),
-        "consumer_identity": "worker-a", "client_public_key": "client-key",
-        "request_id": claim.request_id, "generation": claim.generation,
+        "node_id": "node-a",
+        "control_credential_digest": digest("owner"),
+        "consumer_identity": "worker-a",
+        "client_public_key": "client-key",
+        "request_id": claim.request_id,
+        "generation": claim.generation,
         "envelope": progress_envelope(),
     }
     values.update(overrides)
@@ -1548,6 +1554,60 @@ def test_full_retention_defers_deadline_without_wedging_or_losing_claim(
     assert terminals[0].outcome == "expired"
     assert len(store.control_tombstones()) == 1
     assert store.active_claims("node-a") == ()
+
+
+def test_authenticated_retrieval_fails_closed_for_deferred_deadline(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        clock=clock,
+        lease_ttl_seconds=10,
+        response_replay_ttl_seconds=1,
+        terminal_retention_seconds=5,
+        control_tombstone_ttl_seconds=5,
+        max_terminal_records=1,
+        max_terminal_records_per_client=1,
+        max_control_tombstones=1,
+        max_control_tombstones_per_node=1,
+    )
+    retained = claimed_work(store)
+    due_selection = reserve(
+        store, "request-b", request_deadline_epoch=clock.value + 1
+    )
+    enqueue(store, due_selection, "request-b")
+    due = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+    replace_progress(store, due)
+    assert store.cancel_or_expire_request(
+        "client-key", retained.request_id, "cancel-proof-request-a"
+    ).new_outcome
+
+    clock.value = due.request_deadline_epoch
+    invalid = store.retrieve_encrypted_response(
+        "client-key", "request-b", "wrong-credential"
+    )
+    assert invalid == ResponseRetrievalResult("invalid_retrieval_credential")
+    assert invalid.request_deadline_epoch is invalid.progress is None
+
+    expired = store.retrieve_encrypted_response(
+        "client-key", "request-b", due_selection.reservation_token
+    )
+    assert expired == ResponseRetrievalResult("retrieval_expired")
+    assert expired.request_deadline_epoch is expired.progress is None
+    assert store.progress_records() == ()
+    assert len(store.terminal_records()) == 1
+
+    clock.value += 4
+    for _ in range(3):
+        terminals = store.terminal_records()
+        assert len(terminals) == 1
+        assert terminals[0].request_identity_digest == digest_with_domain(
+            "request-b", b"request\0"
+        )
+        assert terminals[0].outcome == "expired"
+    assert len(store.control_tombstones()) == 1
 
 
 def test_cancellation_invalid_identity_and_queued_retry_proof_fail_closed(

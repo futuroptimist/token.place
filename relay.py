@@ -768,6 +768,22 @@ def _update_runtime_gauges() -> None:
     oldest_lease_age = 0.0
     in_flight = 0
     oldest_in_flight_age = 0.0
+    try:
+        store = _api_v1_store()
+        registrations = store.list()
+        registered = len(registrations)
+        healthy = sum(record.lease_expires_at_epoch > now_wall for record in registrations)
+        for record in registrations:
+            remaining = max(record.lease_expires_at_epoch - now_wall, 0.0)
+            oldest_lease_age = max(oldest_lease_age, max(_api_v1_lease_seconds() - remaining, 0.0))
+            for claim in store.active_claims(record.node_id):
+                in_flight += 1
+                oldest_in_flight_age = max(oldest_in_flight_age, max(now_wall - (claim.lease_expires_at_epoch - store.config.claim_ttl_seconds), 0.0))
+            for queued in store.queued_requests(record.node_id):
+                queue_depth += 1
+                oldest_queued_age = max(oldest_queued_age, max(now_wall - queued.enqueued_at_epoch, 0.0))
+    except RelayStateStoreError:
+        pass
     server_snapshots: list[tuple[Any, bool, list[dict[str, Any]]]] = []
     with server_round_robin_lock:
         for payload in known_servers.values():
@@ -1502,9 +1518,12 @@ def _live_server_diagnostics(*, api_v1_only: bool = False) -> list[dict[str, Any
                                 "in_flight_count": 0, "max_concurrency": None, "load_score": len(client_inference_requests.get(server_public_key, [])),
                                 "capabilities": payload.get("capabilities")})
     try:
-        for record in _api_v1_store().list():
-            caps=record.capabilities; queue_depth=len(_api_v1_store().queued_requests(record.node_id)); in_flight=len(_api_v1_store().active_claims(record.node_id))
-            diagnostics.append({"server_public_key":record.node_id,"age_seconds":round(max(record.lease_expires_at_epoch-time.time(),0.0),3),
+        store = _api_v1_store()
+        now = time.time()
+        for record in store.list():
+            caps=record.capabilities; queue_depth=len(store.queued_requests(record.node_id)); in_flight=len(store.active_claims(record.node_id))
+            lease_remaining = max(record.lease_expires_at_epoch - now, 0.0)
+            diagnostics.append({"server_public_key":record.node_id,"age_seconds":round(max(_api_v1_lease_seconds()-lease_remaining,0.0),3),
                                 "next_ping_in_x_seconds":_api_v1_lease_seconds(),"queue_depth":queue_depth,"in_flight_count":in_flight,
                                 "max_concurrency":caps.max_concurrency,"load_score":queue_depth+in_flight,"capabilities":{"supported_model_ids":list(caps.supported_model_ids),
                                 "active_context_tier":caps.active_context_tier,"maximum_total_context_tokens":caps.maximum_total_context_tokens,
@@ -2164,8 +2183,10 @@ def api_v1_relay_servers_next():
         registration = _api_v1_store().get(result.selected_node_id)
         if registration is None:
             raise RelayStateNoCapacity("no scheduler capacity")
-        # Compatibility-only selections without an identity must not consume capacity.
-        if not request.args.get("client_public_key") or not request.args.get("request_id"):
+        # Compatibility-only discovery has no usable proof; callers that intend
+        # to dispatch must bind an identity and retain the returned reservation.
+        compatibility_selection = not request.args.get("client_public_key") or not request.args.get("request_id")
+        if compatibility_selection:
             _api_v1_store().cancel_or_expire_request(client_key, request_id, cancel_token)
         caps = registration.capabilities
         payload = {
@@ -2180,7 +2201,7 @@ def api_v1_relay_servers_next():
             'selected_load_score': len(_api_v1_store().queued_requests(result.selected_node_id)),
             'spillover': caps.active_context_tier != tier,
         }
-        if result.reservation_token is not None:
+        if result.reservation_token is not None and not compatibility_selection:
             payload['reservation_token'] = result.reservation_token
             payload['request_deadline_epoch'] = result.request_deadline_epoch
         return jsonify(payload), 200
@@ -2902,7 +2923,9 @@ def api_v1_relay_servers_register():
     try:
         existing = _api_v1_store().get(public_key)
         if existing:
-            supplied_digest = (_credential_digest(raw_credential) if isinstance(raw_credential, str) and raw_credential else existing.control_credential_digest)
+            if not isinstance(raw_credential, str) or not raw_credential:
+                raise RelayStateCredentialMismatch("control credential required")
+            supplied_digest = _credential_digest(raw_credential)
             _api_v1_store().renew(public_key, supplied_digest, capabilities=typed)
         else:
             raw_credential = secrets.token_urlsafe(32)
@@ -2973,14 +2996,21 @@ def api_v1_relay_servers_poll():
         registration = _api_v1_store().get(node)
         if registration is None:
             return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
-        digest = _credential_digest(credential) if isinstance(credential, str) and credential else registration.control_credential_digest
-        result = _api_v1_store().claim_queued_request(node, digest, node)
+        if not isinstance(credential, str) or not credential:
+            raise RelayStateCredentialMismatch("control credential required")
+        digest = _credential_digest(credential)
+        wait_deadline = time.monotonic() + _api_v1_poll_wait_seconds()
+        while True:
+            result = _api_v1_store().claim_queued_request(node, digest, node)
+            if result.state != 'empty' or time.monotonic() >= wait_deadline:
+                break
+            time.sleep(min(0.05, max(wait_deadline - time.monotonic(), 0.0)))
     except RelayStateCredentialMismatch:
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     except RelayStateStoreError:
         return _store_failure_response()
     if result.state == 'empty':
-        return jsonify({'message': 'No requests available', 'next_ping_in_x_seconds': max(_api_v1_lease_seconds(), 1), 'poll_wait_seconds': _api_v1_poll_wait_seconds()}), 200
+        return jsonify({'message': 'No requests available', 'next_ping_in_x_seconds': 0, 'poll_wait_seconds': _api_v1_poll_wait_seconds()}), 200
     env=result.envelope
     return jsonify({'client_public_key': result.client_public_key, 'request_id': result.request_id,
                     'chat_history': env.ciphertext, 'ciphertext': env.ciphertext, 'cipherkey': env.cipherkey, 'iv': env.iv,
@@ -2998,12 +3028,12 @@ def api_v1_relay_servers_control():
     if not isinstance(credential, str) or not credential:
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     client_key=data.get('client_public_key'); generation=data.get('claim_generation')
+    request_deadline = None
     if not client_key or not isinstance(generation, int):
-        claims=[c for c in _api_v1_store().active_claims(node) if any(q.request_id == data['request_id'] and q.client_identity_digest == c.client_identity_digest for q in _api_v1_store().queued_requests(node))]
-        if claims:
-            claim=claims[0]
-            queued=next(q for q in _api_v1_store().queued_requests(node) if q.request_id == data['request_id'])
-            client_key=queued.client_public_key; generation=claim.generation
+        lifecycle = _api_v1_store().claimed_request(node, data['request_id'])
+        if lifecycle:
+            queued, claim = lifecycle
+            client_key=queued.client_public_key; generation=claim.generation; request_deadline=claim.request_deadline_epoch
     if not client_key or not isinstance(generation, int):
         return jsonify({'status': 'completed/unavailable', 'next_poll_seconds': _bounded_control_next_poll_seconds()}), 200
     try:
@@ -3013,7 +3043,9 @@ def api_v1_relay_servers_control():
     if result.state == 'owner_mismatch':
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     status={'continued':'active','missing_or_expired':'completed/unavailable','stale_generation':'completed/unavailable','acknowledged':'completed/unavailable'}.get(result.state,result.state)
-    return jsonify({'status': status, 'next_poll_seconds': _bounded_control_next_poll_seconds(), **_api_v1_deadline_metadata_epoch(result.lease_expires_at_epoch)}), 200
+    if request_deadline is None:
+        request_deadline = next((c.request_deadline_epoch for c in _api_v1_store().active_claims(node) if c.request_identity_digest == hashlib.sha256(b'request\0'+data['request_id'].encode()).hexdigest()), None)
+    return jsonify({'status': status, 'next_poll_seconds': _bounded_control_next_poll_seconds(), **(_api_v1_deadline_metadata_epoch(request_deadline) if request_deadline else {})}), 200
 
 @app.route('/api/v1/relay/requests', methods=['POST'])
 def api_v1_relay_requests():
@@ -3045,7 +3077,7 @@ def api_v1_relay_requests():
         return jsonify({'error': {'message': 'Relay queue is at capacity', 'code': 'no_available_capacity'}}), 503
     except RelayStateStoreError:
         return _store_failure_response()
-    return jsonify({'message':'Request received', **_api_v1_deadline_metadata_epoch(result.request_deadline_epoch)}),200
+    return jsonify({'message':'Request received', 'retrieval_credential': token, **_api_v1_deadline_metadata_epoch(result.request_deadline_epoch)}),200
 
 @app.route('/api/v1/relay/requests/cancel', methods=['POST'])
 def api_v1_relay_requests_cancel():
@@ -3065,18 +3097,26 @@ def api_v1_relay_responses():
     auth_error=_validate_server_registration()
     if auth_error: return auth_error
     data=request.get_json(silent=True); envelope,error=_extract_ciphertext_envelope(data,require_server_key=False)
-    if _payload_has_plaintext_fields(data) or error:
+    response_fields = {
+        'server_public_key', 'control_credential', 'claim_generation',
+        'client_public_key', 'request_id', 'protocol', 'version',
+        'ciphertext', 'chat_history', 'cipherkey', 'iv',
+    }
+    if _payload_has_plaintext_fields(data) or not isinstance(data, dict) or any(field not in response_fields for field in data):
+        return jsonify({'error': {'message':'Unexpected relay payload fields are forbidden; send ciphertext envelope only','code':400}}),400
+    if error:
         return jsonify({'error': {'message':'Invalid request data','code':400}}),400
     client_key=envelope.get('client_public_key'); request_id=envelope.get('request_id')
     if not client_key or not request_id:
         return jsonify({'error': {'message':'Invalid request data','code':400}}),400
-    cd=hashlib.sha256(b'client\0'+client_key.encode()).hexdigest(); rd=hashlib.sha256(b'request\0'+request_id.encode()).hexdigest()
-    claim=next((c for n in _api_v1_store().list() for c in _api_v1_store().active_claims(n.node_id) if c.client_identity_digest==cd and c.request_identity_digest==rd),None)
-    if claim is None:
-        return jsonify({'error': {'message':'Request is no longer waiting for a response','code':'gone','status':'gone'}}),410
+    node=data.get('server_public_key'); credential=data.get('control_credential'); generation=data.get('claim_generation')
+    if not isinstance(node,str) or not isinstance(credential,str) or not credential or not isinstance(generation,int):
+        return jsonify({'error': {'message':'Missing or invalid relay server control credential','code':403}}),403
     try:
-        result=_api_v1_store().accept_encrypted_response(claim.selected_node_id,claim.control_credential_digest,claim.selected_node_id,client_key,request_id,claim.generation,
+        result=_api_v1_store().accept_encrypted_response(node,_credential_digest(credential),node,client_key,request_id,generation,
             EncryptedResponseEnvelope(data.get('protocol','tokenplace_api_v1_relay_e2ee'),data.get('version',1),envelope['ciphertext'],envelope['cipherkey'],envelope['iv']))
+    except RelayStateCredentialMismatch:
+        return jsonify({'error': {'message':'Missing or invalid relay server control credential','code':403}}),403
     except RelayStateConflict:
         return jsonify({'error': {'message':'Request is no longer waiting for a response','code':'gone','status':'gone'}}),410
     except RelayStateStoreError:
@@ -3121,7 +3161,7 @@ def api_v1_relay_progress():
 @app.route('/api/v1/relay/responses/retrieve', methods=['POST'])
 def api_v1_relay_responses_retrieve():
     data=request.get_json(silent=True)
-    if not isinstance(data,dict) or not data.get('client_public_key') or not data.get('request_id') or not data.get('retrieval_credential'):
+    if not isinstance(data,dict) or not data.get('client_public_key') or not data.get('request_id'):
         return jsonify({'error': {'message':'Invalid request data','code':400}}),400
     try:
         result=_api_v1_store().retrieve_encrypted_response(data['client_public_key'],data['request_id'],data['retrieval_credential'],data.get('acknowledgement_token'))

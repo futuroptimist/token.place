@@ -320,6 +320,9 @@ class DistributedApiV1ComputeProvider:
                 params={
                     "model": model_id or CANONICAL_LAUNCH_MODEL_ID,
                     "context_tier": "8k-fast",
+                    "client_public_key": crypto_manager.public_key_b64,
+                    "request_id": relay_request_id,
+                    "cancel_token": relay_cancel_token,
                 },
                 timeout=_remaining_timeout(),
             )
@@ -372,6 +375,7 @@ class DistributedApiV1ComputeProvider:
             )
 
         server_public_key = next_server_payload.get("server_public_key")
+        reservation_token = next_server_payload.get("reservation_token")
         if not isinstance(server_public_key, str) or not server_public_key.strip():
             raise _error_from_code(
                 "no_registered_compute_nodes",
@@ -404,6 +408,10 @@ class DistributedApiV1ComputeProvider:
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
             "cancel_token": relay_cancel_token,
+            "reservation_token": reservation_token,
+            "requested_model": next_server_payload.get("requested_model"),
+            "requested_context_tier": next_server_payload.get("requested_context_tier"),
+            "request_deadline_epoch": next_server_payload.get("request_deadline_epoch"),
             **encrypted_envelope,
         }
 
@@ -443,7 +451,9 @@ class DistributedApiV1ComputeProvider:
             admission_payload = faucet_response.json()
         except ValueError:
             admission_payload = None
+        retrieval_credential = reservation_token
         if isinstance(admission_payload, dict):
+            retrieval_credential = admission_payload.get("retrieval_credential") or reservation_token
             admitted_ttl = _coerce_admitted_ttl(
                 admission_payload.get("request_ttl_seconds")
             )
@@ -466,6 +476,7 @@ class DistributedApiV1ComputeProvider:
                     json={
                         "client_public_key": crypto_manager.public_key_b64,
                         "request_id": relay_request_id,
+                        "retrieval_credential": retrieval_credential,
                     },
                     timeout=retrieve_timeout,
                 )

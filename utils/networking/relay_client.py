@@ -3083,6 +3083,12 @@ class RelayClient:
                 client_pub_key,
             )
             source_payload = {
+                "server_public_key": response_envelope.get("server_public_key")
+                or getattr(self.crypto_manager, "public_key_b64", ""),
+                "control_credential": self._api_v1_control_credential_for_relay(
+                    self._api_v1_response_relay_url()
+                ),
+                "claim_generation": response_envelope.get("claim_generation"),
                 "client_public_key": client_pub_key_b64,
                 "request_id": response_envelope["request_id"],
                 "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -5616,7 +5622,11 @@ class RelayClient:
                             submission_allowed=False,
                         )
                     post_outcome = self._post_api_v1_response(
-                        response_envelope,
+                        {
+                            **response_envelope,
+                            "server_public_key": request_data.get("server_public_key"),
+                            "claim_generation": request_data.get("claim_generation"),
+                        },
                         client_pub_key_b64=client_pub_key_b64,
                         client_pub_key=client_pub_key,
                         cancel_snapshot=cancel_snapshot,

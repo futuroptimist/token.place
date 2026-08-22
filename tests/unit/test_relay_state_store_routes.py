@@ -31,6 +31,9 @@ def test_api_v1_encrypted_journey_uses_authoritative_store():
     assert poll.status_code == 200
     assert poll.get_json()["ciphertext"] == "sealed-request"
     assert client.post("/api/v1/relay/responses", json={
+        "server_public_key": node,
+        "control_credential": registration.get_json()["control_credential"],
+        "claim_generation": poll.get_json()["claim_generation"],
         "client_public_key": client_key, "request_id": request_id, "protocol": "tokenplace_api_v1_relay_e2ee",
         "version": 1, "ciphertext": "sealed-response", "cipherkey": "sealed-key", "iv": "sealed-iv",
     }).status_code == 200

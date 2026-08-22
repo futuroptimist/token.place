@@ -635,6 +635,19 @@ async fn promote_attached_bridge_after_startup_event(
     session_id: &str,
     payload: &Value,
 ) -> bool {
+    // The bridge emits bounded provisioning progress before the runtime and
+    // relay client exist.  Those records historically use `type=started`, so
+    // require the actual Running handshake rather than promoting on the event
+    // name alone.
+    if payload.get("type").and_then(Value::as_str) != Some("started")
+        || payload.get("running").and_then(Value::as_bool) != Some(true)
+        || payload
+            .get("runtime_provisioning_state")
+            .and_then(Value::as_str)
+            == Some("provisioning")
+    {
+        return false;
+    }
     let mut process = state.bridge_process.lock().await;
     let Some(record) = process
         .as_mut()
@@ -6074,6 +6087,23 @@ mod tests {
         assert!(attachment.pending_child.is_none());
         assert!(attachment.pending_stdin.is_none());
         assert!(!state.status.lock().await.running);
+        let provisioning_event = serde_json::json!({
+            "type": "started",
+            "operator_session_id": "attach-session",
+            "sequence": 1,
+            "running": false,
+            "registered": false,
+            "runtime_provisioning_state": "provisioning"
+        });
+        assert!(
+            !promote_attached_bridge_after_startup_event(
+                &state,
+                "attach-session",
+                &provisioning_event,
+            )
+            .await,
+            "provisioning progress must not promote the attached child"
+        );
         let stale_event = serde_json::json!({
             "type": "started",
             "operator_session_id": "stale-session",

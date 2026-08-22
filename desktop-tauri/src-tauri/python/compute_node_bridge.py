@@ -850,7 +850,11 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     return {
         "type": "started",
-        "running": True,
+        # Provisioning heartbeats deliberately retain the historical event
+        # type, but they are not the operator startup handshake.  The native
+        # parent must keep the attached process in Starting until the later
+        # runtime-ready ``started`` event reports Running.
+        "running": False,
         "registered": False,
         "registered_relay_count": 0,
         "registered_relay_urls": [],

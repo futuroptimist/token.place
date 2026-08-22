@@ -42,6 +42,8 @@ def test_structured_provisioning_payload_omits_unknown_deadline(monkeypatch):
     payload = compute_node_bridge._structured_provisioning_payload(args, phase='dependency_check', started_at=10.0)
 
     assert payload['runtime_provisioning_state'] == 'provisioning'
+    assert payload['type'] == 'started'
+    assert payload['running'] is False
     assert payload['startup_phase'] == 'dependency_check'
     assert payload['startup_elapsed_ms'] == 2500
     assert payload['startup_deadline_ms'] is None

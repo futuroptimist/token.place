@@ -279,6 +279,71 @@ def test_node_transition_capacity_is_reclaimed_with_expired_tombstones(
     assert store.unregister("node-b", digest("owner-b"))
 
 
+def test_expire_reaps_full_retained_capacity_at_inclusive_deadline(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock,
+        lease_ttl_seconds=1,
+        node_tombstone_ttl_seconds=1,
+        terminal_retention_seconds=1,
+        control_tombstone_ttl_seconds=1,
+        response_replay_ttl_seconds=1,
+        max_node_tombstones=1,
+        max_removed_owner_fences=1,
+    )
+    store.register("node-a", capabilities, digest("owner-a"))
+    assert store.unregister("node-a", digest("owner-a"))
+    store.register("node-b", capabilities, digest("owner-b"))
+
+    clock.value += 1
+    assert [record.node_id for record in store.expire()] == ["node-b"]
+    assert store.get("node-b") is None
+    assert store.list() == ()
+    assert store.expire() == ()
+
+
+def test_retained_reaping_is_linear_and_preserves_pending_authority(
+    store_factory, capabilities, monkeypatch
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock,
+        node_transition_batch_size=1,
+        max_reservations_per_client=100,
+        max_queued_requests_per_client=100,
+        terminal_retention_seconds=1,
+        control_tombstone_ttl_seconds=1,
+        response_replay_ttl_seconds=1,
+    )
+    pending_count = 8
+    for index in range(pending_count):
+        node_id = f"node-{index}"
+        owner_digest = digest(f"owner-{index}")
+        store.register(node_id, capabilities, owner_digest)
+        queued_work(store, f"{index}-a")
+        queued_work(store, f"{index}-b")
+        result = store.unregister_node_and_transition_work(node_id, owner_digest)
+        assert result.continuation_required
+
+    clock.value += 1
+    original_compare_digest = __import__("hmac").compare_digest
+    comparisons = 0
+
+    def counting_compare_digest(left, right):
+        nonlocal comparisons
+        comparisons += 1
+        return original_compare_digest(left, right)
+
+    monkeypatch.setattr("relay_state_store.hmac.compare_digest", counting_compare_digest)
+    store._reap_retained_locked(clock.value)
+
+    assert comparisons == pending_count
+    assert len(store._former_node_authorities) == pending_count
+    assert "any(" not in inspect.getsource(store._reap_retained_locked)
+
+
 def test_node_reuse_retains_all_unexpired_owner_fences(store_factory, capabilities):
     store, _ = registered_store(store_factory, capabilities)
     assert store.unregister("node-a", digest("owner"))

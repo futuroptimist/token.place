@@ -2127,6 +2127,9 @@ class InMemoryRelayStateStore:
     def _expire_locked(
         self, now: float, *, continue_pending: bool = False
     ) -> list[ComputeNodeRegistration]:
+        # Lease eviction consumes retained transition capacity, so reclaim
+        # expired entries before attempting any new transition.
+        self._reap_retained_locked(now)
         expired = sorted(
             (
                 record
@@ -2227,20 +2230,17 @@ class InMemoryRelayStateStore:
             if tombstone.expires_at_epoch <= now:
                 del self._node_tombstones[node_digest]
         pending_authorities = {
-            (
-                transition.node_identity_digest,
-                transition.control_credential_digest,
-            )
+            transition.node_identity_digest: transition.control_credential_digest
             for transition in self._pending_node_transitions.values()
         }
         for node_digest, authorities in tuple(
             self._former_node_authorities.items()
         ):
+            pending_owner_digest = pending_authorities.get(node_digest)
             for owner_digest, authority in tuple(authorities.items()):
-                reserved_by_pending = any(
-                    pending_node_digest == node_digest
+                reserved_by_pending = (
+                    pending_owner_digest is not None
                     and hmac.compare_digest(pending_owner_digest, owner_digest)
-                    for pending_node_digest, pending_owner_digest in pending_authorities
                 )
                 if authority.expires_at_epoch <= now and not reserved_by_pending:
                     del authorities[owner_digest]

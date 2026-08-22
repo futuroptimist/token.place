@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, fields, replace
@@ -813,32 +814,220 @@ def test_progress_replacement_racing_terminal_transition_is_once_only(
     assert store.progress_records() == ()
 
 
-def test_progress_schema_bound_redaction_and_immutable_read(
-    store_factory, capabilities
+PROGRESS_ENVELOPE_VALUES = {
+    "protocol": "tokenplace_api_v1_relay_e2ee",
+    "version": 1,
+    "ciphertext": "sealed-progress",
+    "cipherkey": "progress-cipherkey",
+    "iv": "progress-iv",
+}
+
+
+def test_progress_envelope_has_exact_allowlist_and_requires_every_field():
+    assert {field.name for field in fields(EncryptedProgressEnvelope)} == set(
+        PROGRESS_ENVELOPE_VALUES
+    )
+    for missing in PROGRESS_ENVELOPE_VALUES:
+        values = PROGRESS_ENVELOPE_VALUES.copy()
+        values.pop(missing)
+        with pytest.raises(TypeError):
+            EncryptedProgressEnvelope(**values)
+
+
+@pytest.mark.parametrize("field", ["ciphertext", "cipherkey", "iv"])
+@pytest.mark.parametrize("invalid", ["", None, b"encrypted", 1, True])
+def test_progress_envelope_rejects_empty_or_non_string_encrypted_values(
+    field, invalid
 ):
+    values = PROGRESS_ENVELOPE_VALUES | {field: invalid}
+    with pytest.raises(RelayStateStoreError, match="non-empty strings"):
+        EncryptedProgressEnvelope(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid", "message"),
+    [
+        ("protocol", "tokenplace_api_v2_relay_e2ee", "protocol"),
+        ("protocol", "", "protocol"),
+        ("protocol", None, "protocol"),
+        ("version", 0, "version"),
+        ("version", 2, "version"),
+        ("version", True, "version"),
+        ("version", False, "version"),
+        ("version", "1", "version"),
+    ],
+)
+def test_progress_envelope_rejects_unsupported_protocol_and_version(
+    field, invalid, message
+):
+    values = PROGRESS_ENVELOPE_VALUES | {field: invalid}
+    with pytest.raises(RelayStateStoreError, match=message):
+        EncryptedProgressEnvelope(**values)
+
+
+@pytest.mark.parametrize(
+    "unexpected",
+    [
+        "plaintext",
+        "prompt",
+        "messages",
+        "model_output",
+        "tool_data",
+        "url",
+        "headers",
+        "credential",
+        "credentials",
+        "trace_id",
+        "tracing_data",
+        "arbitrary",
+    ],
+)
+def test_progress_envelope_rejects_unknown_and_plaintext_fields(unexpected):
     with pytest.raises(TypeError):
         EncryptedProgressEnvelope(
-            protocol="tokenplace_api_v1_relay_e2ee",
-            version=1,
-            ciphertext="secret",
-            cipherkey="key",
-            iv="iv",
-            plaintext="forbidden",
+            **PROGRESS_ENVELOPE_VALUES,
+            **{unexpected: "must-not-be-accepted"},
         )
-    store, _ = registered_store(
-        store_factory, capabilities, max_progress_envelope_bytes=180
+
+
+def test_progress_envelope_utf8_byte_bound_is_exact_and_failure_is_immutable(
+    store_factory, capabilities
+):
+    candidate = progress_envelope("界" * 17)
+    serialized_size = len(
+        json.dumps(
+            {field.name: getattr(candidate, field.name) for field in fields(candidate)},
+            separators=(",", ":"),
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
     )
-    claim = claimed_work(store)
-    sample_ciphertext = "sensitive-ciphertext"
+    accepted_store, _ = registered_store(
+        store_factory, capabilities, max_progress_envelope_bytes=serialized_size
+    )
+    accepted_claim = claimed_work(accepted_store)
+    assert replace_progress(accepted_store, accepted_claim, envelope=candidate).state == "accepted"
+
+    rejected_store, _ = registered_store(
+        store_factory, capabilities, max_progress_envelope_bytes=serialized_size - 1
+    )
+    rejected_claim = claimed_work(rejected_store)
+    before = rejected_store.progress_records()
     with pytest.raises(RelayStateStoreError, match="byte bound") as error:
-        replace_progress(store, claim, envelope=progress_envelope("é" * 100))
-    assert "é" not in str(error.value)
-    replace_progress(store, claim, envelope=progress_envelope(sample_ciphertext))
-    record = store.progress_records()[0]
-    assert sample_ciphertext not in repr(record) and sample_ciphertext not in repr(record.envelope)
+        replace_progress(rejected_store, rejected_claim, envelope=candidate)
+    assert rejected_store.progress_records() == before
+    assert "界" not in str(error.value)
+
+
+def test_progress_records_are_immutable_defensive_copies(store_factory, capabilities):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    expected = progress_envelope("defensively-copied-ciphertext")
+    replace_progress(store, claim, envelope=expected)
+
+    first = store.progress_records()[0]
+    second = store.progress_records()[0]
+    assert first == second
+    assert first is not second
+    assert first.envelope == second.envelope == expected
+    assert first.envelope is not second.envelope
     with pytest.raises(FrozenInstanceError):
-        record.envelope.ciphertext = "changed"
-    assert store.progress_records()[0].envelope.ciphertext == sample_ciphertext
+        first.envelope.ciphertext = "changed"
+    with pytest.raises(FrozenInstanceError):
+        first.expires_at_epoch = 0
+    assert store.progress_records()[0] == second
+
+
+def test_progress_results_errors_and_logs_redact_all_sensitive_markers(
+    store_factory, capabilities, caplog
+):
+    node_id = "secret-progress-node-id"
+    owner_digest = digest("secret-progress-owner-credential")
+    consumer = "secret-progress-consumer-identity"
+    client = "secret-progress-client-identity"
+    request = "secret-progress-request-identity"
+    ciphertext = "secret-progress-ciphertext"
+    cipherkey = "secret-progress-cipher-key"
+    iv = "secret-progress-iv"
+    store = store_factory(claim_ttl_seconds=10)
+    store.register(node_id, capabilities, owner_digest)
+    selection = reserve(store, request, client_public_key=client)
+    enqueue(store, selection, request, client_public_key=client)
+    claim = store.claim_queued_request(node_id, owner_digest, consumer)
+    progress = EncryptedProgressEnvelope(
+        protocol="tokenplace_api_v1_relay_e2ee",
+        version=1,
+        ciphertext=ciphertext,
+        cipherkey=cipherkey,
+        iv=iv,
+    )
+    accepted = replace_progress(
+        store,
+        claim,
+        node_id=node_id,
+        control_credential_digest=owner_digest,
+        consumer_identity=consumer,
+        client_public_key=client,
+        envelope=progress,
+    )
+    replaced = replace_progress(
+        store,
+        claim,
+        node_id=node_id,
+        control_credential_digest=owner_digest,
+        consumer_identity=consumer,
+        client_public_key=client,
+        envelope=progress,
+    )
+    with pytest.raises(RelayStateCredentialMismatch) as rejected_owner:
+        replace_progress(
+            store,
+            claim,
+            node_id=node_id,
+            control_credential_digest=digest("rejected-owner-credential"),
+            consumer_identity=consumer,
+            client_public_key=client,
+            envelope=progress,
+        )
+    with pytest.raises(RelayStateConflict) as rejected_generation:
+        replace_progress(
+            store,
+            claim,
+            node_id=node_id,
+            control_credential_digest=owner_digest,
+            consumer_identity=consumer,
+            client_public_key=client,
+            generation=claim.generation + 1,
+            envelope=progress,
+        )
+    pending = store.retrieve_encrypted_response(client, request, selection.reservation_token)
+    rendered = repr(
+        (
+            accepted,
+            replaced,
+            pending,
+            progress,
+            store.progress_records(),
+            rejected_owner.value,
+            rejected_generation.value,
+        )
+    )
+    sensitive = (
+        ciphertext,
+        cipherkey,
+        iv,
+        client,
+        request,
+        node_id,
+        consumer,
+        owner_digest,
+        selection.reservation_token,
+    )
+    for marker in sensitive:
+        assert marker not in rendered
+        assert marker not in caplog.text
+    assert {field.name for field in fields(type(accepted))} == {"state"}
+    assert accepted.state == "accepted" and replaced.state == "replaced"
 
 
 def test_node_transition_authenticates_and_tombstones_without_work(

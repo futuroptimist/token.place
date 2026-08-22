@@ -290,6 +290,170 @@ def test_progress_claim_and_deadline_expiry_are_inclusive(store_factory, capabil
     assert store.progress_records() == ()
 
 
+def test_progress_is_fenced_across_claim_reclaim(store_factory, capabilities):
+    store, clock = registered_store(store_factory, capabilities)
+    selection = reserve(store)
+    enqueue(store, selection)
+    first = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+    assert replace_progress(store, first).state == "accepted"
+
+    clock.value = first.lease_expires_at_epoch
+    second = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+
+    assert second.generation == first.generation + 1
+    assert store.progress_records() == ()
+    with pytest.raises(RelayStateConflict):
+        replace_progress(store, first)
+    assert store.progress_records() == ()
+    latest = progress_envelope("generation-two")
+    assert replace_progress(store, second, envelope=latest).state == "accepted"
+    pending = store.retrieve_encrypted_response(
+        "client-key", "request-a", selection.reservation_token
+    )
+    assert pending.progress == latest
+    assert store.progress_records() == ()
+
+
+def test_progress_replacement_requires_claim_without_mutation(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    queued_work(store)
+
+    with pytest.raises(RelayStateConflict):
+        store.replace_encrypted_progress_if_claimed(
+            node_id="node-a",
+            control_credential_digest=digest("owner"),
+            consumer_identity="worker-a",
+            client_public_key="client-key",
+            request_id="request-a",
+            generation=1,
+            envelope=progress_envelope(),
+        )
+    assert store.progress_records() == ()
+
+
+def test_registration_lease_eviction_cleans_and_fences_progress(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory, capabilities, clock=clock, lease_ttl_seconds=5
+    )
+    claim = claimed_work(store)
+    replace_progress(store, claim)
+    clock.value += 5
+
+    first = store.unregister_node_and_transition_work(
+        "node-a", None, cause="registration_lease_expired"
+    )
+    retry = store.unregister_node_and_transition_work(
+        "node-a", None, cause="registration_lease_expired"
+    )
+
+    assert first.new_outcomes == 1
+    assert retry.new_outcomes == 0
+    assert store.progress_records() == ()
+    with pytest.raises(RelayStateCredentialMismatch):
+        replace_progress(store, claim)
+    assert store.progress_records() == ()
+    assert len(store.terminal_records()) == len(store.control_tombstones()) == 1
+
+
+def test_concurrent_progress_replacement_never_mixes_envelope_fields(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    envelopes = tuple(
+        EncryptedProgressEnvelope(
+            protocol="tokenplace_api_v1_relay_e2ee",
+            version=1,
+            ciphertext=f"ciphertext-{index}",
+            cipherkey=f"cipherkey-{index}",
+            iv=f"iv-{index}",
+        )
+        for index in range(8)
+    )
+
+    results = synchronized_results(
+        *(lambda item=item: replace_progress(store, claim, envelope=item) for item in envelopes)
+    )
+
+    assert all(result.state in {"accepted", "replaced"} for result in results)
+    records = store.progress_records()
+    assert len(records) == 1
+    assert records[0].envelope in envelopes
+
+
+@pytest.mark.parametrize(
+    "transition", ["response", "cancel", "deadline", "unregister", "lease_eviction"]
+)
+def test_progress_replacement_racing_terminal_transition_is_once_only(
+    store_factory, capabilities, transition
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory, capabilities, clock=clock, lease_ttl_seconds=20
+    )
+    deadline_offset = 100 if transition == "lease_eviction" else 5
+    claim = claimed_work(
+        store, request_deadline_epoch=clock.value + deadline_offset
+    )
+    replace_progress(store, claim)
+
+    if transition == "response":
+        terminal_operation = lambda: accept_response(store, claim)
+    elif transition == "cancel":
+        terminal_operation = lambda: store.cancel_or_expire_request(
+            "client-key", "request-a", "cancel-proof-request-a"
+        )
+    elif transition == "deadline":
+        clock.value = claim.request_deadline_epoch
+        terminal_operation = lambda: store.cancel_or_expire_request(
+            "client-key",
+            "request-a",
+            status="expired",
+            reason="request_deadline_expired",
+        )
+    elif transition == "unregister":
+        terminal_operation = lambda: store.unregister_node_and_transition_work(
+            "node-a", digest("owner")
+        )
+    else:
+        clock.value += 20
+        terminal_operation = lambda: store.unregister_node_and_transition_work(
+            "node-a", None, cause="registration_lease_expired"
+        )
+
+    def raced_replacement():
+        try:
+            return replace_progress(
+                store, claim, envelope=progress_envelope("raced")
+            )
+        except RelayStateCredentialMismatch as error:
+            return error
+
+    replacement, terminal = synchronized_results(
+        raced_replacement,
+        terminal_operation,
+    )
+
+    assert isinstance(replacement, (RelayStateConflict, RelayStateCredentialMismatch)) or (
+        replacement.state in {"accepted", "replaced"}
+    )
+    assert store.progress_records() == ()
+    assert len(store.terminal_records()) == 1
+    assert len(store.response_records()) == (1 if transition == "response" else 0)
+    if transition in {"cancel", "deadline", "unregister", "lease_eviction"}:
+        assert len(store.control_tombstones()) == 1
+    retry = terminal_operation()
+    assert not getattr(retry, "new_outcome", False)
+    assert getattr(retry, "new_outcomes", 0) == 0
+    assert len(store.terminal_records()) == 1
+    assert store.progress_records() == ()
+
+
 def test_progress_schema_bound_redaction_and_immutable_read(
     store_factory, capabilities
 ):

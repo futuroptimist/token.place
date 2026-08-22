@@ -1872,7 +1872,7 @@ class InMemoryRelayStateStore:
                     # lifecycle into externally visible pending work.
                     if queued.request_deadline_epoch <= now:
                         self._progress.pop(identity, None)
-                        return ResponseRetrievalResult("retrieval_expired")
+                        return ResponseRetrievalResult("completed_unavailable")
                     progress = self._progress.pop(identity, None)
                     return ResponseRetrievalResult(
                         "pending",
@@ -2071,6 +2071,7 @@ class InMemoryRelayStateStore:
             now + self.config.terminal_retention_seconds,
             outcome=status,
             retrieval_state="completed_unavailable",
+            retrieval_credential_digest=self._queued_token_digests.get(identity, ""),
             reason=reason,
             cancellation_token_digest=self._cancellation_token_digests.get(
                 identity, ""

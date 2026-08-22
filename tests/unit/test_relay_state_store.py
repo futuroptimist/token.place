@@ -1591,11 +1591,14 @@ def test_authenticated_retrieval_fails_closed_for_deferred_deadline(
     assert invalid == ResponseRetrievalResult("invalid_retrieval_credential")
     assert invalid.request_deadline_epoch is invalid.progress is None
 
-    expired = store.retrieve_encrypted_response(
-        "client-key", "request-b", due_selection.reservation_token
-    )
-    assert expired == ResponseRetrievalResult("retrieval_expired")
-    assert expired.request_deadline_epoch is expired.progress is None
+    for _ in range(3):
+        unavailable = store.retrieve_encrypted_response(
+            "client-key", "request-b", due_selection.reservation_token
+        )
+        assert unavailable == ResponseRetrievalResult("completed_unavailable")
+        assert unavailable.request_deadline_epoch is unavailable.progress is None
+        assert unavailable.state not in {"pending", "retrieval_expired"}
+        assert store.response_records() == ()
     assert store.progress_records() == ()
     assert len(store.terminal_records()) == 1
 
@@ -1608,6 +1611,10 @@ def test_authenticated_retrieval_fails_closed_for_deferred_deadline(
         )
         assert terminals[0].outcome == "expired"
     assert len(store.control_tombstones()) == 1
+    assert store.response_records() == ()
+    assert store.retrieve_encrypted_response(
+        "client-key", "request-b", due_selection.reservation_token
+    ) == ResponseRetrievalResult("completed_unavailable")
 
 
 def test_cancellation_invalid_identity_and_queued_retry_proof_fail_closed(

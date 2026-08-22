@@ -1084,12 +1084,58 @@ def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_di
         verify_config_preserved(config_path, seeded_config_values(tier))
 
 
+def run_installed_tokenizer_boundary(
+    exe: Path,
+    model: Path,
+    log_path: Path | None = None,
+) -> None:
+    """Run the production tokenizer boundary against the validated installation."""
+    runner = Path(__file__).with_name("test_desktop_operator_ui_e2e.py")
+    result = _run(
+        [
+            sys.executable,
+            str(runner),
+            "--packaged-windows-tokenizer-boundary",
+            "--app-binary",
+            str(exe),
+            "--model",
+            str(model.resolve(strict=True)),
+        ],
+        timeout=240,
+        check=False,
+        separate_stderr=True,
+    )
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "boundary": "installed_package_tokenizer",
+                    "outcome": "passed" if result.returncode == 0 else "failed",
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    if result.returncode != 0:
+        raise InstallerIdentityError(
+            "installed-package tokenizer production boundary failed; see bounded validation artifacts"
+        )
+
+
 def is_actionable_competing_installer_rejection(result: subprocess.CompletedProcess[str]) -> bool:
     text = result.stdout.lower()
     return result.returncode != 0 and ("competing" in text or "existing installation" in text or "remove" in text) and ("token.place" in text or "token place" in text or "token-place" in text)
 
 
-def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: ScenarioArtifactDir | None = None) -> None:
+def run_scenario(
+    scenario: Scenario,
+    expected_build_id: str,
+    artifact_dir: ScenarioArtifactDir | None = None,
+    tokenizer_boundary_model: Path | None = None,
+) -> None:
     _terminate_processes()
     uninstall_best_effort()
     config_path: Path | None = None
@@ -1127,6 +1173,12 @@ def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: Scena
                     if str(record.get(key)) != str(seeded[key]):
                         raise InstallerIdentityError(f"operator smoke did not preserve seeded config field {key}")
             validate_installed_context_tiers(shortcut.target, env, artifact_dir, scenario.name)
+            if tokenizer_boundary_model is not None:
+                run_installed_tokenizer_boundary(
+                    shortcut.target,
+                    tokenizer_boundary_model,
+                    artifact_dir.path(scenario.name, "tokenizer-production-boundary") if artifact_dir else None,
+                )
             if sentinel_log.exists() and sentinel_log.read_text(encoding="utf-8").strip():
                 raise InstallerIdentityError("host tool/Python sentinel was invoked during installed-app validation")
         finally:
@@ -1173,6 +1225,12 @@ def main() -> int:
     parser.add_argument("--expected-version", default=EXPECTED_VERSION)
     parser.add_argument("--expected-build-id", required=True)
     parser.add_argument("--artifact-dir", type=Path, default=None)
+    parser.add_argument(
+        "--tokenizer-boundary-model",
+        type=Path,
+        default=None,
+        help="Run the packaged tokenizer boundary against the installed executable before cleanup.",
+    )
     args = parser.parse_args()
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
@@ -1180,11 +1238,20 @@ def main() -> int:
         if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)):
             raise InstallerIdentityError("--pr-current-windows-nsis cannot be combined with full release scenario arguments")
         scenario = build_current_package_scenario(args.pr_current_windows_nsis, args.expected_version)
+        if args.tokenizer_boundary_model is None:
+            raise InstallerIdentityError(
+                "--pr-current-windows-nsis requires --tokenizer-boundary-model"
+            )
         if sys.platform != "win32":
             print("validated current-package Windows NSIS PR-gate contract; real install runs only on hosted Windows")
             return 0
         artifacts = ScenarioArtifactDir(args.artifact_dir) if args.artifact_dir else None
-        run_scenario(scenario, args.expected_build_id, artifacts)
+        run_scenario(
+            scenario,
+            args.expected_build_id,
+            artifacts,
+            tokenizer_boundary_model=args.tokenizer_boundary_model,
+        )
         print(f"validated current-package Windows NSIS for {args.expected_version} build {args.expected_build_id}")
         return 0
     required = {
@@ -1193,6 +1260,10 @@ def main() -> int:
         "--previous-windows-nsis": args.previous_windows_nsis,
         "--previous-windows-msi": args.previous_windows_msi,
     }
+    if args.tokenizer_boundary_model is not None:
+        raise InstallerIdentityError(
+            "--tokenizer-boundary-model is supported only with --pr-current-windows-nsis"
+        )
     missing = [name for name, value in required.items() if value is None]
     if missing:
         raise InstallerIdentityError(f"full release validation requires {', '.join(missing)}")

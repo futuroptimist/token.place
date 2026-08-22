@@ -360,7 +360,7 @@ jobs:
         working-directory: desktop-tauri
         run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
 
-      - name: Hosted-Windows packaged-start gate for installed current package
+      - name: Verify Windows application-argument tokenizer production boundary
         shell: pwsh
         run: |
           $installers = @(Get-ChildItem 'desktop-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis' -Filter '*-setup.exe' -File)
@@ -372,6 +372,7 @@ jobs:
             --pr-current-windows-nsis $installers[0].FullName `
             --expected-version $version `
             --expected-build-id $buildId `
+            --tokenizer-boundary-model "$env:GITHUB_WORKSPACE/.ci-models/stories15M-q4_0.gguf" `
             --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -387,13 +388,6 @@ jobs:
           python -m pytest tests/integration/test_desktop_qwen64k_packaged_runtime.py -q
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Verify Windows application-argument tokenizer production boundary
-        run: |
-          $applications = @(Get-ChildItem 'desktop-tauri/src-tauri/target/x86_64-pc-windows-msvc/release' -Filter '*.exe' -File | Where-Object { $_.Name -notmatch 'setup' })
-          if ($applications.Count -ne 1) { throw "Expected exactly one current-head release application, found $($applications.Count)." }
-          python desktop-tauri/scripts/test_desktop_operator_ui_e2e.py --packaged-windows-tokenizer-boundary --app-binary $applications[0].FullName --model "$env:GITHUB_WORKSPACE/.ci-models/stories15M-q4_0.gguf"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run Windows tokenizer boundary regressions

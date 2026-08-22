@@ -3578,38 +3578,50 @@ def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_sc
     guard = _load_windows_installer_identity()
     current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
     current_nsis.write_text('artifact', encoding='utf-8')
+    model = tmp_path / 'tiny.gguf'
+    model.write_text('model', encoding='utf-8')
     artifact_dir = tmp_path / 'logs'
     calls = []
     monkeypatch.setattr(guard.sys, 'platform', 'win32')
-    monkeypatch.setattr(guard, 'run_scenario', lambda scenario, build_id, artifacts=None: calls.append((scenario, build_id, artifacts)))
+    monkeypatch.setattr(
+        guard,
+        'run_scenario',
+        lambda scenario, build_id, artifacts=None, tokenizer_boundary_model=None:
+            calls.append((scenario, build_id, artifacts, tokenizer_boundary_model)),
+    )
     monkeypatch.setattr(sys, 'argv', [
         'test_windows_installer_identity.py',
         '--pr-current-windows-nsis', str(current_nsis),
         '--expected-version', '0.1.5',
         '--expected-build-id', 'abcdef123456',
+        '--tokenizer-boundary-model', str(model),
         '--artifact-dir', str(artifact_dir),
     ])
 
     assert guard.main() == 0
     assert len(calls) == 1
-    scenario, build_id, artifacts = calls[0]
+    scenario, build_id, artifacts, boundary_model = calls[0]
     assert scenario.name == 'pr-clean-current-nsis-0.1.5'
     assert scenario.current.kind == 'nsis'
     assert scenario.previous is None
     assert build_id == 'abcdef123456'
     assert artifacts.root == artifact_dir
+    assert boundary_model == model
 
 
 def test_windows_installer_identity_current_package_validates_contract_off_windows(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
     current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
     current_nsis.write_text('artifact', encoding='utf-8')
+    model = tmp_path / 'tiny.gguf'
+    model.write_text('model', encoding='utf-8')
     monkeypatch.setattr(guard.sys, 'platform', 'linux')
     monkeypatch.setattr(sys, 'argv', [
         'test_windows_installer_identity.py',
         '--pr-current-windows-nsis', str(current_nsis),
         '--expected-version', '0.1.5',
         '--expected-build-id', 'abcdef123456',
+        '--tokenizer-boundary-model', str(model),
     ])
 
     assert guard.main() == 0
@@ -3666,15 +3678,18 @@ def test_windows_packaged_start_workflow_builds_and_validates_current_nsis() -> 
     assert 'prepare_windows_embedded_python_runtime.py' in workflow
     assert 'tauri build -- --target x86_64-pc-windows-msvc --bundles nsis' in workflow
     assert '--pr-current-windows-nsis' in workflow
+    assert '--tokenizer-boundary-model' in workflow
+    assert "target/x86_64-pc-windows-msvc/release' -Filter '*.exe'" not in workflow
     assert '--operator-start-preflight' in Path('desktop-tauri/scripts/test_windows_installer_identity.py').read_text(encoding='utf-8')
 
 
 def test_windows_packaged_start_workflow_cannot_be_only_filtered_cargo_tests() -> None:
     workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
-    packaged_gate = workflow.split('- name: Hosted-Windows packaged-start gate for installed current package', 1)[1]
+    packaged_gate = workflow.split('- name: Verify Windows application-argument tokenizer production boundary', 1)[1]
 
     assert 'test_windows_installer_identity.py' in packaged_gate
     assert '--pr-current-windows-nsis' in packaged_gate
+    assert '--tokenizer-boundary-model' in packaged_gate
     assert 'cargo test' not in packaged_gate.split('- name:', 1)[0]
 
 
@@ -5172,6 +5187,118 @@ def test_windows_installer_identity_run_scenario_rejects_sentinel_after_success(
 
     with pytest.raises(guard.InstallerIdentityError, match='sentinel was invoked'):
         guard.run_scenario(guard.Scenario('clean-nsis-0.1.5', current), 'abcdef123456')
+
+
+@pytest.mark.parametrize('boundary_fails', [False, True])
+def test_windows_installer_identity_runs_boundary_before_guaranteed_cleanup(
+    monkeypatch, tmp_path, boundary_fails
+) -> None:
+    guard = _load_windows_installer_identity()
+    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe', 'nsis', '0.1.5')
+    current.path.write_text('installer', encoding='utf-8')
+    exe = tmp_path / 'installed' / 'token.place.exe'
+    exe.parent.mkdir()
+    exe.write_text('exe', encoding='utf-8')
+    model = tmp_path / 'tiny.gguf'
+    model.write_text('model', encoding='utf-8')
+    events = []
+
+    monkeypatch.setattr(guard, '_terminate_processes', lambda: events.append('terminate'))
+    monkeypatch.setattr(guard, 'uninstall_best_effort', lambda log_path=None: events.append('uninstall'))
+    monkeypatch.setattr(guard, 'install', lambda *args, **kwargs: (events.append('install') or subprocess.CompletedProcess([], 0, '')))
+    monkeypatch.setattr(guard, 'resolve_authoritative_shortcut', lambda *args: guard.Shortcut(tmp_path / 'app.lnk', exe))
+    monkeypatch.setattr(guard, '_assert_runtime', lambda path: events.append('runtime'))
+    monkeypatch.setattr(guard, 'probe_identity', lambda *args: events.append('identity'))
+    monkeypatch.setattr(guard, 'validate_installed_context_tiers', lambda *args: events.append('smoke'))
+    monkeypatch.setattr(guard, 'launch_for_operator_record', lambda *args: json.dumps({
+        'record': 'desktop.compute_node.session.layout',
+        'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe',
+        'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bridge_preflight': 'ok',
+        'model_artifact_inspect': 'ok',
+        'model_artifact_filename': guard.EXPECTED_MODEL_ARTIFACT_FILENAME,
+    }))
+
+    def boundary(target, boundary_model, log_path=None):
+        events.append(('boundary', target, boundary_model))
+        if boundary_fails:
+            raise guard.InstallerIdentityError('boundary failed')
+
+    monkeypatch.setattr(guard, 'run_installed_tokenizer_boundary', boundary)
+    scenario = guard.Scenario('pr-clean-current-nsis-0.1.5', current)
+    if boundary_fails:
+        with pytest.raises(guard.InstallerIdentityError, match='boundary failed'):
+            guard.run_scenario(scenario, 'abcdef123456', tokenizer_boundary_model=model)
+    else:
+        guard.run_scenario(scenario, 'abcdef123456', tokenizer_boundary_model=model)
+
+    boundary_event = ('boundary', exe, model)
+    assert boundary_event in events
+    assert events.index('install') < events.index('smoke') < events.index(boundary_event)
+    assert events.index(boundary_event) < len(events) - 2
+    assert events[-2:] == ['terminate', 'uninstall']
+
+
+def test_windows_installer_identity_boundary_invokes_installed_executable_and_bounded_log(
+    monkeypatch, tmp_path
+) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'installed' / 'token.place.exe'
+    model = tmp_path / 'tiny.gguf'
+    log = tmp_path / 'artifacts' / 'boundary.log'
+    exe.parent.mkdir()
+    exe.write_text('exe', encoding='utf-8')
+    model.write_text('model', encoding='utf-8')
+    calls = []
+    monkeypatch.setattr(
+        guard,
+        '_run',
+        lambda cmd, **kwargs: (calls.append((cmd, kwargs)) or subprocess.CompletedProcess(cmd, 0, 'passed', '')),
+    )
+
+    guard.run_installed_tokenizer_boundary(exe, model, log)
+
+    cmd, kwargs = calls[0]
+    assert cmd[cmd.index('--app-binary') + 1] == str(exe)
+    assert cmd[cmd.index('--model') + 1] == str(model.resolve())
+    assert kwargs['separate_stderr'] is True
+    assert kwargs['check'] is False
+    assert json.loads(log.read_text(encoding='utf-8')) == {
+        'boundary': 'installed_package_tokenizer',
+        'outcome': 'passed',
+        'schema_version': 1,
+    }
+    assert str(exe) not in log.read_text(encoding='utf-8')
+    assert str(model) not in log.read_text(encoding='utf-8')
+
+
+def test_windows_installer_identity_boundary_failure_writes_only_bounded_artifact(
+    monkeypatch, tmp_path
+) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'private-app.exe'
+    model = tmp_path / 'private-model.gguf'
+    log = tmp_path / 'boundary.log'
+    exe.write_text('exe', encoding='utf-8')
+    model.write_text('model', encoding='utf-8')
+    monkeypatch.setattr(
+        guard,
+        '_run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 1, f'hostile {exe}', f'hostile {model}'
+        ),
+    )
+
+    with pytest.raises(guard.InstallerIdentityError, match='bounded validation artifacts'):
+        guard.run_installed_tokenizer_boundary(exe, model, log)
+
+    assert json.loads(log.read_text(encoding='utf-8')) == {
+        'boundary': 'installed_package_tokenizer',
+        'outcome': 'failed',
+        'schema_version': 1,
+    }
 
 
 

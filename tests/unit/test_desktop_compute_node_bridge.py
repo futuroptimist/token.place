@@ -3482,6 +3482,74 @@ def test_run_does_not_warm_when_disabled(capsys, monkeypatch):
     assert all(event.get("relay_runtime_state") == "ready" for event in status_events)
 
 
+def test_run_warm_load_success_starts_once_then_registers_and_keeps_polling(
+    capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    timeline = []
+    original_emit = compute_node_bridge.emit
+
+    def record_operator_event(payload):
+        timeline.append(("event", dict(payload)))
+        original_emit(payload)
+
+    class WarmLoadRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            timeline.append(("warm_load", "started"))
+            timeline.append(("warm_load", "completed"))
+            return True
+
+        def register_and_poll_once(self):
+            timeline.append(("relay_poll", None))
+            return {"next_ping_in_x_seconds": 0}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmLoadRuntime)
+    monkeypatch.setattr(compute_node_bridge, "emit", record_operator_event)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "stop_requested",
+        lambda: sum(kind == "relay_poll" for kind, _value in timeline) >= 2,
+    )
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    args = SimpleNamespace(
+        model="/tmp/model.gguf",
+        mode="cpu",
+        relay_url="https://token.place",
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    runtime_started = [
+        (index, payload)
+        for index, (kind, payload) in enumerate(timeline)
+        if kind == "event"
+        and payload.get("type") == "started"
+        and payload.get("running") is True
+        and payload.get("runtime_provisioning_state") != "provisioning"
+    ]
+    assert len(runtime_started) == 1
+    started_index, started_payload = runtime_started[0]
+    warm_completed_index = timeline.index(("warm_load", "completed"))
+    first_poll_index = next(
+        index for index, (kind, _value) in enumerate(timeline) if kind == "relay_poll"
+    )
+    registered_index = next(
+        index
+        for index, (kind, payload) in enumerate(timeline)
+        if kind == "event" and payload.get("registered") is True
+    )
+
+    assert warm_completed_index < started_index < first_poll_index < registered_index
+    assert started_payload["warm_load_enabled"] is True
+    assert started_payload["warm_load_state"] == "ready"
+    assert sum(kind == "relay_poll" for kind, _value in timeline) == 2
+    assert any(
+        kind == "relay_poll" for kind, _value in timeline[registered_index + 1 :]
+    )
+    _ = capsys.readouterr()
+
+
 def test_run_sidecar_runtime_path_warms_bridge_before_registration_without_dual_opt_in(capsys, monkeypatch):
     _reset_cancel_queue()
     call_order = []

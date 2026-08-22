@@ -393,9 +393,13 @@ def test_progress_replacement_racing_terminal_transition_is_once_only(
     store_factory, capabilities, transition
 ):
     clock = EpochClock()
-    store, _ = registered_store(
-        store_factory, capabilities, clock=clock, lease_ttl_seconds=20
-    )
+    if transition == "lease_eviction":
+        store = store_factory(clock=clock, claim_ttl_seconds=10, lease_ttl_seconds=5)
+        registration = store.register("node-a", capabilities, digest("owner"))
+    else:
+        store, _ = registered_store(
+            store_factory, capabilities, clock=clock, lease_ttl_seconds=20
+        )
     deadline_offset = 100 if transition == "lease_eviction" else 5
     claim = claimed_work(
         store, request_deadline_epoch=clock.value + deadline_offset
@@ -421,7 +425,10 @@ def test_progress_replacement_racing_terminal_transition_is_once_only(
             "node-a", digest("owner")
         )
     else:
-        clock.value += 20
+        clock.value += 5
+        assert clock.value == registration.lease_expires_at_epoch
+        assert clock.value < claim.lease_expires_at_epoch
+        assert clock.value < claim.request_deadline_epoch
         terminal_operation = lambda: store.unregister_node_and_transition_work(
             "node-a", None, cause="registration_lease_expired"
         )

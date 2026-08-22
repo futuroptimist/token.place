@@ -1949,12 +1949,29 @@ class InMemoryRelayStateStore:
                     )
                 former = self._former_node_authorities.get(
                     self._node_digest(node_id), {}
-                ).get(supplied_digest or "")
-                if former is not None and cause == "explicit_unregister":
+                )
+                if cause == "explicit_unregister":
+                    matching = (
+                        authority
+                        for owner_digest, authority in former.items()
+                        if hmac.compare_digest(owner_digest, supplied_digest or "")
+                    )
+                else:
+                    matching = (
+                        authority
+                        for authority in former.values()
+                        if authority.cause == cause
+                    )
+                completed = max(
+                    matching,
+                    key=lambda authority: authority.transition_epoch,
+                    default=None,
+                )
+                if completed is not None:
                     return NodeTransitionResult(
                         "already_complete",
-                        former.cause,
-                        former.transition_epoch,
+                        completed.cause,
+                        completed.transition_epoch,
                         0,
                         0,
                         0,
@@ -2077,6 +2094,18 @@ class InMemoryRelayStateStore:
         if continuation:
             self._pending_node_transitions[node_id] = pending
         else:
+            fence_expiry = now + self.config.terminal_retention_seconds
+            if not math.isfinite(fence_expiry):
+                raise RelayStateStoreError(
+                    "former-owner retention deadline must be finite"
+                )
+            owner_fences = self._former_node_authorities.setdefault(
+                pending.node_identity_digest, {}
+            )
+            owner_fences[pending.control_credential_digest] = replace(
+                owner_fences[pending.control_credential_digest],
+                expires_at_epoch=fence_expiry,
+            )
             self._pending_node_transitions.pop(node_id, None)
             tombstone = self._node_tombstones.get(pending.node_identity_digest)
             if tombstone is not None:
@@ -2197,11 +2226,23 @@ class InMemoryRelayStateStore:
         for node_digest, tombstone in tuple(self._node_tombstones.items()):
             if tombstone.expires_at_epoch <= now:
                 del self._node_tombstones[node_digest]
+        pending_authorities = {
+            (
+                transition.node_identity_digest,
+                transition.control_credential_digest,
+            )
+            for transition in self._pending_node_transitions.values()
+        }
         for node_digest, authorities in tuple(
             self._former_node_authorities.items()
         ):
             for owner_digest, authority in tuple(authorities.items()):
-                if authority.expires_at_epoch <= now:
+                reserved_by_pending = any(
+                    pending_node_digest == node_digest
+                    and hmac.compare_digest(pending_owner_digest, owner_digest)
+                    for pending_node_digest, pending_owner_digest in pending_authorities
+                )
+                if authority.expires_at_epoch <= now and not reserved_by_pending:
                     del authorities[owner_digest]
             if not authorities:
                 del self._former_node_authorities[node_digest]

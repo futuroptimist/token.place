@@ -333,6 +333,106 @@ def test_completed_transition_survives_tombstone_expiry_and_fence_reaps_later(
     store.register("node-a", capabilities, digest("owner"))
 
 
+def test_long_lease_eviction_retains_reserved_fence_from_completion(
+    store_factory, capabilities, caplog
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock,
+        lease_ttl_seconds=1,
+        node_transition_batch_size=1,
+        node_tombstone_ttl_seconds=0.25,
+        terminal_retention_seconds=2,
+        control_tombstone_ttl_seconds=2,
+        response_replay_ttl_seconds=2,
+        max_removed_owner_fences=2,
+    )
+    store.register("node-a", replace(capabilities, max_concurrency=3), digest("owner"))
+    for request_id in ("a", "b", "c"):
+        queued_work(store, request_id)
+
+    clock.value += 1
+    first = store.unregister_node_and_transition_work(
+        "node-a", digest("caller-is-not-authority"), cause="registration_lease_expired"
+    )
+    assert first.continuation_required
+
+    clock.value += 1
+    store.register("node-b", capabilities, digest("owner-b"))
+    assert store.unregister("node-b", digest("owner-b"))
+
+    # The provisional deadline is inclusive, but pending cleanup retains its
+    # already-reserved fence even while all other fence capacity is occupied.
+    clock.value += 1
+    second = store.unregister_node_and_transition_work(
+        "node-a", digest("ignored-again"), cause="registration_lease_expired"
+    )
+    completed = store.unregister_node_and_transition_work(
+        "node-a", None, cause="registration_lease_expired"
+    )
+    assert second.continuation_required
+    assert completed.state == "complete"
+    assert sum(result.new_outcomes for result in (first, second, completed)) == 3
+    assert store.node_tombstones() == ()
+
+    clock.value += 1
+    retry = store.unregister_node_and_transition_work(
+        "node-a", digest("untrusted-caller"), cause="registration_lease_expired"
+    )
+    assert retry.state == "already_complete"
+    assert retry.transition_epoch == first.transition_epoch
+    assert retry.new_outcomes == 0
+    assert "node-a" not in repr(retry)
+    assert digest("owner") not in repr(retry)
+    assert digest("caller-is-not-authority") not in caplog.text
+
+    # A read-only retry did not refresh retention: capacity is reusable at the
+    # inclusive deadline measured from completion.
+    clock.value += 1
+    expired = store.unregister_node_and_transition_work(
+        "node-a", digest("ignored"), cause="registration_lease_expired"
+    )
+    assert expired.state == "not_found"
+    store.register("node-a", capabilities, digest("owner"))
+
+
+@pytest.mark.parametrize(
+    ("cause", "supplied_digest"),
+    [
+        ("explicit_unregister", digest("owner")),
+        ("registration_lease_expired", digest("not-owner")),
+    ],
+)
+def test_completed_transition_retry_survives_short_node_tombstone(
+    store_factory, capabilities, cause, supplied_digest
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        clock=clock,
+        lease_ttl_seconds=1,
+        node_tombstone_ttl_seconds=0.25,
+        terminal_retention_seconds=2,
+        control_tombstone_ttl_seconds=2,
+        response_replay_ttl_seconds=2,
+    )
+    if cause == "registration_lease_expired":
+        clock.value += 1
+    completed = store.unregister_node_and_transition_work(
+        "node-a", supplied_digest, cause=cause
+    )
+
+    clock.value += 0.25
+    assert store.node_tombstones() == ()
+    retry = store.unregister_node_and_transition_work(
+        "node-a", supplied_digest, cause=cause
+    )
+    assert retry.state == "already_complete"
+    assert retry.cause == cause
+    assert retry.transition_epoch == completed.transition_epoch
+
+
 def test_removed_owner_fence_bound_fails_closed_before_node_mutation(
     store_factory, capabilities
 ):

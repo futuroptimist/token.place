@@ -1081,6 +1081,15 @@ def test_post_start_operator_state_distinguishes_running_failure(desktop_runner)
     private_error = "C:\\private\\model.gguf prompt-secret"
     desktop_runner._read_operator_start_diagnostic = lambda _driver: {
         "start_handler_state": "entered", "invocation_state": "resolved"}
+    class Wait:
+        def __init__(self, _driver, _timeout, **_kwargs):
+            pass
+
+        def until(self, predicate):
+            assert predicate(object()) is True
+            return True
+
+    desktop_runner.WebDriverWait = Wait
     desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: (
         (_ for _ in ()).throw(RuntimeError(private_error)))
     failures = []
@@ -1152,6 +1161,34 @@ def test_post_start_operator_state_rejects_optimistic_running_without_active_att
     with pytest.raises(RuntimeError, match="^operator_running_not_reached$"):
         desktop_runner.wait_for_post_start_operator_state(
             object(), lambda: 9, pytest.fail, fail_closed)
+
+
+def test_post_start_operator_state_reports_missing_active_attempt_before_running(
+        desktop_runner):
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "not_entered", "invocation_state": "not_started"}
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
+    failures = []
+
+    class Wait:
+        calls = 0
+
+        def __init__(self, _driver, _timeout, **_kwargs):
+            pass
+
+        def until(self, predicate):
+            type(self).calls += 1
+            if self.calls == 1:
+                assert predicate(object()) is False
+                raise RuntimeError("private stale-state detail")
+            return True
+
+    desktop_runner.WebDriverWait = Wait
+    desktop_runner._status_value = lambda _driver, _label: "yes"
+    desktop_runner.wait_for_post_start_operator_state(
+        object(), lambda: 9, lambda _progress: None, failures.append)
+
+    assert failures == ["operator_running_not_reached"]
 
 
 def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(

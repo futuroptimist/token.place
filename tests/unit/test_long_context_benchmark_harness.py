@@ -961,7 +961,7 @@ def test_native_startup_diagnostic_collects_and_clamps_fixed_values(desktop_runn
     values = {
         "data-native-startup-phase": "running_status_publication",
         "data-native-startup-outcome": "publication_suppressed",
-        "data-native-startup-failure": "none",
+        "data-native-startup-failure": "bridge_exited_before_startup_event",
     }
     shell = SimpleNamespace(get_attribute=lambda name: values[name])
     driver = SimpleNamespace(find_element=lambda *_args: shell)
@@ -969,7 +969,7 @@ def test_native_startup_diagnostic_collects_and_clamps_fixed_values(desktop_runn
     assert desktop_runner._read_native_startup_diagnostic(driver) == {
         "native_startup_phase": "running_status_publication",
         "native_startup_outcome": "publication_suppressed",
-        "native_startup_failure_category": "none",
+        "native_startup_failure_category": "bridge_exited_before_startup_event",
     }
 
     hostile = "C:\\private\\model.gguf prompt SECRET raw exception"

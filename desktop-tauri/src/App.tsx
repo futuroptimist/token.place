@@ -287,7 +287,7 @@ const defaultComputeStatus: ComputeNodeStatus = {
 const nativeStartupDiagnosticAllowlists = {
   phase: new Set(['not_started', 'session_reserved', 'bridge_launch_prepared', 'command_constructed', 'child_spawn_attempted', 'child_spawn_completed', 'stdio_acquired', 'bridge_attached', 'running_status_publication', 'startup_task_failed']),
   outcome: new Set(['not_started', 'pending', 'accepted', 'launcher_validated', 'attempted', 'completed', 'running', 'stopping', 'superseded', 'publication_accepted', 'publication_suppressed', 'failed']),
-  failure: new Set(['none', 'bridge_preparation_failed', 'command_construction_failed', 'launcher_validation_failed', 'child_spawn_failed', 'stdio_acquisition_failed', 'bridge_attachment_failed', 'startup_task_failed']),
+  failure: new Set(['none', 'bridge_preparation_failed', 'command_construction_failed', 'launcher_validation_failed', 'child_spawn_failed', 'stdio_acquisition_failed', 'bridge_attachment_failed', 'bridge_exited_before_startup_event', 'startup_task_failed']),
 };
 
 function boundedNativeStartupValue(value: string | null | undefined, allowed: Set<string>, fallback: string): string {

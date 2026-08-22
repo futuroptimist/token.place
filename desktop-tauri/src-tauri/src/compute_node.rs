@@ -326,6 +326,7 @@ pub enum NativeStartupFailureCategory {
     ChildSpawnFailed,
     StdioAcquisitionFailed,
     BridgeAttachmentFailed,
+    BridgeExitedBeforeStartupEvent,
     StartupTaskFailed,
 }
 
@@ -1631,6 +1632,15 @@ fn finalize_bridge_exit(
     status.registered_relay_count = 0;
     status.registered_relay_urls.clear();
     status.active_relay_urls.clear();
+    if !saw_startup_event {
+        // Child attachment is not startup completion. Preserve the first
+        // demonstrated terminal boundary instead of letting the task wrapper
+        // collapse this pre-registration exit into `startup_task_failed`.
+        status.native_startup_phase = NativeStartupPhase::StartupTaskFailed;
+        status.native_startup_outcome = NativeStartupOutcome::Failed;
+        status.native_startup_failure_category =
+            NativeStartupFailureCategory::BridgeExitedBeforeStartupEvent;
+    }
     let preserve_failed_state = status.relay_runtime_state.as_deref() == Some("failed")
         || status.warm_load_state.as_deref() == Some("failed");
     if preserve_failed_state {
@@ -1673,6 +1683,9 @@ fn finalize_bridge_exit(
             "sequence": sequence,
             "updated_at_ms": updated_at_ms,
             "readiness_diagnostics": status.readiness_diagnostics.clone(),
+            "native_startup_phase": status.native_startup_phase,
+            "native_startup_outcome": status.native_startup_outcome,
+            "native_startup_failure_category": status.native_startup_failure_category,
         })
     })
 }
@@ -7550,6 +7563,16 @@ mod tests {
             .and_then(Value::as_u64)
             .is_some());
         assert_eq!(status.sequence, Some(8));
+        assert_eq!(
+            status.native_startup_failure_category,
+            NativeStartupFailureCategory::BridgeExitedBeforeStartupEvent
+        );
+        assert_eq!(
+            payload
+                .get("native_startup_failure_category")
+                .and_then(Value::as_str),
+            Some("bridge_exited_before_startup_event")
+        );
     }
 
     #[test]

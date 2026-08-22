@@ -914,7 +914,8 @@ NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS = {
     "native_startup_failure_category": frozenset({
         "none", "bridge_preparation_failed", "command_construction_failed",
         "launcher_validation_failed", "child_spawn_failed",
-        "stdio_acquisition_failed", "bridge_attachment_failed", "startup_task_failed",
+        "stdio_acquisition_failed", "bridge_attachment_failed",
+        "bridge_exited_before_startup_event", "startup_task_failed",
     }),
 }
 NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS = {

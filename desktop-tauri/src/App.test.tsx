@@ -199,7 +199,7 @@ describe('desktop app start failure handling', () => {
     mockInitialComputeStatus({
       native_startup_phase: 'bridge_attached',
       native_startup_outcome: 'running',
-      native_startup_failure_category: 'none',
+      native_startup_failure_category: 'bridge_exited_before_startup_event',
     });
 
     const { container } = render(<App />);
@@ -207,7 +207,7 @@ describe('desktop app start failure handling', () => {
     await waitFor(() => expect(shell?.getAttribute('data-application-initialization')).toBe('ready'));
     expect(shell?.getAttribute('data-native-startup-phase')).toBe('bridge_attached');
     expect(shell?.getAttribute('data-native-startup-outcome')).toBe('running');
-    expect(shell?.getAttribute('data-native-startup-failure')).toBe('none');
+    expect(shell?.getAttribute('data-native-startup-failure')).toBe('bridge_exited_before_startup_event');
 
     cleanup();
     mockInitialComputeStatus({

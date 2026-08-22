@@ -426,6 +426,41 @@ def test_renewal_racing_inclusive_lease_eviction_cannot_extend_authority(
     assert store.terminal_records()[0].reason == "server_unregistered"
 
 
+def test_registration_renewal_racing_inclusive_lease_eviction_cannot_extend_authority(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store, _ = registered_store(
+        store_factory, capabilities, clock=clock, lease_ttl_seconds=1
+    )
+    changed_capabilities = replace(capabilities, backend_class="cpu")
+    clock.value += 1
+
+    renewal, eviction = synchronized_results(
+        lambda: store.renew(
+            "node-a", digest("owner"), capabilities=changed_capabilities
+        ),
+        lambda: store.unregister_node_and_transition_work(
+            "node-a", None, cause="registration_lease_expired"
+        ),
+    )
+
+    assert renewal is None
+    assert eviction.state in {"complete", "already_complete"}
+    assert store.get("node-a") is None
+    tombstones = store.node_tombstones()
+    assert len(tombstones) == 1
+    assert tombstones[0].cause == "registration_lease_expired"
+    before_retry = lifecycle_snapshot(store), tombstones
+    retry = store.unregister_node_and_transition_work(
+        "node-a", None, cause="registration_lease_expired"
+    )
+    assert retry.state == "already_complete"
+    assert (lifecycle_snapshot(store), store.node_tombstones()) == before_retry
+    with pytest.raises(RelayStateNoCapacity):
+        reserve(store)
+
+
 def test_claim_and_renewal_are_rejected_after_transition_starts(
     store_factory, capabilities
 ):

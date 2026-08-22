@@ -291,7 +291,7 @@ def test_node_reuse_retains_all_unexpired_owner_fences(store_factory, capabiliti
         store.register("node-a", capabilities, digest("replacement"))
 
 
-def test_compatibility_unregister_finishes_all_transition_batches(
+def test_compatibility_unregister_starts_bounded_transition_completed_by_sweeps(
     store_factory, capabilities
 ):
     store = store_factory(node_transition_batch_size=1)
@@ -300,8 +300,50 @@ def test_compatibility_unregister_finishes_all_transition_batches(
         queued_work(store, request_id)
 
     assert store.unregister("node-a", digest("owner"))
+    assert len(store.terminal_records()) == 1
+    assert not store.node_tombstones()[0].completed
+    store.expire()
+    store.expire()
     assert len(store.terminal_records()) == 3
     assert store.node_tombstones()[0].completed
+
+
+def test_completed_transition_survives_tombstone_expiry_and_fence_reaps_later(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock,
+        node_tombstone_ttl_seconds=1,
+        terminal_retention_seconds=3,
+        response_replay_ttl_seconds=3,
+        control_tombstone_ttl_seconds=3,
+    )
+    store.register("node-a", capabilities, digest("owner"))
+    assert store.unregister("node-a", digest("owner"))
+
+    clock.value += 1
+    assert store.node_tombstones() == ()
+    replay = store.unregister_node_and_transition_work("node-a", digest("owner"))
+    assert replay.state == "already_complete"
+    with pytest.raises(RelayStateCredentialMismatch):
+        store.register("node-a", capabilities, digest("owner"))
+
+    clock.value += 2
+    store.register("node-a", capabilities, digest("owner"))
+
+
+def test_removed_owner_fence_bound_fails_closed_before_node_mutation(
+    store_factory, capabilities
+):
+    store = store_factory(max_removed_owner_fences=1)
+    store.register("node-a", capabilities, digest("owner-a"))
+    store.register("node-b", capabilities, digest("owner-b"))
+    assert store.unregister("node-a", digest("owner-a"))
+
+    with pytest.raises(RelayStateCapacityExceeded, match="fencing capacity"):
+        store.unregister("node-b", digest("owner-b"))
+    assert store.get("node-b") is not None
 
 
 def test_concurrent_node_continuations_terminalize_once(store_factory, capabilities):
@@ -323,6 +365,39 @@ def test_concurrent_node_continuations_terminalize_once(store_factory, capabilit
         )
     assert sum(result.new_outcomes for result in (first, *results)) == 3
     assert len(store.terminal_records()) == 3
+
+
+def test_transition_rejects_enqueue_without_consuming_remaining_reservation(
+    store_factory, capabilities
+):
+    store = store_factory(node_transition_batch_size=1)
+    store.register("node-a", replace(capabilities, max_concurrency=2), digest("owner"))
+    reserve(store, "first")
+    remaining = reserve(store, "remaining")
+
+    assert store.unregister("node-a", digest("owner"))
+    with pytest.raises(RelayStateInvalidReservation):
+        enqueue(store, remaining, request_id="remaining")
+    assert len(store.list_reservations()) == 1
+    store.expire()
+    assert store.list_reservations() == ()
+
+
+def test_transition_batch_uses_node_index_without_scanning_global_work(
+    store_factory, capabilities
+):
+    class NoItemsDict(dict):
+        def items(self):
+            raise AssertionError("global reservation scan")
+
+    store = store_factory(node_transition_batch_size=1)
+    store.register("node-a", capabilities, digest("owner"))
+    reserve(store, "target")
+    store._reservations = NoItemsDict(store._reservations)
+
+    result = store.unregister_node_and_transition_work("node-a", digest("owner"))
+    assert result.processed_count == 1
+    assert not result.continuation_required
 
 
 def test_authenticated_cancellation_and_owner_bound_acknowledgement(

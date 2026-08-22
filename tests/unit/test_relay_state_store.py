@@ -228,6 +228,105 @@ def test_progress_replaces_latest_and_pending_retrieval_is_one_shot(
     )
 
 
+def test_progress_replacement_and_pending_retrieval_preserve_lifecycle_state(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    selection = reserve(store, "request-a")
+    enqueue(store, selection, "request-a")
+    claim = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+    queued_work(store, "request-b")
+    before = lifecycle_snapshot(store)
+
+    accepted = replace_progress(store, claim)
+    assert accepted.state == "accepted"
+    assert lifecycle_snapshot(store) == before
+    assert store.progress_records()[0].envelope == progress_envelope()
+
+    latest = progress_envelope("latest-progress")
+    replaced_progress = replace_progress(store, claim, envelope=latest)
+    assert replaced_progress.state == "replaced"
+    assert lifecycle_snapshot(store) == before
+    assert store.progress_records()[0].envelope == latest
+
+    pending = store.retrieve_encrypted_response(
+        "client-key", "request-a", selection.reservation_token
+    )
+    assert pending == ResponseRetrievalResult(
+        "pending",
+        request_deadline_epoch=claim.request_deadline_epoch,
+        progress=latest,
+    )
+    assert lifecycle_snapshot(store) == before
+    assert store.progress_records() == ()
+    active = store.active_claims("node-a")[0]
+    assert (
+        active.generation,
+        active.lease_expires_at_epoch,
+        active.request_deadline_epoch,
+    ) == (
+        claim.generation,
+        claim.lease_expires_at_epoch,
+        claim.request_deadline_epoch,
+    )
+    assert store.response_records() == store.terminal_records() == ()
+
+
+def test_progress_operations_do_not_change_scheduler_fairness_or_capacity(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+
+    def prepared_store():
+        store = store_factory(
+            clock=clock,
+            acknowledgement_key=b"a" * 32,
+            claim_ttl_seconds=10,
+        )
+        store.register("node-a", capabilities, digest("owner"))
+        store.register("node-b", capabilities, digest("owner-b"))
+        selection = reserve(store, "request-a")
+        enqueue(store, selection, "request-a")
+        claim = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+        queued_work(store, "request-b")
+        return store, selection, claim
+
+    treated, selection, claim = prepared_store()
+    control, _, _ = prepared_store()
+
+    assert replace_progress(treated, claim).state == "accepted"
+    assert replace_progress(
+        treated, claim, envelope=progress_envelope("latest-progress")
+    ).state == "replaced"
+    assert treated.retrieve_encrypted_response(
+        "client-key", "request-a", selection.reservation_token
+    ).state == "pending"
+
+    treated_probe = reserve(treated, "probe-request")
+    control_probe = reserve(control, "probe-request")
+    assert treated_probe.selected_node_id == control_probe.selected_node_id
+
+    def reservation_accounting(store):
+        return tuple(
+            (
+                item.selected_node_id,
+                item.requested_model_id,
+                item.requested_context_tier,
+                item.request_deadline_epoch,
+                item.reservation_expires_at_epoch,
+            )
+            for item in store.list_reservations()
+        )
+
+    assert reservation_accounting(treated) == reservation_accounting(control)
+    for node_id in ("node-a", "node-b"):
+        assert treated.queued_requests(node_id) == control.queued_requests(node_id)
+        assert treated.active_claims(node_id) == control.active_claims(node_id)
+    assert treated.response_records() == control.response_records() == ()
+    assert treated.terminal_records() == control.terminal_records() == ()
+    assert treated.control_tombstones() == control.control_tombstones() == ()
+
+
 def test_pending_progress_retrieval_rejects_invalid_credentials_without_consumption(
     store_factory, capabilities
 ):

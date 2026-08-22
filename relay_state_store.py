@@ -15,8 +15,8 @@ import secrets
 import struct
 import threading
 import time
-from itertools import islice
 from dataclasses import dataclass, replace
+from itertools import islice
 from typing import Callable, Protocol, runtime_checkable
 
 RELAY_STATE_SCHEMA_VERSION = 1
@@ -79,6 +79,9 @@ class RelayStateStoreConfig:
     max_claims_per_node: int = 128
     max_consumer_identity_bytes: int = 1024
     max_response_envelope_bytes: int = 1_048_576
+    max_progress_envelope_bytes: int = 16_384
+    max_progress_records: int = 4096
+    max_progress_records_per_client: int = 8
     max_responses: int = 4096
     max_responses_per_client: int = 8
     response_replay_ttl_seconds: float = 300.0
@@ -188,6 +191,17 @@ class RelayStateStoreConfig:
             ),
             (self.max_responses, "response bound", 1_000_000),
             (self.max_responses_per_client, "per-client response bound", 10_000),
+            (
+                self.max_progress_envelope_bytes,
+                "progress encrypted-envelope byte bound",
+                64 * 1024 * 1024,
+            ),
+            (self.max_progress_records, "progress-record bound", 1_000_000),
+            (
+                self.max_progress_records_per_client,
+                "per-client progress-record bound",
+                10_000,
+            ),
             (self.max_terminal_records, "terminal-record bound", 1_000_000),
             (
                 self.max_cancellation_token_bytes,
@@ -662,6 +676,57 @@ class EncryptedResponseEnvelope:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class EncryptedProgressEnvelope:
+    """Exact API-v1 advisory progress ciphertext allowlist."""
+
+    protocol: str
+    version: int
+    ciphertext: str
+    cipherkey: str
+    iv: str
+
+    def __post_init__(self) -> None:
+        if self.protocol != "tokenplace_api_v1_relay_e2ee":
+            raise RelayStateStoreError("unsupported encrypted progress protocol")
+        if isinstance(self.version, bool) or self.version != 1:
+            raise RelayStateStoreError("unsupported encrypted progress version")
+        for value in (self.ciphertext, self.cipherkey, self.iv):
+            if not isinstance(value, str) or not value:
+                raise RelayStateStoreError(
+                    "encrypted progress values must be non-empty strings"
+                )
+
+    def __repr__(self) -> str:
+        return "EncryptedProgressEnvelope(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ProgressRecord:
+    """One deadline-bound advisory envelope for a canonical request."""
+
+    client_identity_digest: str
+    request_identity_digest: str
+    envelope: EncryptedProgressEnvelope
+    expires_at_epoch: float
+
+    def __repr__(self) -> str:
+        return (
+            "ProgressRecord(identities=<redacted>, envelope=<redacted>, "
+            f"expires_at_epoch={self.expires_at_epoch!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ProgressReplacementResult:
+    """Payload-free result for an accepted advisory progress update."""
+
+    state: str
+
+    def __repr__(self) -> str:
+        return f"ProgressReplacementResult(state={self.state!r})"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class ResponseRecord:
     """One authoritative relay-blind response retained for later retrieval."""
 
@@ -747,12 +812,16 @@ class ResponseRetrievalResult:
     envelope: EncryptedResponseEnvelope | None = None
     acknowledgement_token: str | None = None
     replay_expires_at_epoch: float | None = None
+    request_deadline_epoch: float | None = None
+    encrypted_progress: EncryptedProgressEnvelope | None = None
 
     def __repr__(self) -> str:
         return (
             f"ResponseRetrievalResult(state={self.state!r}, envelope=<redacted>, "
             f"acknowledgement_token_present={self.acknowledgement_token is not None}, "
-            f"replay_expires_at_epoch={self.replay_expires_at_epoch!r})"
+            f"replay_expires_at_epoch={self.replay_expires_at_epoch!r}, "
+            f"request_deadline_epoch={self.request_deadline_epoch!r}, "
+            "encrypted_progress=<redacted>)"
         )
 
 
@@ -857,6 +926,16 @@ class RelayStateStore(Protocol):
         generation: int,
         envelope: EncryptedResponseEnvelope,
     ) -> ResponseAcceptanceResult: ...
+    def replace_encrypted_progress_if_claimed(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        envelope: EncryptedProgressEnvelope,
+    ) -> ProgressReplacementResult: ...
     def retrieve_encrypted_response(
         self,
         client_public_key: str,
@@ -865,6 +944,7 @@ class RelayStateStore(Protocol):
         acknowledgement_token: str | None = None,
     ) -> ResponseRetrievalResult: ...
     def response_records(self) -> tuple[ResponseRecord, ...]: ...
+    def progress_records(self) -> tuple[ProgressRecord, ...]: ...
     def terminal_records(self) -> tuple[TerminalOutcomeRecord, ...]: ...
     def control_tombstones(self) -> tuple[ControlTombstoneRecord, ...]: ...
     def node_tombstones(self) -> tuple[NodeTombstoneRecord, ...]: ...
@@ -898,18 +978,15 @@ class InMemoryRelayStateStore:
         self._node_queues: dict[str, list[QueuedRequest]] = {}
         self._claims: dict[tuple[str, str], ClaimRecord] = {}
         self._responses: dict[tuple[str, str], ResponseRecord] = {}
+        self._progress: dict[tuple[str, str], ProgressRecord] = {}
         self._terminals: dict[tuple[str, str], TerminalOutcomeRecord] = {}
         self._control_tombstones: dict[tuple[str, str], ControlTombstoneRecord] = {}
         self._node_tombstones: dict[str, NodeTombstoneRecord] = {}
         self._pending_node_transitions: dict[str, _PendingNodeTransition] = {}
-        self._former_node_authorities: dict[
-            str, dict[str, _FormerNodeAuthority]
-        ] = {}
+        self._former_node_authorities: dict[str, dict[str, _FormerNodeAuthority]] = {}
         # Ordered-set indexes make teardown proportional to its batch, rather
         # than to all work in the store.  They are private continuation state.
-        self._node_work_identities: dict[
-            str, dict[tuple[str, str], None]
-        ] = {}
+        self._node_work_identities: dict[str, dict[tuple[str, str], None]] = {}
         self._deferred_deadline_identities: set[tuple[str, str]] = set()
         self._next_claim_generation = 0
         self._fairness_cursors: dict[str, tuple[str, int]] = {}
@@ -1688,6 +1765,88 @@ class InMemoryRelayStateStore:
             self._remove_queued_identity_locked(identity, queued)
             return self._response_result(response, True)
 
+    def replace_encrypted_progress_if_claimed(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        envelope: EncryptedProgressEnvelope,
+    ) -> ProgressReplacementResult:
+        """Replace advisory ciphertext only for the exact live fenced claim."""
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        consumer_digest = self._consumer_digest(consumer_identity)
+        identity = self._identity(client_public_key, request_id)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise RelayStateStoreError("claim generation is invalid")
+        if not isinstance(envelope, EncryptedProgressEnvelope):
+            raise RelayStateStoreError(
+                "progress envelope must be EncryptedProgressEnvelope"
+            )
+        if (
+            len(self._serialized_progress_envelope(envelope))
+            > self.config.max_progress_envelope_bytes
+        ):
+            raise RelayStateStoreError(
+                "encrypted progress exceeds its configured byte bound"
+            )
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now)
+            registration = self._records.get(node_id)
+            if registration is None or not hmac.compare_digest(
+                registration.control_credential_digest, control_credential_digest
+            ):
+                raise RelayStateCredentialMismatch("progress owner is invalid")
+            claim = self._claims.get(identity)
+            queued = self._queued.get(identity)
+            if claim is None or queued is None:
+                raise RelayStateConflict("progress claim is missing or expired")
+            if claim.generation != generation:
+                raise RelayStateConflict("progress claim generation is stale")
+            if (
+                claim.selected_node_id != node_id
+                or queued.selected_node_id != node_id
+                or queued.client_public_key != client_public_key
+                or queued.request_id != request_id
+                or not hmac.compare_digest(
+                    claim.consumer_identity_digest, consumer_digest
+                )
+            ):
+                raise RelayStateCredentialMismatch("progress owner is invalid")
+            if (
+                claim.lease_expires_at_epoch <= now
+                or claim.request_deadline_epoch <= now
+            ):
+                raise RelayStateConflict("progress claim is missing or expired")
+            existing = self._progress.get(identity)
+            if existing is None:
+                client_count = sum(
+                    record.client_identity_digest == identity[0]
+                    for record in self._progress.values()
+                )
+                if (
+                    len(self._progress) >= self.config.max_progress_records
+                    or client_count >= self.config.max_progress_records_per_client
+                ):
+                    raise RelayStateCapacityExceeded("progress capacity reached")
+            self._progress[identity] = ProgressRecord(
+                identity[0],
+                identity[1],
+                replace(envelope),
+                claim.request_deadline_epoch,
+            )
+            return ProgressReplacementResult(
+                "replaced" if existing is not None else "accepted"
+            )
+
     def retrieve_encrypted_response(
         self,
         client_public_key: str,
@@ -1702,10 +1861,25 @@ class InMemoryRelayStateStore:
             self._reap_locked(now)
             terminal = self._terminals.get(identity)
             if terminal is None:
-                # Retrieval is credential-gated even when no record exists.  A
-                # single failure prevents routing metadata from becoming an
-                # identity oracle and keeps cross-identity credentials safe.
-                return ResponseRetrievalResult("invalid_retrieval_credential")
+                queued = self._queued.get(identity)
+                expected = self._queued_token_digests.get(identity)
+                if (
+                    queued is None
+                    or expected is None
+                    or not hmac.compare_digest(
+                        self._safe_retrieval_credential_digest(retrieval_credential),
+                        expected,
+                    )
+                ):
+                    return ResponseRetrievalResult("invalid_retrieval_credential")
+                progress = self._progress.pop(identity, None)
+                return ResponseRetrievalResult(
+                    "pending",
+                    request_deadline_epoch=queued.request_deadline_epoch,
+                    encrypted_progress=(
+                        replace(progress.envelope) if progress is not None else None
+                    ),
+                )
             if not hmac.compare_digest(
                 self._safe_retrieval_credential_digest(retrieval_credential),
                 terminal.retrieval_credential_digest,
@@ -1759,6 +1933,15 @@ class InMemoryRelayStateStore:
             return tuple(
                 replace(record, envelope=replace(record.envelope))
                 for record in self._responses.values()
+            )
+
+    def progress_records(self) -> tuple[ProgressRecord, ...]:
+        """Return immutable defensive records for backend contract inspection."""
+        with self._lock:
+            self._reap_locked(self._now())
+            return tuple(
+                replace(record, envelope=replace(record.envelope))
+                for record in self._progress.values()
             )
 
     def cancel_or_expire_request(
@@ -1913,6 +2096,7 @@ class InMemoryRelayStateStore:
             self._remove_queued_identity_locked(identity, queued)
         self._cancellation_token_digests.pop(identity, None)
         self._queued_token_digests.pop(identity, None)
+        self._progress.pop(identity, None)
         self._deferred_deadline_identities.discard(identity)
         self._discard_node_work_identity_locked(record.selected_node_id, identity)
         return TerminalTransitionResult(status, reason, True)
@@ -2006,7 +2190,9 @@ class InMemoryRelayStateStore:
                 owner_key not in owner_fences
                 and fence_count >= self.config.max_removed_owner_fences
             ):
-                raise RelayStateCapacityExceeded("removed-owner fencing capacity reached")
+                raise RelayStateCapacityExceeded(
+                    "removed-owner fencing capacity reached"
+                )
             if (
                 node_digest not in self._node_tombstones
                 and len(self._node_tombstones) >= self.config.max_node_tombstones
@@ -2033,9 +2219,7 @@ class InMemoryRelayStateStore:
             self._pending_node_transitions[node_id] = pending
             fence_expiry = now + self.config.terminal_retention_seconds
             self._former_node_authorities.setdefault(node_digest, {})[owner_key] = (
-                _FormerNodeAuthority(
-                    owner_key, cause, status, now, fence_expiry
-                )
+                _FormerNodeAuthority(owner_key, cause, status, now, fence_expiry)
             )
             self._node_tombstones[node_digest] = NodeTombstoneRecord(
                 node_digest,
@@ -2233,9 +2417,7 @@ class InMemoryRelayStateStore:
             transition.node_identity_digest: transition.control_credential_digest
             for transition in self._pending_node_transitions.values()
         }
-        for node_digest, authorities in tuple(
-            self._former_node_authorities.items()
-        ):
+        for node_digest, authorities in tuple(self._former_node_authorities.items()):
             pending_owner_digest = pending_authorities.get(node_digest)
             for owner_digest, authority in tuple(authorities.items()):
                 reserved_by_pending = (
@@ -2263,6 +2445,7 @@ class InMemoryRelayStateStore:
         self._queued.pop(identity, None)
         self._queued_token_digests.pop(identity, None)
         self._cancellation_token_digests.pop(identity, None)
+        self._progress.pop(identity, None)
         queue = self._node_queues.get(queued.selected_node_id, [])
         remaining = [item for item in queue if item != queued]
         if remaining:
@@ -2294,6 +2477,7 @@ class InMemoryRelayStateStore:
             self._queued_token_digests.pop(identity, None)
             self._cancellation_token_digests.pop(identity, None)
             self._claims.pop(identity, None)
+            self._progress.pop(identity, None)
             self._discard_node_work_identity_locked(node_id, identity)
 
     def _active_fairness_fingerprints_locked(self) -> set[str]:
@@ -2440,6 +2624,21 @@ class InMemoryRelayStateStore:
 
     @staticmethod
     def _serialized_response_envelope(envelope: EncryptedResponseEnvelope) -> bytes:
+        return json.dumps(
+            {
+                "protocol": envelope.protocol,
+                "version": envelope.version,
+                "ciphertext": envelope.ciphertext,
+                "cipherkey": envelope.cipherkey,
+                "iv": envelope.iv,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+
+    @staticmethod
+    def _serialized_progress_envelope(envelope: EncryptedProgressEnvelope) -> bytes:
         return json.dumps(
             {
                 "protocol": envelope.protocol,

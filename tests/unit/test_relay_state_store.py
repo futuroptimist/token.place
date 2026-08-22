@@ -228,6 +228,97 @@ def test_progress_replaces_latest_and_pending_retrieval_is_one_shot(
     )
 
 
+def test_pending_progress_retrieval_rejects_invalid_credentials_without_consumption(
+    store_factory, capabilities
+):
+    store, _ = registered_store(
+        store_factory, replace(capabilities, max_concurrency=3)
+    )
+    identities = (
+        ("client-key", "request-a"),
+        ("client-key", "request-b"),
+        ("other-client-key", "request-c"),
+    )
+    selections = {}
+    claims = {}
+    envelopes = {}
+
+    for index, (client_public_key, request_id) in enumerate(identities):
+        selection = reserve(
+            store,
+            request_id,
+            client_public_key=client_public_key,
+        )
+        enqueue(
+            store,
+            selection,
+            request_id,
+            client_public_key=client_public_key,
+        )
+        claim = store.claim_queued_request("node-a", digest("owner"), "worker-a")
+        progress = progress_envelope(f"ciphertext-{index}")
+        assert (
+            replace_progress(
+                store,
+                claim,
+                client_public_key=client_public_key,
+                envelope=progress,
+            ).state
+            == "accepted"
+        )
+        selections[(client_public_key, request_id)] = selection
+        claims[(client_public_key, request_id)] = claim
+        envelopes[(client_public_key, request_id)] = progress
+
+    target = identities[0]
+    target_credential = selections[target].reservation_token
+    invalid_credentials = (
+        None,
+        "",
+        "not-hex",
+        "f" * 63,
+        b"f" * 64,
+        "0" * 64,
+        selections[identities[1]].reservation_token,
+        selections[identities[2]].reservation_token,
+    )
+    expected_records = store.progress_records()
+
+    for credential in invalid_credentials:
+        result = store.retrieve_encrypted_response(*target, credential)
+        assert result == ResponseRetrievalResult("invalid_retrieval_credential")
+        assert result.request_deadline_epoch is None
+        assert result.progress is None
+        assert result.envelope is None
+        assert result.acknowledgement_token is None
+        assert result.replay_expires_at_epoch is None
+        assert store.progress_records() == expected_records
+
+    target_result = store.retrieve_encrypted_response(*target, target_credential)
+    assert target_result == ResponseRetrievalResult(
+        "pending",
+        request_deadline_epoch=claims[target].request_deadline_epoch,
+        progress=envelopes[target],
+    )
+    assert store.progress_records() == expected_records[1:]
+    assert store.retrieve_encrypted_response(
+        *target, target_credential
+    ) == ResponseRetrievalResult(
+        "pending", request_deadline_epoch=claims[target].request_deadline_epoch
+    )
+    assert store.progress_records() == expected_records[1:]
+
+    for identity in identities[1:]:
+        assert store.retrieve_encrypted_response(
+            *identity, selections[identity].reservation_token
+        ) == ResponseRetrievalResult(
+            "pending",
+            request_deadline_epoch=claims[identity].request_deadline_epoch,
+            progress=envelopes[identity],
+        )
+    assert store.progress_records() == ()
+
+
 def test_global_progress_capacity_rejects_without_eviction_and_is_reclaimed(
     store_factory, capabilities
 ):

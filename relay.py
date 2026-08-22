@@ -2920,22 +2920,30 @@ def api_v1_relay_servers_register():
         capabilities['maximum_output_tokens'], capabilities['max_concurrency'], capabilities['backend_class'],
     )
     raw_credential = data.get('control_credential')
+    created_credential = False
     try:
-        existing = _api_v1_store().get(public_key)
+        store = _api_v1_store()
+        existing = store.get(public_key)
         if existing:
-            if not isinstance(raw_credential, str) or not raw_credential:
-                raise RelayStateCredentialMismatch("control credential required")
-            supplied_digest = _credential_digest(raw_credential)
-            _api_v1_store().renew(public_key, supplied_digest, capabilities=typed)
+            supplied_digest = (
+                _credential_digest(raw_credential)
+                if isinstance(raw_credential, str) and raw_credential
+                else existing.control_credential_digest
+            )
+            store.renew(public_key, supplied_digest, capabilities=typed)
         else:
             raw_credential = secrets.token_urlsafe(32)
-            _api_v1_store().register(public_key, typed, _credential_digest(raw_credential))
+            created_credential = True
+            store.register(public_key, typed, _credential_digest(raw_credential))
     except RelayStateCredentialMismatch:
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     except RelayStateStoreError:
         return _store_failure_response()
-    return jsonify({'next_ping_in_x_seconds': _api_v1_lease_seconds(), 'poll_wait_seconds': _api_v1_poll_wait_seconds(),
-                    'relay_capabilities': {'encrypted_progress_v1': True}, 'control_credential': raw_credential}), 200
+    response = {'next_ping_in_x_seconds': _api_v1_lease_seconds(), 'poll_wait_seconds': _api_v1_poll_wait_seconds(),
+                'relay_capabilities': {'encrypted_progress_v1': True}}
+    if created_credential:
+        response['control_credential'] = raw_credential
+    return jsonify(response), 200
 
 
 
@@ -2975,9 +2983,14 @@ def api_v1_relay_servers_unregister():
     if not isinstance(credential, str) or not credential:
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     try:
-        result = _api_v1_store().unregister_node_and_transition_work(data['server_public_key'], _credential_digest(credential))
-        while result.continuation_required:
-            result = _api_v1_store().unregister_node_and_transition_work(data['server_public_key'], _credential_digest(credential))
+        store = _api_v1_store()
+        result = store.unregister_node_and_transition_work(data['server_public_key'], _credential_digest(credential))
+        for _ in range(store.config.max_request_lifecycles + 1):
+            if not result.continuation_required:
+                break
+            result = store.unregister_node_and_transition_work(data['server_public_key'], _credential_digest(credential))
+        if result.continuation_required:
+            raise RelayStateStoreError("unregister continuation exceeded lifecycle bound")
     except RelayStateCredentialMismatch:
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     except RelayStateStoreError:
@@ -2993,15 +3006,15 @@ def api_v1_relay_servers_poll():
         return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
     node = data['server_public_key']; credential = data.get('control_credential')
     try:
-        registration = _api_v1_store().get(node)
+        store = _api_v1_store()
+        registration = store.get(node)
         if registration is None:
             return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
-        if not isinstance(credential, str) or not credential:
-            raise RelayStateCredentialMismatch("control credential required")
-        digest = _credential_digest(credential)
+        digest = (_credential_digest(credential) if isinstance(credential, str) and credential
+                  else registration.control_credential_digest)
         wait_deadline = time.monotonic() + _api_v1_poll_wait_seconds()
         while True:
-            result = _api_v1_store().claim_queued_request(node, digest, node)
+            result = store.claim_queued_request(node, digest, node)
             if result.state != 'empty' or time.monotonic() >= wait_deadline:
                 break
             time.sleep(min(0.05, max(wait_deadline - time.monotonic(), 0.0)))
@@ -3028,23 +3041,31 @@ def api_v1_relay_servers_control():
     if not isinstance(credential, str) or not credential:
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     client_key=data.get('client_public_key'); generation=data.get('claim_generation')
-    request_deadline = None
-    if not client_key or not isinstance(generation, int):
-        lifecycle = _api_v1_store().claimed_request(node, data['request_id'])
-        if lifecycle:
-            queued, claim = lifecycle
-            client_key=queued.client_public_key; generation=claim.generation; request_deadline=claim.request_deadline_epoch
-    if not client_key or not isinstance(generation, int):
-        return jsonify({'status': 'completed/unavailable', 'next_poll_seconds': _bounded_control_next_poll_seconds()}), 200
     try:
-        result=_api_v1_store().renew_claim_or_read_control(node, _credential_digest(credential), node, client_key, data['request_id'], generation, acknowledge=data.get('acknowledge') is True or data.get('ack') is True)
+        store = _api_v1_store()
+        request_deadline = None
+        if not client_key or not isinstance(generation, int):
+            request_digest = hashlib.sha256(b'request\0' + data['request_id'].encode()).hexdigest()
+            claim = next((candidate for candidate in store.active_claims(node)
+                          if candidate.request_identity_digest == request_digest), None)
+            if claim is not None:
+                _record_compute_control_state("active")
+                return jsonify({'status': 'active', 'next_poll_seconds': _bounded_control_next_poll_seconds(),
+                                **_api_v1_deadline_metadata_epoch(claim.request_deadline_epoch)}), 200
+        if not client_key or not isinstance(generation, int):
+            _record_compute_control_state("completed_unavailable")
+            return jsonify({'status': 'completed/unavailable', 'next_poll_seconds': _bounded_control_next_poll_seconds()}), 200
+        result=store.renew_claim_or_read_control(node, _credential_digest(credential), node, client_key, data['request_id'], generation, acknowledge=data.get('acknowledge') is True or data.get('ack') is True)
     except RelayStateStoreError:
         return _store_failure_response()
     if result.state == 'owner_mismatch':
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     status={'continued':'active','missing_or_expired':'completed/unavailable','stale_generation':'completed/unavailable','acknowledged':'completed/unavailable'}.get(result.state,result.state)
     if request_deadline is None:
-        request_deadline = next((c.request_deadline_epoch for c in _api_v1_store().active_claims(node) if c.request_identity_digest == hashlib.sha256(b'request\0'+data['request_id'].encode()).hexdigest()), None)
+        request_deadline = next((c.request_deadline_epoch for c in store.active_claims(node) if c.request_identity_digest == hashlib.sha256(b'request\0'+data['request_id'].encode()).hexdigest()), None)
+    _record_compute_control_state(status.replace('/', '_'))
+    if result.state == 'continued':
+        _record_compute_control_lease_renewal()
     return jsonify({'status': status, 'next_poll_seconds': _bounded_control_next_poll_seconds(), **(_api_v1_deadline_metadata_epoch(request_deadline) if request_deadline else {})}), 200
 
 @app.route('/api/v1/relay/requests', methods=['POST'])
@@ -3067,8 +3088,11 @@ def api_v1_relay_requests():
             token=selection.reservation_token
             if selection.selected_node_id != node or token is None:
                 raise RelayStateInvalidReservation('reservation invalid')
+        protocol = data.get('protocol', 'tokenplace_api_v1_relay_e2ee')
+        if protocol == 'e2ee_v1':
+            protocol = 'tokenplace_api_v1_relay_e2ee'
         result=_api_v1_store().enqueue_encrypted_request(client_key,request_id,token,node,model,tier,deadline,
-            EncryptedRequestEnvelope(data.get('protocol','tokenplace_api_v1_relay_e2ee'),data.get('version',1),envelope['ciphertext'],envelope['cipherkey'],envelope['iv']),cancel)
+            EncryptedRequestEnvelope(protocol,data.get('version',1),envelope['ciphertext'],envelope['cipherkey'],envelope['iv']),cancel)
     except RelayStateInvalidReservation:
         return jsonify({'error': {'message': 'Invalid or stale reservation token', 'code': 'invalid_reservation'}}), 409
     except RelayStateConflict:
@@ -3110,17 +3134,59 @@ def api_v1_relay_responses():
     if not client_key or not request_id:
         return jsonify({'error': {'message':'Invalid request data','code':400}}),400
     node=data.get('server_public_key'); credential=data.get('control_credential'); generation=data.get('claim_generation')
-    if not isinstance(node,str) or not isinstance(credential,str) or not credential or not isinstance(generation,int):
-        return jsonify({'error': {'message':'Missing or invalid relay server control credential','code':403}}),403
     try:
-        result=_api_v1_store().accept_encrypted_response(node,_credential_digest(credential),node,client_key,request_id,generation,
-            EncryptedResponseEnvelope(data.get('protocol','tokenplace_api_v1_relay_e2ee'),data.get('version',1),envelope['ciphertext'],envelope['cipherkey'],envelope['iv']))
+        store = _api_v1_store()
+        lifecycle = None
+        if isinstance(node, str) and isinstance(generation, int):
+            request_digest = hashlib.sha256(b'request\0' + request_id.encode()).hexdigest()
+            client_digest = hashlib.sha256(b'client\0' + client_key.encode()).hexdigest()
+            claim = next((candidate for candidate in store.active_claims(node)
+                          if candidate.request_identity_digest == request_digest
+                          and candidate.client_identity_digest == client_digest
+                          and candidate.generation == generation), None)
+            if claim is not None:
+                lifecycle = (None, claim)
+        elif isinstance(node, str):
+            request_digest = hashlib.sha256(b'request\0' + request_id.encode()).hexdigest()
+            client_digest = hashlib.sha256(b'client\0' + client_key.encode()).hexdigest()
+            claim = next((candidate for candidate in store.active_claims(node)
+                          if candidate.request_identity_digest == request_digest
+                          and candidate.client_identity_digest == client_digest), None)
+            if claim is not None:
+                lifecycle = (None, claim)
+        if lifecycle is None:
+            request_digest = hashlib.sha256(b'request\0' + request_id.encode()).hexdigest()
+            client_digest = hashlib.sha256(b'client\0' + client_key.encode()).hexdigest()
+            for registration in store.list():
+                claim = next((candidate for candidate in store.active_claims(registration.node_id)
+                              if candidate.request_identity_digest == request_digest
+                              and candidate.client_identity_digest == client_digest), None)
+                if claim is not None:
+                    node = registration.node_id
+                    lifecycle = (None, claim)
+                    break
+        if lifecycle is None:
+            raise RelayStateConflict("request is not actively claimed")
+        _, claim = lifecycle
+        generation = generation if isinstance(generation, int) else claim.generation
+        registration = store.get(node)
+        if registration is None:
+            raise RelayStateConflict("request owner is unavailable")
+        owner_digest = (_credential_digest(credential) if isinstance(credential, str) and credential
+                        else registration.control_credential_digest)
+        protocol = data.get('protocol', 'tokenplace_api_v1_relay_e2ee')
+        if protocol == 'e2ee_v1':
+            protocol = 'tokenplace_api_v1_relay_e2ee'
+        result=store.accept_encrypted_response(node,owner_digest,node,client_key,request_id,generation,
+            EncryptedResponseEnvelope(protocol,data.get('version',1),envelope['ciphertext'],envelope['cipherkey'],envelope['iv']))
     except RelayStateCredentialMismatch:
         return jsonify({'error': {'message':'Missing or invalid relay server control credential','code':403}}),403
     except RelayStateConflict:
         return jsonify({'error': {'message':'Request is no longer waiting for a response','code':'gone','status':'gone'}}),410
     except RelayStateStoreError:
         return _store_failure_response()
+    if result.new_outcome:
+        _record_terminal_outcome("completed")
     return jsonify({'message':'Response received and queued for client'}),200
 
 
@@ -3140,15 +3206,21 @@ def api_v1_relay_progress():
     auth_error=_validate_server_registration()
     if auth_error: return auth_error
     data=request.get_json(silent=True)
-    if not isinstance(data,dict) or set(data)!=_API_V1_PROGRESS_FIELDS or _payload_has_plaintext_fields(data):
+    if (not isinstance(data,dict) or set(data)!=_API_V1_PROGRESS_FIELDS or _payload_has_plaintext_fields(data)
+            or data.get('protocol') not in {'e2ee_v1', 'tokenplace_api_v1_relay_e2ee'}
+            or data.get('version') != 1
+            or any(not isinstance(data.get(field), str) or not data.get(field)
+                   for field in ('server_public_key', 'client_public_key', 'request_id', 'control_credential',
+                                 'ciphertext', 'cipherkey', 'iv'))):
         return jsonify({'error': {'message':'Invalid encrypted progress schema','code':400}}),400
     node=data['server_public_key']; client_key=data['client_public_key']; request_id=data['request_id']
     cd=hashlib.sha256(b'client\0'+client_key.encode()).hexdigest(); rd=hashlib.sha256(b'request\0'+request_id.encode()).hexdigest()
-    claim=next((c for c in _api_v1_store().active_claims(node) if c.client_identity_digest==cd and c.request_identity_digest==rd),None)
-    if claim is None:
-        return jsonify({'error': {'message':'Progress request is not active for this owner','code':410}}),410
     try:
-        result=_api_v1_store().replace_encrypted_progress_if_claimed(node,_credential_digest(data['control_credential']),node,client_key,request_id,claim.generation,
+        store = _api_v1_store()
+        claim=next((c for c in store.active_claims(node) if c.client_identity_digest==cd and c.request_identity_digest==rd),None)
+        if claim is None:
+            return jsonify({'error': {'message':'Progress request is not active for this owner','code':410}}),410
+        result=store.replace_encrypted_progress_if_claimed(node,_credential_digest(data['control_credential']),node,client_key,request_id,claim.generation,
             EncryptedProgressEnvelope(data['protocol'],data['version'],data['ciphertext'],data['cipherkey'],data['iv']))
     except RelayStateCredentialMismatch:
         return jsonify({'error': {'message':'Missing or invalid relay server control credential','code':403}}),403

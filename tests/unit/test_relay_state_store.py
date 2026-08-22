@@ -228,6 +228,168 @@ def test_progress_replaces_latest_and_pending_retrieval_is_one_shot(
     )
 
 
+def test_global_progress_capacity_rejects_without_eviction_and_is_reclaimed(
+    store_factory, capabilities
+):
+    store, _ = registered_store(
+        store_factory,
+        capabilities,
+        max_progress_records=1,
+        max_progress_records_per_client=2,
+    )
+    first_selection = reserve(store, request_id="request-a")
+    enqueue(store, first_selection, request_id="request-a")
+    first_claim = store.claim_queued_request(
+        "node-a", digest("owner"), "worker-a"
+    )
+    second_selection = reserve(
+        store, request_id="request-b", client_public_key="client-key-b"
+    )
+    enqueue(
+        store,
+        second_selection,
+        request_id="request-b",
+        client_public_key="client-key-b",
+    )
+    second_claim = store.claim_queued_request(
+        "node-a", digest("owner"), "worker-b"
+    )
+
+    first_envelope = progress_envelope("first-progress")
+    assert (
+        replace_progress(store, first_claim, envelope=first_envelope).state
+        == "accepted"
+    )
+    before_failure = store.progress_records()
+    with pytest.raises(RelayStateCapacityExceeded, match="progress capacity reached"):
+        replace_progress(
+            store,
+            second_claim,
+            consumer_identity="worker-b",
+            client_public_key="client-key-b",
+            envelope=progress_envelope("rejected-progress"),
+        )
+    assert store.progress_records() == before_failure
+
+    latest_envelope = EncryptedProgressEnvelope(
+        protocol="tokenplace_api_v1_relay_e2ee",
+        version=1,
+        ciphertext="latest-progress",
+        cipherkey="latest-key",
+        iv="latest-iv",
+    )
+    assert (
+        replace_progress(store, first_claim, envelope=latest_envelope).state
+        == "replaced"
+    )
+    assert len(store.progress_records()) == 1
+    assert store.progress_records()[0].envelope == latest_envelope
+
+    pending = store.retrieve_encrypted_response(
+        "client-key", "request-a", first_selection.reservation_token
+    )
+    assert pending.progress == latest_envelope
+    assert store.progress_records() == ()
+    assert (
+        replace_progress(
+            store,
+            second_claim,
+            consumer_identity="worker-b",
+            client_public_key="client-key-b",
+            envelope=progress_envelope("accepted-after-reclaim"),
+        ).state
+        == "accepted"
+    )
+
+
+def test_per_client_progress_capacity_rejects_without_eviction_and_is_reclaimed(
+    store_factory, capabilities
+):
+    store, _ = registered_store(
+        store_factory,
+        replace(capabilities, max_concurrency=3),
+        max_progress_records=2,
+        max_progress_records_per_client=1,
+    )
+    selections = {}
+    claims = {}
+    for request_id, client_public_key, consumer in (
+        ("request-a", "client-key", "worker-a"),
+        ("request-b", "client-key", "worker-b"),
+        ("request-c", "client-key-c", "worker-c"),
+    ):
+        selections[request_id] = reserve(
+            store, request_id=request_id, client_public_key=client_public_key
+        )
+        enqueue(
+            store,
+            selections[request_id],
+            request_id=request_id,
+            client_public_key=client_public_key,
+        )
+        claims[request_id] = store.claim_queued_request(
+            "node-a", digest("owner"), consumer
+        )
+
+    first_envelope = progress_envelope("first-client-progress")
+    assert (
+        replace_progress(
+            store, claims["request-a"], envelope=first_envelope
+        ).state
+        == "accepted"
+    )
+    before_failure = store.progress_records()
+    with pytest.raises(RelayStateCapacityExceeded, match="progress capacity reached"):
+        replace_progress(
+            store,
+            claims["request-b"],
+            consumer_identity="worker-b",
+            envelope=progress_envelope("rejected-same-client-progress"),
+        )
+    assert store.progress_records() == before_failure
+
+    assert (
+        replace_progress(
+            store,
+            claims["request-c"],
+            consumer_identity="worker-c",
+            client_public_key="client-key-c",
+            envelope=progress_envelope("different-client-progress"),
+        ).state
+        == "accepted"
+    )
+    latest_envelope = EncryptedProgressEnvelope(
+        protocol="tokenplace_api_v1_relay_e2ee",
+        version=1,
+        ciphertext="latest-client-progress",
+        cipherkey="latest-client-key",
+        iv="latest-client-iv",
+    )
+    assert (
+        replace_progress(store, claims["request-a"], envelope=latest_envelope).state
+        == "replaced"
+    )
+    records = store.progress_records()
+    assert len(records) == 2
+    assert latest_envelope in tuple(record.envelope for record in records)
+
+    pending = store.retrieve_encrypted_response(
+        "client-key", "request-a", selections["request-a"].reservation_token
+    )
+    assert pending.progress == latest_envelope
+    assert len(store.progress_records()) == 1
+    assert (
+        replace_progress(
+            store,
+            claims["request-b"],
+            consumer_identity="worker-b",
+            envelope=progress_envelope("accepted-after-client-reclaim"),
+        ).state
+        == "accepted"
+    )
+    assert len(store.progress_records()) == 2
+
+
 @pytest.mark.parametrize(
     "override",
     [

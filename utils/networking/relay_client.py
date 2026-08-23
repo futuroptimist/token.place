@@ -2131,6 +2131,9 @@ class RelayClient:
             'server_public_key': self.crypto_manager.public_key_b64,
             'capabilities': self._api_v1_compute_node_capabilities(),
         }
+        control_credential = self._api_v1_control_credential_for_relay(target_url)
+        if control_credential:
+            payload['control_credential'] = control_credential
         request_kwargs: Dict[str, Any] = {'json': payload, 'timeout': self._request_timeout}
         headers = self._auth_headers()
         if headers:
@@ -2386,11 +2389,15 @@ class RelayClient:
                         self._api_v1_public_key_fingerprint(current_public_key),
                     )
 
+                poll_payload = {
+                    'server_public_key': self.crypto_manager.public_key_b64,
+                    'capabilities': self._api_v1_compute_node_capabilities(),
+                }
+                control_credential = self._api_v1_control_credential_for_relay(candidate_url)
+                if control_credential:
+                    poll_payload['control_credential'] = control_credential
                 request_kwargs: Dict[str, Any] = {
-                    'json': {
-                        'server_public_key': self.crypto_manager.public_key_b64,
-                        'capabilities': self._api_v1_compute_node_capabilities(),
-                    },
+                    'json': poll_payload,
                     'timeout': self._api_v1_poll_timeout_seconds(poll_wait),
                 }
                 log_info(

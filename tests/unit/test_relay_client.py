@@ -7883,6 +7883,48 @@ def test_register_api_v1_compute_node_preserves_and_rotates_control_credential(m
     assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'first-secret'
     client.register_api_v1_compute_node()
     assert client._api_v1_control_credential_for_relay('http://localhost:5000') == 'rotated-secret'
+    assert [call.kwargs['json'].get('control_credential') for call in mock_post.call_args_list] == [
+        None,
+        'first-secret',
+        'first-secret',
+    ]
+
+
+@patch('utils.networking.relay_client.requests.post')
+def test_poll_api_v1_encrypted_work_sends_only_candidate_relay_credential(mock_post, caplog):
+    client = _standalone_relay_client()
+    primary = 'https://relay-a.example'
+    backup = 'https://relay-b.example'
+    client._relay_urls = (primary, backup)
+    client._api_v1_registered_relays.update((primary, backup))
+    client._api_v1_last_heartbeat_at.update({primary: 100.0, backup: 100.0})
+    client._api_v1_relay_wait_hints = {
+        primary: {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 0},
+        backup: {'next_ping_in_x_seconds': 30, 'poll_wait_seconds': 0},
+    }
+    client._store_api_v1_control_credential(primary, 'primary-owner-secret')
+    client._store_api_v1_control_credential(backup, 'backup-owner-secret')
+    first = MagicMock(status_code=503)
+    first.json.return_value = {'error': {'code': 'state_backend_unavailable'}}
+    second = MagicMock(status_code=200)
+    second.json.return_value = {'message': 'No requests available'}
+    mock_post.side_effect = [first, second]
+
+    with patch.object(relay_client_module.time, 'monotonic', return_value=100.0):
+        result = client.poll_api_v1_encrypted_work()
+
+    assert result['message'] == 'No requests available'
+    assert [call.kwargs['json']['control_credential'] for call in mock_post.call_args_list] == [
+        'primary-owner-secret',
+        'backup-owner-secret',
+    ]
+    assert [call.args[0] for call in mock_post.call_args_list] == [
+        f'{primary}/api/v1/relay/servers/poll',
+        f'{backup}/api/v1/relay/servers/poll',
+    ]
+    for credential in ('primary-owner-secret', 'backup-owner-secret'):
+        assert credential not in caplog.text
+        assert credential not in json.dumps(result, sort_keys=True)
 
 
 @patch('utils.networking.relay_client.requests.post')

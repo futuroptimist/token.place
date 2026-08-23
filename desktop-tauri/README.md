@@ -302,6 +302,25 @@ It prints:
 
 ### Regression and smoke tests
 
+The installed executable exposes a GUI-independent CPU admission boundary. It must be invoked
+from an installed package (development/source-tree Python is rejected), for example on Windows:
+
+```powershell
+& "$env:LOCALAPPDATA\token.place desktop\token-place-desktop-tauri.exe" `
+  --headless-cpu-admission --model "C:\models\Qwen3-8B-Q4_K_M.gguf" `
+  --backend cpu --context-tier 8k-fast `
+  --startup-timeout-seconds 300 --operation-timeout-seconds 600
+```
+
+The command runs before Tauri, WebView2, plugins, or window creation and emits exactly one JSON
+result on stdout. Schema version `1` includes `success`, `last_completed_phase`, `failure_code`,
+`packaged_runtime_identity`, `selected_backend`, `warm_load_result`, and
+`authoritative_evidence_result`. Exit code zero requires a real bundled-runtime CPU warm load and
+positive production API-v1 render/tokenize admission evidence. Results never contain model paths,
+fixture text, rendered prompts, tokens, or environment values. The command does not contact or
+register with a relay. Windows installed-package execution is intentionally deferred to the
+follow-up workflow task; this documentation does not claim that hosted-Windows validation passed.
+
 - Shared local desktop parity entry point (packaged resources + API v1 E2EE relay lifecycle):
   ```bash
   python desktop-tauri/scripts/run_desktop_parity_checks.py

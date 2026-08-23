@@ -26,6 +26,59 @@ compute_node_bridge = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(compute_node_bridge)
 
+
+def test_headless_boundary_result_contract_is_privacy_safe():
+    result = compute_node_bridge._headless_result(
+        success=False, phase="warm_load_completed",
+        failure_code="authoritative_evidence_failed", identity=True,
+        warm_load="ready", evidence=False,
+    )
+
+    assert result == {
+        "schema_version": 1,
+        "success": False,
+        "last_completed_phase": "warm_load_completed",
+        "failure_code": "authoritative_evidence_failed",
+        "packaged_runtime_identity": "validated",
+        "selected_backend": "cpu",
+        "warm_load_result": "ready",
+        "authoritative_evidence_result": "failed",
+    }
+    assert not ({"model_path", "prompt", "tokens", "environment"} & result.keys())
+
+
+def test_headless_boundary_rejects_non_cpu_before_runtime(monkeypatch, tmp_path, capsys):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"fixture")
+    args = SimpleNamespace(mode="gpu", model=str(model), context_tier="8k-fast")
+    monkeypatch.setattr(
+        compute_node_bridge, "ensure_desktop_python_dependencies",
+        lambda: pytest.fail("runtime must not start"),
+    )
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["failure_code"] == "invalid_arguments"
+    assert result["warm_load_result"] == "not_started"
+
+
+@pytest.mark.parametrize(
+    ("ready", "diagnostics", "expected"),
+    [
+        (False, {}, "warm_load_failed"),
+        (False, {"api_v1_readiness_result": "failed"}, "authoritative_evidence_failed"),
+        (True, {"api_v1_readiness_result": "passed"}, "authoritative_evidence_failed"),
+        (True, {
+            "api_v1_readiness_result": "passed",
+            "api_v1_readiness_tokenizer_render_bridge_available": True,
+            "api_v1_readiness_prompt_tokens": 7,
+        }, "success"),
+    ],
+)
+def test_headless_boundary_readiness_classification(ready, diagnostics, expected):
+    assert compute_node_bridge._headless_classify_readiness(ready, diagnostics) == expected
+
+
 @pytest.fixture(autouse=True)
 def _default_desktop_runtime_arch(monkeypatch):
     """Keep win32 platform simulations independent from the host CPU architecture."""

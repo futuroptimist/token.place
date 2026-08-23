@@ -3063,11 +3063,126 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
         )
     return payload
 
+
+def _headless_result(*, success: bool, phase: str, failure_code: str,
+                     identity: bool, warm_load: str, evidence: bool) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "success": success,
+        "last_completed_phase": phase,
+        "failure_code": failure_code,
+        "packaged_runtime_identity": "validated" if identity else "failed",
+        "selected_backend": "cpu",
+        "warm_load_result": warm_load,
+        "authoritative_evidence_result": "validated" if evidence else "failed",
+    }
+
+
+def _headless_classify_readiness(ready: bool, diagnostics: Dict[str, Any]) -> str:
+    if ready:
+        prompt_tokens = diagnostics.get("api_v1_readiness_prompt_tokens")
+        if (diagnostics.get("api_v1_readiness_result") == "passed"
+                and diagnostics.get("api_v1_readiness_tokenizer_render_bridge_available") is True
+                and isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool)
+                and prompt_tokens > 0):
+            return "success"
+        return "authoritative_evidence_failed"
+    if diagnostics.get("api_v1_readiness_result") == "failed":
+        return "authoritative_evidence_failed"
+    return "warm_load_failed"
+
+
+def headless_cpu_admission(args: Any) -> int:
+    """Exercise the installed CPU model and API-v1 admission boundary without a relay."""
+    result = _headless_result(success=False, phase="arguments_validated",
+                              failure_code="packaged_runtime_identity_failed",
+                              identity=False, warm_load="not_started", evidence=False)
+    runtime = None
+    identity_values = [os.environ.get(name, "") for name in (
+        "TOKENPLACE_APP_VERSION", "TOKENPLACE_BUILD_ID", "TOKENPLACE_TARGET_TRIPLE",
+        "TOKENPLACE_BUNDLED_RUNTIME_ID", "TOKENPLACE_RUNTIME_ID")]
+    try:
+        if args.mode != "cpu" or not args.model or not os.path.isfile(args.model):
+            result["failure_code"] = "invalid_arguments"
+            return 2
+        if not all(identity_values) or identity_values[-1] != identity_values[-2]:
+            return 3
+        result["packaged_runtime_identity"] = "validated"
+        dependency = ensure_desktop_python_dependencies()
+        if dependency.get("ok") != "true":
+            result["failure_code"] = "packaged_runtime_identity_failed"
+            return 3
+        setup = _ensure_desktop_llama_runtime_for_context("cpu", args.context_tier)
+        if setup.get("selected_backend") != "cpu":
+            result["failure_code"] = "unsupported_backend"
+            return 2
+        from utils.compute_node_runtime import (ComputeNodeRuntime,
+                                                ComputeNodeRuntimeConfig,
+                                                apply_compute_mode)
+        apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
+        args.context_tier = normalize_context_tier(args.context_tier)
+        runtime = ComputeNodeRuntime(ComputeNodeRuntimeConfig(
+            relay_url="http://127.0.0.1:1", relay_port=1,
+            use_configured_relay_fallbacks=False,
+            relay_urls=("http://127.0.0.1:1",)))
+        manager = runtime.model_manager
+        if getattr(manager, "use_mock_llm", False):
+            result["failure_code"] = "mock_runtime_rejected"
+            return 4
+        manager.model_path = os.path.abspath(args.model)
+        manager.parent_model_path_exists = True
+        manager.model_path_was_relative = False
+        apply_context_profile(manager, args.context_tier)
+        apply_compute_mode(manager, "cpu")
+        manager.desktop_runtime_probe = dict(setup)
+        result["last_completed_phase"] = "runtime_identity_validated"
+        ready = runtime.ensure_api_v1_runtime_ready()
+        diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
+        readiness = _headless_classify_readiness(ready, diagnostics)
+        if readiness != "success":
+            if readiness == "authoritative_evidence_failed":
+                result["warm_load_result"] = "ready"
+                result["failure_code"] = "authoritative_evidence_failed"
+                result["last_completed_phase"] = "warm_load_completed"
+                return 6
+            result["failure_code"] = "warm_load_failed"
+            return 5
+        result["warm_load_result"] = "ready"
+        result["last_completed_phase"] = "warm_load_completed"
+        result.update(success=True, last_completed_phase="cleanup_completed",
+                      failure_code="none", authoritative_evidence_result="validated")
+        return 0
+    except Exception:
+        if result["failure_code"] == "packaged_runtime_identity_failed":
+            result["failure_code"] = "bridge_exited_before_startup_event"
+        return 7
+    finally:
+        cleanup_ok = True
+        if runtime is not None:
+            try:
+                runtime.stop(shutdown_deadline=time.monotonic() + 2.0)
+                manager = runtime.model_manager
+                loaded_runtime = getattr(manager, "llm", None)
+                if loaded_runtime is not None:
+                    close_runtime = getattr(manager, "_close_llm_proxy", None)
+                    if not callable(close_runtime) or close_runtime(loaded_runtime) is not True:
+                        raise RuntimeError("headless_runtime_cleanup_failed")
+                    manager.llm = None
+            except Exception:
+                cleanup_ok = False
+        if not cleanup_ok:
+            result.update(success=False, failure_code="cleanup_failed")
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
+        if not cleanup_ok:
+            return 8
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--installed-context-smoke", action="store_true")
     parser.add_argument("--operator-runtime-preflight", action="store_true")
     parser.add_argument("--operator-runtime-preflight-cpu-smoke", action="store_true")
+    parser.add_argument("--headless-cpu-admission", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3081,6 +3196,9 @@ def main() -> int:
     parser.add_argument("--context-tier", default="8k-fast")
     parser.add_argument("--qwen-64k-batch-profile", default="balanced", choices=("safe", "balanced", "experimental"))
     args = parser.parse_args()
+
+    if args.headless_cpu_admission:
+        return headless_cpu_admission(args)
 
     if args.installed_context_smoke:
         print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))

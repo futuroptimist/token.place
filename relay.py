@@ -2925,12 +2925,9 @@ def api_v1_relay_servers_register():
         store = _api_v1_store()
         existing = store.get(public_key)
         if existing:
-            supplied_digest = (
-                _credential_digest(raw_credential)
-                if isinstance(raw_credential, str) and raw_credential
-                else existing.control_credential_digest
-            )
-            store.renew(public_key, supplied_digest, capabilities=typed)
+            if not isinstance(raw_credential, str) or not raw_credential:
+                return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
+            store.renew(public_key, _credential_digest(raw_credential), capabilities=typed)
         else:
             raw_credential = secrets.token_urlsafe(32)
             created_credential = True
@@ -3005,13 +3002,14 @@ def api_v1_relay_servers_poll():
     if not isinstance(data, dict) or not data.get('server_public_key'):
         return jsonify({'error': {'message': 'Invalid request data', 'code': 400}}), 400
     node = data['server_public_key']; credential = data.get('control_credential')
+    if not isinstance(credential, str) or not credential:
+        return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     try:
         store = _api_v1_store()
         registration = store.get(node)
         if registration is None:
             return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
-        digest = (_credential_digest(credential) if isinstance(credential, str) and credential
-                  else registration.control_credential_digest)
+        digest = _credential_digest(credential)
         wait_deadline = time.monotonic() + _api_v1_poll_wait_seconds()
         while True:
             result = store.claim_queued_request(node, digest, node)
@@ -3130,6 +3128,8 @@ def api_v1_relay_responses():
     if not client_key or not request_id:
         return jsonify({'error': {'message':'Invalid request data','code':400}}),400
     node=data.get('server_public_key'); credential=data.get('control_credential'); generation=data.get('claim_generation')
+    if not isinstance(credential, str) or not credential:
+        return jsonify({'error': {'message':'Missing or invalid relay server control credential','code':403}}),403
     try:
         store = _api_v1_store()
         lifecycle = None
@@ -3165,11 +3165,9 @@ def api_v1_relay_responses():
             raise RelayStateConflict("request is not actively claimed")
         _, claim = lifecycle
         generation = generation if isinstance(generation, int) else claim.generation
-        registration = store.get(node)
-        if registration is None:
+        if store.get(node) is None:
             raise RelayStateConflict("request owner is unavailable")
-        owner_digest = (_credential_digest(credential) if isinstance(credential, str) and credential
-                        else registration.control_credential_digest)
+        owner_digest = _credential_digest(credential)
         protocol = data.get('protocol', 'tokenplace_api_v1_relay_e2ee')
         if protocol == 'e2ee_v1':
             protocol = 'tokenplace_api_v1_relay_e2ee'

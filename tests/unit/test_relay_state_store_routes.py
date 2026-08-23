@@ -8,7 +8,7 @@ import relay
 from relay_state_store import RelayStateStoreError
 
 
-def _claim_for_control(client, *, request_id="control-request"):
+def _queue_for_owner(client, *, request_id="control-request"):
     node = "control-node"
     client_key = "control-client"
     registration = client.post("/api/v1/relay/servers/register", json={
@@ -28,13 +28,18 @@ def _claim_for_control(client, *, request_id="control-request"):
         "ciphertext": "sealed-request", "cipherkey": "sealed-key", "iv": "sealed-iv",
     }).status_code == 200
     queued = relay._api_v1_store().queued_requests(node)[0]
+    return node, registration["control_credential"], queued, selection["reservation_token"]
+
+
+def _claim_for_control(client, *, request_id="control-request"):
+    node, credential, queued, reservation_token = _queue_for_owner(
+        client, request_id=request_id
+    )
     poll = client.post("/api/v1/relay/servers/poll", json={
-        "server_public_key": node, "control_credential": registration["control_credential"],
+        "server_public_key": node, "control_credential": credential,
     }).get_json()
     claim = relay._api_v1_store().active_claims(node)[0]
-    return node, registration["control_credential"], poll, (
-        queued, claim, selection["reservation_token"]
-    )
+    return node, credential, poll, (queued, claim, reservation_token)
 
 
 def test_api_v1_encrypted_journey_uses_authoritative_store():
@@ -80,6 +85,82 @@ def test_api_v1_encrypted_journey_uses_authoritative_store():
     assert relay.known_servers == {}
     assert relay.client_inference_requests == {}
     assert relay.client_responses == {}
+
+
+@pytest.mark.parametrize("credential", [None, "", 7, "incorrect-proof"])
+def test_existing_registration_requires_caller_control_credential(credential):
+    relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node = "renew-owner-node"
+    original_capabilities = {
+        "supported_model_ids": ["qwen3-8b-instruct"], "active_context_tier": "8k-fast",
+        "maximum_total_context_tokens": 8192, "default_output_token_reservation": 1024,
+        "maximum_output_tokens": 1024, "max_concurrency": 1,
+    }
+    registration = client.post("/api/v1/relay/servers/register", json={
+        "server_public_key": node, "capabilities": original_capabilities,
+    }).get_json()
+    changed_capabilities = {**original_capabilities, "supported_model_ids": ["different-model"]}
+    payload = {"server_public_key": node, "capabilities": changed_capabilities}
+    if credential is not None:
+        payload["control_credential"] = credential
+
+    rejected = client.post("/api/v1/relay/servers/register", json=payload)
+
+    assert rejected.status_code == 403
+    assert relay._api_v1_store().get(node).capabilities.supported_model_ids == ("qwen3-8b-instruct",)
+    payload["control_credential"] = registration["control_credential"]
+    assert client.post("/api/v1/relay/servers/register", json=payload).status_code == 200
+    assert relay._api_v1_store().get(node).capabilities.supported_model_ids == ("different-model",)
+
+
+@pytest.mark.parametrize("credential", [None, "", 7, "incorrect-proof"])
+def test_poll_requires_caller_control_credential_without_claiming(credential):
+    relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, correct_credential, _, _ = _queue_for_owner(
+        client, request_id="poll-owner-proof"
+    )
+    store = relay._api_v1_store()
+    payload = {"server_public_key": node}
+    if credential is not None:
+        payload["control_credential"] = credential
+
+    rejected = client.post("/api/v1/relay/servers/poll", json=payload)
+
+    assert rejected.status_code == 403
+    assert store.active_claims(node) == ()
+    assert len(store.queued_requests(node)) == 1
+    payload["control_credential"] = correct_credential
+    accepted = client.post("/api/v1/relay/servers/poll", json=payload)
+    assert accepted.status_code == 200
+    assert accepted.get_json()["request_id"] == "poll-owner-proof"
+
+
+@pytest.mark.parametrize("credential", [None, "", 7, "incorrect-proof"])
+def test_response_requires_caller_control_credential_without_completion(credential):
+    relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, correct_credential, poll, _ = _claim_for_control(client, request_id="response-owner-proof")
+    payload = {
+        "server_public_key": node, "claim_generation": poll["claim_generation"],
+        "client_public_key": poll["client_public_key"], "request_id": poll["request_id"],
+        "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+        "ciphertext": "sealed-response", "cipherkey": "sealed-key", "iv": "sealed-iv",
+    }
+    if credential is not None:
+        payload["control_credential"] = credential
+
+    rejected = client.post("/api/v1/relay/responses", json=payload)
+
+    assert rejected.status_code == 403
+    assert len(relay._api_v1_store().active_claims(node)) == 1
+    payload["control_credential"] = correct_credential
+    assert client.post("/api/v1/relay/responses", json=payload).status_code == 200
+    assert relay._api_v1_store().active_claims(node) == ()
 
 
 @pytest.mark.parametrize("retrieval_credential", [None, "invalid-proof"])

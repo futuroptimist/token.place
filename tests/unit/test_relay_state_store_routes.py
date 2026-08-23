@@ -335,3 +335,72 @@ def test_compat_control_bounds_claim_resolution_failure(monkeypatch):
         "error": {"message": "Relay state is temporarily unavailable", "code": "state_backend_unavailable"}
     }
     assert b"sensitive backend detail" not in response.data
+
+
+def test_diagnostics_deduplicates_store_identity_over_legacy_state():
+    relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
+    relay.known_servers.clear()
+    relay.client_inference_requests.clear()
+    client = relay.app.test_client()
+    node, _, _, _ = _queue_for_owner(client, request_id="diagnostic-overlap")
+    relay.known_servers[node] = {
+        "last_ping": None,
+        "last_ping_duration": 99,
+        "capabilities": {"source": "legacy"},
+    }
+    relay.client_inference_requests[node] = [{"legacy": "queue"}] * 4
+
+    response = client.get("/relay/diagnostics")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    matching = [
+        item for item in payload["registered_compute_nodes"]
+        if item["server_public_key"] == node
+    ]
+    assert len(matching) == 1
+    assert matching[0]["queue_depth"] == 1
+    assert matching[0]["in_flight_count"] == 0
+    assert matching[0]["capabilities"]["backend_class"] == "unknown"
+
+
+def test_api_v1_only_diagnostics_never_use_legacy_state():
+    relay._reset_api_v1_relay_state_store()
+    relay.known_servers.clear()
+    relay.known_servers["legacy-api-v1-ghost"] = {
+        relay.API_V1_SERVER_MARKER: True,
+        "last_ping": None,
+    }
+
+    assert relay._live_server_diagnostics(api_v1_only=True) == []
+
+
+@pytest.mark.parametrize("method_name", ["list", "queued_requests", "active_claims"])
+@pytest.mark.parametrize("endpoint", ["/healthz", "/relay/diagnostics"])
+def test_operational_endpoints_bound_store_snapshot_failures(
+    monkeypatch, method_name, endpoint
+):
+    relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
+    relay.known_servers.clear()
+    client = relay.app.test_client()
+    if method_name != "list":
+        _queue_for_owner(client, request_id=f"failure-{method_name}")
+    secret = "sensitive-store-failure"
+    monkeypatch.setattr(
+        relay._api_v1_store(),
+        method_name,
+        Mock(side_effect=RelayStateStoreError(secret)),
+    )
+
+    response = client.get(endpoint)
+
+    assert response.status_code == 503
+    assert response.get_json() == {
+        "error": {
+            "message": "Relay state is temporarily unavailable",
+            "code": "state_backend_unavailable",
+        }
+    }
+    assert secret.encode() not in response.data

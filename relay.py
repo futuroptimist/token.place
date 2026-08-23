@@ -768,22 +768,19 @@ def _update_runtime_gauges() -> None:
     oldest_lease_age = 0.0
     in_flight = 0
     oldest_in_flight_age = 0.0
-    try:
-        store = _api_v1_store()
-        registrations = store.list()
-        registered = len(registrations)
-        healthy = sum(record.lease_expires_at_epoch > now_wall for record in registrations)
-        for record in registrations:
-            remaining = max(record.lease_expires_at_epoch - now_wall, 0.0)
-            oldest_lease_age = max(oldest_lease_age, max(_api_v1_lease_seconds() - remaining, 0.0))
-            for claim in store.active_claims(record.node_id):
-                in_flight += 1
-                oldest_in_flight_age = max(oldest_in_flight_age, max(now_wall - (claim.lease_expires_at_epoch - store.config.claim_ttl_seconds), 0.0))
-            for queued in store.queued_requests(record.node_id):
-                queue_depth += 1
-                oldest_queued_age = max(oldest_queued_age, max(now_wall - queued.enqueued_at_epoch, 0.0))
-    except RelayStateStoreError:
-        pass
+    store = _api_v1_store()
+    registrations = store.list()
+    registered = len(registrations)
+    healthy = sum(record.lease_expires_at_epoch > now_wall for record in registrations)
+    for record in registrations:
+        remaining = max(record.lease_expires_at_epoch - now_wall, 0.0)
+        oldest_lease_age = max(oldest_lease_age, max(_api_v1_lease_seconds() - remaining, 0.0))
+        for claim in store.active_claims(record.node_id):
+            in_flight += 1
+            oldest_in_flight_age = max(oldest_in_flight_age, max(now_wall - (claim.lease_expires_at_epoch - store.config.claim_ttl_seconds), 0.0))
+        for queued in store.queued_requests(record.node_id):
+            queue_depth += 1
+            oldest_queued_age = max(oldest_queued_age, max(now_wall - queued.enqueued_at_epoch, 0.0))
     server_snapshots: list[tuple[Any, bool, list[dict[str, Any]]]] = []
     with server_round_robin_lock:
         for payload in known_servers.values():
@@ -1509,28 +1506,61 @@ def _evict_stale_servers() -> list[str]:
     return evicted
 
 
-def _live_server_diagnostics(*, api_v1_only: bool = False) -> list[dict[str, Any]]:
-    diagnostics: list[dict[str, Any]] = []
+def _api_v1_server_diagnostics() -> list[dict[str, Any]]:
+    store = _api_v1_store()
+    now = time.time()
+    diagnostics = []
+    for record in store.list():
+        capabilities = record.capabilities
+        queue_depth = len(store.queued_requests(record.node_id))
+        in_flight = len(store.active_claims(record.node_id))
+        lease_remaining = max(record.lease_expires_at_epoch - now, 0.0)
+        diagnostics.append({
+            "server_public_key": record.node_id,
+            "age_seconds": round(max(_api_v1_lease_seconds() - lease_remaining, 0.0), 3),
+            "next_ping_in_x_seconds": _api_v1_lease_seconds(),
+            "queue_depth": queue_depth,
+            "in_flight_count": in_flight,
+            "max_concurrency": capabilities.max_concurrency,
+            "load_score": queue_depth + in_flight,
+            "capabilities": {
+                "supported_model_ids": list(capabilities.supported_model_ids),
+                "active_context_tier": capabilities.active_context_tier,
+                "maximum_total_context_tokens": capabilities.maximum_total_context_tokens,
+                "default_output_token_reservation": capabilities.default_output_token_reservation,
+                "maximum_output_tokens": capabilities.maximum_output_tokens,
+                "max_concurrency": capabilities.max_concurrency,
+                "backend_class": capabilities.backend_class,
+            },
+        })
+    return diagnostics
+
+
+def _live_server_diagnostics(
+    *,
+    api_v1_only: bool = False,
+    api_v1_diagnostics: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    if api_v1_diagnostics is None:
+        api_v1_diagnostics = _api_v1_server_diagnostics()
+    diagnostics_by_key: dict[str, dict[str, Any]] = {}
     if not api_v1_only:
         for server_public_key, payload in list(known_servers.items()):
-            diagnostics.append({"server_public_key": server_public_key, "age_seconds": round(_server_ping_age_seconds(payload.get("last_ping")), 3),
-                                "next_ping_in_x_seconds": payload.get("last_ping_duration"), "queue_depth": len(client_inference_requests.get(server_public_key, [])),
-                                "in_flight_count": 0, "max_concurrency": None, "load_score": len(client_inference_requests.get(server_public_key, [])),
-                                "capabilities": payload.get("capabilities")})
-    try:
-        store = _api_v1_store()
-        now = time.time()
-        for record in store.list():
-            caps=record.capabilities; queue_depth=len(store.queued_requests(record.node_id)); in_flight=len(store.active_claims(record.node_id))
-            lease_remaining = max(record.lease_expires_at_epoch - now, 0.0)
-            diagnostics.append({"server_public_key":record.node_id,"age_seconds":round(max(_api_v1_lease_seconds()-lease_remaining,0.0),3),
-                                "next_ping_in_x_seconds":_api_v1_lease_seconds(),"queue_depth":queue_depth,"in_flight_count":in_flight,
-                                "max_concurrency":caps.max_concurrency,"load_score":queue_depth+in_flight,"capabilities":{"supported_model_ids":list(caps.supported_model_ids),
-                                "active_context_tier":caps.active_context_tier,"maximum_total_context_tokens":caps.maximum_total_context_tokens,
-                                "default_output_token_reservation":caps.default_output_token_reservation,"maximum_output_tokens":caps.maximum_output_tokens,
-                                "max_concurrency":caps.max_concurrency,"backend_class":caps.backend_class}})
-    except RelayStateStoreError:
-        pass
+            queue_depth = len(client_inference_requests.get(server_public_key, []))
+            diagnostics_by_key[server_public_key] = {
+                "server_public_key": server_public_key,
+                "age_seconds": round(_server_ping_age_seconds(payload.get("last_ping")), 3),
+                "next_ping_in_x_seconds": payload.get("last_ping_duration"),
+                "queue_depth": queue_depth,
+                "in_flight_count": 0,
+                "max_concurrency": None,
+                "load_score": queue_depth,
+                "capabilities": payload.get("capabilities"),
+            }
+    diagnostics_by_key.update(
+        (node["server_public_key"], node) for node in api_v1_diagnostics
+    )
+    diagnostics = list(diagnostics_by_key.values())
     diagnostics.sort(key=lambda node: node["server_public_key"])
     return diagnostics
 
@@ -1784,6 +1814,10 @@ def metrics():
 @app.route("/healthz", methods=["GET"])
 def healthz():
     _evict_stale_servers()
+    try:
+        registered_servers = _live_server_diagnostics()
+    except RelayStateStoreError:
+        return _store_failure_response()
     gpu_host = app.config.get("gpu_host")
     configured_servers = app.config.get("relay_configured_servers", [])
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
@@ -1805,7 +1839,7 @@ def healthz():
         "requiredUpstreamServers": required_upstream_servers,
         "gpuHost": gpu_host,
         "knownServers": len(known_servers),
-        "registeredServers": _live_server_diagnostics(),
+        "registeredServers": registered_servers,
     }
     status["configuredUpstreamServers"] = configured_servers
     if app.config.get("public_base_url"):
@@ -2215,8 +2249,13 @@ def api_v1_relay_servers_next():
 def relay_diagnostics():
     """Live diagnostics for legacy and API v1 relay registered compute nodes."""
     _evict_stale_servers()
-    live_nodes = _live_server_diagnostics()
-    api_v1_live_nodes = _live_server_diagnostics(api_v1_only=True)
+    try:
+        api_v1_live_nodes = _live_server_diagnostics(api_v1_only=True)
+        live_nodes = _live_server_diagnostics(
+            api_v1_diagnostics=api_v1_live_nodes,
+        )
+    except RelayStateStoreError:
+        return _store_failure_response()
     configured_servers = app.config.get("relay_configured_servers", [])
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
     explicit_upstream_config = _has_explicit_relay_upstream_config(configured_servers)

@@ -33,6 +33,7 @@ def relay_client():
     """Provide a clean relay Flask test client."""
 
     app.config["TESTING"] = True
+    relay_module._reset_api_v1_relay_state_store()
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
@@ -78,6 +79,7 @@ def relay_client():
     relay_module.api_v1_control_tombstones.clear()
     api_v1_filtered_round_robin_next_positions.clear()
     relay_module.server_round_robin_next_index = 0
+    relay_module._reset_api_v1_relay_state_store()
     for limiter in app.extensions.get("limiter", set()):
         storage = getattr(getattr(limiter, "limiter", None), "storage", None)
         if storage is None:
@@ -813,6 +815,29 @@ def test_metrics_failure_logs_do_not_expose_raw_exception_values(relay_client, m
     serialized_logs = "\n".join(json.dumps(record, default=str) for record in log_records)
     assert "metrics.gauge_update_failed" in serialized_logs
     assert secret not in serialized_logs
+    assert secret not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize("method_name", ["list", "queued_requests", "active_claims"])
+def test_metrics_bounds_authoritative_store_snapshot_failures(
+    relay_client, monkeypatch, method_name
+) -> None:
+    """Store snapshot failures must not produce legacy-only metrics or leak details."""
+
+    relay_module._reset_api_v1_relay_state_store()
+    if method_name != "list":
+        _register_node(relay_client, server_key=f"metrics-{method_name}")
+    secret = "sensitive-metrics-store-failure"
+
+    def fail(*_args, **_kwargs):
+        raise relay_module.RelayStateStoreError(secret)
+
+    monkeypatch.setattr(relay_module._api_v1_store(), method_name, fail)
+
+    response = relay_client.get("/metrics")
+
+    assert response.status_code == 503
+    assert response.get_data(as_text=True) == "metrics unavailable\n"
     assert secret not in response.get_data(as_text=True)
 
 

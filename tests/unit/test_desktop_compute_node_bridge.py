@@ -73,11 +73,31 @@ def test_headless_boundary_rejects_non_cpu_before_runtime(monkeypatch, tmp_path,
             "api_v1_readiness_result": "passed",
             "api_v1_readiness_tokenizer_render_bridge_available": True,
             "api_v1_readiness_prompt_tokens": 7,
-        }, "success"),
+        }, "authoritative_evidence_failed"),
     ],
 )
 def test_headless_boundary_readiness_classification(ready, diagnostics, expected):
     assert compute_node_bridge._headless_classify_readiness(ready, diagnostics) == expected
+
+
+def test_headless_boundary_requires_exact_authoritative_evidence(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundle-1")
+    diagnostics = {
+        "api_v1_readiness_result": "passed",
+        "api_v1_readiness_tokenizer_render_bridge_available": True,
+        "api_v1_readiness_prompt_tokens": 7,
+    }
+    fixture = {"fixture_sha256": "abc", "target_prefix_utf8_bytes": {"midpoint": 4}}
+    evidence = {
+        "method": "packaged_admission_render_and_tokenize_chat",
+        "runtime_identity": "bundle-1", "fixture_sha256": "abc",
+        "total_prompt_tokens": 7, "target_offsets_tokens": {"midpoint": 3},
+    }
+    assert compute_node_bridge._headless_classify_readiness(
+        True, diagnostics, evidence, fixture) == "success"
+    evidence["runtime_identity"] = "source-tree"
+    assert compute_node_bridge._headless_classify_readiness(
+        True, diagnostics, evidence, fixture) == "authoritative_evidence_failed"
 
 
 def test_headless_warm_load_enforces_startup_timeout():

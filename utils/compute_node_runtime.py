@@ -1,6 +1,7 @@
 """Shared compute-node runtime used by server.py and future desktop bridge code."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -1043,9 +1044,10 @@ class ComputeNodeRuntime:
                 return False
 
             try:
+                readiness_content, _ = authoritative_readiness_fixture()
                 smoke_messages = [
                     {"role": "system", "content": "You are a concise assistant."},
-                    {"role": "user", "content": "Reply with exactly: ok"},
+                    {"role": "user", "content": readiness_content},
                 ]
                 admitted, admission_error, output_budget = (
                     self.relay_client._api_v1_authoritative_context_admission(
@@ -1590,3 +1592,14 @@ class ComputeNodeRuntime:
                 "Relay unregister request raised during shutdown; continuing stop",
                 exc_info=False,
             )
+
+
+def authoritative_readiness_fixture() -> tuple[str, dict[str, Any]]:
+    """Return the bounded, non-secret fixture used to prove production tokenization."""
+
+    content = "Reply with exactly: ok"
+    encoded = content.encode("utf-8")
+    return content, {
+        "fixture_sha256": hashlib.sha256(encoded).hexdigest(),
+        "target_prefix_utf8_bytes": {"midpoint": len(encoded) // 2},
+    }

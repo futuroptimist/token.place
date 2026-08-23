@@ -3078,14 +3078,30 @@ def _headless_result(*, success: bool, phase: str, failure_code: str,
     }
 
 
-def _headless_classify_readiness(ready: bool, diagnostics: Dict[str, Any]) -> str:
+def _headless_classify_readiness(ready: bool, diagnostics: Dict[str, Any],
+                                 evidence: Any = None,
+                                 fixture: Any = None) -> str:
     if ready:
         prompt_tokens = diagnostics.get("api_v1_readiness_prompt_tokens")
         if (diagnostics.get("api_v1_readiness_result") == "passed"
                 and diagnostics.get("api_v1_readiness_tokenizer_render_bridge_available") is True
                 and isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool)
                 and prompt_tokens > 0):
-            return "success"
+            expected_runtime = os.environ.get("TOKENPLACE_BUNDLED_RUNTIME_ID")
+            counts = evidence.get("target_offsets_tokens") if isinstance(evidence, dict) else None
+            evidence_valid = (
+                isinstance(fixture, dict)
+                and isinstance(evidence, dict)
+                and evidence.get("method") == "packaged_admission_render_and_tokenize_chat"
+                and evidence.get("runtime_identity") == expected_runtime
+                and evidence.get("fixture_sha256") == fixture.get("fixture_sha256")
+                and evidence.get("total_prompt_tokens") == prompt_tokens
+                and isinstance(counts, dict) and counts
+                and set(counts) == set(fixture.get("target_prefix_utf8_bytes", {}))
+                and all(isinstance(value, int) and not isinstance(value, bool) and value > 0
+                        for value in counts.values())
+            )
+            return "success" if evidence_valid else "authoritative_evidence_failed"
         return "authoritative_evidence_failed"
     return "warm_load_failed"
 
@@ -3116,6 +3132,7 @@ def headless_cpu_admission(args: Any) -> int:
                               failure_code="packaged_runtime_identity_failed",
                               identity=False, warm_load="not_started", evidence=False)
     runtime = None
+    startup_emitted = False
     identity_values = [os.environ.get(name, "") for name in (
         "TOKENPLACE_APP_VERSION", "TOKENPLACE_BUILD_ID", "TOKENPLACE_TARGET_TRIPLE",
         "TOKENPLACE_BUNDLED_RUNTIME_ID", "TOKENPLACE_RUNTIME_ID")]
@@ -3136,7 +3153,8 @@ def headless_cpu_admission(args: Any) -> int:
             return 2
         from utils.compute_node_runtime import (ComputeNodeRuntime,
                                                 ComputeNodeRuntimeConfig,
-                                                apply_compute_mode)
+                                                apply_compute_mode,
+                                                authoritative_readiness_fixture)
         apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
         args.context_tier = normalize_context_tier(args.context_tier)
         runtime = ComputeNodeRuntime(ComputeNodeRuntimeConfig(
@@ -3154,13 +3172,37 @@ def headless_cpu_admission(args: Any) -> int:
         apply_compute_mode(manager, "cpu")
         manager.desktop_runtime_probe = dict(setup)
         result["last_completed_phase"] = "runtime_identity_validated"
-        warm_load_completed, ready = _headless_warm_load(
-            runtime, args.startup_timeout_seconds)
-        if not warm_load_completed:
-            result["failure_code"] = "startup_timeout"
-            return 5
+        print(json.dumps({"type": "headless_internal", "phase": "startup_ready"},
+                         sort_keys=True, separators=(",", ":")), flush=True)
+        startup_emitted = True
+        _, fixture = authoritative_readiness_fixture()
+        with tempfile.TemporaryDirectory(prefix="tokenplace-headless-") as directory:
+            request_path = os.path.join(directory, "request.json")
+            evidence_path = os.path.join(directory, "evidence.json")
+            with open(request_path, "w", encoding="utf-8") as handle:
+                json.dump(fixture, handle, sort_keys=True, separators=(",", ":"))
+            old_request = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST")
+            old_evidence = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
+            os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"] = request_path
+            os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE"] = evidence_path
+            try:
+                ready = runtime.ensure_api_v1_runtime_ready()
+                try:
+                    with open(evidence_path, encoding="utf-8") as handle:
+                        evidence = json.load(handle)
+                except (OSError, ValueError, TypeError):
+                    evidence = None
+            finally:
+                for name, previous in (
+                    ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", old_request),
+                    ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", old_evidence),
+                ):
+                    if previous is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = previous
         diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
-        readiness = _headless_classify_readiness(ready, diagnostics)
+        readiness = _headless_classify_readiness(ready, diagnostics, evidence, fixture)
         if readiness != "success":
             if readiness == "authoritative_evidence_failed":
                 result["warm_load_result"] = "ready"
@@ -3175,8 +3217,10 @@ def headless_cpu_admission(args: Any) -> int:
                       authoritative_evidence_result="validated")
         return 0
     except Exception:
-        if result["failure_code"] == "packaged_runtime_identity_failed":
+        if not startup_emitted:
             result["failure_code"] = "bridge_exited_before_startup_event"
+        else:
+            result["failure_code"] = "warm_load_failed"
         return 7
     finally:
         cleanup_ok = True

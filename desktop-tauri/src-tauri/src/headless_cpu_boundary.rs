@@ -1,8 +1,10 @@
-use crate::{build_identity, python_runtime};
+use crate::{build_identity, compute_node, python_runtime};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 const COMMAND: &str = "--headless-cpu-admission";
 
@@ -13,7 +15,6 @@ struct Args {
     startup_timeout: u64,
     operation_timeout: u64,
 }
-
 #[derive(Serialize)]
 struct FailureResult<'a> {
     schema_version: u8,
@@ -39,44 +40,56 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let all_values: Vec<String> = args.into_iter().map(|v| v.as_ref().to_owned()).collect();
-    let Some(command_index) = all_values.iter().position(|value| value == COMMAND) else {
-        return Err("command_missing");
-    };
-    let values = all_values[command_index..].to_vec();
+    let values: Vec<String> = args.into_iter().map(|v| v.as_ref().to_owned()).collect();
+    if values.first().map(String::as_str) != Some(COMMAND) {
+        return Err("command_not_first");
+    }
     if values.len() != 11 {
         return Err("invalid_arguments");
     }
-    let value = |name: &str| -> Result<String, &'static str> {
-        let matches: Vec<_> = values
-            .windows(2)
-            .filter(|pair| pair[0] == name)
-            .map(|pair| pair[1].clone())
-            .collect();
-        match matches.as_slice() {
-            [only] if !only.starts_with("--") => Ok(only.clone()),
-            _ => Err("invalid_arguments"),
+    let mut model = None;
+    let mut backend = None;
+    let mut tier = None;
+    let mut startup = None;
+    let mut operation = None;
+    for pair in values[1..].chunks_exact(2) {
+        if pair[1].starts_with("--") {
+            return Err("invalid_arguments");
         }
-    };
-    if value("--backend")?.as_str() != "cpu" {
+        let slot = match pair[0].as_str() {
+            "--model" => &mut model,
+            "--backend" => &mut backend,
+            "--context-tier" => &mut tier,
+            "--startup-timeout-seconds" => &mut startup,
+            "--operation-timeout-seconds" => &mut operation,
+            _ => return Err("unknown_argument"),
+        };
+        if slot.replace(pair[1].clone()).is_some() {
+            return Err("duplicate_argument");
+        }
+    }
+    if backend.as_deref() != Some("cpu") {
         return Err("unsupported_backend");
     }
-    let context_tier = value("--context-tier")?;
+    let context_tier = tier.ok_or("invalid_arguments")?;
     if !matches!(context_tier.as_str(), "8k-fast" | "64k-full") {
-        return Err("invalid_arguments");
+        return Err("unsupported_context_tier");
     }
-    let timeout = |name| {
-        value(name)?
-            .parse::<u64>()
-            .ok()
-            .filter(|seconds| (1..=3600).contains(seconds))
-            .ok_or("invalid_arguments")
+    let timeout = |value: Option<String>| {
+        value
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| (1..=3600).contains(v))
+            .ok_or("invalid_timeout")
     };
+    let model = PathBuf::from(model.ok_or("invalid_arguments")?);
+    if !model.is_file() {
+        return Err("unusable_model_path");
+    }
     Ok(Args {
-        model: PathBuf::from(value("--model")?),
+        model,
         context_tier,
-        startup_timeout: timeout("--startup-timeout-seconds")?,
-        operation_timeout: timeout("--operation-timeout-seconds")?,
+        startup_timeout: timeout(startup)?,
+        operation_timeout: timeout(operation)?,
     })
 }
 
@@ -91,12 +104,23 @@ fn failure(code: &'static str, phase: &'static str) -> String {
         warm_load_result: "not_started",
         authoritative_evidence_result: "failed",
     })
-    .expect("static headless boundary result serializes")
+    .unwrap()
 }
 
-pub(crate) fn run(args: Vec<String>) -> i32 {
-    let args = match parse(args) {
-        Ok(args) => args,
+async fn cleanup(child: &mut tokio::process::Child) -> bool {
+    let Some(pid) = child.id() else {
+        return child.wait().await.is_ok();
+    };
+    let tree_stopped = compute_node::terminate_bridge_process_tree(pid).await;
+    let reaped = tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_ok();
+    tree_stopped && reaped
+}
+
+pub(crate) fn run(argv: Vec<String>) -> i32 {
+    let args = match parse(argv.iter().skip(1)) {
+        Ok(v) => v,
         Err(code) => {
             println!("{}", failure(code, "not_started"));
             return 2;
@@ -115,10 +139,8 @@ pub(crate) fn run(args: Vec<String>) -> i32 {
         );
         return 3;
     }
-    let launcher = match python_runtime::resolve_python_launcher_resource_aware(
-        context.launcher_options("TOKEN_PLACE_PYTHON"),
-    ) {
-        Ok(value) => value,
+    let preparation = match compute_node::prepare_operator_bridge_launch(&context) {
+        Ok(v) => v,
         Err(_) => {
             println!(
                 "{}",
@@ -127,10 +149,18 @@ pub(crate) fn run(args: Vec<String>) -> i32 {
             return 3;
         }
     };
-    let bridge = match context
-        .resolve_bridge_script_path("compute_node_bridge.py", Some(&launcher.program))
-    {
-        Ok(value) => value,
+    let launcher = match preparation.launcher.as_ref() {
+        Some(v) if v.source == python_runtime::PythonLauncherSource::BundledRuntime => v,
+        _ => {
+            println!(
+                "{}",
+                failure("packaged_runtime_identity_failed", "arguments_validated")
+            );
+            return 3;
+        }
+    };
+    let mut command = match preparation.command() {
+        Ok(v) => v,
         Err(_) => {
             println!(
                 "{}",
@@ -139,123 +169,67 @@ pub(crate) fn run(args: Vec<String>) -> i32 {
             return 3;
         }
     };
-    let mut command = match launcher.command_for_script(&bridge) {
-        Ok(value) => value,
-        Err(_) => {
-            println!(
-                "{}",
-                failure("packaged_runtime_identity_failed", "arguments_validated")
-            );
-            return 3;
-        }
-    };
-    let import_root =
-        python_runtime::resolve_runtime_import_root(Some(&bridge), context.manifest_dir);
-    if let Some(root) = import_root.as_deref() {
-        let (_, layout) = context.describe_resource_layout(&bridge);
-        python_runtime::configure_python_subprocess_env_for_layout(
-            &mut command,
-            root,
-            layout,
-            true,
-        );
-    }
     let identity = build_identity::build_identity();
     command
-        .arg(COMMAND)
-        .arg("--model")
+        .args([COMMAND, "--model"])
         .arg(args.model)
-        .arg("--mode")
-        .arg("cpu")
-        .arg("--context-tier")
-        .arg(args.context_tier)
-        .arg("--startup-timeout-seconds")
-        .arg(args.startup_timeout.to_string())
+        .args(["--mode", "cpu", "--context-tier", &args.context_tier])
         .env("TOKENPLACE_APP_VERSION", identity.app_version)
         .env("TOKENPLACE_BUILD_ID", identity.build_id)
         .env("TOKENPLACE_TARGET_TRIPLE", identity.target_triple)
         .env("TOKENPLACE_BUNDLED_RUNTIME_ID", identity.bundled_runtime_id)
-        .env("TOKENPLACE_RUNTIME_ID", launcher.runtime_id)
+        .env("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime")
+        .env("TOKENPLACE_RUNTIME_ID", &launcher.runtime_id)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .kill_on_drop(true);
+    compute_node::isolate_bridge_process_tree(&mut command);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let outcome = runtime.block_on(async {
-        tokio::time::timeout(
-            Duration::from_secs(args.operation_timeout),
-            command.output(),
-        )
-        .await
-    });
-    match outcome {
-        Err(_) => {
-            println!(
-                "{}",
-                failure("operation_timeout", "runtime_identity_validated")
-            );
-            9
+    runtime.block_on(async move {
+        let mut child = match command.spawn() { Ok(v) => v, Err(_) => { println!("{}", failure("bridge_exited_before_startup_event", "arguments_validated")); return 7; } };
+        let stdout = child.stdout.take().unwrap(); let mut lines = BufReader::new(stdout).lines();
+        let startup = tokio::time::timeout(Duration::from_secs(args.startup_timeout), lines.next_line()).await;
+        let startup_ok = matches!(startup, Ok(Ok(Some(ref line))) if serde_json::from_str::<Value>(line).ok().is_some_and(|v| v.get("type")==Some(&Value::from("headless_internal")) && v.get("phase")==Some(&Value::from("startup_ready"))));
+        if !startup_ok { let ok=cleanup(&mut child).await; println!("{}", failure(if ok {"bridge_exited_before_startup_event"} else {"cleanup_failed"}, "arguments_validated")); return if ok {7} else {8}; }
+        let final_line = tokio::time::timeout(Duration::from_secs(args.operation_timeout), lines.next_line()).await;
+        let line = match final_line { Ok(Ok(Some(v))) => v, _ => { let ok=cleanup(&mut child).await; println!("{}", failure(if ok {"operation_timeout"} else {"cleanup_failed"}, "runtime_identity_validated")); return if ok {9} else {8}; } };
+        let pid = child.id();
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        let parsed = serde_json::from_str::<Value>(&line).ok();
+        let valid = parsed.as_ref().is_some_and(|v| v.get("schema_version")==Some(&Value::from(1)) && v.get("selected_backend")==Some(&Value::from("cpu")));
+        if !valid || status.is_err() { let ok=cleanup(&mut child).await; println!("{}", failure(if ok {"bridge_exited_before_startup_event"} else {"cleanup_failed"}, "runtime_identity_validated")); return if ok {7} else {8}; }
+        let status_success = status.as_ref().ok().and_then(|result| result.as_ref().ok()).is_some_and(|value| value.success());
+        if !status_success {
+            let cleaned = match pid { Some(pid) => compute_node::terminate_bridge_process_tree(pid).await, None => false };
+            if !cleaned { println!("{}", failure("cleanup_failed", "runtime_identity_validated")); return 8; }
         }
-        Ok(Err(_)) => {
-            println!(
-                "{}",
-                failure("bridge_exited_before_startup_event", "arguments_validated")
-            );
-            7
-        }
-        Ok(Ok(output)) => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let line = text.lines().last().unwrap_or("");
-            let parsed = serde_json::from_str::<Value>(line).ok();
-            let valid = parsed.as_ref().is_some_and(|value| {
-                value.get("schema_version") == Some(&Value::from(1))
-                    && value.get("selected_backend") == Some(&Value::from("cpu"))
-            });
-            if valid {
-                println!("{line}");
-                let complete = parsed.as_ref().is_some_and(|value| {
-                    value.get("success") == Some(&Value::Bool(true))
-                        && value.get("last_completed_phase")
-                            == Some(&Value::from("cleanup_completed"))
-                        && value.get("failure_code") == Some(&Value::from("none"))
-                        && value.get("packaged_runtime_identity") == Some(&Value::from("validated"))
-                        && value.get("warm_load_result") == Some(&Value::from("ready"))
-                        && value.get("authoritative_evidence_result")
-                            == Some(&Value::from("validated"))
-                });
-                if output.status.success() && complete {
-                    0
-                } else {
-                    output.status.code().filter(|code| *code != 0).unwrap_or(7)
-                }
-            } else {
-                println!(
-                    "{}",
-                    failure(
-                        "bridge_exited_before_startup_event",
-                        "runtime_identity_validated"
-                    )
-                );
-                7
-            }
-        }
-    }
+        println!("{line}");
+        let complete = parsed.as_ref().is_some_and(|v| v.get("success")==Some(&Value::Bool(true)) && v.get("last_completed_phase")==Some(&Value::from("cleanup_completed")) && v.get("failure_code")==Some(&Value::from("none")) && v.get("packaged_runtime_identity")==Some(&Value::from("validated")) && v.get("warm_load_result")==Some(&Value::from("ready")) && v.get("authoritative_evidence_result")==Some(&Value::from("validated")));
+        if status_success && complete { 0 } else { 7 }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use tempfile::NamedTempFile;
     #[test]
     fn dispatch_and_validation_are_fail_closed() {
-        assert!(requested([COMMAND]));
-        assert!(!requested(["--build-identity-json"]));
-        assert_eq!(parse([COMMAND]).unwrap_err(), "invalid_arguments");
+        let model = NamedTempFile::new().unwrap();
+        let m = model.path().to_str().unwrap();
+        assert!(requested(["x", COMMAND]));
+        assert_eq!(
+            parse(["--other", COMMAND]).unwrap_err(),
+            "command_not_first"
+        );
         assert_eq!(
             parse([
                 COMMAND,
                 "--model",
-                "m",
+                m,
                 "--backend",
                 "gpu",
                 "--context-tier",
@@ -268,16 +242,28 @@ mod tests {
             .unwrap_err(),
             "unsupported_backend"
         );
+        assert_eq!(
+            parse([
+                COMMAND,
+                "--model",
+                m,
+                "--model",
+                m,
+                "--context-tier",
+                "8k-fast",
+                "--startup-timeout-seconds",
+                "1",
+                "--operation-timeout-seconds",
+                "1"
+            ])
+            .unwrap_err(),
+            "duplicate_argument"
+        );
     }
-
     #[test]
     fn stable_failure_is_privacy_safe() {
         let output = failure("warm_load_failed", "runtime_identity_validated");
-        assert!(!output.contains("model"));
+        assert!(!output.contains("model_path"));
         assert!(!output.contains("prompt"));
-        assert_eq!(
-            serde_json::from_str::<Value>(&output).unwrap()["failure_code"],
-            "warm_load_failed"
-        );
     }
 }

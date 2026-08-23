@@ -516,7 +516,7 @@ extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
-fn isolate_bridge_process_tree(command: &mut Command) {
+pub(crate) fn isolate_bridge_process_tree(command: &mut Command) {
     #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
@@ -534,36 +534,46 @@ fn isolate_bridge_process_tree(command: &mut Command) {
 }
 
 #[cfg(unix)]
-async fn terminate_bridge_process_tree(pid: u32) {
+pub(crate) async fn terminate_bridge_process_tree(pid: u32) -> bool {
     unsafe {
         let pgid = pid as i32;
+        if kill(-pgid, 0) != 0 {
+            return true;
+        }
         let _ = kill(-pgid, SIGTERM);
         tokio::time::sleep(Duration::from_millis(250)).await;
         let _ = kill(-pgid, SIGKILL);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        kill(-pgid, 0) != 0
     }
 }
 
 #[cfg(windows)]
-async fn terminate_bridge_process_tree(pid: u32) {
+pub(crate) async fn terminate_bridge_process_tree(pid: u32) -> bool {
     let Ok(mut child) = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
     else {
-        return;
+        return false;
     };
-    if tokio::time::timeout(Duration::from_secs(2), child.wait())
-        .await
-        .is_err()
-    {
+    let waited = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    if waited.is_err() {
         let _ = child.kill().await;
         let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        return false;
     }
+    waited
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|status| status.success())
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn terminate_bridge_process_tree(_pid: u32) {}
+pub(crate) async fn terminate_bridge_process_tree(_pid: u32) -> bool {
+    false
+}
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str::<Value>(line)
@@ -1785,7 +1795,7 @@ impl OperatorBridgeLaunchPreparation {
         Ok(())
     }
 
-    fn command(&self) -> anyhow::Result<Command> {
+    pub(crate) fn command(&self) -> anyhow::Result<Command> {
         let mut command = build_bridge_command(&self.bridge_script, self.launcher.clone())?;
         self.configure_command(&mut command)?;
         Ok(command)

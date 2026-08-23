@@ -3063,11 +3063,111 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
         )
     return payload
 
+HEADLESS_ADMISSION_SCHEMA = "token.place.desktop.headless-cpu-admission/v1"
+
+
+def _emit_headless_result(result: Dict[str, Any]) -> int:
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
+    return 0 if result.get("success") is True else 1
+
+
+def run_headless_cpu_admission(args: argparse.Namespace) -> int:
+    """Warm production CPU runtime and require authoritative admission evidence."""
+    result: Dict[str, Any] = {
+        "schema_version": HEADLESS_ADMISSION_SCHEMA,
+        "success": False,
+        "last_completed_phase": "arguments_validated",
+        "failure_code": "runtime_setup_failed",
+        "selected_backend": "cpu",
+        "warm_load_result": "not_started",
+        "authoritative_evidence_result": "not_started",
+    }
+    runtime: Optional[Any] = None
+    try:
+        dependency = ensure_desktop_python_dependencies()
+        if dependency.get("ok") != "true":
+            result["failure_code"] = "packaged_runtime_identity_failed"
+            return _emit_headless_result(result)
+        result["last_completed_phase"] = "packaged_runtime_identity"
+
+        apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
+        context_tier = normalize_context_tier(args.context_tier)
+        runtime_setup = _ensure_desktop_llama_runtime_for_context("cpu", context_tier)
+        if runtime_setup.get("selected_backend") != "cpu":
+            result["failure_code"] = "cpu_backend_unavailable"
+            return _emit_headless_result(result)
+
+        from utils.compute_node_runtime import (
+            apply_compute_mode,
+            ComputeNodeRuntime,
+            ComputeNodeRuntimeConfig,
+        )
+
+        runtime = ComputeNodeRuntime(
+            ComputeNodeRuntimeConfig(
+                relay_url="http://127.0.0.1:1",
+                relay_port=1,
+                use_configured_relay_fallbacks=False,
+                relay_urls=("http://127.0.0.1:1",),
+            )
+        )
+        manager = runtime.model_manager
+        manager.model_path = os.path.abspath(args.model)
+        manager.parent_model_path_exists = os.path.isfile(manager.model_path)
+        manager.model_path_was_relative = False
+        apply_context_profile(manager, context_tier)
+        manager.qwen_64k_batch_profile = args.qwen_64k_batch_profile
+        apply_compute_mode(manager, "cpu")
+        manager.desktop_runtime_probe = dict(runtime_setup)
+        result["last_completed_phase"] = "runtime_configured"
+
+        if not runtime.ensure_api_v1_runtime_ready():
+            result["warm_load_result"] = "failed"
+            result["failure_code"] = "warm_load_failed"
+            return _emit_headless_result(result)
+        result["warm_load_result"] = "passed"
+        result["last_completed_phase"] = "warm_load"
+
+        diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
+        prompt_tokens = diagnostics.get("api_v1_readiness_prompt_tokens")
+        authoritative = (
+            diagnostics.get("api_v1_readiness_result") == "passed"
+            and diagnostics.get("api_v1_readiness_tokenizer_render_bridge_available")
+            is True
+            and isinstance(prompt_tokens, int)
+            and not isinstance(prompt_tokens, bool)
+            and prompt_tokens > 0
+        )
+        if not authoritative:
+            result["authoritative_evidence_result"] = "failed"
+            result["failure_code"] = "authoritative_evidence_failed"
+            return _emit_headless_result(result)
+        result.update(
+            success=True,
+            last_completed_phase="authoritative_evidence",
+            failure_code="none",
+            authoritative_evidence_result="passed",
+        )
+        return _emit_headless_result(result)
+    except Exception:
+        if result["last_completed_phase"] == "runtime_configured":
+            result["warm_load_result"] = "failed"
+            result["failure_code"] = "warm_load_failed"
+        return _emit_headless_result(result)
+    finally:
+        manager = getattr(runtime, "model_manager", None)
+        close = getattr(getattr(manager, "llm", None), "close", None)
+        if callable(close):
+            close()
+
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--installed-context-smoke", action="store_true")
     parser.add_argument("--operator-runtime-preflight", action="store_true")
     parser.add_argument("--operator-runtime-preflight-cpu-smoke", action="store_true")
+    parser.add_argument("--headless-cpu-admission", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3081,6 +3181,11 @@ def main() -> int:
     parser.add_argument("--context-tier", default="8k-fast")
     parser.add_argument("--qwen-64k-batch-profile", default="balanced", choices=("safe", "balanced", "experimental"))
     args = parser.parse_args()
+
+    if args.headless_cpu_admission:
+        if not args.model or args.mode != "cpu" or not os.path.isabs(args.model):
+            parser.error("--headless-cpu-admission requires an absolute --model and --mode cpu")
+        return run_headless_cpu_admission(args)
 
     if args.installed_context_smoke:
         print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))

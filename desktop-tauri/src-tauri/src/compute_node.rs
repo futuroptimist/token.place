@@ -1785,7 +1785,7 @@ impl OperatorBridgeLaunchPreparation {
         Ok(())
     }
 
-    fn command(&self) -> anyhow::Result<Command> {
+    pub(crate) fn command(&self) -> anyhow::Result<Command> {
         let mut command = build_bridge_command(&self.bridge_script, self.launcher.clone())?;
         self.configure_command(&mut command)?;
         Ok(command)

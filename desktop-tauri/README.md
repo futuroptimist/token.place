@@ -374,3 +374,30 @@ and must not run pip, reinstall `llama-cpp-python`, require network access, or
 silently fall back from Metal to CPU. Repair packages, when explicitly needed,
 remain in the writable app-data dependency target and are installed by invoking
 pip through the bundled interpreter rather than modifying `Contents/Resources`.
+
+### Headless installed CPU admission boundary
+
+An installed package can validate its bundled CPU runtime without starting Tauri,
+a window, WebView2, plugins, a relay, or registration. Run the installed executable
+from a noninteractive session with an absolute model path:
+
+```powershell
+& "$env:LOCALAPPDATA\token.place desktop\token-place-desktop-tauri.exe" `
+  --headless-cpu-admission `
+  --model "C:\models\Qwen3-8B-Q4_K_M.gguf" `
+  --backend cpu `
+  --context-tier 8k-fast `
+  --startup-timeout-seconds 60 `
+  --operation-timeout-seconds 600
+```
+
+The command prints exactly one JSON record with schema
+`token.place.desktop.headless-cpu-admission/v1`. It exits zero only after the
+bundled Python identity check, production CPU warm load, and authoritative
+API-v1 tokenizer/admission evidence all pass. The record contains only the schema,
+success, last completed phase, stable failure code, packaged-runtime identity,
+selected backend, warm-load result, and authoritative-evidence result; it never
+contains the model path or fixture plaintext. Unsupported tiers/backends, relative
+model paths, missing/duplicate options, bridge exits, timeouts, and failed evidence
+fail closed. Windows installed-package execution is intentionally left for the
+follow-up workflow change and is not claimed by this portable implementation.

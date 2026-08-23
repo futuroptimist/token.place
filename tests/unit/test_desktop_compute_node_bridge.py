@@ -7099,3 +7099,110 @@ def test_macos_gpu_failure_packaged_probe_simulates_darwin_platform(monkeypatch,
     )
 
     assert captured['extra_env']['TOKENPLACE_DESKTOP_SIMULATED_PLATFORM'] == 'darwin'
+
+@pytest.mark.parametrize(
+    ("ready", "diagnostics", "failure_code"),
+    [
+        (False, {}, "warm_load_failed"),
+        (True, {"api_v1_readiness_result": "passed"}, "authoritative_evidence_failed"),
+    ],
+)
+def test_headless_cpu_admission_requires_authoritative_evidence(
+    monkeypatch, tmp_path, capsys, ready, diagnostics, failure_code
+):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"model")
+    manager = SimpleNamespace(last_compute_diagnostics=diagnostics, llm=None)
+
+    class Runtime:
+        def __init__(self, _config):
+            self.model_manager = manager
+
+        def ensure_api_v1_runtime_ready(self):
+            return ready
+
+    fake_runtime = ModuleType("utils.compute_node_runtime")
+    fake_runtime.ComputeNodeRuntime = Runtime
+    fake_runtime.ComputeNodeRuntimeConfig = lambda **kwargs: kwargs
+    fake_runtime.apply_compute_mode = lambda _manager, _mode: "cpu"
+    monkeypatch.setitem(sys.modules, "utils.compute_node_runtime", fake_runtime)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "ensure_desktop_python_dependencies",
+        lambda: {"ok": "true"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "_ensure_desktop_llama_runtime_for_context",
+        lambda _mode, _tier: {"selected_backend": "cpu"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "_load_context_profile_helpers",
+        lambda: (lambda _manager, tier: tier, lambda tier: tier),
+    )
+    args = SimpleNamespace(
+        model=str(model), context_tier="8k-fast", qwen_64k_batch_profile="balanced"
+    )
+
+    assert compute_node_bridge.run_headless_cpu_admission(args) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["failure_code"] == failure_code
+    assert str(model) not in json.dumps(payload)
+
+
+def test_headless_cpu_admission_success_has_positive_authoritative_evidence(
+    monkeypatch, tmp_path, capsys
+):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"model")
+    manager = SimpleNamespace(
+        last_compute_diagnostics={
+            "api_v1_readiness_result": "passed",
+            "api_v1_readiness_tokenizer_render_bridge_available": True,
+            "api_v1_readiness_prompt_tokens": 3,
+        },
+        llm=None,
+    )
+
+    class Runtime:
+        def __init__(self, _config):
+            self.model_manager = manager
+
+        def ensure_api_v1_runtime_ready(self):
+            return True
+
+    fake_runtime = ModuleType("utils.compute_node_runtime")
+    fake_runtime.ComputeNodeRuntime = Runtime
+    fake_runtime.ComputeNodeRuntimeConfig = lambda **kwargs: kwargs
+    fake_runtime.apply_compute_mode = lambda _manager, _mode: "cpu"
+    monkeypatch.setitem(sys.modules, "utils.compute_node_runtime", fake_runtime)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "ensure_desktop_python_dependencies",
+        lambda: {"ok": "true"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "_ensure_desktop_llama_runtime_for_context",
+        lambda _mode, _tier: {"selected_backend": "cpu"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "_load_context_profile_helpers",
+        lambda: (lambda _manager, tier: tier, lambda tier: tier),
+    )
+
+    assert (
+        compute_node_bridge.run_headless_cpu_admission(
+            SimpleNamespace(
+                model=str(model),
+                context_tier="8k-fast",
+                qwen_64k_batch_profile="balanced",
+            )
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["success"] is True
+    assert payload["authoritative_evidence_result"] == "passed"

@@ -2,6 +2,8 @@
 
 from unittest.mock import Mock
 
+import pytest
+
 import relay
 from relay_state_store import RelayStateStoreError
 
@@ -30,7 +32,9 @@ def _claim_for_control(client, *, request_id="control-request"):
         "server_public_key": node, "control_credential": registration["control_credential"],
     }).get_json()
     claim = relay._api_v1_store().active_claims(node)[0]
-    return node, registration["control_credential"], poll, (queued, claim)
+    return node, registration["control_credential"], poll, (
+        queued, claim, selection["reservation_token"]
+    )
 
 
 def test_api_v1_encrypted_journey_uses_authoritative_store():
@@ -76,6 +80,96 @@ def test_api_v1_encrypted_journey_uses_authoritative_store():
     assert relay.known_servers == {}
     assert relay.client_inference_requests == {}
     assert relay.client_responses == {}
+
+
+@pytest.mark.parametrize("retrieval_credential", [None, "invalid-proof"])
+def test_response_retrieve_rejects_missing_or_invalid_proof(retrieval_credential):
+    relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    _, _, poll, _ = _claim_for_control(client, request_id="retrieve-proof")
+    payload = {"client_public_key": poll["client_public_key"], "request_id": poll["request_id"]}
+    if retrieval_credential is not None:
+        payload["retrieval_credential"] = retrieval_credential
+
+    response = client.post("/api/v1/relay/responses/retrieve", json=payload)
+
+    assert response.status_code == 403
+    assert response.get_json() == {
+        "error": {"message": "Missing or invalid retrieval proof", "code": 403}
+    }
+    assert b"invalid-proof" not in response.data
+    assert b"sealed-request" not in response.data
+
+
+@pytest.mark.parametrize("protocol", ["tokenplace_api_v1_relay_e2ee", "e2ee_v1"])
+def test_progress_protocol_is_stored_canonically_and_retrieved_once(protocol):
+    relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, credential, poll, (_, _, retrieval_credential) = _claim_for_control(
+        client, request_id=f"progress-{protocol}"
+    )
+    progress = {
+        "server_public_key": node, "client_public_key": poll["client_public_key"],
+        "request_id": poll["request_id"], "control_credential": credential,
+        "protocol": protocol, "version": 1, "ciphertext": "progress-secret",
+        "cipherkey": "progress-key", "iv": "progress-iv",
+    }
+
+    accepted = client.post("/api/v1/relay/progress", json=progress)
+    first = client.post("/api/v1/relay/responses/retrieve", json={
+        "client_public_key": poll["client_public_key"], "request_id": poll["request_id"],
+        "retrieval_credential": retrieval_credential,
+    })
+    second = client.post("/api/v1/relay/responses/retrieve", json={
+        "client_public_key": poll["client_public_key"], "request_id": poll["request_id"],
+        "retrieval_credential": retrieval_credential,
+    })
+
+    assert accepted.status_code == 202
+    assert accepted.get_json() == {"message": "Encrypted progress accepted"}
+    assert first.status_code == 202
+    assert first.get_json()["encrypted_progress"]["protocol"] == "tokenplace_api_v1_relay_e2ee"
+    assert "encrypted_progress" not in second.get_json()
+    assert credential not in str(first.get_json())
+
+
+@pytest.mark.parametrize("updates", [
+    {"protocol": "plaintext_v1"},
+    {"version": 2},
+    {"ciphertext": ""},
+    {"cipherkey": None},
+    {"iv": 7},
+])
+def test_invalid_progress_is_rejected_without_store_mutation(updates):
+    relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, credential, poll, (_, _, retrieval_credential) = _claim_for_control(
+        client, request_id="invalid-progress"
+    )
+    progress = {
+        "server_public_key": node, "client_public_key": poll["client_public_key"],
+        "request_id": poll["request_id"], "control_credential": credential,
+        "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+        "ciphertext": "progress-secret", "cipherkey": "progress-key", "iv": "progress-iv",
+    }
+    progress.update(updates)
+
+    rejected = client.post("/api/v1/relay/progress", json=progress)
+    retrieved = client.post("/api/v1/relay/responses/retrieve", json={
+        "client_public_key": poll["client_public_key"], "request_id": poll["request_id"],
+        "retrieval_credential": retrieval_credential,
+    })
+
+    assert rejected.status_code == 400
+    assert rejected.get_json() == {
+        "error": {"message": "Invalid encrypted progress schema", "code": 400}
+    }
+    assert "encrypted_progress" not in retrieved.get_json()
+    for secret in (credential, "progress-secret", "progress-key", "progress-iv"):
+        assert secret not in rejected.get_data(as_text=True)
 
 
 def test_compat_control_resolves_and_renews_authoritative_claim(monkeypatch):

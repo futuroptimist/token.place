@@ -3210,6 +3210,8 @@ def api_v1_relay_progress():
                                  'ciphertext', 'cipherkey', 'iv'))):
         return jsonify({'error': {'message':'Invalid encrypted progress schema','code':400}}),400
     node=data['server_public_key']; client_key=data['client_public_key']; request_id=data['request_id']
+    protocol = ('tokenplace_api_v1_relay_e2ee'
+                if data['protocol'] == 'e2ee_v1' else data['protocol'])
     cd=hashlib.sha256(b'client\0'+client_key.encode()).hexdigest(); rd=hashlib.sha256(b'request\0'+request_id.encode()).hexdigest()
     try:
         store = _api_v1_store()
@@ -3217,7 +3219,7 @@ def api_v1_relay_progress():
         if claim is None:
             return jsonify({'error': {'message':'Progress request is not active for this owner','code':410}}),410
         result=store.replace_encrypted_progress_if_claimed(node,_credential_digest(data['control_credential']),node,client_key,request_id,claim.generation,
-            EncryptedProgressEnvelope(data['protocol'],data['version'],data['ciphertext'],data['cipherkey'],data['iv']))
+            EncryptedProgressEnvelope(protocol,data['version'],data['ciphertext'],data['cipherkey'],data['iv']))
     except RelayStateCredentialMismatch:
         return jsonify({'error': {'message':'Missing or invalid relay server control credential','code':403}}),403
     except RelayStateConflict:
@@ -3232,7 +3234,7 @@ def api_v1_relay_responses_retrieve():
     if not isinstance(data,dict) or not data.get('client_public_key') or not data.get('request_id'):
         return jsonify({'error': {'message':'Invalid request data','code':400}}),400
     try:
-        result=_api_v1_store().retrieve_encrypted_response(data['client_public_key'],data['request_id'],data['retrieval_credential'],data.get('acknowledgement_token'))
+        result=_api_v1_store().retrieve_encrypted_response(data['client_public_key'],data['request_id'],data.get('retrieval_credential'),data.get('acknowledgement_token'))
     except RelayStateStoreError:
         return _store_failure_response()
     if result.state=='pending':

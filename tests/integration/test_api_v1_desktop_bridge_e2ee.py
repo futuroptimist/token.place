@@ -106,6 +106,7 @@ def live_relay_server():
 
 @pytest.fixture(autouse=True)
 def reset_relay_state(monkeypatch):
+    relay._reset_api_v1_relay_state_store()
     relay.known_servers.clear()
     relay.client_inference_requests.clear()
     relay.client_pending_request_ids.clear()
@@ -119,6 +120,7 @@ def reset_relay_state(monkeypatch):
     monkeypatch.delenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", raising=False)
     monkeypatch.setenv("CONTENT_MODERATION_MODE", "off")
     yield
+    relay._reset_api_v1_relay_state_store()
     relay.known_servers.clear()
     relay.client_inference_requests.clear()
     relay.client_pending_request_ids.clear()

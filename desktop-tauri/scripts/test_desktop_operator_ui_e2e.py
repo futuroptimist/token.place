@@ -862,7 +862,7 @@ def tauri_driver_command() -> list[str]:
     )
 
 
-WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v6"
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v7"
 WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
 WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
     "read_timeout", "connection_failure", "capability_rejection",
@@ -924,6 +924,52 @@ NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS = {
     "native_startup_failure_category": "none",
 }
 
+PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS = {
+    "startup_boundary": frozenset({
+        "not_observed", "handler_not_entered", "invocation_pending",
+        "invocation_resolved", "invocation_rejected", "native_not_reached",
+        "native_preparation_not_reached", "bridge_launch_not_reached",
+        "warm_load_pending", "warm_load_ready",
+        "warm_load_timed_out", "warm_load_failed", "readiness_rejected",
+        "bridge_exited_clean", "bridge_exited_nonzero", "relay_polling_started",
+        "registration_not_reached", "registered",
+    }),
+    "startup_phase": frozenset({
+        "none", "starting", "starting_worker", "hardware_model_boundary",
+        "model_manager_get_llm_instance", "warm_load", "ready", "unknown",
+    }),
+    "runtime_provisioning_state": frozenset({
+        "idle", "provisioning", "ready", "failed", "unknown",
+    }),
+    "warm_load_state": frozenset({
+        "not_started", "pending", "ready", "timed_out", "failed", "unknown",
+    }),
+    "worker_state": frozenset({
+        "stopped", "starting", "provisioning", "ready", "recovering", "failed",
+        "unknown",
+    }),
+    "worker_error_code": frozenset({
+        "none", "worker_exit_nonzero", "stale_worker_failure", "worker_dead",
+        "runtime_recovery", "recovery_exhausted", "warm_load_timeout", "unknown",
+    }),
+    "bridge_exit_posture": frozenset({
+        "not_observed", "clean_exit", "nonzero_exit", "unknown",
+    }),
+    "relay_polling_state": frozenset({"not_started", "started", "unknown"}),
+    "registration_state": frozenset({"not_reached", "registered", "unknown"}),
+}
+PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS = {
+    "startup_boundary": "not_observed",
+    "startup_phase": "unknown",
+    "runtime_provisioning_state": "unknown",
+    "warm_load_state": "unknown",
+    "worker_state": "unknown",
+    "worker_error_code": "unknown",
+    "bridge_exit_posture": "not_observed",
+    "relay_polling_state": "not_started",
+    "registration_state": "not_reached",
+}
+
 
 def _read_operator_start_diagnostic(driver: webdriver.Remote | None) -> dict[str, str]:
     defaults = OPERATOR_START_DIAGNOSTIC_DEFAULTS.copy()
@@ -965,6 +1011,105 @@ def _read_native_startup_diagnostic(driver: webdriver.Remote | None) -> dict[str
         }
     except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
         return defaults
+
+
+def _read_packaged_startup_diagnostic(driver: webdriver.Remote | None,
+        operator_start: dict[str, str], native_startup: dict[str, str],
+        readiness_category: str = "unknown") -> dict[str, str]:
+    """Project only bounded status labels into the durable startup diagnostic."""
+    result = PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS.copy()
+    if driver is None:
+        return result
+
+    def status(label: str, allowed: frozenset[str], default: str) -> str:
+        try:
+            value = _status_value(driver, label).strip().lower()
+        except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+            return default
+        return value if value in allowed else default
+
+    def raw_status(label: str) -> str | None:
+        try:
+            return _status_value(driver, label).strip().lower()
+        except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+            return None
+
+    result["startup_phase"] = status(
+        "Startup phase", PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS["startup_phase"], "unknown")
+    result["runtime_provisioning_state"] = status(
+        "Provisioning state",
+        PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS["runtime_provisioning_state"], "unknown")
+    relay_runtime = status("Relay runtime state", frozenset({
+        "idle", "provisioning", "starting", "warming", "ready", "processing",
+        "recovering", "failed", "stopped"}), "unknown")
+    result["worker_state"] = status(
+        "Worker state", PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS["worker_state"], "unknown")
+    result["worker_error_code"] = status(
+        "Last worker error code",
+        PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS["worker_error_code"], "unknown")
+    exit_code = raw_status("Last worker exit code")
+    result["bridge_exit_posture"] = (
+        "not_observed" if exit_code == "none" else
+        "clean_exit" if exit_code == "0" else
+        "nonzero_exit" if exit_code is not None
+            and exit_code.lstrip("-").isdigit() else "unknown")
+    registered_label = raw_status("Registered")
+    registered = (
+        "yes" if registered_label is not None and registered_label.startswith("yes") else
+        "no" if registered_label is not None and registered_label.startswith("no") else "unknown")
+    result["registration_state"] = (
+        "registered" if registered == "yes" else
+        "not_reached" if registered == "no" else "unknown")
+    result["warm_load_state"] = (
+        "ready" if relay_runtime in {"ready", "processing"} else
+        "timed_out" if result["worker_error_code"] == "warm_load_timeout" else
+        "failed" if relay_runtime == "failed" else
+        "pending" if relay_runtime in {"provisioning", "starting", "warming", "recovering"}
+        else "not_started" if relay_runtime in {"idle", "stopped"} else "unknown")
+    result["relay_polling_state"] = (
+        "started" if registered == "yes" or relay_runtime in {"processing", "recovering"}
+        else "not_started" if relay_runtime != "unknown" else "unknown")
+
+    handler = operator_start.get("start_handler_state")
+    invocation = operator_start.get("invocation_state")
+    native_phase = native_startup.get("native_startup_phase")
+    native_failure = native_startup.get("native_startup_failure_category")
+    if readiness_category == "application_initialization_failed":
+        boundary = "readiness_rejected"
+    elif handler != "entered":
+        boundary = "handler_not_entered"
+    elif invocation == "pending":
+        boundary = "invocation_pending"
+    elif invocation == "rejected":
+        boundary = "invocation_rejected"
+    elif native_phase == "not_started":
+        boundary = "native_not_reached"
+    elif native_phase == "session_reserved":
+        boundary = "native_preparation_not_reached"
+    elif native_phase in {"bridge_launch_prepared", "command_constructed"}:
+        boundary = "bridge_launch_not_reached"
+    elif result["bridge_exit_posture"] == "clean_exit" and native_failure == "bridge_exited_before_startup_event":
+        boundary = "bridge_exited_clean"
+    elif result["bridge_exit_posture"] == "nonzero_exit" and native_failure == "bridge_exited_before_startup_event":
+        boundary = "bridge_exited_nonzero"
+    elif result["warm_load_state"] == "timed_out":
+        boundary = "warm_load_timed_out"
+    elif result["warm_load_state"] == "failed":
+        boundary = "warm_load_failed"
+    elif result["warm_load_state"] == "pending":
+        boundary = "warm_load_pending"
+    elif result["warm_load_state"] == "ready" and result["relay_polling_state"] == "not_started":
+        boundary = "warm_load_ready"
+    elif result["relay_polling_state"] == "started" and result["registration_state"] != "registered":
+        boundary = "registration_not_reached"
+    elif result["registration_state"] == "registered":
+        boundary = "registered"
+    elif invocation == "resolved":
+        boundary = "invocation_resolved"
+    else:
+        boundary = "not_observed"
+    result["startup_boundary"] = boundary
+    return result
 
 
 def _classify_webdriver_session_failure(exc: Exception, process: object) -> tuple[str, str, str]:
@@ -1053,7 +1198,8 @@ def _write_webdriver_diagnostic(
         session_elapsed_bucket: str = "unknown", target_category: str = "unknown",
         readiness_category: str = "unknown", operator_progress: str = "not_started",
         operator_start_diagnostic: dict[str, str] | None = None,
-        native_startup_diagnostic: dict[str, str] | None = None) -> None:
+        native_startup_diagnostic: dict[str, str] | None = None,
+        packaged_startup_diagnostic: dict[str, str] | None = None) -> None:
     """Atomically retain the bounded session diagnostic while raw logs are discarded."""
     if compatibility not in WEBDRIVER_COMPATIBILITY_RESULTS:
         compatibility = "unknown"
@@ -1087,6 +1233,12 @@ def _write_webdriver_diagnostic(
                 else NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS[field])
         for field, allowed in NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS.items()
     }
+    supplied_packaged_diagnostic = packaged_startup_diagnostic or {}
+    safe_packaged_diagnostic = {
+        field: (value if (value := supplied_packaged_diagnostic.get(field)) in allowed
+                else PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS[field])
+        for field, allowed in PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS.items()
+    }
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
     fd, temporary_name = tempfile.mkstemp(
@@ -1107,6 +1259,7 @@ def _write_webdriver_diagnostic(
                 "operator_progress": operator_progress,
                 **safe_start_diagnostic,
                 **safe_native_diagnostic,
+                **safe_packaged_diagnostic,
             }, handle, sort_keys=True)
         os.replace(temporary, destination)
     finally:
@@ -1908,12 +2061,16 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     finally:
         operator_start_diagnostic = _read_operator_start_diagnostic(driver)
         native_startup_diagnostic = _read_native_startup_diagnostic(driver)
+        packaged_startup_diagnostic = _read_packaged_startup_diagnostic(
+            driver, operator_start_diagnostic, native_startup_diagnostic,
+            webdriver_readiness_category)
         _write_webdriver_diagnostic(
             os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
             tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
             webdriver_process_posture, webdriver_session_elapsed_bucket,
             webdriver_target_category, webdriver_readiness_category, operator_progress,
-            operator_start_diagnostic, native_startup_diagnostic)
+            operator_start_diagnostic, native_startup_diagnostic,
+            packaged_startup_diagnostic)
         cleanup_deadline = time.monotonic() + cleanup_timeout
         def cleanup_remaining() -> float:
             return max(0.0, cleanup_deadline - time.monotonic())

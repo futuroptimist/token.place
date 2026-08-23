@@ -82,9 +82,8 @@ def test_compat_control_resolves_and_renews_authoritative_claim(monkeypatch):
     relay.app.config["TESTING"] = True
     relay._reset_api_v1_relay_state_store()
     client = relay.app.test_client()
-    node, credential, poll, claimed = _claim_for_control(client)
+    node, credential, poll, _ = _claim_for_control(client)
     store = relay._api_v1_store()
-    monkeypatch.setattr(store, "claimed_request", Mock(return_value=claimed))
     renew = Mock(wraps=store.renew_claim_or_read_control)
     monkeypatch.setattr(store, "renew_claim_or_read_control", renew)
 
@@ -103,9 +102,8 @@ def test_compat_control_forwards_acknowledgement_to_store(monkeypatch):
     relay.app.config["TESTING"] = True
     relay._reset_api_v1_relay_state_store()
     client = relay.app.test_client()
-    node, credential, poll, claimed = _claim_for_control(client, request_id="control-ack")
+    node, credential, poll, _ = _claim_for_control(client, request_id="control-ack")
     store = relay._api_v1_store()
-    monkeypatch.setattr(store, "claimed_request", Mock(return_value=claimed))
     renew = Mock(wraps=store.renew_claim_or_read_control)
     monkeypatch.setattr(store, "renew_claim_or_read_control", renew)
 
@@ -123,9 +121,7 @@ def test_compat_control_reports_unavailable_without_legacy_state(monkeypatch):
     relay.app.config["TESTING"] = True
     relay._reset_api_v1_relay_state_store()
     client = relay.app.test_client()
-    node, credential, poll, _ = _claim_for_control(client, request_id="control-missing")
-    store = relay._api_v1_store()
-    monkeypatch.setattr(store, "claimed_request", Mock(return_value=None))
+    node, credential, _, _ = _claim_for_control(client, request_id="control-missing")
 
     class ForbiddenLegacyState(dict):
         def __getattribute__(self, name):
@@ -137,7 +133,7 @@ def test_compat_control_reports_unavailable_without_legacy_state(monkeypatch):
                  "api_v1_control_tombstones"):
         monkeypatch.setattr(relay, name, ForbiddenLegacyState())
     with relay.app.test_request_context("/api/v1/relay/servers/control", method="POST", json={
-            "server_public_key": node, "request_id": poll["request_id"],
+            "server_public_key": node, "request_id": "missing-request",
             "control_credential": credential, "acknowledge": True,
     }):
         response, status_code = relay.api_v1_relay_servers_control()

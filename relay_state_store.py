@@ -1463,7 +1463,7 @@ class InMemoryRelayStateStore:
         self._validate_node_id(node_id)
         if not isinstance(request_id, str) or not request_id:
             raise RelayStateStoreError("request id is required")
-        request_digest = self._request_digest(request_id)
+        request_digest = self._identity_digest(request_id, b"request\0")
         with self._lock:
             now = self._now()
             self._reap_locked(now)

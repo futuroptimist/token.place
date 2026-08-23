@@ -50,7 +50,8 @@ def test_headless_boundary_result_contract_is_privacy_safe():
 def test_headless_boundary_rejects_non_cpu_before_runtime(monkeypatch, tmp_path, capsys):
     model = tmp_path / "model.gguf"
     model.write_bytes(b"fixture")
-    args = SimpleNamespace(mode="gpu", model=str(model), context_tier="8k-fast")
+    args = SimpleNamespace(mode="gpu", model=str(model), context_tier="8k-fast",
+                           startup_timeout_seconds=1)
     monkeypatch.setattr(
         compute_node_bridge, "ensure_desktop_python_dependencies",
         lambda: pytest.fail("runtime must not start"),
@@ -66,7 +67,7 @@ def test_headless_boundary_rejects_non_cpu_before_runtime(monkeypatch, tmp_path,
     ("ready", "diagnostics", "expected"),
     [
         (False, {}, "warm_load_failed"),
-        (False, {"api_v1_readiness_result": "failed"}, "authoritative_evidence_failed"),
+        (False, {"api_v1_readiness_result": "failed"}, "warm_load_failed"),
         (True, {"api_v1_readiness_result": "passed"}, "authoritative_evidence_failed"),
         (True, {
             "api_v1_readiness_result": "passed",
@@ -77,6 +78,38 @@ def test_headless_boundary_rejects_non_cpu_before_runtime(monkeypatch, tmp_path,
 )
 def test_headless_boundary_readiness_classification(ready, diagnostics, expected):
     assert compute_node_bridge._headless_classify_readiness(ready, diagnostics) == expected
+
+
+def test_headless_warm_load_enforces_startup_timeout():
+    release = threading.Event()
+    runtime = SimpleNamespace(
+        ensure_api_v1_runtime_ready=lambda: release.wait(1),
+    )
+
+    assert compute_node_bridge._headless_warm_load(runtime, 0.01) == (False, False)
+    release.set()
+
+
+def test_gpu_preflight_rejects_silent_cpu_fallback(monkeypatch, capsys):
+    monkeypatch.setattr(
+        compute_node_bridge, "ensure_desktop_python_dependencies",
+        lambda: {"ok": "true"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_load_context_profile_helpers",
+        lambda: (None, lambda tier: tier),
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_ensure_desktop_llama_runtime_for_context",
+        lambda mode, tier: {"selected_backend": "cpu", "runtime_action": "fallback"},
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "compute_node_bridge.py", "--operator-runtime-preflight", "--mode", "gpu",
+    ])
+
+    assert compute_node_bridge.main() == 1
+    event = json.loads(capsys.readouterr().out)
+    assert event["startup_result"] == "runtime_validation_failed"
 
 
 @pytest.fixture(autouse=True)

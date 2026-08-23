@@ -169,15 +169,13 @@ pub(crate) fn run(args: Vec<String>) -> i32 {
         .arg("cpu")
         .arg("--context-tier")
         .arg(args.context_tier)
+        .arg("--startup-timeout-seconds")
+        .arg(args.startup_timeout.to_string())
         .env("TOKENPLACE_APP_VERSION", identity.app_version)
         .env("TOKENPLACE_BUILD_ID", identity.build_id)
         .env("TOKENPLACE_TARGET_TRIPLE", identity.target_triple)
         .env("TOKENPLACE_BUNDLED_RUNTIME_ID", identity.bundled_runtime_id)
         .env("TOKENPLACE_RUNTIME_ID", launcher.runtime_id)
-        .env(
-            "TOKENPLACE_DESKTOP_WARM_LOAD_WAIT_SECONDS",
-            args.startup_timeout.to_string(),
-        )
         .kill_on_drop(true);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

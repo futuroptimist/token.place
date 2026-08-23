@@ -3087,9 +3087,27 @@ def _headless_classify_readiness(ready: bool, diagnostics: Dict[str, Any]) -> st
                 and prompt_tokens > 0):
             return "success"
         return "authoritative_evidence_failed"
-    if diagnostics.get("api_v1_readiness_result") == "failed":
-        return "authoritative_evidence_failed"
     return "warm_load_failed"
+
+
+def _headless_warm_load(runtime: Any, timeout_seconds: float) -> Tuple[bool, bool]:
+    """Return (completed, ready), bounding model construction on every platform."""
+    outcome: Dict[str, Any] = {}
+
+    def load() -> None:
+        try:
+            outcome["ready"] = runtime.ensure_api_v1_runtime_ready()
+        except BaseException as exc:
+            outcome["exception"] = exc
+
+    worker = threading.Thread(target=load, name="headless-warm-load", daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        return False, False
+    if "exception" in outcome:
+        raise outcome["exception"]
+    return True, outcome.get("ready") is True
 
 
 def headless_cpu_admission(args: Any) -> int:
@@ -3136,7 +3154,11 @@ def headless_cpu_admission(args: Any) -> int:
         apply_compute_mode(manager, "cpu")
         manager.desktop_runtime_probe = dict(setup)
         result["last_completed_phase"] = "runtime_identity_validated"
-        ready = runtime.ensure_api_v1_runtime_ready()
+        warm_load_completed, ready = _headless_warm_load(
+            runtime, args.startup_timeout_seconds)
+        if not warm_load_completed:
+            result["failure_code"] = "startup_timeout"
+            return 5
         diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
         readiness = _headless_classify_readiness(ready, diagnostics)
         if readiness != "success":
@@ -3149,8 +3171,8 @@ def headless_cpu_admission(args: Any) -> int:
             return 5
         result["warm_load_result"] = "ready"
         result["last_completed_phase"] = "warm_load_completed"
-        result.update(success=True, last_completed_phase="cleanup_completed",
-                      failure_code="none", authoritative_evidence_result="validated")
+        result.update(success=True, failure_code="none",
+                      authoritative_evidence_result="validated")
         return 0
     except Exception:
         if result["failure_code"] == "packaged_runtime_identity_failed":
@@ -3172,6 +3194,8 @@ def headless_cpu_admission(args: Any) -> int:
                 cleanup_ok = False
         if not cleanup_ok:
             result.update(success=False, failure_code="cleanup_failed")
+        elif result["success"]:
+            result["last_completed_phase"] = "cleanup_completed"
         print(json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
         if not cleanup_ok:
             return 8
@@ -3194,6 +3218,7 @@ def main() -> int:
     )
     parser.add_argument("--relay-port", type=int, default=None)
     parser.add_argument("--context-tier", default="8k-fast")
+    parser.add_argument("--startup-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--qwen-64k-batch-profile", default="balanced", choices=("safe", "balanced", "experimental"))
     args = parser.parse_args()
 

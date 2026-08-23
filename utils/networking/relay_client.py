@@ -3081,8 +3081,14 @@ class RelayClient:
             )
 
         try:
+            server_public_key = response_envelope.get("server_public_key")
+            claim_generation = response_envelope.get("claim_generation")
             bound_response_envelope = {
-                **response_envelope,
+                **{
+                    key: value
+                    for key, value in response_envelope.items()
+                    if key not in {"server_public_key", "claim_generation"}
+                },
                 "client_public_key": client_pub_key_b64,
             }
             encrypted_response = self.crypto_manager.encrypt_message(
@@ -3090,12 +3096,12 @@ class RelayClient:
                 client_pub_key,
             )
             source_payload = {
-                "server_public_key": response_envelope.get("server_public_key")
+                "server_public_key": server_public_key
                 or getattr(self.crypto_manager, "public_key_b64", ""),
                 "control_credential": self._api_v1_control_credential_for_relay(
                     self._api_v1_response_relay_url()
                 ),
-                "claim_generation": response_envelope.get("claim_generation"),
+                "claim_generation": claim_generation,
                 "client_public_key": client_pub_key_b64,
                 "request_id": response_envelope["request_id"],
                 "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -5628,12 +5634,13 @@ class RelayClient:
                             recovery_succeeded=recovery_succeeded,
                             submission_allowed=False,
                         )
+                    response_routing_metadata = {
+                        key: request_data[key]
+                        for key in ("server_public_key", "claim_generation")
+                        if key in request_data
+                    }
                     post_outcome = self._post_api_v1_response(
-                        {
-                            **response_envelope,
-                            "server_public_key": request_data.get("server_public_key"),
-                            "claim_generation": request_data.get("claim_generation"),
-                        },
+                        {**response_envelope, **response_routing_metadata},
                         client_pub_key_b64=client_pub_key_b64,
                         client_pub_key=client_pub_key,
                         cancel_snapshot=cancel_snapshot,

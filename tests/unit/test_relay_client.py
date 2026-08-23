@@ -2754,6 +2754,9 @@ class TestRelayClient:
         mock_post.assert_called_once_with(
             'http://localhost:5000/api/v1/relay/responses',
             json={
+                'server_public_key': 'mock_public_key_b64',
+                'control_credential': '',
+                'claim_generation': None,
                 'client_public_key': request_data["client_public_key"],
                 'request_id': 'req-123',
                 'protocol': 'tokenplace_api_v1_relay_e2ee',
@@ -9192,6 +9195,60 @@ def test_api_v1_inference_custom_base_exception_does_not_escape_supervisor():
 # ---------------------------------------------------------------------------
 # _post_api_v1_response log-safety regression tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("routing_metadata", "expected_server_key", "expected_generation"),
+    [
+        ({"server_public_key": "server-key", "claim_generation": 7}, "server-key", 7),
+        ({}, "local-server-key", None),
+    ],
+)
+def test_post_api_v1_response_keeps_routing_metadata_outside_encryption(
+    monkeypatch,
+    caplog,
+    routing_metadata,
+    expected_server_key,
+    expected_generation,
+):
+    client = _standalone_relay_client()
+    client._last_api_v1_work_relay_url = "https://relay.example"
+    client.crypto_manager.public_key_b64 = "local-server-key"
+    client._store_api_v1_control_credential("https://relay.example", "owner-secret")
+    client.crypto_manager.encrypt_message.return_value = {
+        "chat_history": "ciphertext",
+        "cipherkey": "key",
+        "iv": "iv",
+    }
+    post = MagicMock(return_value=MagicMock(status_code=200))
+    monkeypatch.setattr(relay_client_module.requests, "post", post)
+    response_envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": "req-routing-metadata",
+        "api_v1_response": {"message": {"role": "assistant", "content": "ok"}},
+        **routing_metadata,
+    }
+    original_envelope = response_envelope.copy()
+
+    with caplog.at_level("INFO", logger="relay_client"):
+        outcome = client._post_api_v1_response(
+            response_envelope,
+            client_pub_key_b64="client-key",
+            client_pub_key=b"raw-key",
+        )
+
+    encrypted_plaintext = client.crypto_manager.encrypt_message.call_args.args[0]
+    assert "server_public_key" not in encrypted_plaintext
+    assert "claim_generation" not in encrypted_plaintext
+    assert "control_credential" not in encrypted_plaintext
+    assert response_envelope == original_envelope
+    source_payload = post.call_args.kwargs["json"]
+    assert source_payload["server_public_key"] == expected_server_key
+    assert source_payload["claim_generation"] == expected_generation
+    assert source_payload["control_credential"] == "owner-secret"
+    assert "owner-secret" not in caplog.text
+    assert "owner-secret" not in repr(outcome)
 
 
 def test_post_api_v1_response_encryption_failure_logs_no_sensitive_data(caplog, monkeypatch):

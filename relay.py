@@ -3045,24 +3045,20 @@ def api_v1_relay_servers_control():
         store = _api_v1_store()
         request_deadline = None
         if not client_key or not isinstance(generation, int):
-            request_digest = hashlib.sha256(b'request\0' + data['request_id'].encode()).hexdigest()
-            claim = next((candidate for candidate in store.active_claims(node)
-                          if candidate.request_identity_digest == request_digest), None)
-            if claim is not None:
-                _record_compute_control_state("active")
-                return jsonify({'status': 'active', 'next_poll_seconds': _bounded_control_next_poll_seconds(),
-                                **_api_v1_deadline_metadata_epoch(claim.request_deadline_epoch)}), 200
-        if not client_key or not isinstance(generation, int):
-            _record_compute_control_state("completed_unavailable")
-            return jsonify({'status': 'completed/unavailable', 'next_poll_seconds': _bounded_control_next_poll_seconds()}), 200
+            claimed = store.claimed_request(node, data['request_id'])
+            if claimed is None:
+                _record_compute_control_state("completed_unavailable")
+                return jsonify({'status': 'completed/unavailable', 'next_poll_seconds': _bounded_control_next_poll_seconds()}), 200
+            queued, claim = claimed
+            client_key = queued.client_public_key
+            generation = claim.generation
+            request_deadline = claim.request_deadline_epoch
         result=store.renew_claim_or_read_control(node, _credential_digest(credential), node, client_key, data['request_id'], generation, acknowledge=data.get('acknowledge') is True or data.get('ack') is True)
     except RelayStateStoreError:
         return _store_failure_response()
     if result.state == 'owner_mismatch':
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     status={'continued':'active','missing_or_expired':'completed/unavailable','stale_generation':'completed/unavailable','acknowledged':'completed/unavailable'}.get(result.state,result.state)
-    if request_deadline is None:
-        request_deadline = next((c.request_deadline_epoch for c in store.active_claims(node) if c.request_identity_digest == hashlib.sha256(b'request\0'+data['request_id'].encode()).hexdigest()), None)
     _record_compute_control_state(status.replace('/', '_'))
     if result.state == 'continued':
         _record_compute_control_lease_renewal()

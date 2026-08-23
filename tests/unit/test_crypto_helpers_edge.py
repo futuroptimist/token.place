@@ -37,13 +37,40 @@ def test_base_url_requires_scheme(url: str) -> None:
 def test_send_chat_message_list_branch():
     client = _prep_client()
     msgs = [{'role': 'user', 'content': 'hi'}]
-    with patch.object(client, 'fetch_server_public_key', return_value=True), \
+    server_key = base64.b64encode(b'k').decode()
+    selection = {
+        'server_public_key': server_key,
+        'reservation_token': 'reservation-proof',
+        'requested_model': 'qwen3-8b-instruct',
+        'requested_context_tier': '8k-fast',
+        'request_deadline_epoch': 2_000_000_000,
+    }
+    with patch('utils.crypto_helpers.requests.get', return_value=_FakeResponse(payload=selection)) as mock_get, \
          patch('utils.crypto_helpers.encrypt', return_value=({'ciphertext': b'c', 'iv': b'i'}, b'k', b'i')), \
-         patch.object(client, 'send_encrypted_message', return_value={'success': True}), \
-         patch('utils.crypto_helpers.requests.post', return_value=_FakeResponse(status_code=200, payload={'chat_history': 'c', 'cipherkey': 'k', 'iv': 'i'})), \
+         patch.object(client, 'send_encrypted_message', return_value={
+             'success': True,
+             'retrieval_credential': 'retrieval-proof',
+         }) as mock_enqueue, \
+         patch('utils.crypto_helpers.requests.post', return_value=_FakeResponse(status_code=200, payload={'chat_history': 'c', 'cipherkey': 'k', 'iv': 'i'})) as mock_retrieve, \
          patch.object(client, 'decrypt_message', return_value=msgs), \
          patch('utils.crypto_helpers.time.sleep'):
         assert client.send_chat_message(msgs) == msgs
+
+    selection_params = mock_get.call_args.kwargs['params']
+    assert selection_params['client_public_key']
+    assert selection_params['request_id']
+    assert selection_params['cancel_token']
+    assert selection_params['model'] == 'qwen3-8b-instruct'
+    assert selection_params['context_tier'] == '8k-fast'
+    enqueue_payload = mock_enqueue.call_args.args[1]
+    assert enqueue_payload['request_id'] == selection_params['request_id']
+    assert enqueue_payload['cancel_token'] == selection_params['cancel_token']
+    assert enqueue_payload['reservation_token'] == 'reservation-proof'
+    assert enqueue_payload['requested_model'] == selection_params['model']
+    assert enqueue_payload['requested_context_tier'] == selection_params['context_tier']
+    assert enqueue_payload['request_deadline_epoch'] == 2_000_000_000
+    assert enqueue_payload['server_public_key'] == server_key
+    assert mock_retrieve.call_args.kwargs['json']['retrieval_credential'] == 'retrieval-proof'
 
 
 def test_retrieve_chat_response_error_list():

@@ -1,5 +1,6 @@
 """Focused route wiring coverage for the in-memory API-v1 relay state store."""
 
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -40,6 +41,57 @@ def _claim_for_control(client, *, request_id="control-request"):
     }).get_json()
     claim = relay._api_v1_store().active_claims(node)[0]
     return node, credential, poll, (queued, claim, reservation_token)
+
+
+def test_request_queued_event_is_once_only_and_privacy_safe(monkeypatch):
+    relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    log_info = Mock(wraps=relay.LOGGER.info)
+    monkeypatch.setattr(relay.LOGGER, "info", log_info)
+    node = "request-queued-node-public-key"
+    client_key = "request-queued-client-identity"
+    request_id = "request-queued-identity"
+    cancel_token = "request-queued-cancellation-proof"
+    registration = client.post("/api/v1/relay/servers/register", json={
+        "server_public_key": node,
+        "capabilities": {"supported_model_ids": ["qwen3-8b-instruct"], "active_context_tier": "8k-fast",
+                         "maximum_total_context_tokens": 8192, "default_output_token_reservation": 1024,
+                         "maximum_output_tokens": 1024, "max_concurrency": 1},
+    })
+    assert registration.status_code == 200
+    selection = client.get("/api/v1/relay/servers/next", query_string={
+        "client_public_key": client_key, "request_id": request_id,
+        "cancel_token": cancel_token,
+    }).get_json()
+    payload = {
+        "server_public_key": node, "client_public_key": client_key,
+        "request_id": request_id, "cancel_token": cancel_token,
+        "reservation_token": selection["reservation_token"],
+        "request_deadline_epoch": selection["request_deadline_epoch"],
+        "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+        "ciphertext": "request-queued-ciphertext", "cipherkey": "request-queued-key",
+        "iv": "request-queued-iv",
+    }
+
+    assert client.post("/api/v1/relay/requests", json=payload).status_code == 200
+    assert client.post("/api/v1/relay/requests", json=payload).status_code == 200
+
+    queued_calls = [call for call in log_info.call_args_list
+                    if call.args == ("relay.api_v1.request_queued",)]
+    assert len(queued_calls) == 1
+    metadata = queued_calls[0].kwargs["extra"]
+    assert metadata == {
+        "server_fingerprint": relay._safe_key_fingerprint(node),
+        "queue_depth": 1,
+    }
+    log_body = "relay.api_v1.request_queued" + json.dumps(metadata)
+    for secret in (
+        node, client_key, request_id, cancel_token, selection["reservation_token"],
+        registration.get_json()["control_credential"], "request-queued-ciphertext",
+        "request-queued-key", "request-queued-iv",
+    ):
+        assert secret not in log_body
 
 
 def test_api_v1_encrypted_journey_uses_authoritative_store():

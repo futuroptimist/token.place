@@ -3116,16 +3116,25 @@ def api_v1_relay_requests():
     deadline=data.get('request_deadline_epoch') or time.time()+_api_v1_request_deadline_seconds()
     token=data.get('reservation_token')
     try:
+        store = _api_v1_store()
         if not isinstance(token,str) or not token:
-            selection=_api_v1_store().select_and_reserve(client_key,request_id,model,tier,deadline,cancel)
+            selection=store.select_and_reserve(client_key,request_id,model,tier,deadline,cancel)
             token=selection.reservation_token
             if selection.selected_node_id != node or token is None:
                 raise RelayStateInvalidReservation('reservation invalid')
         protocol = data.get('protocol', 'tokenplace_api_v1_relay_e2ee')
         if protocol == 'e2ee_v1':
             protocol = 'tokenplace_api_v1_relay_e2ee'
-        result=_api_v1_store().enqueue_encrypted_request(client_key,request_id,token,node,model,tier,deadline,
+        result=store.enqueue_encrypted_request(client_key,request_id,token,node,model,tier,deadline,
             EncryptedRequestEnvelope(protocol,data.get('version',1),envelope['ciphertext'],envelope['cipherkey'],envelope['iv']),cancel)
+        if result.created:
+            LOGGER.info(
+                "relay.api_v1.request_queued",
+                extra={
+                    "server_fingerprint": _safe_key_fingerprint(node),
+                    "queue_depth": len(store.queued_requests(node)),
+                },
+            )
     except RelayStateInvalidReservation:
         return jsonify({'error': {'message': 'Invalid or stale reservation token', 'code': 'invalid_reservation'}}), 409
     except RelayStateConflict:

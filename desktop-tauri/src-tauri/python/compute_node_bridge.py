@@ -1764,7 +1764,7 @@ def run(args: argparse.Namespace) -> int:
             emit_operator_event(
                 build_status_payload(
                     event_type="status",
-                    running=True,
+                    running=False,
                     registered=False,
                     active_relay_url=runtime.relay_client.relay_url,
                     current_last_error=last_error,
@@ -1813,7 +1813,7 @@ def run(args: argparse.Namespace) -> int:
                 emit_operator_event(
                     build_status_payload(
                         event_type="status",
-                        running=True,
+                        running=False,
                         registered=False,
                         active_relay_url=runtime.relay_client.relay_url,
                         current_last_error=last_error,

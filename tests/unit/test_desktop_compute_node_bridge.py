@@ -6387,6 +6387,7 @@ def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monk
         if event.get('type') == 'status' and event.get('startup_phase') == 'warm_load'
     ]
     assert warming_status_events
+    assert all(event['running'] is False for event in warming_status_events)
     assert 'desktop.compute_node_bridge.model_init.still_warming' not in output.err
 
 
@@ -6475,6 +6476,7 @@ def test_warm_load_post_deadline_future_completion_treated_as_timeout(capsys, mo
         if e.get('type') == 'status' and e.get('startup_phase') == 'warm_load'
     ]
     assert timeout_status_events, "expected at least one warm_load status event from the timeout path"
+    assert all(event['running'] is False for event in timeout_status_events)
 
 
 def test_runtime_public_value_redacts_secret_path_diagnostics():

@@ -139,6 +139,82 @@ def test_api_v1_encrypted_journey_uses_authoritative_store():
     assert relay.client_responses == {}
 
 
+def test_response_success_events_are_once_only_bounded_and_privacy_safe(monkeypatch):
+    relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    log_info = Mock(wraps=relay.LOGGER.info)
+    monkeypatch.setattr(relay.LOGGER, "info", log_info)
+    node, credential, poll, (_, _, retrieval_credential) = _claim_for_control(
+        client, request_id="response-event-request"
+    )
+    response_payload = {
+        "server_public_key": node,
+        "control_credential": credential,
+        "claim_generation": poll["claim_generation"],
+        "client_public_key": poll["client_public_key"],
+        "request_id": poll["request_id"],
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "ciphertext": "response-event-ciphertext",
+        "cipherkey": "response-event-cipherkey",
+        "iv": "response-event-iv",
+    }
+
+    pending = client.post("/api/v1/relay/responses/retrieve", json={
+        "client_public_key": poll["client_public_key"],
+        "request_id": poll["request_id"],
+        "retrieval_credential": retrieval_credential,
+    })
+    rejected = client.post(
+        "/api/v1/relay/responses", json={**response_payload, "control_credential": "wrong"}
+    )
+    accepted = client.post("/api/v1/relay/responses", json=response_payload)
+    replay = client.post("/api/v1/relay/responses", json=response_payload)
+    retrieved = client.post("/api/v1/relay/responses/retrieve", json={
+        "client_public_key": poll["client_public_key"],
+        "request_id": poll["request_id"],
+        "retrieval_credential": retrieval_credential,
+    })
+
+    assert pending.status_code == 202
+    assert rejected.status_code == 403
+    assert accepted.status_code == 200
+    assert replay.status_code == 410
+    assert retrieved.status_code == 200
+    success_calls = [
+        call for call in log_info.call_args_list
+        if call.args and call.args[0] in {
+            "relay.api_v1.response_received",
+            "relay.api_v1.response_retrieved",
+        }
+    ]
+    assert [call.args[0] for call in success_calls] == [
+        "relay.api_v1.response_received",
+        "relay.api_v1.response_retrieved",
+    ]
+    expected_metadata = {
+        "client_fingerprint": relay._safe_key_fingerprint(poll["client_public_key"])
+    }
+    assert all(call.kwargs == {"extra": expected_metadata} for call in success_calls)
+    serialized_events = json.dumps([
+        {"event": call.args[0], **call.kwargs["extra"]} for call in success_calls
+    ])
+    for secret in (
+        node,
+        poll["client_public_key"],
+        poll["request_id"],
+        "control-cancel",
+        retrieval_credential,
+        credential,
+        retrieved.get_json()["acknowledgement_token"],
+        "response-event-ciphertext",
+        "response-event-cipherkey",
+        "response-event-iv",
+    ):
+        assert secret not in serialized_events
+
+
 @pytest.mark.parametrize("credential", [None, "", 7, "incorrect-proof"])
 def test_existing_registration_requires_caller_control_credential(credential):
     relay.app.config["TESTING"] = True

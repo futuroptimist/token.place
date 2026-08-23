@@ -3229,6 +3229,10 @@ def api_v1_relay_responses():
         return _store_failure_response()
     if result.new_outcome:
         _record_terminal_outcome("completed")
+        LOGGER.info(
+            "relay.api_v1.response_received",
+            extra={"client_fingerprint": _safe_key_fingerprint(client_key)},
+        )
     return jsonify({'message':'Response received and queued for client'}),200
 
 
@@ -3288,6 +3292,14 @@ def api_v1_relay_responses_retrieve():
         return jsonify({'status':'pending',**_api_v1_deadline_metadata_epoch(result.request_deadline_epoch),**({'encrypted_progress': {'client_public_key':data['client_public_key'],'request_id':data['request_id'],'protocol':progress.protocol,'version':progress.version,'ciphertext':progress.ciphertext,'cipherkey':progress.cipherkey,'iv':progress.iv}} if progress else {})}),202
     if result.state=='response_ready':
         env=result.envelope
+        LOGGER.info(
+            "relay.api_v1.response_retrieved",
+            extra={
+                "client_fingerprint": _safe_key_fingerprint(
+                    data['client_public_key']
+                )
+            },
+        )
         return jsonify({'client_public_key':data['client_public_key'],'request_id':data['request_id'],'protocol':env.protocol,'version':env.version,'ciphertext':env.ciphertext,'chat_history':env.ciphertext,'cipherkey':env.cipherkey,'iv':env.iv,'acknowledgement_token':result.acknowledgement_token}),200
     if result.state=='acknowledged': return jsonify({'status':'acknowledged'}),200
     if result.state in {'cancelled','expired','completed_unavailable','retrieval_expired'}:

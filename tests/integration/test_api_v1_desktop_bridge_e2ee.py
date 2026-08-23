@@ -490,15 +490,16 @@ def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_req
         assert first_no_work["message"] == "No requests available"
         store = relay._api_v1_store()
         assert store.get(server_key) is not None
-        register_spy = Mock(wraps=store.register)
-        monkeypatch.setattr(store, "register", register_spy)
+        renew_spy = Mock(wraps=store.renew)
+        monkeypatch.setattr(store, "renew", renew_spy)
 
         desktop_client._api_v1_last_heartbeat_at[base_url] -= 25.0
 
         renewed_no_work = desktop_client.poll_api_v1_encrypted_work()
         assert renewed_no_work["message"] == "No requests available"
         assert store.get(server_key) is not None
-        register_spy.assert_called_once()
+        renew_spy.assert_called_once()
+        assert renew_spy.call_args.args[0] == server_key
         assert requests.get(f"{base_url}/api/v1/relay/servers/next", timeout=2).status_code == 200
 
         monkeypatch.setattr(

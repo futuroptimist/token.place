@@ -3530,6 +3530,13 @@ def test_run_warm_load_success_starts_once_then_registers_and_keeps_polling(
     ]
     assert len(runtime_started) == 1
     started_index, started_payload = runtime_started[0]
+    pre_start_statuses = [
+        payload
+        for index, (kind, payload) in enumerate(timeline)
+        if index < started_index and kind == "event" and payload.get("type") == "status"
+    ]
+    assert pre_start_statuses
+    assert all(payload.get("running") is False for payload in pre_start_statuses)
     warm_completed_index = timeline.index(("warm_load", "completed"))
     first_poll_index = next(
         index for index, (kind, _value) in enumerate(timeline) if kind == "relay_poll"

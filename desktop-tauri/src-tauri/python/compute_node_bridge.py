@@ -763,12 +763,18 @@ def _relay_runtime_state(
 ) -> str:
     if warm_load_state == "failed":
         return "failed"
+    if not warm_load_enabled:
+        return "ready" if running else "stopped"
+    if warm_load_state == "not_started":
+        return "starting" if running else "stopped"
+    # Warm-load progress is meaningful before the runtime-ready handshake.
+    # Keep reporting that phase while ``running`` remains false so callers can
+    # distinguish provisioning from a stopped bridge without treating it as
+    # authoritative Running state.
+    if warm_load_state == "warming":
+        return "warming"
     if not running:
         return "stopped"
-    if not warm_load_enabled:
-        return "ready"
-    if warm_load_state == "not_started":
-        return "starting"
     return warm_load_state
 
 
@@ -1499,10 +1505,17 @@ def run(args: argparse.Namespace) -> int:
         return _sanitize_public_payload(payload)
 
     def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
+        # Status heartbeats emitted by the warm-load gate are progress only.
+        # Reporting them as running lets the native supervisor observe a
+        # transient Running state before the runtime-ready ``started`` event,
+        # after which a genuine warm-load failure looks like a Running
+        # regression.  Once warm-load is ready (or deliberately disabled),
+        # relay-poll status updates remain authoritative Running updates.
+        runtime_ready = not warm_load_enabled or warm_load_state == "ready"
         emit_operator_event(
             build_status_payload(
                 event_type="status",
-                running=True,
+                running=runtime_ready,
                 registered=registered,
                 active_relay_url=active_relay_url,
                 current_last_error=current_last_error,

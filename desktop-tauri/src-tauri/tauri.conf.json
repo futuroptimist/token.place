@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "token.place desktop",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "identifier": "place.token.desktop",
   "build": {
     "beforeBuildCommand": "npm run build",
@@ -30,6 +30,7 @@
       "python/desktop_runtime_setup.py": "python/desktop_runtime_setup.py",
       "python/requirements_desktop_runtime.txt": "python/requirements_desktop_runtime.txt",
       "python/compute_node_bridge.py": "python/compute_node_bridge.py",
+      "python/headless_admission.py": "python/headless_admission.py",
       "python/inference_sidecar.py": "python/inference_sidecar.py",
       "python/model_bridge.py": "python/model_bridge.py",
       "python/path_bootstrap.py": "python/path_bootstrap.py",

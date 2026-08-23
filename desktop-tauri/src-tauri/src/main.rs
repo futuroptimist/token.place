@@ -4,6 +4,7 @@ mod compute_node;
 mod config;
 mod context_profiles;
 pub mod forward;
+mod headless_admission;
 pub mod keygen;
 mod logging;
 mod operator_logs;
@@ -741,6 +742,11 @@ fn print_operator_session_smoke_json() -> Result<(), String> {
 }
 
 fn main() {
+    if headless_admission::is_requested(std::env::args_os()) {
+        std::process::exit(headless_admission::run(
+            std::env::args_os().skip(1).collect(),
+        ));
+    }
     if std::env::args().any(|arg| arg == "--build-identity-json") {
         if let Err(err) = print_build_identity_json() {
             eprintln!("{err}");

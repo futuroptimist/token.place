@@ -374,3 +374,22 @@ and must not run pip, reinstall `llama-cpp-python`, require network access, or
 silently fall back from Metal to CPU. Repair packages, when explicitly needed,
 remain in the writable app-data dependency target and are installed by invoking
 pip through the bundled interpreter rather than modifying `Contents/Resources`.
+
+## Headless installed CPU admission boundary
+
+An installed desktop package exposes a pre-Tauri command for CI and service sessions:
+
+```text
+token-place-desktop-tauri.exe --headless-cpu-admission --model=C:\models\model.gguf --backend=cpu --context-tier=8k-fast --startup-timeout-seconds=120 --operation-timeout-seconds=600
+```
+
+All options are explicit; the model must be an absolute existing file, the backend must be
+`cpu`, and the context tier must be a supported desktop tier. The command rejects development
+and mock Python runtimes. It resolves the bundled runtime and resources, warms the real model,
+and invokes production API v1 chat rendering/tokenization admission without starting a relay or
+GUI. It then releases the runtime and prints exactly one privacy-safe JSON record. Schema version
+`1` contains `success`, `last_completed_phase`, `failure_code`,
+`packaged_runtime_identity`, `selected_backend`, `warm_load`, and
+`authoritative_evidence`; exit code zero requires all fields to attest success. Paths, fixture text,
+tokens, and environment values are never included. Windows installed-package execution is
+intentionally deferred to the follow-up workflow and is not claimed here.

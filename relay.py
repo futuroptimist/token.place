@@ -3096,7 +3096,12 @@ def api_v1_relay_servers_control():
     if result.state == 'owner_mismatch':
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
     status={'continued':'active','missing_or_expired':'completed/unavailable','stale_generation':'completed/unavailable','acknowledged':'completed/unavailable'}.get(result.state,result.state)
-    _record_compute_control_state(status.replace('/', '_'))
+    metric_state = {
+        'continued': 'active',
+        'missing_or_expired': 'completed_unavailable',
+        'stale_generation': 'completed_unavailable',
+    }.get(result.state, result.state)
+    _record_compute_control_state(metric_state)
     if result.state == 'continued':
         _record_compute_control_lease_renewal()
     return jsonify({'status': status, 'next_poll_seconds': _bounded_control_next_poll_seconds(), **(_api_v1_deadline_metadata_epoch(request_deadline) if request_deadline else {})}), 200
@@ -3150,12 +3155,18 @@ def api_v1_relay_requests_cancel():
     data=request.get_json(silent=True)
     if not isinstance(data,dict) or not data.get('client_public_key') or not data.get('request_id'):
         return jsonify({'error': {'message':'Invalid request data','code':400}}),400
+    status = _sanitize_terminal_status(data.get('status'))
+    reason = 'request_deadline_expired' if status == 'expired' else 'requester_cancelled'
     try:
-        result=_api_v1_store().cancel_or_expire_request(data['client_public_key'],data['request_id'],data.get('cancel_token'),status=_sanitize_terminal_status(data.get('status')),reason=_sanitize_terminal_reason(data.get('reason'),_sanitize_terminal_status(data.get('status'))))
+        result=_api_v1_store().cancel_or_expire_request(data['client_public_key'],data['request_id'],data.get('cancel_token'),status=status,reason=reason)
     except RelayStateCredentialMismatch:
         return jsonify({'error': {'message':'Missing or invalid cancel proof','code':403}}),403
     except RelayStateStoreError:
         return _store_failure_response()
+    if result.state == 'invalid_cancellation_proof':
+        return jsonify({'error': {'message':'Missing or invalid cancel proof','code':403}}),403
+    if result.new_outcome:
+        _record_terminal_outcome(_terminal_outcome_from_status_reason(result.state, result.reason))
     return jsonify({'status':result.state,'request_id':data['request_id'],'removed_from_queue':result.new_outcome}),200
 
 @app.route('/api/v1/relay/responses', methods=['POST'])
@@ -3258,6 +3269,7 @@ def api_v1_relay_progress():
             or any(not isinstance(data.get(field), str) or not data.get(field)
                    for field in ('server_public_key', 'client_public_key', 'request_id', 'control_credential',
                                  'ciphertext', 'cipherkey', 'iv'))):
+        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_schema"})
         return jsonify({'error': {'message':'Invalid encrypted progress schema','code':400}}),400
     node=data['server_public_key']; client_key=data['client_public_key']; request_id=data['request_id']
     protocol = ('tokenplace_api_v1_relay_e2ee'
@@ -3267,15 +3279,19 @@ def api_v1_relay_progress():
         store = _api_v1_store()
         claim=next((c for c in store.active_claims(node) if c.client_identity_digest==cd and c.request_identity_digest==rd),None)
         if claim is None:
+            LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_lifecycle"})
             return jsonify({'error': {'message':'Progress request is not active for this owner','code':410}}),410
         result=store.replace_encrypted_progress_if_claimed(node,_credential_digest(data['control_credential']),node,client_key,request_id,claim.generation,
             EncryptedProgressEnvelope(protocol,data['version'],data['ciphertext'],data['cipherkey'],data['iv']))
     except RelayStateCredentialMismatch:
+        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_auth"})
         return jsonify({'error': {'message':'Missing or invalid relay server control credential','code':403}}),403
     except RelayStateConflict:
+        LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": "rejected_lifecycle"})
         return jsonify({'error': {'message':'Progress request is not active for this owner','code':410}}),410
     except RelayStateStoreError:
         return _store_failure_response()
+    LOGGER.info("relay.api_v1.progress", extra={"progress_outcome": result.state})
     return jsonify({'message':'Encrypted progress accepted'}),202
 
 @app.route('/api/v1/relay/responses/retrieve', methods=['POST'])

@@ -3578,38 +3578,45 @@ def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_sc
     guard = _load_windows_installer_identity()
     current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
     current_nsis.write_text('artifact', encoding='utf-8')
+    model = tmp_path / 'tiny.gguf'
+    model.write_text('model', encoding='utf-8')
     artifact_dir = tmp_path / 'logs'
     calls = []
     monkeypatch.setattr(guard.sys, 'platform', 'win32')
-    monkeypatch.setattr(guard, 'run_scenario', lambda scenario, build_id, artifacts=None: calls.append((scenario, build_id, artifacts)))
+    monkeypatch.setattr(guard, 'run_scenario', lambda scenario, build_id, artifacts=None, tokenizer_boundary_model=None: calls.append((scenario, build_id, artifacts, tokenizer_boundary_model)))
     monkeypatch.setattr(sys, 'argv', [
         'test_windows_installer_identity.py',
         '--pr-current-windows-nsis', str(current_nsis),
         '--expected-version', '0.1.5',
         '--expected-build-id', 'abcdef123456',
         '--artifact-dir', str(artifact_dir),
+        '--tokenizer-boundary-model', str(model),
     ])
 
     assert guard.main() == 0
     assert len(calls) == 1
-    scenario, build_id, artifacts = calls[0]
+    scenario, build_id, artifacts, boundary_model = calls[0]
     assert scenario.name == 'pr-clean-current-nsis-0.1.5'
     assert scenario.current.kind == 'nsis'
     assert scenario.previous is None
     assert build_id == 'abcdef123456'
     assert artifacts.root == artifact_dir
+    assert boundary_model == model.resolve()
 
 
 def test_windows_installer_identity_current_package_validates_contract_off_windows(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
     current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
     current_nsis.write_text('artifact', encoding='utf-8')
+    model = tmp_path / 'tiny.gguf'
+    model.write_text('model', encoding='utf-8')
     monkeypatch.setattr(guard.sys, 'platform', 'linux')
     monkeypatch.setattr(sys, 'argv', [
         'test_windows_installer_identity.py',
         '--pr-current-windows-nsis', str(current_nsis),
         '--expected-version', '0.1.5',
         '--expected-build-id', 'abcdef123456',
+        '--tokenizer-boundary-model', str(model),
     ])
 
     assert guard.main() == 0
@@ -3671,11 +3678,48 @@ def test_windows_packaged_start_workflow_builds_and_validates_current_nsis() -> 
 
 def test_windows_packaged_start_workflow_cannot_be_only_filtered_cargo_tests() -> None:
     workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
-    packaged_gate = workflow.split('- name: Hosted-Windows packaged-start gate for installed current package', 1)[1]
+    packaged_gate = workflow.split('- name: Validate installed-package headless CPU admission and package identity', 1)[1]
 
     assert 'test_windows_installer_identity.py' in packaged_gate
     assert '--pr-current-windows-nsis' in packaged_gate
     assert 'cargo test' not in packaged_gate.split('- name:', 1)[0]
+
+
+def _headless_success_result() -> dict[str, object]:
+    return {
+        'schema_version': 1, 'success': True,
+        'last_completed_phase': 'cleanup_completed', 'failure_code': 'none',
+        'packaged_runtime_identity': 'validated', 'selected_backend': 'cpu',
+        'warm_load_result': 'ready', 'authoritative_evidence_result': 'validated',
+    }
+
+
+def test_windows_installer_identity_headless_command_and_strict_result(tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    command = guard.build_headless_cpu_admission_command(Path('installed.exe'), tmp_path / 'tiny.gguf')
+    assert command == [
+        'installed.exe', '--headless-cpu-admission', '--model', str(tmp_path / 'tiny.gguf'),
+        '--backend', 'cpu', '--context-tier', '8k-fast',
+        '--startup-timeout-seconds', '300', '--operation-timeout-seconds', '600',
+    ]
+    payload = _headless_success_result()
+    assert guard.validate_headless_cpu_admission_result(json.dumps(payload) + '\n', 0) == payload
+    for stdout, code in [('', 0), ('{}\n{}\n', 0), ('not-json\n', 0), (json.dumps(payload), 1)]:
+        with pytest.raises(guard.InstallerIdentityError):
+            guard.validate_headless_cpu_admission_result(stdout, code)
+    contradictory = {**payload, 'success': False}
+    with pytest.raises(guard.InstallerIdentityError):
+        guard.validate_headless_cpu_admission_result(json.dumps(contradictory), 0)
+
+
+def test_windows_installer_identity_headless_artifact_is_privacy_safe(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    secret = 'private-model-path-and-fixture'
+    monkeypatch.setattr(guard.subprocess, 'run', lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 9, secret, secret))
+    artifact = tmp_path / 'headless.json'
+    with pytest.raises(guard.InstallerIdentityError):
+        guard.run_headless_cpu_admission(Path('installed.exe'), Path(secret), artifact)
+    assert secret not in artifact.read_text(encoding='utf-8')
 
 
 def test_windows_installer_identity_rejects_duplicate_previous_artifact(tmp_path) -> None:

@@ -17,6 +17,8 @@ on:
       - 'desktop-tauri/src-tauri/python/**'
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
+      - 'desktop-tauri/scripts/test_windows_installer_identity.py'
+      - 'scripts/provision-ci-tiny-gguf.sh'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
@@ -41,6 +43,8 @@ on:
       - 'desktop-tauri/src-tauri/python/**'
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
+      - 'desktop-tauri/scripts/test_windows_installer_identity.py'
+      - 'scripts/provision-ci-tiny-gguf.sh'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
@@ -194,6 +198,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r config/requirements_codex_verification.txt
 
+      - name: Restore cached checksum-pinned tiny GGUF for installed CPU admission
+        uses: actions/cache@v4
+        with:
+          path: .ci-models/stories15M-q4_0.gguf
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
+
+      - name: Provision checksum-pinned tiny GGUF for installed CPU admission
+        shell: bash
+        env:
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+        run: bash scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
+
       - name: Run long-context benchmark harness unit contracts
         run: python -m pytest -q -p no:cacheprovider tests/unit/test_long_context_benchmark_harness.py
 
@@ -260,7 +276,7 @@ jobs:
         working-directory: desktop-tauri
         run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
 
-      - name: Hosted-Windows packaged-start gate for installed current package
+      - name: Validate installed-package headless CPU admission and package identity
         shell: pwsh
         run: |
           $installers = @(Get-ChildItem 'desktop-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis' -Filter '*-setup.exe' -File)
@@ -272,6 +288,7 @@ jobs:
             --pr-current-windows-nsis $installers[0].FullName `
             --expected-version $version `
             --expected-build-id $buildId `
+            --tokenizer-boundary-model "${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf" `
             --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

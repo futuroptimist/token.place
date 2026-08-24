@@ -33,6 +33,9 @@ APP_PROCESS_NAMES = ("token.place", "tokenplace", "token-place")
 ACCEPTABLE_UNINSTALL_EXIT_CODES = frozenset({0, 1605, 1614, 3010})
 WINDOWS_UNINSTALL_CLEANUP_TIMEOUT_SECONDS = 90.0
 WINDOWS_UNINSTALL_REINVENTORY_PASSES = 3
+HEADLESS_STARTUP_TIMEOUT_SECONDS = 300
+HEADLESS_OPERATION_TIMEOUT_SECONDS = 600
+HEADLESS_OUTER_TIMEOUT_SECONDS = 930
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 EXPECTED_LLAMA_CPP_VERSION = "0.3.32"
 EXPECTED_LLAMA_CPP_WHEEL = "llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
@@ -146,6 +149,64 @@ class InstalledResourceManifest:
 
 class InstallerIdentityError(AssertionError):
     pass
+
+
+def build_headless_cpu_admission_command(exe: Path, model: Path) -> list[str]:
+    return [
+        str(exe), "--headless-cpu-admission", "--model", str(model),
+        "--backend", "cpu", "--context-tier", "8k-fast",
+        "--startup-timeout-seconds", str(HEADLESS_STARTUP_TIMEOUT_SECONDS),
+        "--operation-timeout-seconds", str(HEADLESS_OPERATION_TIMEOUT_SECONDS),
+    ]
+
+
+def validate_headless_cpu_admission_result(stdout: str, returncode: int) -> dict[str, object]:
+    lines = stdout.splitlines()
+    if len(lines) != 1 or not lines[0].strip():
+        raise InstallerIdentityError("installed headless CPU admission returned invalid terminal output")
+    try:
+        result = json.loads(lines[0])
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise InstallerIdentityError("installed headless CPU admission returned invalid terminal output") from exc
+    expected = {
+        "schema_version": 1,
+        "success": True,
+        "last_completed_phase": "cleanup_completed",
+        "failure_code": "none",
+        "packaged_runtime_identity": "validated",
+        "selected_backend": "cpu",
+        "warm_load_result": "ready",
+        "authoritative_evidence_result": "validated",
+    }
+    if not isinstance(result, dict) or returncode != 0 or any(result.get(k) != v for k, v in expected.items()):
+        raise InstallerIdentityError("installed headless CPU admission did not report coherent schema-v1 success")
+    return result
+
+
+def run_headless_cpu_admission(exe: Path, model: Path, artifact_path: Path | None = None) -> None:
+    evidence: dict[str, object] = {"schema_version": 1, "status": "failed"}
+    try:
+        completed = subprocess.run(
+            build_headless_cpu_admission_command(exe, model), check=False, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=HEADLESS_OUTER_TIMEOUT_SECONDS,
+        )
+        result = validate_headless_cpu_admission_result(completed.stdout, completed.returncode)
+        evidence = {key: result[key] for key in (
+            "schema_version", "success", "last_completed_phase", "failure_code",
+            "packaged_runtime_identity", "selected_backend", "warm_load_result",
+            "authoritative_evidence_result",
+        )}
+    except subprocess.TimeoutExpired as exc:
+        evidence["failure_code"] = "outer_timeout"
+        raise InstallerIdentityError("installed headless CPU admission exceeded its bounded outer timeout") from exc
+    except InstallerIdentityError:
+        evidence["failure_code"] = "invalid_terminal_result"
+        raise
+    finally:
+        if artifact_path is not None:
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_text(json.dumps(evidence, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _run(
@@ -1043,7 +1104,7 @@ def is_actionable_competing_installer_rejection(result: subprocess.CompletedProc
     return result.returncode != 0 and ("competing" in text or "existing installation" in text or "remove" in text) and ("token.place" in text or "token place" in text or "token-place" in text)
 
 
-def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: ScenarioArtifactDir | None = None) -> None:
+def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: ScenarioArtifactDir | None = None, tokenizer_boundary_model: Path | None = None) -> None:
     _terminate_processes()
     uninstall_best_effort()
     config_path: Path | None = None
@@ -1074,6 +1135,11 @@ def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: Scena
             shortcut = resolve_authoritative_shortcut(scenario.previous.version if scenario.previous else None)
             _assert_runtime(shortcut.target)
             probe_identity(shortcut.target, env, scenario.current.version, expected_build_id)
+            if tokenizer_boundary_model is not None:
+                run_headless_cpu_admission(
+                    shortcut.target, tokenizer_boundary_model,
+                    artifact_dir.path(scenario.name, "headless-cpu-admission") if artifact_dir else None,
+                )
             record = assert_operator_record(launch_for_operator_record(shortcut.target, env, artifact_dir.path(scenario.name, "operator-smoke") if artifact_dir else None))
             if config_path is not None:
                 verify_config_preserved(config_path, seeded)
@@ -1127,20 +1193,25 @@ def main() -> int:
     parser.add_argument("--expected-version", default=EXPECTED_VERSION)
     parser.add_argument("--expected-build-id", required=True)
     parser.add_argument("--artifact-dir", type=Path, default=None)
+    parser.add_argument("--tokenizer-boundary-model", type=Path, default=None)
     args = parser.parse_args()
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
     if args.pr_current_windows_nsis is not None:
         if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)):
             raise InstallerIdentityError("--pr-current-windows-nsis cannot be combined with full release scenario arguments")
+        if args.tokenizer_boundary_model is None or not args.tokenizer_boundary_model.is_file():
+            raise InstallerIdentityError("--pr-current-windows-nsis requires an existing --tokenizer-boundary-model file")
         scenario = build_current_package_scenario(args.pr_current_windows_nsis, args.expected_version)
         if sys.platform != "win32":
             print("validated current-package Windows NSIS PR-gate contract; real install runs only on hosted Windows")
             return 0
         artifacts = ScenarioArtifactDir(args.artifact_dir) if args.artifact_dir else None
-        run_scenario(scenario, args.expected_build_id, artifacts)
+        run_scenario(scenario, args.expected_build_id, artifacts, args.tokenizer_boundary_model.resolve())
         print(f"validated current-package Windows NSIS for {args.expected_version} build {args.expected_build_id}")
         return 0
+    if args.tokenizer_boundary_model is not None:
+        raise InstallerIdentityError("--tokenizer-boundary-model is only valid with --pr-current-windows-nsis")
     required = {
         "--windows-nsis": args.windows_nsis,
         "--windows-msi": args.windows_msi,

@@ -3578,38 +3578,45 @@ def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_sc
     guard = _load_windows_installer_identity()
     current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
     current_nsis.write_text('artifact', encoding='utf-8')
+    model = tmp_path / 'tiny.gguf'
+    model.write_text('model', encoding='utf-8')
     artifact_dir = tmp_path / 'logs'
     calls = []
     monkeypatch.setattr(guard.sys, 'platform', 'win32')
-    monkeypatch.setattr(guard, 'run_scenario', lambda scenario, build_id, artifacts=None: calls.append((scenario, build_id, artifacts)))
+    monkeypatch.setattr(guard, 'run_scenario', lambda scenario, build_id, artifacts=None, tokenizer_boundary_model=None: calls.append((scenario, build_id, artifacts, tokenizer_boundary_model)))
     monkeypatch.setattr(sys, 'argv', [
         'test_windows_installer_identity.py',
         '--pr-current-windows-nsis', str(current_nsis),
         '--expected-version', '0.1.5',
         '--expected-build-id', 'abcdef123456',
+        '--tokenizer-boundary-model', str(model),
         '--artifact-dir', str(artifact_dir),
     ])
 
     assert guard.main() == 0
     assert len(calls) == 1
-    scenario, build_id, artifacts = calls[0]
+    scenario, build_id, artifacts, boundary_model = calls[0]
     assert scenario.name == 'pr-clean-current-nsis-0.1.5'
     assert scenario.current.kind == 'nsis'
     assert scenario.previous is None
     assert build_id == 'abcdef123456'
     assert artifacts.root == artifact_dir
+    assert boundary_model == model.resolve()
 
 
 def test_windows_installer_identity_current_package_validates_contract_off_windows(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
     current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
     current_nsis.write_text('artifact', encoding='utf-8')
+    model = tmp_path / 'tiny.gguf'
+    model.write_text('model', encoding='utf-8')
     monkeypatch.setattr(guard.sys, 'platform', 'linux')
     monkeypatch.setattr(sys, 'argv', [
         'test_windows_installer_identity.py',
         '--pr-current-windows-nsis', str(current_nsis),
         '--expected-version', '0.1.5',
         '--expected-build-id', 'abcdef123456',
+        '--tokenizer-boundary-model', str(model),
     ])
 
     assert guard.main() == 0
@@ -3637,9 +3644,34 @@ def test_windows_installer_identity_rejects_invalid_current_package_arguments(mo
 
     monkeypatch.setattr(sys, 'argv', [
         'test_windows_installer_identity.py',
+        '--pr-current-windows-nsis', str(current_nsis),
+        '--expected-build-id', 'abcdef123456',
+    ])
+    with pytest.raises(guard.InstallerIdentityError, match='tokenizer-boundary-model is required'):
+        guard.main()
+
+    monkeypatch.setattr(sys, 'argv', [
+        'test_windows_installer_identity.py',
+        '--pr-current-windows-nsis', str(current_nsis),
+        '--tokenizer-boundary-model', str(tmp_path / 'missing.gguf'),
+        '--expected-build-id', 'abcdef123456',
+    ])
+    with pytest.raises(guard.InstallerIdentityError, match='existing model file'):
+        guard.main()
+
+    monkeypatch.setattr(sys, 'argv', [
+        'test_windows_installer_identity.py',
         '--expected-build-id', 'abcdef123456',
     ])
     with pytest.raises(guard.InstallerIdentityError, match='full release validation requires'):
+        guard.main()
+
+    monkeypatch.setattr(sys, 'argv', [
+        'test_windows_installer_identity.py',
+        '--tokenizer-boundary-model', str(current_nsis),
+        '--expected-build-id', 'abcdef123456',
+    ])
+    with pytest.raises(guard.InstallerIdentityError, match='only valid'):
         guard.main()
 
 
@@ -3666,16 +3698,130 @@ def test_windows_packaged_start_workflow_builds_and_validates_current_nsis() -> 
     assert 'prepare_windows_embedded_python_runtime.py' in workflow
     assert 'tauri build -- --target x86_64-pc-windows-msvc --bundles nsis' in workflow
     assert '--pr-current-windows-nsis' in workflow
+    assert '--tokenizer-boundary-model' in workflow
+    assert 'scripts/provision-ci-tiny-gguf.sh' in workflow
+    assert workflow.count("'scripts/provision-ci-tiny-gguf.sh'") == 2
+    assert workflow.count("'desktop-tauri/scripts/test_windows_installer_identity.py'") == 2
     assert '--operator-start-preflight' in Path('desktop-tauri/scripts/test_windows_installer_identity.py').read_text(encoding='utf-8')
 
 
 def test_windows_packaged_start_workflow_cannot_be_only_filtered_cargo_tests() -> None:
     workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
-    packaged_gate = workflow.split('- name: Hosted-Windows packaged-start gate for installed current package', 1)[1]
+    packaged_gate = workflow.split('- name: Validate installed-package headless CPU admission and package identity', 1)[1]
 
     assert 'test_windows_installer_identity.py' in packaged_gate
     assert '--pr-current-windows-nsis' in packaged_gate
+    assert '--tokenizer-boundary-model' in packaged_gate
     assert 'cargo test' not in packaged_gate.split('- name:', 1)[0]
+
+
+def test_windows_headless_package_gate_preserves_downstream_checks_without_webdriver() -> None:
+    workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
+    windows = workflow.split('  desktop-operator-packaged-e2e-windows:', 1)[1].split(
+        '  desktop-operator-packaged-inspect-python39-linux:', 1
+    )[0]
+    lowered = windows.lower()
+    for forbidden in ('selenium', 'tauri-driver', 'edgedriver', 'webview2'):
+        assert forbidden not in lowered
+    ordered = (
+        'Build current-head Windows NSIS release package',
+        'Provision tiny GGUF for installed headless CPU admission',
+        'Validate installed-package headless CPU admission and package identity',
+        'Run shared desktop parity checks (Windows)',
+        'Run Windows CUDA capability handoff regressions (fakes)',
+    )
+    positions = [windows.index(name) for name in ordered]
+    assert positions == sorted(positions)
+    assert 'cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml' in windows
+
+
+def _headless_cpu_success_result() -> dict[str, object]:
+    return {
+        'schema_version': 1,
+        'success': True,
+        'last_completed_phase': 'cleanup_completed',
+        'failure_code': 'none',
+        'packaged_runtime_identity': 'validated',
+        'selected_backend': 'cpu',
+        'warm_load_result': 'ready',
+        'authoritative_evidence_result': 'validated',
+    }
+
+
+def test_windows_installer_identity_headless_cpu_command_is_exact_and_bounded(tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    exe = tmp_path / 'token-place-desktop-tauri.exe'
+    model = tmp_path / 'tiny.gguf'
+
+    assert guard.headless_cpu_admission_command(exe, model) == [
+        str(exe), '--headless-cpu-admission', '--model', str(model), '--backend', 'cpu',
+        '--context-tier', '8k-fast', '--startup-timeout-seconds', '300',
+        '--operation-timeout-seconds', '600',
+    ]
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda value: value.pop('warm_load_result'),
+    lambda value: value.update(schema_version=2),
+    lambda value: value.update(success=False),
+    lambda value: value.update(failure_code='warm_load_failed'),
+    lambda value: value.update(selected_backend='gpu'),
+    lambda value: value.update(packaged_runtime_identity='failed'),
+    lambda value: value.update(authoritative_evidence_result='failed'),
+    lambda value: value.update(last_completed_phase='warm_load_completed'),
+    lambda value: value.update(extra='unsupported'),
+])
+def test_windows_installer_identity_headless_cpu_schema_fails_closed(mutation) -> None:
+    guard = _load_windows_installer_identity()
+    result = _headless_cpu_success_result()
+    mutation(result)
+    with pytest.raises(guard.InstallerIdentityError):
+        guard.validate_headless_cpu_admission_result(json.dumps(result), 0)
+
+
+@pytest.mark.parametrize('stdout', ['', '{', '[]', '{}', json.dumps(_headless_cpu_success_result()) + '\n{}'])
+def test_windows_installer_identity_headless_cpu_rejects_missing_malformed_or_extra_stdout(stdout) -> None:
+    guard = _load_windows_installer_identity()
+    with pytest.raises(guard.InstallerIdentityError):
+        guard.validate_headless_cpu_admission_result(stdout, 0)
+
+
+def test_windows_installer_identity_headless_cpu_exit_and_privacy_safe_artifact(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    model = tmp_path / 'private-model-path.gguf'
+    artifact = tmp_path / 'artifacts' / 'result.json'
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(_headless_cpu_success_result()), 'private fixture stderr')
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    assert guard.run_headless_cpu_admission(tmp_path / 'installed.exe', model, {}, artifact)['success'] is True
+    assert calls[0][1]['separate_stderr'] is True
+    assert calls[0][1]['timeout'] == 930
+    evidence = artifact.read_text(encoding='utf-8')
+    assert 'private-model-path' not in evidence
+    assert 'private fixture stderr' not in evidence
+    assert json.loads(evidence)['terminal_result'] == _headless_cpu_success_result()
+
+    failure = {**_headless_cpu_success_result(), 'success': False, 'last_completed_phase': 'warm_load_completed',
+               'failure_code': 'authoritative_evidence_failed', 'authoritative_evidence_result': 'failed'}
+    monkeypatch.setattr(guard, '_run', lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 7, json.dumps(failure), ''))
+    with pytest.raises(guard.InstallerIdentityError, match='agree with exit code 0'):
+        guard.run_headless_cpu_admission(tmp_path / 'installed.exe', model, {}, artifact)
+    assert json.loads(artifact.read_text(encoding='utf-8'))['terminal_result'] == failure
+
+
+def test_windows_installer_identity_headless_cpu_timeout_is_concise_and_safe(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    artifact = tmp_path / 'result.json'
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(args[0], 930, output='private output')))
+    with pytest.raises(guard.InstallerIdentityError, match='bounded outer timeout'):
+        guard.run_headless_cpu_admission(tmp_path / 'installed.exe', tmp_path / 'secret.gguf', {}, artifact)
+    evidence = artifact.read_text(encoding='utf-8')
+    assert 'secret.gguf' not in evidence
+    assert 'private output' not in evidence
 
 
 def test_windows_installer_identity_rejects_duplicate_previous_artifact(tmp_path) -> None:

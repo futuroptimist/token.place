@@ -33,6 +33,30 @@ APP_PROCESS_NAMES = ("token.place", "tokenplace", "token-place")
 ACCEPTABLE_UNINSTALL_EXIT_CODES = frozenset({0, 1605, 1614, 3010})
 WINDOWS_UNINSTALL_CLEANUP_TIMEOUT_SECONDS = 90.0
 WINDOWS_UNINSTALL_REINVENTORY_PASSES = 3
+HEADLESS_CPU_STARTUP_TIMEOUT_SECONDS = 300
+HEADLESS_CPU_OPERATION_TIMEOUT_SECONDS = 600
+HEADLESS_CPU_OUTER_ALLOWANCE_SECONDS = 30
+HEADLESS_CPU_RESULT_KEYS = frozenset({
+    "schema_version",
+    "success",
+    "last_completed_phase",
+    "failure_code",
+    "packaged_runtime_identity",
+    "selected_backend",
+    "warm_load_result",
+    "authoritative_evidence_result",
+})
+HEADLESS_CPU_FAILURE_CODES = frozenset({
+    "none",
+    "invalid_arguments",
+    "packaged_runtime_identity_failed",
+    "unsupported_backend",
+    "mock_runtime_rejected",
+    "bridge_exited_before_startup_event",
+    "warm_load_failed",
+    "authoritative_evidence_failed",
+    "cleanup_failed",
+})
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 EXPECTED_LLAMA_CPP_VERSION = "0.3.32"
 EXPECTED_LLAMA_CPP_WHEEL = "llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
@@ -886,6 +910,123 @@ def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expect
     raise InstallerIdentityError(f"installed executable did not report expected version/build identity through an automation-safe probe: {last[-1000:]}")
 
 
+def headless_cpu_admission_command(exe: Path, model: Path) -> list[str]:
+    return [
+        str(exe),
+        "--headless-cpu-admission",
+        "--model",
+        str(model),
+        "--backend",
+        "cpu",
+        "--context-tier",
+        "8k-fast",
+        "--startup-timeout-seconds",
+        str(HEADLESS_CPU_STARTUP_TIMEOUT_SECONDS),
+        "--operation-timeout-seconds",
+        str(HEADLESS_CPU_OPERATION_TIMEOUT_SECONDS),
+    ]
+
+
+def validate_headless_cpu_admission_result(stdout: str, returncode: int) -> dict[str, object]:
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise InstallerIdentityError("installed headless CPU admission emitted malformed or extra stdout") from exc
+    if not isinstance(result, dict) or set(result) != HEADLESS_CPU_RESULT_KEYS:
+        raise InstallerIdentityError("installed headless CPU admission emitted an incomplete or unsupported schema")
+    expected_types = {
+        "schema_version": int,
+        "success": bool,
+        "last_completed_phase": str,
+        "failure_code": str,
+        "packaged_runtime_identity": str,
+        "selected_backend": str,
+        "warm_load_result": str,
+        "authoritative_evidence_result": str,
+    }
+    if any(type(result[key]) is not value_type for key, value_type in expected_types.items()):
+        raise InstallerIdentityError("installed headless CPU admission emitted invalid schema field types")
+    success = (
+        result["schema_version"] == 1
+        and result["success"] is True
+        and result["last_completed_phase"] == "cleanup_completed"
+        and result["failure_code"] == "none"
+        and result["packaged_runtime_identity"] == "validated"
+        and result["selected_backend"] == "cpu"
+        and result["warm_load_result"] == "ready"
+        and result["authoritative_evidence_result"] == "validated"
+    )
+    if returncode != 0 or not success:
+        raise InstallerIdentityError("installed headless CPU admission result did not agree with exit code 0")
+    return result
+
+
+def _privacy_safe_headless_terminal(stdout: str) -> dict[str, object] | None:
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(result, dict) or set(result) != HEADLESS_CPU_RESULT_KEYS:
+        return None
+    if (
+        type(result["schema_version"]) is not int
+        or type(result["success"]) is not bool
+        or any(type(result[key]) is not str for key in HEADLESS_CPU_RESULT_KEYS - {"schema_version", "success"})
+        or result["schema_version"] != 1
+        or result["last_completed_phase"] not in {
+            "arguments_validated", "runtime_identity_validated", "warm_load_completed", "cleanup_completed"
+        }
+        or result["failure_code"] not in HEADLESS_CPU_FAILURE_CODES
+        or result["packaged_runtime_identity"] not in {"failed", "validated"}
+        or result["selected_backend"] != "cpu"
+        or result["warm_load_result"] not in {"not_started", "ready"}
+        or result["authoritative_evidence_result"] not in {"failed", "validated"}
+    ):
+        return None
+    return result
+
+
+def run_headless_cpu_admission(
+    exe: Path,
+    model: Path,
+    env: dict[str, str],
+    artifact_path: Path | None = None,
+) -> dict[str, object]:
+    command = headless_cpu_admission_command(exe, model)
+    timeout = (
+        HEADLESS_CPU_STARTUP_TIMEOUT_SECONDS
+        + HEADLESS_CPU_OPERATION_TIMEOUT_SECONDS
+        + HEADLESS_CPU_OUTER_ALLOWANCE_SECONDS
+    )
+    result: subprocess.CompletedProcess[str] | None = None
+    terminal: dict[str, object] | None = None
+    error: InstallerIdentityError | None = None
+    try:
+        result = _run(command, env=env, timeout=timeout, check=False, separate_stderr=True)
+        terminal = _privacy_safe_headless_terminal(result.stdout)
+        try:
+            validate_headless_cpu_admission_result(result.stdout, result.returncode)
+        except InstallerIdentityError as exc:
+            error = exc
+    except subprocess.TimeoutExpired:
+        error = InstallerIdentityError("installed headless CPU admission exceeded its bounded outer timeout")
+    if artifact_path is not None:
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence: dict[str, object] = {
+            "command": "headless-cpu-admission",
+            "exit_code": result.returncode if result is not None else None,
+            "stderr_present": bool(result and result.stderr),
+            "timed_out": result is None,
+        }
+        if terminal is not None:
+            evidence["terminal_result"] = terminal
+        artifact_path.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+    if error is not None:
+        raise error
+    assert terminal is not None
+    return terminal
+
+
 def launch_for_operator_record(exe: Path, env: dict[str, str], log_path: Path | None = None) -> str:
     # Uses --operator-start-preflight-cpu-smoke, not --operator-start-preflight:
     # this script runs on hosted Windows runners with no NVIDIA GPU/driver
@@ -1043,7 +1184,12 @@ def is_actionable_competing_installer_rejection(result: subprocess.CompletedProc
     return result.returncode != 0 and ("competing" in text or "existing installation" in text or "remove" in text) and ("token.place" in text or "token place" in text or "token-place" in text)
 
 
-def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: ScenarioArtifactDir | None = None) -> None:
+def run_scenario(
+    scenario: Scenario,
+    expected_build_id: str,
+    artifact_dir: ScenarioArtifactDir | None = None,
+    tokenizer_boundary_model: Path | None = None,
+) -> None:
     _terminate_processes()
     uninstall_best_effort()
     config_path: Path | None = None
@@ -1081,6 +1227,13 @@ def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: Scena
                     if str(record.get(key)) != str(seeded[key]):
                         raise InstallerIdentityError(f"operator smoke did not preserve seeded config field {key}")
             validate_installed_context_tiers(shortcut.target, env, artifact_dir, scenario.name)
+            if tokenizer_boundary_model is not None:
+                run_headless_cpu_admission(
+                    shortcut.target,
+                    tokenizer_boundary_model,
+                    env,
+                    artifact_dir.path(scenario.name, "headless-cpu-admission") if artifact_dir else None,
+                )
             if sentinel_log.exists() and sentinel_log.read_text(encoding="utf-8").strip():
                 raise InstallerIdentityError("host tool/Python sentinel was invoked during installed-app validation")
         finally:
@@ -1127,20 +1280,32 @@ def main() -> int:
     parser.add_argument("--expected-version", default=EXPECTED_VERSION)
     parser.add_argument("--expected-build-id", required=True)
     parser.add_argument("--artifact-dir", type=Path, default=None)
+    parser.add_argument(
+        "--tokenizer-boundary-model",
+        type=Path,
+        default=None,
+        help="Tiny checksum-pinned GGUF required by the current-package headless CPU admission gate.",
+    )
     args = parser.parse_args()
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
     if args.pr_current_windows_nsis is not None:
         if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)):
             raise InstallerIdentityError("--pr-current-windows-nsis cannot be combined with full release scenario arguments")
+        if args.tokenizer_boundary_model is None:
+            raise InstallerIdentityError("--tokenizer-boundary-model is required with --pr-current-windows-nsis")
+        if not args.tokenizer_boundary_model.is_file():
+            raise InstallerIdentityError("--tokenizer-boundary-model must name an existing model file")
         scenario = build_current_package_scenario(args.pr_current_windows_nsis, args.expected_version)
         if sys.platform != "win32":
             print("validated current-package Windows NSIS PR-gate contract; real install runs only on hosted Windows")
             return 0
         artifacts = ScenarioArtifactDir(args.artifact_dir) if args.artifact_dir else None
-        run_scenario(scenario, args.expected_build_id, artifacts)
+        run_scenario(scenario, args.expected_build_id, artifacts, args.tokenizer_boundary_model.resolve())
         print(f"validated current-package Windows NSIS for {args.expected_version} build {args.expected_build_id}")
         return 0
+    if args.tokenizer_boundary_model is not None:
+        raise InstallerIdentityError("--tokenizer-boundary-model is only valid with --pr-current-windows-nsis")
     required = {
         "--windows-nsis": args.windows_nsis,
         "--windows-msi": args.windows_msi,

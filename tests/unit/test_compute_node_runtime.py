@@ -7,6 +7,7 @@ import pytest
 
 from utils.compute_node_runtime import (
     ApiV1RelayRequestAdapter,
+    authoritative_readiness_fixture,
     apply_compute_mode,
     ComputeNodeRuntime,
     ComputeNodeRuntimeConfig,
@@ -25,6 +26,14 @@ from utils.compute_node_runtime import (
     _safe_completion_smoke_worker_diagnostics,
     _qwen_64k_readiness_profile_recoverable,
 )
+
+
+def test_authoritative_readiness_fixture_is_stable_and_privacy_safe():
+    content, fixture = authoritative_readiness_fixture()
+
+    assert content == "Reply with exactly: ok"
+    assert set(fixture) == {"fixture_sha256", "target_prefix_utf8_bytes"}
+    assert fixture["target_prefix_utf8_bytes"] == {"midpoint": 11}
 
 
 def _ready_relay_client():

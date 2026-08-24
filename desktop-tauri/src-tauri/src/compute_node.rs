@@ -506,6 +506,14 @@ pub struct ComputeNodeState {
 
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+#[cfg(windows)]
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+#[cfg(windows)]
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+#[cfg(windows)]
+const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS: i32 = 1;
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
 #[cfg(unix)]
@@ -516,7 +524,7 @@ extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
-fn isolate_bridge_process_tree(command: &mut Command) {
+pub(crate) fn isolate_bridge_process_tree(command: &mut Command) {
     #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
@@ -533,8 +541,207 @@ fn isolate_bridge_process_tree(command: &mut Command) {
     }
 }
 
+/// Owns the headless bridge's Windows process tree independently of its root PID.
+///
+/// Windows launches the root suspended, assigns it to a kill-on-close job, and
+/// only then lets it execute. Unix continues to use the existing process group.
+pub(crate) struct BridgeProcessContainment {
+    #[cfg(windows)]
+    job: isize,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct JobObjectBasicLimitInformation {
+    per_process_user_time_limit: i64,
+    per_job_user_time_limit: i64,
+    limit_flags: u32,
+    minimum_working_set_size: usize,
+    maximum_working_set_size: usize,
+    active_process_limit: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct IoCounters {
+    read_operation_count: u64,
+    write_operation_count: u64,
+    other_operation_count: u64,
+    read_transfer_count: u64,
+    write_transfer_count: u64,
+    other_transfer_count: u64,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct JobObjectExtendedLimitInformation {
+    basic_limit_information: JobObjectBasicLimitInformation,
+    io_info: IoCounters,
+    process_memory_limit: usize,
+    job_memory_limit: usize,
+    peak_process_memory_used: usize,
+    peak_job_memory_used: usize,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct JobObjectBasicAccountingInformation {
+    total_user_time: i64,
+    total_kernel_time: i64,
+    this_period_total_user_time: i64,
+    this_period_total_kernel_time: i64,
+    total_page_fault_count: u32,
+    total_processes: u32,
+    active_processes: u32,
+    total_terminated_processes: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateJobObjectW(attributes: *const std::ffi::c_void, name: *const u16) -> isize;
+    fn SetInformationJobObject(
+        job: isize,
+        class: i32,
+        info: *const std::ffi::c_void,
+        length: u32,
+    ) -> i32;
+    fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
+    fn TerminateJobObject(job: isize, exit_code: u32) -> i32;
+    fn QueryInformationJobObject(
+        job: isize,
+        class: i32,
+        info: *mut std::ffi::c_void,
+        length: u32,
+        returned_length: *mut u32,
+    ) -> i32;
+    fn CloseHandle(handle: isize) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtResumeProcess(process: isize) -> i32;
+}
+
+impl BridgeProcessContainment {
+    pub(crate) fn prepare(command: &mut Command) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            isolate_bridge_process_tree(command);
+            Ok(Self {})
+        }
+        #[cfg(windows)]
+        unsafe {
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut limits = JobObjectExtendedLimitInformation::default();
+            limits.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                &limits as *const _ as *const _,
+                std::mem::size_of_val(&limits) as u32,
+            ) == 0
+            {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(error);
+            }
+            Ok(Self { job })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = command;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "process containment unavailable",
+            ))
+        }
+    }
+
+    pub(crate) fn assign_and_resume(&self, child: &tokio::process::Child) -> std::io::Result<()> {
+        #[cfg(windows)]
+        unsafe {
+            let process = child.raw_handle().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "headless bridge process handle is unavailable",
+                )
+            })? as isize;
+            if AssignProcessToJobObject(self.job, process) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let resume_status = NtResumeProcess(process);
+            if resume_status < 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("NtResumeProcess failed with NTSTATUS {resume_status:#010x}"),
+                ));
+            }
+        }
+        let _ = child;
+        Ok(())
+    }
+
+    pub(crate) async fn terminate_and_reap(&self, child: &mut tokio::process::Child) -> bool {
+        #[cfg(windows)]
+        unsafe {
+            if TerminateJobObject(self.job, 1) == 0 {
+                return false;
+            }
+            let reaped = matches!(
+                tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+                Ok(Ok(_))
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let mut accounting = JobObjectBasicAccountingInformation::default();
+                let queried = QueryInformationJobObject(
+                    self.job,
+                    JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS,
+                    &mut accounting as *mut _ as *mut _,
+                    std::mem::size_of_val(&accounting) as u32,
+                    std::ptr::null_mut(),
+                ) != 0;
+                if queried && accounting.active_processes == 0 {
+                    return reaped;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            terminate_and_reap_bridge_process_tree(child).await
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for BridgeProcessContainment {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.job);
+        }
+    }
+}
+
 #[cfg(unix)]
-async fn terminate_bridge_process_tree(pid: u32) {
+async fn signal_bridge_process_tree(pid: u32) {
     unsafe {
         let pgid = pid as i32;
         let _ = kill(-pgid, SIGTERM);
@@ -543,27 +750,90 @@ async fn terminate_bridge_process_tree(pid: u32) {
     }
 }
 
+#[cfg(all(unix, target_os = "linux"))]
+fn bridge_process_tree_stopped(pid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    !entries.flatten().any(|entry| {
+        let Ok(member_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            return false;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{member_pid}/stat")) else {
+            return false;
+        };
+        let Some(fields) = stat.split(')').nth(1) else {
+            return false;
+        };
+        let mut fields = fields.split_whitespace();
+        let state = fields.next();
+        let _parent = fields.next();
+        let group = fields.next().and_then(|value| value.parse::<u32>().ok());
+        group == Some(pid) && state != Some("Z")
+    })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bridge_process_tree_stopped(pid: u32) -> bool {
+    unsafe { kill(-(pid as i32), 0) != 0 }
+}
+
+#[cfg(unix)]
+pub(crate) async fn terminate_bridge_process_tree(pid: u32) -> bool {
+    signal_bridge_process_tree(pid).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bridge_process_tree_stopped(pid)
+}
+
+/// Terminate an isolated bridge tree, reap its root, then confirm no live tree member remains.
+pub(crate) async fn terminate_and_reap_bridge_process_tree(
+    child: &mut tokio::process::Child,
+) -> bool {
+    let Some(pid) = child.id() else {
+        return tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_ok();
+    };
+    #[cfg(unix)]
+    signal_bridge_process_tree(pid).await;
+    #[cfg(not(unix))]
+    let terminated = terminate_bridge_process_tree(pid).await;
+
+    let reaped = matches!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+        Ok(Ok(_))
+    );
+    #[cfg(unix)]
+    let terminated = bridge_process_tree_stopped(pid);
+    terminated && reaped
+}
+
 #[cfg(windows)]
-async fn terminate_bridge_process_tree(pid: u32) {
+pub(crate) async fn terminate_bridge_process_tree(pid: u32) -> bool {
     let Ok(mut child) = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
     else {
-        return;
+        return false;
     };
-    if tokio::time::timeout(Duration::from_secs(2), child.wait())
-        .await
-        .is_err()
-    {
+    let waited = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    if waited.is_err() {
         let _ = child.kill().await;
         let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        return false;
     }
+    waited
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|status| status.success())
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn terminate_bridge_process_tree(_pid: u32) {}
+pub(crate) async fn terminate_bridge_process_tree(_pid: u32) -> bool {
+    false
+}
 
 fn parse_compute_node_event_line(line: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str::<Value>(line)
@@ -1785,7 +2055,7 @@ impl OperatorBridgeLaunchPreparation {
         Ok(())
     }
 
-    fn command(&self) -> anyhow::Result<Command> {
+    pub(crate) fn command(&self) -> anyhow::Result<Command> {
         let mut command = build_bridge_command(&self.bridge_script, self.launcher.clone())?;
         self.configure_command(&mut command)?;
         Ok(command)

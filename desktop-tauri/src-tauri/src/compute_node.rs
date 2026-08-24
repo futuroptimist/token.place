@@ -673,10 +673,21 @@ impl BridgeProcessContainment {
     pub(crate) fn assign_and_resume(&self, child: &tokio::process::Child) -> std::io::Result<()> {
         #[cfg(windows)]
         unsafe {
-            use std::os::windows::io::AsRawHandle;
-            let process = child.as_raw_handle() as isize;
-            if AssignProcessToJobObject(self.job, process) == 0 || NtResumeProcess(process) < 0 {
+            let process = child.raw_handle().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "headless bridge process handle is unavailable",
+                )
+            })? as isize;
+            if AssignProcessToJobObject(self.job, process) == 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            let resume_status = NtResumeProcess(process);
+            if resume_status < 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("NtResumeProcess failed with NTSTATUS {resume_status:#010x}"),
+                ));
             }
         }
         let _ = child;

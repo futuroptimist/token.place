@@ -321,6 +321,93 @@ def test_canonical_metrics_track_queue_in_flight_completion_and_eviction(relay_c
     assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
 
 
+def test_store_lease_evictions_are_reconciled_once_and_pruned(relay_client, monkeypatch) -> None:
+    """Public lease-expiry tombstones drive bounded, once-only eviction metrics."""
+
+    store = relay_module._api_v1_store()
+    now = [time.time()]
+    store._epoch_time = lambda: now[0]
+    monkeypatch.setattr(relay_module.time, "time", lambda: now[0])
+    baseline = _metric_value(
+        _metric_body(relay_client),
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    )
+
+    explicit_credential = _register_node(
+        relay_client, server_key="explicit-node"
+    ).get_json()["control_credential"]
+    explicit = relay_client.post(
+        "/api/v1/relay/servers/unregister",
+        json={
+            "server_public_key": "explicit-node",
+            "control_credential": explicit_credential,
+        },
+    )
+    assert explicit.status_code == 200
+    assert _metric_value(
+        _metric_body(relay_client),
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    ) == baseline
+
+    node_id = "telemetry-node-secret"
+    first_credential = _register_node(relay_client, server_key=node_id).get_json()[
+        "control_credential"
+    ]
+    first_lease = store.get(node_id).lease_expires_at_epoch
+    now[0] = first_lease + 1
+    first_body = _metric_body(relay_client)
+    assert _metric_value(first_body, "tokenplace_compute_nodes_registered") == 0
+    assert _metric_value(first_body, "tokenplace_compute_nodes_healthy") == 0
+    assert _metric_value(
+        first_body,
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    ) == baseline + 1
+
+    assert relay_client.get("/healthz").status_code == 200
+    assert relay_client.get("/relay/diagnostics").status_code == 200
+    repeated_body = _metric_body(relay_client)
+    assert _metric_value(
+        repeated_body,
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    ) == baseline + 1
+
+    second_registration = _register_node(relay_client, server_key=node_id).get_json()
+    second_credential = second_registration["control_credential"]
+    assert second_credential != first_credential
+    second_lease = store.get(node_id).lease_expires_at_epoch
+    now[0] = second_lease + 1
+    second_body = _metric_body(relay_client)
+    assert _metric_value(
+        second_body,
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    ) == baseline + 2
+
+    ledger = relay_module._api_v1_seen_stale_lease_evictions
+    assert len(ledger) == 1
+    assert node_id not in repr(ledger)
+    assert first_credential not in repr(ledger)
+    assert second_credential not in repr(ledger)
+    eviction_samples = [
+        line for line in second_body.splitlines()
+        if line.startswith("tokenplace_compute_node_evictions_total{")
+    ]
+    assert eviction_samples
+    assert all(re.fullmatch(
+        r'tokenplace_compute_node_evictions_total\{reason="[a-z_]+"\} [0-9.eE+-]+',
+        line,
+    ) for line in eviction_samples)
+    assert node_id not in second_body
+    assert first_credential not in second_body
+    assert second_credential not in second_body
+
+    tombstone_expiry = max(
+        record.expires_at_epoch for record in store.node_tombstones()
+    )
+    now[0] = tombstone_expiry + 1
+    assert relay_client.get("/healthz").status_code == 200
+    assert not relay_module._api_v1_seen_stale_lease_evictions
+
+
 def test_metrics_endpoint_optional_bearer_auth(relay_client, monkeypatch) -> None:
     """TOKENPLACE_METRICS_TOKEN protects /metrics without affecting health."""
 

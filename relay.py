@@ -770,6 +770,7 @@ def _update_runtime_gauges() -> None:
     oldest_in_flight_age = 0.0
     store = _api_v1_store()
     registrations = store.list()
+    _reconcile_api_v1_stale_lease_evictions(store)
     registered = len(registrations)
     healthy = sum(record.lease_expires_at_epoch > now_wall for record in registrations)
     for record in registrations:
@@ -1021,6 +1022,8 @@ def _new_api_v1_relay_state_store() -> RelayStateStore:
 
 
 api_v1_relay_state_store: RelayStateStore | None = None
+_api_v1_stale_lease_eviction_lock = threading.Lock()
+_api_v1_seen_stale_lease_evictions: set[tuple[str, float]] = set()
 
 
 def _api_v1_store() -> RelayStateStore:
@@ -1032,7 +1035,27 @@ def _api_v1_store() -> RelayStateStore:
 
 def _reset_api_v1_relay_state_store() -> None:
     global api_v1_relay_state_store
-    api_v1_relay_state_store = _new_api_v1_relay_state_store()
+    with _api_v1_stale_lease_eviction_lock:
+        api_v1_relay_state_store = _new_api_v1_relay_state_store()
+        _api_v1_seen_stale_lease_evictions.clear()
+
+
+def _reconcile_api_v1_stale_lease_evictions(store: RelayStateStore) -> None:
+    """Record each retained store-backed lease-expiry transition once."""
+    with _api_v1_stale_lease_eviction_lock:
+        if store is not api_v1_relay_state_store:
+            return
+        tombstones = store.node_tombstones()
+        retained = {
+            (record.node_identity_digest, record.transition_epoch)
+            for record in tombstones
+            if record.cause == "registration_lease_expired"
+        }
+        _api_v1_seen_stale_lease_evictions.intersection_update(retained)
+        unseen = retained - _api_v1_seen_stale_lease_evictions
+        if unseen:
+            COMPUTE_NODE_EVICTIONS_TOTAL.labels("stale_lease").inc(len(unseen))
+            _api_v1_seen_stale_lease_evictions.update(unseen)
 
 
 def _credential_digest(value: str) -> str:
@@ -1510,7 +1533,9 @@ def _api_v1_server_diagnostics() -> list[dict[str, Any]]:
     store = _api_v1_store()
     now = time.time()
     diagnostics = []
-    for record in store.list():
+    registrations = store.list()
+    _reconcile_api_v1_stale_lease_evictions(store)
+    for record in registrations:
         capabilities = record.capabilities
         queue_depth = len(store.queued_requests(record.node_id))
         in_flight = len(store.active_claims(record.node_id))

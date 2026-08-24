@@ -8,11 +8,13 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
+
+from utils import compute_node_runtime
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -108,6 +110,166 @@ def test_headless_warm_load_enforces_startup_timeout():
 
     assert compute_node_bridge._headless_warm_load(runtime, 0.01) == (False, False)
     release.set()
+
+
+def test_headless_warm_load_propagates_runtime_failure():
+    def fail_load():
+        raise RuntimeError("warm load failed")
+
+    runtime = SimpleNamespace(ensure_api_v1_runtime_ready=fail_load)
+
+    with pytest.raises(RuntimeError, match="warm load failed"):
+        compute_node_bridge._headless_warm_load(runtime, 1)
+
+
+def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
+                                evidence_valid=True, mock_runtime=False,
+                                load_exception=None, cleanup_exception=None):
+    """Install a minimal runtime double while retaining the real evidence validator."""
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"fixture")
+    for name, value in {
+        "TOKENPLACE_APP_VERSION": "1.0.0",
+        "TOKENPLACE_BUILD_ID": "build-1",
+        "TOKENPLACE_TARGET_TRIPLE": "test-target",
+        "TOKENPLACE_BUNDLED_RUNTIME_ID": "bundle-1",
+        "TOKENPLACE_RUNTIME_ID": "bundle-1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        compute_node_bridge, "ensure_desktop_python_dependencies",
+        lambda: {"ok": "true"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_ensure_desktop_llama_runtime_for_context",
+        lambda _mode, _tier: {"selected_backend": "cpu"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_load_context_profile_helpers",
+        lambda: (lambda manager, tier: setattr(manager, "context_tier", tier),
+                 lambda tier: tier),
+    )
+
+    class Manager:
+        use_mock_llm = mock_runtime
+        llm = None
+        last_compute_diagnostics = {}
+
+        @staticmethod
+        def _close_llm_proxy(_loaded):
+            return True
+
+    class Runtime:
+        def __init__(self, _config):
+            self.model_manager = Manager()
+
+        def ensure_api_v1_runtime_ready(self):
+            if load_exception:
+                raise load_exception
+            self.model_manager.last_compute_diagnostics = {
+                "api_v1_readiness_result": "passed" if ready else "failed",
+                "api_v1_readiness_tokenizer_render_bridge_available": ready,
+                "api_v1_readiness_prompt_tokens": 7,
+            }
+            if ready:
+                with open(os.environ[
+                    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"
+                ], encoding="utf-8") as handle:
+                    fixture = json.load(handle)
+                evidence = {
+                    "method": "packaged_admission_render_and_tokenize_chat",
+                    "runtime_identity": "bundle-1",
+                    "fixture_sha256": fixture["fixture_sha256"],
+                    "total_prompt_tokens": 7,
+                    "target_offsets_tokens": {"midpoint": 3},
+                }
+                if not evidence_valid:
+                    evidence["fixture_sha256"] = "wrong"
+                with open(os.environ[
+                    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE"
+                ], "w", encoding="utf-8") as handle:
+                    json.dump(evidence, handle)
+            return ready
+
+        def stop(self, **_kwargs):
+            if cleanup_exception:
+                raise cleanup_exception
+
+    monkeypatch.setattr(compute_node_runtime, "ComputeNodeRuntime", Runtime)
+    return SimpleNamespace(mode="cpu", model=str(model), context_tier="8k-fast",
+                           startup_timeout_seconds=1)
+
+
+@pytest.mark.parametrize(
+    ("ready", "evidence_valid", "expected_code", "expected_exit"),
+    [
+        (True, True, "none", 0),
+        (False, True, "warm_load_failed", 5),
+        (True, False, "authoritative_evidence_failed", 6),
+    ],
+)
+def test_headless_cpu_admission_runtime_outcomes(
+        monkeypatch, tmp_path, capsys, ready, evidence_valid,
+        expected_code, expected_exit):
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, ready=ready, evidence_valid=evidence_valid)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == expected_exit
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[0] == {"type": "headless_internal", "phase": "startup_ready"}
+    assert records[-1]["failure_code"] == expected_code
+    assert records[-1]["success"] is (expected_exit == 0)
+    assert records[-1]["last_completed_phase"] == (
+        "cleanup_completed" if expected_exit == 0 else
+        "warm_load_completed" if expected_exit == 6 else
+        "runtime_identity_validated")
+
+
+def test_headless_cpu_admission_fail_closed_paths(monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "wrong")
+    assert compute_node_bridge.headless_cpu_admission(args) == 3
+    assert json.loads(capsys.readouterr().out)["failure_code"] == \
+        "packaged_runtime_identity_failed"
+
+    monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "bundle-1")
+    monkeypatch.setattr(compute_node_bridge, "ensure_desktop_python_dependencies",
+                        lambda: {"ok": "false"})
+    assert compute_node_bridge.headless_cpu_admission(args) == 3
+    capsys.readouterr()
+
+    monkeypatch.setattr(compute_node_bridge, "ensure_desktop_python_dependencies",
+                        lambda: {"ok": "true"})
+    monkeypatch.setattr(compute_node_bridge,
+                        "_ensure_desktop_llama_runtime_for_context",
+                        lambda *_args: {"selected_backend": "gpu"})
+    assert compute_node_bridge.headless_cpu_admission(args) == 2
+    assert json.loads(capsys.readouterr().out)["failure_code"] == "unsupported_backend"
+
+
+def test_headless_cpu_admission_rejects_mock_and_classifies_exceptions(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(monkeypatch, tmp_path, mock_runtime=True)
+    assert compute_node_bridge.headless_cpu_admission(args) == 4
+    assert json.loads(capsys.readouterr().out)["failure_code"] == "mock_runtime_rejected"
+
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, load_exception=RuntimeError("load failed"))
+    assert compute_node_bridge.headless_cpu_admission(args) == 7
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[-1]["failure_code"] == "warm_load_failed"
+
+
+def test_headless_cpu_admission_cleanup_failure_overrides_success(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, cleanup_exception=RuntimeError("stop failed"))
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 8
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[-1]["failure_code"] == "cleanup_failed"
+    assert records[-1]["success"] is False
+    assert records[-1]["last_completed_phase"] == "warm_load_completed"
 
 
 def test_gpu_preflight_rejects_silent_cpu_fallback(monkeypatch, capsys):

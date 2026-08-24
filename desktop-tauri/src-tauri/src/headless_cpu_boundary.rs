@@ -93,13 +93,23 @@ where
     })
 }
 
-fn failure(code: &'static str, phase: &'static str) -> String {
+#[derive(Clone, Copy)]
+struct FailureState {
+    phase: &'static str,
+    identity_validated: bool,
+}
+
+fn failure(code: &'static str, state: FailureState) -> String {
     serde_json::to_string(&FailureResult {
         schema_version: 1,
         success: false,
-        last_completed_phase: phase,
+        last_completed_phase: state.phase,
         failure_code: code,
-        packaged_runtime_identity: "failed",
+        packaged_runtime_identity: if state.identity_validated {
+            "validated"
+        } else {
+            "failed"
+        },
         selected_backend: "cpu",
         warm_load_result: "not_started",
         authoritative_evidence_result: "failed",
@@ -108,21 +118,177 @@ fn failure(code: &'static str, phase: &'static str) -> String {
 }
 
 async fn cleanup(child: &mut tokio::process::Child) -> bool {
-    let Some(pid) = child.id() else {
-        return child.wait().await.is_ok();
+    compute_node::terminate_and_reap_bridge_process_tree(child).await
+}
+
+struct SupervisionResult {
+    output: String,
+    exit_code: i32,
+}
+
+async fn supervise_bridge(
+    child: &mut tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    startup_timeout: Duration,
+    operation_timeout: Duration,
+) -> SupervisionResult {
+    let before_startup = FailureState {
+        phase: "arguments_validated",
+        identity_validated: false,
     };
-    let tree_stopped = compute_node::terminate_bridge_process_tree(pid).await;
-    let reaped = tokio::time::timeout(Duration::from_secs(2), child.wait())
-        .await
-        .is_ok();
-    tree_stopped && reaped
+    let after_startup = FailureState {
+        phase: "runtime_identity_validated",
+        identity_validated: true,
+    };
+    let mut lines = BufReader::new(stdout).lines();
+    let startup = tokio::time::timeout(startup_timeout, lines.next_line()).await;
+    let startup_line = match startup {
+        Err(_) => {
+            let cleaned = cleanup(child).await;
+            return SupervisionResult {
+                output: failure(
+                    if cleaned {
+                        "startup_timeout"
+                    } else {
+                        "cleanup_failed"
+                    },
+                    before_startup,
+                ),
+                exit_code: if cleaned { 9 } else { 8 },
+            };
+        }
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) | Ok(Err(_)) => {
+            let cleaned = cleanup(child).await;
+            return SupervisionResult {
+                output: failure(
+                    if cleaned {
+                        "bridge_exited_before_startup_event"
+                    } else {
+                        "cleanup_failed"
+                    },
+                    before_startup,
+                ),
+                exit_code: if cleaned { 7 } else { 8 },
+            };
+        }
+    };
+    let startup_valid = serde_json::from_str::<Value>(&startup_line)
+        .ok()
+        .is_some_and(|value| {
+            value.get("type") == Some(&Value::from("headless_internal"))
+                && value.get("phase") == Some(&Value::from("startup_ready"))
+        });
+    if !startup_valid {
+        let cleaned = cleanup(child).await;
+        return SupervisionResult {
+            output: failure(
+                if cleaned {
+                    "bridge_protocol_failed"
+                } else {
+                    "cleanup_failed"
+                },
+                before_startup,
+            ),
+            exit_code: if cleaned { 7 } else { 8 },
+        };
+    }
+
+    let line = match tokio::time::timeout(operation_timeout, lines.next_line()).await {
+        Err(_) => {
+            let cleaned = cleanup(child).await;
+            return SupervisionResult {
+                output: failure(
+                    if cleaned {
+                        "operation_timeout"
+                    } else {
+                        "cleanup_failed"
+                    },
+                    after_startup,
+                ),
+                exit_code: if cleaned { 9 } else { 8 },
+            };
+        }
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) | Ok(Err(_)) => {
+            let cleaned = cleanup(child).await;
+            return SupervisionResult {
+                output: failure(
+                    if cleaned {
+                        "bridge_protocol_failed"
+                    } else {
+                        "cleanup_failed"
+                    },
+                    after_startup,
+                ),
+                exit_code: if cleaned { 7 } else { 8 },
+            };
+        }
+    };
+    let parsed = serde_json::from_str::<Value>(&line).ok();
+    let valid = parsed.as_ref().is_some_and(|value| {
+        value.get("schema_version") == Some(&Value::from(1))
+            && value.get("selected_backend") == Some(&Value::from("cpu"))
+            && value.get("packaged_runtime_identity") == Some(&Value::from("validated"))
+            && value.get("type").is_none()
+    });
+    if !valid {
+        let cleaned = cleanup(child).await;
+        return SupervisionResult {
+            output: failure(
+                if cleaned {
+                    "bridge_protocol_failed"
+                } else {
+                    "cleanup_failed"
+                },
+                after_startup,
+            ),
+            exit_code: if cleaned { 7 } else { 8 },
+        };
+    }
+    let status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    let status_success = matches!(&status, Ok(Ok(value)) if value.success());
+    if status.is_err() {
+        let cleaned = cleanup(child).await;
+        return SupervisionResult {
+            output: failure(
+                if cleaned {
+                    "bridge_protocol_failed"
+                } else {
+                    "cleanup_failed"
+                },
+                after_startup,
+            ),
+            exit_code: if cleaned { 7 } else { 8 },
+        };
+    }
+    let complete = parsed.as_ref().is_some_and(|value| {
+        value.get("success") == Some(&Value::Bool(true))
+            && value.get("last_completed_phase") == Some(&Value::from("cleanup_completed"))
+            && value.get("failure_code") == Some(&Value::from("none"))
+            && value.get("warm_load_result") == Some(&Value::from("ready"))
+            && value.get("authoritative_evidence_result") == Some(&Value::from("validated"))
+    });
+    SupervisionResult {
+        output: line,
+        exit_code: if status_success && complete { 0 } else { 7 },
+    }
 }
 
 pub(crate) fn run(argv: Vec<String>) -> i32 {
     let args = match parse(argv.iter().skip(1)) {
         Ok(v) => v,
         Err(code) => {
-            println!("{}", failure(code, "not_started"));
+            println!(
+                "{}",
+                failure(
+                    code,
+                    FailureState {
+                        phase: "not_started",
+                        identity_validated: false
+                    }
+                )
+            );
             return 2;
         }
     };
@@ -135,7 +301,13 @@ pub(crate) fn run(argv: Vec<String>) -> i32 {
     if !context.packaged() {
         println!(
             "{}",
-            failure("installed_package_required", "arguments_validated")
+            failure(
+                "installed_package_required",
+                FailureState {
+                    phase: "arguments_validated",
+                    identity_validated: false
+                }
+            )
         );
         return 3;
     }
@@ -144,7 +316,13 @@ pub(crate) fn run(argv: Vec<String>) -> i32 {
         Err(_) => {
             println!(
                 "{}",
-                failure("packaged_runtime_identity_failed", "arguments_validated")
+                failure(
+                    "packaged_runtime_identity_failed",
+                    FailureState {
+                        phase: "arguments_validated",
+                        identity_validated: false
+                    }
+                )
             );
             return 3;
         }
@@ -154,7 +332,13 @@ pub(crate) fn run(argv: Vec<String>) -> i32 {
         _ => {
             println!(
                 "{}",
-                failure("packaged_runtime_identity_failed", "arguments_validated")
+                failure(
+                    "packaged_runtime_identity_failed",
+                    FailureState {
+                        phase: "arguments_validated",
+                        identity_validated: false
+                    }
+                )
             );
             return 3;
         }
@@ -164,7 +348,13 @@ pub(crate) fn run(argv: Vec<String>) -> i32 {
         Err(_) => {
             println!(
                 "{}",
-                failure("packaged_runtime_identity_failed", "arguments_validated")
+                failure(
+                    "packaged_runtime_identity_failed",
+                    FailureState {
+                        phase: "arguments_validated",
+                        identity_validated: false
+                    }
+                )
             );
             return 3;
         }
@@ -189,32 +379,39 @@ pub(crate) fn run(argv: Vec<String>) -> i32 {
         .build()
         .unwrap();
     runtime.block_on(async move {
-        let mut child = match command.spawn() { Ok(v) => v, Err(_) => { println!("{}", failure("bridge_exited_before_startup_event", "arguments_validated")); return 7; } };
-        let stdout = child.stdout.take().unwrap(); let mut lines = BufReader::new(stdout).lines();
-        let startup = tokio::time::timeout(Duration::from_secs(args.startup_timeout), lines.next_line()).await;
-        let startup_ok = matches!(startup, Ok(Ok(Some(ref line))) if serde_json::from_str::<Value>(line).ok().is_some_and(|v| v.get("type")==Some(&Value::from("headless_internal")) && v.get("phase")==Some(&Value::from("startup_ready"))));
-        if !startup_ok { let ok=cleanup(&mut child).await; println!("{}", failure(if ok {"bridge_exited_before_startup_event"} else {"cleanup_failed"}, "arguments_validated")); return if ok {7} else {8}; }
-        let final_line = tokio::time::timeout(Duration::from_secs(args.operation_timeout), lines.next_line()).await;
-        let line = match final_line { Ok(Ok(Some(v))) => v, _ => { let ok=cleanup(&mut child).await; println!("{}", failure(if ok {"operation_timeout"} else {"cleanup_failed"}, "runtime_identity_validated")); return if ok {9} else {8}; } };
-        let pid = child.id();
-        let status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-        let parsed = serde_json::from_str::<Value>(&line).ok();
-        let valid = parsed.as_ref().is_some_and(|v| v.get("schema_version")==Some(&Value::from(1)) && v.get("selected_backend")==Some(&Value::from("cpu")));
-        if !valid || status.is_err() { let ok=cleanup(&mut child).await; println!("{}", failure(if ok {"bridge_exited_before_startup_event"} else {"cleanup_failed"}, "runtime_identity_validated")); return if ok {7} else {8}; }
-        let status_success = status.as_ref().ok().and_then(|result| result.as_ref().ok()).is_some_and(|value| value.success());
-        if !status_success {
-            let cleaned = match pid { Some(pid) => compute_node::terminate_bridge_process_tree(pid).await, None => false };
-            if !cleaned { println!("{}", failure("cleanup_failed", "runtime_identity_validated")); return 8; }
-        }
-        println!("{line}");
-        let complete = parsed.as_ref().is_some_and(|v| v.get("success")==Some(&Value::Bool(true)) && v.get("last_completed_phase")==Some(&Value::from("cleanup_completed")) && v.get("failure_code")==Some(&Value::from("none")) && v.get("packaged_runtime_identity")==Some(&Value::from("validated")) && v.get("warm_load_result")==Some(&Value::from("ready")) && v.get("authoritative_evidence_result")==Some(&Value::from("validated")));
-        if status_success && complete { 0 } else { 7 }
+        let mut child = match command.spawn() {
+            Ok(v) => v,
+            Err(_) => {
+                println!(
+                    "{}",
+                    failure(
+                        "bridge_exited_before_startup_event",
+                        FailureState {
+                            phase: "arguments_validated",
+                            identity_validated: false
+                        }
+                    )
+                );
+                return 7;
+            }
+        };
+        let stdout = child.stdout.take().expect("piped bridge stdout");
+        let result = supervise_bridge(
+            &mut child,
+            stdout,
+            Duration::from_secs(args.startup_timeout),
+            Duration::from_secs(args.operation_timeout),
+        )
+        .await;
+        println!("{}", result.output);
+        result.exit_code
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
     use tempfile::NamedTempFile;
     #[test]
     fn dispatch_and_validation_are_fail_closed() {
@@ -262,8 +459,143 @@ mod tests {
     }
     #[test]
     fn stable_failure_is_privacy_safe() {
-        let output = failure("warm_load_failed", "runtime_identity_validated");
+        let output = failure(
+            "warm_load_failed",
+            FailureState {
+                phase: "runtime_identity_validated",
+                identity_validated: true,
+            },
+        );
         assert!(!output.contains("model_path"));
         assert!(!output.contains("prompt"));
+    }
+
+    #[test]
+    fn generated_failures_preserve_state_without_claiming_cleanup() {
+        let timeout = failure(
+            "operation_timeout",
+            FailureState {
+                phase: "runtime_identity_validated",
+                identity_validated: true,
+            },
+        );
+        let value: Value = serde_json::from_str(&timeout).unwrap();
+        assert_eq!(value["packaged_runtime_identity"], "validated");
+        assert_eq!(value["last_completed_phase"], "runtime_identity_validated");
+        assert_ne!(value["last_completed_phase"], "cleanup_completed");
+
+        let cleanup = failure(
+            "cleanup_failed",
+            FailureState {
+                phase: "runtime_identity_validated",
+                identity_validated: true,
+            },
+        );
+        assert_ne!(
+            serde_json::from_str::<Value>(&cleanup).unwrap()["last_completed_phase"],
+            "cleanup_completed"
+        );
+    }
+
+    #[cfg(unix)]
+    fn shell_bridge(script: &str) -> (tokio::process::Child, tokio::process::ChildStdout) {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        compute_node::isolate_bridge_process_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        (child, stdout)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_distinguishes_startup_timeout_from_early_exit() {
+        let (mut child, stdout) = shell_bridge("sleep 30");
+        let timed_out = supervise_bridge(
+            &mut child,
+            stdout,
+            Duration::from_millis(30),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&timed_out.output).unwrap()["failure_code"],
+            "startup_timeout"
+        );
+
+        let (mut child, stdout) = shell_bridge("exit 4");
+        let exited = supervise_bridge(
+            &mut child,
+            stdout,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&exited.output).unwrap()["failure_code"],
+            "bridge_exited_before_startup_event"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_rejects_malformed_protocol_without_forwarding_it() {
+        let (mut child, stdout) = shell_bridge("printf 'private malformed payload\\n'; sleep 30");
+        let result = supervise_bridge(
+            &mut child,
+            stdout,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(!result.output.contains("private malformed payload"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.output).unwrap()["failure_code"],
+            "bridge_protocol_failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operation_timeout_reaps_root_and_descendant() {
+        let directory = tempfile::tempdir().unwrap();
+        let descendant_path = directory.path().join("descendant");
+        let script = format!(
+            "printf '{{\"type\":\"headless_internal\",\"phase\":\"startup_ready\"}}\\n'; \
+             sleep 30 & printf '%s' \"$!\" > {}; wait",
+            descendant_path.display()
+        );
+        let (mut child, stdout) = shell_bridge(&script);
+        let root = child.id().unwrap();
+        let result = supervise_bridge(
+            &mut child,
+            stdout,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["failure_code"], "operation_timeout");
+        assert_eq!(value["packaged_runtime_identity"], "validated");
+        assert_eq!(value["last_completed_phase"], "runtime_identity_validated");
+        assert!(child.try_wait().unwrap().is_some(), "root was not reaped");
+        assert!(compute_node::terminate_bridge_process_tree(root).await);
+        let descendant: u32 = std::fs::read_to_string(descendant_path)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let stat = std::fs::read_to_string(format!("/proc/{descendant}/stat"));
+        assert!(
+            stat.is_err()
+                || stat
+                    .unwrap()
+                    .split(')')
+                    .nth(1)
+                    .is_some_and(|fields| fields.trim_start().starts_with('Z')),
+            "descendant remained live"
+        );
     }
 }

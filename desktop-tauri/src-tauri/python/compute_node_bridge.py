@@ -3106,26 +3106,6 @@ def _headless_classify_readiness(ready: bool, diagnostics: Dict[str, Any],
     return "warm_load_failed"
 
 
-def _headless_warm_load(runtime: Any, timeout_seconds: float) -> Tuple[bool, bool]:
-    """Return (completed, ready), bounding model construction on every platform."""
-    outcome: Dict[str, Any] = {}
-
-    def load() -> None:
-        try:
-            outcome["ready"] = runtime.ensure_api_v1_runtime_ready()
-        except BaseException as exc:
-            outcome["exception"] = exc
-
-    worker = threading.Thread(target=load, name="headless-warm-load", daemon=True)
-    worker.start()
-    worker.join(timeout_seconds)
-    if worker.is_alive():
-        return False, False
-    if "exception" in outcome:
-        raise outcome["exception"]
-    return True, outcome.get("ready") is True
-
-
 def headless_cpu_admission(args: Any) -> int:
     """Exercise the installed CPU model and API-v1 admission boundary without a relay."""
     result = _headless_result(success=False, phase="arguments_validated",

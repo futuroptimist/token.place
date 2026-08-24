@@ -534,18 +534,71 @@ pub(crate) fn isolate_bridge_process_tree(command: &mut Command) {
 }
 
 #[cfg(unix)]
-pub(crate) async fn terminate_bridge_process_tree(pid: u32) -> bool {
+async fn signal_bridge_process_tree(pid: u32) {
     unsafe {
         let pgid = pid as i32;
-        if kill(-pgid, 0) != 0 {
-            return true;
-        }
         let _ = kill(-pgid, SIGTERM);
         tokio::time::sleep(Duration::from_millis(250)).await;
         let _ = kill(-pgid, SIGKILL);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        kill(-pgid, 0) != 0
     }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn bridge_process_tree_stopped(pid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    !entries.flatten().any(|entry| {
+        let Ok(member_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            return false;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{member_pid}/stat")) else {
+            return false;
+        };
+        let Some(fields) = stat.split(')').nth(1) else {
+            return false;
+        };
+        let mut fields = fields.split_whitespace();
+        let state = fields.next();
+        let _parent = fields.next();
+        let group = fields.next().and_then(|value| value.parse::<u32>().ok());
+        group == Some(pid) && state != Some("Z")
+    })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bridge_process_tree_stopped(pid: u32) -> bool {
+    unsafe { kill(-(pid as i32), 0) != 0 }
+}
+
+#[cfg(unix)]
+pub(crate) async fn terminate_bridge_process_tree(pid: u32) -> bool {
+    signal_bridge_process_tree(pid).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bridge_process_tree_stopped(pid)
+}
+
+/// Terminate an isolated bridge tree, reap its root, then confirm no live tree member remains.
+pub(crate) async fn terminate_and_reap_bridge_process_tree(
+    child: &mut tokio::process::Child,
+) -> bool {
+    let Some(pid) = child.id() else {
+        return tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_ok();
+    };
+    #[cfg(unix)]
+    signal_bridge_process_tree(pid).await;
+    #[cfg(not(unix))]
+    let terminated = terminate_bridge_process_tree(pid).await;
+
+    let reaped = matches!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+        Ok(Ok(_))
+    );
+    #[cfg(unix)]
+    let terminated = bridge_process_tree_stopped(pid);
+    terminated && reaped
 }
 
 #[cfg(windows)]

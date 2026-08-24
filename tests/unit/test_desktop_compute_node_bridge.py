@@ -102,26 +102,6 @@ def test_headless_boundary_requires_exact_authoritative_evidence(monkeypatch):
         True, diagnostics, evidence, fixture) == "authoritative_evidence_failed"
 
 
-def test_headless_warm_load_enforces_startup_timeout():
-    release = threading.Event()
-    runtime = SimpleNamespace(
-        ensure_api_v1_runtime_ready=lambda: release.wait(1),
-    )
-
-    assert compute_node_bridge._headless_warm_load(runtime, 0.01) == (False, False)
-    release.set()
-
-
-def test_headless_warm_load_propagates_runtime_failure():
-    def fail_load():
-        raise RuntimeError("warm load failed")
-
-    runtime = SimpleNamespace(ensure_api_v1_runtime_ready=fail_load)
-
-    with pytest.raises(RuntimeError, match="warm load failed"):
-        compute_node_bridge._headless_warm_load(runtime, 1)
-
-
 def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
                                 evidence_valid=True, mock_runtime=False,
                                 load_exception=None, cleanup_exception=None):

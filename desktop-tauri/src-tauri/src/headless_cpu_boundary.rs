@@ -1,5 +1,5 @@
 use crate::{build_identity, compute_node, python_runtime};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -126,6 +126,97 @@ struct SupervisionResult {
     exit_code: i32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalResult {
+    schema_version: u8,
+    success: bool,
+    last_completed_phase: String,
+    failure_code: String,
+    packaged_runtime_identity: String,
+    selected_backend: String,
+    warm_load_result: String,
+    authoritative_evidence_result: String,
+}
+
+fn validate_terminal(line: &str) -> Option<TerminalResult> {
+    let result: TerminalResult = serde_json::from_str(line).ok()?;
+    let supported_failure = matches!(
+        result.failure_code.as_str(),
+        "none"
+            | "invalid_arguments"
+            | "packaged_runtime_identity_failed"
+            | "unsupported_backend"
+            | "mock_runtime_rejected"
+            | "bridge_exited_before_startup_event"
+            | "warm_load_failed"
+            | "authoritative_evidence_failed"
+            | "cleanup_failed"
+    );
+    if result.schema_version != 1
+        || result.selected_backend != "cpu"
+        || !matches!(
+            result.last_completed_phase.as_str(),
+            "arguments_validated"
+                | "runtime_identity_validated"
+                | "warm_load_completed"
+                | "cleanup_completed"
+        )
+        || !matches!(
+            result.packaged_runtime_identity.as_str(),
+            "failed" | "validated"
+        )
+        || !matches!(result.warm_load_result.as_str(), "not_started" | "ready")
+        || !matches!(
+            result.authoritative_evidence_result.as_str(),
+            "failed" | "validated"
+        )
+        || !supported_failure
+    {
+        return None;
+    }
+    let coherent_success = result.last_completed_phase == "cleanup_completed"
+        && result.failure_code == "none"
+        && result.packaged_runtime_identity == "validated"
+        && result.warm_load_result == "ready"
+        && result.authoritative_evidence_result == "validated";
+    if result.success != coherent_success || (!result.success && result.failure_code == "none") {
+        return None;
+    }
+    Some(result)
+}
+
+async fn confirm_terminal(
+    child: &mut tokio::process::Child,
+    line: String,
+    result: TerminalResult,
+    failure_state: FailureState,
+) -> SupervisionResult {
+    match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) if status.success() == result.success => SupervisionResult {
+            output: line,
+            exit_code: if result.success { 0 } else { 7 },
+        },
+        status => {
+            let cleaned = match status {
+                Ok(Ok(_)) => true,
+                Ok(Err(_)) | Err(_) => cleanup(child).await,
+            };
+            SupervisionResult {
+                output: failure(
+                    if cleaned {
+                        "bridge_protocol_failed"
+                    } else {
+                        "cleanup_failed"
+                    },
+                    failure_state,
+                ),
+                exit_code: if cleaned { 7 } else { 8 },
+            }
+        }
+    }
+}
+
 async fn supervise_bridge(
     child: &mut tokio::process::Child,
     stdout: tokio::process::ChildStdout,
@@ -176,10 +267,18 @@ async fn supervise_bridge(
     let startup_valid = serde_json::from_str::<Value>(&startup_line)
         .ok()
         .is_some_and(|value| {
-            value.get("type") == Some(&Value::from("headless_internal"))
-                && value.get("phase") == Some(&Value::from("startup_ready"))
+            value.as_object().is_some_and(|record| {
+                record.len() == 2
+                    && value.get("type") == Some(&Value::from("headless_internal"))
+                    && value.get("phase") == Some(&Value::from("startup_ready"))
+            })
         });
     if !startup_valid {
+        if let Some(result) = validate_terminal(&startup_line) {
+            if !result.success {
+                return confirm_terminal(child, startup_line, result, before_startup).await;
+            }
+        }
         let cleaned = cleanup(child).await;
         return SupervisionResult {
             output: failure(
@@ -225,14 +324,7 @@ async fn supervise_bridge(
             };
         }
     };
-    let parsed = serde_json::from_str::<Value>(&line).ok();
-    let valid = parsed.as_ref().is_some_and(|value| {
-        value.get("schema_version") == Some(&Value::from(1))
-            && value.get("selected_backend") == Some(&Value::from("cpu"))
-            && value.get("packaged_runtime_identity") == Some(&Value::from("validated"))
-            && value.get("type").is_none()
-    });
-    if !valid {
+    let Some(parsed) = validate_terminal(&line) else {
         let cleaned = cleanup(child).await;
         return SupervisionResult {
             output: failure(
@@ -245,34 +337,8 @@ async fn supervise_bridge(
             ),
             exit_code: if cleaned { 7 } else { 8 },
         };
-    }
-    let status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-    let status_success = matches!(&status, Ok(Ok(value)) if value.success());
-    if status.is_err() {
-        let cleaned = cleanup(child).await;
-        return SupervisionResult {
-            output: failure(
-                if cleaned {
-                    "bridge_protocol_failed"
-                } else {
-                    "cleanup_failed"
-                },
-                after_startup,
-            ),
-            exit_code: if cleaned { 7 } else { 8 },
-        };
-    }
-    let complete = parsed.as_ref().is_some_and(|value| {
-        value.get("success") == Some(&Value::Bool(true))
-            && value.get("last_completed_phase") == Some(&Value::from("cleanup_completed"))
-            && value.get("failure_code") == Some(&Value::from("none"))
-            && value.get("warm_load_result") == Some(&Value::from("ready"))
-            && value.get("authoritative_evidence_result") == Some(&Value::from("validated"))
-    });
-    SupervisionResult {
-        output: line,
-        exit_code: if status_success && complete { 0 } else { 7 },
-    }
+    };
+    confirm_terminal(child, line, parsed, after_startup).await
 }
 
 pub(crate) fn run(argv: Vec<String>) -> i32 {
@@ -556,6 +622,100 @@ mod tests {
             serde_json::from_str::<Value>(&result.output).unwrap()["failure_code"],
             "bridge_protocol_failed"
         );
+    }
+
+    #[cfg(unix)]
+    async fn supervise_script(script: &str) -> SupervisionResult {
+        let (mut child, stdout) = shell_bridge(script);
+        supervise_bridge(
+            &mut child,
+            stdout,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    fn terminal_json(success: bool, failure_code: &str) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "success": success,
+            "last_completed_phase": if success { "cleanup_completed" } else { "arguments_validated" },
+            "failure_code": failure_code,
+            "packaged_runtime_identity": if failure_code == "packaged_runtime_identity_failed" { "failed" } else { "validated" },
+            "selected_backend": "cpu",
+            "warm_load_result": if success { "ready" } else { "not_started" },
+            "authoritative_evidence_result": if success { "validated" } else { "failed" }
+        })
+        .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_preserves_complete_pre_start_failures() {
+        for code in [
+            "packaged_runtime_identity_failed",
+            "unsupported_backend",
+            "mock_runtime_rejected",
+        ] {
+            let record = terminal_json(false, code);
+            let result = supervise_script(&format!("printf '%s\\n' '{record}'; exit 4")).await;
+            assert_eq!(result.output, record);
+            assert_eq!(
+                serde_json::from_str::<Value>(&result.output).unwrap()["failure_code"],
+                code
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_rejects_success_before_startup_and_incomplete_or_extra_results() {
+        let success = terminal_json(true, "none");
+        for record in [
+            success,
+            r#"{"schema_version":1,"success":false}"#.to_owned(),
+            format!(
+                "{}",
+                terminal_json(false, "unsupported_backend").replace("}", ",\"extra\":true}")
+            ),
+        ] {
+            let result = supervise_script(&format!("printf '%s\\n' '{record}'; exit 4")).await;
+            assert_eq!(
+                serde_json::from_str::<Value>(&result.output).unwrap()["failure_code"],
+                "bridge_protocol_failed"
+            );
+            assert_ne!(result.output, record);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_requires_exit_status_to_match_and_preserves_post_start_results() {
+        let ready = r#"{"type":"headless_internal","phase":"startup_ready"}"#;
+        let success = terminal_json(true, "none");
+        let failure = terminal_json(false, "warm_load_failed")
+            .replace("arguments_validated", "runtime_identity_validated");
+        for (record, exit, forwarded) in [
+            (&success, 0, true),
+            (&failure, 5, true),
+            (&success, 5, false),
+            (&failure, 0, false),
+        ] {
+            let result = supervise_script(&format!(
+                "printf '%s\\n%s\\n' '{ready}' '{record}'; exit {exit}"
+            ))
+            .await;
+            if forwarded {
+                assert_eq!(result.output, *record);
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&result.output).unwrap()["failure_code"],
+                    "bridge_protocol_failed"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

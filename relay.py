@@ -3156,17 +3156,22 @@ def api_v1_relay_requests_cancel():
     if not isinstance(data,dict) or not data.get('client_public_key') or not data.get('request_id'):
         return jsonify({'error': {'message':'Invalid request data','code':400}}),400
     status = _sanitize_terminal_status(data.get('status'))
-    reason = 'request_deadline_expired' if status == 'expired' else 'requester_cancelled'
+    requested_reason = _sanitize_terminal_reason(data.get('reason'), status)
+    store_reason = 'request_deadline_expired' if status == 'expired' else 'requester_cancelled'
     try:
-        result=_api_v1_store().cancel_or_expire_request(data['client_public_key'],data['request_id'],data.get('cancel_token'),status=status,reason=reason)
+        result=_api_v1_store().cancel_or_expire_request(data['client_public_key'],data['request_id'],data.get('cancel_token'),status=status,reason=store_reason)
     except RelayStateCredentialMismatch:
         return jsonify({'error': {'message':'Missing or invalid cancel proof','code':403}}),403
     except RelayStateStoreError:
         return _store_failure_response()
     if result.state == 'invalid_cancellation_proof':
         return jsonify({'error': {'message':'Missing or invalid cancel proof','code':403}}),403
-    if result.new_outcome:
-        _record_terminal_outcome(_terminal_outcome_from_status_reason(result.state, result.reason))
+    if result.state in {'cancelled', 'expired'}:
+        metric_reason = requested_reason if result.state == status else result.reason
+        _record_request_terminal_outcome_once(
+            data['client_public_key'], data['request_id'],
+            _terminal_outcome_from_status_reason(result.state, metric_reason),
+        )
     return jsonify({'status':result.state,'request_id':data['request_id'],'removed_from_queue':result.new_outcome}),200
 
 @app.route('/api/v1/relay/responses', methods=['POST'])
@@ -3239,7 +3244,7 @@ def api_v1_relay_responses():
     except RelayStateStoreError:
         return _store_failure_response()
     if result.new_outcome:
-        _record_terminal_outcome("completed")
+        _record_request_terminal_outcome_once(client_key, request_id, "completed")
         LOGGER.info(
             "relay.api_v1.response_received",
             extra={"client_fingerprint": _safe_key_fingerprint(client_key)},

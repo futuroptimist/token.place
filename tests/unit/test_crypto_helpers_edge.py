@@ -78,9 +78,12 @@ def test_send_chat_message_list_branch():
     [
         ('selection_status', 'Failed to select relay server: 503'),
         ('selection_exception', 'Exception while selecting relay server: RuntimeError'),
+        ('selection_metadata', 'Relay server selection returned invalid reservation metadata'),
+        ('selection_key', 'Relay server selection returned an invalid public key'),
         ('encryption_exception', 'Failed to encrypt API v1 relay envelope: RuntimeError'),
         ('enqueue_empty', 'Failed to send message to API v1 relay requests'),
         ('enqueue_unexpected', 'Unexpected response from API v1 relay requests'),
+        ('retrieval_metadata', 'API v1 relay request returned invalid retrieval metadata'),
     ],
 )
 def test_send_chat_message_failures_are_covered_by_unit_suite(
@@ -105,6 +108,10 @@ def test_send_chat_message_failures_are_covered_by_unit_suite(
         if failure == 'selection_exception'
         else MagicMock(return_value=selection)
     )
+    if failure == 'selection_metadata':
+        selection._payload['reservation_token'] = ''
+    elif failure == 'selection_key':
+        selection._payload['server_public_key'] = 'not-base64!'
     encryption_result = (
         MagicMock(side_effect=RuntimeError('encryption failed'))
         if failure == 'encryption_exception'
@@ -118,6 +125,8 @@ def test_send_chat_message_failures_are_covered_by_unit_suite(
         enqueue_result = None
     elif failure == 'enqueue_unexpected':
         enqueue_result = {'retrieval_credential': 'retrieval-proof'}
+    elif failure == 'retrieval_metadata':
+        enqueue_result = {'message': 'Request received'}
 
     with patch('utils.crypto_helpers.requests.get', selection_result), \
          patch.object(client, '_encrypt_message_for_key', encryption_result), \

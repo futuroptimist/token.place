@@ -192,15 +192,24 @@ async fn confirm_terminal(
     result: TerminalResult,
     failure_state: FailureState,
 ) -> SupervisionResult {
+    if result.failure_code == "cleanup_failed" {
+        let cleaned = cleanup(child).await;
+        return SupervisionResult {
+            output: line,
+            exit_code: if cleaned { 7 } else { 8 },
+        };
+    }
+    let root_pid = child.id();
     match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
         Ok(Ok(status)) if status.success() == result.success => SupervisionResult {
             output: line,
             exit_code: if result.success { 0 } else { 7 },
         },
         status => {
-            let cleaned = match status {
-                Ok(Ok(_)) => true,
-                Ok(Err(_)) | Err(_) => cleanup(child).await,
+            let cleaned = match (status, root_pid) {
+                (Ok(Ok(_)), Some(pid)) => compute_node::terminate_bridge_process_tree(pid).await,
+                (Ok(Ok(_)), None) => false,
+                (Ok(Err(_)) | Err(_), _) => cleanup(child).await,
             };
             SupervisionResult {
                 output: failure(
@@ -741,6 +750,50 @@ mod tests {
         assert_eq!(value["failure_code"], "operation_timeout");
         assert_eq!(value["packaged_runtime_identity"], "validated");
         assert_eq!(value["last_completed_phase"], "runtime_identity_validated");
+        assert!(child.try_wait().unwrap().is_some(), "root was not reaped");
+        assert!(compute_node::terminate_bridge_process_tree(root).await);
+        let descendant: u32 = std::fs::read_to_string(descendant_path)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let stat = std::fs::read_to_string(format!("/proc/{descendant}/stat"));
+        assert!(
+            stat.is_err()
+                || stat
+                    .unwrap()
+                    .split(')')
+                    .nth(1)
+                    .is_some_and(|fields| fields.trim_start().starts_with('Z')),
+            "descendant remained live"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_failed_result_still_reaps_root_and_descendant() {
+        let directory = tempfile::tempdir().unwrap();
+        let descendant_path = directory.path().join("descendant");
+        let ready = r#"{"type":"headless_internal","phase":"startup_ready"}"#;
+        let failure = terminal_json(false, "cleanup_failed")
+            .replace("arguments_validated", "runtime_identity_validated");
+        let script = format!(
+            "sleep 30 & printf '%s' \"$!\" > {}; printf '%s\\n%s\\n' '{}' '{}'; exit 7",
+            descendant_path.display(),
+            ready,
+            failure
+        );
+        let (mut child, stdout) = shell_bridge(&script);
+        let root = child.id().unwrap();
+        let result = supervise_bridge(
+            &mut child,
+            stdout,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(result.output, failure);
+        assert_eq!(result.exit_code, 7);
         assert!(child.try_wait().unwrap().is_some(), "root was not reaped");
         assert!(compute_node::terminate_bridge_process_tree(root).await);
         let descendant: u32 = std::fs::read_to_string(descendant_path)

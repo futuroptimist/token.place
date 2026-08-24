@@ -1,7 +1,10 @@
 import dataclasses
 import math
+from unittest.mock import Mock, patch
 
 import pytest
+import redis
+from redis.sentinel import MasterNotFoundError
 
 from valkey_relay_state import (
     DirectPrimary,
@@ -113,6 +116,29 @@ def test_tls_auth_and_all_representations_are_redacted():
         assert secret not in rendered
 
 
+def test_sentinel_tls_applies_to_discovery_and_primary_connections():
+    sentinel = SentinelPrimary((("sentinel.internal", 26379),), "relay-primary")
+    cfg = config(
+        direct=None,
+        sentinel=sentinel,
+        tls=True,
+        tls_ca_cert="ca.pem",
+        tls_client_cert="client.pem",
+        tls_client_key="client-key.pem",
+    )
+    expected = manifest()
+    master = Mock()
+    with patch("valkey_relay_state.Sentinel") as sentinel_class:
+        sentinel_class.return_value.master_for.return_value = master
+        foundation = ValkeyFoundation(cfg, expected)
+
+    call = sentinel_class.call_args
+    assert call.kwargs["connection_class"] is redis.SSLConnection
+    assert call.kwargs["sentinel_kwargs"]["connection_class"] is redis.SSLConnection
+    assert call.kwargs["sentinel_kwargs"]["ssl_ca_certs"] == "ca.pem"
+    assert foundation._client is master
+
+
 @pytest.mark.parametrize(
     "changed",
     [
@@ -167,3 +193,27 @@ def test_errors_do_not_disclose_backend_details():
     error = ValkeyUnavailableError("state backend unavailable")
     assert "host" not in repr(error)
     assert "password" not in repr(error)
+
+
+def test_lazy_sentinel_discovery_error_is_bounded_and_redacted():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+
+    def unavailable():
+        raise MasterNotFoundError("No master at secret-sentinel:26379")
+
+    with pytest.raises(
+        ValkeyUnavailableError, match="state backend unavailable"
+    ) as caught:
+        foundation._call(unavailable)
+    assert "secret-sentinel" not in str(caught.value)
+
+
+def test_invalid_expected_manifest_is_rejected_before_creation():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation.expected_manifest = manifest(schema_major=2)
+    foundation._client = Mock()
+
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.initialize_manifest()
+    foundation._client.set.assert_not_called()

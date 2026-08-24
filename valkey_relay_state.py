@@ -360,14 +360,23 @@ class ValkeyFoundation:
                 )
                 return redis.Redis(connection_pool=pool)
             assert self.config.sentinel
+            sentinel_kwargs = {
+                "username": self.config.sentinel.sentinel_username,
+                "password": self.config.sentinel.sentinel_password,
+                "socket_connect_timeout": self.config.connect_timeout_seconds,
+                "socket_timeout": self.config.socket_timeout_seconds,
+            }
+            if self.config.tls:
+                sentinel_kwargs.update(
+                    connection_class=redis.SSLConnection,
+                    ssl_ca_certs=self.config.tls_ca_cert,
+                    ssl_certfile=self.config.tls_client_cert,
+                    ssl_keyfile=self.config.tls_client_key,
+                )
+                kwargs["connection_class"] = redis.SSLConnection
             sentinel = Sentinel(
                 self.config.sentinel.sentinels,
-                sentinel_kwargs={
-                    "username": self.config.sentinel.sentinel_username,
-                    "password": self.config.sentinel.sentinel_password,
-                    "socket_connect_timeout": self.config.connect_timeout_seconds,
-                    "socket_timeout": self.config.socket_timeout_seconds,
-                },
+                sentinel_kwargs=sentinel_kwargs,
                 **kwargs,
             )
             return sentinel.master_for(self.config.sentinel.service_name)
@@ -391,8 +400,14 @@ class ValkeyFoundation:
             if "READONLY" in str(exc).upper():
                 raise ValkeyReadOnlyError("state backend is not writable") from None
             raise ValkeyUnavailableError("state backend command failed") from None
+        except RedisError:
+            # Includes lazy Sentinel discovery failures such as MasterNotFoundError.
+            raise ValkeyUnavailableError("state backend unavailable") from None
 
     def initialize_manifest(self) -> SchemaManifest:
+        # Never persist an expected value this process could not itself use.
+        self.check_read_compatible(self.expected_manifest)
+        self.check_write_compatible(self.expected_manifest)
         raw = self.expected_manifest.encode()
         key = self.config.key("schema")
         self._call(self._client.set, key, raw, nx=True)

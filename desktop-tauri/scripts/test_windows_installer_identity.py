@@ -48,9 +48,16 @@ HEADLESS_CPU_RESULT_KEYS = frozenset({
 })
 HEADLESS_CPU_FAILURE_CODES = frozenset({
     "none",
+    "command_not_first",
     "invalid_arguments",
+    "unknown_argument",
+    "duplicate_argument",
     "packaged_runtime_identity_failed",
     "unsupported_backend",
+    "unsupported_context_tier",
+    "invalid_timeout",
+    "unusable_model_path",
+    "installed_package_required",
     "mock_runtime_rejected",
     "bridge_exited_before_startup_event",
     "startup_timeout",
@@ -977,7 +984,7 @@ def _privacy_safe_headless_terminal(stdout: str) -> dict[str, object] | None:
         or any(type(result[key]) is not str for key in HEADLESS_CPU_RESULT_KEYS - {"schema_version", "success"})
         or result["schema_version"] != 1
         or result["last_completed_phase"] not in {
-            "arguments_validated", "runtime_identity_validated", "warm_load_completed", "cleanup_completed"
+            "not_started", "arguments_validated", "runtime_identity_validated", "warm_load_completed", "cleanup_completed"
         }
         or result["failure_code"] not in HEADLESS_CPU_FAILURE_CODES
         or result["packaged_runtime_identity"] not in {"failed", "validated"}

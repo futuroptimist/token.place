@@ -3700,7 +3700,9 @@ def test_windows_packaged_start_workflow_builds_and_validates_current_nsis() -> 
     assert '--pr-current-windows-nsis' in workflow
     assert '--tokenizer-boundary-model' in workflow
     assert 'scripts/provision-ci-tiny-gguf.sh' in workflow
-    assert 'bash scripts/provision-ci-tiny-gguf.sh "$PWD/.ci-models/stories15M-q4_0.gguf"' in workflow
+    assert 'model_path="$(cygpath -u "$TOKENPLACE_REAL_E2E_MODEL_PATH")"' in workflow
+    assert 'bash scripts/provision-ci-tiny-gguf.sh "$model_path"' in workflow
+    assert '--tokenizer-boundary-model "${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf"' in workflow
     assert workflow.count("'scripts/provision-ci-tiny-gguf.sh'") == 2
     assert workflow.count("'desktop-tauri/scripts/test_windows_installer_identity.py'") == 2
     assert '--operator-start-preflight' in Path('desktop-tauri/scripts/test_windows_installer_identity.py').read_text(encoding='utf-8')
@@ -3814,16 +3816,22 @@ def test_windows_installer_identity_headless_cpu_exit_and_privacy_safe_artifact(
     assert json.loads(artifact.read_text(encoding='utf-8'))['terminal_result'] == failure
 
 
-@pytest.mark.parametrize('failure_code', ['startup_timeout', 'operation_timeout', 'bridge_protocol_failed'])
+@pytest.mark.parametrize(('failure_code', 'last_completed_phase'), [
+    ('startup_timeout', 'runtime_identity_validated'),
+    ('operation_timeout', 'runtime_identity_validated'),
+    ('bridge_protocol_failed', 'runtime_identity_validated'),
+    ('installed_package_required', 'not_started'),
+    ('command_not_first', 'not_started'),
+])
 def test_windows_installer_identity_headless_cpu_preserves_supervisor_failure_codes(
-    monkeypatch, tmp_path, failure_code
+    monkeypatch, tmp_path, failure_code, last_completed_phase
 ) -> None:
     guard = _load_windows_installer_identity()
     artifact = tmp_path / 'result.json'
     failure = {
         **_headless_cpu_success_result(),
         'success': False,
-        'last_completed_phase': 'runtime_identity_validated',
+        'last_completed_phase': last_completed_phase,
         'failure_code': failure_code,
         'warm_load_result': 'not_started',
         'authoritative_evidence_result': 'failed',
@@ -3838,6 +3846,43 @@ def test_windows_installer_identity_headless_cpu_preserves_supervisor_failure_co
         guard.run_headless_cpu_admission(tmp_path / 'installed.exe', tmp_path / 'tiny.gguf', {}, artifact)
 
     assert json.loads(artifact.read_text(encoding='utf-8'))['terminal_result'] == failure
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('failure_code', []),
+    ('last_completed_phase', None),
+    ('schema_version', '1'),
+])
+def test_windows_installer_identity_headless_cpu_malformed_failure_types_are_concise_and_safe(
+    monkeypatch, tmp_path, field, value
+) -> None:
+    guard = _load_windows_installer_identity()
+    artifact = tmp_path / 'result.json'
+    failure = {
+        **_headless_cpu_success_result(),
+        'success': False,
+        'last_completed_phase': 'not_started',
+        'failure_code': 'installed_package_required',
+        'warm_load_result': 'not_started',
+        'authoritative_evidence_result': 'failed',
+    }
+    failure[field] = value
+    private_stdout = json.dumps(failure)
+    monkeypatch.setattr(
+        guard,
+        '_run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 7, private_stdout, 'private fixture stderr'),
+    )
+
+    with pytest.raises(guard.InstallerIdentityError, match='invalid schema field types'):
+        guard.run_headless_cpu_admission(
+            tmp_path / 'installed.exe', tmp_path / 'private-model.gguf', {'PRIVATE_ENV': 'secret'}, artifact
+        )
+
+    evidence = artifact.read_text(encoding='utf-8')
+    assert 'terminal_result' not in json.loads(evidence)
+    for private_value in ('private-model', 'private fixture stderr', 'PRIVATE_ENV', 'secret', private_stdout):
+        assert private_value not in evidence
 
 
 def test_windows_installer_identity_headless_cpu_timeout_is_concise_and_safe(monkeypatch, tmp_path) -> None:

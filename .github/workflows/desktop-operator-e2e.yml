@@ -272,7 +272,11 @@ jobs:
 
       - name: Provision tiny GGUF for installed headless CPU admission
         shell: bash
-        run: bash scripts/provision-ci-tiny-gguf.sh "$PWD/.ci-models/stories15M-q4_0.gguf"
+        env:
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+        run: |
+          model_path="$(cygpath -u "$TOKENPLACE_REAL_E2E_MODEL_PATH")"
+          bash scripts/provision-ci-tiny-gguf.sh "$model_path"
 
       - name: Validate installed-package headless CPU admission and package identity
         shell: pwsh

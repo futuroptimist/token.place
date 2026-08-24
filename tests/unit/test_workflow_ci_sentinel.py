@@ -726,6 +726,34 @@ def test_desktop_operator_pr_validation_has_no_macos_jobs_and_linux_python39_ins
     assert "test_desktop_no_relay_autostart_e2e.py" not in linux_runs
 
 
+def test_desktop_operator_windows_uses_installed_headless_cpu_admission() -> None:
+    workflow_path = WORKFLOW_DIR / "desktop-operator-e2e.yml"
+    workflow_data = _load_workflow(workflow_path)
+    on_block = _workflow_on_block(workflow_data, workflow_path.name)
+    windows_job = workflow_data["jobs"]["desktop-operator-packaged-e2e-windows"]
+    steps = windows_job["steps"]
+    names = [step.get("name", "") for step in steps]
+    windows_text = yaml.dump(windows_job, sort_keys=True).lower()
+    runs = _step_runs(windows_job)
+
+    for trigger in ("pull_request", "push"):
+        paths = on_block[trigger]["paths"]
+        assert "desktop-tauri/scripts/test_windows_installer_identity.py" in paths
+        assert "scripts/provision-ci-tiny-gguf.sh" in paths
+    assert "actions/cache@v4" in [step.get("uses") for step in steps]
+    assert "scripts/provision-ci-tiny-gguf.sh" in runs
+    assert "--tokenizer-boundary-model" in runs
+    assert "headless cpu admission" in windows_text
+    for forbidden in ("selenium", "tauri-driver", "edgedriver", "webview2"):
+        assert forbidden not in windows_text
+
+    gate = names.index("Validate installed-package headless CPU admission boundary")
+    parity = names.index("Run shared desktop parity checks (Windows)")
+    cuda = names.index("Run Windows CUDA capability handoff regressions (fakes)")
+    assert gate < parity < cuda
+    assert "cargo test --manifest-path desktop-tauri/src-tauri/Cargo.toml" in runs
+
+
 def test_retired_legacy_electron_desktop_packaging_workflow_stays_removed() -> None:
     legacy_workflow = WORKFLOW_DIR / "desktop.yml"
     assert not legacy_workflow.exists(), (

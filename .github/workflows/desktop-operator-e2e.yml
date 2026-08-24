@@ -17,6 +17,7 @@ on:
       - 'desktop-tauri/src-tauri/python/**'
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
+      - 'desktop-tauri/scripts/test_windows_installer_identity.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
@@ -24,6 +25,7 @@ on:
       - 'tests/unit/test_model_manager.py'
       - 'tests/integration/test_desktop_qwen64k_packaged_runtime.py'
       - 'scripts/long_context_benchmark.py'
+      - 'scripts/provision-ci-tiny-gguf.sh'
       - 'scripts/long_context_benchmark/**'
       - 'tests/unit/test_long_context_benchmark_harness.py'
       - 'utils/**'
@@ -41,6 +43,7 @@ on:
       - 'desktop-tauri/src-tauri/python/**'
       - 'desktop-tauri/src-tauri/tauri.conf.json'
       - 'desktop-tauri/scripts/test_packaged_operator_e2e.py'
+      - 'desktop-tauri/scripts/test_windows_installer_identity.py'
       - 'desktop-tauri/scripts/test_desktop_operator_ui_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_no_relay_autostart_e2e.py'
       - 'desktop-tauri/scripts/test_desktop_relay_operator_parity_e2e.py'
@@ -48,6 +51,7 @@ on:
       - 'tests/unit/test_model_manager.py'
       - 'tests/integration/test_desktop_qwen64k_packaged_runtime.py'
       - 'scripts/long_context_benchmark.py'
+      - 'scripts/provision-ci-tiny-gguf.sh'
       - 'scripts/long_context_benchmark/**'
       - 'tests/unit/test_long_context_benchmark_harness.py'
       - 'utils/**'
@@ -260,7 +264,19 @@ jobs:
         working-directory: desktop-tauri
         run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
 
-      - name: Hosted-Windows packaged-start gate for installed current package
+      - name: Restore cached tiny GGUF for installed headless CPU admission
+        uses: actions/cache@v4
+        with:
+          path: .ci-models/stories15M-q4_0.gguf
+          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
+
+      - name: Provision tiny GGUF for installed headless CPU admission
+        shell: bash
+        env:
+          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
+        run: bash scripts/provision-ci-tiny-gguf.sh "$TOKENPLACE_REAL_E2E_MODEL_PATH"
+
+      - name: Validate installed-package headless CPU admission boundary
         shell: pwsh
         run: |
           $installers = @(Get-ChildItem 'desktop-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis' -Filter '*-setup.exe' -File)
@@ -272,6 +288,7 @@ jobs:
             --pr-current-windows-nsis $installers[0].FullName `
             --expected-version $version `
             --expected-build-id $buildId `
+            --tokenizer-boundary-model "${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf" `
             --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

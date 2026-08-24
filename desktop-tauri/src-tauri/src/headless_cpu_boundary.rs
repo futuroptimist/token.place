@@ -117,8 +117,11 @@ fn failure(code: &'static str, state: FailureState) -> String {
     .unwrap()
 }
 
-async fn cleanup(child: &mut tokio::process::Child) -> bool {
-    compute_node::terminate_and_reap_bridge_process_tree(child).await
+async fn cleanup(
+    child: &mut tokio::process::Child,
+    containment: &compute_node::BridgeProcessContainment,
+) -> bool {
+    containment.terminate_and_reap(child).await
 }
 
 struct SupervisionResult {
@@ -188,12 +191,13 @@ fn validate_terminal(line: &str) -> Option<TerminalResult> {
 
 async fn confirm_terminal(
     child: &mut tokio::process::Child,
+    containment: &compute_node::BridgeProcessContainment,
     line: String,
     result: TerminalResult,
     failure_state: FailureState,
 ) -> SupervisionResult {
     if result.failure_code == "cleanup_failed" {
-        let cleaned = cleanup(child).await;
+        let cleaned = cleanup(child, containment).await;
         return SupervisionResult {
             output: line,
             exit_code: if cleaned { 7 } else { 8 },
@@ -207,9 +211,9 @@ async fn confirm_terminal(
         },
         status => {
             let cleaned = match (status, root_pid) {
-                (Ok(Ok(_)), Some(pid)) => compute_node::terminate_bridge_process_tree(pid).await,
+                (Ok(Ok(_)), Some(_)) => containment.terminate_and_reap(child).await,
                 (Ok(Ok(_)), None) => false,
-                (Ok(Err(_)) | Err(_), _) => cleanup(child).await,
+                (Ok(Err(_)) | Err(_), _) => cleanup(child, containment).await,
             };
             SupervisionResult {
                 output: failure(
@@ -228,6 +232,7 @@ async fn confirm_terminal(
 
 async fn supervise_bridge(
     child: &mut tokio::process::Child,
+    containment: &compute_node::BridgeProcessContainment,
     stdout: tokio::process::ChildStdout,
     startup_timeout: Duration,
     operation_timeout: Duration,
@@ -244,7 +249,7 @@ async fn supervise_bridge(
     let startup = tokio::time::timeout(startup_timeout, lines.next_line()).await;
     let startup_line = match startup {
         Err(_) => {
-            let cleaned = cleanup(child).await;
+            let cleaned = cleanup(child, containment).await;
             return SupervisionResult {
                 output: failure(
                     if cleaned {
@@ -259,7 +264,7 @@ async fn supervise_bridge(
         }
         Ok(Ok(Some(line))) => line,
         Ok(Ok(None)) | Ok(Err(_)) => {
-            let cleaned = cleanup(child).await;
+            let cleaned = cleanup(child, containment).await;
             return SupervisionResult {
                 output: failure(
                     if cleaned {
@@ -285,10 +290,11 @@ async fn supervise_bridge(
     if !startup_valid {
         if let Some(result) = validate_terminal(&startup_line) {
             if !result.success {
-                return confirm_terminal(child, startup_line, result, before_startup).await;
+                return confirm_terminal(child, containment, startup_line, result, before_startup)
+                    .await;
             }
         }
-        let cleaned = cleanup(child).await;
+        let cleaned = cleanup(child, containment).await;
         return SupervisionResult {
             output: failure(
                 if cleaned {
@@ -304,7 +310,7 @@ async fn supervise_bridge(
 
     let line = match tokio::time::timeout(operation_timeout, lines.next_line()).await {
         Err(_) => {
-            let cleaned = cleanup(child).await;
+            let cleaned = cleanup(child, containment).await;
             return SupervisionResult {
                 output: failure(
                     if cleaned {
@@ -319,7 +325,7 @@ async fn supervise_bridge(
         }
         Ok(Ok(Some(line))) => line,
         Ok(Ok(None)) | Ok(Err(_)) => {
-            let cleaned = cleanup(child).await;
+            let cleaned = cleanup(child, containment).await;
             return SupervisionResult {
                 output: failure(
                     if cleaned {
@@ -334,7 +340,7 @@ async fn supervise_bridge(
         }
     };
     let Some(parsed) = validate_terminal(&line) else {
-        let cleaned = cleanup(child).await;
+        let cleaned = cleanup(child, containment).await;
         return SupervisionResult {
             output: failure(
                 if cleaned {
@@ -347,7 +353,7 @@ async fn supervise_bridge(
             exit_code: if cleaned { 7 } else { 8 },
         };
     };
-    confirm_terminal(child, line, parsed, after_startup).await
+    confirm_terminal(child, containment, line, parsed, after_startup).await
 }
 
 pub(crate) fn run(argv: Vec<String>) -> i32 {
@@ -448,7 +454,22 @@ pub(crate) fn run(argv: Vec<String>) -> i32 {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    compute_node::isolate_bridge_process_tree(&mut command);
+    let containment = match compute_node::BridgeProcessContainment::prepare(&mut command) {
+        Ok(value) => value,
+        Err(_) => {
+            println!(
+                "{}",
+                failure(
+                    "cleanup_failed",
+                    FailureState {
+                        phase: "arguments_validated",
+                        identity_validated: false
+                    }
+                )
+            );
+            return 8;
+        }
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -470,9 +491,24 @@ pub(crate) fn run(argv: Vec<String>) -> i32 {
                 return 7;
             }
         };
+        if containment.assign_and_resume(&child).is_err() {
+            let _ = containment.terminate_and_reap(&mut child).await;
+            println!(
+                "{}",
+                failure(
+                    "cleanup_failed",
+                    FailureState {
+                        phase: "arguments_validated",
+                        identity_validated: false
+                    }
+                )
+            );
+            return 8;
+        }
         let stdout = child.stdout.take().expect("piped bridge stdout");
         let result = supervise_bridge(
             &mut child,
+            &containment,
             stdout,
             Duration::from_secs(args.startup_timeout),
             Duration::from_secs(args.operation_timeout),
@@ -573,24 +609,32 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn shell_bridge(script: &str) -> (tokio::process::Child, tokio::process::ChildStdout) {
+    fn shell_bridge(
+        script: &str,
+    ) -> (
+        tokio::process::Child,
+        tokio::process::ChildStdout,
+        compute_node::BridgeProcessContainment,
+    ) {
         let mut command = tokio::process::Command::new("sh");
         command
             .args(["-c", script])
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        compute_node::isolate_bridge_process_tree(&mut command);
+        let containment = compute_node::BridgeProcessContainment::prepare(&mut command).unwrap();
         let mut child = command.spawn().unwrap();
+        containment.assign_and_resume(&child).unwrap();
         let stdout = child.stdout.take().unwrap();
-        (child, stdout)
+        (child, stdout, containment)
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn supervisor_distinguishes_startup_timeout_from_early_exit() {
-        let (mut child, stdout) = shell_bridge("sleep 30");
+        let (mut child, stdout, containment) = shell_bridge("sleep 30");
         let timed_out = supervise_bridge(
             &mut child,
+            &containment,
             stdout,
             Duration::from_millis(30),
             Duration::from_secs(1),
@@ -601,9 +645,10 @@ mod tests {
             "startup_timeout"
         );
 
-        let (mut child, stdout) = shell_bridge("exit 4");
+        let (mut child, stdout, containment) = shell_bridge("exit 4");
         let exited = supervise_bridge(
             &mut child,
+            &containment,
             stdout,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -618,9 +663,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn supervisor_rejects_malformed_protocol_without_forwarding_it() {
-        let (mut child, stdout) = shell_bridge("printf 'private malformed payload\\n'; sleep 30");
+        let (mut child, stdout, containment) =
+            shell_bridge("printf 'private malformed payload\\n'; sleep 30");
         let result = supervise_bridge(
             &mut child,
+            &containment,
             stdout,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -635,9 +682,10 @@ mod tests {
 
     #[cfg(unix)]
     async fn supervise_script(script: &str) -> SupervisionResult {
-        let (mut child, stdout) = shell_bridge(script);
+        let (mut child, stdout, containment) = shell_bridge(script);
         supervise_bridge(
             &mut child,
+            &containment,
             stdout,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -737,10 +785,11 @@ mod tests {
              sleep 30 & printf '%s' \"$!\" > {}; wait",
             descendant_path.display()
         );
-        let (mut child, stdout) = shell_bridge(&script);
+        let (mut child, stdout, containment) = shell_bridge(&script);
         let root = child.id().unwrap();
         let result = supervise_bridge(
             &mut child,
+            &containment,
             stdout,
             Duration::from_secs(1),
             Duration::from_millis(100),
@@ -782,10 +831,10 @@ mod tests {
             ready,
             failure
         );
-        let (mut child, stdout) = shell_bridge(&script);
-        let root = child.id().unwrap();
+        let (mut child, stdout, containment) = shell_bridge(&script);
         let result = supervise_bridge(
             &mut child,
+            &containment,
             stdout,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -795,7 +844,6 @@ mod tests {
         assert_eq!(result.output, failure);
         assert_eq!(result.exit_code, 7);
         assert!(child.try_wait().unwrap().is_some(), "root was not reaped");
-        assert!(compute_node::terminate_bridge_process_tree(root).await);
         let descendant: u32 = std::fs::read_to_string(descendant_path)
             .unwrap()
             .parse()
@@ -810,5 +858,64 @@ mod tests {
                     .is_some_and(|fields| fields.trim_start().starts_with('Z')),
             "descendant remained live"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cleanup_failed_result_still_reaps_root_and_descendant_windows() {
+        let directory = tempfile::tempdir().unwrap();
+        let descendant_path = directory.path().join("descendant.txt");
+        let escaped_path = descendant_path.to_string_lossy().replace('\'', "''");
+        let ready = r#"{"type":"headless_internal","phase":"startup_ready"}"#;
+        let failure = terminal_json(false, "cleanup_failed")
+            .replace("arguments_validated", "runtime_identity_validated");
+        let script = format!(
+            "$d=Start-Process -PassThru -WindowStyle Hidden ping -ArgumentList '-n 60 127.0.0.1'; \
+             [IO.File]::WriteAllText('{escaped_path}',[string]$d.Id); \
+             [Console]::Out.WriteLine('{ready}'); [Console]::Out.WriteLine('{failure}'); exit 7"
+        );
+        let mut command = tokio::process::Command::new("powershell");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let containment = compute_node::BridgeProcessContainment::prepare(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        containment.assign_and_resume(&child).unwrap();
+        let root = child.id().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let result = supervise_bridge(
+            &mut child,
+            &containment,
+            stdout,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(result.output, failure);
+        assert_eq!(result.exit_code, 7);
+        assert!(child.try_wait().unwrap().is_some(), "root was not reaped");
+        let descendant: u32 = std::fs::read_to_string(descendant_path)
+            .unwrap()
+            .parse()
+            .unwrap();
+        for pid in [root, descendant] {
+            let output = tokio::process::Command::new("tasklist")
+                .args([
+                    "/FI",
+                    &format!("PID eq {pid}"),
+                    &format!("/{}{}", "F", "O"),
+                    "CSV",
+                    "/NH",
+                ])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")),
+                "process {pid} remained live"
+            );
+        }
     }
 }

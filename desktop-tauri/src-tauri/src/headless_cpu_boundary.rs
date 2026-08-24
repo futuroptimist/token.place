@@ -693,7 +693,6 @@ mod tests {
         .await
     }
 
-    #[cfg(unix)]
     fn terminal_json(success: bool, failure_code: &str) -> String {
         serde_json::json!({
             "schema_version": 1,

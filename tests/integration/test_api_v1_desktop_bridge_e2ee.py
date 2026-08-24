@@ -12,8 +12,8 @@ import base64
 import json
 import threading
 import time
-from datetime import datetime, timedelta
 from contextlib import contextmanager
+from unittest.mock import Mock
 from urllib.parse import urlparse
 
 import pytest
@@ -106,6 +106,7 @@ def live_relay_server():
 
 @pytest.fixture(autouse=True)
 def reset_relay_state(monkeypatch):
+    relay._reset_api_v1_relay_state_store()
     relay.known_servers.clear()
     relay.client_inference_requests.clear()
     relay.client_pending_request_ids.clear()
@@ -119,6 +120,7 @@ def reset_relay_state(monkeypatch):
     monkeypatch.delenv("TOKENPLACE_API_V1_DISTRIBUTED_FALLBACK", raising=False)
     monkeypatch.setenv("CONTENT_MODERATION_MODE", "off")
     yield
+    relay._reset_api_v1_relay_state_store()
     relay.known_servers.clear()
     relay.client_inference_requests.clear()
     relay.client_pending_request_ids.clear()
@@ -488,14 +490,18 @@ def test_api_v1_desktop_bridge_reregisters_after_idle_no_work_before_browser_req
 
         first_no_work = desktop_client.poll_api_v1_encrypted_work()
         assert first_no_work["message"] == "No requests available"
-        assert server_key in relay.known_servers
+        store = relay._api_v1_store()
+        assert store.get(server_key) is not None
+        renew_spy = Mock(wraps=store.renew)
+        monkeypatch.setattr(store, "renew", renew_spy)
 
-        relay.known_servers[server_key]["last_ping"] = datetime.now() - timedelta(seconds=60)
         desktop_client._api_v1_last_heartbeat_at[base_url] -= 25.0
 
         renewed_no_work = desktop_client.poll_api_v1_encrypted_work()
         assert renewed_no_work["message"] == "No requests available"
-        assert server_key in relay.known_servers
+        assert store.get(server_key) is not None
+        renew_spy.assert_called_once()
+        assert renew_spy.call_args.args[0] == server_key
         assert requests.get(f"{base_url}/api/v1/relay/servers/next", timeout=2).status_code == 200
 
         monkeypatch.setattr(

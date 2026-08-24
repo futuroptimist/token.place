@@ -22,9 +22,11 @@ def relay_module(monkeypatch: pytest.MonkeyPatch) -> Iterator[object]:
 
     relay = importlib.import_module("relay")
     relay.app.config["TESTING"] = True
+    relay._reset_api_v1_relay_state_store()
 
     yield relay
 
+    relay._reset_api_v1_relay_state_store()
     for name in MODULES_TO_CLEAR:
         sys.modules.pop(name, None)
 
@@ -152,7 +154,10 @@ def test_api_v1_unregister_requires_token_and_clears_registry(relay_module) -> N
         headers={"X-Relay-Server-Token": "unit-token"},
     )
     assert register_response.status_code == 200
-    assert list(relay_module.known_servers) == ["api-v1-node"]
+    credential = register_response.get_json()["control_credential"]
+    store = relay_module._api_v1_store()
+    assert store.get("api-v1-node") is not None
+    assert relay_module.known_servers == {}
 
     unauthorised = client.post(
         "/api/v1/relay/servers/unregister",
@@ -165,7 +170,18 @@ def test_api_v1_unregister_requires_token_and_clears_registry(relay_module) -> N
             "message": "Missing or invalid relay server token",
         }
     }
-    assert list(relay_module.known_servers) == ["api-v1-node"]
+    assert store.get("api-v1-node") is not None
+
+    wrong_token = client.post(
+        "/api/v1/relay/servers/unregister",
+        json={
+            "server_public_key": "api-v1-node",
+            "control_credential": credential,
+        },
+        headers={"X-Relay-Server-Token": "wrong-token"},
+    )
+    assert wrong_token.status_code == 401
+    assert store.get("api-v1-node") is not None
 
     token_only = client.post(
         "/api/v1/relay/servers/unregister",
@@ -179,27 +195,48 @@ def test_api_v1_unregister_requires_token_and_clears_registry(relay_module) -> N
             "message": "Missing or invalid relay server control credential",
         }
     }
-    assert list(relay_module.known_servers) == ["api-v1-node"]
+    assert store.get("api-v1-node") is not None
+
+    wrong_owner = client.post(
+        "/api/v1/relay/servers/unregister",
+        json={
+            "server_public_key": "api-v1-node",
+            "control_credential": "wrong-owner",
+        },
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+    assert wrong_owner.status_code == 403
+    assert wrong_owner.get_json() == {
+        "error": {
+            "code": 403,
+            "message": "Missing or invalid relay server control credential",
+        }
+    }
+    assert store.get("api-v1-node") is not None
 
     authorised = client.post(
         "/api/v1/relay/servers/unregister",
         json={
             "server_public_key": "api-v1-node",
-            "control_credential": register_response.get_json()["control_credential"],
+            "control_credential": credential,
         },
         headers={"X-Relay-Server-Token": "unit-token"},
     )
     assert authorised.status_code == 200
     assert authorised.get_json() == {"message": "Server unregistered", "removed": True}
-    assert relay_module.known_servers == {}
+    assert store.get("api-v1-node") is None
 
-    absent = client.post(
+    repeat = client.post(
         "/api/v1/relay/servers/unregister",
-        json={"server_public_key": "api-v1-node"},
+        json={
+            "server_public_key": "api-v1-node",
+            "control_credential": credential,
+        },
         headers={"X-Relay-Server-Token": "unit-token"},
     )
-    assert absent.status_code == 200
-    assert absent.get_json() == {"message": "Server unregistered", "removed": False}
+    assert repeat.status_code == 200
+    assert repeat.get_json() == {"message": "Server unregistered", "removed": True}
+    assert store.get("api-v1-node") is None
 
     diagnostics = client.get("/relay/diagnostics")
     assert diagnostics.status_code == 200
@@ -308,28 +345,34 @@ def test_evict_stale_servers_cleans_up_queue_and_stream_state(relay_module) -> N
     assert "client-stale" not in relay_module.streaming_sessions_by_client
 
 
-@pytest.mark.parametrize("route", ["/api/v1/relay/servers/unregister", "/unregister"])
-def test_api_v1_unregister_token_and_owner_credential_matrix(relay_module, route) -> None:
-    """Live API v1 unregister aliases require shared token plus exact owner proof."""
+def test_api_v1_unregister_token_and_owner_credential_matrix(relay_module) -> None:
+    """API v1 unregister requires the shared token and exact owner proof."""
 
     relay_module.known_servers.clear()
-    relay_module.client_inference_requests.clear()
     client = relay_module.app.test_client()
     headers = {"X-Relay-Server-Token": "unit-token"}
     wrong_headers = {"X-Relay-Server-Token": "wrong-token"}
+    server_key = "api-v1-matrix-node"
 
     register = client.post(
         "/api/v1/relay/servers/register",
-        json={"server_public_key": f"api-v1-node-{route}"},
+        json={"server_public_key": server_key},
         headers=headers,
     )
     assert register.status_code == 200
-    server_key = f"api-v1-node-{route}"
     credential = register.get_json()["control_credential"]
+    store = relay_module._api_v1_store()
 
+    route = "/api/v1/relay/servers/unregister"
     missing_shared = client.post(route, json={"server_public_key": server_key})
-    wrong_shared = client.post(route, json={"server_public_key": server_key}, headers=wrong_headers)
-    missing_owner = client.post(route, json={"server_public_key": server_key}, headers=headers)
+    wrong_shared = client.post(
+        route,
+        json={"server_public_key": server_key, "control_credential": credential},
+        headers=wrong_headers,
+    )
+    missing_owner = client.post(
+        route, json={"server_public_key": server_key}, headers=headers
+    )
     wrong_owner = client.post(
         route,
         json={"server_public_key": server_key, "control_credential": "wrong-owner"},
@@ -340,17 +383,48 @@ def test_api_v1_unregister_token_and_owner_credential_matrix(relay_module, route
     assert wrong_shared.status_code == 401
     assert missing_owner.status_code == 403
     assert wrong_owner.status_code == 403
-    assert server_key in relay_module.known_servers
+    assert store.get(server_key) is not None
+    assert relay_module.known_servers == {}
 
     correct = client.post(
         route,
         json={"server_public_key": server_key, "control_credential": credential},
         headers=headers,
     )
-    absent = client.post(route, json={"server_public_key": server_key}, headers=headers)
-
     assert correct.status_code == 200
     assert correct.get_json()["removed"] is True
+    assert store.get(server_key) is None
+
+
+def test_legacy_unregister_token_and_owner_credential_matrix(relay_module) -> None:
+    """Legacy unregister requires only the shared registration token."""
+
+    server_key = "legacy-matrix-node"
+    relay_module.known_servers.clear()
+    relay_module.known_servers[server_key] = {
+        "public_key": server_key,
+        "last_ping": relay_module.datetime.now(),
+        "last_ping_duration": 10,
+    }
+    client = relay_module.app.test_client()
+
+    missing_shared = client.post("/unregister", json={"server_public_key": server_key})
+    wrong_shared = client.post(
+        "/unregister",
+        json={"server_public_key": server_key},
+        headers={"X-Relay-Server-Token": "wrong-token"},
+    )
+
+    assert missing_shared.status_code == 401
+    assert wrong_shared.status_code == 401
+    assert server_key in relay_module.known_servers
+
+    correct = client.post(
+        "/unregister",
+        json={"server_public_key": server_key},
+        headers={"X-Relay-Server-Token": "unit-token"},
+    )
+
+    assert correct.status_code == 200
+    assert correct.get_json() == {"message": "Server unregistered", "removed": True}
     assert server_key not in relay_module.known_servers
-    assert absent.status_code == 200
-    assert absent.get_json()["removed"] is False

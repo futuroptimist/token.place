@@ -1,4 +1,5 @@
 import copy
+import time
 from urllib.parse import urlparse
 
 from api.v1 import compute_provider
@@ -126,9 +127,19 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
 
     def fake_get(url, timeout, params=None):
         assert url == "https://node-a.example/api/v1/relay/servers/next"
-        assert params == {"model": "qwen3-8b-instruct", "context_tier": "8k-fast"}
+        assert params["model"] == "qwen3-8b-instruct"
+        assert params["context_tier"] == "8k-fast"
+        assert params["client_public_key"] == fake_crypto.public_key_b64
+        assert params["request_id"].startswith("api-v1-")
+        assert params["cancel_token"]
         assert 0 < timeout <= 5
-        return _FakeResponse(200, {"server_public_key": "server-public-key"})
+        return _FakeResponse(200, {
+            "server_public_key": "server-public-key",
+            "reservation_token": "reservation-proof",
+            "requested_model": "qwen3-8b-instruct",
+            "requested_context_tier": "8k-fast",
+            "request_deadline_epoch": time.time() + 5,
+        })
 
     def fake_post(url, json, timeout):
         posted_payloads.append((url, copy.deepcopy(json), timeout))
@@ -221,6 +232,7 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
     expected_retrieve_payload = {
         "client_public_key": fake_crypto.public_key_b64,
         "request_id": relay_request_id,
+        "retrieval_credential": "reservation-proof",
     }
     assert retrieve_calls == [expected_retrieve_payload] * 8
     assert posted_payloads[0][0] == "https://node-a.example/api/v1/relay/requests"

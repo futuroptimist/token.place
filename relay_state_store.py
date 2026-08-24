@@ -881,6 +881,8 @@ class RelayStateStore(Protocol):
     ) -> EnqueueResult: ...
     def list_reservations(self) -> tuple[ReservationRecord, ...]: ...
     def queued_requests(self, node_id: str) -> tuple[QueuedRequest, ...]: ...
+
+    def claimed_request(self, node_id: str, request_id: str) -> tuple[QueuedRequest, ClaimRecord] | None: ...
     def claim_queued_request(
         self, node_id: str, control_credential_digest: str, consumer_identity: str
     ) -> ClaimResult: ...
@@ -1455,6 +1457,26 @@ class InMemoryRelayStateStore:
                     or claim.lease_expires_at_epoch <= now
                 )
             )
+
+    def claimed_request(self, node_id: str, request_id: str) -> tuple[QueuedRequest, ClaimRecord] | None:
+        """Return the exact live claimed lifecycle for node/request routing metadata."""
+        self._validate_node_id(node_id)
+        if not isinstance(request_id, str) or not request_id:
+            raise RelayStateStoreError("request id is required")
+        request_digest = self._identity_digest(request_id, b"request\0")
+        with self._lock:
+            now = self._now()
+            self._reap_locked(now)
+            for queued in self._node_queues.get(node_id, ()):
+                identity = (queued.client_identity_digest, queued.request_identity_digest)
+                claim = self._claims.get(identity)
+                if (
+                    queued.request_identity_digest == request_digest
+                    and claim is not None
+                    and claim.lease_expires_at_epoch > now
+                ):
+                    return replace(queued), replace(claim)
+        return None
 
     def claim_queued_request(
         self,

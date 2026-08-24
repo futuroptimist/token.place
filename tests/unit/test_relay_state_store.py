@@ -1766,6 +1766,34 @@ def test_live_claim_control_read_renews_without_creating_tombstone(
     assert store.control_tombstones() == ()
 
 
+def test_claimed_request_returns_only_the_matching_live_node_claim(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    queued, resolved_claim = store.claimed_request("node-a", "request-a")
+
+    assert queued.request_id == "request-a"
+    assert resolved_claim.generation == claim.generation
+    assert resolved_claim.lease_expires_at_epoch == claim.lease_expires_at_epoch
+    assert resolved_claim.request_deadline_epoch == claim.request_deadline_epoch
+    assert store.claimed_request("node-a", "missing-request") is None
+    assert store.claimed_request("missing-node", "request-a") is None
+
+
+def test_claimed_request_validates_request_identity_length(store_factory, capabilities):
+    store, _ = registered_store(
+        store_factory, capabilities, max_identity_bytes=8
+    )
+
+    with pytest.raises(RelayStateStoreError, match="request identity is invalid"):
+        store.claimed_request("node-a", "request-too-long")
+
+    for request_id in (None, ""):
+        with pytest.raises(RelayStateStoreError, match="request id is required"):
+            store.claimed_request("node-a", request_id)
+
+
 @pytest.mark.parametrize("status", ["cancelled", "expired"])
 def test_claim_control_is_owner_bound_and_acknowledgement_is_idempotent(
     store_factory, capabilities, status

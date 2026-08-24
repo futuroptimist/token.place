@@ -1,6 +1,6 @@
 import base64
 import logging
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import pytest
 
 from encrypt import encrypt
@@ -71,6 +71,63 @@ def test_send_chat_message_list_branch():
     assert enqueue_payload['request_deadline_epoch'] == 2_000_000_000
     assert enqueue_payload['server_public_key'] == server_key
     assert mock_retrieve.call_args.kwargs['json']['retrieval_credential'] == 'retrieval-proof'
+
+
+@pytest.mark.parametrize(
+    ('failure', 'expected_log'),
+    [
+        ('selection_status', 'Failed to select relay server: 503'),
+        ('selection_exception', 'Exception while selecting relay server: RuntimeError'),
+        ('encryption_exception', 'Failed to encrypt API v1 relay envelope: RuntimeError'),
+        ('enqueue_empty', 'Failed to send message to API v1 relay requests'),
+        ('enqueue_unexpected', 'Unexpected response from API v1 relay requests'),
+    ],
+)
+def test_send_chat_message_failures_are_covered_by_unit_suite(
+    caplog,
+    failure,
+    expected_log,
+):
+    """Keep fail-closed relay branches covered by CI's tests/unit run."""
+    client = _prep_client()
+    selection = _FakeResponse(
+        status_code=503 if failure == 'selection_status' else 200,
+        payload={
+            'server_public_key': base64.b64encode(b'k').decode(),
+            'reservation_token': 'reservation-proof',
+            'requested_model': 'qwen3-8b-instruct',
+            'requested_context_tier': '8k-fast',
+            'request_deadline_epoch': 2_000_000_000,
+        },
+    )
+    selection_result = (
+        MagicMock(side_effect=RuntimeError('selection failed'))
+        if failure == 'selection_exception'
+        else MagicMock(return_value=selection)
+    )
+    encryption_result = (
+        MagicMock(side_effect=RuntimeError('encryption failed'))
+        if failure == 'encryption_exception'
+        else MagicMock(return_value={'ciphertext': 'c', 'cipherkey': 'k', 'iv': 'i'})
+    )
+    enqueue_result = {
+        'message': 'Request received',
+        'retrieval_credential': 'retrieval-proof',
+    }
+    if failure == 'enqueue_empty':
+        enqueue_result = None
+    elif failure == 'enqueue_unexpected':
+        enqueue_result = {'retrieval_credential': 'retrieval-proof'}
+
+    with patch('utils.crypto_helpers.requests.get', selection_result), \
+         patch.object(client, '_encrypt_message_for_key', encryption_result), \
+         patch.object(client, 'send_encrypted_message', return_value=enqueue_result), \
+         caplog.at_level(logging.ERROR, logger='crypto_client'):
+        assert client.send_chat_message('hello') is None
+
+    assert expected_log in caplog.text
+    assert 'reservation-proof' not in caplog.text
+    assert 'retrieval-proof' not in caplog.text
 
 
 def test_retrieve_chat_response_error_list():

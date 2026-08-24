@@ -3700,6 +3700,7 @@ def test_windows_packaged_start_workflow_builds_and_validates_current_nsis() -> 
     assert '--pr-current-windows-nsis' in workflow
     assert '--tokenizer-boundary-model' in workflow
     assert 'scripts/provision-ci-tiny-gguf.sh' in workflow
+    assert 'bash scripts/provision-ci-tiny-gguf.sh "$PWD/.ci-models/stories15M-q4_0.gguf"' in workflow
     assert workflow.count("'scripts/provision-ci-tiny-gguf.sh'") == 2
     assert workflow.count("'desktop-tauri/scripts/test_windows_installer_identity.py'") == 2
     assert '--operator-start-preflight' in Path('desktop-tauri/scripts/test_windows_installer_identity.py').read_text(encoding='utf-8')
@@ -3810,6 +3811,32 @@ def test_windows_installer_identity_headless_cpu_exit_and_privacy_safe_artifact(
     monkeypatch.setattr(guard, '_run', lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 7, json.dumps(failure), ''))
     with pytest.raises(guard.InstallerIdentityError, match='agree with exit code 0'):
         guard.run_headless_cpu_admission(tmp_path / 'installed.exe', model, {}, artifact)
+    assert json.loads(artifact.read_text(encoding='utf-8'))['terminal_result'] == failure
+
+
+@pytest.mark.parametrize('failure_code', ['startup_timeout', 'operation_timeout', 'bridge_protocol_failed'])
+def test_windows_installer_identity_headless_cpu_preserves_supervisor_failure_codes(
+    monkeypatch, tmp_path, failure_code
+) -> None:
+    guard = _load_windows_installer_identity()
+    artifact = tmp_path / 'result.json'
+    failure = {
+        **_headless_cpu_success_result(),
+        'success': False,
+        'last_completed_phase': 'runtime_identity_validated',
+        'failure_code': failure_code,
+        'warm_load_result': 'not_started',
+        'authoritative_evidence_result': 'failed',
+    }
+    monkeypatch.setattr(
+        guard,
+        '_run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 7, json.dumps(failure), ''),
+    )
+
+    with pytest.raises(guard.InstallerIdentityError, match='agree with exit code 0'):
+        guard.run_headless_cpu_admission(tmp_path / 'installed.exe', tmp_path / 'tiny.gguf', {}, artifact)
+
     assert json.loads(artifact.read_text(encoding='utf-8'))['terminal_result'] == failure
 
 

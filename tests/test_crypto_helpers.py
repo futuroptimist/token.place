@@ -1075,6 +1075,72 @@ def test_chat_send_fails_closed_on_invalid_reservation_metadata(monkeypatch, sel
     submit.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ('failure', 'expected_log'),
+    [
+        ('selection_status', 'Failed to select relay server: 503'),
+        ('selection_exception', 'Exception while selecting relay server: RuntimeError'),
+        ('encryption_exception', 'Failed to encrypt API v1 relay envelope: RuntimeError'),
+        ('enqueue_empty', 'Failed to send message to API v1 relay requests'),
+        ('enqueue_unexpected', 'Unexpected response from API v1 relay requests'),
+    ],
+)
+def test_chat_send_fails_closed_at_relay_boundaries(
+    monkeypatch,
+    caplog,
+    failure,
+    expected_log,
+):
+    client = CryptoClient('https://test-server.com')
+    selection = MagicMock(status_code=503 if failure == 'selection_status' else 200)
+    selection.json.return_value = {
+        'server_public_key': base64.b64encode(b'selected-key').decode(),
+        'reservation_token': 'reservation-proof',
+        'requested_model': 'qwen3-8b-instruct',
+        'requested_context_tier': '8k-fast',
+        'request_deadline_epoch': 9999999999.0,
+    }
+
+    if failure == 'selection_exception':
+        monkeypatch.setattr(
+            'utils.crypto_helpers.requests.get',
+            MagicMock(side_effect=RuntimeError('selection failed')),
+        )
+    else:
+        monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *args, **kwargs: selection)
+
+    if failure == 'encryption_exception':
+        monkeypatch.setattr(
+            client,
+            '_encrypt_message_for_key',
+            MagicMock(side_effect=RuntimeError('encryption failed')),
+        )
+    else:
+        monkeypatch.setattr(
+            client,
+            '_encrypt_message_for_key',
+            lambda *_args: {'ciphertext': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'},
+        )
+
+    enqueue_result = {
+        'message': 'Request received',
+        'retrieval_credential': 'retrieval-proof',
+    }
+    if failure == 'enqueue_empty':
+        enqueue_result = None
+    elif failure == 'enqueue_unexpected':
+        enqueue_result = {'retrieval_credential': 'retrieval-proof'}
+    submit = MagicMock(return_value=enqueue_result)
+    monkeypatch.setattr(client, 'send_encrypted_message', submit)
+
+    with caplog.at_level(logging.ERROR, logger='crypto_client'):
+        assert client.send_chat_message('hello') is None
+
+    assert expected_log in caplog.text
+    assert 'reservation-proof' not in caplog.text
+    assert 'retrieval-proof' not in caplog.text
+
+
 @pytest.mark.parametrize('retrieval_credential', [None, '', 42])
 def test_chat_send_fails_closed_on_invalid_retrieval_credential(
     monkeypatch,

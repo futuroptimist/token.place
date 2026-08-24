@@ -1789,6 +1789,10 @@ def test_claimed_request_validates_request_identity_length(store_factory, capabi
     with pytest.raises(RelayStateStoreError, match="request identity is invalid"):
         store.claimed_request("node-a", "request-too-long")
 
+    for request_id in (None, ""):
+        with pytest.raises(RelayStateStoreError, match="request id is required"):
+            store.claimed_request("node-a", request_id)
+
 
 @pytest.mark.parametrize("status", ["cancelled", "expired"])
 def test_claim_control_is_owner_bound_and_acknowledgement_is_idempotent(

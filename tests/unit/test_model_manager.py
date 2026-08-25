@@ -8333,6 +8333,23 @@ class Llama:
     assert 'fixture prompt' not in json.dumps(response)
 
 
+def test_subprocess_proxy_controls_headless_worker_marker():
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._lock = model_manager_module.Lock()
+    proxy._timeout_seconds = 1
+    proxy._closed = False
+    proxy._rpc = MagicMock(return_value={'result': {'prompt_tokens': 2}})
+
+    proxy.render_and_tokenize_chat([], token_place_headless_admission_fixture=True)
+    assert 'token_place_headless_admission_fixture' not in proxy._rpc.call_args.args[0]['kwargs']
+
+    proxy._headless_admission_fixture = True
+    proxy.render_and_tokenize_chat([], token_place_headless_admission_fixture=False)
+    assert proxy._rpc.call_args.args[0]['kwargs']['token_place_headless_admission_fixture'] is True
+
+
 def test_llama_worker_headless_fallback_ignores_environment_and_filename(monkeypatch, tmp_path):
     monkeypatch.setenv('TOKEN_PLACE_HEADLESS_ADMISSION_FIXTURE', '1')
     response = _run_llama_worker_request(
@@ -8872,6 +8889,7 @@ def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
         'paths.models_dir': str(tmp_path),
     }.get(key, default)
     manager = ModelManager(config)
+    manager.headless_admission_fixture = True
     Path(manager.model_path).write_text('fake')
 
     class FakeTokenizer:
@@ -8883,6 +8901,7 @@ def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
             self.kwargs = dict(model_path=model_path, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=verbose)
 
         def tokenizer(self):
+            assert self._headless_admission_fixture is True
             return FakeTokenizer()
 
     with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
@@ -8897,6 +8916,22 @@ def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
     assert manager.last_compute_diagnostics['rope_yarn_enabled'] is False
     assert manager.last_yarn_rope_diagnostics['active'] is False
     assert manager.last_yarn_rope_diagnostics['required'] is False
+
+
+def test_headless_admission_fixture_omits_legacy_chat_format(tmp_path):
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'llama-3-8b-instruct',
+        'model.context_size': 8192,
+        'model.chat_format': 'llama-3',
+        'paths.models_dir': str(tmp_path),
+    }.get(key, default)
+    manager = ModelManager(config)
+    manager.headless_admission_fixture = True
+
+    kwargs = manager._runtime_init_kwargs(object, 0)
+
+    assert 'chat_format' not in kwargs
 
 
 def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):

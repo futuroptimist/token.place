@@ -28,8 +28,30 @@ _MAX_RESULT_ITEMS = 1_024
 _MAX_RESULT_DEPTH = 8
 _MAX_MANIFEST_SCRIPTS = 64
 _MAX_CONNECTIONS = 32
-_KEY_FAMILIES = frozenset({"schema"})
-_DIGEST_KEY_FAMILIES = frozenset({"request", "response", "lease", "worker"})
+_MAX_RATE_LIMIT_WINDOW = 2**63 - 1
+_ROUTE_CLASS_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_KEY_COMPONENT_COUNTS = {
+    "schema": 0,
+    "nodes:lease": 0,
+    "cursor": 0,
+    "reservations:expiry": 0,
+    "requests:deadline": 0,
+    "claims:expiry": 0,
+    "responses:expiry": 0,
+    "control:expiry": 0,
+    "node_tombstones:expiry": 0,
+    "terminals:expiry": 0,
+    "node": 1,
+    "reservation": 1,
+    "queue": 1,
+    "node_tombstone": 1,
+    "request": 2,
+    "claim": 2,
+    "response": 2,
+    "progress": 2,
+    "terminal": 2,
+    "control": 3,
+}
 
 
 def _validate_optional_strings(*values: object, message: str) -> None:
@@ -237,16 +259,37 @@ class ValkeyConfig:
     def key_prefix(self) -> str:
         return f"tokenplace:{{{self.environment}:{self.cluster}}}:relay:v{self.schema_major}:"
 
-    def key(self, family: str, digest: str | None = None) -> str:
-        if family in _KEY_FAMILIES and digest is None:
-            return self.key_prefix + family
-        if (
-            family not in _DIGEST_KEY_FAMILIES
-            or not isinstance(digest, str)
-            or not _SHA256_RE.fullmatch(digest)
-        ):
+    def key(self, family: str, *components: object) -> str:
+        if not isinstance(family, str):
             raise ValkeyConfigurationError("invalid key suffix")
-        return f"{self.key_prefix}{family}:{digest}"
+        component_count = _KEY_COMPONENT_COUNTS.get(family)
+        if component_count is not None:
+            if len(components) != component_count or any(
+                not isinstance(component, str) or not _SHA256_RE.fullmatch(component)
+                for component in components
+            ):
+                raise ValkeyConfigurationError("invalid key suffix")
+        elif family == "ratelimit":
+            if len(components) != 3:
+                raise ValkeyConfigurationError("invalid key suffix")
+            route_class, identity_digest, window = components
+            if (
+                not isinstance(route_class, str)
+                or not _ROUTE_CLASS_RE.fullmatch(route_class)
+                or not isinstance(identity_digest, str)
+                or not _SHA256_RE.fullmatch(identity_digest)
+                or isinstance(window, bool)
+                or not isinstance(window, int)
+                or not 0 <= window <= _MAX_RATE_LIMIT_WINDOW
+            ):
+                raise ValkeyConfigurationError("invalid key suffix")
+        else:
+            raise ValkeyConfigurationError("invalid key suffix")
+        suffix = ":".join((family, *(str(component) for component in components)))
+        key = self.key_prefix + suffix
+        if key.count("{") != 1 or key.count("}") != 1:
+            raise ValkeyConfigurationError("invalid key suffix")
+        return key
 
     def __repr__(self) -> str:
         return "ValkeyConfig(<redacted>)"

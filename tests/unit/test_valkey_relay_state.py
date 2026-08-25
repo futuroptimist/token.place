@@ -291,18 +291,80 @@ def test_failure_rendering_traceback_and_logs_are_redacted(caplog):
     assert all(secret not in rendered for secret in secrets)
 
 
-def test_key_families_require_validated_sha256_components():
-    cfg = config()
-    digest = "a" * 64
-    assert cfg.key("request", digest).endswith(f"request:{digest}")
-    for family, component in (
-        ("arbitrary", digest),
-        ("request", "raw-id"),
-        ("request", "a" * 63),
-        ("request", "{" + "a" * 63),
-    ):
-        with pytest.raises(ValkeyConfigurationError):
-            cfg.key(family, component)
+@pytest.mark.parametrize(
+    ("family", "components", "suffix"),
+    [
+        *(
+            (family, (), family)
+            for family in (
+                "schema",
+                "nodes:lease",
+                "cursor",
+                "reservations:expiry",
+                "requests:deadline",
+                "claims:expiry",
+                "responses:expiry",
+                "control:expiry",
+                "node_tombstones:expiry",
+                "terminals:expiry",
+            )
+        ),
+        *(
+            (family, ("a" * 64,), f"{family}:{'a' * 64}")
+            for family in ("node", "reservation", "queue", "node_tombstone")
+        ),
+        *(
+            (family, ("a" * 64, "b" * 64), f"{family}:{'a' * 64}:{'b' * 64}")
+            for family in ("request", "claim", "response", "progress", "terminal")
+        ),
+        (
+            "control",
+            ("a" * 64, "b" * 64, "c" * 64),
+            f"control:{'a' * 64}:{'b' * 64}:{'c' * 64}",
+        ),
+        (
+            "ratelimit",
+            ("public-api", "d" * 64, 123),
+            f"ratelimit:public-api:{'d' * 64}:123",
+        ),
+    ],
+)
+def test_complete_adr_key_families_have_exact_layout(family, components, suffix):
+    cfg = config(environment="staging", cluster="relay-a", schema_major=4)
+    assert cfg.key(family, *components) == (
+        "tokenplace:{staging:relay-a}:relay:v4:" + suffix
+    )
+
+
+@pytest.mark.parametrize(
+    ("family", "components"),
+    [
+        ("unknown", ()),
+        (None, ()),
+        ("lease", ("a" * 64,)),
+        ("worker", ("a" * 64,)),
+        ("schema", ("a" * 64,)),
+        ("request", ("a" * 64,)),
+        ("request", ("a" * 64, "b" * 64, "c" * 64)),
+        ("request", ("raw-client", "b" * 64)),
+        ("request", ("A" * 64, "b" * 64)),
+        ("request", ("{" + "a" * 63, "b" * 64)),
+        ("request", (123, "b" * 64)),
+        ("ratelimit", ("public:api", "d" * 64, 1)),
+        ("ratelimit", ("public api", "d" * 64, 1)),
+        ("ratelimit", ("{public}", "d" * 64, 1)),
+        ("ratelimit", ("public", "raw-identity", 1)),
+        ("ratelimit", ("public", "d" * 64, True)),
+        ("ratelimit", ("public", "d" * 64, -1)),
+        ("ratelimit", ("public", "d" * 64, 2**63)),
+        ("ratelimit", ("public", "d" * 64, "01")),
+    ],
+)
+def test_key_builder_rejects_invalid_family_components_and_extra_hash_tags(
+    family, components
+):
+    with pytest.raises(ValkeyConfigurationError, match="invalid key suffix"):
+        config().key(family, *components)
 
 
 @pytest.mark.parametrize(

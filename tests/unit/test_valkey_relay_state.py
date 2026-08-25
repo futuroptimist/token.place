@@ -120,7 +120,14 @@ def test_invalid_runtime_discovery_objects_fail_closed_and_redacted(field):
         ValkeyConfigurationError, match="^invalid discovery configuration$"
     ) as caught:
         config(**changes)
-    assert "secret" not in str(caught.value)
+    rendered = " ".join(
+        (
+            str(caught.value),
+            repr(caught.value),
+            "".join(traceback.format_exception(caught.value)),
+        )
+    )
+    assert "secret" not in rendered
 
 
 @pytest.mark.parametrize(
@@ -147,13 +154,23 @@ def test_invalid_foundation_arguments_fail_before_client_construction(
     manifest_value = manifest() if manifest_value is None else manifest_value
     with patch.object(ValkeyFoundation, "_create_client") as create, patch(
         "valkey_relay_state.redis.ConnectionPool"
-    ) as pool, patch("valkey_relay_state.Sentinel") as sentinel_class:
+    ) as pool, patch("valkey_relay_state.redis.Redis") as redis_class, patch(
+        "valkey_relay_state.Sentinel"
+    ) as sentinel_class:
         with pytest.raises(error_type, match=f"^{message}$") as caught:
             ValkeyFoundation(config_value, manifest_value)
     create.assert_not_called()
     pool.assert_not_called()
+    redis_class.assert_not_called()
     sentinel_class.assert_not_called()
-    assert "secret" not in str(caught.value)
+    rendered = " ".join(
+        (
+            str(caught.value),
+            repr(caught.value),
+            "".join(traceback.format_exception(caught.value)),
+        )
+    )
+    assert "secret" not in rendered
 
 
 @pytest.mark.parametrize(

@@ -134,6 +134,7 @@ def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
         use_mock_llm = mock_runtime
         llm = None
         last_compute_diagnostics = {}
+        model_profile = {"provider": "qwen", "chat_template_policy": "gguf-jinja"}
 
         @staticmethod
         def _close_llm_proxy(_loaded):
@@ -144,6 +145,11 @@ def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
             self.model_manager = Manager()
 
         def ensure_api_v1_runtime_ready(self):
+            manager = self.model_manager
+            assert manager.headless_admission_fixture is True
+            assert manager.model_path == os.path.abspath(model)
+            assert manager.model_profile["provider"] == "headless-admission-fixture"
+            assert manager.model_profile["chat_template_policy"] == "headless-plain-chat"
             if load_exception:
                 raise load_exception
             self.model_manager.last_compute_diagnostics = {

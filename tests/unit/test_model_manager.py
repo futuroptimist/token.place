@@ -7950,7 +7950,7 @@ def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
     assert proxy._closed is True
 
 
-def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_format_body=None):
+def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_format_body=None, init_kwargs=None):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()
     (package_dir / '__init__.py').write_text(llama_body)
@@ -7969,7 +7969,7 @@ def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_forma
     )
     assert process.stdin is not None
     assert process.stdout is not None
-    process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+    process.stdin.write(json.dumps({'args': [], 'kwargs': init_kwargs or {}}) + '\n')
     process.stdin.flush()
     init = process.stdout.readline()
     assert init.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:')
@@ -8300,6 +8300,60 @@ class Llama:
     )
 
     assert response == {'status': 'ok', 'result': {'prompt_tokens': 4}}
+    assert 'secret prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_uses_marked_headless_fallback(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'fixture prompt'}]],
+            'kwargs': {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'token_place_headless_admission_fixture': True,
+            },
+        },
+        llama_body=r"""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def tokenizer(self):
+        return object()
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt.decode('utf-8') == '<|im_start|>user\nfixture prompt<|im_end|>\n<|im_start|>assistant\n'
+        return [10, 20, 30]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 3}}
+    assert 'fixture prompt' not in json.dumps(response)
+
+
+def test_llama_worker_headless_fallback_ignores_environment_and_filename(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKEN_PLACE_HEADLESS_ADMISSION_FIXTURE', '1')
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        init_kwargs={'model_path': str(tmp_path / 'stories15M-q4_0.gguf')},
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def tokenizer(self):
+        return object()
+    def tokenize(self, prompt, add_bos=False):
+        return [1]
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_metadata_missing'
     assert 'secret prompt' not in json.dumps(response)
 
 

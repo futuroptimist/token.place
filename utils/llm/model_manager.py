@@ -3357,6 +3357,10 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
     def render_and_tokenize_chat(self, *args, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs.pop('token_place_headless_admission_fixture', None)
+        if getattr(self, '_headless_admission_fixture', False):
+            kwargs['token_place_headless_admission_fixture'] = True
         with self._lock:
             try:
                 message = self._rpc({'method': 'render_and_tokenize_chat', 'args': args, 'kwargs': kwargs}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_prompt_render_tokenize')
@@ -4362,6 +4366,7 @@ def _type_error_is_unexpected_keyword(exc, keyword):
 
 def _render_chat_with_runtime_template(llama, args, kwargs):
     kwargs = dict(kwargs)
+    headless_fixture = kwargs.pop('token_place_headless_admission_fixture', False) is True
 
     def _rejection_diagnostics(rejected_kwarg, *, include_generation_category=True):
         diagnostics = {
@@ -4453,6 +4458,12 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
                 raise
     template, metadata_qwen_evidence = _runtime_chat_template(llama)
     if not isinstance(template, str) or not template.strip():
+        if headless_fixture:
+            return _render_testing_chat_template_fallback(args, kwargs), {
+                'direct_apply_chat_template': direct_apply_available,
+                'metadata_template': False,
+                'jinja_renderer': False,
+            }
         if qwen_api_v1_non_thinking:
             messages = args[0] if args else kwargs.get('messages')
             return _render_qwen_api_v1_non_thinking_template(messages, llama, add_generation_prompt=bool(kwargs.get('add_generation_prompt', True))), {
@@ -6887,6 +6898,8 @@ class ModelManager:
                                             self._qwen_64k_profile_attempt_ids.append(profile_id)
                                 try:
                                     llm_instance = Llama(**runtime_kwargs)
+                                    if getattr(self, 'headless_admission_fixture', False):
+                                        setattr(llm_instance, '_headless_admission_fixture', True)
                                     if is_qwen_64k and isinstance(profile_id, str):
                                         ids = [p.get('profile_id') for p in self._qwen_64k_runtime_profiles]
                                         self._qwen_64k_selected_profile_index = ids.index(profile_id) if profile_id in ids else 0

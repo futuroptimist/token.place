@@ -3148,6 +3148,12 @@ def headless_cpu_admission(args: Any) -> int:
         manager.model_path = os.path.abspath(args.model)
         manager.parent_model_path_exists = True
         manager.model_path_was_relative = False
+        # The explicit headless fixture is not the production Qwen artifact.
+        # Keep this exception boundary-local and in memory.
+        manager.headless_admission_fixture = True
+        manager.model_profile = dict(manager.model_profile)
+        manager.model_profile["provider"] = "headless-admission-fixture"
+        manager.model_profile["chat_template_policy"] = "headless-plain-chat"
         apply_context_profile(manager, args.context_tier)
         apply_compute_mode(manager, "cpu")
         manager.desktop_runtime_probe = dict(setup)

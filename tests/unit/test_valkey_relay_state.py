@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 import redis
 from redis.sentinel import MasterNotFoundError
+import valkey_relay_state
 
 from valkey_relay_state import (
     DirectPrimary,
@@ -532,3 +533,79 @@ def test_manifest_construction_bounds_scripts_and_encoded_bytes():
     with patch("valkey_relay_state._MAX_RESULT_BYTES", 10):
         with pytest.raises(ValkeySchemaIncompatibleError):
             manifest().encode()
+
+
+@pytest.mark.parametrize(
+    "constructor",
+    [
+        lambda: DirectPrimary("bad host"),
+        lambda: DirectPrimary("host", True),
+        lambda: SentinelPrimary((("host", 26379),), "bad service"),
+        lambda: config(environment="bad namespace"),
+        lambda: config(schema_major=True),
+        lambda: config(supported_schema_read_min=3, supported_schema_read_max=2),
+        lambda: config(tls=True, tls_client_cert="client.pem"),
+        lambda: manifest(schema_major=True),
+        lambda: manifest(reader_min=3, reader_max=2),
+        lambda: manifest(migration_epoch=True),
+        lambda: manifest(script_digests={"bad name": "a" * 64}),
+    ],
+)
+def test_invalid_configuration_and_manifest_branches_are_covered(constructor):
+    with pytest.raises((ValkeyConfigurationError, ValkeySchemaIncompatibleError)):
+        constructor()
+
+
+@pytest.mark.parametrize("raw", ["not-bytes", b"[]", b"not-json"])
+def test_manifest_decoder_rejects_invalid_encodings(raw):
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        SchemaManifest.decode(raw)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [None, True, 123, b"x" * 65_537, [[[[[[[[[b"too-deep"]]]]]]]]]],
+)
+def test_script_result_decoder_covers_scalar_and_bound_branches(result):
+    if result in (None, True, 123):
+        valkey_relay_state._validate_script_result(result)
+    else:
+        with pytest.raises(ValkeyScriptError):
+            valkey_relay_state._validate_script_result(result)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_error"),
+    [
+        (redis.ResponseError("READONLY private reply"), ValkeyReadOnlyError),
+        (redis.ResponseError("private reply"), ValkeyUnavailableError),
+    ],
+)
+def test_response_errors_are_classified_without_details(error, expected_error):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=0)
+    with pytest.raises(expected_error) as caught:
+        foundation._call(Mock(side_effect=error))
+    assert "private reply" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+def test_missing_manifest_results_are_typed():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=0)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = None
+
+    with pytest.raises(ValkeyUnavailableError):
+        foundation.initialize_manifest()
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.read_manifest()
+
+
+@pytest.mark.parametrize("result", [[b"invalid"], [-1, 0], [0, 1_000_000]])
+def test_server_time_rejects_malformed_and_out_of_range_results(result):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    with patch.object(foundation, "execute", return_value=result):
+        with pytest.raises(ValkeyScriptError, match="invalid reviewed script result"):
+            foundation.server_time()

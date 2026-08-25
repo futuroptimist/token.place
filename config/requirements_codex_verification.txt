@@ -17,4 +17,4 @@ pre-commit
 bandit>=1.7.9
 PyYAML>=6.0
 pytest-cov
-redis==8.1.0
+redis==7.0.1

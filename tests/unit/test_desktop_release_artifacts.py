@@ -5310,62 +5310,6 @@ def test_windows_installer_identity_safe_env_restricts_path_and_preserves_requir
     assert absent_path['PROCESSOR_ARCHITEW6432'] == 'x86'
 
 
-def test_windows_installer_identity_headless_env_restores_only_native_runtime_requirements(monkeypatch, tmp_path) -> None:
-    guard = _load_windows_installer_identity()
-    native = {
-        'SystemRoot': r'C:\Windows',
-        'WINDIR': r'C:\Windows',
-        'PATH': r'C:\Windows\System32;C:\Program Files\Git\cmd',
-        'PATHEXT': '.COM;.EXE;.BAT;.CMD',
-        'PROCESSOR_ARCHITECTURE': 'AMD64',
-        'PROCESSOR_ARCHITEW6432': 'AMD64',
-        'TEMP': r'C:\Users\runner\Temp',
-    }
-    poisoned = {
-        'PYTHONHOME': 'source-tree-python',
-        'PYTHONPATH': 'source-tree-imports',
-        'VIRTUAL_ENV': 'source-tree-venv',
-        'CONDA_PREFIX': 'source-tree-conda',
-        'TOKEN_PLACE_SIDECAR_PYTHON': 'python-override.exe',
-        'TOKEN_PLACE_PYTHON_IMPORT_ROOT': 'source-tree-runtime',
-        'CMAKE_ARGS': '-DGGML_CUDA=on',
-        'FORCE_CMAKE': '1',
-        'PIP_INDEX_URL': 'https://packages.example.invalid/simple',
-    }
-    for key, value in {**native, **poisoned}.items():
-        monkeypatch.setenv(key, value)
-
-    env = guard._headless_cpu_env()
-
-    assert all(env[key] == value for key, value in native.items())
-    assert env['PIP_NO_INDEX'] == '1'
-    assert env['PIP_DISABLE_PIP_VERSION_CHECK'] == '1'
-    assert env['PYTHONDONTWRITEBYTECODE'] == '1'
-    assert not set(poisoned) & set(env)
-
-    model = tmp_path / 'tiny.gguf'
-    exe = tmp_path / 'installed' / 'token-place-desktop-tauri.exe'
-    captured = {}
-
-    def fake_run(command, **kwargs):
-        captured.update(command=command, kwargs=kwargs)
-        terminal = {
-            'schema_version': 1, 'success': True, 'last_completed_phase': 'cleanup_completed',
-            'failure_code': 'none', 'packaged_runtime_identity': 'validated',
-            'selected_backend': 'cpu', 'warm_load_result': 'ready',
-            'authoritative_evidence_result': 'validated',
-        }
-        return subprocess.CompletedProcess(command, 0, json.dumps(terminal), '')
-
-    monkeypatch.setattr(guard, '_run', fake_run)
-    guard.run_headless_cpu_admission(exe, model, env)
-    assert captured['command'] == guard.headless_cpu_admission_command(exe, model)
-    assert captured['kwargs']['env'] == env
-    assert captured['kwargs']['timeout'] == 930
-    assert captured['kwargs']['check'] is False
-    assert captured['kwargs']['separate_stderr'] is True
-
-
 def test_windows_installer_identity_sentinel_dir_creates_every_host_tool_guard(tmp_path) -> None:
     guard = _load_windows_installer_identity()
 

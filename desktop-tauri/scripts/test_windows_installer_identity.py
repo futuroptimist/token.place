@@ -322,30 +322,6 @@ def _safe_env(
     return env
 
 
-def _headless_cpu_env() -> dict[str, str]:
-    """Return the minimal native Windows environment for the real warm load.
-
-    Unlike the structural launch matrix, this invocation must let Windows and
-    the bundled interpreter discover their native runtime dependencies.  Keep
-    Python/runtime overrides and build-tool configuration out of the child
-    environment, while retaining offline pip protection.
-    """
-    required_windows_keys = (
-        "SystemRoot", "WINDIR", "SystemDrive", "ComSpec", "TEMP", "TMP",
-        "USERPROFILE", "LOCALAPPDATA", "APPDATA", "ProgramData",
-        "ProgramFiles", "ProgramFiles(x86)", "CommonProgramFiles",
-        "CommonProgramFiles(x86)", "PATH", "PATHEXT",
-        "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432",
-    )
-    env = {key: os.environ[key] for key in required_windows_keys if key in os.environ}
-    env.update({
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "PIP_NO_INDEX": "1",
-        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-    })
-    return env
-
-
 def _sentinel_dir(root: Path) -> Path:
     directory = root / "sentinel-path"
     directory.mkdir(parents=True, exist_ok=True)
@@ -1265,7 +1241,7 @@ def run_scenario(
                 run_headless_cpu_admission(
                     shortcut.target,
                     tokenizer_boundary_model,
-                    _headless_cpu_env(),
+                    env,
                     artifact_dir.path(scenario.name, "headless-cpu-admission") if artifact_dir else None,
                 )
             if sentinel_log.exists() and sentinel_log.read_text(encoding="utf-8").strip():

@@ -20,6 +20,7 @@ from valkey_relay_state import (
     ValkeySchemaIncompatibleError,
     ValkeyScriptError,
     ValkeyUnavailableError,
+    SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
 )
 
@@ -220,6 +221,33 @@ def test_invalid_expected_manifest_is_rejected_before_connection_or_creation():
     create.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "script_digests",
+    [
+        {},
+        {**SCRIPT_DIGESTS, "extra_v1": "a" * 64},
+        {SERVER_TIME_SCRIPT.name: "a" * 64},
+    ],
+)
+def test_expected_script_digests_must_exactly_match_registry_before_connection(
+    script_digests,
+):
+    expected = manifest(script_digests=script_digests)
+    with patch.object(ValkeyFoundation, "_create_client") as create:
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            ValkeyFoundation(config(), expected)
+    create.assert_not_called()
+
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation.expected_manifest = expected
+    candidate = manifest(script_digests=script_digests)
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.check_read_compatible(candidate)
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.check_write_compatible(candidate)
+
+
 def test_retry_budget_is_total_and_deterministic():
     foundation = ValkeyFoundation.__new__(ValkeyFoundation)
     foundation.config = config(retry_attempts=5, retry_timeout_seconds=0.1)
@@ -246,6 +274,34 @@ def test_incompatible_execution_reads_only_manifest():
     foundation._client.get.assert_called_once()
     foundation._client.evalsha.assert_not_called()
     foundation._client.script_load.assert_not_called()
+
+
+def test_second_noscript_is_a_bounded_typed_error_without_another_retry():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=0)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.side_effect = [manifest().encode(), manifest().encode()]
+    datastore_detail = "NOSCRIPT reply from secret-endpoint:6379"
+    foundation._client.evalsha.side_effect = [
+        redis.exceptions.NoScriptError(datastore_detail),
+        redis.exceptions.NoScriptError(datastore_detail),
+    ]
+    foundation._client.script_load.return_value = SERVER_TIME_SCRIPT.eval_sha1
+
+    with pytest.raises(
+        ValkeyScriptError, match="^reviewed script recovery failed$"
+    ) as caught:
+        foundation.server_time()
+
+    assert foundation._client.evalsha.call_count == 2
+    foundation._client.script_load.assert_called_once_with(SERVER_TIME_SCRIPT.source)
+    assert caught.value.__cause__ is None
+    rendered = repr(caught.value) + str(caught.value) + "".join(
+        traceback.format_exception(caught.value)
+    )
+    assert datastore_detail not in rendered
+    assert "secret-endpoint" not in rendered
 
 
 @pytest.mark.parametrize("result", ["reply", {"raw": b"reply"}, [b"x"] * 1025])

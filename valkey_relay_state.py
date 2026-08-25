@@ -329,7 +329,7 @@ class SchemaManifest:
             raise ValkeySchemaIncompatibleError("state schema incompatible")
         if (
             not isinstance(self.script_digests, Mapping)
-            or not 0 < len(self.script_digests) <= _MAX_MANIFEST_SCRIPTS
+            or len(self.script_digests) > _MAX_MANIFEST_SCRIPTS
         ):
             raise ValkeySchemaIncompatibleError("state schema incompatible")
         digests: dict[str, str] = {}
@@ -412,11 +412,14 @@ SERVER_TIME_SOURCE = "local t = redis.call('TIME')\nreturn {t[1], t[2]}\n"
 SERVER_TIME_SCRIPT = ReviewedScript(
     "server_time_v1",
     SERVER_TIME_SOURCE,
-    hashlib.sha256(SERVER_TIME_SOURCE.encode()).hexdigest(),
+    "b60030a7ea7b76a01601d26aba460e94c4fa0d52fa472333c111f18c6701bd94",  # pragma: allowlist secret
     False,
 )
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
     {SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT}
+)
+SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
+    {name: script.sha256 for name, script in SCRIPT_REGISTRY.items()}
 )
 
 
@@ -554,7 +557,7 @@ class ValkeyFoundation:
             or not c.supported_schema_read_min
             <= manifest.active_schema_revision
             <= c.supported_schema_read_max
-            or dict(manifest.script_digests) != dict(e.script_digests)
+            or dict(manifest.script_digests) != dict(SCRIPT_DIGESTS)
             or manifest.migration_epoch != e.migration_epoch
         ):
             raise ValkeySchemaIncompatibleError("state schema incompatible")
@@ -594,7 +597,10 @@ class ValkeyFoundation:
                 self._client.evalsha, script.eval_sha1, len(keys), *keys, *args
             )
         except NoScriptError:
-            loaded = self._call(self._client.script_load, script.source)
+            try:
+                loaded = self._call(self._client.script_load, script.source)
+            except NoScriptError:
+                raise ValkeyScriptError("reviewed script recovery failed") from None
             loaded = loaded.decode() if isinstance(loaded, bytes) else loaded
             if loaded != script.eval_sha1:
                 raise ValkeyScriptError("reviewed script digest mismatch")
@@ -602,9 +608,12 @@ class ValkeyFoundation:
             self.check_read_compatible(manifest)
             if script.mutates:
                 self.check_write_compatible(manifest)
-            result = self._call(
-                self._client.evalsha, script.eval_sha1, len(keys), *keys, *args
-            )
+            try:
+                result = self._call(
+                    self._client.evalsha, script.eval_sha1, len(keys), *keys, *args
+                )
+            except NoScriptError:
+                raise ValkeyScriptError("reviewed script recovery failed") from None
         _validate_script_result(result)
         return result
 

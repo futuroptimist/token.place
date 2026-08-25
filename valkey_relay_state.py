@@ -142,7 +142,11 @@ class SentinelPrimary:
     sentinel_password: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.sentinels or len(self.sentinels) > 32:
+        if (
+            not isinstance(self.sentinels, tuple)
+            or not self.sentinels
+            or len(self.sentinels) > 32
+        ):
             raise ValkeyConfigurationError("invalid Sentinel discovery")
         for endpoint in self.sentinels:
             if (
@@ -216,6 +220,12 @@ class ValkeyConfig:
             or self.supported_writer_min > self.supported_writer_max
         ):
             raise ValkeyConfigurationError("invalid revision range")
+        if self.direct is not None and not isinstance(self.direct, DirectPrimary):
+            raise ValkeyConfigurationError("invalid discovery configuration")
+        if self.sentinel is not None and not isinstance(
+            self.sentinel, SentinelPrimary
+        ):
+            raise ValkeyConfigurationError("invalid discovery configuration")
         if (self.direct is None) == (self.sentinel is None):
             raise ValkeyConfigurationError("exactly one discovery mode is required")
         if not isinstance(self.tls, bool):
@@ -427,6 +437,10 @@ class ValkeyFoundation:
     """Owns an explicit pool and exposes only foundation-level operations."""
 
     def __init__(self, config: ValkeyConfig, expected_manifest: SchemaManifest):
+        if not isinstance(config, ValkeyConfig):
+            raise ValkeyConfigurationError("invalid Valkey configuration")
+        if not isinstance(expected_manifest, SchemaManifest):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
         self.config = config
         self.expected_manifest = expected_manifest
         self.check_read_compatible(expected_manifest)

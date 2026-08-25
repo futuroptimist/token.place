@@ -81,6 +81,82 @@ def test_direct_and_sentinel_discovery_validation():
 
 
 @pytest.mark.parametrize(
+    "sentinels",
+    [
+        [["host", 26379]],
+        [("host", 26379)],
+        (["host", 26379],),
+    ],
+)
+def test_mutable_sentinel_endpoint_collections_are_rejected(sentinels):
+    with pytest.raises(
+        ValkeyConfigurationError, match="^invalid Sentinel discovery$"
+    ) as caught:
+        SentinelPrimary(sentinels, "relay-primary")
+    assert "host" not in str(caught.value)
+
+
+def test_valid_sentinel_configuration_is_deeply_immutable():
+    sentinel = SentinelPrimary((("host", 26379),), "relay-primary")
+    cfg = config(direct=None, sentinel=sentinel)
+
+    with pytest.raises(TypeError):
+        sentinel.sentinels[0] = ("other", 26380)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.sentinel = SentinelPrimary((("other", 26380),), "relay-primary")
+
+
+class MaliciousDiscovery:
+    def __repr__(self):
+        return "secret-endpoint secret-password"
+
+
+@pytest.mark.parametrize("field", ["direct", "sentinel"])
+def test_invalid_runtime_discovery_objects_fail_closed_and_redacted(field):
+    changes = {field: MaliciousDiscovery()}
+    if field == "sentinel":
+        changes["direct"] = None
+    with pytest.raises(
+        ValkeyConfigurationError, match="^invalid discovery configuration$"
+    ) as caught:
+        config(**changes)
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("config_value", "manifest_value", "error_type", "message"),
+    [
+        (
+            MaliciousDiscovery(),
+            None,
+            ValkeyConfigurationError,
+            "invalid Valkey configuration",
+        ),
+        (
+            None,
+            MaliciousDiscovery(),
+            ValkeySchemaIncompatibleError,
+            "state schema incompatible",
+        ),
+    ],
+)
+def test_invalid_foundation_arguments_fail_before_client_construction(
+    config_value, manifest_value, error_type, message
+):
+    config_value = config() if config_value is None else config_value
+    manifest_value = manifest() if manifest_value is None else manifest_value
+    with patch.object(ValkeyFoundation, "_create_client") as create, patch(
+        "valkey_relay_state.redis.ConnectionPool"
+    ) as pool, patch("valkey_relay_state.Sentinel") as sentinel_class:
+        with pytest.raises(error_type, match=f"^{message}$") as caught:
+            ValkeyFoundation(config_value, manifest_value)
+    create.assert_not_called()
+    pool.assert_not_called()
+    sentinel_class.assert_not_called()
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
     "changes",
     [
         {"direct": None},

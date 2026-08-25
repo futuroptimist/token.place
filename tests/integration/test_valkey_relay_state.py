@@ -10,6 +10,7 @@ import redis
 
 from valkey_relay_state import (
     DirectPrimary,
+    SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
     SchemaManifest,
     ValkeyConfig,
@@ -175,8 +176,10 @@ def test_server_time_and_exact_noscript_recovery_without_lifecycle_mutation(
 def test_conflicting_concurrent_initializers_preserve_one_manifest(valkey_server):
     namespace = uuid.uuid4().hex
     first = _foundation(valkey_server, namespace)
-    other_manifest = _manifest(script_digests={SERVER_TIME_SCRIPT.name: "a" * 64})
+    other_manifest = _manifest(migration_epoch=1)
     second = _foundation(valkey_server, namespace, other_manifest)
+    assert first.expected_manifest.script_digests == SCRIPT_DIGESTS
+    assert second.expected_manifest.script_digests == SCRIPT_DIGESTS
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     try:
         futures = [pool.submit(store.initialize_manifest) for store in (first, second)]
@@ -188,6 +191,7 @@ def test_conflicting_concurrent_initializers_preserve_one_manifest(valkey_server
                 outcomes.append("rejected")
         stored = first._client.get(first.config.key("schema"))
         assert outcomes.count("rejected") == 1
+        assert len([outcome for outcome in outcomes if outcome != "rejected"]) == 1
         assert stored in {_manifest().encode(), other_manifest.encode()}
     finally:
         pool.shutdown()

@@ -4436,6 +4436,18 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
             except Exception:
                 tokenizer = None
         render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
+    template = None
+    metadata_qwen_evidence = False
+    metadata_preflighted = False
+    if headless_fixture:
+        template, metadata_qwen_evidence = _runtime_chat_template(llama)
+        metadata_preflighted = True
+        if not isinstance(template, str) or not template.strip():
+            return _render_testing_chat_template_fallback(args, kwargs), {
+                'direct_apply_chat_template': direct_apply_available,
+                'metadata_template': False,
+                'jinja_renderer': False,
+            }
     render_exc = None
     rejected_render_kwarg = None
     if callable(render):
@@ -4456,14 +4468,9 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
                         break
             if rejected_render_kwarg not in {'enable_thinking', 'tokenize', 'add_generation_prompt'}:
                 raise
-    template, metadata_qwen_evidence = _runtime_chat_template(llama)
+    if not metadata_preflighted:
+        template, metadata_qwen_evidence = _runtime_chat_template(llama)
     if not isinstance(template, str) or not template.strip():
-        if headless_fixture:
-            return _render_testing_chat_template_fallback(args, kwargs), {
-                'direct_apply_chat_template': direct_apply_available,
-                'metadata_template': False,
-                'jinja_renderer': False,
-            }
         if qwen_api_v1_non_thinking:
             messages = args[0] if args else kwargs.get('messages')
             return _render_qwen_api_v1_non_thinking_template(messages, llama, add_generation_prompt=bool(kwargs.get('add_generation_prompt', True))), {

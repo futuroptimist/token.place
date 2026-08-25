@@ -8319,6 +8319,8 @@ def test_llama_worker_render_and_tokenize_chat_uses_marked_headless_fallback(tmp
 class Llama:
     def __init__(self, *args, **kwargs):
         pass
+    def apply_chat_template(self, messages, **kwargs):
+        raise AssertionError('apply_chat_template must not be invoked without metadata')
     def tokenizer(self):
         return object()
     def tokenize(self, prompt, add_bos=False):
@@ -8345,6 +8347,8 @@ def test_llama_worker_headless_fallback_ignores_environment_and_filename(monkeyp
 class Llama:
     def __init__(self, *args, **kwargs):
         pass
+    def apply_chat_template(self, messages, **kwargs):
+        raise RuntimeError('missing chat template metadata')
     def tokenizer(self):
         return object()
     def tokenize(self, prompt, add_bos=False):
@@ -8353,7 +8357,7 @@ class Llama:
     )
 
     assert response['status'] == 'error'
-    assert response['diagnostics']['reason'] == 'runtime_chat_template_metadata_missing'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_render_exception'
     assert 'secret prompt' not in json.dumps(response)
 
 

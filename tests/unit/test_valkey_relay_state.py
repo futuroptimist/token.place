@@ -1,5 +1,7 @@
 import dataclasses
+import logging
 import math
+import traceback
 from unittest.mock import Mock, patch
 
 import pytest
@@ -124,7 +126,7 @@ def test_sentinel_tls_applies_to_discovery_and_primary_connections():
         tls=True,
         tls_ca_cert="ca.pem",
         tls_client_cert="client.pem",
-        tls_client_key="client-key.pem",
+        tls_client_key="client-key.pem",  # pragma: allowlist secret
     )
     expected = manifest()
     master = Mock()
@@ -133,9 +135,11 @@ def test_sentinel_tls_applies_to_discovery_and_primary_connections():
         foundation = ValkeyFoundation(cfg, expected)
 
     call = sentinel_class.call_args
-    assert call.kwargs["connection_class"] is redis.SSLConnection
-    assert call.kwargs["sentinel_kwargs"]["connection_class"] is redis.SSLConnection
+    assert call.kwargs["ssl"] is True
+    assert call.kwargs["sentinel_kwargs"]["ssl"] is True
     assert call.kwargs["sentinel_kwargs"]["ssl_ca_certs"] == "ca.pem"
+    assert call.kwargs["max_connections"] == 32
+    assert call.kwargs["sentinel_kwargs"]["max_connections"] == 32
     assert foundation._client is master
 
 
@@ -183,7 +187,7 @@ def test_manifest_is_immutable_and_round_trips_canonically():
 
 def test_arbitrary_and_digest_mismatched_scripts_are_rejected():
     with pytest.raises(ValkeyScriptError):
-        ReviewedScript("bad", "return 1", "0" * 64)
+        ReviewedScript("bad", "return 1", "0" * 64, False)
     foundation = ValkeyFoundation.__new__(ValkeyFoundation)
     with pytest.raises(ValkeyScriptError, match="unknown reviewed script"):
         foundation.execute("caller_lua")
@@ -197,6 +201,7 @@ def test_errors_do_not_disclose_backend_details():
 
 def test_lazy_sentinel_discovery_error_is_bounded_and_redacted():
     foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=0)
 
     def unavailable():
         raise MasterNotFoundError("No master at secret-sentinel:26379")
@@ -208,12 +213,111 @@ def test_lazy_sentinel_discovery_error_is_bounded_and_redacted():
     assert "secret-sentinel" not in str(caught.value)
 
 
-def test_invalid_expected_manifest_is_rejected_before_creation():
+def test_invalid_expected_manifest_is_rejected_before_connection_or_creation():
+    with patch.object(ValkeyFoundation, "_create_client") as create:
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            ValkeyFoundation(config(), manifest(schema_major=2))
+    create.assert_not_called()
+
+
+def test_retry_budget_is_total_and_deterministic():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5, retry_timeout_seconds=0.1)
+    operation = Mock(side_effect=redis.ConnectionError("private endpoint"))
+    clock = Mock(side_effect=[0.0, 0.04, 0.11])
+    with patch("valkey_relay_state.time.monotonic", clock), patch(
+        "valkey_relay_state.time.sleep"
+    ) as sleep:
+        with pytest.raises(ValkeyUnavailableError) as caught:
+            foundation._call(operation)
+    assert operation.call_count == 2
+    sleep.assert_called_once_with(0.05)
+    assert caught.value.__cause__ is None
+
+
+def test_incompatible_execution_reads_only_manifest():
     foundation = ValkeyFoundation.__new__(ValkeyFoundation)
     foundation.config = config()
-    foundation.expected_manifest = manifest(schema_major=2)
+    foundation.expected_manifest = manifest()
     foundation._client = Mock()
-
+    foundation._client.get.return_value = manifest(schema_major=2).encode()
     with pytest.raises(ValkeySchemaIncompatibleError):
-        foundation.initialize_manifest()
-    foundation._client.set.assert_not_called()
+        foundation.server_time()
+    foundation._client.get.assert_called_once()
+    foundation._client.evalsha.assert_not_called()
+    foundation._client.script_load.assert_not_called()
+
+
+@pytest.mark.parametrize("result", ["reply", {"raw": b"reply"}, [b"x"] * 1025])
+def test_script_result_decoder_rejects_unbounded_or_unsupported_values(result):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.return_value = result
+    with pytest.raises(ValkeyScriptError, match="invalid reviewed script result"):
+        foundation.server_time()
+
+
+def test_false_ping_is_unavailable():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._client.ping.return_value = False
+    with pytest.raises(ValkeyUnavailableError):
+        foundation.readiness()
+    foundation._client.role.assert_not_called()
+
+
+def test_failure_rendering_traceback_and_logs_are_redacted(caplog):
+    secrets = ("host.internal", "user", "password", "/secret/ca", "raw:key", "reply")
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=0)
+
+    def fail():
+        raise redis.ConnectionError(" ".join(secrets))
+
+    with caplog.at_level(logging.DEBUG):
+        try:
+            foundation._call(fail)
+        except ValkeyUnavailableError as error:
+            rendered = (
+                repr(error)
+                + str(error)
+                + "".join(traceback.format_exception(error))
+                + caplog.text
+            )
+    assert all(secret not in rendered for secret in secrets)
+
+
+def test_key_families_require_validated_sha256_components():
+    cfg = config()
+    digest = "a" * 64
+    assert cfg.key("request", digest).endswith(f"request:{digest}")
+    for family, component in (
+        ("arbitrary", digest),
+        ("request", "raw-id"),
+        ("request", "a" * 63),
+        ("request", "{" + "a" * 63),
+    ):
+        with pytest.raises(ValkeyConfigurationError):
+            cfg.key(family, component)
+
+
+@pytest.mark.parametrize(
+    "changes", [{"tls": 1}, {"username": ""}, {"password": 42}, {"tls_ca_cert": " "}]
+)
+def test_authentication_and_tls_types_are_strict(changes):
+    with pytest.raises(ValkeyConfigurationError):
+        config(**changes)
+    with pytest.raises(ValkeyConfigurationError):
+        SentinelPrimary((("host", 26379),), "relay-primary", "")
+
+
+def test_manifest_construction_bounds_scripts_and_encoded_bytes():
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        manifest(script_digests={f"s{i}": "a" * 64 for i in range(65)})
+    with patch("valkey_relay_state._MAX_RESULT_BYTES", 10):
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            manifest().encode()

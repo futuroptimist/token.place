@@ -10,15 +10,13 @@ import hashlib
 import json
 import math
 import re
+import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
 
 import redis
-from redis.backoff import ExponentialBackoff
-from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import NoScriptError, RedisError, ResponseError, TimeoutError
-from redis.retry import Retry
+from redis.exceptions import NoScriptError, RedisError, ResponseError
 from redis.sentinel import Sentinel
 
 _NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
@@ -26,6 +24,43 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_TIMEOUT_SECONDS = 30.0
 _MAX_RETRIES = 5
 _MAX_RESULT_BYTES = 65_536
+_MAX_RESULT_ITEMS = 1_024
+_MAX_RESULT_DEPTH = 8
+_MAX_MANIFEST_SCRIPTS = 64
+_MAX_CONNECTIONS = 32
+_KEY_FAMILIES = frozenset({"schema"})
+_DIGEST_KEY_FAMILIES = frozenset({"request", "response", "lease", "worker"})
+
+
+def _validate_optional_strings(*values: object, message: str) -> None:
+    if any(
+        value is not None and (not isinstance(value, str) or not value)
+        for value in values
+    ):
+        raise ValkeyConfigurationError(message)
+
+
+def _validate_script_result(result: object) -> None:
+    total_bytes = 0
+    total_items = 0
+    pending = [(result, 0)]
+    while pending:
+        value, depth = pending.pop()
+        total_items += 1
+        if total_items > _MAX_RESULT_ITEMS or depth > _MAX_RESULT_DEPTH:
+            raise ValkeyScriptError("invalid reviewed script result")
+        if value is None or isinstance(value, bool):
+            total_bytes += 1
+        elif isinstance(value, int) and not isinstance(value, bool):
+            total_bytes += len(str(value))
+        elif isinstance(value, bytes):
+            total_bytes += len(value)
+        elif isinstance(value, (list, tuple)):
+            pending.extend((item, depth + 1) for item in value)
+        else:
+            raise ValkeyScriptError("invalid reviewed script result")
+        if total_bytes > _MAX_RESULT_BYTES:
+            raise ValkeyScriptError("invalid reviewed script result")
 
 
 class ValkeyFoundationError(RuntimeError):
@@ -104,6 +139,11 @@ class SentinelPrimary:
             self.service_name
         ):
             raise ValkeyConfigurationError("invalid Sentinel discovery")
+        _validate_optional_strings(
+            self.sentinel_username,
+            self.sentinel_password,
+            message="invalid Sentinel credentials",
+        )
 
     def __repr__(self) -> str:
         return "SentinelPrimary(<redacted>)"
@@ -156,6 +196,16 @@ class ValkeyConfig:
             raise ValkeyConfigurationError("invalid revision range")
         if (self.direct is None) == (self.sentinel is None):
             raise ValkeyConfigurationError("exactly one discovery mode is required")
+        if not isinstance(self.tls, bool):
+            raise ValkeyConfigurationError("TLS flag must be boolean")
+        _validate_optional_strings(
+            self.tls_ca_cert,
+            self.tls_client_cert,
+            self.tls_client_key,
+            self.username,
+            self.password,
+            message="invalid authentication or certificate input",
+        )
         for timeout in (
             self.connect_timeout_seconds,
             self.socket_timeout_seconds,
@@ -187,16 +237,16 @@ class ValkeyConfig:
     def key_prefix(self) -> str:
         return f"tokenplace:{{{self.environment}:{self.cluster}}}:relay:v{self.schema_major}:"
 
-    def key(self, suffix: str) -> str:
+    def key(self, family: str, digest: str | None = None) -> str:
+        if family in _KEY_FAMILIES and digest is None:
+            return self.key_prefix + family
         if (
-            not isinstance(suffix, str)
-            or not suffix
-            or len(suffix) > 512
-            or "{" in suffix
-            or "}" in suffix
+            family not in _DIGEST_KEY_FAMILIES
+            or not isinstance(digest, str)
+            or not _SHA256_RE.fullmatch(digest)
         ):
             raise ValkeyConfigurationError("invalid key suffix")
-        return self.key_prefix + suffix
+        return f"{self.key_prefix}{family}:{digest}"
 
     def __repr__(self) -> str:
         return "ValkeyConfig(<redacted>)"
@@ -234,12 +284,22 @@ class SchemaManifest:
             or self.migration_epoch < 0
         ):
             raise ValkeySchemaIncompatibleError("state schema incompatible")
-        digests = dict(self.script_digests)
-        if not digests or any(
-            not _NAMESPACE_RE.fullmatch(k) or not _SHA256_RE.fullmatch(v)
-            for k, v in digests.items()
+        if (
+            not isinstance(self.script_digests, Mapping)
+            or not 0 < len(self.script_digests) <= _MAX_MANIFEST_SCRIPTS
         ):
             raise ValkeySchemaIncompatibleError("state schema incompatible")
+        digests: dict[str, str] = {}
+        for name, digest in self.script_digests.items():
+            if (
+                not isinstance(name, str)
+                or len(name.encode()) > 128
+                or not _NAMESPACE_RE.fullmatch(name)
+                or not isinstance(digest, str)
+                or not _SHA256_RE.fullmatch(digest)
+            ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            digests[name] = digest
         object.__setattr__(self, "script_digests", MappingProxyType(digests))
 
     def encode(self) -> bytes:
@@ -254,7 +314,10 @@ class SchemaManifest:
             "script_digests": dict(self.script_digests),
             "migration_epoch": self.migration_epoch,
         }
-        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        if len(encoded) > _MAX_RESULT_BYTES:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return encoded
 
     @classmethod
     def decode(cls, raw: bytes) -> "SchemaManifest":
@@ -275,8 +338,8 @@ class SchemaManifest:
             }:
                 raise ValueError
             return cls(**value)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValkeySchemaIncompatibleError("state schema incompatible") from exc
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,11 +347,13 @@ class ReviewedScript:
     name: str
     source: str
     sha256: str
+    mutates: bool
 
     def __post_init__(self) -> None:
         actual = hashlib.sha256(self.source.encode()).hexdigest()
         if (
             not _NAMESPACE_RE.fullmatch(self.name)
+            or not isinstance(self.mutates, bool)
             or not _SHA256_RE.fullmatch(self.sha256)
             or actual != self.sha256
         ):
@@ -305,6 +370,7 @@ SERVER_TIME_SCRIPT = ReviewedScript(
     "server_time_v1",
     SERVER_TIME_SOURCE,
     hashlib.sha256(SERVER_TIME_SOURCE.encode()).hexdigest(),
+    False,
 )
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
     {SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT}
@@ -317,6 +383,8 @@ class ValkeyFoundation:
     def __init__(self, config: ValkeyConfig, expected_manifest: SchemaManifest):
         self.config = config
         self.expected_manifest = expected_manifest
+        self.check_read_compatible(expected_manifest)
+        self.check_write_compatible(expected_manifest)
         self._client = self._create_client()
 
     def __repr__(self) -> str:
@@ -329,13 +397,13 @@ class ValkeyFoundation:
             "password": cfg.password,
             "socket_connect_timeout": cfg.connect_timeout_seconds,
             "socket_timeout": min(
-                cfg.socket_timeout_seconds, cfg.command_timeout_seconds
+                cfg.socket_timeout_seconds,
+                cfg.command_timeout_seconds,
+                cfg.retry_timeout_seconds,
             ),
-            "retry": Retry(
-                ExponentialBackoff(cap=cfg.retry_timeout_seconds), cfg.retry_attempts
-            ),
-            "retry_on_error": [RedisConnectionError, TimeoutError],
+            "retry_on_error": [],
             "decode_responses": False,
+            "max_connections": _MAX_CONNECTIONS,
         }
         if cfg.tls:
             kwargs.update(
@@ -365,22 +433,25 @@ class ValkeyFoundation:
                 "password": self.config.sentinel.sentinel_password,
                 "socket_connect_timeout": self.config.connect_timeout_seconds,
                 "socket_timeout": self.config.socket_timeout_seconds,
+                "max_connections": _MAX_CONNECTIONS,
             }
             if self.config.tls:
                 sentinel_kwargs.update(
-                    connection_class=redis.SSLConnection,
+                    ssl=True,
                     ssl_ca_certs=self.config.tls_ca_cert,
                     ssl_certfile=self.config.tls_client_cert,
                     ssl_keyfile=self.config.tls_client_key,
                 )
-                kwargs["connection_class"] = redis.SSLConnection
+                kwargs["ssl"] = True
             sentinel = Sentinel(
                 self.config.sentinel.sentinels,
                 sentinel_kwargs=sentinel_kwargs,
                 **kwargs,
             )
             return sentinel.master_for(self.config.sentinel.service_name)
-        except (RedisError, TypeError, ValueError):
+        except RedisError:
+            raise ValkeyUnavailableError("state backend unavailable") from None
+        except (TypeError, ValueError):
             raise ValkeyConfigurationError(
                 "invalid Valkey connection configuration"
             ) from None
@@ -390,19 +461,24 @@ class ValkeyFoundation:
         self._client.connection_pool.disconnect()
 
     def _call(self, operation: Any, *args: Any, **kwargs: Any) -> Any:
-        try:
-            return operation(*args, **kwargs)
-        except NoScriptError:
-            raise
-        except (RedisConnectionError, TimeoutError):
-            raise ValkeyUnavailableError("state backend unavailable") from None
-        except ResponseError as exc:
-            if "READONLY" in str(exc).upper():
-                raise ValkeyReadOnlyError("state backend is not writable") from None
-            raise ValkeyUnavailableError("state backend command failed") from None
-        except RedisError:
-            # Includes lazy Sentinel discovery failures such as MasterNotFoundError.
-            raise ValkeyUnavailableError("state backend unavailable") from None
+        deadline = time.monotonic() + self.config.retry_timeout_seconds
+        for attempt in range(self.config.retry_attempts + 1):
+            try:
+                return operation(*args, **kwargs)
+            except NoScriptError:
+                raise
+            except ResponseError as exc:
+                if "READONLY" in str(exc).upper():
+                    raise ValkeyReadOnlyError("state backend is not writable") from None
+                raise ValkeyUnavailableError("state backend command failed") from None
+            except RedisError:
+                if attempt >= self.config.retry_attempts:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.05 * (2**attempt), remaining))
+        raise ValkeyUnavailableError("state backend unavailable") from None
 
     def initialize_manifest(self) -> SchemaManifest:
         # Never persist an expected value this process could not itself use.
@@ -410,6 +486,8 @@ class ValkeyFoundation:
         self.check_write_compatible(self.expected_manifest)
         raw = self.expected_manifest.encode()
         key = self.config.key("schema")
+        self.check_read_compatible(self.expected_manifest)
+        self.check_write_compatible(self.expected_manifest)
         self._call(self._client.set, key, raw, nx=True)
         stored = self._call(self._client.get, key)
         if stored is None:
@@ -461,12 +539,14 @@ class ValkeyFoundation:
             raise ValkeyScriptError("unknown reviewed script")
         manifest = self.read_manifest()
         self.check_read_compatible(manifest)
-        self.check_write_compatible(
-            manifest
-        )  # immediately before mutating-capable dispatch
+        if script.mutates:
+            self.check_write_compatible(manifest)
         if manifest.script_digests.get(script.name) != script.sha256:
             raise ValkeySchemaIncompatibleError("state schema incompatible")
         try:
+            if script.mutates:
+                self.check_read_compatible(manifest)
+                self.check_write_compatible(manifest)
             result = self._call(
                 self._client.evalsha, script.eval_sha1, len(keys), *keys, *args
             )
@@ -475,25 +555,29 @@ class ValkeyFoundation:
             loaded = loaded.decode() if isinstance(loaded, bytes) else loaded
             if loaded != script.eval_sha1:
                 raise ValkeyScriptError("reviewed script digest mismatch")
+            manifest = self.read_manifest()
+            self.check_read_compatible(manifest)
+            if script.mutates:
+                self.check_write_compatible(manifest)
             result = self._call(
                 self._client.evalsha, script.eval_sha1, len(keys), *keys, *args
             )
-        if len(repr(result).encode()) > _MAX_RESULT_BYTES:
-            raise ValkeyScriptError("reviewed script result exceeded bound")
+        _validate_script_result(result)
         return result
 
     def server_time(self) -> tuple[int, int]:
         result = self.execute(SERVER_TIME_SCRIPT.name)
         try:
             seconds, micros = (int(part) for part in result)
-        except (TypeError, ValueError) as exc:
-            raise ValkeyScriptError("invalid reviewed script result") from exc
+        except (TypeError, ValueError):
+            raise ValkeyScriptError("invalid reviewed script result") from None
         if seconds < 0 or not 0 <= micros < 1_000_000:
             raise ValkeyScriptError("invalid reviewed script result")
         return seconds, micros
 
     def readiness(self) -> None:
-        self._call(self._client.ping)
+        if self._call(self._client.ping) is not True:
+            raise ValkeyUnavailableError("state backend unavailable")
         role = self._call(self._client.role)
         if (
             not isinstance(role, (list, tuple))

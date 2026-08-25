@@ -50,8 +50,9 @@ def valkey_server(tmp_path_factory):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    probe = redis.Redis(host="127.0.0.1", port=port, socket_timeout=0.2)
+    probe = None
     try:
+        probe = redis.Redis(host="127.0.0.1", port=port, socket_timeout=0.2)
         for _ in range(100):
             try:
                 if probe.ping():
@@ -62,9 +63,15 @@ def valkey_server(tmp_path_factory):
             raise RuntimeError("isolated Valkey did not start")
         yield port
     finally:
-        probe.close()
-        process.terminate()
-        process.wait(timeout=5)
+        if probe is not None:
+            probe.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
 
 def _manifest(**changes):
@@ -163,6 +170,30 @@ def test_server_time_and_exact_noscript_recovery_without_lifecycle_mutation(
     finally:
         foundation._client.delete(foundation.config.key("schema"))
         foundation.close()
+
+
+def test_conflicting_concurrent_initializers_preserve_one_manifest(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _foundation(valkey_server, namespace)
+    other_manifest = _manifest(script_digests={SERVER_TIME_SCRIPT.name: "a" * 64})
+    second = _foundation(valkey_server, namespace, other_manifest)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    try:
+        futures = [pool.submit(store.initialize_manifest) for store in (first, second)]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except ValkeySchemaIncompatibleError:
+                outcomes.append("rejected")
+        stored = first._client.get(first.config.key("schema"))
+        assert outcomes.count("rejected") == 1
+        assert stored in {_manifest().encode(), other_manifest.encode()}
+    finally:
+        pool.shutdown()
+        first._client.delete(first.config.key("schema"))
+        first.close()
+        second.close()
 
 
 def test_unavailable_backend_is_bounded_and_redacted():

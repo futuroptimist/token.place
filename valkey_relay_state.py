@@ -38,6 +38,20 @@ _MAX_RESULT_DEPTH = 8
 _MAX_MANIFEST_SCRIPTS = 64
 _MAX_CONNECTIONS = 32
 _MAX_RATE_LIMIT_WINDOW = 2**63 - 1
+_REGISTRATION_FIELDS = (
+    b"node_id",
+    b"control_credential_digest",
+    b"registered_at_epoch",
+    b"supported_model_ids",
+    b"active_context_tier",
+    b"maximum_total_context_tokens",
+    b"default_output_token_reservation",
+    b"maximum_output_tokens",
+    b"max_concurrency",
+    b"backend_class",
+    b"api_version",
+    b"lease_expires_at_epoch",
+)
 _ROUTE_CLASS_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _KEY_COMPONENT_COUNTS = {
     "schema": 0,
@@ -919,23 +933,22 @@ class ValkeyRegistrationStore:
 
     @staticmethod
     def _record_from_script(raw: object) -> ComputeNodeRegistration:
-        fields = (
-            b"node_id",
-            b"control_credential_digest",
-            b"registered_at_epoch",
-            b"supported_model_ids",
-            b"active_context_tier",
-            b"maximum_total_context_tokens",
-            b"default_output_token_reservation",
-            b"maximum_output_tokens",
-            b"max_concurrency",
-            b"backend_class",
-            b"api_version",
-            b"lease_expires_at_epoch",
-        )
-        if not isinstance(raw, (list, tuple)) or len(raw) != len(fields):
+        record = ValkeyRegistrationStore._fixed_record(raw)
+        if record is None:
             raise ValkeySchemaIncompatibleError("state schema incompatible")
-        return ValkeyRegistrationStore._decode_record(dict(zip(fields, raw)))
+        return ValkeyRegistrationStore._decode_record(record)
+
+    @staticmethod
+    def _fixed_record(raw: object) -> dict[bytes, bytes] | None:
+        if not isinstance(raw, (list, tuple)) or len(raw) != len(_REGISTRATION_FIELDS):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if all(value is None for value in raw):
+            return None
+        if any(not isinstance(value, bytes) for value in raw):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if sum(len(value) for value in raw) > _MAX_RESULT_BYTES:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return dict(zip(_REGISTRATION_FIELDS, raw))
 
     @staticmethod
     def _decode_record(raw: Mapping[bytes, bytes]) -> ComputeNodeRegistration:
@@ -981,10 +994,12 @@ class ValkeyRegistrationStore:
         if score is None or not math.isfinite(score) or score <= now:
             return None
         raw = self._foundation._call(
-            self._foundation._client.hgetall,
+            self._foundation._client.hmget,
             self._foundation.config.key("node", digest),
+            _REGISTRATION_FIELDS,
         )
-        return self._decode_record(raw) if raw else None
+        record = self._fixed_record(raw)
+        return self._decode_record(record) if record is not None else None
 
     def register(
         self,
@@ -1054,13 +1069,24 @@ class ValkeyRegistrationStore:
             num=self.config.max_compute_nodes,
         )
         records = []
+        # Listing is intentionally not a transactional whole-list snapshot; each
+        # included record is nevertheless a bounded, fixed-field read.
         for digest in digests:
+            if not isinstance(digest, bytes) or not re.fullmatch(
+                rb"[0-9a-f]{64}", digest
+            ):
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
             raw = self._foundation._call(
-                self._foundation._client.hgetall,
+                self._foundation._client.hmget,
                 self._foundation.config.key("node", digest.decode()),
+                _REGISTRATION_FIELDS,
             )
-            if raw:
-                records.append(self._decode_record(raw))
+            record = self._fixed_record(raw)
+            if record is None:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            records.append(self._decode_record(record))
         return tuple(sorted(records, key=lambda record: record.node_id))
 
     def expire(self) -> tuple[ComputeNodeRegistration, ...]:

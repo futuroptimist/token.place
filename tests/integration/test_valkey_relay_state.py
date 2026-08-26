@@ -381,7 +381,12 @@ def test_reads_are_read_only_and_unknown_fields_survive_updates(valkey_server):
     node_key = store._foundation.config.key("node", store._node_digest("node-a"))
     try:
         store.register("node-a", _capabilities(), owner)
-        store._foundation._client.hset(node_key, "future_field", "future-value")
+        future_value = b"future-marker:" + b"x" * 100_000
+        store._foundation._client.hset(node_key, "future_field", future_value)
+        assert store.get("node-a") is not None
+        assert len(store.list()) == 1
+        assert store.renew("node-a", owner) is not None
+        assert store._foundation._client.hget(node_key, "future_field") == future_value
         incompatible = _manifest(writer_min=2, writer_max=2, active_writer_revision=2)
         store._foundation._client.set(
             store._foundation.config.key("schema"), incompatible.encode()
@@ -396,9 +401,7 @@ def test_reads_are_read_only_and_unknown_fields_survive_updates(valkey_server):
         ):
             with pytest.raises(ValkeySchemaIncompatibleError):
                 mutation()
-        assert (
-            store._foundation._client.hget(node_key, "future_field") == b"future-value"
-        )
+        assert store._foundation._client.hget(node_key, "future_field") == future_value
     finally:
         store._foundation._client.delete(*_registration_keys(store, "node-a", "node-b"))
         store.close()
@@ -735,9 +738,7 @@ def test_expire_lost_reply_does_not_consume_a_hidden_retry_batch(valkey_server):
             raise redis.ConnectionError("lost reply from private endpoint")
 
         store._foundation._client.evalsha = lose_reply
-        with pytest.raises(
-            ValkeyUnavailableError, match="^state backend unavailable$"
-        ):
+        with pytest.raises(ValkeyUnavailableError, match="^state backend unavailable$"):
             store.expire()
         assert dispatches == 1
 

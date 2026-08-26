@@ -91,14 +91,91 @@ def test_registration_reads_use_server_time_and_never_mutating_transition():
     foundation._client = Mock()
     foundation._client.zscore = Mock()
     foundation._client.zrangebyscore = Mock()
-    foundation._client.hgetall = Mock()
-    foundation._call.side_effect = [99_999_999, [], []]
+    foundation._client.hmget = Mock()
+    foundation._call.side_effect = [99, []]
     store = registration_store_with_foundation(foundation)
 
     assert store.get("node-a") is None
     assert store.list() == ()
     foundation.execute.assert_not_called()
     foundation.check_write_compatible.assert_not_called()
+
+
+def _registration_values():
+    return (
+        b"node-a",
+        b"a" * 64,
+        b"100",
+        b'["model-a"]',
+        b"8k-fast",
+        b"8192",
+        b"1024",
+        b"2048",
+        b"1",
+        b"cpu",
+        b"v1",
+        b"200",
+    )
+
+
+def test_registration_read_uses_exact_bounded_fields():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.side_effect = [200.0, list(_registration_values())]
+    store = registration_store_with_foundation(foundation)
+
+    assert store._read("node-a", 100).node_id == "node-a"
+    hmget_call = foundation._call.call_args_list[1]
+    assert hmget_call.args[0] is foundation._client.hmget
+    assert hmget_call.args[2] == valkey_relay_state._REGISTRATION_FIELDS
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [([None] * 12, None), ([None, *(_registration_values()[1:])], "error")],
+)
+def test_registration_read_distinguishes_absent_and_partial_records(reply, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.side_effect = [200.0, reply]
+    store = registration_store_with_foundation(foundation)
+
+    if expected is None:
+        assert store._read("node-a", 100) is None
+    else:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store._read("node-a", 100)
+
+
+def test_registration_read_rejects_over_byte_budget_without_value_leakage():
+    marker = b"private-marker"
+    reply = list(_registration_values())
+    reply[3] = marker + b"x" * valkey_relay_state._MAX_RESULT_BYTES
+    with pytest.raises(ValkeySchemaIncompatibleError) as caught:
+        ValkeyRegistrationStore._fixed_record(reply)
+    assert str(caught.value) == "state schema incompatible"
+    assert marker.decode() not in repr(caught.value)
+
+
+@pytest.mark.parametrize("member", [b"A" * 64, b"g" * 64, b"a" * 63, "a" * 64])
+def test_registration_list_translates_malformed_index_members(member):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    foundation._client = Mock()
+    foundation._call.return_value = [member]
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+    ) as caught:
+        store.list()
+    assert str(member) not in repr(caught.value)
 
 
 def test_exact_key_prefix_and_hash_tag():

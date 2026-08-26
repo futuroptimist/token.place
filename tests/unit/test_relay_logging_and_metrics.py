@@ -33,6 +33,7 @@ def relay_client():
     """Provide a clean relay Flask test client."""
 
     app.config["TESTING"] = True
+    relay_module._reset_api_v1_relay_state_store()
     known_servers.clear()
     client_inference_requests.clear()
     client_pending_request_ids.clear()
@@ -78,6 +79,7 @@ def relay_client():
     relay_module.api_v1_control_tombstones.clear()
     api_v1_filtered_round_robin_next_positions.clear()
     relay_module.server_round_robin_next_index = 0
+    relay_module._reset_api_v1_relay_state_store()
     for limiter in app.extensions.get("limiter", set()):
         storage = getattr(getattr(limiter, "limiter", None), "storage", None)
         if storage is None:
@@ -154,21 +156,70 @@ def _register_node(client, server_key="server-key", *, token=None):
 
 
 def _queue_request(client, *, server_key="server-key", client_key="client-key", request_id="request-1"):
+    cancel_token = f"cancel-{request_id}"
+    selection = client.get(
+        "/api/v1/relay/servers/next",
+        query_string={
+            "client_public_key": client_key,
+            "request_id": request_id,
+            "cancel_token": cancel_token,
+            "requested_model": "qwen3-8b-instruct",
+            "requested_context_tier": "8k-fast",
+        },
+    )
+    assert selection.status_code == 200
+    reservation = selection.get_json()
     response = client.post(
         "/api/v1/relay/requests",
         json={
             "server_public_key": server_key,
             "client_public_key": client_key,
             "request_id": request_id,
-            "cancel_token": f"cancel-{request_id}",
+            "cancel_token": cancel_token,
+            "reservation_token": reservation["reservation_token"],
+            "request_deadline_epoch": reservation["request_deadline_epoch"],
+            "requested_model": "qwen3-8b-instruct",
+            "requested_context_tier": "8k-fast",
             "ciphertext": "sealed-ciphertext",
             "cipherkey": "sealed-key",
             "iv": "sealed-iv",
-            "protocol": "e2ee_v1",
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
         },
     )
     assert response.status_code == 200
-    return response
+    return {
+        "response": response,
+        "retrieval_credential": response.get_json()["retrieval_credential"],
+        "request_deadline_epoch": reservation["request_deadline_epoch"],
+    }
+
+
+def _claim_request(client, credential, *, server_key="server-key"):
+    response = client.post(
+        "/api/v1/relay/servers/poll",
+        json={"server_public_key": server_key, "control_credential": credential},
+    )
+    assert response.status_code == 200
+    return response.get_json()
+
+
+def _submit_response(client, credential, claim, *, server_key="server-key"):
+    return client.post(
+        "/api/v1/relay/responses",
+        json={
+            "server_public_key": server_key,
+            "control_credential": credential,
+            "claim_generation": claim["claim_generation"],
+            "client_public_key": claim["client_public_key"],
+            "request_id": claim["request_id"],
+            "ciphertext": "sealed-response",
+            "cipherkey": "sealed-key",
+            "iv": "sealed-iv",
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+        },
+    )
 
 
 def _metric_body(client, headers=None):
@@ -232,46 +283,129 @@ def test_build_revision_label_prefers_ref_then_resolved_deploy_ref(monkeypatch) 
     )
 
 
-def test_canonical_metrics_track_queue_in_flight_completion_and_eviction(relay_client) -> None:
-    """Canonical gauges and counters reflect bounded relay state transitions."""
+def test_canonical_metrics_track_queue_in_flight_completion_and_eviction(relay_client, monkeypatch) -> None:
+    """Canonical gauges and counters reflect authoritative relay transitions."""
 
-    _register_node(relay_client)
+    credential = _register_node(relay_client).get_json()["control_credential"]
+    store = relay_module._api_v1_store()
+    now = [time.time()]
+    store._epoch_time = lambda: now[0]
+    monkeypatch.setattr(relay_module.time, "time", lambda: now[0])
     _queue_request(relay_client, request_id="request-complete")
-
+    now[0] += 2
     body = _metric_body(relay_client)
     assert _metric_value(body, 'tokenplace_relay_queue_depth', '{provider_mode="relay"}') == 1
+    assert _metric_value(
+        body, 'tokenplace_relay_oldest_queued_request_age_seconds',
+        '{provider_mode="relay"}',
+    ) > 0
     assert _metric_value(body, "tokenplace_compute_nodes_registered") == 1
     assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 1
-    assert _metric_value(body, "tokenplace_relay_oldest_queued_request_age_seconds", '{provider_mode="relay"}') >= 0
 
-    poll = relay_client.post("/api/v1/relay/servers/poll", json={"server_public_key": "server-key"})
-    assert poll.status_code == 200
+    claim = _claim_request(relay_client, credential)
+    now[0] += 2
     body = _metric_body(relay_client)
     assert _metric_value(body, 'tokenplace_relay_queue_depth', '{provider_mode="relay"}') == 0
     assert _metric_value(body, "tokenplace_relay_in_flight_requests") == 1
-    assert _metric_value(body, "tokenplace_relay_oldest_in_flight_age_seconds") >= 0
-
-    response = relay_client.post(
-        "/api/v1/relay/responses",
-        json={
-            "client_public_key": "client-key",
-            "request_id": "request-complete",
-            "ciphertext": "sealed-response",
-            "cipherkey": "sealed-key",
-            "iv": "sealed-iv",
-            "protocol": "e2ee_v1",
-        },
-    )
-    assert response.status_code == 200
+    assert _metric_value(body, "tokenplace_relay_oldest_in_flight_age_seconds") > 0
+    assert _submit_response(relay_client, credential, claim).status_code == 200
     body = _metric_body(relay_client)
     assert _metric_value(body, "tokenplace_relay_in_flight_requests") == 0
+    assert _metric_value(body, "tokenplace_relay_oldest_in_flight_age_seconds") == 0
     assert _metric_value(body, 'tokenplace_relay_request_outcomes_total{outcome="completed"}') >= 1
 
-    known_servers["server-key"]["last_ping"] = datetime.now() - timedelta(seconds=120)
-    relay_client.get("/healthz")
+    lease = store.get("server-key").lease_expires_at_epoch
+    store._epoch_time = lambda: lease + 1
     body = _metric_body(relay_client)
     assert _metric_value(body, "tokenplace_compute_nodes_registered") == 0
-    assert _metric_value(body, 'tokenplace_compute_node_evictions_total{reason="stale_lease"}') >= 1
+    assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
+
+
+def test_store_lease_evictions_are_reconciled_once_and_pruned(relay_client, monkeypatch) -> None:
+    """Public lease-expiry tombstones drive bounded, once-only eviction metrics."""
+
+    store = relay_module._api_v1_store()
+    now = [time.time()]
+    store._epoch_time = lambda: now[0]
+    monkeypatch.setattr(relay_module.time, "time", lambda: now[0])
+    baseline = _metric_value(
+        _metric_body(relay_client),
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    )
+
+    explicit_credential = _register_node(
+        relay_client, server_key="explicit-node"
+    ).get_json()["control_credential"]
+    explicit = relay_client.post(
+        "/api/v1/relay/servers/unregister",
+        json={
+            "server_public_key": "explicit-node",
+            "control_credential": explicit_credential,
+        },
+    )
+    assert explicit.status_code == 200
+    assert _metric_value(
+        _metric_body(relay_client),
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    ) == baseline
+
+    node_id = "telemetry-node-secret"
+    first_credential = _register_node(relay_client, server_key=node_id).get_json()[
+        "control_credential"
+    ]
+    first_lease = store.get(node_id).lease_expires_at_epoch
+    now[0] = first_lease + 1
+    first_body = _metric_body(relay_client)
+    assert _metric_value(first_body, "tokenplace_compute_nodes_registered") == 0
+    assert _metric_value(first_body, "tokenplace_compute_nodes_healthy") == 0
+    assert _metric_value(
+        first_body,
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    ) == baseline + 1
+
+    assert relay_client.get("/healthz").status_code == 200
+    assert relay_client.get("/relay/diagnostics").status_code == 200
+    repeated_body = _metric_body(relay_client)
+    assert _metric_value(
+        repeated_body,
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    ) == baseline + 1
+
+    second_registration = _register_node(relay_client, server_key=node_id).get_json()
+    second_credential = second_registration["control_credential"]
+    assert second_credential != first_credential
+    second_lease = store.get(node_id).lease_expires_at_epoch
+    now[0] = second_lease + 1
+    second_body = _metric_body(relay_client)
+    assert _metric_value(
+        second_body,
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    ) == baseline + 2
+
+    ledger = relay_module._api_v1_seen_stale_lease_evictions
+    assert len(ledger) == 1
+    assert node_id not in repr(ledger)
+    assert first_credential not in repr(ledger)
+    assert second_credential not in repr(ledger)
+    eviction_samples = [
+        line for line in second_body.splitlines()
+        if line.startswith("tokenplace_compute_node_evictions_total{")
+    ]
+    assert eviction_samples
+    assert all(re.fullmatch(
+        r'tokenplace_compute_node_evictions_total\{reason="[a-z_]+"\} [0-9.eE+-]+',
+        line,
+    ) for line in eviction_samples)
+    assert node_id not in second_body
+    assert first_credential not in second_body
+    assert second_credential not in second_body
+
+    tombstone_expiry = max(
+        record.expires_at_epoch for record in store.node_tombstones()
+    )
+    now[0] = tombstone_expiry + 1
+    assert relay_client.get("/healthz").status_code == 200
+    assert not relay_module._api_v1_seen_stale_lease_evictions
 
 
 def test_metrics_endpoint_optional_bearer_auth(relay_client, monkeypatch) -> None:
@@ -305,267 +439,149 @@ def test_metrics_endpoint_rejects_explicit_empty_token(relay_client, monkeypatch
 
 
 def test_request_outcomes_cover_cancel_expire_timeout_and_rate_limit(relay_client, monkeypatch) -> None:
-    """Terminal transitions increment fixed outcome counters without identity labels."""
+    """Route cancellation and fixed terminal label normalization stay bounded."""
 
     _register_node(relay_client)
     _queue_request(relay_client, request_id="request-cancel")
-    cancel = relay_client.post(
-        "/api/v1/relay/requests/cancel",
-        json={
-            "client_public_key": "client-key",
-            "request_id": "request-cancel",
-            "cancel_token": "cancel-request-cancel",
-            "status": "cancelled",
-            "reason": "requester_cancelled",
-        },
-    )
-    assert cancel.status_code == 200
+    before_cancelled = _outcome_value(relay_client, "cancelled")
+    payload = {
+        "client_public_key": "client-key", "request_id": "request-cancel",
+        "cancel_token": "cancel-request-cancel", "status": "cancelled",
+        "reason": "requester_cancelled",
+    }
+    result = relay_client.post("/api/v1/relay/requests/cancel", json=payload)
+    assert result.status_code == 200
+    assert result.get_json()["removed_from_queue"] is True
+    assert _outcome_value(relay_client, "cancelled") == before_cancelled + 1
+    assert relay_client.post("/api/v1/relay/requests/cancel", json=payload).status_code == 200
+    assert _outcome_value(relay_client, "cancelled") == before_cancelled + 1
 
-    _queue_request(relay_client, request_id="request-timeout")
-    claimed = relay_client.post("/api/v1/relay/servers/poll", json={"server_public_key": "server-key"})
-    assert claimed.status_code == 200
-    relay_module._cancel_api_v1_request(
-        "client-key",
-        "request-timeout",
-        status="expired",
-        reason="provider_timeout",
-    )
+    def expiry_outcome(request_id, reason, expected_outcome):
+        monkeypatch.setenv(relay_module.API_V1_LEASE_SECONDS_ENV, "1000")
+        monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_MIN_SECONDS_ENV, "10")
+        monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_MAX_SECONDS_ENV, "10")
+        relay_module._reset_api_v1_relay_state_store()
+        clock = [100.0]
+        store = relay_module._api_v1_store()
+        store._epoch_time = lambda: clock[0]
+        monkeypatch.setattr(relay_module.time, "time", lambda: clock[0])
+        _register_node(relay_client)
+        journey = _queue_request(relay_client, request_id=request_id)
+        deadline = journey["request_deadline_epoch"]
+        before = _outcome_value(relay_client, expected_outcome)
 
-    monkeypatch.setattr(relay_module, "PENDING_REQUEST_TTL_SECONDS", 0.001)
-    monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, "1")
-    _queue_request(relay_client, request_id="request-expire")
-    original_monotonic = time.monotonic
-    monkeypatch.setattr(relay_module.time, "monotonic", lambda: original_monotonic() + 2.0)
-    relay_module._expire_stale_pending_requests()
+        early = relay_client.post("/api/v1/relay/requests/cancel", json={
+            "client_public_key": "client-key", "request_id": request_id,
+            "cancel_token": f"cancel-{request_id}", "status": "expired", "reason": reason,
+        })
+        assert early.status_code == 200
+        assert early.get_json()["status"] == "not_expired"
+        assert _outcome_value(relay_client, expected_outcome) == before
 
-    before_rate_limit_body = _metric_body(relay_client)
-    before_rate_limit = _metric_value(
-        before_rate_limit_body,
-        'tokenplace_relay_request_outcomes_total',
-        '{outcome="rate_limited"}',
-    )
+        clock[0] = deadline + 1
+        expired = relay_client.post("/api/v1/relay/requests/cancel", json={
+            "client_public_key": "client-key", "request_id": request_id,
+            "cancel_token": f"cancel-{request_id}", "status": "expired", "reason": reason,
+        })
+        assert expired.status_code == 200
+        assert expired.get_json()["status"] == "expired"
+        assert _outcome_value(relay_client, expected_outcome) == before + 1
+        assert relay_client.post("/api/v1/relay/requests/cancel", json={
+            "client_public_key": "client-key", "request_id": request_id,
+            "cancel_token": f"cancel-{request_id}", "status": "expired", "reason": reason,
+        }).status_code == 200
+        assert _outcome_value(relay_client, expected_outcome) == before + 1
+
+    expiry_outcome("request-provider-timeout", "provider_timeout", "timed_out")
+    expiry_outcome("request-deadline-expiry", "request_deadline_expired", "expired")
+
+    before = _outcome_value(relay_client, "rate_limited")
     with app.test_request_context("/api/v1/relay/requests", method="POST"):
         relay_module.g.request_start_time = time.time()
-        response = relay_module._log_request(relay_module.Response("rate limited", status=429))
-    assert response.status_code == 429
-
-    body = _metric_body(relay_client)
-    assert _metric_value(body, 'tokenplace_relay_request_outcomes_total', '{outcome="cancelled"}') >= 1
-    assert _metric_value(body, 'tokenplace_relay_request_outcomes_total', '{outcome="timed_out"}') >= 1
-    assert _metric_value(body, 'tokenplace_relay_request_outcomes_total', '{outcome="expired"}') >= 1
-    assert (
-        _metric_value(body, 'tokenplace_relay_request_outcomes_total', '{outcome="rate_limited"}')
-        == before_rate_limit + 1
-    )
-
+        assert relay_module._log_request(relay_module.Response("rate limited", status=429)).status_code == 429
+    assert _outcome_value(relay_client, "rate_limited") == before + 1
 
 def test_response_completion_does_not_double_count_after_terminal_race(relay_client) -> None:
-    """A late completion after cancellation should not emit a second terminal outcome."""
+    """A late completion after cancellation does not emit a second outcome."""
 
-    _register_node(relay_client)
+    credential = _register_node(relay_client).get_json()["control_credential"]
     _queue_request(relay_client, request_id="request-race")
-    poll = relay_client.post("/api/v1/relay/servers/poll", json={"server_public_key": "server-key"})
-    assert poll.status_code == 200
-    relay_module._cancel_api_v1_request(
-        "client-key",
-        "request-race",
-        status="cancelled",
-        reason="requester_cancelled",
-    )
-    before = _metric_body(relay_client)
-    before_completed = _metric_value(
-        before,
-        'tokenplace_relay_request_outcomes_total',
-        '{outcome="completed"}',
-    )
-    before_cancelled = _metric_value(
-        before,
-        'tokenplace_relay_request_outcomes_total',
-        '{outcome="cancelled"}',
-    )
+    claim = _claim_request(relay_client, credential)
+    cancelled = relay_client.post("/api/v1/relay/requests/cancel", json={
+        "client_public_key": "client-key", "request_id": "request-race",
+        "cancel_token": "cancel-request-race", "status": "cancelled", "reason": "requester_cancelled",
+    })
+    assert cancelled.status_code == 200
+    before_completed = _outcome_value(relay_client, "completed")
+    before_cancelled = _outcome_value(relay_client, "cancelled")
+    assert _submit_response(relay_client, credential, claim).status_code == 410
+    assert _outcome_value(relay_client, "completed") == before_completed
+    assert _outcome_value(relay_client, "cancelled") == before_cancelled
 
-    response = relay_client.post(
-        "/api/v1/relay/responses",
-        json={
-            "client_public_key": "client-key",
-            "request_id": "request-race",
-            "ciphertext": "sealed-response",
-            "cipherkey": "sealed-key",
-            "iv": "sealed-iv",
-            "protocol": "e2ee_v1",
-        },
-    )
 
+def test_late_response_rechecks_terminal_state_before_queueing(relay_client) -> None:
+    """Cancellation-before-response cannot queue a late response."""
+
+    credential = _register_node(relay_client).get_json()["control_credential"]
+    journey = _queue_request(relay_client, request_id="request-late-cancel")
+    claim = _claim_request(relay_client, credential)
+    assert relay_client.post("/api/v1/relay/requests/cancel", json={
+        "client_public_key": "client-key", "request_id": "request-late-cancel",
+        "cancel_token": "cancel-request-late-cancel", "status": "cancelled", "reason": "requester_cancelled",
+    }).status_code == 200
+    response = _submit_response(relay_client, credential, claim)
     assert response.status_code == 410
-    after = _metric_body(relay_client)
-    assert (
-        _metric_value(after, 'tokenplace_relay_request_outcomes_total', '{outcome="completed"}')
-        == before_completed
-    )
-    assert (
-        _metric_value(after, 'tokenplace_relay_request_outcomes_total', '{outcome="cancelled"}')
-        == before_cancelled
-    )
+    retrieve = relay_client.post("/api/v1/relay/responses/retrieve", json={
+        "client_public_key": "client-key", "request_id": "request-late-cancel",
+        "retrieval_credential": journey["retrieval_credential"],
+    })
+    assert retrieve.status_code == 410
 
 
-def test_late_response_rechecks_terminal_state_before_queueing(relay_client, monkeypatch) -> None:
-    """A cancellation that wins during response acceptance prevents queueing a late response."""
+def test_response_acceptance_serializes_cancellation_before_queueing(relay_client) -> None:
+    """The authoritative terminal transition counts cancellation only once."""
 
-    _register_node(relay_client)
-    _queue_request(relay_client, request_id="request-late-cancel")
-    poll = relay_client.post("/api/v1/relay/servers/poll", json={"server_public_key": "server-key"})
-    assert poll.status_code == 200
-
-    original_clear_pending = relay_module._clear_pending_request
-
-    def terminalize_during_acceptance(client_public_key: str, request_id: str) -> bool:
-        cleared = original_clear_pending(client_public_key, request_id)
-        relay_module._mark_request_terminal(
-            client_public_key,
-            request_id,
-            status="cancelled",
-            reason="requester_cancelled",
-        )
-        return cleared
-
-    monkeypatch.setattr(relay_module, "_clear_pending_request", terminalize_during_acceptance)
-
-    response = relay_client.post(
-        "/api/v1/relay/responses",
-        json={
-            "client_public_key": "client-key",
-            "request_id": "request-late-cancel",
-            "ciphertext": "sealed-response",
-            "cipherkey": "sealed-key",
-            "iv": "sealed-iv",
-            "protocol": "e2ee_v1",
-        },
-    )
-
-    assert response.status_code == 410
-    assert response.get_json()["error"]["status"] == "cancelled"
-    assert "client-key" not in client_responses
-
-
-def test_response_acceptance_serializes_cancellation_before_queueing(relay_client, monkeypatch) -> None:
-    """A cancellation between duplicate checks and lifecycle ownership cannot leave an orphan response."""
-
-    _register_node(relay_client)
+    credential = _register_node(relay_client).get_json()["control_credential"]
     _queue_request(relay_client, request_id="request-atomic-cancel")
-    poll = relay_client.post("/api/v1/relay/servers/poll", json={"server_public_key": "server-key"})
-    assert poll.status_code == 200
-
-    before = _metric_body(relay_client)
-    before_completed = _metric_value(
-        before,
-        'tokenplace_relay_request_outcomes_total',
-        '{outcome="completed"}',
-    )
-    before_cancelled = _metric_value(
-        before,
-        'tokenplace_relay_request_outcomes_total',
-        '{outcome="cancelled"}',
-    )
-
-    original_has_response = relay_module._has_client_response_for_request
-    cancelled = False
-
-    def cancel_during_acceptance(client_public_key: str, request_id: str) -> bool:
-        nonlocal cancelled
-        has_response = original_has_response(client_public_key, request_id)
-        if not cancelled:
-            cancelled = True
-            relay_module._cancel_api_v1_request(
-                client_public_key,
-                request_id,
-                status="cancelled",
-                reason="requester_cancelled",
-            )
-        return has_response
-
-    monkeypatch.setattr(relay_module, "_has_client_response_for_request", cancel_during_acceptance)
-
-    response = relay_client.post(
-        "/api/v1/relay/responses",
-        json={
-            "client_public_key": "client-key",
-            "request_id": "request-atomic-cancel",
-            "ciphertext": "sealed-response",
-            "cipherkey": "sealed-key",
-            "iv": "sealed-iv",
-            "protocol": "e2ee_v1",
-        },
-    )
-
-    assert response.status_code == 410
-    assert response.get_json()["error"]["status"] == "cancelled"
-    assert "client-key" not in client_responses
-    after = _metric_body(relay_client)
-    assert (
-        _metric_value(after, 'tokenplace_relay_request_outcomes_total', '{outcome="completed"}')
-        == before_completed
-    )
-    assert (
-        _metric_value(after, 'tokenplace_relay_request_outcomes_total', '{outcome="cancelled"}')
-        == before_cancelled + 1
-    )
+    claim = _claim_request(relay_client, credential)
+    before_completed = _outcome_value(relay_client, "completed")
+    before_cancelled = _outcome_value(relay_client, "cancelled")
+    payload = {"client_public_key": "client-key", "request_id": "request-atomic-cancel",
+               "cancel_token": "cancel-request-atomic-cancel", "status": "cancelled", "reason": "requester_cancelled"}
+    first_cancel = relay_client.post("/api/v1/relay/requests/cancel", json=payload)
+    assert first_cancel.status_code == 200
+    assert first_cancel.get_json()["removed_from_queue"] is True
+    second_cancel = relay_client.post("/api/v1/relay/requests/cancel", json=payload)
+    assert second_cancel.status_code == 200
+    assert second_cancel.get_json()["removed_from_queue"] is False
+    assert _submit_response(relay_client, credential, claim).status_code == 410
+    assert _outcome_value(relay_client, "completed") == before_completed
+    assert _outcome_value(relay_client, "cancelled") == before_cancelled + 1
 
 
 def test_stale_cancellation_does_not_delete_accepted_response(relay_client) -> None:
-    """Cancellation selected before locking must not terminalize after response acceptance wins."""
+    """Response-before-cancellation preserves the accepted response."""
 
-    _register_node(relay_client)
-    _queue_request(relay_client, request_id="request-response-wins")
-    poll = relay_client.post("/api/v1/relay/servers/poll", json={"server_public_key": "server-key"})
-    assert poll.status_code == 200
-
-    before = _metric_body(relay_client)
-    before_completed = _metric_value(
-        before,
-        'tokenplace_relay_request_outcomes_total',
-        '{outcome="completed"}',
-    )
-    before_expired = _metric_value(
-        before,
-        'tokenplace_relay_request_outcomes_total',
-        '{outcome="expired"}',
-    )
-
-    response = relay_client.post(
-        "/api/v1/relay/responses",
-        json={
-            "client_public_key": "client-key",
-            "request_id": "request-response-wins",
-            "ciphertext": "sealed-response",
-            "cipherkey": "sealed-key",
-            "iv": "sealed-iv",
-            "protocol": "e2ee_v1",
-        },
-    )
-    assert response.status_code == 200
-
-    removed = relay_module._cancel_api_v1_request(
-        "client-key",
-        "request-response-wins",
-        status="expired",
-        reason="server_unregistered",
-    )
-
-    assert removed == 0
-    assert relay_module._get_terminal_request("client-key", "request-response-wins") is None
-    retrieve = relay_client.post("/api/v1/relay/responses/retrieve", json={"client_public_key": "client-key"})
+    credential = _register_node(relay_client).get_json()["control_credential"]
+    journey = _queue_request(relay_client, request_id="request-response-wins")
+    claim = _claim_request(relay_client, credential)
+    before_completed = _outcome_value(relay_client, "completed")
+    before_expired = _outcome_value(relay_client, "expired")
+    assert _submit_response(relay_client, credential, claim).status_code == 200
+    cancelled = relay_client.post("/api/v1/relay/requests/cancel", json={
+        "client_public_key": "client-key", "request_id": "request-response-wins",
+        "cancel_token": "cancel-request-response-wins", "status": "expired",
+        "reason": "requester_cancelled",
+    })
+    assert cancelled.status_code == 200
+    assert cancelled.get_json()["removed_from_queue"] is False
+    retrieve = relay_client.post("/api/v1/relay/responses/retrieve", json={
+        "client_public_key": "client-key", "request_id": "request-response-wins",
+        "retrieval_credential": journey["retrieval_credential"],
+    })
     assert retrieve.status_code == 200
-    assert retrieve.get_json()["request_id"] == "request-response-wins"
-
-    after = _metric_body(relay_client)
-    assert (
-        _metric_value(after, 'tokenplace_relay_request_outcomes_total', '{outcome="completed"}')
-        == before_completed + 1
-    )
-    assert (
-        _metric_value(after, 'tokenplace_relay_request_outcomes_total', '{outcome="expired"}')
-        == before_expired
-    )
+    assert _outcome_value(relay_client, "completed") == before_completed + 1
+    assert _outcome_value(relay_client, "expired") == before_expired
 
 
 def test_failed_http_responses_are_not_counted_as_completed(relay_client, monkeypatch) -> None:
@@ -659,65 +675,66 @@ def test_canonical_http_method_label_is_bounded(relay_client) -> None:
 
 
 def test_unknown_terminal_attempts_do_not_increment_outcomes(relay_client) -> None:
-    """Orphan cancellation and late/orphan responses are ignored for terminal outcomes."""
+    """Authenticated orphan responses do not increment terminal outcomes."""
 
+    credential = _register_node(relay_client, server_key="orphan-owner").get_json()["control_credential"]
     before = {outcome: _outcome_value(relay_client, outcome) for outcome in ("completed", "cancelled")}
-
-    relay_module._cancel_api_v1_request(
-        "client-missing",
-        "request-missing",
-        status="cancelled",
-        reason="requester_cancelled",
-    )
-    orphan_response = relay_client.post(
-        "/api/v1/relay/responses",
-        json={
-            "client_public_key": "client-missing",
-            "request_id": "request-missing",
-            "ciphertext": "sealed-response",
-            "cipherkey": "sealed-key",
-            "iv": "sealed-iv",
-            "protocol": "e2ee_v1",
-        },
-    )
-
+    orphan_response = relay_client.post("/api/v1/relay/responses", json={
+        "server_public_key": "orphan-owner", "control_credential": credential,
+        "client_public_key": "client-missing", "request_id": "request-missing",
+        "ciphertext": "sealed-response", "cipherkey": "sealed-key", "iv": "sealed-iv",
+        "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+    })
     assert orphan_response.status_code == 410
     assert _outcome_value(relay_client, "cancelled") == before["cancelled"]
     assert _outcome_value(relay_client, "completed") == before["completed"]
 
 
-def test_node_stale_registered_then_evicted_and_expired_in_flight_excluded(relay_client) -> None:
-    """Gauge collection reports stale registered nodes and skips expired in-flight entries without mutation."""
+def test_invalid_cancellation_proof_is_fixed_non_mutating_and_unmetered(relay_client) -> None:
+    """An invalid requester proof is a bounded 403, not a terminal transition."""
 
-    before_evictions = _metric_value(
-        _metric_body(relay_client),
-        "tokenplace_compute_node_evictions_total",
-        '{reason="stale_lease"}',
-    )
     _register_node(relay_client)
-    stale_payload = known_servers["server-key"]
-    stale_payload["last_ping"] = datetime.now() - timedelta(seconds=120)
-    stale_payload["api_v1_in_flight_requests"] = {
-        "expired-in-flight": {
-            "client_public_key": "client-key",
-            "started_at_monotonic": time.monotonic() - 10,
-            "expires_at": time.monotonic() - 1,
-        }
+    _queue_request(relay_client, request_id="request-invalid-cancel")
+    store = relay_module._api_v1_store()
+    before_state = (
+        store.queued_requests("server-key"), store.active_claims("server-key"),
+        store.terminal_records(),
+    )
+    before_outcomes = {
+        outcome: _outcome_value(relay_client, outcome)
+        for outcome in ("cancelled", "expired", "timed_out", "completed")
     }
+    response = relay_client.post("/api/v1/relay/requests/cancel", json={
+        "client_public_key": "client-key", "request_id": "request-invalid-cancel",
+        "cancel_token": "invalid-cancellation-proof-secret",
+    })
+    assert response.status_code == 403
+    assert response.get_json() == {
+        "error": {"message": "Missing or invalid cancel proof", "code": 403}
+    }
+    assert before_state == (
+        store.queued_requests("server-key"), store.active_claims("server-key"),
+        store.terminal_records(),
+    )
+    assert {outcome: _outcome_value(relay_client, outcome)
+            for outcome in before_outcomes} == before_outcomes
+    assert "invalid-cancellation-proof-secret" not in response.get_data(as_text=True)
 
-    body = _metric_body(relay_client)
-    assert _metric_value(body, "tokenplace_compute_nodes_registered") == 1
-    assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
-    assert _metric_value(body, "tokenplace_relay_in_flight_requests") == 0
-    assert "expired-in-flight" in stale_payload["api_v1_in_flight_requests"]
 
-    relay_client.get("/healthz")
+def test_node_stale_registered_then_evicted_and_expired_in_flight_excluded(relay_client) -> None:
+    """Authoritative lease expiry removes stale nodes and their claims from gauges."""
+
+    credential = _register_node(relay_client).get_json()["control_credential"]
+    _queue_request(relay_client, request_id="expired-in-flight")
+    _claim_request(relay_client, credential)
+    assert _metric_value(_metric_body(relay_client), "tokenplace_relay_in_flight_requests") == 1
+    store = relay_module._api_v1_store()
+    registration = store.get("server-key")
+    store._epoch_time = lambda: registration.lease_expires_at_epoch + 1
     body = _metric_body(relay_client)
     assert _metric_value(body, "tokenplace_compute_nodes_registered") == 0
-    assert (
-        _metric_value(body, "tokenplace_compute_node_evictions_total", '{reason="stale_lease"}')
-        == before_evictions + 1
-    )
+    assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
+    assert _metric_value(body, "tokenplace_relay_in_flight_requests") == 0
 
 
 def test_stale_eviction_uses_terminal_lock_before_server_lock(relay_client, monkeypatch) -> None:
@@ -768,9 +785,15 @@ def test_stale_eviction_uses_terminal_lock_before_server_lock(relay_client, monk
         "cancelled": _outcome_value(relay_client, "cancelled"),
         "completed": _outcome_value(relay_client, "completed"),
     }
-    _register_node(relay_client)
-    _queue_request(relay_client, request_id="request-stale-eviction-lock-order")
-    known_servers["server-key"]["last_ping"] = datetime.now() - timedelta(seconds=120)
+    known_servers["server-key"] = {
+        "public_key": "server-key", "last_ping": datetime.now() - timedelta(seconds=120),
+        "last_ping_duration": 1, relay_module.API_V1_SERVER_MARKER: True,
+    }
+    client_inference_requests["server-key"] = [{
+        "client_public_key": "client-key", "request_id": "request-stale-eviction-lock-order",
+        "e2ee_v1": True,
+    }]
+    relay_module._mark_request_pending("client-key", "request-stale-eviction-lock-order")
 
     evicted = relay_module._evict_stale_servers()
 
@@ -816,70 +839,65 @@ def test_metrics_failure_logs_do_not_expose_raw_exception_values(relay_client, m
     assert secret not in response.get_data(as_text=True)
 
 
+@pytest.mark.parametrize("method_name", ["list", "queued_requests", "active_claims"])
+def test_metrics_bounds_authoritative_store_snapshot_failures(
+    relay_client, monkeypatch, method_name
+) -> None:
+    """Store snapshot failures must not produce legacy-only metrics or leak details."""
+
+    relay_module._reset_api_v1_relay_state_store()
+    if method_name != "list":
+        _register_node(relay_client, server_key=f"metrics-{method_name}")
+    secret = "sensitive-metrics-store-failure"
+
+    def fail(*_args, **_kwargs):
+        raise relay_module.RelayStateStoreError(secret)
+
+    monkeypatch.setattr(relay_module._api_v1_store(), method_name, fail)
+
+    response = relay_client.get("/metrics")
+
+    assert response.status_code == 503
+    assert response.get_data(as_text=True) == "metrics unavailable\n"
+    assert secret not in response.get_data(as_text=True)
+
+
 def test_progress_observability_uses_fixed_outcomes_without_forbidden_data(
     relay_client, monkeypatch
 ) -> None:
     """Progress logs and metrics remain fixed-cardinality and relay-blind."""
 
-    relay_module.client_progress.clear()
     server = "progress-server-secret"
     client = "progress-client-secret"
     request_id = "progress-request-secret"
-    credential = "progress-credential-secret"
-    ciphertext = "progress-ciphertext-secret"
-    registration = _register_node(relay_client, server).get_json()
-    credential = registration["control_credential"]
-    relay_module._mark_request_pending(client, request_id)
-    known_servers[server]["api_v1_in_flight_requests"] = {
-        request_id: {
-            "client_public_key": client,
-            "request_deadline_monotonic": time.monotonic() + 30,
-        }
-    }
+    credential = _register_node(relay_client, server).get_json()["control_credential"]
+    _queue_request(relay_client, server_key=server, client_key=client, request_id=request_id)
+    _claim_request(relay_client, credential, server_key=server)
     payload = {
-        "server_public_key": server,
-        "client_public_key": client,
-        "request_id": request_id,
-        "control_credential": credential,
-        "protocol": "tokenplace_api_v1_relay_e2ee",
-        "version": 1,
-        "ciphertext": ciphertext,
-        "cipherkey": "progress-cipherkey-secret",
-        "iv": "progress-iv-secret",
+        "server_public_key": server, "client_public_key": client, "request_id": request_id,
+        "control_credential": credential, "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1, "ciphertext": "progress-ciphertext-secret",
+        "cipherkey": "progress-cipherkey-secret", "iv": "progress-iv-secret",
     }
-
     progress_records = []
     original_info = relay_module.LOGGER.info
-
     def capture_info(message, *args, **kwargs):
         if message == "relay.api_v1.progress":
             progress_records.append({"message": message, **kwargs.get("extra", {})})
         return original_info(message, *args, **kwargs)
-
     monkeypatch.setattr(relay_module.LOGGER, "info", capture_info)
     assert relay_client.post("/api/v1/relay/progress", json=payload).status_code == 202
     assert relay_client.post("/api/v1/relay/progress", json=payload).status_code == 202
-    assert relay_client.post(
-        "/api/v1/relay/progress", json={**payload, "control_credential": "wrong-secret"}
-    ).status_code == 403
-    assert relay_client.post(
-        "/api/v1/relay/progress", json={**payload, "request_id": "unknown-secret"}
-    ).status_code == 410
-    assert relay_client.post(
-        "/api/v1/relay/progress", json={**payload, "phase": "prefill-secret"}
-    ).status_code == 400
-
+    assert relay_client.post("/api/v1/relay/progress", json={**payload, "control_credential": "wrong-secret"}).status_code == 403
+    assert relay_client.post("/api/v1/relay/progress", json={**payload, "request_id": "unknown-secret"}).status_code == 410
+    assert relay_client.post("/api/v1/relay/progress", json={**payload, "phase": "prefill-secret"}).status_code == 400
     assert [record["progress_outcome"] for record in progress_records] == [
-        "accepted", "replaced", "rejected_auth", "rejected_lifecycle", "rejected_schema"
+        "accepted", "replaced", "rejected_auth", "rejected_lifecycle", "rejected_schema",
     ]
-    serialized = "\n".join(
-        json.dumps(record, default=str) for record in progress_records
-    ) + relay_client.get("/metrics").get_data(as_text=True)
-    forbidden = (
-        server, client, request_id, credential, ciphertext, "progress-cipherkey-secret",
-        "progress-iv-secret", "wrong-secret", "unknown-secret", "prefill-secret",
-        "prompt-secret", "output-secret", "counter-secret",
-    )
+    assert all(set(record) == {"message", "progress_outcome"} for record in progress_records)
+    serialized = json.dumps(progress_records, default=str) + _metric_body(relay_client)
+    forbidden = (server, client, request_id, credential, payload["ciphertext"], payload["cipherkey"],
+                 payload["iv"], "wrong-secret", "unknown-secret", "prefill-secret")
     assert all(secret not in serialized for secret in forbidden)
 
 
@@ -962,174 +980,50 @@ def test_metrics_do_not_expose_high_cardinality_or_sensitive_values(relay_client
 
 
 def test_compute_control_metrics_are_bounded_and_privacy_safe(relay_client, caplog) -> None:
+    """Compute-control labels are fixed and lifecycle secrets stay excluded."""
+
     caplog.set_level(logging.DEBUG)
-    register = _register_node(relay_client, server_key="server-metric-control")
-    credential = register.get_json()["control_credential"]
-
-    sensitive_values = {
-        "server-metric-control",
-        "client-metric-control",
-        "client-metric-control-cancelled",
-        "client-metric-control-expired",
-        "client-metric-control-completed",
-        "request-control-metric-active",
-        "request-control-metric-cancelled",
-        "request-control-metric-expired",
-        "request-control-metric-completed",
-        "proof-metric-control-active",
-        "proof-metric-control-cancelled",
-        "proof-metric-control-expired",
-        "proof-metric-control-completed",
-        "cipher-metric-control-active",
-        "cipher-metric-control-cancelled",
-        "cipher-metric-control-expired",
-        "cipher-metric-control-completed",
-        "key-metric-control-active",
-        "iv-metric-control-active",
-        credential,
-    }
-
-    def queue_and_dispatch(request_id: str, *, client_key: str, cancel_token: str, ciphertext: str):
-        queued = relay_client.post(
-            "/api/v1/relay/requests",
-            json={
-                "server_public_key": "server-metric-control",
-                "client_public_key": client_key,
-                "request_id": request_id,
-                "ciphertext": ciphertext,
-                "cipherkey": "key-metric-control-active",
-                "iv": "iv-metric-control-active",
-                "cancel_token": cancel_token,
-            },
-        )
-        assert queued.status_code == 200
-        poll = relay_client.post(
-            "/api/v1/relay/servers/poll",
-            json={"server_public_key": "server-metric-control"},
-        )
-        assert poll.status_code == 200
-        assert poll.get_json()["request_id"] == request_id
-
-    active_request_id = "request-control-metric-active"
-    queue_and_dispatch(
-        active_request_id,
-        client_key="client-metric-control",
-        cancel_token="proof-metric-control-active",
-        ciphertext="cipher-metric-control-active",
-    )
-    control = relay_client.post(
-        "/api/v1/relay/servers/control",
-        json={
-            "server_public_key": "server-metric-control",
-            "request_id": active_request_id,
-            "control_credential": credential,
-        },
-    )
+    server = "server-metric-control"
+    credential = _register_node(relay_client, server_key=server).get_json()["control_credential"]
+    _queue_request(relay_client, server_key=server, client_key="client-metric-control",
+                   request_id="request-control-metric-active")
+    active = _claim_request(relay_client, credential, server_key=server)
+    control = relay_client.post("/api/v1/relay/servers/control", json={
+        "server_public_key": server, "request_id": active["request_id"],
+        "control_credential": credential,
+    })
     assert control.status_code == 200
     assert control.get_json()["status"] == "active"
 
-    cancelled_request_id = "request-control-metric-cancelled"
-    queue_and_dispatch(
-        cancelled_request_id,
-        client_key="client-metric-control-cancelled",
-        cancel_token="proof-metric-control-cancelled",
-        ciphertext="cipher-metric-control-cancelled",
-    )
-    cancelled = relay_client.post(
-        "/api/v1/relay/requests/cancel",
-        json={
-            "client_public_key": "client-metric-control-cancelled",
-            "request_id": cancelled_request_id,
-            "cancel_token": "proof-metric-control-cancelled",
-        },
-    )
-    assert cancelled.status_code == 200
-    cancelled_control = relay_client.post(
-        "/api/v1/relay/servers/control",
-        json={
-            "server_public_key": "server-metric-control",
-            "request_id": cancelled_request_id,
-            "control_credential": credential,
-        },
-    )
-    assert cancelled_control.status_code == 200
-    assert cancelled_control.get_json()["status"] == "cancelled"
-    acknowledged = relay_client.post(
-        "/api/v1/relay/servers/control",
-        json={
-            "server_public_key": "server-metric-control",
-            "request_id": cancelled_request_id,
-            "control_credential": credential,
-            "acknowledge": True,
-        },
-    )
-    assert acknowledged.status_code == 200
-    assert acknowledged.get_json()["status"] == "cancelled"
-
-    expired_request_id = "request-control-metric-expired"
-    queue_and_dispatch(
-        expired_request_id,
-        client_key="client-metric-control-expired",
-        cancel_token="proof-metric-control-expired",
-        ciphertext="cipher-metric-control-expired",
-    )
-    known_servers["server-metric-control"]["api_v1_in_flight_requests"][expired_request_id][
-        "request_deadline_monotonic"
-    ] = time.monotonic() - 1.0
-    expired = relay_client.post(
-        "/api/v1/relay/servers/control",
-        json={
-            "server_public_key": "server-metric-control",
-            "request_id": expired_request_id,
-            "control_credential": credential,
-        },
-    )
-    assert expired.status_code == 200
-    assert expired.get_json()["status"] == "expired"
-
-    completed_request_id = "request-control-metric-completed"
-    queue_and_dispatch(
-        completed_request_id,
-        client_key="client-metric-control-completed",
-        cancel_token="proof-metric-control-completed",
-        ciphertext="cipher-metric-control-completed",
-    )
-    completed = relay_client.post(
-        "/api/v1/relay/responses",
-        json={
-            "client_public_key": "client-metric-control-completed",
-            "request_id": completed_request_id,
-            "ciphertext": "cipher-response-metric-completed",
-            "cipherkey": "key-response-metric-completed",
-            "iv": "iv-response-metric-completed",
-        },
-    )
-    assert completed.status_code == 200
-    completed_control = relay_client.post(
-        "/api/v1/relay/servers/control",
-        json={
-            "server_public_key": "server-metric-control",
-            "request_id": completed_request_id,
-            "control_credential": credential,
-        },
-    )
-    assert completed_control.status_code == 200
-    assert completed_control.get_json()["status"] == "completed/unavailable"
+    cancel = relay_client.post("/api/v1/relay/requests/cancel", json={
+        "client_public_key": active["client_public_key"], "request_id": active["request_id"],
+        "cancel_token": "cancel-request-control-metric-active",
+    })
+    assert cancel.status_code == 200
+    cancelled_control = {
+        "server_public_key": server, "request_id": active["request_id"],
+        "client_public_key": active["client_public_key"],
+        "claim_generation": active["claim_generation"], "control_credential": credential,
+    }
+    assert relay_client.post("/api/v1/relay/servers/control", json=cancelled_control).get_json()["status"] == "cancelled"
+    assert relay_client.post("/api/v1/relay/servers/control", json={**cancelled_control, "ack": True}).get_json()["status"] == "completed/unavailable"
+    assert relay_client.post("/api/v1/relay/servers/control", json={
+        "server_public_key": server, "request_id": "missing-control-request",
+        "control_credential": credential,
+    }).get_json()["status"] == "completed/unavailable"
 
     metrics_body = _metric_body(relay_client)
-    for state in ("active", "cancelled", "expired", "acknowledged", "completed_unavailable"):
-        assert _metric_value(
-            metrics_body,
-            "tokenplace_relay_compute_control_requests_total",
-            f'{{state="{state}"}}',
-        ) >= 1
-    assert "state=\"lease_renewed\"" not in metrics_body
+    for state in ("active", "cancelled", "acknowledged", "completed_unavailable"):
+        assert _metric_value(metrics_body, "tokenplace_relay_compute_control_requests_total",
+                             f'{{state="{state}"}}') >= 1
+    assert 'state="lease_renewed"' not in metrics_body
     assert _metric_value(metrics_body, "tokenplace_relay_compute_control_lease_renewals_total") >= 1
-
-    log_body = "\n".join(record.getMessage() + json.dumps(record.__dict__, default=str) for record in caplog.records)
-    for raw in sensitive_values | {"cipher-response-metric-completed", "key-response-metric-completed", "iv-response-metric-completed"}:
+    logs = "\n".join(record.getMessage() + json.dumps(record.__dict__, default=str)
+                     for record in caplog.records)
+    for raw in (server, "client-metric-control", "request-control-metric-active", credential,
+                "sealed-ciphertext", "sealed-key", "sealed-iv"):
         assert raw not in metrics_body
-        assert raw not in log_body
+        assert raw not in logs
 
 
 def test_metrics_scrape_uses_bounded_relay_registry(relay_client) -> None:

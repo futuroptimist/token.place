@@ -23,7 +23,6 @@ from relay_state_store import (
     ComputeNodeCapabilities,
     ComputeNodeRegistration,
     RelayStateCapacityExceeded,
-    RelayStateConflict,
     RelayStateCredentialMismatch,
     RelayStateStoreConfig,
     RelayStateStoreError,
@@ -465,6 +464,9 @@ if operation == 'register' then
     return {'capacity'}
   end
   local expires_us = now_us + ttl_us
+  if expires_us ~= expires_us or expires_us == math.huge or expires_us == -math.huge then
+    return {'deadline'}
+  end
   if not exists then
     redis.call('HSET', node, 'node_id', ARGV[8],
       'control_credential_digest', owner, 'registered_at_us', now_us,
@@ -489,6 +491,9 @@ elseif operation == 'renew' then
     return {'credential_mismatch'}
   end
   local expires_us = now_us + ttl_us
+  if expires_us ~= expires_us or expires_us == math.huge or expires_us == -math.huge then
+    return {'deadline'}
+  end
   if ARGV[8] == '1' then
     redis.call('HSET', node, 'supported_model_ids', ARGV[9],
       'active_context_tier', ARGV[10], 'maximum_total_context_tokens', ARGV[11],
@@ -515,7 +520,7 @@ return {'invalid'}
 REGISTRATION_TRANSITION_SCRIPT = ReviewedScript(
     "registration_transition_v1",
     REGISTRATION_TRANSITION_SOURCE,
-    "dc7196f12bcd007fcbdb90287a0b0d68144b099a255bd0156f5b5cac1daa1c73",  # pragma: allowlist secret
+    "986871e72cbf890a44b5d2c7bcee2f71f39b227b6577ce3810f72fc19c4f5b51",  # pragma: allowlist secret
     True,
 )
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
@@ -831,12 +836,19 @@ class ValkeyRegistrationStore:
         extra: tuple[bytes, ...],
     ) -> tuple[str, list[Any]]:
         digest = self._node_digest(node_id)
+        try:
+            ttl_us = max(1, math.ceil(self.config.lease_ttl_seconds * 1_000_000))
+            ttl_arg = str(ttl_us).encode()
+        except (OverflowError, ValueError):
+            # The script returns the contract error after establishing whether a
+            # renewal target is live; unknown/expired renewals remain idempotent.
+            ttl_arg = b"inf"
         args = (
             self._foundation.config.key_prefix.encode(),
             operation.encode(),
             digest.encode(),
             owner.encode(),
-            str(max(1, math.ceil(self.config.lease_ttl_seconds * 1_000_000))).encode(),
+            ttl_arg,
             str(self.config.max_compute_nodes).encode(),
             str(self.config.node_transition_batch_size).encode(),
             *extra,
@@ -844,15 +856,37 @@ class ValkeyRegistrationStore:
         result = self._foundation.execute(
             REGISTRATION_TRANSITION_SCRIPT.name, self._keys(digest), args
         )
-        code = result[0].decode() if isinstance(result[0], bytes) else result[0]
+        if not isinstance(result, (list, tuple)) or not result:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        status = result[0]
+        if isinstance(status, bytes):
+            try:
+                code = status.decode("ascii")
+            except UnicodeDecodeError:
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
+        elif isinstance(status, str):
+            code = status
+        else:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        expected_lengths = {
+            "capacity": 1,
+            "credential_mismatch": 1,
+            "deadline": 1,
+            "not_found": 1,
+            "ok": 2 if operation in {"register", "renew", "reap"} else 1,
+        }
+        if code not in expected_lengths or len(result) != expected_lengths[code]:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
         if code == "capacity":
             raise RelayStateCapacityExceeded(
                 "compute-node registration capacity reached"
             )
         if code == "credential_mismatch":
             raise RelayStateCredentialMismatch("control credential digest mismatch")
-        if code not in {"ok", "not_found"}:
-            raise RelayStateConflict("registration transition rejected")
+        if code == "deadline":
+            raise RelayStateStoreError("registration deadline must be finite")
         return code, list(result[1:])
 
     @staticmethod
@@ -892,12 +926,18 @@ class ValkeyRegistrationStore:
         ):
             raise ValkeySchemaIncompatibleError("state schema incompatible") from None
 
-    def _read(self, node_id: str) -> ComputeNodeRegistration | None:
-        manifest = self._foundation.read_manifest()
-        self._foundation.check_read_compatible(manifest)
+    def _read(self, node_id: str, now_us: int) -> ComputeNodeRegistration | None:
+        digest = self._node_digest(node_id)
+        score = self._foundation._call(
+            self._foundation._client.zscore,
+            self._foundation.config.key("nodes:lease"),
+            digest,
+        )
+        if score is None or not math.isfinite(score) or score <= now_us:
+            return None
         raw = self._foundation._call(
             self._foundation._client.hgetall,
-            self._foundation.config.key("node", self._node_digest(node_id)),
+            self._foundation.config.key("node", digest),
         )
         return self._decode_record(raw) if raw else None
 
@@ -952,18 +992,21 @@ class ValkeyRegistrationStore:
         self._validate_node_id(node_id)
         manifest = self._foundation.read_manifest()
         self._foundation.check_read_compatible(manifest)
-        self._transition("reap", node_id, "", ())
-        return self._read(node_id)
+        seconds, micros = self._foundation.server_time()
+        return self._read(node_id, seconds * 1_000_000 + micros)
 
     def list(self) -> tuple[ComputeNodeRegistration, ...]:
         manifest = self._foundation.read_manifest()
         self._foundation.check_read_compatible(manifest)
-        self._transition("reap", "", "", ())
+        seconds, micros = self._foundation.server_time()
+        now_us = seconds * 1_000_000 + micros
         digests = self._foundation._call(
-            self._foundation._client.zrange,
+            self._foundation._client.zrangebyscore,
             self._foundation.config.key("nodes:lease"),
-            0,
-            self.config.max_compute_nodes - 1,
+            f"({now_us}",
+            "+inf",
+            start=0,
+            num=self.config.max_compute_nodes,
         )
         records = []
         for digest in digests:

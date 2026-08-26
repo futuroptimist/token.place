@@ -38,10 +38,12 @@ metadata.
 
 ## Backend contract and consequences
 
-The backend tests obtain stores through a factory. A future Valkey implementation will be added to
-that factory and must pass the same deterministic lifecycle, bounds, defensive-read, clock, and
-concurrency suite. This provides a backend-neutral behavioral baseline without choosing Valkey
-keys, transactions, scripts, or discovery mechanisms prematurely.
+The backend tests share a registration-only contract helper between the in-memory store and the
+internal Valkey component. This deliberately does not parameterize the complete `RelayStateStore`
+suite or imply that the partial Valkey component conforms to that protocol. Valkey mutations use
+one bounded reviewed transition script and authoritative server time; lookups and listings remain
+read-only and exclude leases at the inclusive expiry boundary. The registration hash allowlist is
+updated field-by-field so additive fields written by a compatible future revision survive renewal.
 
 Memory-only operation and a registration-only boundary keep this change reviewable and avoid a
 partial runtime migration that could imply false horizontal-scaling guarantees. This PR is a

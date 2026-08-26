@@ -17,6 +17,7 @@ from valkey_relay_state import (
     ValkeyConfig,
     ValkeyConfigurationError,
     ValkeyFoundation,
+    ValkeyRegistrationStore,
     ValkeyReadOnlyError,
     ValkeySchemaIncompatibleError,
     ValkeyScriptError,
@@ -24,6 +25,7 @@ from valkey_relay_state import (
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
 )
+from relay_state_store import RelayStateStoreConfig
 
 
 def config(**changes):
@@ -57,6 +59,45 @@ def manifest(**changes):
     )
     values.update(changes)
     return SchemaManifest(**values)
+
+
+def registration_store_with_foundation(foundation):
+    store = object.__new__(ValkeyRegistrationStore)
+    store._foundation = foundation
+    store._config = RelayStateStoreConfig(namespace="testing.unit")
+    return store
+
+
+@pytest.mark.parametrize(
+    "result",
+    [None, [], [1], [b"unknown"], [b"ok", b"extra"], [b"not_found", b"extra"]],
+)
+def test_registration_transition_rejects_every_malformed_result(result):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store._transition("unregister", "node-a", "a" * 64, ())
+
+
+def test_registration_reads_use_server_time_and_never_mutating_transition():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    foundation._client = Mock()
+    foundation._client.zscore = Mock()
+    foundation._client.zrangebyscore = Mock()
+    foundation._client.hgetall = Mock()
+    foundation._call.side_effect = [99_999_999, [], []]
+    store = registration_store_with_foundation(foundation)
+
+    assert store.get("node-a") is None
+    assert store.list() == ()
+    foundation.execute.assert_not_called()
+    foundation.check_write_compatible.assert_not_called()
 
 
 def test_exact_key_prefix_and_hash_tag():

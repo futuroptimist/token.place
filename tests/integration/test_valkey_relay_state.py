@@ -269,7 +269,12 @@ def test_registration_contract_is_atomic_across_independent_clients(valkey_serve
     try:
         created = first.register("node-b", _capabilities(), owner)
         assert created == second.get("node-b")
-        assert second.register("node-b", _capabilities(3), owner).capabilities.max_concurrency == 3
+        assert (
+            second.register(
+                "node-b", _capabilities(3), owner
+            ).capabilities.max_concurrency
+            == 3
+        )
         with pytest.raises(RelayStateCredentialMismatch):
             second.register("node-b", _capabilities(), _digest("other"))
         assert first.renew("unknown", owner) is None
@@ -282,14 +287,20 @@ def test_registration_contract_is_atomic_across_independent_clients(valkey_serve
         second.register("node-c", _capabilities(), owner)
 
         barrier = Barrier(2)
+
         def compete(store, credential):
             barrier.wait()
             try:
-                return store.register("node-b", _capabilities(), credential).control_credential_digest
+                return store.register(
+                    "node-b", _capabilities(), credential
+                ).control_credential_digest
             except RelayStateCredentialMismatch:
                 return "rejected"
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(compete, (first, second), (owner, _digest("rival"))))
+            results = list(
+                pool.map(compete, (first, second), (owner, _digest("rival")))
+            )
         assert sorted(results) == sorted(["rejected", owner])
     finally:
         keys = [
@@ -297,7 +308,9 @@ def test_registration_contract_is_atomic_across_independent_clients(valkey_serve
             first._foundation.config.key("nodes:lease"),
         ]
         for node_id in ("node-a", "node-b", "node-c", "unknown"):
-            keys.append(first._foundation.config.key("node", first._node_digest(node_id)))
+            keys.append(
+                first._foundation.config.key("node", first._node_digest(node_id))
+            )
         first._foundation._client.delete(*keys)
         first.close()
         second.close()
@@ -312,10 +325,79 @@ def test_registration_expiry_is_server_timed_and_recovers_capacity(valkey_server
     try:
         record = store.register("node-a", _capabilities(), owner)
         server_seconds, server_micros = store._foundation.server_time()
-        assert abs(record.registered_at_epoch - (server_seconds + server_micros / 1_000_000)) < 1
+        assert (
+            abs(
+                record.registered_at_epoch
+                - (server_seconds + server_micros / 1_000_000)
+            )
+            < 1
+        )
         time.sleep(0.03)
         assert store.get("node-a") is None
         assert store.register("node-b", _capabilities(), owner).node_id == "node-b"
+    finally:
+        keys = [
+            store._foundation.config.key("schema"),
+            store._foundation.config.key("nodes:lease"),
+            store._foundation.config.key("node", store._node_digest("node-a")),
+            store._foundation.config.key("node", store._node_digest("node-b")),
+        ]
+        store._foundation._client.delete(*keys)
+        store.close()
+
+
+def test_registration_expiry_backlog_does_not_affect_liveness_or_capacity(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        max_compute_nodes=3,
+        node_transition_batch_size=1,
+        lease_ttl_seconds=0.02,
+    )
+    owner = _digest("owner")
+    node_ids = ("node-a", "node-b", "node-c", "node-d")
+    try:
+        for node_id in node_ids[:3]:
+            store.register(node_id, _capabilities(), owner)
+        time.sleep(0.03)
+
+        # The addressed node is expired even when it falls outside bounded cleanup.
+        assert store.get("node-c") is None
+        # Unreaped expired scores do not consume live registration capacity.
+        assert store.register("node-d", _capabilities(), owner).node_id == "node-d"
+    finally:
+        keys = [
+            store._foundation.config.key("schema"),
+            store._foundation.config.key("nodes:lease"),
+            *(
+                store._foundation.config.key("node", store._node_digest(node_id))
+                for node_id in node_ids
+            ),
+        ]
+        store._foundation._client.delete(*keys)
+        store.close()
+
+
+def test_expire_returns_the_records_removed_at_its_atomic_cutoff(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        max_compute_nodes=2,
+        node_transition_batch_size=2,
+        lease_ttl_seconds=0.02,
+    )
+    owner = _digest("owner")
+    try:
+        store.register("node-a", _capabilities(), owner)
+        store.register("node-b", _capabilities(), owner)
+        time.sleep(0.03)
+
+        assert [record.node_id for record in store.expire()] == ["node-a", "node-b"]
+        assert store.expire() == ()
     finally:
         keys = [
             store._foundation.config.key("schema"),

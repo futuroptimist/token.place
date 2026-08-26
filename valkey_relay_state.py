@@ -436,74 +436,86 @@ SERVER_TIME_SCRIPT = ReviewedScript(
 REGISTRATION_TRANSITION_SOURCE = """\
 local leases, node = KEYS[1], KEYS[2]
 local prefix, operation, digest, owner = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
-local ttl_us, capacity, batch = tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7])
+local ttl, capacity, batch = tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7])
 local t = redis.call('TIME')
-local now_us = tonumber(t[1]) * 1000000 + tonumber(t[2])
-local expired = {}
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local fields = {'node_id', 'control_credential_digest', 'registered_at_epoch',
+  'supported_model_ids', 'active_context_tier', 'maximum_total_context_tokens',
+  'default_output_token_reservation', 'maximum_output_tokens', 'max_concurrency',
+  'backend_class', 'api_version', 'lease_expires_at_epoch'}
+local function fixed_record(key)
+  local record = redis.call('HMGET', key, unpack(fields))
+  local bytes = 0
+  for _, value in ipairs(record) do
+    if not value then return nil end
+    bytes = bytes + string.len(value)
+  end
+  local json_ok, models = pcall(cjson.decode, record[4])
+  if not json_ok or type(models) ~= 'table' then return nil end
+  return record, bytes
+end
 local addressed_expiry = redis.call('ZSCORE', leases, digest)
-if addressed_expiry and tonumber(addressed_expiry) <= now_us then
-  local record = redis.call('HGETALL', node)
-  if #record > 0 then table.insert(expired, record) end
+if addressed_expiry and tonumber(addressed_expiry) <= now then
   redis.call('DEL', node)
   redis.call('ZREM', leases, digest)
 end
-local due = redis.call('ZRANGEBYSCORE', leases, '-inf', now_us, 'LIMIT', 0, batch)
+local due = redis.call('ZRANGEBYSCORE', leases, '-inf', now, 'LIMIT', 0, batch)
+local expired = {}
+local reply_bytes, reply_items = 2, 3
 for _, expired_digest in ipairs(due) do
   local expired_node = prefix .. 'node:' .. expired_digest
-  local record = redis.call('HGETALL', expired_node)
-  if #record > 0 then table.insert(expired, record) end
+  if operation == 'reap' then
+    local record, record_bytes = fixed_record(expired_node)
+    if not record then return {'schema'} end
+    if reply_items + 13 > 1024 or reply_bytes + record_bytes > 65536 then break end
+    table.insert(expired, record)
+    reply_items = reply_items + 13
+    reply_bytes = reply_bytes + record_bytes
+  end
   redis.call('DEL', expired_node)
   redis.call('ZREM', leases, expired_digest)
 end
 local exists = redis.call('EXISTS', node) == 1
-if operation == 'register' then
-  if exists then
-    local current = redis.call('HGET', node, 'control_credential_digest')
-    if current ~= owner then return {'credential_mismatch'} end
-  elseif redis.call('ZCOUNT', leases, '(' .. now_us, '+inf') >= capacity then
-    return {'capacity'}
+if operation == 'register' or operation == 'renew' then
+  if operation == 'register' then
+    if exists then
+      if redis.call('HGET', node, 'control_credential_digest') ~= owner then
+        return {'credential_mismatch'}
+      end
+    elseif redis.call('ZCOUNT', leases, '(' .. now, '+inf') >= capacity then
+      return {'capacity'}
+    end
+  else
+    if not exists then return {'not_found'} end
+    if redis.call('HGET', node, 'control_credential_digest') ~= owner then
+      return {'credential_mismatch'}
+    end
   end
-  local expires_us = now_us + ttl_us
-  if expires_us ~= expires_us or expires_us == math.huge or expires_us == -math.huge then
+  if ttl < 0.000001 then ttl = 0.000001 end
+  local deadline = now + ttl
+  if deadline ~= deadline or deadline == math.huge or deadline == -math.huge then
     return {'deadline'}
   end
-  if not exists then
+  if operation == 'register' and not exists then
     redis.call('HSET', node, 'node_id', ARGV[8],
-      'control_credential_digest', owner, 'registered_at_us', now_us,
+      'control_credential_digest', owner, 'registered_at_epoch', now,
       'supported_model_ids', ARGV[9], 'active_context_tier', ARGV[10],
       'maximum_total_context_tokens', ARGV[11],
       'default_output_token_reservation', ARGV[12],
       'maximum_output_tokens', ARGV[13], 'max_concurrency', ARGV[14],
       'backend_class', ARGV[15], 'api_version', ARGV[16])
-  else
+  elseif operation == 'register' or ARGV[8] == '1' then
     redis.call('HSET', node, 'supported_model_ids', ARGV[9],
       'active_context_tier', ARGV[10], 'maximum_total_context_tokens', ARGV[11],
       'default_output_token_reservation', ARGV[12],
       'maximum_output_tokens', ARGV[13], 'max_concurrency', ARGV[14],
       'backend_class', ARGV[15], 'api_version', ARGV[16])
   end
-  redis.call('HSET', node, 'lease_expires_at_us', expires_us)
-  redis.call('ZADD', leases, expires_us, digest)
-  return {'ok', redis.call('HGETALL', node)}
-elseif operation == 'renew' then
-  if not exists then return {'not_found'} end
-  if redis.call('HGET', node, 'control_credential_digest') ~= owner then
-    return {'credential_mismatch'}
-  end
-  local expires_us = now_us + ttl_us
-  if expires_us ~= expires_us or expires_us == math.huge or expires_us == -math.huge then
-    return {'deadline'}
-  end
-  if ARGV[8] == '1' then
-    redis.call('HSET', node, 'supported_model_ids', ARGV[9],
-      'active_context_tier', ARGV[10], 'maximum_total_context_tokens', ARGV[11],
-      'default_output_token_reservation', ARGV[12],
-      'maximum_output_tokens', ARGV[13], 'max_concurrency', ARGV[14],
-      'backend_class', ARGV[15], 'api_version', ARGV[16])
-  end
-  redis.call('HSET', node, 'lease_expires_at_us', expires_us)
-  redis.call('ZADD', leases, expires_us, digest)
-  return {'ok', redis.call('HGETALL', node)}
+  redis.call('HSET', node, 'lease_expires_at_epoch', deadline)
+  redis.call('ZADD', leases, deadline, digest)
+  local record = fixed_record(node)
+  if not record then return {'schema'} end
+  return {'ok', record}
 elseif operation == 'unregister' then
   if not exists then return {'not_found'} end
   if redis.call('HGET', node, 'control_credential_digest') ~= owner then
@@ -520,7 +532,7 @@ return {'invalid'}
 REGISTRATION_TRANSITION_SCRIPT = ReviewedScript(
     "registration_transition_v1",
     REGISTRATION_TRANSITION_SOURCE,
-    "986871e72cbf890a44b5d2c7bcee2f71f39b227b6577ce3810f72fc19c4f5b51",  # pragma: allowlist secret
+    "6b2a4873c89176ec44f08f71f778b263bdfb55c9b3bd383883058292a548ed26",  # pragma: allowlist secret
     True,
 )
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
@@ -808,8 +820,12 @@ class ValkeyRegistrationStore:
     @staticmethod
     def _capability_args(capabilities: ComputeNodeCapabilities) -> tuple[bytes, ...]:
         models = json.dumps(
-            capabilities.supported_model_ids, separators=(",", ":")
-        ).encode()
+            capabilities.supported_model_ids,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(models) > _MAX_RESULT_BYTES:
+            raise RelayStateStoreError("supported model IDs exceed byte bound")
         return (
             models,
             capabilities.active_context_tier.encode(),
@@ -836,13 +852,7 @@ class ValkeyRegistrationStore:
         extra: tuple[bytes, ...],
     ) -> tuple[str, list[Any]]:
         digest = self._node_digest(node_id)
-        try:
-            ttl_us = max(1, math.ceil(self.config.lease_ttl_seconds * 1_000_000))
-            ttl_arg = str(ttl_us).encode()
-        except (OverflowError, ValueError):
-            # The script returns the contract error after establishing whether a
-            # renewal target is live; unknown/expired renewals remain idempotent.
-            ttl_arg = b"inf"
+        ttl_arg = repr(float(self.config.lease_ttl_seconds)).encode("ascii")
         args = (
             self._foundation.config.key_prefix.encode(),
             operation.encode(),
@@ -875,6 +885,7 @@ class ValkeyRegistrationStore:
             "credential_mismatch": 1,
             "deadline": 1,
             "not_found": 1,
+            "schema": 1,
             "ok": 2 if operation in {"register", "renew", "reap"} else 1,
         }
         if code not in expected_lengths or len(result) != expected_lengths[code]:
@@ -887,19 +898,38 @@ class ValkeyRegistrationStore:
             raise RelayStateCredentialMismatch("control credential digest mismatch")
         if code == "deadline":
             raise RelayStateStoreError("registration deadline must be finite")
+        if code == "schema":
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
         return code, list(result[1:])
 
     @staticmethod
     def _record_from_script(raw: object) -> ComputeNodeRegistration:
-        if not isinstance(raw, (list, tuple)) or len(raw) % 2:
+        fields = (
+            b"node_id",
+            b"control_credential_digest",
+            b"registered_at_epoch",
+            b"supported_model_ids",
+            b"active_context_tier",
+            b"maximum_total_context_tokens",
+            b"default_output_token_reservation",
+            b"maximum_output_tokens",
+            b"max_concurrency",
+            b"backend_class",
+            b"api_version",
+            b"lease_expires_at_epoch",
+        )
+        if not isinstance(raw, (list, tuple)) or len(raw) != len(fields):
             raise ValkeySchemaIncompatibleError("state schema incompatible")
-        return ValkeyRegistrationStore._decode_record(dict(zip(raw[::2], raw[1::2])))
+        return ValkeyRegistrationStore._decode_record(dict(zip(fields, raw)))
 
     @staticmethod
     def _decode_record(raw: Mapping[bytes, bytes]) -> ComputeNodeRegistration:
         try:
+            model_ids = json.loads(raw[b"supported_model_ids"])
+            if not isinstance(model_ids, list):
+                raise ValueError
             capabilities = ComputeNodeCapabilities(
-                supported_model_ids=tuple(json.loads(raw[b"supported_model_ids"])),
+                supported_model_ids=tuple(model_ids),
                 active_context_tier=raw[b"active_context_tier"].decode(),
                 maximum_total_context_tokens=int(raw[b"maximum_total_context_tokens"]),
                 default_output_token_reservation=int(
@@ -914,8 +944,8 @@ class ValkeyRegistrationStore:
                 node_id=raw[b"node_id"].decode(),
                 capabilities=capabilities,
                 control_credential_digest=raw[b"control_credential_digest"].decode(),
-                registered_at_epoch=int(raw[b"registered_at_us"]) / 1_000_000,
-                lease_expires_at_epoch=int(raw[b"lease_expires_at_us"]) / 1_000_000,
+                registered_at_epoch=float(raw[b"registered_at_epoch"]),
+                lease_expires_at_epoch=float(raw[b"lease_expires_at_epoch"]),
             )
         except (
             KeyError,
@@ -926,14 +956,14 @@ class ValkeyRegistrationStore:
         ):
             raise ValkeySchemaIncompatibleError("state schema incompatible") from None
 
-    def _read(self, node_id: str, now_us: int) -> ComputeNodeRegistration | None:
+    def _read(self, node_id: str, now: float) -> ComputeNodeRegistration | None:
         digest = self._node_digest(node_id)
         score = self._foundation._call(
             self._foundation._client.zscore,
             self._foundation.config.key("nodes:lease"),
             digest,
         )
-        if score is None or not math.isfinite(score) or score <= now_us:
+        if score is None or not math.isfinite(score) or score <= now:
             return None
         raw = self._foundation._call(
             self._foundation._client.hgetall,
@@ -993,17 +1023,17 @@ class ValkeyRegistrationStore:
         manifest = self._foundation.read_manifest()
         self._foundation.check_read_compatible(manifest)
         seconds, micros = self._foundation.server_time()
-        return self._read(node_id, seconds * 1_000_000 + micros)
+        return self._read(node_id, seconds + micros / 1_000_000)
 
     def list(self) -> tuple[ComputeNodeRegistration, ...]:
         manifest = self._foundation.read_manifest()
         self._foundation.check_read_compatible(manifest)
         seconds, micros = self._foundation.server_time()
-        now_us = seconds * 1_000_000 + micros
+        now = seconds + micros / 1_000_000
         digests = self._foundation._call(
             self._foundation._client.zrangebyscore,
             self._foundation.config.key("nodes:lease"),
-            f"({now_us}",
+            f"({now}",
             "+inf",
             start=0,
             num=self.config.max_compute_nodes,

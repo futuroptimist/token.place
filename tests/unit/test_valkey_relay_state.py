@@ -25,7 +25,7 @@ from valkey_relay_state import (
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
 )
-from relay_state_store import RelayStateStoreConfig
+from relay_state_store import RelayStateStoreConfig, RelayStateStoreError
 
 
 def config(**changes):
@@ -194,11 +194,12 @@ def test_invalid_foundation_arguments_fail_before_client_construction(
 ):
     config_value = config() if config_value is None else config_value
     manifest_value = manifest() if manifest_value is None else manifest_value
-    with patch.object(ValkeyFoundation, "_create_client") as create, patch(
-        "valkey_relay_state.redis.ConnectionPool"
-    ) as pool, patch("valkey_relay_state.redis.Redis") as redis_class, patch(
-        "valkey_relay_state.Sentinel"
-    ) as sentinel_class:
+    with (
+        patch.object(ValkeyFoundation, "_create_client") as create,
+        patch("valkey_relay_state.redis.ConnectionPool") as pool,
+        patch("valkey_relay_state.redis.Redis") as redis_class,
+        patch("valkey_relay_state.Sentinel") as sentinel_class,
+    ):
         with pytest.raises(error_type, match=f"^{message}$") as caught:
             ValkeyFoundation(config_value, manifest_value)
     create.assert_not_called()
@@ -388,9 +389,10 @@ def test_retry_budget_is_total_and_deterministic():
     foundation.config = config(retry_attempts=5, retry_timeout_seconds=0.1)
     operation = Mock(side_effect=redis.ConnectionError("private endpoint"))
     clock = Mock(side_effect=[0.0, 0.04, 0.11])
-    with patch("valkey_relay_state.time.monotonic", clock), patch(
-        "valkey_relay_state.time.sleep"
-    ) as sleep:
+    with (
+        patch("valkey_relay_state.time.monotonic", clock),
+        patch("valkey_relay_state.time.sleep") as sleep,
+    ):
         with pytest.raises(ValkeyUnavailableError) as caught:
             foundation._call(operation)
     assert operation.call_count == 2
@@ -432,8 +434,10 @@ def test_second_noscript_is_a_bounded_typed_error_without_another_retry():
     assert foundation._client.evalsha.call_count == 2
     foundation._client.script_load.assert_called_once_with(SERVER_TIME_SCRIPT.source)
     assert caught.value.__cause__ is None
-    rendered = repr(caught.value) + str(caught.value) + "".join(
-        traceback.format_exception(caught.value)
+    rendered = (
+        repr(caught.value)
+        + str(caught.value)
+        + "".join(traceback.format_exception(caught.value))
     )
     assert datastore_detail not in rendered
     assert "secret-endpoint" not in rendered
@@ -650,3 +654,23 @@ def test_server_time_rejects_malformed_and_out_of_range_results(result):
     with patch.object(foundation, "execute", return_value=result):
         with pytest.raises(ValkeyScriptError, match="invalid reviewed script result"):
             foundation.server_time()
+
+
+def test_registration_deadline_failure_is_typed_before_record_decoding():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = [b"deadline"]
+    store = registration_store_with_foundation(foundation)
+    store._config = RelayStateStoreConfig(
+        namespace="testing.unit",
+        lease_ttl_seconds=float.fromhex("0x1.fffffffffffffp+1023"),
+    )
+
+    with pytest.raises(
+        RelayStateStoreError, match="^registration deadline must be finite$"
+    ):
+        store._transition(
+            "register", "node-a", "a" * 64, (b"node-a", *(b"" for _ in range(8)))
+        )
+
+    assert foundation.execute.call_args.args[2][4] == b"1.7976931348623157e+308"

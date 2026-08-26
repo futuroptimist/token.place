@@ -284,6 +284,19 @@ def _registration_keys(store, *node_ids):
     ]
 
 
+def _mark_registrations_due(store, node_ids):
+    seconds, micros = store._foundation.server_time()
+    cutoff = seconds + micros / 1_000_000
+    lease_key = store._foundation.config.key("nodes:lease")
+    with store._foundation._client.pipeline(transaction=True) as pipeline:
+        for node_id in node_ids:
+            digest = store._node_digest(node_id)
+            node_key = store._foundation.config.key("node", digest)
+            pipeline.hset(node_key, "lease_expires_at_epoch", cutoff)
+            pipeline.zadd(lease_key, {digest: cutoff})
+        pipeline.execute()
+
+
 def test_shared_registration_only_backend_contract(valkey_server):
     store = _registration_store(valkey_server, uuid.uuid4().hex, max_compute_nodes=1)
     try:
@@ -404,35 +417,75 @@ def test_large_finite_ttl_uses_a_finite_epoch_seconds_deadline(valkey_server):
         store.close()
 
 
-def test_default_reap_batch_and_maximum_utf8_capabilities_are_bounded(valkey_server):
+def test_maximum_utf8_capabilities_round_trip_without_expiry_timing(valkey_server):
     store = _registration_store(
         valkey_server,
         uuid.uuid4().hex,
-        max_compute_nodes=64,
-        lease_ttl_seconds=0.02,
+        lease_ttl_seconds=3600,
     )
     owner = _digest("owner")
-    node_ids = tuple(f"node-{index}" for index in range(64))
     non_bmp_models = tuple(chr(0x10000 + index) * 128 for index in range(64))
     capabilities = dataclasses.replace(
         _capabilities(), supported_model_ids=non_bmp_models
     )
     try:
-        records = [store.register(node_id, capabilities, owner) for node_id in node_ids]
-        renewed = store.renew(node_ids[0], owner, capabilities=capabilities)
+        registered = store.register("node-a", capabilities, owner)
+        assert registered.capabilities == capabilities
+        renewed = store.renew("node-a", owner, capabilities=capabilities)
         assert renewed is not None and renewed.capabilities == capabilities
-        assert store.get(node_ids[0]) == renewed
+        assert store.get("node-a") == renewed
+    finally:
+        store._foundation._client.delete(*_registration_keys(store, "node-a"))
+        store.close()
 
-        def leases_elapsed():
-            seconds, micros = store._foundation.server_time()
-            return seconds + micros / 1_000_000 >= max(
-                record.lease_expires_at_epoch for record in records[1:] + [renewed]
-            )
 
-        _wait_until(leases_elapsed)
+def test_default_reap_batch_returns_64_small_records(valkey_server):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        max_compute_nodes=64,
+        lease_ttl_seconds=3600,
+    )
+    owner = _digest("owner")
+    node_ids = tuple(f"node-{index}" for index in range(64))
+    try:
+        for node_id in node_ids:
+            store.register(node_id, _capabilities(), owner)
+
+        _mark_registrations_due(store, node_ids)
         expired = store.expire()
         assert [record.node_id for record in expired] == sorted(node_ids)
         assert len({record.node_id for record in expired}) == 64
+        assert store.expire() == ()
+    finally:
+        store._foundation._client.delete(*_registration_keys(store, *node_ids))
+        store.close()
+
+
+def test_maximum_utf8_reap_respects_byte_budget_across_batches(valkey_server):
+    node_ids = ("node-a", "node-b", "node-c")
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        max_compute_nodes=len(node_ids),
+        lease_ttl_seconds=3600,
+    )
+    owner = _digest("owner")
+    non_bmp_models = tuple(chr(0x10000 + index) * 128 for index in range(64))
+    capabilities = dataclasses.replace(
+        _capabilities(), supported_model_ids=non_bmp_models
+    )
+    try:
+        for node_id in node_ids:
+            store.register(node_id, capabilities, owner)
+
+        _mark_registrations_due(store, node_ids)
+        expired_node_ids = []
+        while batch := store.expire():
+            expired_node_ids.extend(record.node_id for record in batch)
+
+        assert sorted(expired_node_ids) == sorted(node_ids)
+        assert len(set(expired_node_ids)) == len(node_ids)
         assert store.expire() == ()
     finally:
         store._foundation._client.delete(*_registration_keys(store, *node_ids))

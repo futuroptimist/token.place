@@ -3204,6 +3204,23 @@ def headless_cpu_admission(args: Any) -> int:
                             os.environ.pop(name, None)
                         else:
                             os.environ[name] = previous
+            diag_phase = "classify_readiness"
+            diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
+            readiness = _headless_classify_readiness(ready, diagnostics, evidence, fixture)
+            diag_phase = "post_classify_return"
+            if readiness != "success":
+                if readiness == "authoritative_evidence_failed":
+                    result["warm_load_result"] = "ready"
+                    result["failure_code"] = "authoritative_evidence_failed"
+                    result["last_completed_phase"] = "warm_load_completed"
+                    return 6
+                result["failure_code"] = "warm_load_failed"
+                return 5
+            result["warm_load_result"] = "ready"
+            result["last_completed_phase"] = "warm_load_completed"
+            result.update(success=True, failure_code="none",
+                          authoritative_evidence_result="validated")
+            return 0
         except Exception as _diag_exc:
             try:
                 with open(diag_path, "w", encoding="utf-8") as _diag_handle:
@@ -3211,21 +3228,6 @@ def headless_cpu_admission(args: Any) -> int:
             except Exception:
                 pass
             raise
-        diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
-        readiness = _headless_classify_readiness(ready, diagnostics, evidence, fixture)
-        if readiness != "success":
-            if readiness == "authoritative_evidence_failed":
-                result["warm_load_result"] = "ready"
-                result["failure_code"] = "authoritative_evidence_failed"
-                result["last_completed_phase"] = "warm_load_completed"
-                return 6
-            result["failure_code"] = "warm_load_failed"
-            return 5
-        result["warm_load_result"] = "ready"
-        result["last_completed_phase"] = "warm_load_completed"
-        result.update(success=True, failure_code="none",
-                      authoritative_evidence_result="validated")
-        return 0
     except Exception:
         if not startup_emitted:
             result["failure_code"] = "bridge_exited_before_startup_event"

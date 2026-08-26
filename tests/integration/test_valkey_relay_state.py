@@ -7,6 +7,14 @@ import uuid
 
 import pytest
 import redis
+from dataclasses import replace
+
+from relay_state_store import (
+    ComputeNodeCapabilities,
+    RelayStateCapacityExceeded,
+    RelayStateCredentialMismatch,
+    RelayStateStoreConfig,
+)
 
 from valkey_relay_state import (
     DirectPrimary,
@@ -16,6 +24,7 @@ from valkey_relay_state import (
     ValkeyConfig,
     ValkeyFoundation,
     ValkeyReadOnlyError,
+    ValkeyRegistrationStore,
     ValkeySchemaIncompatibleError,
     ValkeyUnavailableError,
 )
@@ -84,7 +93,7 @@ def _manifest(**changes):
         reader_max=1,
         writer_min=1,
         writer_max=1,
-        script_digests={SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT.sha256},
+        script_digests=SCRIPT_DIGESTS,
         migration_epoch=0,
     )
     values.update(changes)
@@ -110,6 +119,160 @@ def _foundation(port, namespace=None, expected=None):
         retry_attempts=1,
     )
     return ValkeyFoundation(cfg, expected or _manifest())
+
+
+def _registration_store(port, namespace=None, *, capacity=8, ttl=30):
+    foundation = _foundation(port, namespace)
+    foundation.initialize_manifest()
+    return ValkeyRegistrationStore(
+        foundation,
+        RelayStateStoreConfig(
+            namespace=namespace or "integration",
+            max_compute_nodes=capacity,
+            lease_ttl_seconds=ttl,
+        ),
+    )
+
+
+@pytest.fixture
+def capabilities():
+    return ComputeNodeCapabilities(
+        supported_model_ids=("model-a",),
+        active_context_tier="8k-fast",
+        maximum_total_context_tokens=8192,
+        default_output_token_reservation=256,
+        maximum_output_tokens=1024,
+        max_concurrency=2,
+        backend_class="cpu",
+    )
+
+
+def _owner(value):
+    import hashlib
+
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _clean_registration_store(store):
+    lease_key = store._foundation.config.key("nodes:lease")
+    digests = store._foundation._client.zrange(lease_key, 0, -1)
+    keys = [
+        store._foundation.config.key(
+            "node", digest.decode() if isinstance(digest, bytes) else digest
+        )
+        for digest in digests
+    ]
+    keys.extend((lease_key, store._foundation.config.key("schema")))
+    if keys:
+        store._foundation._client.delete(*keys)
+    store.close()
+
+
+def test_registration_lifecycle_and_unknown_field_preservation(
+    valkey_server, capabilities
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    owner = _owner("owner")
+    try:
+        first = store.register("node-b", capabilities, owner)
+        assert first == store.get("node-b")
+        changed = replace(capabilities, max_concurrency=3)
+        store._foundation._client.hset(
+            store._foundation.config.key("node", store._node_digest("node-b")),
+            "future_additive_field",
+            "safe-fixed-value",
+        )
+        renewed = store.register("node-b", changed, owner)
+        assert renewed.registered_at_epoch == first.registered_at_epoch
+        assert renewed.capabilities == changed
+        assert store.renew("missing", owner) is None
+        assert store.renew("node-b", owner) is not None
+        with pytest.raises(RelayStateCredentialMismatch):
+            store.register("node-b", capabilities, _owner("other"))
+        with pytest.raises(RelayStateCredentialMismatch):
+            store.unregister("node-b", _owner("other"))
+        raw = store._foundation._client.hgetall(
+            store._foundation.config.key("node", store._node_digest("node-b"))
+        )
+        assert raw[b"future_additive_field"] == b"safe-fixed-value"
+        assert store.unregister("node-b", owner)
+        assert not store.unregister("node-b", owner)
+        assert store.get("node-b") is None
+    finally:
+        _clean_registration_store(store)
+
+
+def test_listing_capacity_concurrency_and_namespace_isolation(
+    valkey_server, capabilities
+):
+    namespace = uuid.uuid4().hex
+    stores = [
+        _registration_store(valkey_server, namespace, capacity=2) for _ in range(3)
+    ]
+    isolated = _registration_store(valkey_server, uuid.uuid4().hex)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            same = list(
+                pool.map(
+                    lambda store: store.register(
+                        "node-b", capabilities, _owner("same-owner")
+                    ),
+                    stores[:2],
+                )
+            )
+        assert same[0].control_credential_digest == same[1].control_credential_digest
+        stores[0].register("node-a", capabilities, _owner("a"))
+        assert [record.node_id for record in stores[1].list()] == ["node-a", "node-b"]
+        with pytest.raises(RelayStateCapacityExceeded):
+            stores[2].register("node-c", capabilities, _owner("c"))
+        isolated.register("node-c", capabilities, _owner("c"))
+        assert [record.node_id for record in isolated.list()] == ["node-c"]
+    finally:
+        _clean_registration_store(stores[0])
+        for store in stores[1:]:
+            store.close()
+        _clean_registration_store(isolated)
+
+
+def test_competing_owner_and_final_capacity_slot_have_one_winner(
+    valkey_server, capabilities
+):
+    namespace = uuid.uuid4().hex
+    stores = [_registration_store(valkey_server, namespace, capacity=1) for _ in range(2)]
+    try:
+        def attempt(index):
+            try:
+                return stores[index].register(
+                    "node-shared", capabilities, _owner(f"owner-{index}")
+                ).control_credential_digest
+            except RelayStateCredentialMismatch:
+                return "rejected"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(attempt, range(2)))
+        assert results.count("rejected") == 1
+        assert stores[0].get("node-shared").control_credential_digest in results
+    finally:
+        _clean_registration_store(stores[0])
+        stores[1].close()
+
+
+def test_server_time_inclusive_expiry_and_capacity_recovery(
+    valkey_server, capabilities
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, capacity=1, ttl=0.05
+    )
+    try:
+        registration = store.register("node-old", capabilities, _owner("old"))
+        while time.time() < registration.lease_expires_at_epoch:
+            time.sleep(0.005)
+        assert store.get("node-old") is None
+        store.register("node-new", capabilities, _owner("new"))
+        assert [record.node_id for record in store.list()] == ["node-new"]
+    finally:
+        _clean_registration_store(store)
 
 
 def test_atomic_initialization_compatibility_readiness_and_exact_cleanup(valkey_server):
@@ -162,7 +325,12 @@ def test_server_time_and_exact_noscript_recovery_without_lifecycle_mutation(
     foundation = _foundation(valkey_server)
     try:
         foundation.initialize_manifest()
-        assert foundation._client.script_exists(SERVER_TIME_SCRIPT.eval_sha1) == [False]
+        # Other lifecycle tests may already have loaded this reviewed script into
+        # the shared isolated server; script cache state is not namespaced.
+        assert foundation._client.script_exists(SERVER_TIME_SCRIPT.eval_sha1) in (
+            [False],
+            [True],
+        )
         before = foundation._client.dbsize()
         seconds, micros = foundation.server_time()
         assert abs(seconds - time.time()) < 5 and 0 <= micros < 1_000_000

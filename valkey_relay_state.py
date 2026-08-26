@@ -19,6 +19,15 @@ import redis
 from redis.exceptions import NoScriptError, RedisError, ResponseError
 from redis.sentinel import Sentinel
 
+from relay_state_store import (
+    ComputeNodeCapabilities,
+    ComputeNodeRegistration,
+    RelayStateCapacityExceeded,
+    RelayStateCredentialMismatch,
+    RelayStateStoreConfig,
+    RelayStateStoreError,
+)
+
 _NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_TIMEOUT_SECONDS = 30.0
@@ -425,8 +434,51 @@ SERVER_TIME_SCRIPT = ReviewedScript(
     "b60030a7ea7b76a01601d26aba460e94c4fa0d52fa472333c111f18c6701bd94",  # pragma: allowlist secret
     False,
 )
+REGISTRATION_TRANSITION_SOURCE = r"""
+local now_parts = redis.call('TIME')
+local now = tonumber(now_parts[1]) + tonumber(now_parts[2]) / 1000000
+local lease_key, node_key, prefix = KEYS[1], KEYS[2], ARGV[1]
+local batch = tonumber(ARGV[2])
+local due = redis.call('ZRANGEBYSCORE', lease_key, '-inf', now, 'LIMIT', 0, batch)
+for _, digest in ipairs(due) do
+  redis.call('DEL', prefix .. digest)
+  redis.call('ZREM', lease_key, digest)
+end
+local operation, digest = ARGV[3], ARGV[4]
+if operation == 'expire' then return {#due} end
+local owner = redis.call('HGET', node_key, 'control_credential_digest')
+if operation == 'unregister' then
+  if not owner then return {0} end
+  if owner ~= ARGV[5] then return {-2} end
+  redis.call('DEL', node_key)
+  redis.call('ZREM', lease_key, digest)
+  return {1}
+end
+if operation == 'renew' and not owner then return {0} end
+if owner and owner ~= ARGV[5] then return {-2} end
+if not owner and tonumber(redis.call('ZCARD', lease_key)) >= tonumber(ARGV[6]) then
+  return {-1}
+end
+local expires = now + tonumber(ARGV[7])
+if not owner then
+  redis.call('HSET', node_key, 'node_id', ARGV[8],
+    'control_credential_digest', ARGV[5], 'registered_at_epoch', tostring(now))
+end
+if ARGV[9] ~= '' then redis.call('HSET', node_key, 'capabilities', ARGV[9]) end
+redis.call('HSET', node_key, 'lease_expires_at_epoch', tostring(expires))
+redis.call('ZADD', lease_key, expires, digest)
+local registered = redis.call('HGET', node_key, 'registered_at_epoch')
+local capabilities = redis.call('HGET', node_key, 'capabilities')
+return {2, registered, tostring(expires), capabilities}
+""".strip() + "\n"
+REGISTRATION_TRANSITION_SCRIPT = ReviewedScript(
+    "registration_transition_v1",
+    REGISTRATION_TRANSITION_SOURCE,
+    hashlib.sha256(REGISTRATION_TRANSITION_SOURCE.encode()).hexdigest(),
+    True,
+)
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
-    {SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT}
+    {script.name: script for script in (SERVER_TIME_SCRIPT, REGISTRATION_TRANSITION_SCRIPT)}
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
     {name: script.sha256 for name, script in SCRIPT_REGISTRY.items()}
@@ -654,3 +706,235 @@ class ValkeyFoundation:
         manifest = self.read_manifest()
         self.check_read_compatible(manifest)
         self.check_write_compatible(manifest)
+
+
+class ValkeyRegistrationStore:
+    """Internal Valkey implementation of only the registration/lease slice.
+
+    Deliberately does not implement ``RelayStateStore`` and is not runtime-selectable.
+    """
+
+    _REAP_BATCH = 64
+
+    def __init__(
+        self, foundation: ValkeyFoundation, config: RelayStateStoreConfig
+    ) -> None:
+        if not isinstance(foundation, ValkeyFoundation) or not isinstance(
+            config, RelayStateStoreConfig
+        ):
+            raise RelayStateStoreError("invalid Valkey registration configuration")
+        self._foundation = foundation
+        self._config = config
+
+    @property
+    def config(self) -> RelayStateStoreConfig:
+        return self._config
+
+    def __repr__(self) -> str:
+        return "ValkeyRegistrationStore(<redacted>)"
+
+    def close(self) -> None:
+        self._foundation.close()
+
+    @staticmethod
+    def _node_digest(node_id: str) -> str:
+        return hashlib.sha256(b"node\0" + node_id.encode()).hexdigest()
+
+    def _validate_node(self, node_id: str) -> None:
+        try:
+            valid = (
+                isinstance(node_id, str)
+                and bool(node_id)
+                and len(node_id.encode()) <= self.config.max_node_id_bytes
+            )
+        except UnicodeError:
+            valid = False
+        if not valid:
+            raise RelayStateStoreError(
+                "node ID is empty or exceeds its configured byte bound"
+            )
+
+    @staticmethod
+    def _validate_owner(owner: str) -> None:
+        if not isinstance(owner, str) or not _SHA256_RE.fullmatch(owner):
+            raise RelayStateStoreError(
+                "control credential digest must be lowercase SHA-256 hex"
+            )
+
+    @staticmethod
+    def _encode_capabilities(capabilities: ComputeNodeCapabilities) -> bytes:
+        if not isinstance(capabilities, ComputeNodeCapabilities):
+            raise RelayStateStoreError("capabilities must be ComputeNodeCapabilities")
+        value = {
+            "active_context_tier": capabilities.active_context_tier,
+            "api_version": capabilities.api_version,
+            "backend_class": capabilities.backend_class,
+            "default_output_token_reservation": capabilities.default_output_token_reservation,
+            "max_concurrency": capabilities.max_concurrency,
+            "maximum_output_tokens": capabilities.maximum_output_tokens,
+            "maximum_total_context_tokens": capabilities.maximum_total_context_tokens,
+            "supported_model_ids": capabilities.supported_model_ids,
+        }
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    @staticmethod
+    def _decode(raw: Mapping[bytes, bytes]) -> ComputeNodeRegistration:
+        try:
+            capabilities = json.loads(raw[b"capabilities"])
+            capabilities["supported_model_ids"] = tuple(
+                capabilities["supported_model_ids"]
+            )
+            return ComputeNodeRegistration(
+                node_id=raw[b"node_id"].decode(),
+                capabilities=ComputeNodeCapabilities(**capabilities),
+                control_credential_digest=raw[b"control_credential_digest"].decode(),
+                registered_at_epoch=float(raw[b"registered_at_epoch"]),
+                lease_expires_at_epoch=float(raw[b"lease_expires_at_epoch"]),
+            )
+        except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+
+    def _keys(self, node_id: str) -> tuple[str, str, str]:
+        digest = self._node_digest(node_id)
+        return (
+            self._foundation.config.key("nodes:lease"),
+            self._foundation.config.key("node", digest),
+            digest,
+        )
+
+    def _transition(
+        self,
+        operation: str,
+        node_id: str,
+        owner: str,
+        capabilities: ComputeNodeCapabilities | None,
+    ) -> list[object]:
+        lease_key, node_key, digest = self._keys(node_id)
+        encoded = b"" if capabilities is None else self._encode_capabilities(capabilities)
+        result = self._foundation.execute(
+            REGISTRATION_TRANSITION_SCRIPT.name,
+            (lease_key, node_key),
+            (
+                (self._foundation.config.key_prefix + "node:").encode(),
+                str(self._REAP_BATCH).encode(),
+                operation.encode(),
+                digest.encode(),
+                owner.encode(),
+                str(self.config.max_compute_nodes).encode(),
+                repr(float(self.config.lease_ttl_seconds)).encode(),
+                node_id.encode(),
+                encoded,
+            ),
+        )
+        if not isinstance(result, list) or not result:
+            raise ValkeyScriptError("invalid reviewed script result")
+        code = int(result[0])
+        if code == -2:
+            raise RelayStateCredentialMismatch("control credential digest mismatch")
+        if code == -1:
+            raise RelayStateCapacityExceeded(
+                "compute-node registration capacity reached"
+            )
+        return result
+
+    def register(
+        self,
+        node_id: str,
+        capabilities: ComputeNodeCapabilities,
+        control_credential_digest: str,
+    ) -> ComputeNodeRegistration:
+        self._validate_node(node_id)
+        self._validate_owner(control_credential_digest)
+        self._encode_capabilities(capabilities)
+        self._transition("register", node_id, control_credential_digest, capabilities)
+        record = self.get(node_id)
+        if record is None:
+            raise ValkeyUnavailableError("state backend command failed")
+        return record
+
+    def renew(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        *,
+        capabilities: ComputeNodeCapabilities | None = None,
+    ) -> ComputeNodeRegistration | None:
+        self._validate_node(node_id)
+        self._validate_owner(control_credential_digest)
+        if capabilities is not None:
+            self._encode_capabilities(capabilities)
+        result = self._transition(
+            "renew", node_id, control_credential_digest, capabilities
+        )
+        return None if int(result[0]) == 0 else self.get(node_id)
+
+    def get(self, node_id: str) -> ComputeNodeRegistration | None:
+        self._validate_node(node_id)
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        lease_key, node_key, digest = self._keys(node_id)
+        seconds, micros = self._foundation.server_time()
+        score = self._foundation._call(self._foundation._client.zscore, lease_key, digest)
+        if score is None or float(score) <= seconds + micros / 1_000_000:
+            return None
+        raw = self._foundation._call(self._foundation._client.hgetall, node_key)
+        return self._decode(raw) if raw else None
+
+    def list(self) -> tuple[ComputeNodeRegistration, ...]:
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        seconds, micros = self._foundation.server_time()
+        lease_key = self._foundation.config.key("nodes:lease")
+        digests = self._foundation._call(
+            self._foundation._client.zrangebyscore,
+            lease_key,
+            seconds + micros / 1_000_000,
+            "+inf",
+            start=0,
+            num=self.config.max_compute_nodes,
+        )
+        records = []
+        for digest in digests:
+            digest_text = digest.decode() if isinstance(digest, bytes) else digest
+            raw = self._foundation._call(
+                self._foundation._client.hgetall,
+                self._foundation.config.key("node", digest_text),
+            )
+            if raw:
+                records.append(self._decode(raw))
+        return tuple(sorted(records, key=lambda record: record.node_id))
+
+    def expire(self) -> tuple[ComputeNodeRegistration, ...]:
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_write_compatible(manifest)
+        seconds, micros = self._foundation.server_time()
+        lease_key = self._foundation.config.key("nodes:lease")
+        due = self._foundation._call(
+            self._foundation._client.zrangebyscore,
+            lease_key,
+            "-inf",
+            seconds + micros / 1_000_000,
+            start=0,
+            num=self._REAP_BATCH,
+        )
+        records = []
+        for digest in due:
+            text = digest.decode() if isinstance(digest, bytes) else digest
+            raw = self._foundation._call(
+                self._foundation._client.hgetall,
+                self._foundation.config.key("node", text),
+            )
+            if raw:
+                records.append(self._decode(raw))
+        # The script re-checks server time and atomically removes only still-due entries.
+        self._transition("expire", "_", "0" * 64, None)
+        return tuple(records)
+
+    def unregister(self, node_id: str, control_credential_digest: str) -> bool:
+        self._validate_node(node_id)
+        self._validate_owner(control_credential_digest)
+        return int(
+            self._transition(
+                "unregister", node_id, control_credential_digest, None
+            )[0]
+        ) == 1

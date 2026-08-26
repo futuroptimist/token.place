@@ -501,6 +501,9 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
         b"control_credential_digest",
         b"registered_at_epoch",
         b"lease_expires_at_epoch",
+        b"scheduler_healthy",
+        b"scheduler_draining",
+        b"scheduler_claimed_work",
     }
     forbidden = (
         raw_credential.encode(),
@@ -521,6 +524,9 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
         assert persisted[b"supported_model_ids"] == b'["qwen3-8b-instruct"]'
         assert persisted[b"max_concurrency"] == b"2"
         assert persisted[b"maximum_total_context_tokens"] == b"8192"
+        assert persisted[b"scheduler_healthy"] == b"1"
+        assert persisted[b"scheduler_draining"] == b"0"
+        assert persisted[b"scheduler_claimed_work"] == b"0"
         assert all(
             marker not in value for marker in forbidden for value in persisted.values()
         )

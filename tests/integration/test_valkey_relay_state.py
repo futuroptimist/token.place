@@ -1,12 +1,14 @@
 import concurrent.futures
 import dataclasses
 import math
+import logging
 import shutil
 import socket
 import subprocess
 import time
 import uuid
 import hashlib
+import traceback
 from threading import Barrier
 
 import pytest
@@ -407,6 +409,126 @@ def test_reads_are_read_only_and_unknown_fields_survive_updates(valkey_server):
         store.close()
 
 
+def test_registration_namespace_isolation(valkey_server):
+    stores = [_registration_store(valkey_server, uuid.uuid4().hex) for _ in range(2)]
+    node_id = "shared-node"
+    owners = (_digest("owner-a"), _digest("owner-b"))
+    capabilities = (_capabilities(2), _capabilities(7))
+    try:
+        records = [
+            store.register(node_id, capability, owner)
+            for store, capability, owner in zip(stores, capabilities, owners)
+        ]
+        assert [store.get(node_id) for store in stores] == records
+        assert [store.list() for store in stores] == [(records[0],), (records[1],)]
+
+        renewed = stores[0].renew(node_id, owners[0], capabilities=_capabilities(3))
+        assert renewed is not None and renewed.capabilities.max_concurrency == 3
+        assert stores[1].get(node_id) == records[1]
+        assert stores[0].unregister(node_id, owners[0])
+        assert stores[0].get(node_id) is None
+        assert stores[1].get(node_id) == records[1]
+        assert stores[1].renew(node_id, owners[1]) is not None
+        assert stores[1].unregister(node_id, owners[1])
+        assert stores[0].list() == () and stores[1].list() == ()
+    finally:
+        for store in stores:
+            store._foundation._client.delete(*_registration_keys(store, node_id))
+            store.close()
+
+
+@pytest.mark.parametrize("operation", ["get", "list"])
+def test_reader_incompatible_registration_reads_stop_before_state_access(
+    valkey_server, operation
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    schema_key, lease_key, node_key = _registration_keys(store, "node-a")
+    incompatible = _manifest(reader_min=2, reader_max=2)
+    malformed_hash = {b"node_id": b"malformed-application-payload"}
+    malformed_member = b"malformed-index-member"
+    try:
+        store._foundation._client.hset(node_key, mapping=malformed_hash)
+        store._foundation._client.zadd(lease_key, {malformed_member: 123.0})
+        store._foundation._client.set(schema_key, incompatible.encode())
+        before = (
+            store._foundation._client.get(schema_key),
+            store._foundation._client.hgetall(node_key),
+            store._foundation._client.zrange(lease_key, 0, -1, withscores=True),
+        )
+        original_call = store._foundation._call
+        commands = []
+
+        def record_command(command, *args, **kwargs):
+            commands.append(command.__name__.lower())
+            return original_call(command, *args, **kwargs)
+
+        store._foundation._call = record_command
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ) as caught:
+            getattr(store, operation)("node-a") if operation == "get" else store.list()
+        assert str(caught.value) == "state schema incompatible"
+        assert not {"zscore", "zrangebyscore", "hmget", "evalsha"}.intersection(
+            commands
+        )
+        assert before == (
+            store._foundation._client.get(schema_key),
+            store._foundation._client.hgetall(node_key),
+            store._foundation._client.zrange(lease_key, 0, -1, withscores=True),
+        )
+    finally:
+        store._foundation._client.delete(schema_key, lease_key, node_key)
+        store.close()
+
+
+def test_registration_persistence_uses_only_approved_redacted_values(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node_id = "node-persistence"
+    raw_credential = "raw-control-credential-marker"
+    owner = _digest(raw_credential)
+    node_digest = store._node_digest(node_id)
+    schema_key, lease_key, node_key = _registration_keys(store, node_id)
+    expected_fields = {
+        b"node_id",
+        b"supported_model_ids",
+        b"active_context_tier",
+        b"maximum_total_context_tokens",
+        b"default_output_token_reservation",
+        b"maximum_output_tokens",
+        b"max_concurrency",
+        b"backend_class",
+        b"api_version",
+        b"control_credential_digest",
+        b"registered_at_epoch",
+        b"lease_expires_at_epoch",
+    }
+    forbidden = (
+        raw_credential.encode(),
+        b"application-payload-marker",
+        b"private-endpoint-marker",
+        schema_key.encode(),
+        lease_key.encode(),
+        node_key.encode(),
+    )
+    try:
+        store.register(node_id, _capabilities(), owner)
+        assert store._foundation._client.zrange(lease_key, 0, -1) == [
+            node_digest.encode()
+        ]
+        persisted = store._foundation._client.hgetall(node_key)
+        assert set(persisted) == expected_fields
+        assert persisted[b"control_credential_digest"] == owner.encode()
+        assert persisted[b"supported_model_ids"] == b'["qwen3-8b-instruct"]'
+        assert persisted[b"max_concurrency"] == b"2"
+        assert persisted[b"maximum_total_context_tokens"] == b"8192"
+        assert all(
+            marker not in value for marker in forbidden for value in persisted.values()
+        )
+    finally:
+        store._foundation._client.delete(schema_key, lease_key, node_key)
+        store.close()
+
+
 def test_list_tolerates_concurrent_unregister(valkey_server):
     namespace = uuid.uuid4().hex
     stores = [_registration_store(valkey_server, namespace) for _ in range(2)]
@@ -712,32 +834,59 @@ def test_expire_returns_the_records_removed_at_its_atomic_cutoff(valkey_server):
         store.close()
 
 
-def test_unregister_lost_reply_is_ambiguous_without_replay(valkey_server):
+def test_unregister_lost_reply_redaction_is_ambiguous_without_replay(
+    valkey_server, caplog
+):
     store = _registration_store(valkey_server, uuid.uuid4().hex)
-    owner = _digest("owner")
+    node_id = "node-identity-marker"
+    raw_credential = "raw-credential-marker"
+    owner = _digest(raw_credential)
+    raw_key = store._foundation.config.key("node", store._node_digest(node_id))
+    markers = (
+        "private-endpoint-marker",
+        "datastore-reply-marker",
+        raw_key,
+        node_id,
+        raw_credential,
+        owner,
+    )
     original_evalsha = store._foundation._client.evalsha
     dispatches = 0
     try:
-        store.register("node-a", _capabilities(), owner)
+        store.register(node_id, _capabilities(), owner)
 
         def lose_reply(*args):
             nonlocal dispatches
             dispatches += 1
             original_evalsha(*args)
-            raise redis.ConnectionError("lost reply from private endpoint")
+            raise redis.ConnectionError(" ".join(markers))
 
         store._foundation._client.evalsha = lose_reply
-        with pytest.raises(
-            ValkeyUnavailableError, match="^state backend unavailable$"
-        ) as caught:
-            store.unregister("node-a", owner)
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(
+                ValkeyUnavailableError, match="^state backend unavailable$"
+            ) as caught:
+                store.unregister(node_id, owner)
         assert dispatches == 1
         assert caught.value.__cause__ is None
+        rendered = "".join(
+            (
+                str(caught.value),
+                repr(caught.value),
+                "".join(traceback.format_exception(caught.value)),
+                caplog.text,
+                repr(store),
+                repr(store._foundation),
+                repr(store._foundation.config),
+                repr(store._foundation.config.direct),
+            )
+        )
+        assert all(marker not in rendered for marker in markers)
         store._foundation._client.evalsha = original_evalsha
-        assert store.get("node-a") is None
+        assert store.get(node_id) is None
     finally:
         store._foundation._client.evalsha = original_evalsha
-        store._foundation._client.delete(*_registration_keys(store, "node-a"))
+        store._foundation._client.delete(*_registration_keys(store, node_id))
         store.close()
 
 

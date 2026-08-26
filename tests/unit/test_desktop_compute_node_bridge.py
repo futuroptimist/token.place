@@ -211,6 +211,31 @@ def test_headless_cpu_admission_runtime_outcomes(
         "runtime_identity_validated")
 
 
+def test_headless_cpu_admission_temp_dir_avoids_ambient_temp_env(
+        monkeypatch, tmp_path, capsys):
+    """The installed package's sandboxed child process does not forward
+    TEMP/TMP/USERPROFILE, so tempfile.gettempdir() can resolve to an
+    unwritable location there even though every dev/portable context works.
+    The admission boundary must anchor its scratch directory next to the
+    already-validated, already-writable model path instead of relying on
+    ambient temp-dir resolution, and must tolerate a Windows cleanup race
+    if a still-running subprocess worker briefly holds a handle open."""
+    args = _configure_headless_runtime(monkeypatch, tmp_path)
+    captured = {}
+    real_temporary_directory = compute_node_bridge.tempfile.TemporaryDirectory
+
+    def recording_temporary_directory(*args_, **kwargs):
+        captured.update(kwargs)
+        return real_temporary_directory(*args_, **kwargs)
+
+    monkeypatch.setattr(compute_node_bridge.tempfile, "TemporaryDirectory",
+                        recording_temporary_directory)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 0
+    assert captured.get("dir") == os.path.dirname(os.path.abspath(args.model))
+    assert captured.get("ignore_cleanup_errors") is True
+
+
 def test_headless_cpu_admission_fail_closed_paths(monkeypatch, tmp_path, capsys):
     args = _configure_headless_runtime(monkeypatch, tmp_path)
     monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "wrong")

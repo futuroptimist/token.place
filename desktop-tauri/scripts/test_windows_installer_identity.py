@@ -1238,6 +1238,25 @@ def run_scenario(
                         raise InstallerIdentityError(f"operator smoke did not preserve seeded config field {key}")
             validate_installed_context_tiers(shortcut.target, env, artifact_dir, scenario.name)
             if tokenizer_boundary_model is not None:
+                # TEMPORARY bounded diagnostic for PR #1715 (warm_load_failed
+                # root cause investigation). Confirms whether the installed
+                # package's bundled compute_node_bridge.py actually contains
+                # the latest source (three independent code changes have all
+                # produced byte-identical failure signatures, which is
+                # consistent with the installed package running stale
+                # sources). Prints only booleans, never file contents.
+                # Remove once root cause is confirmed/fixed.
+                bridge_script = shortcut.target.parent / "resources" / "python" / "compute_node_bridge.py"
+                marker_present = (
+                    bridge_script.is_file()
+                    and "readiness_fixture" in bridge_script.read_text(encoding="utf-8", errors="ignore")
+                )
+                print(
+                    "installed_compute_node_bridge_diag "
+                    f"path_exists={bridge_script.is_file()} "
+                    f"latest_marker_present={marker_present}",
+                    flush=True,
+                )
                 run_headless_cpu_admission(
                     shortcut.target,
                     tokenizer_boundary_model,

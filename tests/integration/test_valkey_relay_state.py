@@ -16,9 +16,11 @@ import redis
 
 from relay_state_store import (
     ComputeNodeCapabilities,
+    EncryptedRequestEnvelope,
     RelayStateCapacityExceeded,
     RelayStateCredentialMismatch,
     RelayStateStoreConfig,
+    SchedulerNodeState,
 )
 
 from valkey_relay_state import (
@@ -275,6 +277,148 @@ def _wait_until(predicate, timeout=1.0):
     pytest.fail("bounded polling condition was not reached")
 
 
+def _scheduler_cleanup(store, identities=(), nodes=()):
+    cfg = store._foundation.config
+    keys = [
+        cfg.key("schema"),
+        cfg.key("nodes:lease"),
+        cfg.key("reservations:expiry"),
+        cfg.key("cursor"),
+        cfg.key_prefix + "request_count",
+        cfg.key_prefix + "queued_count",
+        cfg.key_prefix + "queue_sequence",
+        cfg.key_prefix + "registration_order",
+    ]
+    for node_id in nodes:
+        digest = store._node_digest(node_id)
+        keys.extend((cfg.key("node", digest), cfg.key("queue", digest)))
+    for client_key, request_id in identities:
+        client, request = store._identity(client_key, request_id)
+        keys.extend(
+            (
+                store._request_key(client, request),
+                cfg.key_prefix + "client_count:" + client,
+                cfg.key_prefix + "queued_client:" + client,
+            )
+        )
+    store._foundation._client.delete(*keys)
+
+
+def test_scheduler_reservation_and_enqueue_contract_on_real_valkey(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    owner = _digest("scheduler-owner")
+    deadline = time.time() + 60
+    identity = ("client-key-marker", "request-id-marker")
+    try:
+        store.register("node-a", _capabilities(concurrency=1), owner)
+        assert store.set_scheduler_state(
+            "node-a", owner, SchedulerNodeState(healthy=True, claimed_work=0)
+        )
+        with pytest.raises(RelayStateCredentialMismatch):
+            store.set_scheduler_state("node-a", _digest("wrong"), SchedulerNodeState())
+        assert not store.set_scheduler_state("missing", owner, SchedulerNodeState())
+
+        selected = store.select_and_reserve(
+            *identity,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            "raw-cancel-proof-marker",
+        )
+        assert selected.created and selected.reservation_token
+        retry = store.select_and_reserve(
+            *identity,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            "raw-cancel-proof-marker",
+        )
+        assert not retry.created and retry.reservation_token is None
+        assert len(store.list_reservations()) == 1
+        envelope = EncryptedRequestEnvelope(
+            "tokenplace_api_v1_relay_e2ee",
+            1,
+            "ciphertext-marker",
+            "cipherkey-marker",
+            "iv-marker",
+        )
+        queued = store.enqueue_encrypted_request(
+            *identity,
+            selected.reservation_token,
+            "node-a",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "raw-cancel-proof-marker",
+        )
+        assert queued.created and queued.sequence == 1
+        again = store.enqueue_encrypted_request(
+            *identity,
+            selected.reservation_token,
+            "node-a",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "raw-cancel-proof-marker",
+        )
+        assert not again.created and again.sequence == queued.sequence
+        assert store.list_reservations() == ()
+        assert [item.envelope for item in store.queued_requests("node-a")] == [envelope]
+        client_digest, request_digest = store._identity(*identity)
+        inspected_keys = (
+            store._request_key(client_digest, request_digest),
+            store._foundation.config.key("node", store._node_digest("node-a")),
+            store._foundation.config.key("queue", store._node_digest("node-a")),
+        )
+        persisted = b" ".join(
+            value
+            for key in inspected_keys
+            if (value := store._foundation._client.dump(key)) is not None
+        )
+        assert selected.reservation_token.encode() not in persisted
+        assert b"raw-cancel-proof-marker" not in persisted
+    finally:
+        _scheduler_cleanup(store, [identity], ["node-a"])
+        store.close()
+
+
+def test_atomic_final_scheduler_slot_across_independent_clients(valkey_server):
+    namespace = uuid.uuid4().hex
+    stores = [_registration_store(valkey_server, namespace) for _ in range(2)]
+    owner = _digest("shared-owner")
+    identities = [("client-a", "request-a"), ("client-b", "request-b")]
+    try:
+        stores[0].register("only-node", _capabilities(concurrency=1), owner)
+        barrier = Barrier(2)
+
+        def reserve(index):
+            barrier.wait()
+            try:
+                return stores[index].select_and_reserve(
+                    *identities[index], "qwen3-8b-instruct", "8k-fast", time.time() + 60
+                )
+            except Exception as error:
+                return error
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(reserve, range(2)))
+        assert sum(not isinstance(result, Exception) for result in results) == 1
+        assert (
+            sum(
+                result.__class__.__name__ == "RelayStateNoCapacity"
+                for result in results
+            )
+            == 1
+        )
+        assert len(stores[0].list_reservations()) == 1
+    finally:
+        _scheduler_cleanup(stores[0], identities, ["only-node"])
+        for store in stores:
+            store.close()
+
+
 def _registration_keys(store, *node_ids):
     return [
         store._foundation.config.key("schema"),
@@ -501,6 +645,12 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
         b"control_credential_digest",
         b"registered_at_epoch",
         b"lease_expires_at_epoch",
+        b"healthy",
+        b"draining",
+        b"claimed_work",
+        b"reservation_count",
+        b"queue_count",
+        b"registration_order",
     }
     forbidden = (
         raw_credential.encode(),

@@ -19,6 +19,7 @@ from relay_state_store import (
     EncryptedRequestEnvelope,
     RelayStateCapacityExceeded,
     RelayStateCredentialMismatch,
+    RelayStateNoCapacity,
     RelayStateStoreConfig,
     SchedulerNodeState,
 )
@@ -345,6 +346,11 @@ def test_scheduler_reservation_and_enqueue_are_shared_and_idempotent(valkey_serv
             "cancel",
         )
         assert not repeated.created and repeated.sequence == queued.sequence
+        selection_after_enqueue = second.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        assert not selection_after_enqueue.created
+        assert selection_after_enqueue.state == "queued"
         assert first.list_reservations() == ()
         assert first.queued_requests("node")[0].envelope == envelope
     finally:
@@ -370,6 +376,75 @@ def test_scheduler_reservation_and_enqueue_are_shared_and_idempotent(valkey_serv
         first._foundation._client.delete(*keys)
         first.close()
         second.close()
+
+
+def test_registration_renew_backfills_additive_scheduler_fields(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    owner = _digest("owner")
+    node_key = store._foundation.config.key("node", store._node_digest("node"))
+    try:
+        store.register("node", _capabilities(), owner)
+        store._foundation._client.hdel(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        )
+
+        store.renew("node", owner)
+
+        assert store._foundation._client.hmget(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        ) == [b"1", b"0", b"0"]
+        assert store.set_scheduler_state(
+            "node", owner, SchedulerNodeState(healthy=True, claimed_work=0)
+        )
+    finally:
+        keys = list(store._foundation._client.scan_iter(store._foundation.config.key_prefix + "*"))
+        if keys:
+            store._foundation._client.delete(*keys)
+        store.close()
+
+
+def test_enqueue_counts_queued_requests_hidden_by_earlier_reservations(valkey_server):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        max_queued_requests=1,
+        max_queued_requests_per_client=2,
+    )
+    owner = _digest("owner")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    try:
+        store.register("node", _capabilities(concurrency=3), owner)
+        late_deadline = time.time() + 60
+        queued = store.select_and_reserve(
+            "client-a", "queued", "qwen3-8b-instruct", "8k-fast", late_deadline
+        )
+        store.enqueue_encrypted_request(
+            "client-a", "queued", queued.reservation_token, "node",
+            "qwen3-8b-instruct", "8k-fast", late_deadline, envelope, "cancel-a"
+        )
+        early_deadline = time.time() + 30
+        reserved = store.select_and_reserve(
+            "client-b", "reserved", "qwen3-8b-instruct", "8k-fast", early_deadline
+        )
+
+        with pytest.raises(RelayStateNoCapacity, match="^no scheduler capacity$"):
+            store.enqueue_encrypted_request(
+                "client-b", "reserved", reserved.reservation_token, "node",
+                "qwen3-8b-instruct", "8k-fast", early_deadline, envelope, "cancel-b"
+            )
+    finally:
+        keys = list(store._foundation._client.scan_iter(store._foundation.config.key_prefix + "*"))
+        if keys:
+            store._foundation._client.delete(*keys)
+        store.close()
 
 
 def _mark_registrations_due(store, node_ids):

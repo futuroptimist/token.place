@@ -538,6 +538,11 @@ if operation == 'register' or operation == 'renew' then
       'maximum_output_tokens', ARGV[13], 'max_concurrency', ARGV[14],
       'backend_class', ARGV[15], 'api_version', ARGV[16])
   end
+  -- Backfill additive scheduler fields on every registration transition so
+  -- records written by the preceding schema remain usable during rollout.
+  redis.call('HSETNX', node, 'scheduler_healthy', '1')
+  redis.call('HSETNX', node, 'scheduler_draining', '0')
+  redis.call('HSETNX', node, 'scheduler_claimed_work', '0')
   redis.call('HSET', node, 'lease_expires_at_epoch', deadline)
   redis.call('ZADD', leases, deadline, digest)
   local record = fixed_record(node)
@@ -559,7 +564,7 @@ return {'invalid'}
 REGISTRATION_TRANSITION_SCRIPT = ReviewedScript(
     "registration_transition_v1",
     REGISTRATION_TRANSITION_SOURCE,
-    "0a44d6e30ebae2093f3d7035f61a0c72c6bf606aed02d6405a1d9248b74161a0",  # pragma: allowlist secret
+    "2a4e0fd177d7c247ed71d8d11dc564d67c213c3c03ff156100b4304d8551110f",  # pragma: allowlist secret
     True,
 )
 
@@ -635,10 +640,19 @@ local state = redis.call('HGET', request_key, 'state')
 if state then
   local values = redis.call('HMGET', request_key, 'model', 'tier', 'deadline',
     'cancellation_digest', 'node_id', 'reservation_expires')
-  if values[1] ~= model or values[2] ~= tier or tonumber(values[3]) ~= deadline or
-     (values[4] and values[4] ~= '' and values[4] ~= cancel) then return {'conflict'} end
-  if state == 'reserved' then return {'existing', values[5], values[6], 'reserved'} end
-  if state == 'queued' or state == 'claimed' then return {'existing', values[5], '', state} end
+  if values[1] ~= model or values[2] ~= tier or tonumber(values[3]) ~= deadline then
+    return {'conflict'}
+  end
+  if state == 'reserved' then
+    if values[4] and values[4] ~= '' and values[4] ~= cancel then return {'conflict'} end
+    return {'existing', values[5], values[6], 'reserved'}
+  end
+  if state == 'queued' or state == 'claimed' then
+    if cancel ~= '' and values[4] and values[4] ~= '' and values[4] ~= cancel then
+      return {'conflict'}
+    end
+    return {'existing', values[5], '', state}
+  end
   return {'conflict'}
 end
 if redis.call('ZCARD', expiries) >= max_res then return {'capacity'} end
@@ -750,7 +764,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "cee665e011abbbe3c0411e008ddd89cf7791dc3788f25ec23512e34f0af30592",  # pragma: allowlist secret
+    "eb9a5fec3e6f2b97455172956c7c6afdb1a1160efaf58ff141ff9c448d100265",  # pragma: allowlist secret
     True,
 )
 
@@ -760,6 +774,7 @@ local node_digest, client, request, model, tier, deadline, token_digest,
   cancel_digest, envelope_json = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5],
   tonumber(ARGV[6]), ARGV[7], ARGV[8], ARGV[9]
 local max_depth, max_queued, max_client = tonumber(ARGV[10]), tonumber(ARGV[11]), tonumber(ARGV[12])
+local prefix, max_lifecycles = ARGV[13], tonumber(ARGV[14])
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 local state = redis.call('HGET', request_key, 'state')
@@ -784,14 +799,15 @@ if tonumber(values[8]) <= now or redis.call('ZSCORE', expiries, token_digest) ==
   return {'invalid'}
 end
 if redis.call('XLEN', queue) >= max_depth then return {'capacity'} end
-local members = redis.call('ZRANGE', deadlines, 0, max_queued)
+-- The shared deadline index contains reservations as well as queued requests.
+-- Scan its configured lifecycle bound so reservations cannot hide queued work.
+local members = redis.call('ZRANGE', deadlines, 0, max_lifecycles)
 local queued, client_queued = 0, 0
 for _, member in ipairs(members) do
   local colon = string.find(member, ':', 1, true)
   if not colon then return {'schema'} end
   local c, q = string.sub(member, 1, colon - 1), string.sub(member, colon + 1)
-  local s = redis.call('HGET', string.sub(request_key, 1,
-    string.len(request_key) - 129) .. c .. ':' .. q, 'state')
+  local s = redis.call('HGET', prefix .. 'request:' .. c .. ':' .. q, 'state')
   if s == 'queued' then queued = queued + 1; if c == client then client_queued = client_queued + 1 end end
 end
 if queued >= max_queued or client_queued >= max_client then return {'capacity'} end
@@ -807,7 +823,7 @@ return {'created', 'queued', values[7], tostring(sequence)}
 ENQUEUE_SCRIPT = ReviewedScript(
     "enqueue_encrypted_request_v1",
     ENQUEUE_SOURCE,
-    "4d46bca7cd35dca60cc56182bbd99016e332cc30a104cbf574f751c48281e937",  # pragma: allowlist secret
+    "685ad30988bf2dc0622c30b31425b24d0fe8a9bbf23cae329cc1a43b06305103",  # pragma: allowlist secret
     True,
 )
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
@@ -1613,6 +1629,8 @@ class ValkeyRegistrationStore:
             str(self.config.max_queue_depth_per_node).encode(),
             str(self.config.max_queued_requests).encode(),
             str(self.config.max_queued_requests_per_client).encode(),
+            cfg.key_prefix.encode(),
+            str(self.config.max_request_lifecycles).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(ENQUEUE_SCRIPT.name, keys, args)

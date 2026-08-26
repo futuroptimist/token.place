@@ -418,6 +418,35 @@ def test_mutating_script_transport_failure_is_not_retried():
     assert caught.value.__cause__ is None
 
 
+@pytest.mark.parametrize(
+    ("backend_error", "expected_error", "message"),
+    [
+        (
+            redis.ResponseError("READONLY private primary"),
+            ValkeyReadOnlyError,
+            "state backend is not writable",
+        ),
+        (
+            redis.ResponseError("private command failure"),
+            ValkeyUnavailableError,
+            "state backend command failed",
+        ),
+    ],
+)
+def test_mutating_script_response_failures_are_typed_redacted_and_not_retried(
+    backend_error, expected_error, message
+):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5)
+    operation = Mock(side_effect=backend_error)
+
+    with pytest.raises(expected_error, match=f"^{message}$") as caught:
+        foundation._call_mutating_script(operation)
+
+    operation.assert_called_once()
+    assert "private" not in str(caught.value)
+
+
 def test_read_only_script_transport_failure_retains_bounded_retry():
     foundation = ValkeyFoundation.__new__(ValkeyFoundation)
     foundation.config = config(retry_attempts=2)

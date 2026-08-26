@@ -4,6 +4,7 @@ import socket
 import subprocess
 import time
 import uuid
+import hashlib
 
 import pytest
 import redis
@@ -18,6 +19,13 @@ from valkey_relay_state import (
     ValkeyReadOnlyError,
     ValkeySchemaIncompatibleError,
     ValkeyUnavailableError,
+    ValkeyRegistrationStore,
+)
+from relay_state_store import (
+    ComputeNodeCapabilities,
+    RelayStateCapacityExceeded,
+    RelayStateCredentialMismatch,
+    RelayStateStoreConfig,
 )
 
 
@@ -84,7 +92,7 @@ def _manifest(**changes):
         reader_max=1,
         writer_min=1,
         writer_max=1,
-        script_digests={SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT.sha256},
+        script_digests=SCRIPT_DIGESTS,
         migration_epoch=0,
     )
     values.update(changes)
@@ -224,3 +232,119 @@ def test_read_only_role_is_classified_without_details(valkey_server):
     finally:
         foundation._client.role = original
         foundation.close()
+
+
+def _registration_store(port, namespace, **changes):
+    foundation = _foundation(port, namespace)
+    foundation.initialize_manifest()
+    return ValkeyRegistrationStore(
+        foundation,
+        RelayStateStoreConfig(namespace="testing.cluster-a", **changes),
+    )
+
+
+def _capabilities(max_concurrency=2):
+    return ComputeNodeCapabilities(
+        supported_model_ids=("qwen3-8b-instruct",),
+        active_context_tier="8k-fast",
+        maximum_total_context_tokens=8192,
+        default_output_token_reservation=1024,
+        maximum_output_tokens=2048,
+        max_concurrency=max_concurrency,
+        backend_class="cuda",
+    )
+
+
+def _digest(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _cleanup_registration(store, node_ids):
+    client = store._foundation._client
+    keys = [store._foundation.config.key("schema"), store._lease_key()]
+    keys.extend(store._node_key(node_id) for node_id in node_ids)
+    client.delete(*keys)
+    store.close()
+
+
+def test_registration_contract_shared_instances_and_capability_replacement(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    nodes = ["node-a"]
+    try:
+        registered = first.register("node-a", _capabilities(), _digest("owner"))
+        assert second.get("node-a") == registered
+        changed = _capabilities(max_concurrency=4)
+        renewed = second.renew("node-a", _digest("owner"), capabilities=changed)
+        assert renewed.capabilities == changed
+        assert first.list() == (renewed,)
+        with pytest.raises(RelayStateCredentialMismatch):
+            first.register("node-a", changed, _digest("attacker"))
+        with pytest.raises(RelayStateCredentialMismatch):
+            second.unregister("node-a", _digest("attacker"))
+        assert first.renew("missing", _digest("owner")) is None
+        assert second.unregister("node-a", _digest("owner"))
+        assert not first.unregister("node-a", _digest("owner"))
+    finally:
+        _cleanup_registration(first, nodes)
+        second.close()
+
+
+def test_registration_capacity_is_atomic_and_recovers_after_inclusive_expiry(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    stores = [
+        _registration_store(
+            valkey_server, namespace, max_compute_nodes=1, lease_ttl_seconds=0.05
+        )
+        for _ in range(2)
+    ]
+    nodes = ["node-a", "node-b"]
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(store.register, node, _capabilities(), _digest(node))
+                for store, node in zip(stores, nodes)
+            ]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result().node_id)
+            except RelayStateCapacityExceeded:
+                outcomes.append("capacity")
+        assert outcomes.count("capacity") == 1
+        time.sleep(0.06)
+        loser = next(node for node in nodes if node not in outcomes)
+        assert (
+            stores[0].register(loser, _capabilities(), _digest(loser)).node_id == loser
+        )
+    finally:
+        _cleanup_registration(stores[0], nodes)
+        stores[1].close()
+
+
+def test_concurrent_different_owner_registration_has_one_winner(valkey_server):
+    namespace = uuid.uuid4().hex
+    stores = [_registration_store(valkey_server, namespace) for _ in range(2)]
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(store.register, "node-a", _capabilities(), _digest(owner))
+                for store, owner in zip(stores, ("owner-a", "owner-b"))
+            ]
+        winners = 0
+        for future in futures:
+            try:
+                future.result()
+                winners += 1
+            except RelayStateCredentialMismatch:
+                pass
+        assert winners == 1
+        assert stores[0].get("node-a") == stores[1].get("node-a")
+    finally:
+        _cleanup_registration(stores[0], ["node-a"])
+        stores[1].close()

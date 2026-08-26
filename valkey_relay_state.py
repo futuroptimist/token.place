@@ -19,6 +19,15 @@ import redis
 from redis.exceptions import NoScriptError, RedisError, ResponseError
 from redis.sentinel import Sentinel
 
+from relay_state_store import (
+    ComputeNodeCapabilities,
+    ComputeNodeRegistration,
+    RelayStateCapacityExceeded,
+    RelayStateCredentialMismatch,
+    RelayStateStoreConfig,
+    RelayStateStoreError,
+)
+
 _NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_TIMEOUT_SECONDS = 30.0
@@ -222,9 +231,7 @@ class ValkeyConfig:
             raise ValkeyConfigurationError("invalid revision range")
         if self.direct is not None and not isinstance(self.direct, DirectPrimary):
             raise ValkeyConfigurationError("invalid discovery configuration")
-        if self.sentinel is not None and not isinstance(
-            self.sentinel, SentinelPrimary
-        ):
+        if self.sentinel is not None and not isinstance(self.sentinel, SentinelPrimary):
             raise ValkeyConfigurationError("invalid discovery configuration")
         if (self.direct is None) == (self.sentinel is None):
             raise ValkeyConfigurationError("exactly one discovery mode is required")
@@ -425,8 +432,64 @@ SERVER_TIME_SCRIPT = ReviewedScript(
     "b60030a7ea7b76a01601d26aba460e94c4fa0d52fa472333c111f18c6701bd94",  # pragma: allowlist secret
     False,
 )
+
+REGISTRATION_MUTATE_SOURCE = """local lease_key = KEYS[1]
+local node_key = KEYS[2]
+local node_prefix = ARGV[1]
+local action = ARGV[2]
+local digest = ARGV[3]
+local node_id = ARGV[4]
+local owner = ARGV[5]
+local capabilities = ARGV[6]
+local ttl = tonumber(ARGV[7])
+local capacity = tonumber(ARGV[8])
+local batch = tonumber(ARGV[9])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local expired = redis.call('ZRANGEBYSCORE', lease_key, '-inf', now, 'LIMIT', 0, batch)
+for _, member in ipairs(expired) do
+  redis.call('ZREM', lease_key, member)
+  redis.call('DEL', node_prefix .. member)
+end
+local current_owner = redis.call('HGET', node_key, 'owner_digest')
+if action == 'unregister' then
+  if not current_owner then return {'absent'} end
+  if current_owner ~= owner then return {'credential'} end
+  redis.call('DEL', node_key)
+  redis.call('ZREM', lease_key, digest)
+  return {'removed'}
+end
+if action == 'renew' and not current_owner then return {'absent'} end
+if current_owner and current_owner ~= owner then return {'credential'} end
+if not current_owner and redis.call('ZCARD', lease_key) >= capacity then
+  return {'capacity'}
+end
+local expires = now + ttl
+if expires == math.huge then return {'deadline'} end
+local registered = redis.call('HGET', node_key, 'registered_at') or tostring(now)
+if action == 'renew' and capabilities == '' then
+  capabilities = redis.call('HGET', node_key, 'capabilities')
+end
+redis.call('HSET', node_key,
+  'node_id', node_id,
+  'owner_digest', current_owner or owner,
+  'capabilities', capabilities,
+  'registered_at', registered,
+  'lease_expires_at', tostring(expires))
+redis.call('ZADD', lease_key, expires, digest)
+return {'record', registered, tostring(expires), current_owner or owner, capabilities}
+"""
+REGISTRATION_MUTATE_SCRIPT = ReviewedScript(
+    "registration_mutate_v1",
+    REGISTRATION_MUTATE_SOURCE,
+    hashlib.sha256(REGISTRATION_MUTATE_SOURCE.encode()).hexdigest(),
+    True,
+)
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
-    {SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT}
+    {
+        SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT,
+        REGISTRATION_MUTATE_SCRIPT.name: REGISTRATION_MUTATE_SCRIPT,
+    }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
     {name: script.sha256 for name, script in SCRIPT_REGISTRY.items()}
@@ -654,3 +717,253 @@ class ValkeyFoundation:
         manifest = self.read_manifest()
         self.check_read_compatible(manifest)
         self.check_write_compatible(manifest)
+
+
+class ValkeyRegistrationStore:
+    """Internal Valkey implementation of only the registration/lease slice.
+
+    This deliberately does not implement :class:`RelayStateStore` and is not a
+    runtime-selectable backend.
+    """
+
+    def __init__(self, foundation: ValkeyFoundation, config: RelayStateStoreConfig):
+        if not isinstance(foundation, ValkeyFoundation) or not isinstance(
+            config, RelayStateStoreConfig
+        ):
+            raise RelayStateStoreError("invalid registration store configuration")
+        self._foundation = foundation
+        self._config = config
+
+    @property
+    def config(self) -> RelayStateStoreConfig:
+        return self._config
+
+    def __repr__(self) -> str:
+        return "ValkeyRegistrationStore(<redacted>)"
+
+    def close(self) -> None:
+        self._foundation.close()
+
+    def register(
+        self,
+        node_id: str,
+        capabilities: ComputeNodeCapabilities,
+        control_credential_digest: str,
+    ) -> ComputeNodeRegistration:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        if not isinstance(capabilities, ComputeNodeCapabilities):
+            raise RelayStateStoreError("capabilities must be ComputeNodeCapabilities")
+        return self._mutate(
+            "register", node_id, control_credential_digest, capabilities
+        )  # type: ignore[return-value]
+
+    def renew(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        *,
+        capabilities: ComputeNodeCapabilities | None = None,
+    ) -> ComputeNodeRegistration | None:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        if capabilities is not None and not isinstance(
+            capabilities, ComputeNodeCapabilities
+        ):
+            raise RelayStateStoreError("capabilities must be ComputeNodeCapabilities")
+        return self._mutate("renew", node_id, control_credential_digest, capabilities)
+
+    def unregister(self, node_id: str, control_credential_digest: str) -> bool:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        result = self._mutate("unregister", node_id, control_credential_digest, None)
+        return result is True
+
+    def get(self, node_id: str) -> ComputeNodeRegistration | None:
+        self._validate_node_id(node_id)
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        now = self._server_epoch()
+        raw = self._foundation._call(
+            self._foundation._client.hgetall, self._node_key(node_id)
+        )
+        record = self._decode_record(raw)
+        if record is None or record.lease_expires_at_epoch <= now:
+            return None
+        return record
+
+    def list(self) -> tuple[ComputeNodeRegistration, ...]:
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        now = self._server_epoch()
+        digests = self._foundation._call(
+            self._foundation._client.zrangebyscore,
+            self._lease_key(),
+            f"({now}",
+            "+inf",
+            start=0,
+            num=self.config.max_compute_nodes,
+        )
+        records = []
+        for digest in digests:
+            digest_text = (
+                digest.decode("ascii") if isinstance(digest, bytes) else digest
+            )
+            raw = self._foundation._call(
+                self._foundation._client.hgetall,
+                self._foundation.config.key("node", digest_text),
+            )
+            record = self._decode_record(raw)
+            if record is not None and record.lease_expires_at_epoch > now:
+                records.append(record)
+        return tuple(sorted(records, key=lambda record: record.node_id))
+
+    def expire(self) -> tuple[ComputeNodeRegistration, ...]:
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        now = self._server_epoch()
+        digests = self._foundation._call(
+            self._foundation._client.zrangebyscore,
+            self._lease_key(),
+            "-inf",
+            now,
+            start=0,
+            num=self.config.node_transition_batch_size,
+        )
+        records = []
+        for digest in digests:
+            digest_text = (
+                digest.decode("ascii") if isinstance(digest, bytes) else digest
+            )
+            record = self._decode_record(
+                self._foundation._call(
+                    self._foundation._client.hgetall,
+                    self._foundation.config.key("node", digest_text),
+                )
+            )
+            if record is not None:
+                records.append(record)
+        self._mutate("renew", "__expiry_sweep__", "0" * 64, None)
+        return tuple(sorted(records, key=lambda record: record.node_id))
+
+    def _mutate(self, action, node_id, owner, capabilities):
+        digest = self._node_digest(node_id)
+        encoded = (
+            b"" if capabilities is None else self._encode_capabilities(capabilities)
+        )
+        result = self._foundation.execute(
+            REGISTRATION_MUTATE_SCRIPT.name,
+            (self._lease_key(), self._foundation.config.key("node", digest)),
+            (
+                (self._foundation.config.key_prefix + "node:").encode(),
+                action.encode(),
+                digest.encode(),
+                node_id.encode(),
+                owner.encode(),
+                encoded,
+                repr(float(self.config.lease_ttl_seconds)).encode(),
+                str(self.config.max_compute_nodes).encode(),
+                str(self.config.node_transition_batch_size).encode(),
+            ),
+        )
+        code = result[0].decode() if isinstance(result[0], bytes) else result[0]
+        if code == "absent":
+            return None if action == "renew" else False
+        if code == "removed":
+            return True
+        if code == "credential":
+            raise RelayStateCredentialMismatch(
+                "control credential digest does not own this registration"
+            )
+        if code == "capacity":
+            raise RelayStateCapacityExceeded(
+                "compute-node registration capacity reached"
+            )
+        if code == "deadline":
+            raise RelayStateStoreError("lease deadline must be finite")
+        if code != "record" or len(result) != 5:
+            raise ValkeyScriptError("invalid reviewed script result")
+        raw = {
+            b"node_id": node_id.encode(),
+            b"registered_at": result[1],
+            b"lease_expires_at": result[2],
+            b"owner_digest": result[3],
+            b"capabilities": result[4],
+        }
+        record = self._decode_record(raw)
+        if record is None:
+            raise ValkeyScriptError("invalid reviewed script result")
+        return record
+
+    def _server_epoch(self) -> float:
+        seconds, micros = self._foundation.server_time()
+        return seconds + micros / 1_000_000
+
+    def _lease_key(self) -> str:
+        return self._foundation.config.key("nodes:lease")
+
+    def _node_key(self, node_id: str) -> str:
+        return self._foundation.config.key("node", self._node_digest(node_id))
+
+    @staticmethod
+    def _node_digest(node_id: str) -> str:
+        return hashlib.sha256(b"node\0" + node_id.encode()).hexdigest()
+
+    def _validate_node_id(self, node_id: str) -> None:
+        if (
+            not isinstance(node_id, str)
+            or not node_id
+            or len(node_id.encode("utf-8")) > self.config.max_node_id_bytes
+        ):
+            raise RelayStateStoreError(
+                "node ID is empty or exceeds its configured byte bound"
+            )
+
+    @staticmethod
+    def _validate_digest(value: str) -> None:
+        if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+            raise RelayStateStoreError(
+                "control credential digest must be lowercase SHA-256 hex"
+            )
+
+    @staticmethod
+    def _encode_capabilities(capabilities: ComputeNodeCapabilities) -> bytes:
+        return json.dumps(
+            {
+                "active_context_tier": capabilities.active_context_tier,
+                "api_version": capabilities.api_version,
+                "backend_class": capabilities.backend_class,
+                "default_output_token_reservation": capabilities.default_output_token_reservation,
+                "max_concurrency": capabilities.max_concurrency,
+                "maximum_output_tokens": capabilities.maximum_output_tokens,
+                "maximum_total_context_tokens": capabilities.maximum_total_context_tokens,
+                "supported_model_ids": capabilities.supported_model_ids,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+
+    @staticmethod
+    def _decode_record(raw: Mapping[bytes, bytes]) -> ComputeNodeRegistration | None:
+        if not raw:
+            return None
+        try:
+            fields = {
+                (key.decode() if isinstance(key, bytes) else key): (
+                    value.decode() if isinstance(value, bytes) else value
+                )
+                for key, value in raw.items()
+            }
+            capabilities_value = json.loads(fields["capabilities"])
+            capabilities_value["supported_model_ids"] = tuple(
+                capabilities_value["supported_model_ids"]
+            )
+            return ComputeNodeRegistration(
+                node_id=fields["node_id"],
+                capabilities=ComputeNodeCapabilities(**capabilities_value),
+                control_credential_digest=fields["owner_digest"],
+                registered_at_epoch=float(fields["registered_at"]),
+                lease_expires_at_epoch=float(fields["lease_expires_at"]),
+            )
+        except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            raise ValkeyScriptError("invalid registration state") from None

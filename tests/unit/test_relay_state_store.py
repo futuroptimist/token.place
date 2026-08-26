@@ -32,6 +32,7 @@ from relay_state_store import RelayStateStoreError
 from relay_state_store import ResponseAcceptanceResult
 from relay_state_store import ResponseRetrievalResult
 from relay_state_store import SchedulerNodeState
+from tests.registration_store_contract import assert_registration_contract
 
 # isort: on
 
@@ -88,6 +89,15 @@ def digest(value: str) -> str:
 
 def digest_with_domain(value: str, domain: bytes) -> str:
     return hashlib.sha256(domain + value.encode()).hexdigest()
+
+
+def test_registration_only_shared_backend_contract(capabilities):
+    store = InMemoryRelayStateStore(
+        RelayStateStoreConfig(namespace="testing.shared", max_compute_nodes=1),
+        acknowledgement_key=b"a" * 32,
+        epoch_time=EpochClock(),
+    )
+    assert_registration_contract(store, capabilities, digest)
 
 
 def envelope(ciphertext="ciphertext"):

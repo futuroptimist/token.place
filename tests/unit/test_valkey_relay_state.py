@@ -17,13 +17,16 @@ from valkey_relay_state import (
     ValkeyConfig,
     ValkeyConfigurationError,
     ValkeyFoundation,
+    ValkeyRegistrationStore,
     ValkeyReadOnlyError,
     ValkeySchemaIncompatibleError,
     ValkeyScriptError,
     ValkeyUnavailableError,
+    REGISTRATION_TRANSITION_SCRIPT,
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
 )
+from relay_state_store import RelayStateStoreConfig, RelayStateStoreError
 
 
 def config(**changes):
@@ -52,11 +55,142 @@ def manifest(**changes):
         reader_max=3,
         writer_min=1,
         writer_max=3,
-        script_digests={SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT.sha256},
+        script_digests=SCRIPT_DIGESTS,
         migration_epoch=0,
     )
     values.update(changes)
     return SchemaManifest(**values)
+
+
+def registration_store_with_foundation(foundation):
+    store = object.__new__(ValkeyRegistrationStore)
+    store._foundation = foundation
+    store._config = RelayStateStoreConfig(namespace="testing.unit")
+    return store
+
+
+@pytest.mark.parametrize(
+    "result",
+    [None, [], [1], [b"unknown"], [b"ok", b"extra"], [b"not_found", b"extra"]],
+)
+def test_registration_transition_rejects_every_malformed_result(result):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store._transition("unregister", "node-a", "a" * 64, ())
+
+
+def test_registration_reads_use_server_time_and_never_mutating_transition():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    foundation._client = Mock()
+    foundation._client.zscore = Mock()
+    foundation._client.zrangebyscore = Mock()
+    foundation._client.hmget = Mock()
+    foundation._call.side_effect = [99, []]
+    store = registration_store_with_foundation(foundation)
+
+    assert store.get("node-a") is None
+    assert store.list() == ()
+    foundation.execute.assert_not_called()
+    foundation.check_write_compatible.assert_not_called()
+
+
+def _registration_values():
+    return (
+        b"node-a",
+        b"a" * 64,
+        b"100",
+        b'["model-a"]',
+        b"8k-fast",
+        b"8192",
+        b"1024",
+        b"2048",
+        b"1",
+        b"cpu",
+        b"v1",
+        b"200",
+    )
+
+
+def test_registration_read_uses_exact_bounded_fields():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.side_effect = [200.0, list(_registration_values())]
+    store = registration_store_with_foundation(foundation)
+
+    assert store._read("node-a", 100).node_id == "node-a"
+    hmget_call = foundation._call.call_args_list[1]
+    assert hmget_call.args[0] is foundation._client.hmget
+    assert hmget_call.args[2] == valkey_relay_state._REGISTRATION_FIELDS
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [([None] * 12, None), ([None, *(_registration_values()[1:])], "error")],
+)
+def test_registration_read_distinguishes_absent_and_partial_records(reply, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.side_effect = [200.0, reply]
+    store = registration_store_with_foundation(foundation)
+
+    if expected is None:
+        assert store._read("node-a", 100) is None
+    else:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store._read("node-a", 100)
+
+
+def test_registration_read_rejects_over_byte_budget_without_value_leakage():
+    marker = b"private-marker"
+    reply = list(_registration_values())
+    reply[3] = marker + b"x" * valkey_relay_state._MAX_RESULT_BYTES
+    with pytest.raises(ValkeySchemaIncompatibleError) as caught:
+        ValkeyRegistrationStore._fixed_record(reply)
+    assert str(caught.value) == "state schema incompatible"
+    assert marker.decode() not in repr(caught.value)
+
+
+@pytest.mark.parametrize("member", [b"A" * 64, b"g" * 64, b"a" * 63, "a" * 64])
+def test_registration_list_translates_malformed_index_members(member):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    foundation._client = Mock()
+    foundation._call.return_value = [member]
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+    ) as caught:
+        store.list()
+    assert str(member) not in repr(caught.value)
+
+
+def test_registration_list_tolerates_concurrent_disappearance():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    foundation._client = Mock()
+    foundation._call.side_effect = [[b"a" * 64], [None] * 12]
+    store = registration_store_with_foundation(foundation)
+
+    assert store.list() == ()
+    assert foundation._call.call_count == 2
+    foundation.execute.assert_not_called()
+    foundation.check_write_compatible.assert_not_called()
 
 
 def test_exact_key_prefix_and_hash_tag():
@@ -153,11 +287,12 @@ def test_invalid_foundation_arguments_fail_before_client_construction(
 ):
     config_value = config() if config_value is None else config_value
     manifest_value = manifest() if manifest_value is None else manifest_value
-    with patch.object(ValkeyFoundation, "_create_client") as create, patch(
-        "valkey_relay_state.redis.ConnectionPool"
-    ) as pool, patch("valkey_relay_state.redis.Redis") as redis_class, patch(
-        "valkey_relay_state.Sentinel"
-    ) as sentinel_class:
+    with (
+        patch.object(ValkeyFoundation, "_create_client") as create,
+        patch("valkey_relay_state.redis.ConnectionPool") as pool,
+        patch("valkey_relay_state.redis.Redis") as redis_class,
+        patch("valkey_relay_state.Sentinel") as sentinel_class,
+    ):
         with pytest.raises(error_type, match=f"^{message}$") as caught:
             ValkeyFoundation(config_value, manifest_value)
     create.assert_not_called()
@@ -347,14 +482,102 @@ def test_retry_budget_is_total_and_deterministic():
     foundation.config = config(retry_attempts=5, retry_timeout_seconds=0.1)
     operation = Mock(side_effect=redis.ConnectionError("private endpoint"))
     clock = Mock(side_effect=[0.0, 0.04, 0.11])
-    with patch("valkey_relay_state.time.monotonic", clock), patch(
-        "valkey_relay_state.time.sleep"
-    ) as sleep:
+    with (
+        patch("valkey_relay_state.time.monotonic", clock),
+        patch("valkey_relay_state.time.sleep") as sleep,
+    ):
         with pytest.raises(ValkeyUnavailableError) as caught:
             foundation._call(operation)
     assert operation.call_count == 2
     sleep.assert_called_once_with(0.05)
     assert caught.value.__cause__ is None
+
+
+def test_mutating_script_transport_failure_is_not_retried():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.side_effect = redis.ConnectionError("private endpoint")
+
+    with pytest.raises(
+        ValkeyUnavailableError, match="^state backend unavailable$"
+    ) as caught:
+        foundation.execute(REGISTRATION_TRANSITION_SCRIPT.name)
+
+    foundation._client.evalsha.assert_called_once()
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("backend_error", "expected_error", "message"),
+    [
+        (
+            redis.ResponseError("READONLY private primary"),
+            ValkeyReadOnlyError,
+            "state backend is not writable",
+        ),
+        (
+            redis.ResponseError("private command failure"),
+            ValkeyUnavailableError,
+            "state backend command failed",
+        ),
+    ],
+)
+def test_mutating_script_response_failures_are_typed_redacted_and_not_retried(
+    backend_error, expected_error, message
+):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5)
+    operation = Mock(side_effect=backend_error)
+
+    with pytest.raises(expected_error, match=f"^{message}$") as caught:
+        foundation._call_mutating_script(operation)
+
+    operation.assert_called_once()
+    assert "private" not in str(caught.value)
+
+
+def test_read_only_script_transport_failure_retains_bounded_retry():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=2)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.side_effect = [
+        redis.ConnectionError("private endpoint"),
+        [b"1", b"2"],
+    ]
+
+    with patch("valkey_relay_state.time.sleep"):
+        assert foundation.server_time() == (1, 2)
+
+    assert foundation._client.evalsha.call_count == 2
+
+
+def test_mutating_noscript_recovery_dispatches_loaded_script_only_once():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.side_effect = [
+        redis.exceptions.NoScriptError("missing reviewed script"),
+        redis.ConnectionError("lost reply from private endpoint"),
+    ]
+    foundation._client.script_load.return_value = (
+        REGISTRATION_TRANSITION_SCRIPT.eval_sha1
+    )
+
+    with pytest.raises(ValkeyUnavailableError, match="^state backend unavailable$"):
+        foundation.execute(REGISTRATION_TRANSITION_SCRIPT.name)
+
+    assert foundation._client.evalsha.call_count == 2
+    foundation._client.script_load.assert_called_once_with(
+        REGISTRATION_TRANSITION_SCRIPT.source
+    )
+    assert foundation._client.get.call_count == 2
 
 
 def test_incompatible_execution_reads_only_manifest():
@@ -372,7 +595,7 @@ def test_incompatible_execution_reads_only_manifest():
 
 def test_second_noscript_is_a_bounded_typed_error_without_another_retry():
     foundation = ValkeyFoundation.__new__(ValkeyFoundation)
-    foundation.config = config(retry_attempts=0)
+    foundation.config = config(retry_attempts=5)
     foundation.expected_manifest = manifest()
     foundation._client = Mock()
     foundation._client.get.side_effect = [manifest().encode(), manifest().encode()]
@@ -391,8 +614,10 @@ def test_second_noscript_is_a_bounded_typed_error_without_another_retry():
     assert foundation._client.evalsha.call_count == 2
     foundation._client.script_load.assert_called_once_with(SERVER_TIME_SCRIPT.source)
     assert caught.value.__cause__ is None
-    rendered = repr(caught.value) + str(caught.value) + "".join(
-        traceback.format_exception(caught.value)
+    rendered = (
+        repr(caught.value)
+        + str(caught.value)
+        + "".join(traceback.format_exception(caught.value))
     )
     assert datastore_detail not in rendered
     assert "secret-endpoint" not in rendered
@@ -609,3 +834,23 @@ def test_server_time_rejects_malformed_and_out_of_range_results(result):
     with patch.object(foundation, "execute", return_value=result):
         with pytest.raises(ValkeyScriptError, match="invalid reviewed script result"):
             foundation.server_time()
+
+
+def test_registration_deadline_failure_is_typed_before_record_decoding():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = [b"deadline"]
+    store = registration_store_with_foundation(foundation)
+    store._config = RelayStateStoreConfig(
+        namespace="testing.unit",
+        lease_ttl_seconds=float.fromhex("0x1.fffffffffffffp+1023"),
+    )
+
+    with pytest.raises(
+        RelayStateStoreError, match="^registration deadline must be finite$"
+    ):
+        store._transition(
+            "register", "node-a", "a" * 64, (b"node-a", *(b"" for _ in range(8)))
+        )
+
+    assert foundation.execute.call_args.args[2][4] == b"1.7976931348623157e+308"

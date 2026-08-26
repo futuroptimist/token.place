@@ -19,6 +19,15 @@ import redis
 from redis.exceptions import NoScriptError, RedisError, ResponseError
 from redis.sentinel import Sentinel
 
+from relay_state_store import (
+    ComputeNodeCapabilities,
+    ComputeNodeRegistration,
+    RelayStateCapacityExceeded,
+    RelayStateCredentialMismatch,
+    RelayStateStoreConfig,
+    RelayStateStoreError,
+)
+
 _NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_TIMEOUT_SECONDS = 30.0
@@ -29,6 +38,20 @@ _MAX_RESULT_DEPTH = 8
 _MAX_MANIFEST_SCRIPTS = 64
 _MAX_CONNECTIONS = 32
 _MAX_RATE_LIMIT_WINDOW = 2**63 - 1
+_REGISTRATION_FIELDS = (
+    b"node_id",
+    b"control_credential_digest",
+    b"registered_at_epoch",
+    b"supported_model_ids",
+    b"active_context_tier",
+    b"maximum_total_context_tokens",
+    b"default_output_token_reservation",
+    b"maximum_output_tokens",
+    b"max_concurrency",
+    b"backend_class",
+    b"api_version",
+    b"lease_expires_at_epoch",
+)
 _ROUTE_CLASS_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _KEY_COMPONENT_COUNTS = {
     "schema": 0,
@@ -222,9 +245,7 @@ class ValkeyConfig:
             raise ValkeyConfigurationError("invalid revision range")
         if self.direct is not None and not isinstance(self.direct, DirectPrimary):
             raise ValkeyConfigurationError("invalid discovery configuration")
-        if self.sentinel is not None and not isinstance(
-            self.sentinel, SentinelPrimary
-        ):
+        if self.sentinel is not None and not isinstance(self.sentinel, SentinelPrimary):
             raise ValkeyConfigurationError("invalid discovery configuration")
         if (self.direct is None) == (self.sentinel is None):
             raise ValkeyConfigurationError("exactly one discovery mode is required")
@@ -425,8 +446,114 @@ SERVER_TIME_SCRIPT = ReviewedScript(
     "b60030a7ea7b76a01601d26aba460e94c4fa0d52fa472333c111f18c6701bd94",  # pragma: allowlist secret
     False,
 )
+
+REGISTRATION_TRANSITION_SOURCE = """\
+local leases, node = KEYS[1], KEYS[2]
+local prefix, operation, digest, owner = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+local ttl, capacity, batch = tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local fields = {'node_id', 'control_credential_digest', 'registered_at_epoch',
+  'supported_model_ids', 'active_context_tier', 'maximum_total_context_tokens',
+  'default_output_token_reservation', 'maximum_output_tokens', 'max_concurrency',
+  'backend_class', 'api_version', 'lease_expires_at_epoch'}
+local function fixed_record(key)
+  local record = redis.call('HMGET', key, unpack(fields))
+  local bytes = 0
+  for _, value in ipairs(record) do
+    if not value then return nil end
+    bytes = bytes + string.len(value)
+  end
+  local json_ok, models = pcall(cjson.decode, record[4])
+  if not json_ok or type(models) ~= 'table' then return nil end
+  return record, bytes
+end
+local addressed_expiry = redis.call('ZSCORE', leases, digest)
+if addressed_expiry and tonumber(addressed_expiry) <= now then
+  redis.call('DEL', node)
+  redis.call('ZREM', leases, digest)
+end
+local due = redis.call('ZRANGEBYSCORE', leases, '-inf', now, 'LIMIT', 0, batch)
+local expired = {}
+local reply_bytes, reply_items = 2, 3
+for _, expired_digest in ipairs(due) do
+  local expired_node = prefix .. 'node:' .. expired_digest
+  if operation == 'reap' then
+    local record, record_bytes = fixed_record(expired_node)
+    if not record then return {'schema'} end
+    if reply_items + 13 > 1024 or reply_bytes + record_bytes > 65536 then break end
+    table.insert(expired, record)
+    reply_items = reply_items + 13
+    reply_bytes = reply_bytes + record_bytes
+  end
+  redis.call('DEL', expired_node)
+  redis.call('ZREM', leases, expired_digest)
+end
+local exists = redis.call('EXISTS', node) == 1
+if operation == 'register' or operation == 'renew' then
+  if operation == 'register' then
+    if exists then
+      if redis.call('HGET', node, 'control_credential_digest') ~= owner then
+        return {'credential_mismatch'}
+      end
+    elseif redis.call('ZCOUNT', leases, '(' .. now, '+inf') >= capacity then
+      return {'capacity'}
+    end
+  else
+    if not exists then return {'not_found'} end
+    if redis.call('HGET', node, 'control_credential_digest') ~= owner then
+      return {'credential_mismatch'}
+    end
+  end
+  if ttl < 0.000001 then ttl = 0.000001 end
+  local deadline = now + ttl
+  if deadline ~= deadline or deadline == math.huge or deadline == -math.huge then
+    return {'deadline'}
+  end
+  if operation == 'register' and not exists then
+    redis.call('HSET', node, 'node_id', ARGV[8],
+      'control_credential_digest', owner, 'registered_at_epoch', now,
+      'supported_model_ids', ARGV[9], 'active_context_tier', ARGV[10],
+      'maximum_total_context_tokens', ARGV[11],
+      'default_output_token_reservation', ARGV[12],
+      'maximum_output_tokens', ARGV[13], 'max_concurrency', ARGV[14],
+      'backend_class', ARGV[15], 'api_version', ARGV[16])
+  elseif operation == 'register' or ARGV[8] == '1' then
+    redis.call('HSET', node, 'supported_model_ids', ARGV[9],
+      'active_context_tier', ARGV[10], 'maximum_total_context_tokens', ARGV[11],
+      'default_output_token_reservation', ARGV[12],
+      'maximum_output_tokens', ARGV[13], 'max_concurrency', ARGV[14],
+      'backend_class', ARGV[15], 'api_version', ARGV[16])
+  end
+  redis.call('HSET', node, 'lease_expires_at_epoch', deadline)
+  redis.call('ZADD', leases, deadline, digest)
+  local record = fixed_record(node)
+  if not record then return {'schema'} end
+  return {'ok', record}
+elseif operation == 'unregister' then
+  if not exists then return {'not_found'} end
+  if redis.call('HGET', node, 'control_credential_digest') ~= owner then
+    return {'credential_mismatch'}
+  end
+  redis.call('DEL', node)
+  redis.call('ZREM', leases, digest)
+  return {'ok'}
+elseif operation == 'reap' then
+  return {'ok', expired}
+end
+return {'invalid'}
+"""
+REGISTRATION_TRANSITION_SCRIPT = ReviewedScript(
+    "registration_transition_v1",
+    REGISTRATION_TRANSITION_SOURCE,
+    "6b2a4873c89176ec44f08f71f778b263bdfb55c9b3bd383883058292a548ed26",  # pragma: allowlist secret
+    True,
+)
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
-    {SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT}
+    {
+        SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT,
+        REGISTRATION_TRANSITION_SCRIPT.name: REGISTRATION_TRANSITION_SCRIPT,
+    }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
     {name: script.sha256 for name, script in SCRIPT_REGISTRY.items()}
@@ -540,6 +667,19 @@ class ValkeyFoundation:
                 time.sleep(min(0.05 * (2**attempt), remaining))
         raise ValkeyUnavailableError("state backend unavailable") from None
 
+    def _call_mutating_script(self, operation: Any, *args: Any) -> Any:
+        # A lost reply may follow a committed mutation, so replay cannot be safe.
+        try:
+            return operation(*args)
+        except NoScriptError:
+            raise
+        except ResponseError as exc:
+            if "READONLY" in str(exc).upper():
+                raise ValkeyReadOnlyError("state backend is not writable") from None
+            raise ValkeyUnavailableError("state backend command failed") from None
+        except RedisError:
+            raise ValkeyUnavailableError("state backend unavailable") from None
+
     def initialize_manifest(self) -> SchemaManifest:
         # Never persist an expected value this process could not itself use.
         self.check_read_compatible(self.expected_manifest)
@@ -607,7 +747,8 @@ class ValkeyFoundation:
             if script.mutates:
                 self.check_read_compatible(manifest)
                 self.check_write_compatible(manifest)
-            result = self._call(
+            dispatch = self._call_mutating_script if script.mutates else self._call
+            result = dispatch(
                 self._client.evalsha, script.eval_sha1, len(keys), *keys, *args
             )
         except NoScriptError:
@@ -623,7 +764,8 @@ class ValkeyFoundation:
             if script.mutates:
                 self.check_write_compatible(manifest)
             try:
-                result = self._call(
+                dispatch = self._call_mutating_script if script.mutates else self._call
+                result = dispatch(
                     self._client.evalsha, script.eval_sha1, len(keys), *keys, *args
                 )
             except NoScriptError:
@@ -654,3 +796,312 @@ class ValkeyFoundation:
         manifest = self.read_manifest()
         self.check_read_compatible(manifest)
         self.check_write_compatible(manifest)
+
+
+class ValkeyRegistrationStore:
+    """Internal Valkey implementation of only registration and lease transitions.
+
+    This deliberately does not implement or advertise ``RelayStateStore``: the
+    remaining coordination transitions must exist before runtime selection is safe.
+    """
+
+    def __init__(
+        self, foundation: ValkeyFoundation, config: RelayStateStoreConfig
+    ) -> None:
+        if not isinstance(foundation, ValkeyFoundation) or not isinstance(
+            config, RelayStateStoreConfig
+        ):
+            raise RelayStateStoreError("invalid Valkey registration configuration")
+        self._foundation = foundation
+        self._config = config
+
+    def __repr__(self) -> str:
+        return "ValkeyRegistrationStore(<redacted>)"
+
+    @property
+    def config(self) -> RelayStateStoreConfig:
+        return self._config
+
+    def close(self) -> None:
+        self._foundation.close()
+
+    @staticmethod
+    def _node_digest(node_id: str) -> str:
+        return hashlib.sha256(b"node\0" + node_id.encode("utf-8")).hexdigest()
+
+    def _validate_node_id(self, node_id: str) -> None:
+        if (
+            not isinstance(node_id, str)
+            or not node_id
+            or len(node_id.encode()) > self.config.max_node_id_bytes
+        ):
+            raise RelayStateStoreError(
+                "node ID must be non-empty and within byte bound"
+            )
+
+    @staticmethod
+    def _validate_digest(value: str) -> None:
+        if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+            raise RelayStateStoreError(
+                "control credential digest must be lowercase SHA-256"
+            )
+
+    @staticmethod
+    def _capability_args(capabilities: ComputeNodeCapabilities) -> tuple[bytes, ...]:
+        models = json.dumps(
+            capabilities.supported_model_ids,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(models) > _MAX_RESULT_BYTES:
+            raise RelayStateStoreError("supported model IDs exceed byte bound")
+        return (
+            models,
+            capabilities.active_context_tier.encode(),
+            str(capabilities.maximum_total_context_tokens).encode(),
+            str(capabilities.default_output_token_reservation).encode(),
+            str(capabilities.maximum_output_tokens).encode(),
+            str(capabilities.max_concurrency).encode(),
+            capabilities.backend_class.encode(),
+            capabilities.api_version.encode(),
+        )
+
+    def _keys(self, digest: str) -> tuple[str, ...]:
+        cfg = self._foundation.config
+        return (
+            cfg.key("nodes:lease"),
+            cfg.key("node", digest),
+        )
+
+    def _transition(
+        self,
+        operation: str,
+        node_id: str,
+        owner: str,
+        extra: tuple[bytes, ...],
+    ) -> tuple[str, list[Any]]:
+        digest = self._node_digest(node_id)
+        ttl_arg = repr(float(self.config.lease_ttl_seconds)).encode("ascii")
+        args = (
+            self._foundation.config.key_prefix.encode(),
+            operation.encode(),
+            digest.encode(),
+            owner.encode(),
+            ttl_arg,
+            str(self.config.max_compute_nodes).encode(),
+            str(self.config.node_transition_batch_size).encode(),
+            *extra,
+        )
+        result = self._foundation.execute(
+            REGISTRATION_TRANSITION_SCRIPT.name, self._keys(digest), args
+        )
+        if not isinstance(result, (list, tuple)) or not result:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        status = result[0]
+        if isinstance(status, bytes):
+            try:
+                code = status.decode("ascii")
+            except UnicodeDecodeError:
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
+        elif isinstance(status, str):
+            code = status
+        else:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        expected_lengths = {
+            "capacity": 1,
+            "credential_mismatch": 1,
+            "deadline": 1,
+            "not_found": 1,
+            "schema": 1,
+            "ok": 2 if operation in {"register", "renew", "reap"} else 1,
+        }
+        if code not in expected_lengths or len(result) != expected_lengths[code]:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if code == "capacity":
+            raise RelayStateCapacityExceeded(
+                "compute-node registration capacity reached"
+            )
+        if code == "credential_mismatch":
+            raise RelayStateCredentialMismatch("control credential digest mismatch")
+        if code == "deadline":
+            raise RelayStateStoreError("registration deadline must be finite")
+        if code == "schema":
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return code, list(result[1:])
+
+    @staticmethod
+    def _record_from_script(raw: object) -> ComputeNodeRegistration:
+        record = ValkeyRegistrationStore._fixed_record(raw)
+        if record is None:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return ValkeyRegistrationStore._decode_record(record)
+
+    @staticmethod
+    def _fixed_record(raw: object) -> dict[bytes, bytes] | None:
+        if not isinstance(raw, (list, tuple)) or len(raw) != len(_REGISTRATION_FIELDS):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if all(value is None for value in raw):
+            return None
+        if any(not isinstance(value, bytes) for value in raw):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if sum(len(value) for value in raw) > _MAX_RESULT_BYTES:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return dict(zip(_REGISTRATION_FIELDS, raw))
+
+    @staticmethod
+    def _decode_record(raw: Mapping[bytes, bytes]) -> ComputeNodeRegistration:
+        try:
+            model_ids = json.loads(raw[b"supported_model_ids"])
+            if not isinstance(model_ids, list):
+                raise ValueError
+            capabilities = ComputeNodeCapabilities(
+                supported_model_ids=tuple(model_ids),
+                active_context_tier=raw[b"active_context_tier"].decode(),
+                maximum_total_context_tokens=int(raw[b"maximum_total_context_tokens"]),
+                default_output_token_reservation=int(
+                    raw[b"default_output_token_reservation"]
+                ),
+                maximum_output_tokens=int(raw[b"maximum_output_tokens"]),
+                max_concurrency=int(raw[b"max_concurrency"]),
+                backend_class=raw[b"backend_class"].decode(),
+                api_version=raw[b"api_version"].decode(),
+            )
+            return ComputeNodeRegistration(
+                node_id=raw[b"node_id"].decode(),
+                capabilities=capabilities,
+                control_credential_digest=raw[b"control_credential_digest"].decode(),
+                registered_at_epoch=float(raw[b"registered_at_epoch"]),
+                lease_expires_at_epoch=float(raw[b"lease_expires_at_epoch"]),
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+
+    def _read(self, node_id: str, now: float) -> ComputeNodeRegistration | None:
+        digest = self._node_digest(node_id)
+        score = self._foundation._call(
+            self._foundation._client.zscore,
+            self._foundation.config.key("nodes:lease"),
+            digest,
+        )
+        if score is None or not math.isfinite(score) or score <= now:
+            return None
+        raw = self._foundation._call(
+            self._foundation._client.hmget,
+            self._foundation.config.key("node", digest),
+            _REGISTRATION_FIELDS,
+        )
+        record = self._fixed_record(raw)
+        return self._decode_record(record) if record is not None else None
+
+    def register(
+        self,
+        node_id: str,
+        capabilities: ComputeNodeCapabilities,
+        control_credential_digest: str,
+    ) -> ComputeNodeRegistration:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        if not isinstance(capabilities, ComputeNodeCapabilities):
+            raise RelayStateStoreError("capabilities must be ComputeNodeCapabilities")
+        _, returned = self._transition(
+            "register",
+            node_id,
+            control_credential_digest,
+            (node_id.encode(), *self._capability_args(capabilities)),
+        )
+        if len(returned) != 1:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return self._record_from_script(returned[0])
+
+    def renew(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        *,
+        capabilities: ComputeNodeCapabilities | None = None,
+    ) -> ComputeNodeRegistration | None:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        if capabilities is not None and not isinstance(
+            capabilities, ComputeNodeCapabilities
+        ):
+            raise RelayStateStoreError("capabilities must be ComputeNodeCapabilities")
+        extra = (
+            (b"1", *self._capability_args(capabilities))
+            if capabilities is not None
+            else (b"0", *(b"" for _ in range(8)))
+        )
+        code, returned = self._transition(
+            "renew", node_id, control_credential_digest, extra
+        )
+        if code == "not_found":
+            return None
+        if len(returned) != 1:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return self._record_from_script(returned[0])
+
+    def get(self, node_id: str) -> ComputeNodeRegistration | None:
+        self._validate_node_id(node_id)
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        seconds, micros = self._foundation.server_time()
+        return self._read(node_id, seconds + micros / 1_000_000)
+
+    def list(self) -> tuple[ComputeNodeRegistration, ...]:
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        seconds, micros = self._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        digests = self._foundation._call(
+            self._foundation._client.zrangebyscore,
+            self._foundation.config.key("nodes:lease"),
+            f"({now}",
+            "+inf",
+            start=0,
+            num=self.config.max_compute_nodes,
+        )
+        records = []
+        # Whole-list snapshots are intentionally non-transactional; each record is
+        # bounded, and nodes removed between the index and hash reads are omitted.
+        for digest in digests:
+            if not isinstance(digest, bytes) or not re.fullmatch(
+                rb"[0-9a-f]{64}", digest
+            ):
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
+            raw = self._foundation._call(
+                self._foundation._client.hmget,
+                self._foundation.config.key("node", digest.decode()),
+                _REGISTRATION_FIELDS,
+            )
+            record = self._fixed_record(raw)
+            if record is None:
+                continue
+            records.append(self._decode_record(record))
+        return tuple(sorted(records, key=lambda record: record.node_id))
+
+    def expire(self) -> tuple[ComputeNodeRegistration, ...]:
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        _, returned = self._transition("reap", "", "", ())
+        if len(returned) != 1 or not isinstance(returned[0], (list, tuple)):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        expired = [self._record_from_script(raw) for raw in returned[0]]
+        return tuple(sorted(expired, key=lambda record: record.node_id))
+
+    def unregister(self, node_id: str, control_credential_digest: str) -> bool:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        return (
+            self._transition("unregister", node_id, control_credential_digest, ())[0]
+            == "ok"
+        )

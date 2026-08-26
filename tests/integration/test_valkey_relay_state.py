@@ -18,6 +18,12 @@ from valkey_relay_state import (
     ValkeyReadOnlyError,
     ValkeySchemaIncompatibleError,
     ValkeyUnavailableError,
+    ValkeyRegistrationStore,
+)
+from relay_state_store import (
+    ComputeNodeCapabilities,
+    RelayStateCredentialMismatch,
+    RelayStateStoreConfig,
 )
 
 
@@ -84,7 +90,7 @@ def _manifest(**changes):
         reader_max=1,
         writer_min=1,
         writer_max=1,
-        script_digests={SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT.sha256},
+        script_digests=SCRIPT_DIGESTS,
         migration_epoch=0,
     )
     values.update(changes)
@@ -110,6 +116,18 @@ def _foundation(port, namespace=None, expected=None):
         retry_attempts=1,
     )
     return ValkeyFoundation(cfg, expected or _manifest())
+
+
+def _capabilities(model="model-a"):
+    return ComputeNodeCapabilities(
+        supported_model_ids=(model,),
+        active_context_tier="8k-fast",
+        maximum_total_context_tokens=8192,
+        default_output_token_reservation=128,
+        maximum_output_tokens=1024,
+        max_concurrency=1,
+        backend_class="cpu",
+    )
 
 
 def test_atomic_initialization_compatibility_readiness_and_exact_cleanup(valkey_server):
@@ -224,3 +242,60 @@ def test_read_only_role_is_classified_without_details(valkey_server):
     finally:
         foundation._client.role = original
         foundation.close()
+
+
+def test_registration_slice_is_shared_atomic_and_credential_redacted(valkey_server):
+    namespace = uuid.uuid4().hex
+    foundations = [_foundation(valkey_server, namespace) for _ in range(2)]
+    config = RelayStateStoreConfig(
+        namespace=namespace, lease_ttl_seconds=0.2, max_compute_nodes=2
+    )
+    stores = [ValkeyRegistrationStore(item, config) for item in foundations]
+    owner_a, owner_b = "a" * 64, "b" * 64
+    try:
+        foundations[0].initialize_manifest()
+        first = stores[0].register("node-b", _capabilities(), owner_a)
+        assert stores[1].get("node-b") == first
+        renewed = stores[1].register("node-b", _capabilities("model-b"), owner_a)
+        assert renewed.registered_at_epoch == first.registered_at_epoch
+        assert renewed.capabilities.supported_model_ids == ("model-b",)
+        with pytest.raises(RelayStateCredentialMismatch):
+            stores[1].register("node-b", _capabilities(), owner_b)
+        stores[1].register("node-a", _capabilities(), owner_b)
+        assert [record.node_id for record in stores[0].list()] == ["node-a", "node-b"]
+        assert stores[0].unregister("node-a", owner_b) is True
+        assert stores[1].unregister("node-a", owner_b) is False
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(
+                pool.map(
+                    lambda pair: _register_outcome(*pair),
+                    [(stores[0], owner_a), (stores[1], owner_b)],
+                )
+            )
+        assert outcomes.count("ok") == 1
+        assert outcomes.count("credential") == 1
+        raw = foundations[0]._client.hgetall(
+            foundations[0].config.key("node", stores[0]._digest("node-b"))
+        )
+        assert owner_a.encode() in raw.values()
+        assert b"raw-control-secret" not in b"".join(raw.values())
+        time.sleep(0.22)
+        assert stores[0].get("node-b") is None
+    finally:
+        client = foundations[0]._client
+        for node in ("node-a", "node-b", "node-race"):
+            client.delete(foundations[0].config.key("node", stores[0]._digest(node)))
+        client.delete(
+            foundations[0].config.key("nodes:lease"),
+            foundations[0].config.key("schema"),
+        )
+        for store in stores:
+            store.close()
+
+
+def _register_outcome(store, owner):
+    try:
+        store.register("node-race", _capabilities(), owner)
+        return "ok"
+    except RelayStateCredentialMismatch:
+        return "credential"

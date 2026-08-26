@@ -52,7 +52,7 @@ def manifest(**changes):
         reader_max=3,
         writer_min=1,
         writer_max=3,
-        script_digests={SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT.sha256},
+        script_digests=SCRIPT_DIGESTS,
         migration_epoch=0,
     )
     values.update(changes)
@@ -391,8 +391,10 @@ def test_second_noscript_is_a_bounded_typed_error_without_another_retry():
     assert foundation._client.evalsha.call_count == 2
     foundation._client.script_load.assert_called_once_with(SERVER_TIME_SCRIPT.source)
     assert caught.value.__cause__ is None
-    rendered = repr(caught.value) + str(caught.value) + "".join(
-        traceback.format_exception(caught.value)
+    rendered = (
+        repr(caught.value)
+        + str(caught.value)
+        + "".join(traceback.format_exception(caught.value))
     )
     assert datastore_detail not in rendered
     assert "secret-endpoint" not in rendered

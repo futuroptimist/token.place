@@ -36,15 +36,11 @@ metadata.
 
 ## Backend contract and consequences
 
-The backend tests obtain stores through a factory. A future Valkey implementation will be added to
-that factory and must pass the same deterministic lifecycle, bounds, defensive-read, clock, and
-concurrency suite. This provides a backend-neutral behavioral baseline without choosing Valkey
-keys, transactions, scripts, or discovery mechanisms prematurely.
-
-Memory-only operation and a registration-only boundary keep this change reviewable and avoid a
-partial runtime migration that could imply false horizontal-scaling guarantees. This PR is a
-prerequisite only: it does **not** make the relay horizontally scalable and does not satisfy issue
-#1569 by itself.
+The first internal Valkey implementation of this slice uses reviewed versioned scripts, Valkey
+server time, digested node-key components, and the compatibility gates defined by the Valkey ADR.
+It remains separate from the complete `RelayStateStore` protocol and is not selectable by
+`relay.py`. Scheduler, work-lifecycle, runtime wiring, deployment, and failover work remain
+prerequisites for horizontal scaling; this slice does not satisfy #1569.
 
 ## Explicitly deferred
 
@@ -54,7 +50,7 @@ The following remain future design and implementation work:
 - terminal transitions (completion, failure, and cancellation), queues, claims/reclaim, responses,
   tombstones, and outcome deduplication;
 - scheduler reservations and cursors, shared rate limits, and functional availability;
-- Valkey data structures, transactions/server-side scripts, and failure semantics;
+- Valkey implementations for every transition beyond registration and leases;
 - Sentinel discovery and HA deployment topology;
 - schema-compatible rolling-upgrade policy.
 

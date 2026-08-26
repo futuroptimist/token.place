@@ -19,6 +19,16 @@ import redis
 from redis.exceptions import NoScriptError, RedisError, ResponseError
 from redis.sentinel import Sentinel
 
+from relay_state_store import (
+    ComputeNodeCapabilities,
+    ComputeNodeRegistration,
+    RelayStateCapacityExceeded,
+    RelayStateConflict,
+    RelayStateCredentialMismatch,
+    RelayStateStoreConfig,
+    RelayStateStoreError,
+)
+
 _NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_TIMEOUT_SECONDS = 30.0
@@ -222,9 +232,7 @@ class ValkeyConfig:
             raise ValkeyConfigurationError("invalid revision range")
         if self.direct is not None and not isinstance(self.direct, DirectPrimary):
             raise ValkeyConfigurationError("invalid discovery configuration")
-        if self.sentinel is not None and not isinstance(
-            self.sentinel, SentinelPrimary
-        ):
+        if self.sentinel is not None and not isinstance(self.sentinel, SentinelPrimary):
             raise ValkeyConfigurationError("invalid discovery configuration")
         if (self.direct is None) == (self.sentinel is None):
             raise ValkeyConfigurationError("exactly one discovery mode is required")
@@ -425,8 +433,76 @@ SERVER_TIME_SCRIPT = ReviewedScript(
     "b60030a7ea7b76a01601d26aba460e94c4fa0d52fa472333c111f18c6701bd94",  # pragma: allowlist secret
     False,
 )
+REGISTRATION_TRANSITION_SOURCE = """local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local current = redis.call('HGET', KEYS[1], 'control_credential_digest')
+if current and current ~= ARGV[2] then return {'credential_mismatch'} end
+if not current and ARGV[7] == 'renew' then return {'absent'} end
+if not current and redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[6]) then
+  return {'capacity'}
+end
+local registered = redis.call('HGET', KEYS[1], 'registered_at_epoch')
+if not registered then registered = string.format('%.6f', now) end
+local expires = now + tonumber(ARGV[5])
+redis.call('HSET', KEYS[1], 'node_id', ARGV[1],
+  'control_credential_digest', current or ARGV[2],
+  'capabilities', ARGV[3], 'registered_at_epoch', registered,
+  'lease_expires_at_epoch', string.format('%.6f', expires), 'state', 'live')
+redis.call('ZADD', KEYS[2], expires, ARGV[4])
+return {'ok', registered, string.format('%.6f', expires)}
+"""
+REGISTRATION_TRANSITION_SCRIPT = ReviewedScript(
+    "registration_transition_v1",
+    REGISTRATION_TRANSITION_SOURCE,
+    hashlib.sha256(REGISTRATION_TRANSITION_SOURCE.encode()).hexdigest(),
+    True,
+)
+REGISTRATION_REAP_SOURCE = """local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local removed = {}
+for i = 2, #KEYS do
+  local digest = ARGV[i - 1]
+  local score = redis.call('ZSCORE', KEYS[1], digest)
+  if score and tonumber(score) <= now then
+    redis.call('DEL', KEYS[i]); redis.call('ZREM', KEYS[1], digest)
+    removed[#removed + 1] = digest
+  end
+end
+return removed
+"""
+REGISTRATION_REAP_SCRIPT = ReviewedScript(
+    "registration_reap_v1",
+    REGISTRATION_REAP_SOURCE,
+    hashlib.sha256(REGISTRATION_REAP_SOURCE.encode()).hexdigest(),
+    True,
+)
+REGISTRATION_UNREGISTER_SOURCE = """local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local expires = redis.call('ZSCORE', KEYS[2], ARGV[2])
+if expires and tonumber(expires) <= now then
+  redis.call('DEL', KEYS[1]); redis.call('ZREM', KEYS[2], ARGV[2]); return {'absent'}
+end
+local current = redis.call('HGET', KEYS[1], 'control_credential_digest')
+if not current then redis.call('ZREM', KEYS[2], ARGV[2]); return {'absent'} end
+if current ~= ARGV[1] then return {'credential_mismatch'} end
+redis.call('DEL', KEYS[1]); redis.call('ZREM', KEYS[2], ARGV[2]); return {'removed'}
+"""
+REGISTRATION_UNREGISTER_SCRIPT = ReviewedScript(
+    "registration_unregister_v1",
+    REGISTRATION_UNREGISTER_SOURCE,
+    hashlib.sha256(REGISTRATION_UNREGISTER_SOURCE.encode()).hexdigest(),
+    True,
+)
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
-    {SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT}
+    {
+        script.name: script
+        for script in (
+            SERVER_TIME_SCRIPT,
+            REGISTRATION_TRANSITION_SCRIPT,
+            REGISTRATION_REAP_SCRIPT,
+            REGISTRATION_UNREGISTER_SCRIPT,
+        )
+    }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
     {name: script.sha256 for name, script in SCRIPT_REGISTRY.items()}
@@ -654,3 +730,250 @@ class ValkeyFoundation:
         manifest = self.read_manifest()
         self.check_read_compatible(manifest)
         self.check_write_compatible(manifest)
+
+
+class ValkeyRegistrationStore:
+    """Internal Valkey implementation of only the registration/lease slice.
+
+    Deliberately does not implement ``RelayStateStore`` and is not runtime-selectable.
+    """
+
+    _REAP_BATCH = 64
+
+    def __init__(self, foundation: ValkeyFoundation, config: RelayStateStoreConfig):
+        if not isinstance(foundation, ValkeyFoundation) or not isinstance(
+            config, RelayStateStoreConfig
+        ):
+            raise RelayStateStoreError("invalid registration store configuration")
+        self._foundation = foundation
+        self._config = config
+
+    @property
+    def config(self) -> RelayStateStoreConfig:
+        return self._config
+
+    def __repr__(self) -> str:
+        return "ValkeyRegistrationStore(<redacted>)"
+
+    @staticmethod
+    def _digest(node_id: str) -> str:
+        return hashlib.sha256(node_id.encode()).hexdigest()
+
+    def _validate_node(self, node_id: str) -> None:
+        if (
+            not isinstance(node_id, str)
+            or not node_id
+            or len(node_id.encode()) > self.config.max_node_id_bytes
+        ):
+            raise RelayStateStoreError(
+                "node ID must be a non-empty bounded UTF-8 string"
+            )
+
+    @staticmethod
+    def _validate_credential(digest: str) -> None:
+        if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+            raise RelayStateStoreError(
+                "control credential must be a lowercase SHA-256 digest"
+            )
+
+    @staticmethod
+    def _encode_capabilities(value: ComputeNodeCapabilities) -> bytes:
+        if not isinstance(value, ComputeNodeCapabilities):
+            raise RelayStateStoreError("capabilities must be ComputeNodeCapabilities")
+        return json.dumps(
+            {name: getattr(value, name) for name in value.__dataclass_fields__},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+
+    @staticmethod
+    def _decode_record(raw: Mapping[bytes, bytes]) -> ComputeNodeRegistration:
+        try:
+            values = json.loads(raw[b"capabilities"])
+            values["supported_model_ids"] = tuple(values["supported_model_ids"])
+            return ComputeNodeRegistration(
+                node_id=raw[b"node_id"].decode(),
+                capabilities=ComputeNodeCapabilities(**values),
+                control_credential_digest=raw[b"control_credential_digest"].decode(),
+                registered_at_epoch=float(raw[b"registered_at_epoch"]),
+                lease_expires_at_epoch=float(raw[b"lease_expires_at_epoch"]),
+            )
+        except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+
+    def _reap(self) -> None:
+        lease = self._foundation.config.key("nodes:lease")
+        while True:
+            manifest = self._foundation.read_manifest()
+            self._foundation.check_read_compatible(manifest)
+            self._foundation.check_write_compatible(manifest)
+            seconds, micros = self._foundation.server_time()
+            due = self._foundation._call(
+                self._foundation._client.zrangebyscore,
+                lease,
+                "-inf",
+                seconds + micros / 1_000_000,
+                start=0,
+                num=self._REAP_BATCH,
+            )
+            if not due:
+                return
+            digests = tuple(item.decode() for item in due)
+            keys = (lease,) + tuple(
+                self._foundation.config.key("node", d) for d in digests
+            )
+            self._foundation.execute(
+                REGISTRATION_REAP_SCRIPT.name, keys, tuple(d.encode() for d in digests)
+            )
+            if len(due) < self._REAP_BATCH:
+                return
+
+    def _transition(
+        self,
+        node_id: str,
+        capabilities: ComputeNodeCapabilities,
+        credential: str,
+        mode: str,
+    ) -> ComputeNodeRegistration | None:
+        self._validate_node(node_id)
+        self._validate_credential(credential)
+        encoded = self._encode_capabilities(capabilities)
+        self._reap()
+        digest = self._digest(node_id)
+        result = self._foundation.execute(
+            REGISTRATION_TRANSITION_SCRIPT.name,
+            (
+                self._foundation.config.key("node", digest),
+                self._foundation.config.key("nodes:lease"),
+            ),
+            (
+                node_id.encode(),
+                credential.encode(),
+                encoded,
+                digest.encode(),
+                str(self.config.lease_ttl_seconds).encode(),
+                str(self.config.max_compute_nodes).encode(),
+                mode.encode(),
+            ),
+        )
+        code = result[0].decode()
+        if code == "absent":
+            return None
+        if code == "capacity":
+            raise RelayStateCapacityExceeded(
+                "compute-node registration capacity reached"
+            )
+        if code == "credential_mismatch":
+            raise RelayStateCredentialMismatch(
+                "control credential digest does not own registration"
+            )
+        return self.get(node_id)
+
+    def register(
+        self,
+        node_id: str,
+        capabilities: ComputeNodeCapabilities,
+        control_credential_digest: str,
+    ) -> ComputeNodeRegistration:
+        result = self._transition(
+            node_id, capabilities, control_credential_digest, "register"
+        )
+        assert result is not None
+        return result
+
+    def renew(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        *,
+        capabilities: ComputeNodeCapabilities | None = None,
+    ) -> ComputeNodeRegistration | None:
+        current = self.get(node_id)
+        if current is None:
+            self._validate_credential(control_credential_digest)
+            return None
+        return self._transition(
+            node_id,
+            capabilities or current.capabilities,
+            control_credential_digest,
+            "renew",
+        )
+
+    def get(self, node_id: str) -> ComputeNodeRegistration | None:
+        self._validate_node(node_id)
+        self._reap()
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        raw = self._foundation._call(
+            self._foundation._client.hgetall,
+            self._foundation.config.key("node", self._digest(node_id)),
+        )
+        return self._decode_record(raw) if raw else None
+
+    def list(self) -> tuple[ComputeNodeRegistration, ...]:
+        self._reap()
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        lease = self._foundation.config.key("nodes:lease")
+        digests = self._foundation._call(
+            self._foundation._client.zrange, lease, 0, self.config.max_compute_nodes - 1
+        )
+        pipe = self._foundation._client.pipeline(transaction=False)
+        for digest in digests:
+            pipe.hgetall(self._foundation.config.key("node", digest.decode()))
+        try:
+            records = self._foundation._call(pipe.execute)
+        finally:
+            pipe.reset()
+        return tuple(
+            sorted(
+                (self._decode_record(raw) for raw in records if raw),
+                key=lambda r: r.node_id,
+            )
+        )
+
+    def expire(self) -> tuple[ComputeNodeRegistration, ...]:
+        lease = self._foundation.config.key("nodes:lease")
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        seconds, micros = self._foundation.server_time()
+        digests = self._foundation._call(
+            self._foundation._client.zrangebyscore,
+            lease,
+            "-inf",
+            seconds + micros / 1_000_000,
+            start=0,
+            num=self.config.max_compute_nodes,
+        )
+        pipe = self._foundation._client.pipeline(transaction=False)
+        for digest in digests:
+            pipe.hgetall(self._foundation.config.key("node", digest.decode()))
+        try:
+            raw_records = self._foundation._call(pipe.execute)
+        finally:
+            pipe.reset()
+        expired = tuple(self._decode_record(raw) for raw in raw_records if raw)
+        self._reap()
+        return tuple(sorted(expired, key=lambda record: record.node_id))
+
+    def unregister(self, node_id: str, control_credential_digest: str) -> bool:
+        self._validate_node(node_id)
+        self._validate_credential(control_credential_digest)
+        digest = self._digest(node_id)
+        result = self._foundation.execute(
+            REGISTRATION_UNREGISTER_SCRIPT.name,
+            (
+                self._foundation.config.key("node", digest),
+                self._foundation.config.key("nodes:lease"),
+            ),
+            (control_credential_digest.encode(), digest.encode()),
+        )
+        code = result[0].decode()
+        if code == "credential_mismatch":
+            raise RelayStateCredentialMismatch(
+                "control credential digest does not own registration"
+            )
+        return code == "removed"
+
+    def close(self) -> None:
+        self._foundation.close()

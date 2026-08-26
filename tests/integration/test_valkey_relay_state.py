@@ -16,9 +16,11 @@ import redis
 
 from relay_state_store import (
     ComputeNodeCapabilities,
+    EncryptedRequestEnvelope,
     RelayStateCapacityExceeded,
     RelayStateCredentialMismatch,
     RelayStateStoreConfig,
+    SchedulerNodeState,
 )
 
 from valkey_relay_state import (
@@ -286,6 +288,94 @@ def _registration_keys(store, *node_ids):
     ]
 
 
+def test_scheduler_reservation_and_enqueue_are_atomic_and_idempotent(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    owner = _digest("owner")
+    deadline = time.time() + 120
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    try:
+        store.register("node-a", _capabilities(), owner)
+        assert store.set_scheduler_state(
+            "node-a", owner, SchedulerNodeState(healthy=True, claimed_work=0)
+        )
+        selected = store.select_and_reserve(
+            "client-key",
+            "request-a",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            "cancel-token",
+        )
+        retried = store.select_and_reserve(
+            "client-key",
+            "request-a",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            "cancel-token",
+        )
+        assert selected.created and selected.reservation_token
+        assert not retried.created and retried.reservation_token is None
+        assert len(store.list_reservations()) == 1
+        queued = store.enqueue_encrypted_request(
+            "client-key",
+            "request-a",
+            selected.reservation_token,
+            "node-a",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel-token",
+        )
+        queued_retry = store.enqueue_encrypted_request(
+            "client-key",
+            "request-a",
+            selected.reservation_token,
+            "node-a",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel-token",
+        )
+        assert queued.created and not queued_retry.created
+        assert queued.sequence == queued_retry.sequence
+        assert store.list_reservations() == ()
+        assert store.queued_requests("node-a")[0].envelope == envelope
+    finally:
+        client = hashlib.sha256(b"client\0client-key").hexdigest()
+        request = hashlib.sha256(b"request\0request-a").hexdigest()
+        node = store._node_digest("node-a")
+        token = (
+            hashlib.sha256(selected.reservation_token.encode()).hexdigest()
+            if "selected" in locals() and selected.reservation_token
+            else "0" * 64
+        )
+        cfg = store._foundation.config
+        store._foundation._client.delete(
+            *_registration_keys(store, "node-a"),
+            cfg.key("registration:sequence"),
+            cfg.key("requests"),
+            cfg.key("reservations"),
+            cfg.key("reservations:expiry"),
+            cfg.key("cursors"),
+            cfg.key("queue:sequence"),
+            cfg.key("queues"),
+            cfg.key("queue", node),
+            cfg.key("request", client, request),
+            cfg.key("reservation", token),
+            cfg.key("client:requests", client),
+            cfg.key("client:reservations", client),
+            cfg.key("client:queue", client),
+            cfg.key("node:reservations", node),
+        )
+        store.close()
+
+
 def _mark_registrations_due(store, node_ids):
     seconds, micros = store._foundation.server_time()
     cutoff = seconds + micros / 1_000_000
@@ -501,6 +591,10 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
         b"control_credential_digest",
         b"registered_at_epoch",
         b"lease_expires_at_epoch",
+        b"scheduler_healthy",
+        b"scheduler_draining",
+        b"scheduler_claimed_work",
+        b"registration_order",
     }
     forbidden = (
         raw_credential.encode(),

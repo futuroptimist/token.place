@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -20,12 +21,22 @@ from redis.exceptions import NoScriptError, RedisError, ResponseError
 from redis.sentinel import Sentinel
 
 from relay_state_store import (
+    CONTEXT_TIER_TOKEN_BOUNDS,
     ComputeNodeCapabilities,
     ComputeNodeRegistration,
+    EncryptedRequestEnvelope,
+    EnqueueResult,
     RelayStateCapacityExceeded,
+    RelayStateConflict,
     RelayStateCredentialMismatch,
+    RelayStateInvalidReservation,
+    RelayStateNoCapacity,
     RelayStateStoreConfig,
     RelayStateStoreError,
+    ReservationRecord,
+    SchedulerNodeState,
+    SelectionResult,
+    QueuedRequest,
 )
 
 _NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
@@ -64,9 +75,19 @@ _KEY_COMPONENT_COUNTS = {
     "control:expiry": 0,
     "node_tombstones:expiry": 0,
     "terminals:expiry": 0,
+    "registration:sequence": 0,
+    "queue:sequence": 0,
+    "reservations": 0,
+    "requests": 0,
+    "cursors": 0,
+    "queues": 0,
     "node": 1,
     "reservation": 1,
     "queue": 1,
+    "client:reservations": 1,
+    "client:requests": 1,
+    "client:queue": 1,
+    "node:reservations": 1,
     "node_tombstone": 1,
     "request": 2,
     "claim": 2,
@@ -448,7 +469,7 @@ SERVER_TIME_SCRIPT = ReviewedScript(
 )
 
 REGISTRATION_TRANSITION_SOURCE = """\
-local leases, node = KEYS[1], KEYS[2]
+local leases, node, registration_sequence = KEYS[1], KEYS[2], KEYS[3]
 local prefix, operation, digest, owner = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
 local ttl, capacity, batch = tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7])
 local t = redis.call('TIME')
@@ -511,13 +532,16 @@ if operation == 'register' or operation == 'renew' then
     return {'deadline'}
   end
   if operation == 'register' and not exists then
+    local registration_order = redis.call('INCR', registration_sequence)
     redis.call('HSET', node, 'node_id', ARGV[8],
       'control_credential_digest', owner, 'registered_at_epoch', now,
       'supported_model_ids', ARGV[9], 'active_context_tier', ARGV[10],
       'maximum_total_context_tokens', ARGV[11],
       'default_output_token_reservation', ARGV[12],
       'maximum_output_tokens', ARGV[13], 'max_concurrency', ARGV[14],
-      'backend_class', ARGV[15], 'api_version', ARGV[16])
+      'backend_class', ARGV[15], 'api_version', ARGV[16],
+      'scheduler_healthy', '1', 'scheduler_draining', '0',
+      'scheduler_claimed_work', '0', 'registration_order', registration_order)
   elseif operation == 'register' or ARGV[8] == '1' then
     redis.call('HSET', node, 'supported_model_ids', ARGV[9],
       'active_context_tier', ARGV[10], 'maximum_total_context_tokens', ARGV[11],
@@ -546,13 +570,169 @@ return {'invalid'}
 REGISTRATION_TRANSITION_SCRIPT = ReviewedScript(
     "registration_transition_v1",
     REGISTRATION_TRANSITION_SOURCE,
-    "6b2a4873c89176ec44f08f71f778b263bdfb55c9b3bd383883058292a548ed26",  # pragma: allowlist secret
+    "8a97c3ec1459b176314d9faf89f8659c7ac22a544862c8dd8f67c5446b88fd57",  # pragma: allowlist secret
+    True,
+)
+
+SCHEDULER_STATE_SOURCE = """\
+local leases, node = KEYS[1], KEYS[2]
+local owner = ARGV[1]
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local expiry = redis.call('ZSCORE', leases, ARGV[2])
+if not expiry or tonumber(expiry) <= now then
+  if expiry then redis.call('DEL', node); redis.call('ZREM', leases, ARGV[2]) end
+  return {'not_found'}
+end
+if redis.call('HGET', node, 'control_credential_digest') ~= owner then
+  return {'credential_mismatch'}
+end
+if not redis.call('HGET', node, 'registration_order') then return {'schema'} end
+redis.call('HSET', node, 'scheduler_healthy', ARGV[3],
+  'scheduler_draining', ARGV[4], 'scheduler_claimed_work', ARGV[5])
+return {'ok'}
+"""
+
+SCHEDULER_STATE_SCRIPT = ReviewedScript(
+    "scheduler_state_v1",
+    SCHEDULER_STATE_SOURCE,
+    "e7e52d01570ee07ed8bb71626b1d124e5c02d4f729a10f882c985f66639aa697",  # pragma: allowlist secret
+    True,
+)
+
+SELECT_RESERVE_SOURCE = """\
+local leases, expiry_index, requests, reservations, cursors = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
+local prefix, client, request, identity, model, tier, tier_tokens, deadline =
+  ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], tonumber(ARGV[7]), tonumber(ARGV[8])
+local fingerprint, token_digest, cancellation = ARGV[9], ARGV[10], ARGV[11]
+local ttl, max_ttl, max_nodes, batch = tonumber(ARGV[12]), tonumber(ARGV[13]), tonumber(ARGV[14]), tonumber(ARGV[15])
+local max_res, max_client, max_node, max_depth, max_lifecycle, max_cursors =
+  tonumber(ARGV[16]), tonumber(ARGV[17]), tonumber(ARGV[18]), tonumber(ARGV[19]), tonumber(ARGV[20]), tonumber(ARGV[21])
+local t = redis.call('TIME'); local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local lifecycle = prefix .. 'request:' .. client .. ':' .. request
+local function reap()
+  local due = redis.call('ZRANGEBYSCORE', expiry_index, '-inf', now, 'LIMIT', 0, batch)
+  for _, token in ipairs(due) do
+    local rkey = prefix .. 'reservation:' .. token
+    local vals = redis.call('HMGET', rkey, 'client', 'request', 'identity')
+    if vals[1] and vals[2] and vals[3] then
+      local lkey = prefix .. 'request:' .. vals[1] .. ':' .. vals[2]
+      if redis.call('HGET', lkey, 'state') == 'reserved' and redis.call('HGET', lkey, 'token_digest') == token then
+        redis.call('DEL', lkey); redis.call('ZREM', requests, vals[3])
+        redis.call('ZREM', prefix .. 'client:requests:' .. vals[1], vals[3])
+        local node = redis.call('HGET', rkey, 'node_digest')
+        if node then redis.call('ZREM', prefix .. 'node:reservations:' .. node, vals[3]) end
+        redis.call('ZREM', prefix .. 'client:reservations:' .. vals[1], vals[3])
+      end
+    end
+    redis.call('DEL', rkey); redis.call('ZREM', expiry_index, token); redis.call('ZREM', reservations, token)
+  end
+end
+reap()
+if deadline <= now then return {'invalid'} end
+if deadline > now + max_ttl then return {'deadline'} end
+local existing = redis.call('HMGET', lifecycle, 'state','node_id','model','tier','deadline','reservation_expiry','cancellation_digest')
+if existing[1] then
+  if existing[3] ~= model or existing[4] ~= tier or tonumber(existing[5]) ~= deadline then return {'conflict'} end
+  if existing[7] and existing[7] ~= '' and (cancellation == '' or existing[7] ~= cancellation) then return {'conflict'} end
+  if existing[1] == 'reserved' then return {'existing',existing[2],existing[6],'reserved'} end
+  if existing[1] == 'queued' or existing[1] == 'claimed' then return {'existing',existing[2],'',existing[1]} end
+  return {'conflict'}
+end
+if redis.call('ZCARD', reservations) >= max_res or redis.call('ZCARD', requests) >= max_lifecycle then return {'capacity'} end
+if redis.call('ZCARD', prefix .. 'client:requests:' .. client) >= max_client then return {'capacity'} end
+local live = redis.call('ZRANGEBYSCORE', leases, '(' .. now, '+inf', 'LIMIT', 0, max_nodes)
+local candidates = {}
+for _, node_digest in ipairs(live) do
+  local nk = prefix .. 'node:' .. node_digest
+  local v = redis.call('HMGET', nk, 'node_id','supported_model_ids','active_context_tier','maximum_total_context_tokens','max_concurrency','scheduler_healthy','scheduler_draining','scheduler_claimed_work','registration_order')
+  if not v[9] then return {'schema'} end
+  local ok, models = pcall(cjson.decode, v[2]); if not ok or type(models) ~= 'table' then return {'schema'} end
+  local supports = false; for _, m in ipairs(models) do if m == model then supports = true end end
+  local sizes = {['2k']=2048,['4k']=4096,['8k-fast']=8192,['16k']=16384,['32k']=32768,['64k']=65536,['128k']=131072}
+  local size = sizes[v[3]]
+  local nr = redis.call('ZCARD', prefix .. 'node:reservations:' .. node_digest)
+  local nq = redis.call('ZCARD', prefix .. 'queue:' .. node_digest)
+  local load = nr + nq + tonumber(v[8])
+  if supports and size and size >= tier_tokens and tonumber(v[4]) >= tier_tokens and v[6] == '1' and v[7] == '0'
+    and load < tonumber(v[5]) and nr < max_node and nr + nq < max_depth then
+    table.insert(candidates, {size,load,tonumber(v[9]),v[1],node_digest})
+  end
+end
+if #candidates == 0 then return {'capacity'} end
+table.sort(candidates, function(a,b) if a[1]~=b[1] then return a[1]<b[1] elseif a[2]~=b[2] then return a[2]<b[2] else return a[3]<b[3] end end)
+local best_tier, best_load = candidates[1][1], candidates[1][2]
+local tied = {}; for _, c in ipairs(candidates) do if c[1]==best_tier and c[2]==best_load then table.insert(tied,c) end end
+local cursor = redis.call('HGET', cursors, fingerprint); local chosen = tied[1]
+if cursor then
+  local separator = string.find(cursor, ':'); local cursor_order = separator and tonumber(string.sub(cursor, 1, separator - 1))
+  if not cursor_order then return {'schema'} end
+  for _, c in ipairs(tied) do if c[3] > cursor_order then chosen=c; break end end
+end
+local expires = math.min(now + ttl, deadline)
+local rkey = prefix .. 'reservation:' .. token_digest
+redis.call('HSET', lifecycle, 'state','reserved','client_digest',client,'request_digest',request,
+ 'node_id',chosen[4],'node_digest',chosen[5],'model',model,'tier',tier,'deadline',deadline,
+ 'reservation_expiry',expires,'token_digest',token_digest,'cancellation_digest',cancellation)
+redis.call('HSET', rkey, 'client',client,'request',request,'identity',identity,'node_digest',chosen[5])
+redis.call('ZADD', requests, deadline, identity); redis.call('ZADD', reservations, expires, token_digest)
+redis.call('ZADD', expiry_index, expires, token_digest); redis.call('ZADD', prefix .. 'client:requests:' .. client, deadline, identity)
+redis.call('ZADD', prefix .. 'client:reservations:' .. client, expires, identity); redis.call('ZADD', prefix .. 'node:reservations:' .. chosen[5], expires, identity)
+if redis.call('HLEN', cursors) - (redis.call('HEXISTS', cursors, '_activity') == 1 and 1 or 0) >= max_cursors and not redis.call('HEXISTS', cursors, fingerprint) then
+  local all=redis.call('HGETALL', cursors); local victim=nil; local activity=math.huge
+  for i=1,#all,2 do if all[i] ~= '_activity' then local sep=string.find(all[i+1],':'); local a=sep and tonumber(string.sub(all[i+1],sep+1)); if a and a<activity then victim=all[i];activity=a end end end
+  if victim then redis.call('HDEL',cursors,victim) end
+end
+local sequence=redis.call('HINCRBY',cursors,'_activity',1); redis.call('HSET',cursors,fingerprint,chosen[3]..':'..sequence)
+return {'created',chosen[4],tostring(expires),'reserved'}
+"""
+SELECT_RESERVE_SCRIPT = ReviewedScript(
+    "select_reserve_v1",
+    SELECT_RESERVE_SOURCE,
+    "36a0f73801d1de4d4de6112ae2ce578e800d2bb7e8b2475df959e36f94727f39",  # pragma: allowlist secret
+    True,
+)
+
+ENQUEUE_SOURCE = """\
+local leases, requests, reservations, expiry_index, queue, queue_sequence, queues = KEYS[1],KEYS[2],KEYS[3],KEYS[4],KEYS[5],KEYS[6],KEYS[7]
+local prefix,client,request,identity,token,node_id,node_digest,model,tier,deadline,envelope,cancel =
+ ARGV[1],ARGV[2],ARGV[3],ARGV[4],ARGV[5],ARGV[6],ARGV[7],ARGV[8],ARGV[9],tonumber(ARGV[10]),ARGV[11],ARGV[12]
+local max_ttl,max_queue,max_client,max_node = tonumber(ARGV[13]),tonumber(ARGV[14]),tonumber(ARGV[15]),tonumber(ARGV[16])
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local lifecycle=prefix..'request:'..client..':'..request
+local v=redis.call('HMGET',lifecycle,'state','node_id','node_digest','model','tier','deadline','token_digest','cancellation_digest','envelope','sequence')
+if v[1]=='queued' or v[1]=='claimed' then
+ if v[2]~=node_id or v[4]~=model or v[5]~=tier or tonumber(v[6])~=deadline or v[9]~=envelope or v[8]~=cancel then return {'conflict'} end
+ if v[7]~=token then return {'invalid'} end
+ return {'existing',v[1],v[10]}
+end
+if v[1]~='reserved' or v[2]~=node_id or v[3]~=node_digest or v[4]~=model or v[5]~=tier or tonumber(v[6])~=deadline or v[7]~=token then return {'invalid'} end
+if v[8]~='' and v[8]~=cancel then return {'conflict'} end
+local lease=redis.call('ZSCORE',leases,node_digest); local rexp=redis.call('ZSCORE',expiry_index,token)
+if deadline<=now or not lease or tonumber(lease)<=now or not rexp or tonumber(rexp)<=now then return {'invalid'} end
+if deadline>now+max_ttl then return {'deadline'} end
+if redis.call('ZCARD',queue)>=max_node or redis.call('ZCARD',queues)>=max_queue or redis.call('ZCARD',prefix..'client:queue:'..client)>=max_client then return {'capacity'} end
+local seq=redis.call('INCR',queue_sequence)
+redis.call('HSET',lifecycle,'state','queued','envelope',envelope,'cancellation_digest',cancel,'enqueued_at',now,'sequence',seq)
+redis.call('ZADD',queue,seq,client..':'..request); redis.call('ZADD',prefix..'client:queue:'..client,seq,identity)
+redis.call('ZADD',queues,seq,identity)
+redis.call('DEL',prefix..'reservation:'..token); redis.call('ZREM',reservations,token); redis.call('ZREM',expiry_index,token)
+redis.call('ZREM',prefix..'client:reservations:'..client,identity); redis.call('ZREM',prefix..'node:reservations:'..node_digest,identity)
+return {'created','queued',tostring(seq)}
+"""
+ENQUEUE_SCRIPT = ReviewedScript(
+    "enqueue_request_v1",
+    ENQUEUE_SOURCE,
+    "fdd05d42207b0d39a89f835de4a7afec90079575e563c1880440c08eed71e1ba",  # pragma: allowlist secret
     True,
 )
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
     {
         SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT,
         REGISTRATION_TRANSITION_SCRIPT.name: REGISTRATION_TRANSITION_SCRIPT,
+        SCHEDULER_STATE_SCRIPT.name: SCHEDULER_STATE_SCRIPT,
+        SELECT_RESERVE_SCRIPT.name: SELECT_RESERVE_SCRIPT,
+        ENQUEUE_SCRIPT.name: ENQUEUE_SCRIPT,
     }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
@@ -871,6 +1051,7 @@ class ValkeyRegistrationStore:
         return (
             cfg.key("nodes:lease"),
             cfg.key("node", digest),
+            cfg.key("registration:sequence"),
         )
 
     def _transition(
@@ -1105,3 +1286,407 @@ class ValkeyRegistrationStore:
             self._transition("unregister", node_id, control_credential_digest, ())[0]
             == "ok"
         )
+
+    def set_scheduler_state(
+        self, node_id: str, control_credential_digest: str, state: SchedulerNodeState
+    ) -> bool:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        if not isinstance(state, SchedulerNodeState):
+            raise RelayStateStoreError("scheduler state must be SchedulerNodeState")
+        digest = self._node_digest(node_id)
+        result = self._foundation.execute(
+            SCHEDULER_STATE_SCRIPT.name,
+            (
+                self._foundation.config.key("nodes:lease"),
+                self._foundation.config.key("node", digest),
+            ),
+            (
+                control_credential_digest.encode(),
+                digest.encode(),
+                b"1" if state.healthy else b"0",
+                b"1" if state.draining else b"0",
+                str(state.claimed_work).encode(),
+            ),
+        )
+        code = self._status(result)
+        if code == "credential_mismatch":
+            raise RelayStateCredentialMismatch("control credential digest mismatch")
+        if code == "schema":
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return code == "ok"
+
+    @staticmethod
+    def _status(result: object) -> str:
+        if (
+            not isinstance(result, (list, tuple))
+            or not result
+            or not isinstance(result[0], bytes)
+        ):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            return result[0].decode("ascii")
+        except UnicodeDecodeError:
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+
+    def _identity(self, client_public_key: str, request_id: str) -> tuple[str, str]:
+        def digest(value: str, domain: bytes) -> str:
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value.encode()) > self.config.max_identity_bytes
+            ):
+                raise RelayStateStoreError("request identity is invalid")
+            return hashlib.sha256(domain + value.encode()).hexdigest()
+
+        return digest(client_public_key, b"client\0"), digest(request_id, b"request\0")
+
+    def _model(self, value: str) -> str:
+        normalized = value.strip().lower() if isinstance(value, str) else ""
+        if not normalized or len(normalized.encode()) > self.config.max_model_id_bytes:
+            raise RelayStateStoreError("requested model is invalid")
+        return normalized
+
+    @staticmethod
+    def _tier(value: str) -> str:
+        normalized = value.strip().lower() if isinstance(value, str) else ""
+        if normalized not in CONTEXT_TIER_TOKEN_BOUNDS:
+            raise RelayStateStoreError("requested context tier is invalid")
+        return normalized
+
+    @staticmethod
+    def _deadline(value: float) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise RelayStateStoreError("request deadline must be finite")
+        return float(value)
+
+    def select_and_reserve(
+        self,
+        client_public_key: str,
+        request_id: str,
+        requested_model_id: str,
+        requested_context_tier: str,
+        request_deadline_epoch: float,
+        cancellation_token: str | None = None,
+    ) -> SelectionResult:
+        client, request = self._identity(client_public_key, request_id)
+        model, tier, deadline = (
+            self._model(requested_model_id),
+            self._tier(requested_context_tier),
+            self._deadline(request_deadline_epoch),
+        )
+        cancellation = ""
+        if cancellation_token is not None:
+            if (
+                not isinstance(cancellation_token, str)
+                or not cancellation_token
+                or len(cancellation_token.encode())
+                > self.config.max_cancellation_token_bytes
+            ):
+                raise RelayStateStoreError("cancellation proof is invalid")
+            cancellation = hashlib.sha256(
+                b"cancel\0" + cancellation_token.encode()
+            ).hexdigest()
+        fingerprint = hashlib.sha256(f"{model}\0{tier}".encode()).hexdigest()
+        identity = hashlib.sha256(f"{client}\0{request}".encode()).hexdigest()
+        raw_token = secrets.token_hex(32)
+        token_digest = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
+        cfg = self._foundation.config
+        keys = (
+            cfg.key("nodes:lease"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests"),
+            cfg.key("reservations"),
+            cfg.key("cursors"),
+        )
+        args = tuple(
+            str(v).encode()
+            for v in (
+                cfg.key_prefix,
+                client,
+                request,
+                identity,
+                model,
+                tier,
+                CONTEXT_TIER_TOKEN_BOUNDS[tier],
+                repr(deadline),
+                fingerprint,
+                token_digest,
+                cancellation,
+                repr(float(self.config.reservation_ttl_seconds)),
+                repr(float(self.config.max_request_ttl_seconds)),
+                self.config.max_compute_nodes,
+                self.config.node_transition_batch_size,
+                self.config.max_reservations,
+                self.config.max_reservations_per_client,
+                self.config.max_reservations_per_node,
+                self.config.max_queue_depth_per_node,
+                self.config.max_request_lifecycles,
+                self.config.max_scheduler_fingerprints,
+            )
+        )
+        result = self._foundation.execute(SELECT_RESERVE_SCRIPT.name, keys, args)
+        code = self._status(result)
+        if code == "capacity":
+            raise RelayStateNoCapacity("no scheduler capacity")
+        if code == "invalid":
+            raise RelayStateInvalidReservation("request deadline expired")
+        if code == "deadline":
+            raise RelayStateStoreError("request deadline exceeds its configured bound")
+        if code == "conflict":
+            raise RelayStateConflict("request identity conflict")
+        if code == "schema":
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if code not in {"created", "existing"} or len(result) != 4:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            node = result[1].decode()
+            expiry = float(result[2]) if result[2] else None
+            state = result[3].decode()
+        except (UnicodeDecodeError, ValueError, TypeError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        return SelectionResult(
+            node,
+            model,
+            tier,
+            deadline,
+            expiry,
+            raw_token if code == "created" else None,
+            code == "created",
+            state,
+        )
+
+    def enqueue_encrypted_request(
+        self,
+        client_public_key: str,
+        request_id: str,
+        reservation_token: str,
+        selected_node_id: str,
+        requested_model_id: str,
+        requested_context_tier: str,
+        request_deadline_epoch: float,
+        envelope: EncryptedRequestEnvelope,
+        cancellation_token: str,
+    ) -> EnqueueResult:
+        client, request = self._identity(client_public_key, request_id)
+        self._validate_node_id(selected_node_id)
+        model, tier, deadline = (
+            self._model(requested_model_id),
+            self._tier(requested_context_tier),
+            self._deadline(request_deadline_epoch),
+        )
+        if not isinstance(envelope, EncryptedRequestEnvelope):
+            raise RelayStateStoreError("envelope must be EncryptedRequestEnvelope")
+        serialized = json.dumps(
+            {
+                "protocol": envelope.protocol,
+                "version": envelope.version,
+                "ciphertext": envelope.ciphertext,
+                "cipherkey": envelope.cipherkey,
+                "iv": envelope.iv,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        if len(serialized) > self.config.max_envelope_bytes:
+            raise RelayStateStoreError(
+                "encrypted envelope exceeds its configured byte bound"
+            )
+        if not isinstance(reservation_token, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", reservation_token
+        ):
+            raise RelayStateInvalidReservation("reservation invalid")
+        if (
+            not isinstance(cancellation_token, str)
+            or not cancellation_token
+            or len(cancellation_token.encode())
+            > self.config.max_cancellation_token_bytes
+        ):
+            raise RelayStateStoreError("cancellation proof is invalid")
+        token = hashlib.sha256(reservation_token.encode("ascii")).hexdigest()
+        cancel = hashlib.sha256(b"cancel\0" + cancellation_token.encode()).hexdigest()
+        identity = hashlib.sha256(f"{client}\0{request}".encode()).hexdigest()
+        selected_node_digest = self._node_digest(selected_node_id)
+        cfg = self._foundation.config
+        keys = (
+            cfg.key("nodes:lease"),
+            cfg.key("requests"),
+            cfg.key("reservations"),
+            cfg.key("reservations:expiry"),
+            cfg.key("queue", selected_node_digest),
+            cfg.key("queue:sequence"),
+            cfg.key("queues"),
+        )
+        args = tuple(
+            str(v).encode()
+            for v in (
+                cfg.key_prefix,
+                client,
+                request,
+                identity,
+                token,
+                selected_node_id,
+                selected_node_digest,
+                model,
+                tier,
+                repr(deadline),
+                serialized.decode(),
+                cancel,
+                repr(float(self.config.max_request_ttl_seconds)),
+                self.config.max_queued_requests,
+                self.config.max_queued_requests_per_client,
+                self.config.max_queue_depth_per_node,
+            )
+        )
+        result = self._foundation.execute(ENQUEUE_SCRIPT.name, keys, args)
+        code = self._status(result)
+        if code == "invalid":
+            raise RelayStateInvalidReservation("reservation invalid")
+        if code == "conflict":
+            raise RelayStateConflict("request identity conflict")
+        if code == "capacity":
+            raise RelayStateNoCapacity("no scheduler capacity")
+        if code == "deadline":
+            raise RelayStateStoreError("request deadline exceeds its configured bound")
+        if code not in {"created", "existing"} or len(result) != 3:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            state = result[1].decode()
+            sequence = int(result[2])
+        except (UnicodeDecodeError, ValueError, TypeError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        return EnqueueResult(
+            state, selected_node_id, deadline, sequence, code == "created"
+        )
+
+    def list_reservations(self) -> tuple[ReservationRecord, ...]:
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        seconds, micros = self._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        cfg = self._foundation.config
+        tokens = self._foundation._call(
+            self._foundation._client.zrangebyscore,
+            cfg.key("reservations"),
+            f"({now}",
+            "+inf",
+            start=0,
+            num=self.config.max_reservations,
+        )
+        records = []
+        for token in tokens:
+            if not isinstance(token, bytes) or not re.fullmatch(
+                rb"[0-9a-f]{64}", token
+            ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            reservation = self._foundation._call(
+                self._foundation._client.hmget,
+                cfg.key("reservation", token.decode()),
+                ("client", "request"),
+            )
+            if (
+                not isinstance(reservation, list)
+                or len(reservation) != 2
+                or any(not isinstance(value, bytes) for value in reservation)
+            ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            client, request = (value.decode("ascii") for value in reservation)
+            raw = self._foundation._call(
+                self._foundation._client.hmget,
+                cfg.key("request", client, request),
+                ("node_id", "model", "tier", "deadline", "reservation_expiry"),
+            )
+            try:
+                node, model, tier = (raw[index].decode() for index in range(3))
+                deadline, expires = float(raw[3]), float(raw[4])
+            except (
+                AttributeError,
+                IndexError,
+                TypeError,
+                ValueError,
+                UnicodeDecodeError,
+            ):
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
+            records.append(
+                ReservationRecord(
+                    client,
+                    request,
+                    hashlib.sha256(f"{model}\0{tier}".encode()).hexdigest(),
+                    node,
+                    model,
+                    tier,
+                    deadline,
+                    expires,
+                    token.decode(),
+                )
+            )
+        return tuple(records)
+
+    def queued_requests(self, node_id: str) -> tuple[QueuedRequest, ...]:
+        self._validate_node_id(node_id)
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        cfg = self._foundation.config
+        node_digest = self._node_digest(node_id)
+        identities = self._foundation._call(
+            self._foundation._client.zrange,
+            cfg.key("queue", node_digest),
+            0,
+            self.config.max_queue_depth_per_node - 1,
+        )
+        records = []
+        for member in identities:
+            if not isinstance(member, bytes) or not re.fullmatch(
+                rb"[0-9a-f]{64}:[0-9a-f]{64}", member
+            ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            client, request = member.decode("ascii").split(":")
+            raw = self._foundation._call(
+                self._foundation._client.hmget,
+                cfg.key("request", client, request),
+                (
+                    "node_id",
+                    "model",
+                    "tier",
+                    "deadline",
+                    "envelope",
+                    "enqueued_at",
+                    "sequence",
+                ),
+            )
+            try:
+                envelope_value = json.loads(raw[4])
+                envelope = EncryptedRequestEnvelope(**envelope_value)
+                records.append(
+                    QueuedRequest(
+                        client,
+                        request,
+                        client,
+                        request,
+                        raw[0].decode(),
+                        raw[1].decode(),
+                        raw[2].decode(),
+                        float(raw[3]),
+                        envelope,
+                        float(raw[5]),
+                        int(raw[6]),
+                    )
+                )
+            except (
+                IndexError,
+                TypeError,
+                ValueError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                RelayStateStoreError,
+            ):
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
+        return tuple(records)

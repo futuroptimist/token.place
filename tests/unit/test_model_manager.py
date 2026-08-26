@@ -8952,6 +8952,101 @@ def test_headless_admission_fixture_omits_legacy_chat_format(tmp_path):
     assert 'chat_format' not in llm.kwargs
 
 
+def test_headless_admission_fixture_uses_configured_subprocess_render_contract(
+    monkeypatch, tmp_path
+):
+    from utils.compute_node_runtime import authoritative_readiness_fixture
+    from utils.llm import model_manager as model_manager_module
+    from utils.networking.relay_client import RelayClient
+
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    module_path = package_dir / '__init__.py'
+    module_path.write_text(
+        "class Llama:\n"
+        "    def __init__(self, **kwargs):\n"
+        "        assert 'chat_format' not in kwargs\n"
+        "    def apply_chat_template(self, *args, **kwargs):\n"
+        "        raise AssertionError('metadata-free fixture must use fallback')\n"
+        "    def create_chat_completion(self, **kwargs):\n"
+        "        return {'choices': [{'message': {'content': 'ok'}}]}\n"
+        "    def tokenize(self, prompt, add_bos=False):\n"
+        "        return list(prompt)\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'llama-3.1-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.chat_format': 'llama-3',
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }.get(key, default)
+    manager = ModelManager(config)
+    manager.headless_admission_fixture = True
+    manager.model_profile = dict(manager.model_profile)
+    manager.model_profile.update({
+        'provider': 'headless-admission-fixture',
+        'chat_template_policy': 'headless-plain-chat',
+    })
+    Path(manager.model_path).write_text('fake')
+    facade = model_manager_module._SubprocessLlamaCppModule(str(module_path))
+
+    with patch(
+        'utils.llm.model_manager._import_llama_cpp_runtime', return_value=facade
+    ), patch.object(
+        manager,
+        '_runtime_capabilities',
+        return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None},
+    ):
+        llm = manager.get_llm_instance()
+
+    try:
+        assert isinstance(llm, model_manager_module._SubprocessLlamaProxy)
+        assert llm is manager.llm
+        assert llm._headless_admission_fixture is True
+        content, fixture = authoritative_readiness_fixture()
+        messages = [{'role': 'user', 'content': content}]
+        count = RelayClient._api_v1_render_and_tokenize_chat_prompt(
+            llm, messages, model_profile=manager.model_profile
+        )
+        assert isinstance(count, int) and count > 0, getattr(
+            llm, '_token_place_last_render_tokenize_error', None
+        )
+
+        request_path = tmp_path / 'request.json'
+        evidence_path = tmp_path / 'evidence.json'
+        request_path.write_text(json.dumps(fixture), encoding='utf-8')
+        monkeypatch.setenv(
+            'TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST', str(request_path)
+        )
+        monkeypatch.setenv(
+            'TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE', str(evidence_path)
+        )
+        monkeypatch.setenv('TOKENPLACE_RUNTIME_ID', 'test-runtime')
+        RelayClient._api_v1_record_benchmark_tokenizer_observation(
+            llm,
+            messages,
+            full_prompt_tokens=count,
+            enable_thinking=None,
+            model_profile=manager.model_profile,
+        )
+        evidence = json.loads(evidence_path.read_text(encoding='utf-8'))
+        assert evidence['method'] == 'packaged_admission_render_and_tokenize_chat'
+        assert evidence['total_prompt_tokens'] == count
+        assert set(evidence['target_offsets_tokens']) == set(
+            fixture['target_prefix_utf8_bytes']
+        )
+        assert all(value > 0 for value in evidence['target_offsets_tokens'].values())
+    finally:
+        if llm is not None:
+            llm.close()
+
+
 def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):
     from utils.context_profiles import apply_context_profile
     captured = {}

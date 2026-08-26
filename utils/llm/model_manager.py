@@ -6104,7 +6104,7 @@ class ModelManager:
             'n_ctx': n_ctx,
             'verbose': llama_cpp_verbose_logging_enabled(),
         }
-        if getattr(self, 'headless_admission_fixture', False):
+        if getattr(self, 'headless_admission_fixture', False) is True:
             pass
         elif self.model_profile.get('provider') == 'qwen':
             if self._chat_template_mode() != 'gguf-jinja':
@@ -6907,7 +6907,7 @@ class ModelManager:
                                             self._qwen_64k_profile_attempt_ids.append(profile_id)
                                 try:
                                     llm_instance = Llama(**runtime_kwargs)
-                                    if getattr(self, 'headless_admission_fixture', False):
+                                    if getattr(self, 'headless_admission_fixture', False) is True:
                                         setattr(llm_instance, '_headless_admission_fixture', True)
                                     if is_qwen_64k and isinstance(profile_id, str):
                                         ids = [p.get('profile_id') for p in self._qwen_64k_runtime_profiles]

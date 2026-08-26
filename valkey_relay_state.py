@@ -1069,8 +1069,8 @@ class ValkeyRegistrationStore:
             num=self.config.max_compute_nodes,
         )
         records = []
-        # Listing is intentionally not a transactional whole-list snapshot; each
-        # included record is nevertheless a bounded, fixed-field read.
+        # Whole-list snapshots are intentionally non-transactional; each record is
+        # bounded, and nodes removed between the index and hash reads are omitted.
         for digest in digests:
             if not isinstance(digest, bytes) or not re.fullmatch(
                 rb"[0-9a-f]{64}", digest
@@ -1085,7 +1085,7 @@ class ValkeyRegistrationStore:
             )
             record = self._fixed_record(raw)
             if record is None:
-                raise ValkeySchemaIncompatibleError("state schema incompatible")
+                continue
             records.append(self._decode_record(record))
         return tuple(sorted(records, key=lambda record: record.node_id))
 

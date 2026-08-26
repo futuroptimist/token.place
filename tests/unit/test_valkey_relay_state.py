@@ -178,6 +178,21 @@ def test_registration_list_translates_malformed_index_members(member):
     assert str(member) not in repr(caught.value)
 
 
+def test_registration_list_tolerates_concurrent_disappearance():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    foundation._client = Mock()
+    foundation._call.side_effect = [[b"a" * 64], [None] * 12]
+    store = registration_store_with_foundation(foundation)
+
+    assert store.list() == ()
+    assert foundation._call.call_count == 2
+    foundation.execute.assert_not_called()
+    foundation.check_write_compatible.assert_not_called()
+
+
 def test_exact_key_prefix_and_hash_tag():
     cfg = config(environment="staging", cluster="relay-a", schema_major=4)
     assert cfg.key_prefix == "tokenplace:{staging:relay-a}:relay:v4:"

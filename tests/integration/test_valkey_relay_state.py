@@ -407,6 +407,32 @@ def test_reads_are_read_only_and_unknown_fields_survive_updates(valkey_server):
         store.close()
 
 
+def test_list_tolerates_concurrent_unregister(valkey_server):
+    namespace = uuid.uuid4().hex
+    stores = [_registration_store(valkey_server, namespace) for _ in range(2)]
+    owner = _digest("owner")
+    original_call = stores[0]._foundation._call
+    intercepted = False
+    try:
+        stores[0].register("node-a", _capabilities(), owner)
+
+        def unregister_before_hash_read(command, *args, **kwargs):
+            nonlocal intercepted
+            if command.__name__ == "hmget":
+                intercepted = True
+                assert stores[1].unregister("node-a", owner)
+            return original_call(command, *args, **kwargs)
+
+        stores[0]._foundation._call = unregister_before_hash_read
+        assert stores[0].list() == ()
+        assert intercepted
+        assert stores[1].get("node-a") is None
+    finally:
+        stores[0]._foundation._client.delete(*_registration_keys(stores[0], "node-a"))
+        for store in stores:
+            store.close()
+
+
 def test_large_finite_ttl_uses_a_finite_epoch_seconds_deadline(valkey_server):
     store = _registration_store(
         valkey_server, uuid.uuid4().hex, lease_ttl_seconds=1e308

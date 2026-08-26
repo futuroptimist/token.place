@@ -3202,7 +3202,18 @@ def headless_cpu_admission(args: Any) -> int:
         result.update(success=True, failure_code="none",
                       authoritative_evidence_result="validated")
         return 0
-    except Exception:
+    except Exception as _diag_exc:
+        # TEMPORARY bounded diagnostic for investigating the hosted-Windows
+        # warm_load_failed signature (PR #1715). Writes only the exception
+        # class name (never message/args/traceback/paths) to a fixed TEMP
+        # file so CI can surface it without touching the strict privacy-safe
+        # result schema. Remove once root cause is confirmed and fixed.
+        try:
+            with open(os.path.join(tempfile.gettempdir(), "tokenplace-headless-diag.txt"),
+                      "w", encoding="utf-8") as _diag_handle:
+                _diag_handle.write(type(_diag_exc).__name__)
+        except Exception:
+            pass
         if not startup_emitted:
             result["failure_code"] = "bridge_exited_before_startup_event"
         else:

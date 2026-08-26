@@ -294,6 +294,20 @@ jobs:
             --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # TEMPORARY bounded diagnostic for PR #1715 (warm_load_failed root
+      # cause investigation). Prints only an exception class name, never a
+      # message/traceback/path. Remove once root cause is confirmed/fixed.
+      - name: Print bounded headless-admission diagnostic on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $diagPath = "$env:TEMP\tokenplace-headless-diag.txt"
+          if (Test-Path $diagPath) {
+            Write-Host "headless_admission_diag_exception_type=$(Get-Content $diagPath -Raw)"
+          } else {
+            Write-Host "headless_admission_diag_exception_type=<no diagnostic file written>"
+          }
+
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py
 

@@ -1,14 +1,14 @@
 import concurrent.futures
 import dataclasses
-import math
+import hashlib
 import logging
+import math
 import shutil
 import socket
 import subprocess
 import time
-import uuid
-import hashlib
 import traceback
+import uuid
 from threading import Barrier
 
 import pytest
@@ -16,24 +16,25 @@ import redis
 
 from relay_state_store import (
     ComputeNodeCapabilities,
+    EncryptedRequestEnvelope,
     RelayStateCapacityExceeded,
     RelayStateCredentialMismatch,
     RelayStateStoreConfig,
+    SchedulerNodeState,
 )
-
+from tests.registration_store_contract import assert_registration_contract
 from valkey_relay_state import (
-    DirectPrimary,
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
+    DirectPrimary,
     SchemaManifest,
     ValkeyConfig,
     ValkeyFoundation,
-    ValkeyRegistrationStore,
     ValkeyReadOnlyError,
+    ValkeyRegistrationStore,
     ValkeySchemaIncompatibleError,
     ValkeyUnavailableError,
 )
-from tests.registration_store_contract import assert_registration_contract
 
 
 def _free_port():
@@ -286,6 +287,91 @@ def _registration_keys(store, *node_ids):
     ]
 
 
+def test_scheduler_reservation_and_enqueue_are_shared_and_idempotent(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner = _digest("owner")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    deadline = time.time() + 30
+    selected = None
+    try:
+        registered = first.register("node", _capabilities(concurrency=1), owner)
+        node_key = first._foundation.config.key("node", first._node_digest("node"))
+        assert first._foundation._client.hmget(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        ) == [b"1", b"0", b"0"]
+        assert second.set_scheduler_state(
+            "node", owner, SchedulerNodeState(healthy=True, claimed_work=0)
+        )
+
+        selected = first.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        assert selected.created and selected.selected_node_id == registered.node_id
+        assert selected.reservation_token is not None
+        retry = second.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        assert not retry.created and retry.reservation_token is None
+        assert len(second.list_reservations()) == 1
+
+        queued = second.enqueue_encrypted_request(
+            "client",
+            "request",
+            selected.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
+        )
+        assert queued.created and queued.sequence == 1
+        repeated = first.enqueue_encrypted_request(
+            "client",
+            "request",
+            selected.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
+        )
+        assert not repeated.created and repeated.sequence == queued.sequence
+        assert first.list_reservations() == ()
+        assert first.queued_requests("node")[0].envelope == envelope
+    finally:
+        cfg = first._foundation.config
+        client = hashlib.sha256(b"client\0client").hexdigest()
+        request = hashlib.sha256(b"request\0request").hexdigest()
+        node = first._node_digest("node")
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", client, request),
+        ]
+        if selected is not None and selected.reservation_token is not None:
+            token = hashlib.sha256(
+                selected.reservation_token.encode("ascii")
+            ).hexdigest()
+            keys.append(cfg.key("reservation", token))
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()
+
+
 def _mark_registrations_due(store, node_ids):
     seconds, micros = store._foundation.server_time()
     cutoff = seconds + micros / 1_000_000
@@ -501,6 +587,9 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
         b"control_credential_digest",
         b"registered_at_epoch",
         b"lease_expires_at_epoch",
+        b"scheduler_healthy",
+        b"scheduler_draining",
+        b"scheduler_claimed_work",
     }
     forbidden = (
         raw_credential.encode(),

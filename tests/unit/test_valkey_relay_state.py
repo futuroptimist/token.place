@@ -52,7 +52,7 @@ def manifest(**changes):
         reader_max=3,
         writer_min=1,
         writer_max=3,
-        script_digests={SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT.sha256},
+        script_digests=SCRIPT_DIGESTS,
         migration_epoch=0,
     )
     values.update(changes)

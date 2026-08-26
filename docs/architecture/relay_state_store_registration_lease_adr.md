@@ -9,8 +9,10 @@
 Correctness-critical relay coordination currently lives in process-local globals. A typed
 `RelayStateStore` boundary is needed before that state can safely move to a shared backend. This
 first, deliberately small slice defines only compute-node registration, renewal, lookup/listing,
-lease expiry, and explicit unregistration. It includes an atomic, lock-protected memory backend
-but is not connected to `relay.py`; current routes and runtime behavior therefore remain unchanged.
+lease expiry, and explicit unregistration. It includes an atomic, lock-protected memory backend and
+an internal Valkey registration component using the shared schema and reviewed-script foundation.
+The incomplete Valkey component is not a `RelayStateStore` implementation and is not connected to
+`relay.py`; current routes and runtime behavior therefore remain unchanged.
 
 The public API expresses lifecycle transitions rather than generic key/value access. Configuration
 makes an environment/cluster namespace, schema version, authoritative lease TTL, compute-node
@@ -54,7 +56,7 @@ The following remain future design and implementation work:
 - terminal transitions (completion, failure, and cancellation), queues, claims/reclaim, responses,
   tombstones, and outcome deduplication;
 - scheduler reservations and cursors, shared rate limits, and functional availability;
-- Valkey data structures, transactions/server-side scripts, and failure semantics;
+- Valkey transitions beyond registration and leases, including scheduler reservations and queues;
 - Sentinel discovery and HA deployment topology;
 - schema-compatible rolling-upgrade policy.
 

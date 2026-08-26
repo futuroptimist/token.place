@@ -4,9 +4,18 @@ import socket
 import subprocess
 import time
 import uuid
+import hashlib
+from threading import Barrier
 
 import pytest
 import redis
+
+from relay_state_store import (
+    ComputeNodeCapabilities,
+    RelayStateCapacityExceeded,
+    RelayStateCredentialMismatch,
+    RelayStateStoreConfig,
+)
 
 from valkey_relay_state import (
     DirectPrimary,
@@ -15,6 +24,7 @@ from valkey_relay_state import (
     SchemaManifest,
     ValkeyConfig,
     ValkeyFoundation,
+    ValkeyRegistrationStore,
     ValkeyReadOnlyError,
     ValkeySchemaIncompatibleError,
     ValkeyUnavailableError,
@@ -84,7 +94,7 @@ def _manifest(**changes):
         reader_max=1,
         writer_min=1,
         writer_max=1,
-        script_digests={SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT.sha256},
+        script_digests=SCRIPT_DIGESTS,
         migration_epoch=0,
     )
     values.update(changes)
@@ -224,3 +234,94 @@ def test_read_only_role_is_classified_without_details(valkey_server):
     finally:
         foundation._client.role = original
         foundation.close()
+
+
+def _registration_store(port, namespace, **overrides):
+    foundation = _foundation(port, namespace)
+    foundation.initialize_manifest()
+    return ValkeyRegistrationStore(
+        foundation,
+        RelayStateStoreConfig(namespace="testing.valkey", **overrides),
+    )
+
+
+def _capabilities(concurrency=2):
+    return ComputeNodeCapabilities(
+        supported_model_ids=("qwen3-8b-instruct",),
+        active_context_tier="8k-fast",
+        maximum_total_context_tokens=8192,
+        default_output_token_reservation=1024,
+        maximum_output_tokens=2048,
+        max_concurrency=concurrency,
+        backend_class="cuda",
+    )
+
+
+def _digest(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def test_registration_contract_is_atomic_across_independent_clients(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, max_compute_nodes=2)
+    second = _registration_store(valkey_server, namespace, max_compute_nodes=2)
+    owner = _digest("owner")
+    try:
+        created = first.register("node-b", _capabilities(), owner)
+        assert created == second.get("node-b")
+        assert second.register("node-b", _capabilities(3), owner).capabilities.max_concurrency == 3
+        with pytest.raises(RelayStateCredentialMismatch):
+            second.register("node-b", _capabilities(), _digest("other"))
+        assert first.renew("unknown", owner) is None
+        first.register("node-a", _capabilities(), owner)
+        assert [record.node_id for record in second.list()] == ["node-a", "node-b"]
+        with pytest.raises(RelayStateCapacityExceeded):
+            second.register("node-c", _capabilities(), owner)
+        assert first.unregister("node-a", owner) is True
+        assert second.unregister("node-a", owner) is False
+        second.register("node-c", _capabilities(), owner)
+
+        barrier = Barrier(2)
+        def compete(store, credential):
+            barrier.wait()
+            try:
+                return store.register("node-b", _capabilities(), credential).control_credential_digest
+            except RelayStateCredentialMismatch:
+                return "rejected"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(compete, (first, second), (owner, _digest("rival"))))
+        assert sorted(results) == sorted(["rejected", owner])
+    finally:
+        keys = [
+            first._foundation.config.key("schema"),
+            first._foundation.config.key("nodes:lease"),
+        ]
+        for node_id in ("node-a", "node-b", "node-c", "unknown"):
+            keys.append(first._foundation.config.key("node", first._node_digest(node_id)))
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()
+
+
+def test_registration_expiry_is_server_timed_and_recovers_capacity(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server, namespace, max_compute_nodes=1, lease_ttl_seconds=0.02
+    )
+    owner = _digest("owner")
+    try:
+        record = store.register("node-a", _capabilities(), owner)
+        server_seconds, server_micros = store._foundation.server_time()
+        assert abs(record.registered_at_epoch - (server_seconds + server_micros / 1_000_000)) < 1
+        time.sleep(0.03)
+        assert store.get("node-a") is None
+        assert store.register("node-b", _capabilities(), owner).node_id == "node-b"
+    finally:
+        keys = [
+            store._foundation.config.key("schema"),
+            store._foundation.config.key("nodes:lease"),
+            store._foundation.config.key("node", store._node_digest("node-a")),
+            store._foundation.config.key("node", store._node_digest("node-b")),
+        ]
+        store._foundation._client.delete(*keys)
+        store.close()

@@ -22,6 +22,7 @@ from valkey_relay_state import (
     ValkeySchemaIncompatibleError,
     ValkeyScriptError,
     ValkeyUnavailableError,
+    REGISTRATION_TRANSITION_SCRIPT,
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
 )
@@ -400,6 +401,64 @@ def test_retry_budget_is_total_and_deterministic():
     assert caught.value.__cause__ is None
 
 
+def test_mutating_script_transport_failure_is_not_retried():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.side_effect = redis.ConnectionError("private endpoint")
+
+    with pytest.raises(
+        ValkeyUnavailableError, match="^state backend unavailable$"
+    ) as caught:
+        foundation.execute(REGISTRATION_TRANSITION_SCRIPT.name)
+
+    foundation._client.evalsha.assert_called_once()
+    assert caught.value.__cause__ is None
+
+
+def test_read_only_script_transport_failure_retains_bounded_retry():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=2)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.side_effect = [
+        redis.ConnectionError("private endpoint"),
+        [b"1", b"2"],
+    ]
+
+    with patch("valkey_relay_state.time.sleep"):
+        assert foundation.server_time() == (1, 2)
+
+    assert foundation._client.evalsha.call_count == 2
+
+
+def test_mutating_noscript_recovery_dispatches_loaded_script_only_once():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.side_effect = [
+        redis.exceptions.NoScriptError("missing reviewed script"),
+        redis.ConnectionError("lost reply from private endpoint"),
+    ]
+    foundation._client.script_load.return_value = (
+        REGISTRATION_TRANSITION_SCRIPT.eval_sha1
+    )
+
+    with pytest.raises(ValkeyUnavailableError, match="^state backend unavailable$"):
+        foundation.execute(REGISTRATION_TRANSITION_SCRIPT.name)
+
+    assert foundation._client.evalsha.call_count == 2
+    foundation._client.script_load.assert_called_once_with(
+        REGISTRATION_TRANSITION_SCRIPT.source
+    )
+    assert foundation._client.get.call_count == 2
+
+
 def test_incompatible_execution_reads_only_manifest():
     foundation = ValkeyFoundation.__new__(ValkeyFoundation)
     foundation.config = config()
@@ -415,7 +474,7 @@ def test_incompatible_execution_reads_only_manifest():
 
 def test_second_noscript_is_a_bounded_typed_error_without_another_retry():
     foundation = ValkeyFoundation.__new__(ValkeyFoundation)
-    foundation.config = config(retry_attempts=0)
+    foundation.config = config(retry_attempts=5)
     foundation.expected_manifest = manifest()
     foundation._client = Mock()
     foundation._client.get.side_effect = [manifest().encode(), manifest().encode()]

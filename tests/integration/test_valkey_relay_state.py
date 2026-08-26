@@ -681,3 +681,72 @@ def test_expire_returns_the_records_removed_at_its_atomic_cutoff(valkey_server):
         ]
         store._foundation._client.delete(*keys)
         store.close()
+
+
+def test_unregister_lost_reply_is_ambiguous_without_replay(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    owner = _digest("owner")
+    original_evalsha = store._foundation._client.evalsha
+    dispatches = 0
+    try:
+        store.register("node-a", _capabilities(), owner)
+
+        def lose_reply(*args):
+            nonlocal dispatches
+            dispatches += 1
+            original_evalsha(*args)
+            raise redis.ConnectionError("lost reply from private endpoint")
+
+        store._foundation._client.evalsha = lose_reply
+        with pytest.raises(
+            ValkeyUnavailableError, match="^state backend unavailable$"
+        ) as caught:
+            store.unregister("node-a", owner)
+        assert dispatches == 1
+        assert caught.value.__cause__ is None
+        store._foundation._client.evalsha = original_evalsha
+        assert store.get("node-a") is None
+    finally:
+        store._foundation._client.evalsha = original_evalsha
+        store._foundation._client.delete(*_registration_keys(store, "node-a"))
+        store.close()
+
+
+def test_expire_lost_reply_does_not_consume_a_hidden_retry_batch(valkey_server):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        max_compute_nodes=2,
+        node_transition_batch_size=1,
+    )
+    owner = _digest("owner")
+    node_ids = ("node-a", "node-b")
+    original_evalsha = store._foundation._client.evalsha
+    dispatches = 0
+    try:
+        for node_id in node_ids:
+            store.register(node_id, _capabilities(), owner)
+        _mark_registrations_due(store, node_ids)
+
+        def lose_reply(*args):
+            nonlocal dispatches
+            dispatches += 1
+            original_evalsha(*args)
+            raise redis.ConnectionError("lost reply from private endpoint")
+
+        store._foundation._client.evalsha = lose_reply
+        with pytest.raises(
+            ValkeyUnavailableError, match="^state backend unavailable$"
+        ):
+            store.expire()
+        assert dispatches == 1
+
+        store._foundation._client.evalsha = original_evalsha
+        remaining = store.expire()
+        assert len(remaining) == 1
+        assert remaining[0].node_id in node_ids
+        assert store.expire() == ()
+    finally:
+        store._foundation._client.evalsha = original_evalsha
+        store._foundation._client.delete(*_registration_keys(store, *node_ids))
+        store.close()

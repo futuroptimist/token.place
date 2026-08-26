@@ -653,6 +653,19 @@ class ValkeyFoundation:
                 time.sleep(min(0.05 * (2**attempt), remaining))
         raise ValkeyUnavailableError("state backend unavailable") from None
 
+    def _call_mutating_script(self, operation: Any, *args: Any) -> Any:
+        # A lost reply may follow a committed mutation, so replay cannot be safe.
+        try:
+            return operation(*args)
+        except NoScriptError:
+            raise
+        except ResponseError as exc:
+            if "READONLY" in str(exc).upper():
+                raise ValkeyReadOnlyError("state backend is not writable") from None
+            raise ValkeyUnavailableError("state backend command failed") from None
+        except RedisError:
+            raise ValkeyUnavailableError("state backend unavailable") from None
+
     def initialize_manifest(self) -> SchemaManifest:
         # Never persist an expected value this process could not itself use.
         self.check_read_compatible(self.expected_manifest)
@@ -720,7 +733,8 @@ class ValkeyFoundation:
             if script.mutates:
                 self.check_read_compatible(manifest)
                 self.check_write_compatible(manifest)
-            result = self._call(
+            dispatch = self._call_mutating_script if script.mutates else self._call
+            result = dispatch(
                 self._client.evalsha, script.eval_sha1, len(keys), *keys, *args
             )
         except NoScriptError:
@@ -736,7 +750,8 @@ class ValkeyFoundation:
             if script.mutates:
                 self.check_write_compatible(manifest)
             try:
-                result = self._call(
+                dispatch = self._call_mutating_script if script.mutates else self._call
+                result = dispatch(
                     self._client.evalsha, script.eval_sha1, len(keys), *keys, *args
                 )
             except NoScriptError:

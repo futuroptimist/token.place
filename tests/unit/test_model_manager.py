@@ -8889,7 +8889,6 @@ def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
         'paths.models_dir': str(tmp_path),
     }.get(key, default)
     manager = ModelManager(config)
-    manager.headless_admission_fixture = True
     Path(manager.model_path).write_text('fake')
 
     class FakeTokenizer:
@@ -8901,7 +8900,6 @@ def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
             self.kwargs = dict(model_path=model_path, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=verbose)
 
         def tokenizer(self):
-            assert self._headless_admission_fixture is True
             return FakeTokenizer()
 
     with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
@@ -8921,17 +8919,37 @@ def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
 def test_headless_admission_fixture_omits_legacy_chat_format(tmp_path):
     config = MagicMock(is_production=False)
     config.get.side_effect = lambda key, default=None: {
-        'model.profile_id': 'llama-3-8b-instruct',
+        'model.profile_id': 'llama-3.1-8b-q4-k-m',
         'model.context_size': 8192,
         'model.chat_format': 'llama-3',
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }.get(key, default)
     manager = ModelManager(config)
     manager.headless_admission_fixture = True
+    Path(manager.model_path).write_text('fake')
 
-    kwargs = manager._runtime_init_kwargs(object, 0)
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            return '<fixture>'
 
-    assert 'chat_format' not in kwargs
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
+            self.kwargs = dict(model_path=model_path, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=verbose)
+
+        def tokenizer(self):
+            assert self._headless_admission_fixture is True
+            return FakeTokenizer()
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        llm = manager.get_llm_instance()
+
+    assert llm is not None
+    assert llm._headless_admission_fixture is True
+    assert 'chat_format' not in llm.kwargs
 
 
 def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):

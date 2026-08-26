@@ -3161,43 +3161,56 @@ def headless_cpu_admission(args: Any) -> int:
         print(json.dumps({"type": "headless_internal", "phase": "startup_ready"},
                          sort_keys=True, separators=(",", ":")), flush=True)
         startup_emitted = True
-        _, fixture = authoritative_readiness_fixture()
-        # Do not rely on ambient TEMP/TMP/USERPROFILE resolution: the installed
-        # package's sandboxed child process does not forward those variables,
-        # so tempfile.gettempdir() can resolve to an unwritable location there
-        # even though it works in every dev/portable context. Anchor the temp
-        # directory next to the already-validated, already-writable model
-        # path instead, and ignore Windows cleanup races if a still-running
-        # subprocess worker briefly holds a handle open inside it.
-        with tempfile.TemporaryDirectory(
-            prefix="tokenplace-headless-",
-            dir=os.path.dirname(os.path.abspath(args.model)),
-            ignore_cleanup_errors=True,
-        ) as directory:
-            request_path = os.path.join(directory, "request.json")
-            evidence_path = os.path.join(directory, "evidence.json")
-            with open(request_path, "w", encoding="utf-8") as handle:
-                json.dump(fixture, handle, sort_keys=True, separators=(",", ":"))
-            old_request = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST")
-            old_evidence = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
-            os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"] = request_path
-            os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE"] = evidence_path
-            try:
-                ready = runtime.ensure_api_v1_runtime_ready()
+        # TEMPORARY bounded diagnostic for PR #1715 (warm_load_failed root
+        # cause investigation). Tags exactly which step in this window raised
+        # and writes only that phase name plus the exception's class name
+        # (never message/args/traceback) to a file next to the already-
+        # validated, already-writable model path -- not ambient TEMP -- so
+        # the CI step and this process are guaranteed to agree on the
+        # location. Remove once root cause is confirmed/fixed.
+        model_dir = os.path.dirname(os.path.abspath(args.model))
+        diag_path = os.path.join(model_dir, "tokenplace-headless-diag.txt")
+        diag_phase = "readiness_fixture"
+        try:
+            _, fixture = authoritative_readiness_fixture()
+            with tempfile.TemporaryDirectory(
+                prefix="tokenplace-headless-", dir=model_dir,
+                ignore_cleanup_errors=True,
+            ) as directory:
+                diag_phase = "request_write"
+                request_path = os.path.join(directory, "request.json")
+                evidence_path = os.path.join(directory, "evidence.json")
+                with open(request_path, "w", encoding="utf-8") as handle:
+                    json.dump(fixture, handle, sort_keys=True, separators=(",", ":"))
+                old_request = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST")
+                old_evidence = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
+                os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"] = request_path
+                os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE"] = evidence_path
                 try:
-                    with open(evidence_path, encoding="utf-8") as handle:
-                        evidence = json.load(handle)
-                except (OSError, ValueError, TypeError):
-                    evidence = None
-            finally:
-                for name, previous in (
-                    ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", old_request),
-                    ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", old_evidence),
-                ):
-                    if previous is None:
-                        os.environ.pop(name, None)
-                    else:
-                        os.environ[name] = previous
+                    diag_phase = "ensure_api_v1_runtime_ready"
+                    ready = runtime.ensure_api_v1_runtime_ready()
+                    diag_phase = "evidence_read"
+                    try:
+                        with open(evidence_path, encoding="utf-8") as handle:
+                            evidence = json.load(handle)
+                    except (OSError, ValueError, TypeError):
+                        evidence = None
+                finally:
+                    for name, previous in (
+                        ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", old_request),
+                        ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", old_evidence),
+                    ):
+                        if previous is None:
+                            os.environ.pop(name, None)
+                        else:
+                            os.environ[name] = previous
+        except Exception as _diag_exc:
+            try:
+                with open(diag_path, "w", encoding="utf-8") as _diag_handle:
+                    _diag_handle.write(f"{diag_phase}:{type(_diag_exc).__name__}")
+            except Exception:
+                pass
+            raise
         diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
         readiness = _headless_classify_readiness(ready, diagnostics, evidence, fixture)
         if readiness != "success":

@@ -294,6 +294,24 @@ jobs:
             --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # TEMPORARY bounded diagnostic for PR #1715 (warm_load_failed root
+      # cause investigation). Prints only a phase tag and an exception class
+      # name, never a message/traceback/path. Remove once root cause is
+      # confirmed/fixed. Reads from a location derived the same way both
+      # this step and the Python process derive it (next to the tokenizer
+      # boundary model), not ambient TEMP, so the two are guaranteed to
+      # agree.
+      - name: Print bounded headless-admission diagnostic on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $diagPath = "${{ github.workspace }}/.ci-models/tokenplace-headless-diag.txt"
+          if (Test-Path $diagPath) {
+            Write-Host "headless_admission_diag_phase_and_exception_type=$(Get-Content $diagPath -Raw)"
+          } else {
+            Write-Host "headless_admission_diag_phase_and_exception_type=<no diagnostic file written>"
+          }
+
       - name: Run shared desktop parity checks (Windows)
         run: python desktop-tauri/scripts/run_desktop_parity_checks.py
 

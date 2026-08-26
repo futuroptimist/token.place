@@ -8964,10 +8964,11 @@ def test_headless_admission_fixture_uses_configured_subprocess_render_contract(
     module_path = package_dir / '__init__.py'
     module_path.write_text(
         "class Llama:\n"
+        "    metadata = {'tokenizer.chat_template': '{{ messages }}'}\n"
         "    def __init__(self, **kwargs):\n"
         "        assert 'chat_format' not in kwargs\n"
         "    def apply_chat_template(self, *args, **kwargs):\n"
-        "        raise AssertionError('metadata-free fixture must use fallback')\n"
+        "        raise AssertionError('marked fixture must use stable fallback')\n"
         "    def create_chat_completion(self, **kwargs):\n"
         "        return {'choices': [{'message': {'content': 'ok'}}]}\n"
         "    def tokenize(self, prompt, add_bos=False):\n"

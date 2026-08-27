@@ -692,11 +692,12 @@ for _, member in ipairs(lifecycle_members) do
      string.find(c, '[^0-9a-f]') or string.find(q, '[^0-9a-f]') then return {'schema'} end
   local qkey = prefix .. 'request:' .. c .. ':' .. q
   local s, node, fp = unpack(redis.call('HMGET', qkey, 'state', 'node_digest', 'fingerprint'))
-  if not s or not node then return {'schema'} end
-  if c == client and (s == 'reserved' or s == 'queued') then client_count = client_count + 1 end
+  if not s or not node or not fp or
+     (s ~= 'reserved' and s ~= 'queued' and s ~= 'claimed') then return {'schema'} end
+  if c == client and (s == 'reserved' or s == 'queued' or s == 'claimed') then client_count = client_count + 1 end
   if s == 'reserved' then node_reservations[node] = (node_reservations[node] or 0) + 1 end
-  if s == 'queued' then node_queued[node] = (node_queued[node] or 0) + 1 end
-  if fp then active_fingerprints[fp] = true end
+  if s == 'queued' or s == 'claimed' then node_queued[node] = (node_queued[node] or 0) + 1 end
+  active_fingerprints[fp] = true
 end
 if client_count >= max_client then return {'capacity'} end
 
@@ -800,7 +801,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "07c1af4c6c28550709ab634cca0cbeb4c4a5bbc75c2ecb285c2414efc9567fff",  # pragma: allowlist secret
+    "a96bbc6f3723297210c2f899fddf03af559bb37d9d052cef5901ad978cd97705",  # pragma: allowlist secret
     True,
 )
 
@@ -857,8 +858,14 @@ for _, member in ipairs(members) do
   local c, q = string.sub(member, 1, colon - 1), string.sub(member, colon + 1)
   if string.len(c) ~= 64 or string.len(q) ~= 64 or
      string.find(c, '[^0-9a-f]') or string.find(q, '[^0-9a-f]') then return {'schema'} end
-  local s = redis.call('HGET', prefix .. 'request:' .. c .. ':' .. q, 'state')
-  if s == 'queued' then queued = queued + 1; if c == client then client_queued = client_queued + 1 end end
+  local s, lifecycle_node = unpack(redis.call('HMGET',
+    prefix .. 'request:' .. c .. ':' .. q, 'state', 'node_digest'))
+  if not s or not lifecycle_node or
+     (s ~= 'reserved' and s ~= 'queued' and s ~= 'claimed') then return {'schema'} end
+  if s == 'queued' or s == 'claimed' then
+    queued = queued + 1
+    if c == client then client_queued = client_queued + 1 end
+  end
 end
 if queued >= max_queued or client_queued >= max_client then return {'capacity'} end
 local sequence = redis.call('HINCRBY', cursor, '_queue_sequence', 1)
@@ -874,7 +881,7 @@ return {'created', 'queued', values[7], tostring(sequence)}
 ENQUEUE_SCRIPT = ReviewedScript(
     "enqueue_encrypted_request_v1",
     ENQUEUE_SOURCE,
-    "b7dbb2f904fb798ce480be6e6043d984b9d6ab0f018dcafb601c691f27f19ebd",  # pragma: allowlist secret
+    "aad724c48c74c6bb83a0bf0b09ba507dbf28f95e579979755af9d4c8cdd48056",  # pragma: allowlist secret
     True,
 )
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
@@ -1856,12 +1863,11 @@ class ValkeyRegistrationStore:
                 deadline = float(raw[b"deadline"])
                 enqueued_at = float(raw[b"enqueued_at"])
                 sequence = int(raw[b"sequence"])
-                if (
-                    not math.isfinite(deadline)
-                    or deadline <= now
-                    or not math.isfinite(enqueued_at)
-                    or sequence < 1
-                ):
+                if not math.isfinite(deadline) or not math.isfinite(enqueued_at):
+                    raise ValueError
+                if deadline <= now:
+                    continue
+                if sequence < 1:
                     raise ValueError
                 envelope_value = json.loads(raw[b"envelope"])
                 envelope = EncryptedRequestEnvelope(**envelope_value)

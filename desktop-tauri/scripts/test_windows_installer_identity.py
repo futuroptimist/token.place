@@ -1031,6 +1031,20 @@ def run_headless_cpu_admission(
         if terminal is not None:
             evidence["terminal_result"] = terminal
         artifact_path.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+    # TEMPORARY bounded diagnostic for PR #1715 (warm_load_failed root cause
+    # investigation). Reads the diag file back in this same Python process
+    # (not a separate pwsh step reading a separately-derived path), using
+    # the exact same `model` Path object passed into this call, to remove
+    # any remaining doubt about cross-process/cross-step path derivation.
+    # Prints only a phase tag and an exception class name, never file
+    # contents beyond that. Removes the file after reading so it does not
+    # leak into later scenario runs. Remove once root cause is confirmed.
+    diag_path = model.parent / "tokenplace-headless-diag.txt"
+    if diag_path.is_file():
+        print(f"headless_admission_diag_same_process_read={diag_path.read_text(encoding='utf-8', errors='ignore')!r}", flush=True)
+        diag_path.unlink(missing_ok=True)
+    else:
+        print("headless_admission_diag_same_process_read=<no diagnostic file written>", flush=True)
     if error is not None:
         raise error
     assert terminal is not None
@@ -1238,36 +1252,6 @@ def run_scenario(
                         raise InstallerIdentityError(f"operator smoke did not preserve seeded config field {key}")
             validate_installed_context_tiers(shortcut.target, env, artifact_dir, scenario.name)
             if tokenizer_boundary_model is not None:
-                # TEMPORARY bounded diagnostic for PR #1715 (warm_load_failed
-                # root cause investigation). Confirms whether the installed
-                # package's bundled compute_node_bridge.py actually contains
-                # the latest source (four independent code changes have all
-                # produced byte-identical failure signatures, which is
-                # consistent with the installed package running stale
-                # sources). The first path guess (exe_dir/resources/python/...)
-                # came back path_exists=False even though the script clearly
-                # runs, so check every candidate location the Rust launcher
-                # itself tries (bridge_script_candidates_from_candidates in
-                # python_runtime.rs), in its own priority order. Prints only
-                # which basename-free candidate index matched plus booleans,
-                # never file contents or full paths.
-                exe_dir = shortcut.target.parent
-                bridge_candidates = [
-                    exe_dir / "resources" / "python" / "compute_node_bridge.py",
-                    exe_dir / "resources" / "compute_node_bridge.py",
-                    exe_dir / "python" / "compute_node_bridge.py",
-                    exe_dir / "compute_node_bridge.py",
-                ]
-                found_index = next(
-                    (i for i, c in enumerate(bridge_candidates) if c.is_file()), None)
-                marker_present = found_index is not None and "readiness_fixture" in (
-                    bridge_candidates[found_index].read_text(encoding="utf-8", errors="ignore"))
-                print(
-                    "installed_compute_node_bridge_diag "
-                    f"found_candidate_index={found_index} "
-                    f"latest_marker_present={marker_present}",
-                    flush=True,
-                )
                 run_headless_cpu_admission(
                     shortcut.target,
                     tokenizer_boundary_model,

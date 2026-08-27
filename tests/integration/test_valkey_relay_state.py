@@ -634,6 +634,126 @@ def test_missing_indexed_lifecycle_fails_closed_without_mutation(valkey_server):
         store.close()
 
 
+def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(valkey_server):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        reservation_ttl_seconds=0.03,
+        node_transition_batch_size=1,
+        max_queued_requests=1,
+        max_queued_requests_per_client=1,
+        max_queue_depth_per_node=4,
+        max_reservations=4,
+        max_reservations_per_client=4,
+        max_reservations_per_node=4,
+    )
+    cfg = store._foundation.config
+    owner = _digest("owner")
+    node = store._node_digest("node")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    identities = []
+    tokens = []
+    try:
+        store.register("node", _capabilities(concurrency=4), owner)
+        queued_deadline = time.time() + 0.08
+        queued = store.select_and_reserve(
+            "queued-client", "queued-request", "qwen3-8b-instruct", "8k-fast",
+            queued_deadline,
+        )
+        store.enqueue_encrypted_request(
+            "queued-client", "queued-request", queued.reservation_token, "node",
+            "qwen3-8b-instruct", "8k-fast", queued_deadline, envelope, "cancel",
+        )
+        identities.append(("queued-client", "queued-request"))
+        time.sleep(0.1)
+
+        replacement_deadline = time.time() + 30
+        replacement = store.select_and_reserve(
+            "queued-client", "queued-request", "qwen3-8b-instruct", "8k-fast",
+            replacement_deadline,
+        )
+        assert replacement.created
+        assert store._foundation._client.xlen(cfg.key("queue", node)) == 0
+        tokens.append(replacement.reservation_token)
+        replacement_token = _digest(replacement.reservation_token)
+        replacement_client = hashlib.sha256(b"client\0queued-client").hexdigest()
+        replacement_request = hashlib.sha256(b"request\0queued-request").hexdigest()
+        store._foundation._client.delete(
+            cfg.key("reservation", replacement_token),
+            cfg.key("request", replacement_client, replacement_request),
+        )
+        store._foundation._client.zrem(
+            cfg.key("reservations:expiry"), replacement_token
+        )
+        store._foundation._client.zrem(
+            cfg.key("requests:deadline"), replacement_client + ":" + replacement_request
+        )
+
+    finally:
+        keys = [
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node), cfg.key("queue", node),
+        ]
+        for client_public_key, request_id in identities:
+            keys.append(
+                cfg.key(
+                    "request",
+                    hashlib.sha256(f"client\0{client_public_key}".encode()).hexdigest(),
+                    hashlib.sha256(f"request\0{request_id}".encode()).hexdigest(),
+                )
+            )
+        for token in tokens:
+            if token:
+                keys.append(cfg.key("reservation", _digest(token)))
+        store._foundation._client.delete(*keys)
+        store.close()
+
+
+def test_malformed_expired_queue_authority_blocks_admission_without_mutation(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    cfg = store._foundation.config
+    owner = _digest("owner")
+    node = store._node_digest("node")
+    client = hashlib.sha256(b"client\0expired").hexdigest()
+    request = hashlib.sha256(b"request\0malformed").hexdigest()
+    request_key = cfg.key("request", client, request)
+    member = client + ":" + request
+    try:
+        store.register("node", _capabilities(), owner)
+        store._foundation._client.hset(
+            request_key,
+            mapping={
+                "state": "queued", "client": client, "request": request,
+                "node_digest": node, "deadline": time.time() - 1,
+                "queue_entry": "missing-0",
+            },
+        )
+        store._foundation._client.zadd(
+            cfg.key("requests:deadline"), {member: time.time() - 1}
+        )
+        cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.select_and_reserve(
+                "new", "request", "qwen3-8b-instruct", "8k-fast",
+                time.time() + 30,
+            )
+        assert store._foundation._client.exists(request_key)
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node), cfg.key("queue", node), request_key,
+        )
+        store.close()
+
+
 def _mark_registrations_due(store, node_ids):
     seconds, micros = store._foundation.server_time()
     cutoff = seconds + micros / 1_000_000

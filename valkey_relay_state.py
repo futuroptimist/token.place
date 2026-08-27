@@ -621,27 +621,90 @@ local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 if deadline <= now then return {'invalid'} end
 if deadline > now + tonumber(ARGV[22]) then return {'deadline_bound'} end
 
+local function reclaim(c, q)
+  local qkey = prefix .. 'request:' .. c .. ':' .. q
+  local v = redis.call('HMGET', qkey, 'state', 'client', 'request', 'node_digest',
+    'deadline', 'token_digest', 'reservation_expires', 'queue_entry')
+  local state, lifecycle_deadline = v[1], tonumber(v[5])
+  if not state then return false, nil end
+  if not v[2] or not v[3] or not v[4] or not lifecycle_deadline or
+     v[2] ~= c or v[3] ~= q or
+     (state ~= 'reserved' and state ~= 'queued' and state ~= 'claimed') then
+    return false, 'schema'
+  end
+  local indexed_deadline = redis.call('ZSCORE', deadlines, c .. ':' .. q)
+  if not indexed_deadline or math.abs(tonumber(indexed_deadline) - lifecycle_deadline) > 0.000001 then
+    return false, 'schema'
+  end
+  if state == 'queued' or state == 'claimed' then
+    if lifecycle_deadline > now then return false, nil end
+    if not v[8] or v[8] == '' then return false, 'schema' end
+    local entries = redis.call('XRANGE', prefix .. 'queue:' .. v[4], v[8], v[8], 'COUNT', 1)
+    if #entries ~= 1 or entries[1][1] ~= v[8] then return false, 'schema' end
+    local ec, eq = nil, nil
+    local fields = entries[1][2]
+    for i=1,#fields,2 do
+      if fields[i] == 'client' then ec = fields[i+1] end
+      if fields[i] == 'request' then eq = fields[i+1] end
+    end
+    if ec ~= c or eq ~= q then return false, 'schema' end
+    redis.call('XDEL', prefix .. 'queue:' .. v[4], v[8])
+  else
+    local expires = tonumber(v[7])
+    if not v[6] or not expires then return false, 'schema' end
+    if lifecycle_deadline > now and expires > now then return false, nil end
+    local indexed_expiry = redis.call('ZSCORE', expiries, v[6])
+    local rkey = prefix .. 'reservation:' .. v[6]
+    local r = redis.call('HMGET', rkey, 'client', 'request', 'node_digest',
+      'deadline', 'reservation_expires', 'token_digest')
+    for _, value in ipairs(r) do if not value then return false, 'schema' end end
+    if not indexed_expiry or math.abs(tonumber(indexed_expiry) - expires) > 0.000001 or r[1] ~= c or
+       r[2] ~= q or r[3] ~= v[4] or tonumber(r[4]) ~= lifecycle_deadline or
+       tonumber(r[5]) ~= expires or r[6] ~= v[6] then return false, 'schema' end
+    redis.call('DEL', rkey)
+    redis.call('ZREM', expiries, v[6])
+  end
+  redis.call('DEL', qkey)
+  redis.call('ZREM', deadlines, c .. ':' .. q)
+  return true, nil, v[6]
+end
+
 local expired_nodes = redis.call('ZRANGEBYSCORE', leases, '-inf', now, 'LIMIT', 0, batch)
 for _, expired_node in ipairs(expired_nodes) do
   redis.call('DEL', prefix .. 'node:' .. expired_node)
   redis.call('ZREM', leases, expired_node)
 end
 
--- The expiry member is the reservation-token digest. Cleanup is deliberately bounded.
-local due = redis.call('ZRANGEBYSCORE', expiries, '-inf', now, 'LIMIT', 0, batch)
-for _, token in ipairs(due) do
-  local rkey = prefix .. 'reservation:' .. token
-  local c, q = redis.call('HMGET', rkey, 'client', 'request')
-  if c and q then
-    local qkey = prefix .. 'request:' .. c .. ':' .. q
-    if redis.call('HGET', qkey, 'state') == 'reserved' and
-       redis.call('HGET', qkey, 'token_digest') == token then
-      redis.call('DEL', qkey)
-      redis.call('ZREM', deadlines, c .. ':' .. q)
+-- Reclaim the addressed identity independently of the bounded general backlog.
+local addressed, reclaim_error, addressed_token = reclaim(client, request)
+if reclaim_error then return {reclaim_error} end
+local cleaned = 0
+local due = redis.call('ZRANGEBYSCORE', deadlines, '-inf', now, 'LIMIT', 0, batch + 1)
+for _, member in ipairs(due) do
+  if cleaned < batch and member ~= client .. ':' .. request then
+    local colon = string.find(member, ':', 1, true)
+    if not colon then return {'schema'} end
+    local due_c, due_q = string.sub(member, 1, colon - 1), string.sub(member, colon + 1)
+    if redis.call('EXISTS', prefix .. 'request:' .. due_c .. ':' .. due_q) == 0 then
+      return {'schema'}
+    end
+    local ok, err = reclaim(due_c, due_q)
+    if err then return {err} end
+    if ok then cleaned = cleaned + 1 end
+  end
+end
+local expired = redis.call('ZRANGEBYSCORE', expiries, '-inf', now, 'LIMIT', 0, batch + 1)
+for _, token in ipairs(expired) do
+  if cleaned < batch and token ~= addressed_token then
+    local rkey = prefix .. 'reservation:' .. token
+    local c, q = redis.call('HMGET', rkey, 'client', 'request')
+    if not c or not q then return {'schema'} end
+    if c ~= client or q ~= request or not addressed then
+      local ok, err = reclaim(c, q)
+      if err then return {err} end
+      if ok then cleaned = cleaned + 1 end
     end
   end
-  redis.call('DEL', rkey)
-  redis.call('ZREM', expiries, token)
 end
 
 local state = redis.call('HGET', request_key, 'state')
@@ -801,7 +864,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "a96bbc6f3723297210c2f899fddf03af559bb37d9d052cef5901ad978cd97705",  # pragma: allowlist secret
+    "560bca396949d2ba56d5d80a1e03cfd36c0d39d8d1afaddc93b7bd2fada9e6a3",  # pragma: allowlist secret
     True,
 )
 
@@ -814,6 +877,83 @@ local max_depth, max_queued, max_client = tonumber(ARGV[10]), tonumber(ARGV[11])
 local prefix, max_lifecycles = ARGV[13], tonumber(ARGV[14])
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local batch = tonumber(ARGV[17])
+local function reclaim(c, q)
+  local qkey = prefix .. 'request:' .. c .. ':' .. q
+  local v = redis.call('HMGET', qkey, 'state', 'client', 'request', 'node_digest',
+    'deadline', 'token_digest', 'reservation_expires', 'queue_entry')
+  local lifecycle_state, lifecycle_deadline = v[1], tonumber(v[5])
+  if not lifecycle_state then return false, nil end
+  if not v[2] or not v[3] or not v[4] or not lifecycle_deadline or
+     v[2] ~= c or v[3] ~= q or
+     (lifecycle_state ~= 'reserved' and lifecycle_state ~= 'queued' and
+      lifecycle_state ~= 'claimed') then return false, 'schema' end
+  local indexed_deadline = redis.call('ZSCORE', deadlines, c .. ':' .. q)
+  if not indexed_deadline or math.abs(tonumber(indexed_deadline) - lifecycle_deadline) > 0.000001 then
+    return false, 'schema'
+  end
+  if lifecycle_state == 'queued' or lifecycle_state == 'claimed' then
+    if lifecycle_deadline > now then return false, nil end
+    if not v[8] or v[8] == '' then return false, 'schema' end
+    local entries = redis.call('XRANGE', prefix .. 'queue:' .. v[4], v[8], v[8], 'COUNT', 1)
+    if #entries ~= 1 or entries[1][1] ~= v[8] then return false, 'schema' end
+    local ec, eq = nil, nil
+    local fields = entries[1][2]
+    for i=1,#fields,2 do
+      if fields[i] == 'client' then ec = fields[i+1] end
+      if fields[i] == 'request' then eq = fields[i+1] end
+    end
+    if ec ~= c or eq ~= q then return false, 'schema' end
+    redis.call('XDEL', prefix .. 'queue:' .. v[4], v[8])
+  else
+    local expires = tonumber(v[7])
+    if not v[6] or not expires then return false, 'schema' end
+    if lifecycle_deadline > now and expires > now then return false, nil end
+    local indexed_expiry = redis.call('ZSCORE', expiries, v[6])
+    local rkey = prefix .. 'reservation:' .. v[6]
+    local r = redis.call('HMGET', rkey, 'client', 'request', 'node_digest',
+      'deadline', 'reservation_expires', 'token_digest')
+    for _, value in ipairs(r) do if not value then return false, 'schema' end end
+    if not indexed_expiry or math.abs(tonumber(indexed_expiry) - expires) > 0.000001 or r[1] ~= c or
+       r[2] ~= q or r[3] ~= v[4] or tonumber(r[4]) ~= lifecycle_deadline or
+       tonumber(r[5]) ~= expires or r[6] ~= v[6] then return false, 'schema' end
+    redis.call('DEL', rkey)
+    redis.call('ZREM', expiries, v[6])
+  end
+  redis.call('DEL', qkey)
+  redis.call('ZREM', deadlines, c .. ':' .. q)
+  return true, nil, v[6]
+end
+local addressed, reclaim_error, addressed_token = reclaim(client, request)
+if reclaim_error then return {reclaim_error} end
+local cleaned = 0
+local due = redis.call('ZRANGEBYSCORE', deadlines, '-inf', now, 'LIMIT', 0, batch + 1)
+for _, member in ipairs(due) do
+  if cleaned < batch and member ~= client .. ':' .. request then
+    local colon = string.find(member, ':', 1, true)
+    if not colon then return {'schema'} end
+    local due_c, due_q = string.sub(member, 1, colon - 1), string.sub(member, colon + 1)
+    if redis.call('EXISTS', prefix .. 'request:' .. due_c .. ':' .. due_q) == 0 then
+      return {'schema'}
+    end
+    local ok, err = reclaim(due_c, due_q)
+    if err then return {err} end
+    if ok then cleaned = cleaned + 1 end
+  end
+end
+local expired = redis.call('ZRANGEBYSCORE', expiries, '-inf', now, 'LIMIT', 0, batch + 1)
+for _, expired_token in ipairs(expired) do
+  if cleaned < batch and expired_token ~= addressed_token then
+    local c, q = redis.call('HMGET', prefix .. 'reservation:' .. expired_token,
+      'client', 'request')
+    if not c or not q then return {'schema'} end
+    if c ~= client or q ~= request or not addressed then
+      local ok, err = reclaim(c, q)
+      if err then return {err} end
+      if ok then cleaned = cleaned + 1 end
+    end
+  end
+end
 local state = redis.call('HGET', request_key, 'state')
 if state == 'queued' or state == 'claimed' then
   local values = redis.call('HMGET', request_key, 'node_digest', 'model', 'tier', 'deadline',
@@ -881,7 +1021,7 @@ return {'created', 'queued', values[7], tostring(sequence)}
 ENQUEUE_SCRIPT = ReviewedScript(
     "enqueue_encrypted_request_v1",
     ENQUEUE_SOURCE,
-    "aad724c48c74c6bb83a0bf0b09ba507dbf28f95e579979755af9d4c8cdd48056",  # pragma: allowlist secret
+    "b273d4267861d937cb7a66de9b92219a3795e93a55378047ccd24b5e182782c3",  # pragma: allowlist secret
     True,
 )
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
@@ -1690,6 +1830,7 @@ class ValkeyRegistrationStore:
             str(self.config.max_request_lifecycles).encode(),
             client_public_key.encode(),
             request_id.encode(),
+            str(self.config.node_transition_batch_size).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(ENQUEUE_SCRIPT.name, keys, args)

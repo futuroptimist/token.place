@@ -104,7 +104,8 @@ def test_headless_boundary_requires_exact_authoritative_evidence(monkeypatch):
 
 def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
                                 evidence_valid=True, mock_runtime=False,
-                                load_exception=None, cleanup_exception=None):
+                                load_exception=None, cleanup_exception=None,
+                                report_readiness_failure=True):
     """Install a minimal runtime double while retaining the real evidence validator."""
     model = tmp_path / "model.gguf"
     model.write_bytes(b"fixture")
@@ -134,6 +135,7 @@ def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
         use_mock_llm = mock_runtime
         llm = None
         last_compute_diagnostics = {}
+        last_runtime_init_error = "PRIVATE runtime path and raw exception"
         model_profile = {"provider": "qwen", "chat_template_policy": "gguf-jinja"}
 
         @staticmethod
@@ -153,10 +155,13 @@ def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
             if load_exception:
                 raise load_exception
             self.model_manager.last_compute_diagnostics = {
-                "api_v1_readiness_result": "passed" if ready else "failed",
                 "api_v1_readiness_tokenizer_render_bridge_available": ready,
                 "api_v1_readiness_prompt_tokens": 7,
             }
+            if ready or report_readiness_failure:
+                self.model_manager.last_compute_diagnostics[
+                    "api_v1_readiness_result"
+                ] = "passed" if ready else "failed"
             if ready:
                 with open(os.environ[
                     "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"
@@ -209,6 +214,31 @@ def test_headless_cpu_admission_runtime_outcomes(
         "cleanup_completed" if expected_exit == 0 else
         "warm_load_completed" if expected_exit == 6 else
         "runtime_identity_validated")
+
+
+def test_headless_cpu_admission_false_readiness_writes_bounded_diagnostic(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, ready=False, report_readiness_failure=False)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 5
+
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[-1]["failure_code"] == "warm_load_failed"
+    diagnostic = json.loads(
+        (tmp_path / "tokenplace-headless-diag.txt").read_text(encoding="utf-8")
+    )
+    assert diagnostic == {
+        "schema_version": 1,
+        "outcome": "readiness_returned_false",
+        "stage": "runtime_initialization",
+        "runtime_present": False,
+        "readiness": {},
+    }
+    serialized = json.dumps(diagnostic)
+    assert str(args.model) not in serialized
+    assert "last_runtime_init_error" not in serialized
+    assert "PRIVATE" not in serialized
 
 
 def test_headless_cpu_admission_temp_dir_avoids_ambient_temp_env(

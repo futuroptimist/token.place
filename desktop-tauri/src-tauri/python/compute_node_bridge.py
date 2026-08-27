@@ -3114,6 +3114,7 @@ def headless_cpu_admission(args: Any) -> int:
     runtime = None
     startup_emitted = False
     diag_path = None  # TEMPORARY bounded diagnostic for PR #1715, see below.
+    controlled_false_diagnostic = False
     identity_values = [os.environ.get(name, "") for name in (
         "TOKENPLACE_APP_VERSION", "TOKENPLACE_BUILD_ID", "TOKENPLACE_TARGET_TRIPLE",
         "TOKENPLACE_BUNDLED_RUNTIME_ID", "TOKENPLACE_RUNTIME_ID")]
@@ -3190,6 +3191,34 @@ def headless_cpu_admission(args: Any) -> int:
                 try:
                     diag_phase = "ensure_api_v1_runtime_ready"
                     ready = runtime.ensure_api_v1_runtime_ready()
+                    if ready is False:
+                        readiness_diagnostics = _safe_readiness_diagnostics(manager)
+                        validation = getattr(manager, "last_model_artifact_validation", None)
+                        if isinstance(validation, dict) and validation.get("valid") is False:
+                            failure_stage = "model_preflight"
+                        elif readiness_diagnostics.get("api_v1_readiness_result") == "failed":
+                            failure_stage = "authoritative_admission"
+                        elif getattr(manager, "llm", None) is None:
+                            failure_stage = "runtime_initialization"
+                        else:
+                            failure_stage = "unclassified"
+                        controlled_false_diagnostic = True
+                        try:
+                            with open(diag_path, "w", encoding="utf-8") as diag_handle:
+                                json.dump(
+                                    {
+                                        "schema_version": 1,
+                                        "outcome": "readiness_returned_false",
+                                        "stage": failure_stage,
+                                        "runtime_present": getattr(manager, "llm", None) is not None,
+                                        "readiness": readiness_diagnostics,
+                                    },
+                                    diag_handle,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
+                        except Exception:
+                            pass
                     diag_phase = "evidence_read"
                     try:
                         with open(evidence_path, encoding="utf-8") as handle:
@@ -3295,7 +3324,8 @@ def headless_cpu_admission(args: Any) -> int:
             result.update(success=False, failure_code="cleanup_failed")
         elif result["success"]:
             result["last_completed_phase"] = "cleanup_completed"
-        elif result.get("failure_code") == "warm_load_failed" and diag_pre_cleanup:
+        elif (result.get("failure_code") == "warm_load_failed"
+              and diag_pre_cleanup and not controlled_false_diagnostic):
             result["failure_code"] = (
                 "packaged_runtime_identity_failed" if diag_post_cleanup
                 else "unsupported_backend"

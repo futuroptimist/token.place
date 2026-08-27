@@ -618,8 +618,6 @@ local max_res, max_client, max_node, max_depth, max_lifecycles,
   tonumber(ARGV[18]), tonumber(ARGV[19])
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
-if deadline <= now then return {'invalid'} end
-if deadline > now + tonumber(ARGV[22]) then return {'deadline_bound'} end
 
 local function reclaim(c, q)
   local qkey = prefix .. 'request:' .. c .. ':' .. q
@@ -706,6 +704,9 @@ for _, token in ipairs(expired) do
     end
   end
 end
+
+if deadline <= now then return {'invalid'} end
+if deadline > now + tonumber(ARGV[22]) then return {'deadline_bound'} end
 
 local state = redis.call('HGET', request_key, 'state')
 if state then
@@ -864,7 +865,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "560bca396949d2ba56d5d80a1e03cfd36c0d39d8d1afaddc93b7bd2fada9e6a3",  # pragma: allowlist secret
+    "f8e168ee03d0843225e8443bc16ddce2da878044c1499f09961cab83996e20ec",  # pragma: allowlist secret
     True,
 )
 

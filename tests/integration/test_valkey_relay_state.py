@@ -19,6 +19,7 @@ from relay_state_store import (
     EncryptedRequestEnvelope,
     RelayStateCapacityExceeded,
     RelayStateCredentialMismatch,
+    RelayStateInvalidReservation,
     RelayStateNoCapacity,
     RelayStateStoreConfig,
     SchedulerNodeState,
@@ -634,7 +635,10 @@ def test_missing_indexed_lifecycle_fails_closed_without_mutation(valkey_server):
         store.close()
 
 
-def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(valkey_server):
+@pytest.mark.parametrize("state", ["queued", "claimed"])
+def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(
+    valkey_server, state
+):
     store = _registration_store(
         valkey_server,
         uuid.uuid4().hex,
@@ -654,10 +658,10 @@ def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(valkey_serve
         "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
     )
     identities = []
-    tokens = []
     try:
         store.register("node", _capabilities(concurrency=4), owner)
-        queued_deadline = time.time() + 0.08
+        seconds, micros = store._foundation.server_time()
+        queued_deadline = seconds + micros / 1_000_000 + 30
         queued = store.select_and_reserve(
             "queued-client", "queued-request", "qwen3-8b-instruct", "8k-fast",
             queued_deadline,
@@ -667,29 +671,31 @@ def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(valkey_serve
             "qwen3-8b-instruct", "8k-fast", queued_deadline, envelope, "cancel",
         )
         identities.append(("queued-client", "queued-request"))
-        time.sleep(0.1)
+        client = hashlib.sha256(b"client\0queued-client").hexdigest()
+        request = hashlib.sha256(b"request\0queued-request").hexdigest()
+        request_key = cfg.key("request", client, request)
+        expired_deadline = seconds + micros / 1_000_000 - 1
+        store._foundation._client.hset(
+            request_key, mapping={"state": state, "deadline": expired_deadline}
+        )
+        store._foundation._client.zadd(
+            cfg.key("requests:deadline"), {client + ":" + request: expired_deadline}
+        )
+        cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
 
-        replacement_deadline = time.time() + 30
-        replacement = store.select_and_reserve(
-            "queued-client", "queued-request", "qwen3-8b-instruct", "8k-fast",
-            replacement_deadline,
-        )
-        assert replacement.created
+        with pytest.raises(RelayStateInvalidReservation):
+            store.select_and_reserve(
+                "queued-client", "queued-request", "qwen3-8b-instruct",
+                "8k-fast", expired_deadline,
+            )
+
         assert store._foundation._client.xlen(cfg.key("queue", node)) == 0
-        tokens.append(replacement.reservation_token)
-        replacement_token = _digest(replacement.reservation_token)
-        replacement_client = hashlib.sha256(b"client\0queued-client").hexdigest()
-        replacement_request = hashlib.sha256(b"request\0queued-request").hexdigest()
-        store._foundation._client.delete(
-            cfg.key("reservation", replacement_token),
-            cfg.key("request", replacement_client, replacement_request),
-        )
-        store._foundation._client.zrem(
-            cfg.key("reservations:expiry"), replacement_token
-        )
-        store._foundation._client.zrem(
-            cfg.key("requests:deadline"), replacement_client + ":" + replacement_request
-        )
+        assert not store._foundation._client.exists(request_key)
+        assert store._foundation._client.zscore(
+            cfg.key("requests:deadline"), client + ":" + request
+        ) is None
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
 
     finally:
         keys = [
@@ -705,9 +711,6 @@ def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(valkey_serve
                     hashlib.sha256(f"request\0{request_id}".encode()).hexdigest(),
                 )
             )
-        for token in tokens:
-            if token:
-                keys.append(cfg.key("reservation", _digest(token)))
         store._foundation._client.delete(*keys)
         store.close()
 
@@ -751,6 +754,80 @@ def test_malformed_expired_queue_authority_blocks_admission_without_mutation(
             cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
             cfg.key("node", node), cfg.key("queue", node), request_key,
         )
+        store.close()
+
+
+def test_expired_addressed_reservation_is_reclaimed_beyond_cleanup_batch(
+    valkey_server,
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, node_transition_batch_size=1,
+        max_reservations=4, max_reservations_per_client=4,
+        max_reservations_per_node=4,
+    )
+    cfg = store._foundation.config
+    owner = _digest("owner")
+    node = store._node_digest("node")
+    records = []
+    try:
+        store.register("node", _capabilities(concurrency=4), owner)
+        seconds, micros = store._foundation.server_time()
+        future = seconds + micros / 1_000_000 + 30
+        for index in range(3):
+            client_name, request_name = f"client-{index}", f"request-{index}"
+            result = store.select_and_reserve(
+                client_name, request_name, "qwen3-8b-instruct", "8k-fast", future
+            )
+            client = hashlib.sha256(f"client\0{client_name}".encode()).hexdigest()
+            request = hashlib.sha256(f"request\0{request_name}".encode()).hexdigest()
+            token = _digest(result.reservation_token)
+            records.append((client_name, request_name, client, request, token))
+
+        expired = seconds + micros / 1_000_000 - 1
+        for offset, (_, _, client, request, token) in enumerate(records):
+            score = expired - (len(records) - offset)
+            store._foundation._client.hset(
+                cfg.key("request", client, request),
+                mapping={"deadline": score, "reservation_expires": score},
+            )
+            store._foundation._client.hset(
+                cfg.key("reservation", token),
+                mapping={"deadline": score, "reservation_expires": score},
+            )
+            store._foundation._client.zadd(
+                cfg.key("requests:deadline"), {client + ":" + request: score}
+            )
+            store._foundation._client.zadd(
+                cfg.key("reservations:expiry"), {token: score}
+            )
+
+        cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
+        target = records[-1]
+        target_deadline = expired - 1
+        with pytest.raises(RelayStateInvalidReservation):
+            store.select_and_reserve(
+                target[0], target[1], "qwen3-8b-instruct", "8k-fast",
+                target_deadline,
+            )
+
+        assert not store._foundation._client.exists(
+            cfg.key("request", target[2], target[3]),
+            cfg.key("reservation", target[4]),
+        )
+        assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 1
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 1
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+    finally:
+        keys = [
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node), cfg.key("queue", node),
+        ]
+        for _, _, client, request, token in records:
+            keys.extend(
+                [cfg.key("request", client, request), cfg.key("reservation", token)]
+            )
+        store._foundation._client.delete(*keys)
         store.close()
 
 

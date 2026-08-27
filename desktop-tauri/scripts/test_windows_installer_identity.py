@@ -1241,19 +1241,30 @@ def run_scenario(
                 # TEMPORARY bounded diagnostic for PR #1715 (warm_load_failed
                 # root cause investigation). Confirms whether the installed
                 # package's bundled compute_node_bridge.py actually contains
-                # the latest source (three independent code changes have all
+                # the latest source (four independent code changes have all
                 # produced byte-identical failure signatures, which is
                 # consistent with the installed package running stale
-                # sources). Prints only booleans, never file contents.
-                # Remove once root cause is confirmed/fixed.
-                bridge_script = shortcut.target.parent / "resources" / "python" / "compute_node_bridge.py"
-                marker_present = (
-                    bridge_script.is_file()
-                    and "readiness_fixture" in bridge_script.read_text(encoding="utf-8", errors="ignore")
-                )
+                # sources). The first path guess (exe_dir/resources/python/...)
+                # came back path_exists=False even though the script clearly
+                # runs, so check every candidate location the Rust launcher
+                # itself tries (bridge_script_candidates_from_candidates in
+                # python_runtime.rs), in its own priority order. Prints only
+                # which basename-free candidate index matched plus booleans,
+                # never file contents or full paths.
+                exe_dir = shortcut.target.parent
+                bridge_candidates = [
+                    exe_dir / "resources" / "python" / "compute_node_bridge.py",
+                    exe_dir / "resources" / "compute_node_bridge.py",
+                    exe_dir / "python" / "compute_node_bridge.py",
+                    exe_dir / "compute_node_bridge.py",
+                ]
+                found_index = next(
+                    (i for i, c in enumerate(bridge_candidates) if c.is_file()), None)
+                marker_present = found_index is not None and "readiness_fixture" in (
+                    bridge_candidates[found_index].read_text(encoding="utf-8", errors="ignore"))
                 print(
                     "installed_compute_node_bridge_diag "
-                    f"path_exists={bridge_script.is_file()} "
+                    f"found_candidate_index={found_index} "
                     f"latest_marker_present={marker_present}",
                     flush=True,
                 )

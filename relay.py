@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from release_metadata import get_release_metadata, resolve_asset_version
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
-from prometheus_client import Counter, REGISTRY
+from prometheus_client import Counter, Gauge, REGISTRY
 from werkzeug.serving import make_server
 
 # Logging --------------------------------------------------------------------
@@ -411,6 +411,48 @@ def _get_request_counter() -> Counter:
 REQUEST_COUNTER = _get_request_counter()
 
 
+def _get_gauge(name: str, description: str, labelnames: tuple[str, ...] = ()) -> Gauge:
+    """Create a relay gauge while remaining safe when the module is reloaded."""
+
+    existing = getattr(REGISTRY, "_names_to_collectors", {}).get(name)
+    if existing is not None:
+        return existing  # type: ignore[return-value]
+    return Gauge(name, description, labelnames)
+
+
+BUILD_INFO = _get_gauge(
+    "tokenplace_build_info",
+    "token.place relay build metadata.",
+    ("version", "revision"),
+)
+INSTRUMENTATION_UP = _get_gauge(
+    "tokenplace_instrumentation_up",
+    "Whether relay metrics instrumentation initialized successfully.",
+)
+COMPUTE_NODES_REGISTERED = _get_gauge(
+    "tokenplace_compute_nodes_registered",
+    "Registered API v1 compute nodes.",
+)
+COMPUTE_NODES_HEALTHY = _get_gauge(
+    "tokenplace_compute_nodes_healthy",
+    "Healthy API v1 compute nodes using relay lease semantics.",
+)
+
+try:
+    _build_metadata = get_release_metadata(None)
+    BUILD_INFO.labels(
+        _build_metadata.get("version", "dev"),
+        _build_metadata.get("ref") or _build_metadata.get("version", "dev"),
+    ).set(1)
+    INSTRUMENTATION_UP.set(1)
+except Exception:  # pragma: no cover - defensive instrumentation initialization
+    INSTRUMENTATION_UP.set(0)
+    LOGGER.error(
+        "metrics.initialization_failed",
+        extra={"reason": "initialization_failed"},
+    )
+
+
 def _load_server_registration_tokens():
     """Return configured relay server registration tokens."""
 
@@ -490,6 +532,60 @@ DEFAULT_API_V1_POLL_WAIT_SECONDS = 10
 API_V1_LEASE_SECONDS_ENV = "TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS"
 DEFAULT_API_V1_LEASE_SECONDS = 30
 API_V1_IN_FLIGHT_TTL_SECONDS_ENV = "TOKEN_PLACE_API_V1_IN_FLIGHT_TTL_SECONDS"
+
+
+def _metrics_token_is_valid() -> bool:
+    """Validate the optional metrics bearer token without leaking its value."""
+
+    configured_token = os.environ.get("TOKENPLACE_METRICS_TOKEN", "")
+    if not configured_token:
+        return True
+    authorization = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return False
+    candidate = authorization[len(prefix):]
+    return bool(candidate) and secrets.compare_digest(candidate, configured_token)
+
+
+def _api_v1_node_is_healthy(payload: dict[str, Any], now_monotonic: float) -> bool:
+    """Apply the existing API v1 lease extensions without mutating relay state."""
+
+    polling_until = payload.get("polling_until_monotonic")
+    if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
+        return True
+
+    in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
+    if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
+        return True
+
+    in_flight_requests = payload.get("api_v1_in_flight_requests")
+    if isinstance(in_flight_requests, dict):
+        for entry in in_flight_requests.values():
+            expires_at = entry.get("expires_at") if isinstance(entry, dict) else entry
+            if isinstance(expires_at, (int, float)) and expires_at > now_monotonic:
+                return True
+
+    stale_after = payload.get("last_ping_duration", _server_stale_seconds())
+    if not isinstance(stale_after, (int, float)):
+        stale_after = _server_stale_seconds()
+    return _server_ping_age_seconds(payload.get("last_ping")) <= max(float(stale_after), 1.0)
+
+
+def _update_compute_node_metrics() -> None:
+    """Snapshot authoritative API v1 registrations into read-only gauges."""
+
+    now_monotonic = time.monotonic()
+    with server_round_robin_lock:
+        api_v1_payloads = [
+            dict(payload)
+            for payload in known_servers.values()
+            if isinstance(payload, dict) and bool(payload.get(API_V1_SERVER_MARKER))
+        ]
+    COMPUTE_NODES_REGISTERED.set(len(api_v1_payloads))
+    COMPUTE_NODES_HEALTHY.set(
+        sum(_api_v1_node_is_healthy(payload, now_monotonic) for payload in api_v1_payloads)
+    )
 
 
 def _server_ping_age_seconds(last_ping: Any) -> float:
@@ -759,6 +855,22 @@ def _can_resolve_gpu_host(hostname: str) -> bool:
 def _record_request_start():
     g.request_start_time = time.time()
     g.request_id = request.headers.get("X-Request-Id") or secrets.token_hex(8)
+    if request.path.rstrip("/") == "/metrics":
+        if not _metrics_token_is_valid():
+            return Response(
+                "Unauthorized\n",
+                status=401,
+                headers={"WWW-Authenticate": "Bearer"},
+                mimetype="text/plain",
+            )
+        try:
+            _update_compute_node_metrics()
+        except Exception:  # pragma: no cover - defensive scrape failure
+            LOGGER.error(
+                "metrics.collection_failed",
+                extra={"reason": "collection_failed"},
+            )
+            return Response("metrics unavailable\n", status=503, mimetype="text/plain")
 
 
 @app.after_request

@@ -3226,7 +3226,18 @@ def headless_cpu_admission(args: Any) -> int:
                 with open(diag_path, "w", encoding="utf-8") as _diag_handle:
                     _diag_handle.write(f"{diag_phase}:{type(_diag_exc).__name__}")
             except Exception:
-                pass
+                # TEMPORARY bounded diagnostic for PR #1715: the file-based
+                # side channel has never once been observed on hosted
+                # Windows despite an equivalent local reproduction proving
+                # the write succeeds there. Rather than add a fifth variant
+                # of "write somewhere and hope it is found," make the write
+                # failing itself unambiguously visible through the existing
+                # strict protocol: mock_runtime_rejected/exit 4 is otherwise
+                # unreachable this late in the function, so its appearance
+                # here (instead of the normal warm_load_failed/exit 7) is
+                # conclusive proof the write itself is what is failing.
+                result["failure_code"] = "mock_runtime_rejected"
+                return 4
             raise
     except Exception:
         if not startup_emitted:

@@ -845,8 +845,9 @@ local function decimal_lte(left, right)
   return string.len(left) < string.len(right) or
     (string.len(left) == string.len(right) and left <= right)
 end
-if (count_raw and (not string.match(count_raw, '^%d+$') or not cursor_count)) or
+if (count_raw and (not canonical_decimal(count_raw) or not cursor_count)) or
    cursor_count < 0 or cursor_count > max_fingerprints or
+   (cursor_count == 0 and activity_raw and activity_raw ~= '0') or
    (cursor_count > 0 and not activity_raw) or
    (activity_raw and (not canonical_decimal(activity_raw) or
     not decimal_lte(activity_raw, '9223372036854775806'))) then
@@ -920,7 +921,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "bab6da698ab7cf9efdca981d005a7cbfb1fe7fccb8e4741405a16d5570f5de62",  # pragma: allowlist secret
+    "1dc7d0952fe4c080e42fc94ec5dd2da3aaa66cd9fcb4edf4fff95755f3a322a0",  # pragma: allowlist secret
     True,
 )
 

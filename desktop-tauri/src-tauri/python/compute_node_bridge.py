@@ -3222,20 +3222,34 @@ def headless_cpu_admission(args: Any) -> int:
                           authoritative_evidence_result="validated")
             return 0
         except Exception as _diag_exc:
+            # TEMPORARY bounded diagnostic for PR #1715: the file-based side
+            # channel has never once been observed downstream on hosted
+            # Windows despite an equivalent local reproduction proving the
+            # write succeeds there, and despite this same write never
+            # raising on hosted Windows either (ruled out via a dedicated
+            # exit-4 signal on an earlier commit). Narrow the timing window
+            # to its tightest possible point: verify the write is visible
+            # to THIS SAME PROCESS microseconds later, before anything else
+            # (cleanup, another process, real-time AV scanning) gets a
+            # chance to interfere. If even this immediate self-read
+            # disagrees with what was just written, that is unambiguous
+            # proof of something acting on the file within this process's
+            # own execution, not a downstream/cross-process timing issue.
+            expected_diag_content = f"{diag_phase}:{type(_diag_exc).__name__}"
+            self_check_ok = False
             try:
                 with open(diag_path, "w", encoding="utf-8") as _diag_handle:
-                    _diag_handle.write(f"{diag_phase}:{type(_diag_exc).__name__}")
+                    _diag_handle.write(expected_diag_content)
+                with open(diag_path, encoding="utf-8") as _diag_verify:
+                    self_check_ok = _diag_verify.read() == expected_diag_content
             except Exception:
-                # TEMPORARY bounded diagnostic for PR #1715: the file-based
-                # side channel has never once been observed on hosted
-                # Windows despite an equivalent local reproduction proving
-                # the write succeeds there. Rather than add a fifth variant
-                # of "write somewhere and hope it is found," make the write
-                # failing itself unambiguously visible through the existing
-                # strict protocol: mock_runtime_rejected/exit 4 is otherwise
-                # unreachable this late in the function, so its appearance
-                # here (instead of the normal warm_load_failed/exit 7) is
-                # conclusive proof the write itself is what is failing.
+                self_check_ok = False
+            if not self_check_ok:
+                # mock_runtime_rejected/exit 4 is otherwise unreachable this
+                # late in the function, so its appearance here (instead of
+                # the normal warm_load_failed/exit 7) is conclusive proof
+                # the file is not durably visible even to this same process
+                # immediately after writing it.
                 result["failure_code"] = "mock_runtime_rejected"
                 return 4
             raise

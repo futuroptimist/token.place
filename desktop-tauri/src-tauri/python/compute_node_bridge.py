@@ -3245,12 +3245,38 @@ def headless_cpu_admission(args: Any) -> int:
             except Exception:
                 self_check_ok = False
             if not self_check_ok:
-                # mock_runtime_rejected/exit 4 is otherwise unreachable this
-                # late in the function, so its appearance here (instead of
-                # the normal warm_load_failed/exit 7) is conclusive proof
-                # the file is not durably visible even to this same process
-                # immediately after writing it.
+                # failure_code (forwarded verbatim by the Rust supervisor,
+                # unlike exit_code which it normalizes to a fixed 0/7) is
+                # otherwise unreachable as mock_runtime_rejected this late
+                # in the function, so its appearance here (instead of the
+                # normal warm_load_failed) is conclusive proof the file is
+                # not durably visible even to this same process immediately
+                # after writing it.
                 result["failure_code"] = "mock_runtime_rejected"
+                return 4
+            # The write and an immediate read-back both succeed, yet every
+            # downstream reader (this same process moments later with
+            # retries, and a separate CI step) has never once found the
+            # file. Monitor its survival within this process's own
+            # remaining lifetime, before cleanup/exit, to bucket how long it
+            # lasts. Each failure_code below is otherwise unreachable this
+            # late in the function -- reused only as a labeled bucket, not
+            # for its normal meaning.
+            survived_ms = 0
+            vanished_bucket = None
+            for _check in range(20):
+                time.sleep(0.05)
+                survived_ms += 50
+                if not os.path.isfile(diag_path):
+                    if survived_ms <= 150:
+                        vanished_bucket = "invalid_arguments"
+                    elif survived_ms <= 500:
+                        vanished_bucket = "unsupported_backend"
+                    else:
+                        vanished_bucket = "packaged_runtime_identity_failed"
+                    break
+            if vanished_bucket is not None:
+                result["failure_code"] = vanished_bucket
                 return 4
             raise
     except Exception:

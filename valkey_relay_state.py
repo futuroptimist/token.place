@@ -835,34 +835,60 @@ if previous then
   end
 end
 
+local count_raw = redis.call('HGET', cursor, '_count')
+local cursor_count = count_raw and tonumber(count_raw) or 0
+local activity_raw = redis.call('HGET', cursor, '_activity')
+if (count_raw and (not string.match(count_raw, '^%d+$') or not cursor_count)) or
+   cursor_count < 0 or cursor_count > max_fingerprints or
+   (activity_raw and (not string.match(activity_raw, '^%d+$') or not tonumber(activity_raw))) then
+  return {'schema'}
+end
+local occupied, free_slot, fingerprint_slot = 0, nil, nil
+local indexed = {}
+for slot=1,max_fingerprints do
+  local slot_field = '_fp:' .. slot
+  local fp = redis.call('HGET', cursor, slot_field)
+  if fp then
+    if string.len(fp) ~= 64 or string.find(fp, '[^0-9a-f]') or indexed[fp] then
+      return {'schema'}
+    end
+    local mapping, fp_activity = unpack(redis.call('HMGET', cursor, fp, 'a:' .. fp))
+    if not mapping or string.len(mapping) ~= 64 or string.find(mapping, '[^0-9a-f]') or
+       not fp_activity or not string.match(fp_activity, '^%d+$') or not tonumber(fp_activity) then
+      return {'schema'}
+    end
+    indexed[fp], occupied = true, occupied + 1
+    if fp == fingerprint then fingerprint_slot = slot_field end
+  elseif not free_slot then
+    free_slot = slot_field
+  end
+end
+if occupied ~= cursor_count or (previous and not fingerprint_slot) or
+   (not previous and (fingerprint_slot or redis.call('HGET', cursor, 'a:' .. fingerprint))) then
+  return {'schema'}
+end
+
+local selected_slot = fingerprint_slot
 if not previous then
-  local cursor_count = tonumber(redis.call('HGET', cursor, '_count') or '0')
   if cursor_count >= max_fingerprints then
-    local oldest_fp, oldest_activity = nil, nil
-    local scan_cursor, inspected = '0', 0
-    repeat
-      local scan = redis.call('HSCAN', cursor, scan_cursor, 'MATCH', 'a:*',
-        'COUNT', max_fingerprints + 1)
-      scan_cursor = scan[1]
-      local all = scan[2]
-      inspected = inspected + #all / 2
-      if inspected > max_fingerprints then return {'capacity'} end
-      for i=1,#all,2 do
-        local field = all[i]
-        if string.sub(field, 1, 2) == 'a:' then
-          local fp = string.sub(field, 3)
-          local activity = tonumber(all[i+1])
-          if not activity then return {'schema'} end
-          if not active_fingerprints[fp] and (not oldest_activity or activity < oldest_activity or
-             (activity == oldest_activity and fp < oldest_fp)) then
-            oldest_fp, oldest_activity = fp, activity
-          end
-        end
+    local oldest_fp, oldest_activity, oldest_slot = nil, nil, nil
+    for slot=1,max_fingerprints do
+      local slot_field = '_fp:' .. slot
+      local fp = redis.call('HGET', cursor, slot_field)
+      local activity = tonumber(redis.call('HGET', cursor, 'a:' .. fp))
+      if not active_fingerprints[fp] and (not oldest_activity or activity < oldest_activity or
+         (activity == oldest_activity and fp < oldest_fp)) then
+        oldest_fp, oldest_activity, oldest_slot = fp, activity, slot_field
       end
-    until scan_cursor == '0'
+    end
     if not oldest_fp then return {'capacity'} end
     redis.call('HDEL', cursor, oldest_fp, 'a:' .. oldest_fp)
-  else redis.call('HINCRBY', cursor, '_count', 1) end
+    selected_slot = oldest_slot
+  else
+    if not free_slot then return {'schema'} end
+    redis.call('HINCRBY', cursor, '_count', 1)
+    selected_slot = free_slot
+  end
 end
 local expires = math.min(now + ttl, deadline)
 redis.call('HSET', reservation_key, 'client', client, 'request', request,
@@ -876,14 +902,15 @@ redis.call('HSET', request_key, 'state', 'reserved', 'client', client, 'request'
 redis.call('ZADD', expiries, expires, token_digest)
 redis.call('ZADD', deadlines, deadline, client .. ':' .. request)
 local activity = redis.call('HINCRBY', cursor, '_activity', 1)
-redis.call('HSET', cursor, fingerprint, selected[4], 'a:' .. fingerprint, activity)
+redis.call('HSET', cursor, fingerprint, selected[4], 'a:' .. fingerprint, activity,
+  selected_slot, fingerprint)
 return {'created', selected[5], tostring(expires)}
 """
 
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "48e10734e3c6c90cf1a8d4cccf87c5ee012ec281f052675b89440b27efcc2a96",  # pragma: allowlist secret
+    "4c6fb792ea7e1f3405dcc572169d7e92e19aedd893a6b3b0de0efcdbdc628e80",  # pragma: allowlist secret
     True,
 )
 

@@ -379,6 +379,156 @@ def test_scheduler_reservation_and_enqueue_are_shared_and_idempotent(valkey_serv
         second.close()
 
 
+@pytest.mark.parametrize(
+    ("activities", "expected_evicted"),
+    [((1, 2), "alpha"), ((1, 1), "alpha")],
+)
+def test_cursor_fingerprint_index_preserves_additive_fields_and_evicts_deterministically(
+    valkey_server, activities, expected_evicted
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=2
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    fingerprints = {name: _digest(name) for name in ("alpha", "beta")}
+    deadline = time.time() + 30
+    selected = None
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        store._foundation._client.hset(
+            cfg.key("node", node_digest),
+            "supported_model_ids",
+            '["qwen3-8b-instruct","new-model"]',
+        )
+        additive = {f"additive:{index}": f"value-{index}" for index in range(1_000)}
+        metadata = {"_count": 2, "_activity": 2, "_fp:1": fingerprints["alpha"],
+                    "_fp:2": fingerprints["beta"], **additive}
+        for index, name in enumerate(("alpha", "beta")):
+            metadata[fingerprints[name]] = node_digest
+            metadata["a:" + fingerprints[name]] = activities[index]
+        store._foundation._client.hset(cursor, mapping=metadata)
+
+        selected = store.select_and_reserve(
+            "client", "request", "new-model", "8k-fast", deadline
+        )
+        new_fingerprint = _digest("new-model\x008k-fast")
+        evicted = fingerprints[expected_evicted]
+        assert store._foundation._client.hmget(cursor, *additive) == [
+            value.encode() for value in additive.values()
+        ]
+        assert store._foundation._client.hget(cursor, evicted) is None
+        assert store._foundation._client.hget(cursor, "a:" + evicted) is None
+        assert new_fingerprint.encode() in store._foundation._client.hmget(
+            cursor, "_fp:1", "_fp:2"
+        )
+    finally:
+        token = (_digest(selected.reservation_token) if selected and
+                 selected.reservation_token else _digest("unused"))
+        client, request = store._identity("client", "request")
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("reservation", token),
+        )
+        store.close()
+
+
+def test_cursor_fingerprint_index_protects_active_fingerprints(valkey_server):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=2
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    active, inactive = _digest("active"), _digest("inactive")
+    active_client, active_request = _digest("active-client"), _digest("active-request")
+    active_key = cfg.key("request", active_client, active_request)
+    deadline = time.time() + 30
+    selected = None
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        store._foundation._client.hset(
+            cfg.key("node", node_digest), "supported_model_ids",
+            '["qwen3-8b-instruct","new-model"]',
+        )
+        store._foundation._client.hset(cursor, mapping={
+            "_count": 2, "_activity": 2, "_fp:1": active, "_fp:2": inactive,
+            active: node_digest, "a:" + active: 1,
+            inactive: node_digest, "a:" + inactive: 2,
+        })
+        store._foundation._client.hset(
+            active_key,
+            mapping={"state": "reserved", "node_digest": node_digest,
+                     "fingerprint": active},
+        )
+        store._foundation._client.zadd(
+            cfg.key("requests:deadline"),
+            {active_client + ":" + active_request: deadline},
+        )
+
+        selected = store.select_and_reserve(
+            "client", "request", "new-model", "8k-fast", deadline
+        )
+        assert store._foundation._client.hget(cursor, active) == node_digest.encode()
+        assert store._foundation._client.hget(cursor, inactive) is None
+    finally:
+        token = (_digest(selected.reservation_token) if selected and
+                 selected.reservation_token else _digest("unused"))
+        client, request = store._identity("client", "request")
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest), active_key,
+            cfg.key("request", client, request), cfg.key("reservation", token),
+        )
+        store.close()
+
+
+@pytest.mark.parametrize("corruption", ["count", "duplicate", "mapping", "activity"])
+def test_cursor_fingerprint_index_malformed_metadata_fails_without_mutation(
+    valkey_server, corruption
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=2
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    first, second = _digest("first"), _digest("second")
+    deadline = time.time() + 30
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        metadata = {"_count": 2, "_activity": 2, "_fp:1": first,
+                    "_fp:2": second, first: node_digest, second: node_digest,
+                    "a:" + first: 1, "a:" + second: 2, "additive": "kept"}
+        if corruption == "count": metadata["_count"] = 1
+        if corruption == "duplicate": metadata["_fp:2"] = first
+        if corruption == "mapping": del metadata[first]
+        if corruption == "activity": metadata["a:" + first] = "bad"
+        store._foundation._client.hset(cursor, mapping=metadata)
+        before = store._foundation._client.hgetall(cursor)
+        client, request = store._identity("client", "request")
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.select_and_reserve(
+                "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+        assert store._foundation._client.hgetall(cursor) == before
+        assert not store._foundation._client.exists(cfg.key("request", client, request))
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+        assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 0
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+        )
+        store.close()
+
+
 @pytest.mark.parametrize("state", ["queued", "claimed"])
 @pytest.mark.parametrize("corruption", ["missing", "wrong_identity"])
 def test_idempotent_retries_require_exact_stream_authority(

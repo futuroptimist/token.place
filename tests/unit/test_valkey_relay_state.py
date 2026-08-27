@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import math
+import re
 import traceback
 from unittest.mock import Mock, patch
 
@@ -75,6 +76,16 @@ def registration_store_with_foundation(foundation):
     store._foundation = foundation
     store._config = RelayStateStoreConfig(namespace="testing.unit")
     return store
+
+
+def test_select_script_contains_no_scan_commands():
+    assert (
+        re.search(
+            r"redis\.call\(['\"](?:HSCAN|SCAN|KEYS)['\"]",
+            valkey_relay_state.SELECT_AND_RESERVE_SOURCE,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

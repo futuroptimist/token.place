@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from release_metadata import get_release_metadata, resolve_asset_version
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
-from prometheus_client import Counter, REGISTRY
+from prometheus_client import Counter, Gauge, REGISTRY
 from werkzeug.serving import make_server
 
 # Logging --------------------------------------------------------------------
@@ -411,6 +411,53 @@ def _get_request_counter() -> Counter:
 REQUEST_COUNTER = _get_request_counter()
 
 
+def _get_gauge(name: str, description: str, labelnames: tuple[str, ...] = ()) -> Gauge:
+    """Return a process-wide gauge without duplicating exporter collectors."""
+
+    existing = getattr(REGISTRY, "_names_to_collectors", {}).get(name)
+    if existing is not None:
+        return existing  # type: ignore[return-value]
+    return Gauge(name, description, labelnames)
+
+
+BUILD_INFO = _get_gauge(
+    "tokenplace_build_info",
+    "token.place relay build metadata.",
+    ("version", "revision"),
+)
+INSTRUMENTATION_UP = _get_gauge(
+    "tokenplace_instrumentation_up",
+    "Whether relay metrics instrumentation initialized.",
+)
+COMPUTE_NODES_REGISTERED = _get_gauge(
+    "tokenplace_compute_nodes_registered",
+    "Registered API v1 compute nodes.",
+)
+COMPUTE_NODES_HEALTHY = _get_gauge(
+    "tokenplace_compute_nodes_healthy",
+    "Healthy API v1 compute nodes using relay lease semantics.",
+)
+
+
+def _initialize_metrics() -> None:
+    metadata = get_release_metadata(None)
+    BUILD_INFO.labels(
+        metadata.get("version", "dev"),
+        metadata.get("ref") or metadata.get("version") or "unknown",
+    ).set(1)
+    COMPUTE_NODES_REGISTERED.set(0)
+    COMPUTE_NODES_HEALTHY.set(0)
+    INSTRUMENTATION_UP.set(1)
+
+
+try:
+    INSTRUMENTATION_UP.set(0)
+    _initialize_metrics()
+except Exception:  # pragma: no cover - defensive instrumentation boundary
+    LOGGER.error("metrics.initialization_failed", extra={"reason": "initialization_failed"})
+    INSTRUMENTATION_UP.set(0)
+
+
 def _load_server_registration_tokens():
     """Return configured relay server registration tokens."""
 
@@ -508,6 +555,41 @@ def _server_stale_seconds() -> int:
     except ValueError:
         return DEFAULT_SERVER_STALE_SECONDS
     return max(value, 1)
+
+
+def _api_v1_node_is_healthy(payload: dict[str, Any]) -> bool:
+    """Apply the existing API v1 registration lease without mutating state."""
+
+    stale_after = payload.get("last_ping_duration", _server_stale_seconds())
+    if not isinstance(stale_after, (int, float)):
+        stale_after = _server_stale_seconds()
+    return _server_ping_age_seconds(payload.get("last_ping")) <= max(float(stale_after), 1.0)
+
+
+def _update_compute_node_gauges() -> None:
+    """Snapshot authoritative API v1 registrations for a read-only scrape."""
+
+    with server_round_robin_lock:
+        api_v1_nodes = [
+            dict(payload)
+            for payload in known_servers.values()
+            if isinstance(payload, dict) and bool(payload.get(API_V1_SERVER_MARKER))
+        ]
+    COMPUTE_NODES_REGISTERED.set(len(api_v1_nodes))
+    COMPUTE_NODES_HEALTHY.set(sum(_api_v1_node_is_healthy(payload) for payload in api_v1_nodes))
+
+
+def _metrics_token_is_valid() -> bool:
+    """Preserve open metrics unless an explicit bearer token is configured."""
+
+    configured_token = os.environ.get("TOKENPLACE_METRICS_TOKEN", "")
+    if not configured_token:
+        return True
+    authorization = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return False
+    return secrets.compare_digest(authorization[len(prefix):], configured_token)
 
 
 def _api_v1_poll_wait_seconds() -> float:
@@ -759,6 +841,16 @@ def _can_resolve_gpu_host(hostname: str) -> bool:
 def _record_request_start():
     g.request_start_time = time.time()
     g.request_id = request.headers.get("X-Request-Id") or secrets.token_hex(8)
+    if request.path.rstrip("/") != "/metrics":
+        return None
+    if not _metrics_token_is_valid():
+        return Response("unauthorized\n", status=401, mimetype="text/plain")
+    try:
+        _update_compute_node_gauges()
+    except Exception:  # pragma: no cover - defensive instrumentation boundary
+        LOGGER.error("metrics.collection_failed", extra={"reason": "collection_failed"})
+        return Response("metrics unavailable\n", status=503, mimetype="text/plain")
+    return None
 
 
 @app.after_request

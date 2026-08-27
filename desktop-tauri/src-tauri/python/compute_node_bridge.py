@@ -3113,6 +3113,7 @@ def headless_cpu_admission(args: Any) -> int:
                               identity=False, warm_load="not_started", evidence=False)
     runtime = None
     startup_emitted = False
+    diag_path = None  # TEMPORARY bounded diagnostic for PR #1715, see below.
     identity_values = [os.environ.get(name, "") for name in (
         "TOKENPLACE_APP_VERSION", "TOKENPLACE_BUILD_ID", "TOKENPLACE_TARGET_TRIPLE",
         "TOKENPLACE_BUNDLED_RUNTIME_ID", "TOKENPLACE_RUNTIME_ID")]
@@ -3254,30 +3255,12 @@ def headless_cpu_admission(args: Any) -> int:
                 # after writing it.
                 result["failure_code"] = "mock_runtime_rejected"
                 return 4
-            # The write and an immediate read-back both succeed, yet every
-            # downstream reader (this same process moments later with
-            # retries, and a separate CI step) has never once found the
-            # file. Monitor its survival within this process's own
-            # remaining lifetime, before cleanup/exit, to bucket how long it
-            # lasts. Each failure_code below is otherwise unreachable this
-            # late in the function -- reused only as a labeled bucket, not
-            # for its normal meaning.
-            survived_ms = 0
-            vanished_bucket = None
-            for _check in range(20):
-                time.sleep(0.05)
-                survived_ms += 50
-                if not os.path.isfile(diag_path):
-                    if survived_ms <= 150:
-                        vanished_bucket = "invalid_arguments"
-                    elif survived_ms <= 500:
-                        vanished_bucket = "unsupported_backend"
-                    else:
-                        vanished_bucket = "packaged_runtime_identity_failed"
-                    break
-            if vanished_bucket is not None:
-                result["failure_code"] = vanished_bucket
-                return 4
+            # Confirmed (previous commit): the write and an immediate
+            # read-back succeed, and the file survives a full ~1s monitored
+            # window within this process's own execution -- it is not being
+            # removed near-instantly by something reacting to the write
+            # itself. See the finally block below for the next check: does
+            # it survive past runtime.stop()/_close_llm_proxy cleanup too?
             raise
     except Exception:
         if not startup_emitted:
@@ -3287,6 +3270,14 @@ def headless_cpu_admission(args: Any) -> int:
         return 7
     finally:
         cleanup_ok = True
+        # TEMPORARY bounded diagnostic for PR #1715: the diag file is known
+        # (previous commit) to survive a full ~1s monitored window inside
+        # this process before this point is ever reached. Check whether it
+        # survives runtime.stop()/_close_llm_proxy cleanup too, using two
+        # more failure_code values that are otherwise unreachable when the
+        # underlying result is warm_load_failed (both booleans, never a
+        # path or content).
+        diag_pre_cleanup = diag_path is not None and os.path.isfile(diag_path)
         if runtime is not None:
             try:
                 runtime.stop(shutdown_deadline=time.monotonic() + 2.0)
@@ -3299,10 +3290,16 @@ def headless_cpu_admission(args: Any) -> int:
                     manager.llm = None
             except Exception:
                 cleanup_ok = False
+        diag_post_cleanup = diag_path is not None and os.path.isfile(diag_path)
         if not cleanup_ok:
             result.update(success=False, failure_code="cleanup_failed")
         elif result["success"]:
             result["last_completed_phase"] = "cleanup_completed"
+        elif result.get("failure_code") == "warm_load_failed" and diag_pre_cleanup:
+            result["failure_code"] = (
+                "packaged_runtime_identity_failed" if diag_post_cleanup
+                else "unsupported_backend"
+            )
         print(json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
         if not cleanup_ok:
             return 8

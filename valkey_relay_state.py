@@ -619,6 +619,20 @@ local max_res, max_client, max_node, max_depth, max_lifecycles,
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 
+local function valid_queue_authority(c, q, node_digest, entry)
+  if not node_digest or node_digest == '' or not entry or entry == '' then return false end
+  local entries = redis.call('XRANGE', prefix .. 'queue:' .. node_digest,
+    entry, entry, 'COUNT', 1)
+  if #entries ~= 1 or entries[1][1] ~= entry then return false end
+  local ec, eq = nil, nil
+  local fields = entries[1][2]
+  for i=1,#fields,2 do
+    if fields[i] == 'client' then ec = fields[i+1] end
+    if fields[i] == 'request' then eq = fields[i+1] end
+  end
+  return ec == c and eq == q
+end
+
 local function reclaim(c, q)
   local qkey = prefix .. 'request:' .. c .. ':' .. q
   local v = redis.call('HMGET', qkey, 'state', 'client', 'request', 'node_digest',
@@ -711,7 +725,8 @@ if deadline > now + tonumber(ARGV[22]) then return {'deadline_bound'} end
 local state = redis.call('HGET', request_key, 'state')
 if state then
   local values = redis.call('HMGET', request_key, 'model', 'tier', 'deadline',
-    'cancellation_digest', 'node_id', 'reservation_expires', 'token_digest')
+    'cancellation_digest', 'node_id', 'reservation_expires', 'token_digest',
+    'node_digest', 'queue_entry')
   if values[1] ~= model or values[2] ~= tier or tonumber(values[3]) ~= deadline then
     return {'conflict'}
   end
@@ -736,6 +751,9 @@ if state then
   if state == 'queued' or state == 'claimed' then
     if cancel ~= '' and values[4] and values[4] ~= '' and values[4] ~= cancel then
       return {'conflict'}
+    end
+    if not valid_queue_authority(client, request, values[8], values[9]) then
+      return {'schema'}
     end
     return {'existing', values[5], '', state}
   end
@@ -865,7 +883,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "f8e168ee03d0843225e8443bc16ddce2da878044c1499f09961cab83996e20ec",  # pragma: allowlist secret
+    "48e10734e3c6c90cf1a8d4cccf87c5ee012ec281f052675b89440b27efcc2a96",  # pragma: allowlist secret
     True,
 )
 
@@ -879,6 +897,19 @@ local prefix, max_lifecycles = ARGV[13], tonumber(ARGV[14])
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 local batch = tonumber(ARGV[17])
+local function valid_queue_authority(c, q, queued_node, entry)
+  if not queued_node or queued_node == '' or not entry or entry == '' then return false end
+  local entries = redis.call('XRANGE', prefix .. 'queue:' .. queued_node,
+    entry, entry, 'COUNT', 1)
+  if #entries ~= 1 or entries[1][1] ~= entry then return false end
+  local ec, eq = nil, nil
+  local fields = entries[1][2]
+  for i=1,#fields,2 do
+    if fields[i] == 'client' then ec = fields[i+1] end
+    if fields[i] == 'request' then eq = fields[i+1] end
+  end
+  return ec == c and eq == q
+end
 local function reclaim(c, q)
   local qkey = prefix .. 'request:' .. c .. ':' .. q
   local v = redis.call('HMGET', qkey, 'state', 'client', 'request', 'node_digest',
@@ -958,11 +989,15 @@ end
 local state = redis.call('HGET', request_key, 'state')
 if state == 'queued' or state == 'claimed' then
   local values = redis.call('HMGET', request_key, 'node_digest', 'model', 'tier', 'deadline',
-    'token_digest', 'cancellation_digest', 'envelope', 'sequence', 'node_id')
+    'token_digest', 'cancellation_digest', 'envelope', 'sequence', 'node_id',
+    'queue_entry')
   if values[1] ~= node_digest or values[2] ~= model or values[3] ~= tier or
      tonumber(values[4]) ~= deadline or values[7] ~= envelope_json or
      values[6] ~= cancel_digest then return {'conflict'} end
   if values[5] ~= token_digest then return {'invalid'} end
+  if not valid_queue_authority(client, request, values[1], values[10]) then
+    return {'schema'}
+  end
   return {'existing', state, values[9], values[8]}
 end
 if state ~= 'reserved' or deadline <= now then return {'invalid'} end
@@ -1022,7 +1057,7 @@ return {'created', 'queued', values[7], tostring(sequence)}
 ENQUEUE_SCRIPT = ReviewedScript(
     "enqueue_encrypted_request_v1",
     ENQUEUE_SOURCE,
-    "b273d4267861d937cb7a66de9b92219a3795e93a55378047ccd24b5e182782c3",  # pragma: allowlist secret
+    "7506042454cbe0deabd9066f16510c297352e9b1a26f0cc385a79314d84c6888",  # pragma: allowlist secret
     True,
 )
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(

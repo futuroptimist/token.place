@@ -379,6 +379,88 @@ def test_scheduler_reservation_and_enqueue_are_shared_and_idempotent(valkey_serv
         second.close()
 
 
+@pytest.mark.parametrize("state", ["queued", "claimed"])
+@pytest.mark.parametrize("corruption", ["missing", "wrong_identity"])
+def test_idempotent_retries_require_exact_stream_authority(
+    valkey_server, state, corruption
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner = _digest("owner")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    deadline = time.time() + 30
+    selected = None
+    cfg = first._foundation.config
+    client, request = first._identity("client", "request")
+    node = first._node_digest("node")
+    request_key = cfg.key("request", client, request)
+    queue_key = cfg.key("queue", node)
+    try:
+        first.register("node", _capabilities(), owner)
+        selected = first.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        queued = first.enqueue_encrypted_request(
+            "client", "request", selected.reservation_token, "node",
+            "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel",
+        )
+        entry = first._foundation._client.hget(request_key, "queue_entry")
+        assert entry is not None
+        if state == "claimed":
+            first._foundation._client.hset(request_key, "state", "claimed")
+
+        cursor_before = first._foundation._client.hgetall(cfg.key("cursor"))
+        node_before = first._foundation._client.hgetall(cfg.key("node", node))
+        assert not second.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+        ).created
+        assert not second.enqueue_encrypted_request(
+            "client", "request", selected.reservation_token, "node",
+            "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel",
+        ).created
+        assert first._foundation._client.xlen(queue_key) == 1
+        assert queued.sequence == 1
+
+        if corruption == "missing":
+            assert first._foundation._client.xdel(queue_key, entry) == 1
+        else:
+            wrong = first._foundation._client.xadd(
+                queue_key, {"client": _digest("wrong"), "request": request}
+            )
+            first._foundation._client.hset(request_key, "queue_entry", wrong)
+        lifecycle_before = first._foundation._client.hgetall(request_key)
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            second.select_and_reserve(
+                "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            second.enqueue_encrypted_request(
+                "client", "request", selected.reservation_token, "node",
+                "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel",
+            )
+        assert first._foundation._client.hgetall(request_key) == lifecycle_before
+        assert first._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+        assert first._foundation._client.hgetall(cfg.key("node", node)) == node_before
+    finally:
+        token = (
+            hashlib.sha256(selected.reservation_token.encode("ascii")).hexdigest()
+            if selected is not None and selected.reservation_token is not None
+            else "unused"
+        )
+        first._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node), queue_key, request_key,
+            cfg.key("reservation", token),
+        )
+        first.close()
+        second.close()
+
+
 def test_registration_renew_backfills_additive_scheduler_fields(valkey_server):
     store = _registration_store(valkey_server, uuid.uuid4().hex)
     owner = _digest("owner")

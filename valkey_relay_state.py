@@ -838,9 +838,18 @@ end
 local count_raw = redis.call('HGET', cursor, '_count')
 local cursor_count = count_raw and tonumber(count_raw) or 0
 local activity_raw = redis.call('HGET', cursor, '_activity')
+local function canonical_decimal(value)
+  return value and (value == '0' or string.match(value, '^[1-9]%d*$'))
+end
+local function decimal_lte(left, right)
+  return string.len(left) < string.len(right) or
+    (string.len(left) == string.len(right) and left <= right)
+end
 if (count_raw and (not string.match(count_raw, '^%d+$') or not cursor_count)) or
    cursor_count < 0 or cursor_count > max_fingerprints or
-   (activity_raw and (not string.match(activity_raw, '^%d+$') or not tonumber(activity_raw))) then
+   (cursor_count > 0 and not activity_raw) or
+   (activity_raw and (not canonical_decimal(activity_raw) or
+    not decimal_lte(activity_raw, '9223372036854775806'))) then
   return {'schema'}
 end
 local occupied, free_slot, fingerprint_slot = 0, nil, nil
@@ -854,7 +863,8 @@ for slot=1,max_fingerprints do
     end
     local mapping, fp_activity = unpack(redis.call('HMGET', cursor, fp, 'a:' .. fp))
     if not mapping or string.len(mapping) ~= 64 or string.find(mapping, '[^0-9a-f]') or
-       not fp_activity or not string.match(fp_activity, '^%d+$') or not tonumber(fp_activity) then
+       not activity_raw or not canonical_decimal(fp_activity) or fp_activity == '0' or
+       not decimal_lte(fp_activity, activity_raw) then
       return {'schema'}
     end
     indexed[fp], occupied = true, occupied + 1
@@ -910,7 +920,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "4c6fb792ea7e1f3405dcc572169d7e92e19aedd893a6b3b0de0efcdbdc628e80",  # pragma: allowlist secret
+    "bab6da698ab7cf9efdca981d005a7cbfb1fe7fccb8e4741405a16d5570f5de62",  # pragma: allowlist secret
     True,
 )
 

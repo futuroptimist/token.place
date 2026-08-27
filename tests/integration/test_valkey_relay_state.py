@@ -403,7 +403,11 @@ def test_registration_renew_backfills_additive_scheduler_fields(valkey_server):
             "node", owner, SchedulerNodeState(healthy=True, claimed_work=0)
         )
     finally:
-        keys = list(store._foundation._client.scan_iter(store._foundation.config.key_prefix + "*"))
+        keys = list(
+            store._foundation._client.scan_iter(
+                store._foundation.config.key_prefix + "*"
+            )
+        )
         if keys:
             store._foundation._client.delete(*keys)
         store.close()
@@ -427,8 +431,15 @@ def test_enqueue_counts_queued_requests_hidden_by_earlier_reservations(valkey_se
             "client-a", "queued", "qwen3-8b-instruct", "8k-fast", late_deadline
         )
         store.enqueue_encrypted_request(
-            "client-a", "queued", queued.reservation_token, "node",
-            "qwen3-8b-instruct", "8k-fast", late_deadline, envelope, "cancel-a"
+            "client-a",
+            "queued",
+            queued.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            late_deadline,
+            envelope,
+            "cancel-a",
         )
         early_deadline = time.time() + 30
         reserved = store.select_and_reserve(
@@ -437,11 +448,22 @@ def test_enqueue_counts_queued_requests_hidden_by_earlier_reservations(valkey_se
 
         with pytest.raises(RelayStateNoCapacity, match="^no scheduler capacity$"):
             store.enqueue_encrypted_request(
-                "client-b", "reserved", reserved.reservation_token, "node",
-                "qwen3-8b-instruct", "8k-fast", early_deadline, envelope, "cancel-b"
+                "client-b",
+                "reserved",
+                reserved.reservation_token,
+                "node",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                early_deadline,
+                envelope,
+                "cancel-b",
             )
     finally:
-        keys = list(store._foundation._client.scan_iter(store._foundation.config.key_prefix + "*"))
+        keys = list(
+            store._foundation._client.scan_iter(
+                store._foundation.config.key_prefix + "*"
+            )
+        )
         if keys:
             store._foundation._client.delete(*keys)
         store.close()
@@ -665,6 +687,7 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
         b"scheduler_healthy",
         b"scheduler_draining",
         b"scheduler_claimed_work",
+        b"registration_order",
     }
     forbidden = (
         raw_credential.encode(),

@@ -459,7 +459,7 @@ SERVER_TIME_SCRIPT = ReviewedScript(
 )
 
 REGISTRATION_TRANSITION_SOURCE = """\
-local leases, node = KEYS[1], KEYS[2]
+local leases, node, cursor = KEYS[1], KEYS[2], KEYS[3]
 local prefix, operation, digest, owner = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
 local ttl, capacity, batch = tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7])
 local t = redis.call('TIME')
@@ -543,6 +543,14 @@ if operation == 'register' or operation == 'renew' then
   redis.call('HSETNX', node, 'scheduler_healthy', '1')
   redis.call('HSETNX', node, 'scheduler_draining', '0')
   redis.call('HSETNX', node, 'scheduler_claimed_work', '0')
+  -- Registration order is allocated once and is independent of wall-clock time.
+  -- HSETNX preserves it across renewal and capability replacement, including
+  -- records produced by the preceding compatible writer.
+  local registration_order = redis.call('HGET', node, 'registration_order')
+  if not registration_order then
+    registration_order = redis.call('HINCRBY', cursor, '_registration_sequence', 1)
+    redis.call('HSETNX', node, 'registration_order', registration_order)
+  end
   redis.call('HSET', node, 'lease_expires_at_epoch', deadline)
   redis.call('ZADD', leases, deadline, digest)
   local record = fixed_record(node)
@@ -564,7 +572,7 @@ return {'invalid'}
 REGISTRATION_TRANSITION_SCRIPT = ReviewedScript(
     "registration_transition_v1",
     REGISTRATION_TRANSITION_SOURCE,
-    "2a4e0fd177d7c247ed71d8d11dc564d67c213c3c03ff156100b4304d8551110f",  # pragma: allowlist secret
+    "ce651ae95d14c5980782937816e5d10c628c3ce4663f0a85f7d0470c3988e092",  # pragma: allowlist secret
     True,
 )
 
@@ -611,7 +619,7 @@ local max_res, max_client, max_node, max_depth, max_lifecycles,
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 if deadline <= now then return {'invalid'} end
-if deadline > now + tonumber(ARGV[24]) then return {'deadline_bound'} end
+if deadline > now + tonumber(ARGV[22]) then return {'deadline_bound'} end
 
 local expired_nodes = redis.call('ZRANGEBYSCORE', leases, '-inf', now, 'LIMIT', 0, batch)
 for _, expired_node in ipairs(expired_nodes) do
@@ -639,12 +647,26 @@ end
 local state = redis.call('HGET', request_key, 'state')
 if state then
   local values = redis.call('HMGET', request_key, 'model', 'tier', 'deadline',
-    'cancellation_digest', 'node_id', 'reservation_expires')
+    'cancellation_digest', 'node_id', 'reservation_expires', 'token_digest')
   if values[1] ~= model or values[2] ~= tier or tonumber(values[3]) ~= deadline then
     return {'conflict'}
   end
   if state == 'reserved' then
-    if values[4] and values[4] ~= '' and values[4] ~= cancel then return {'conflict'} end
+    if cancel ~= '' and values[4] and values[4] ~= '' and values[4] ~= cancel then
+      return {'conflict'}
+    end
+    if not values[7] or not values[6] or tonumber(values[6]) <= now then return {'schema'} end
+    local indexed = redis.call('ZSCORE', expiries, values[7])
+    local authority_key = prefix .. 'reservation:' .. values[7]
+    local authority = redis.call('HMGET', authority_key, 'client', 'request', 'node_id',
+      'model', 'tier', 'deadline', 'reservation_expires', 'token_digest',
+      'cancellation_digest')
+    for _, value in ipairs(authority) do if not value then return {'schema'} end end
+    if not indexed or tonumber(indexed) ~= tonumber(values[6]) or
+       authority[1] ~= client or authority[2] ~= request or authority[3] ~= values[5] or
+       authority[4] ~= model or authority[5] ~= tier or tonumber(authority[6]) ~= deadline or
+       tonumber(authority[7]) ~= tonumber(values[6]) or authority[8] ~= values[7] or
+       authority[9] ~= values[4] then return {'schema'} end
     return {'existing', values[5], values[6], 'reserved'}
   end
   if state == 'queued' or state == 'claimed' then
@@ -666,6 +688,8 @@ for _, member in ipairs(lifecycle_members) do
   local colon = string.find(member, ':', 1, true)
   if not colon then return {'schema'} end
   local c, q = string.sub(member, 1, colon - 1), string.sub(member, colon + 1)
+  if string.len(c) ~= 64 or string.len(q) ~= 64 or
+     string.find(c, '[^0-9a-f]') or string.find(q, '[^0-9a-f]') then return {'schema'} end
   local qkey = prefix .. 'request:' .. c .. ':' .. q
   local s, node, fp = unpack(redis.call('HMGET', qkey, 'state', 'node_digest', 'fingerprint'))
   if not s or not node then return {'schema'} end
@@ -683,7 +707,7 @@ for _, node_digest in ipairs(candidates) do
   local nkey = prefix .. 'node:' .. node_digest
   local values = redis.call('HMGET', nkey, 'node_id', 'supported_model_ids',
     'active_context_tier', 'maximum_total_context_tokens', 'max_concurrency',
-    'registered_at_epoch', 'scheduler_healthy', 'scheduler_draining',
+    'registration_order', 'scheduler_healthy', 'scheduler_draining',
     'scheduler_claimed_work')
   local complete = true
   for _, value in ipairs(values) do if not value then complete = false end end
@@ -721,8 +745,10 @@ end
 local previous = redis.call('HGET', cursor, fingerprint)
 local selected = tied[1]
 if previous then
-  for index, item in ipairs(tied) do
-    if item[4] == previous then selected = tied[(index % #tied) + 1]; break end
+  local previous_order = tonumber(redis.call('HGET', prefix .. 'node:' .. previous,
+    'registration_order') or '-1')
+  for _, item in ipairs(tied) do
+    if item[3] > previous_order then selected = item; break end
   end
 end
 
@@ -730,30 +756,40 @@ if not previous then
   local cursor_count = tonumber(redis.call('HGET', cursor, '_count') or '0')
   if cursor_count >= max_fingerprints then
     local oldest_fp, oldest_activity = nil, nil
-    local all = redis.call('HGETALL', cursor)
-    for i=1,#all,2 do
-      local field = all[i]
-      if string.sub(field, 1, 2) == 'a:' then
-        local fp = string.sub(field, 3)
-        local activity = tonumber(all[i+1])
-        if not active_fingerprints[fp] and (not oldest_activity or activity < oldest_activity or
-           (activity == oldest_activity and fp < oldest_fp)) then
-          oldest_fp, oldest_activity = fp, activity
+    local scan_cursor, inspected = '0', 0
+    repeat
+      local scan = redis.call('HSCAN', cursor, scan_cursor, 'MATCH', 'a:*',
+        'COUNT', max_fingerprints + 1)
+      scan_cursor = scan[1]
+      local all = scan[2]
+      inspected = inspected + #all / 2
+      if inspected > max_fingerprints then return {'capacity'} end
+      for i=1,#all,2 do
+        local field = all[i]
+        if string.sub(field, 1, 2) == 'a:' then
+          local fp = string.sub(field, 3)
+          local activity = tonumber(all[i+1])
+          if not activity then return {'schema'} end
+          if not active_fingerprints[fp] and (not oldest_activity or activity < oldest_activity or
+             (activity == oldest_activity and fp < oldest_fp)) then
+            oldest_fp, oldest_activity = fp, activity
+          end
         end
       end
-    end
+    until scan_cursor == '0'
     if not oldest_fp then return {'capacity'} end
     redis.call('HDEL', cursor, oldest_fp, 'a:' .. oldest_fp)
   else redis.call('HINCRBY', cursor, '_count', 1) end
 end
 local expires = math.min(now + ttl, deadline)
 redis.call('HSET', reservation_key, 'client', client, 'request', request,
-  'node_digest', selected[4], 'token_digest', token_digest)
+  'fingerprint', fingerprint, 'node_digest', selected[4], 'node_id', selected[5],
+  'model', model, 'tier', tier, 'deadline', deadline, 'reservation_expires', expires,
+  'token_digest', token_digest, 'cancellation_digest', cancel)
 redis.call('HSET', request_key, 'state', 'reserved', 'client', client, 'request', request,
   'node_digest', selected[4], 'node_id', selected[5], 'model', model, 'tier', tier,
   'deadline', deadline, 'reservation_expires', expires, 'token_digest', token_digest,
-  'cancellation_digest', cancel, 'fingerprint', fingerprint,
-  'client_public_key', ARGV[22], 'request_id', ARGV[23])
+  'cancellation_digest', cancel, 'fingerprint', fingerprint)
 redis.call('ZADD', expiries, expires, token_digest)
 redis.call('ZADD', deadlines, deadline, client .. ':' .. request)
 local activity = redis.call('HINCRBY', cursor, '_activity', 1)
@@ -764,7 +800,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "eb9a5fec3e6f2b97455172956c7c6afdb1a1160efaf58ff141ff9c448d100265",  # pragma: allowlist secret
+    "07c1af4c6c28550709ab634cca0cbeb4c4a5bbc75c2ecb285c2414efc9567fff",  # pragma: allowlist secret
     True,
 )
 
@@ -793,7 +829,19 @@ local values = redis.call('HMGET', request_key, 'node_digest', 'model', 'tier', 
 if values[1] ~= node_digest or values[2] ~= model or values[3] ~= tier or
    tonumber(values[4]) ~= deadline or values[5] ~= token_digest then return {'invalid'} end
 if values[6] ~= '' and values[6] ~= cancel_digest then return {'conflict'} end
-if tonumber(values[8]) <= now or redis.call('ZSCORE', expiries, token_digest) == false or
+local authority = redis.call('HMGET', reservation_key, 'client', 'request', 'node_digest',
+  'node_id', 'model', 'tier', 'deadline', 'reservation_expires', 'token_digest',
+  'cancellation_digest')
+for _, value in ipairs(authority) do if not value then return {'invalid'} end end
+if authority[1] ~= client or authority[2] ~= request or authority[3] ~= node_digest or
+   authority[4] ~= values[7] or authority[5] ~= model or authority[6] ~= tier or
+   tonumber(authority[7]) ~= deadline or authority[9] ~= token_digest or
+   authority[10] ~= values[6] or tonumber(authority[8]) ~= tonumber(values[8]) then
+  return {'invalid'}
+end
+local indexed_expiry = redis.call('ZSCORE', expiries, token_digest)
+if tonumber(values[8]) <= now or not indexed_expiry or
+   tonumber(indexed_expiry) ~= tonumber(values[8]) or
    redis.call('ZSCORE', leases, node_digest) == false or
    tonumber(redis.call('ZSCORE', leases, node_digest)) <= now or redis.call('EXISTS', node) == 0 then
   return {'invalid'}
@@ -807,6 +855,8 @@ for _, member in ipairs(members) do
   local colon = string.find(member, ':', 1, true)
   if not colon then return {'schema'} end
   local c, q = string.sub(member, 1, colon - 1), string.sub(member, colon + 1)
+  if string.len(c) ~= 64 or string.len(q) ~= 64 or
+     string.find(c, '[^0-9a-f]') or string.find(q, '[^0-9a-f]') then return {'schema'} end
   local s = redis.call('HGET', prefix .. 'request:' .. c .. ':' .. q, 'state')
   if s == 'queued' then queued = queued + 1; if c == client then client_queued = client_queued + 1 end end
 end
@@ -814,7 +864,8 @@ if queued >= max_queued or client_queued >= max_client then return {'capacity'} 
 local sequence = redis.call('HINCRBY', cursor, '_queue_sequence', 1)
 local entry = redis.call('XADD', queue, sequence .. '-0', 'client', client, 'request', request)
 redis.call('HSET', request_key, 'state', 'queued', 'cancellation_digest', cancel_digest,
-  'envelope', envelope_json, 'enqueued_at', now, 'sequence', sequence, 'queue_entry', entry)
+  'envelope', envelope_json, 'enqueued_at', now, 'sequence', sequence, 'queue_entry', entry,
+  'client_public_key', ARGV[15], 'request_id', ARGV[16])
 redis.call('DEL', reservation_key)
 redis.call('ZREM', expiries, token_digest)
 return {'created', 'queued', values[7], tostring(sequence)}
@@ -823,7 +874,7 @@ return {'created', 'queued', values[7], tostring(sequence)}
 ENQUEUE_SCRIPT = ReviewedScript(
     "enqueue_encrypted_request_v1",
     ENQUEUE_SOURCE,
-    "685ad30988bf2dc0622c30b31425b24d0fe8a9bbf23cae329cc1a43b06305103",  # pragma: allowlist secret
+    "b7dbb2f904fb798ce480be6e6043d984b9d6ab0f018dcafb601c691f27f19ebd",  # pragma: allowlist secret
     True,
 )
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
@@ -1151,6 +1202,7 @@ class ValkeyRegistrationStore:
         return (
             cfg.key("nodes:lease"),
             cfg.key("node", digest),
+            cfg.key("cursor"),
         )
 
     def _transition(
@@ -1528,8 +1580,6 @@ class ValkeyRegistrationStore:
             str(self.config.max_compute_nodes).encode(),
             str(self.config.node_transition_batch_size).encode(),
             *tier_bounds,
-            client_public_key.encode(),
-            request_id.encode(),
             repr(float(self.config.max_request_ttl_seconds)).encode(),
         )
         status, values = self._ascii_status(
@@ -1631,6 +1681,8 @@ class ValkeyRegistrationStore:
             str(self.config.max_queued_requests_per_client).encode(),
             cfg.key_prefix.encode(),
             str(self.config.max_request_lifecycles).encode(),
+            client_public_key.encode(),
+            request_id.encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(ENQUEUE_SCRIPT.name, keys, args)
@@ -1683,22 +1735,16 @@ class ValkeyRegistrationStore:
             token = self._decode_text(raw_token)
             if not _SHA256_RE.fullmatch(token):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
-            reservation = self._foundation._call(
-                self._foundation._client.hmget,
-                cfg.key("reservation", token),
-                (b"client", b"request"),
-            )
-            if not isinstance(reservation, list) or any(
-                not isinstance(value, bytes) for value in reservation
-            ):
-                raise ValkeySchemaIncompatibleError("state schema incompatible")
             raw = self._foundation._call(
                 self._foundation._client.hmget,
-                cfg.key(
-                    "request", *(self._decode_text(value) for value in reservation)
-                ),
+                cfg.key("reservation", token),
                 fields,
             )
+            # A cleanup transition may legitimately remove the hash after the
+            # bounded index snapshot. Treat an entirely absent record as gone,
+            # while malformed or partially present authority fails closed.
+            if isinstance(raw, list) and raw and all(value is None for value in raw):
+                continue
             if (
                 not isinstance(raw, list)
                 or len(raw) != len(fields)
@@ -1708,13 +1754,23 @@ class ValkeyRegistrationStore:
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             value = dict(zip(fields, raw))
             try:
+                decoded = [self._decode_text(value[field]) for field in fields[:6]]
+                deadline = float(value[b"deadline"])
+                expires = float(value[b"reservation_expires"])
+                stored_token = self._decode_text(value[b"token_digest"])
+                if (
+                    any(not _SHA256_RE.fullmatch(item) for item in decoded[:3])
+                    or not _SHA256_RE.fullmatch(stored_token)
+                    or stored_token != token
+                    or not math.isfinite(deadline)
+                    or not math.isfinite(expires)
+                    or expires <= now
+                    or deadline <= now
+                    or decoded[5] not in CONTEXT_TIER_TOKEN_BOUNDS
+                ):
+                    raise ValueError
                 records.append(
-                    ReservationRecord(
-                        *(self._decode_text(value[field]) for field in fields[:6]),
-                        float(value[b"deadline"]),
-                        float(value[b"reservation_expires"]),
-                        self._decode_text(value[b"token_digest"]),
-                    )
+                    ReservationRecord(*decoded, deadline, expires, stored_token)
                 )
             except ValueError:
                 raise ValkeySchemaIncompatibleError(
@@ -1726,6 +1782,8 @@ class ValkeyRegistrationStore:
         self._validate_node_id(node_id)
         manifest = self._foundation.read_manifest()
         self._foundation.check_read_compatible(manifest)
+        seconds, micros = self._foundation.server_time()
+        now = seconds + micros / 1_000_000
         node_digest = self._node_digest(node_id)
         cfg = self._foundation.config
         entries = self._foundation._call(
@@ -1747,34 +1805,79 @@ class ValkeyRegistrationStore:
             request = entry[1].get(b"request")
             if not isinstance(client, bytes) or not isinstance(request, bytes):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
-            raw = self._foundation._call(
-                self._foundation._client.hgetall,
+            fields = (
+                b"state",
+                b"client",
+                b"request",
+                b"client_public_key",
+                b"request_id",
+                b"node_id",
+                b"model",
+                b"tier",
+                b"deadline",
+                b"envelope",
+                b"enqueued_at",
+                b"sequence",
+            )
+            raw_values = self._foundation._call(
+                self._foundation._client.hmget,
                 cfg.key(
                     "request", self._decode_text(client), self._decode_text(request)
                 ),
+                fields,
             )
             if (
-                not isinstance(raw, dict)
-                or sum(len(k) + len(v) for k, v in raw.items())
-                > self.config.max_envelope_bytes + _MAX_RESULT_BYTES
+                isinstance(raw_values, list)
+                and raw_values
+                and all(value is None for value in raw_values)
+            ):
+                continue
+            if (
+                not isinstance(raw_values, list)
+                or len(raw_values) != len(fields)
+                or any(not isinstance(value, bytes) for value in raw_values)
+                or sum(len(value) for value in raw_values)
+                > (self.config.max_envelope_bytes + _MAX_RESULT_BYTES)
             ):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
+            raw = dict(zip(fields, raw_values))
             try:
+                if raw[b"state"] != b"queued":
+                    continue
+                decoded_client = self._decode_text(raw[b"client"])
+                decoded_request = self._decode_text(raw[b"request"])
+                if (
+                    decoded_client != self._decode_text(client)
+                    or decoded_request != self._decode_text(request)
+                    or not _SHA256_RE.fullmatch(decoded_client)
+                    or not _SHA256_RE.fullmatch(decoded_request)
+                ):
+                    raise ValueError
+                deadline = float(raw[b"deadline"])
+                enqueued_at = float(raw[b"enqueued_at"])
+                sequence = int(raw[b"sequence"])
+                if (
+                    not math.isfinite(deadline)
+                    or deadline <= now
+                    or not math.isfinite(enqueued_at)
+                    or sequence < 1
+                ):
+                    raise ValueError
                 envelope_value = json.loads(raw[b"envelope"])
                 envelope = EncryptedRequestEnvelope(**envelope_value)
                 records.append(
                     QueuedRequest(
-                        self._decode_text(raw[b"client"]),
-                        self._decode_text(raw[b"request"]),
+                        decoded_client,
+                        decoded_request,
                         self._decode_text(raw[b"client_public_key"]),
                         self._decode_text(raw[b"request_id"]),
                         self._decode_text(raw[b"node_id"]),
                         self._decode_text(raw[b"model"]),
                         self._decode_text(raw[b"tier"]),
-                        float(raw[b"deadline"]),
+                        deadline,
                         envelope,
-                        float(raw[b"enqueued_at"]),
-                        int(raw[b"sequence"]),
+                        enqueued_at,
+                        sequence,
                     )
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):

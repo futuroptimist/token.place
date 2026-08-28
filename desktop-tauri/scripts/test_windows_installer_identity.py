@@ -819,7 +819,7 @@ def assert_no_probe_attempt_counters(data: dict[str, object]) -> None:
         raise InstallerIdentityError(f"installed-context smoke attempted forbidden provisioning/network work: {nonzero}")
 
 
-def _assert_runtime(exe: Path) -> None:
+def _installed_python_executable(exe: Path) -> Path:
     roots = [exe.parent, exe.parent.parent]
     candidates = [root / "python-runtime" / "python.exe" for root in roots]
     python_exe = next((candidate for candidate in candidates if candidate.exists()), None)
@@ -828,6 +828,11 @@ def _assert_runtime(exe: Path) -> None:
         if not found:
             raise InstallerIdentityError("expected installed resources to contain python-runtime/python.exe")
         python_exe = found[0]
+    return python_exe
+
+
+def _assert_runtime(exe: Path) -> None:
+    python_exe = _installed_python_executable(exe)
     provenance = python_exe.parent / RUNTIME_PROVENANCE_NAME
     if not provenance.exists():
         raise InstallerIdentityError(f"expected runtime provenance file at {provenance.name}, but it is missing")
@@ -901,6 +906,83 @@ def _assert_runtime(exe: Path) -> None:
         raise InstallerIdentityError("installed bundled interpreter resolved llama_cpp outside runtime") from exc
     if not origin_path.is_file():
         raise InstallerIdentityError("installed bundled interpreter llama_cpp module origin is missing")
+
+
+def run_native_load_probe(exe: Path, model: Path, artifact_path: Path | None = None) -> dict[str, object]:
+    python_exe = _installed_python_executable(exe)
+    code = (
+        "import json,re,sys\n"
+        "phase='import'\n"
+        "record={'schema_version':1,'phase':phase,'success':False,'exception_class':None}\n"
+        "try:\n"
+        " import llama_cpp\n"
+        " phase='construct';record['phase']=phase\n"
+        " llama=llama_cpp.Llama(model_path=sys.argv[1],n_ctx=512,n_gpu_layers=0,verbose=False)\n"
+        " phase='close';record['phase']=phase\n"
+        " llama.close()\n"
+        " record['success']=True\n"
+        "except BaseException as exc:\n"
+        " name=type(exc).__name__\n"
+        " record['exception_class']=name if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}',name) else 'native_exception'\n"
+        "print(json.dumps(record,separators=(',',':')))\n"
+    )
+    command = [str(python_exe), "-I", "-c", code, str(model)]
+    env = {key: os.environ[key] for key in ("SystemRoot", "TEMP", "TMP") if key in os.environ}
+    result: subprocess.CompletedProcess[str] | None = None
+    try:
+        result = _run(command, env=env, timeout=60, check=False, separate_stderr=True)
+        try:
+            child = json.loads(result.stdout.strip())
+        except json.JSONDecodeError:
+            child = None
+        valid = (
+            isinstance(child, dict)
+            and set(child) == {"schema_version", "phase", "success", "exception_class"}
+            and type(child["schema_version"]) is int
+            and child["schema_version"] == 1
+            and type(child["success"]) is bool
+            and child["phase"] in {"import", "construct", "close"}
+            and (child["exception_class"] is None or (
+                isinstance(child["exception_class"], str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", child["exception_class"])
+            ))
+        )
+        if valid and result.returncode == 0:
+            record = {
+                **child,
+                "exit_code": result.returncode,
+                "stderr_present": bool(result.stderr),
+                "timed_out": False,
+            }
+        else:
+            record = {
+                "schema_version": 1,
+                "phase": "launch",
+                "success": False,
+                "exception_class": "process_nonzero" if result.returncode else "malformed_output",
+                "exit_code": result.returncode,
+                "stderr_present": bool(result.stderr),
+                "timed_out": False,
+            }
+    except subprocess.TimeoutExpired:
+        record = {
+            "schema_version": 1,
+            "phase": "launch",
+            "success": False,
+            "exception_class": "timeout",
+            "exit_code": None,
+            "stderr_present": False,
+            "timed_out": True,
+        }
+    if artifact_path is not None:
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    print(
+        f"native_load_probe phase={record['phase']} success={str(record['success']).lower()} "
+        f"category={record['exception_class'] or 'none'}",
+        flush=True,
+    )
+    return record
 
 
 def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expected_build_id: str) -> dict[str, object]:
@@ -1261,6 +1343,11 @@ def run_scenario(
                         raise InstallerIdentityError(f"operator smoke did not preserve seeded config field {key}")
             validate_installed_context_tiers(shortcut.target, env, artifact_dir, scenario.name)
             if tokenizer_boundary_model is not None:
+                run_native_load_probe(
+                    shortcut.target,
+                    tokenizer_boundary_model,
+                    artifact_dir.path(scenario.name, "native-load-probe") if artifact_dir else None,
+                )
                 run_headless_cpu_admission(
                     shortcut.target,
                     tokenizer_boundary_model,

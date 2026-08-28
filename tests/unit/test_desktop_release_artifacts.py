@@ -3763,6 +3763,104 @@ def test_windows_installer_identity_headless_cpu_command_is_exact_and_bounded(tm
     ]
 
 
+def test_windows_installer_identity_native_load_probe_uses_installed_runtime(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    install = tmp_path / 'installed'
+    runtime = install / 'python-runtime'
+    runtime.mkdir(parents=True)
+    python_exe = runtime / 'python.exe'
+    python_exe.write_text('python', encoding='utf-8')
+    exe = install / 'token-place.exe'
+    model = tmp_path / 'same tiny model.gguf'
+    artifact = tmp_path / 'artifacts' / 'native-load.json'
+    calls = []
+    monkeypatch.setenv('SystemRoot', r'C:\Windows')
+    monkeypatch.setenv('PRIVATE_SECRET', 'must-not-pass')
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        payload = {'schema_version': 1, 'phase': 'close', 'success': True, 'exception_class': None}
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), '')
+
+    monkeypatch.setattr(guard, '_run', fake_run)
+    record = guard.run_native_load_probe(exe, model, artifact)
+
+    command, kwargs = calls[0]
+    assert command[:3] == [str(python_exe), '-I', '-c']
+    assert command[-1] == str(model)
+    assert 'llama_cpp.Llama(model_path=sys.argv[1],n_ctx=512,n_gpu_layers=0,verbose=False)' in command[3]
+    assert 'llama.close()' in command[3]
+    assert kwargs == {
+        'env': {'SystemRoot': r'C:\Windows'}, 'timeout': 60, 'check': False, 'separate_stderr': True,
+    }
+    assert record['success'] is True
+    assert json.loads(artifact.read_text(encoding='utf-8')) == record
+
+
+def test_windows_installer_identity_native_load_probe_failure_is_privacy_safe(monkeypatch, tmp_path, capsys) -> None:
+    guard = _load_windows_installer_identity()
+    runtime = tmp_path / 'installed' / 'python-runtime'
+    runtime.mkdir(parents=True)
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    exe = runtime.parent / 'token-place.exe'
+    model = tmp_path / 'private-model-path.gguf'
+    artifact = tmp_path / 'native-load.json'
+    private_stdout = 'private stdout with model path'
+    private_stderr = 'private stderr and environment secret'
+    monkeypatch.setattr(
+        guard,
+        '_run',
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 9, private_stdout, private_stderr),
+    )
+
+    record = guard.run_native_load_probe(exe, model, artifact)
+
+    assert record == {
+        'schema_version': 1, 'phase': 'launch', 'success': False,
+        'exception_class': 'process_nonzero', 'exit_code': 9,
+        'stderr_present': True, 'timed_out': False,
+    }
+    combined = artifact.read_text(encoding='utf-8') + capsys.readouterr().out
+    for secret in (str(model), private_stdout, private_stderr, 'environment secret'):
+        assert secret not in combined
+
+
+def test_windows_installer_identity_native_probe_failure_precedes_authoritative_gate(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.17-x64-setup.exe', 'nsis', '0.1.17')
+    exe = tmp_path / 'token-place.exe'
+    model = tmp_path / 'tiny.gguf'
+    events = []
+    monkeypatch.setattr(guard, '_terminate_processes', lambda: None)
+    monkeypatch.setattr(guard, 'uninstall_best_effort', lambda log_path=None: None)
+    monkeypatch.setattr(
+        guard, 'install',
+        lambda value, log_path=None: subprocess.CompletedProcess([str(value.path)], 0, '', ''),
+    )
+    monkeypatch.setattr(guard, 'resolve_authoritative_shortcut', lambda rejected_version=None: guard.Shortcut(tmp_path / 'app.lnk', exe))
+    monkeypatch.setattr(guard, '_assert_runtime', lambda target: None)
+    monkeypatch.setattr(guard, 'probe_identity', lambda *args: {})
+    monkeypatch.setattr(guard, 'validate_installed_context_tiers', lambda *args: None)
+    monkeypatch.setattr(guard, 'launch_for_operator_record', lambda *args: json.dumps({
+        'record': 'desktop.compute_node.session.layout', 'launcher_source': 'bundled',
+        'interpreter_basename': 'python.exe', 'runtime_id': guard.EXPECTED_RUNTIME_ID,
+        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID, 'bridge_preflight': 'ok',
+        'model_artifact_inspect': 'ok', 'model_artifact_filename': guard.EXPECTED_MODEL_ARTIFACT_FILENAME,
+    }))
+    monkeypatch.setattr(
+        guard, 'run_native_load_probe',
+        lambda *args: events.append('native-failed') or {'success': False},
+    )
+    monkeypatch.setattr(
+        guard, 'run_headless_cpu_admission',
+        lambda *args: events.append('authoritative-ran') or _headless_cpu_success_result(),
+    )
+
+    guard.run_scenario(guard.Scenario('clean-nsis-0.1.17', installer), 'abcdef123456', tokenizer_boundary_model=model)
+
+    assert events == ['native-failed', 'authoritative-ran']
+
+
 @pytest.mark.parametrize('mutation', [
     lambda value: value.pop('warm_load_result'),
     lambda value: value.update(schema_version=2),

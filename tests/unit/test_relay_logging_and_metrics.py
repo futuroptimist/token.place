@@ -121,14 +121,29 @@ def test_legacy_registration_is_not_counted_as_api_v1(relay_client) -> None:
 
 @pytest.mark.parametrize(
     "authorization",
-    [None, "", "Basic incorrect", "Bearer", "Bearer ", "Bearer incorrect"],
+    [None, "", "Basic incorrect", "Bearer", "Bearer "],
 )
-def test_metrics_auth_rejects_missing_malformed_and_incorrect_credentials(
+def test_metrics_auth_rejects_missing_and_malformed_credentials(
     relay_client, monkeypatch, authorization
 ) -> None:
     monkeypatch.setenv("TOKENPLACE_METRICS_TOKEN", secrets.token_urlsafe(24))
     headers = {"Authorization": authorization} if authorization is not None else {}
     assert relay_client.get("/metrics", headers=headers).status_code == 401
+
+
+def test_metrics_auth_rejects_incorrect_bearer_credential(
+    relay_client, monkeypatch
+) -> None:
+    expected_token = secrets.token_urlsafe(24)
+    incorrect_token = secrets.token_urlsafe(24)
+    assert incorrect_token != expected_token
+    monkeypatch.setenv("TOKENPLACE_METRICS_TOKEN", expected_token)
+
+    response = relay_client.get(
+        "/metrics", headers={"Authorization": f"Bearer {incorrect_token}"}
+    )
+
+    assert response.status_code == 401
 
 
 def test_metrics_auth_accepts_correct_credential_without_logging_it(

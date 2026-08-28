@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
+import subprocess
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
+from prometheus_client.parser import text_string_to_metric_families
 
 import relay
 from relay import JsonFormatter, app, known_servers
@@ -95,6 +100,97 @@ def test_required_sugarkube_metric_families_and_initialization(relay_client) -> 
     assert _metric_value(body, "tokenplace_instrumentation_up") == 1
     assert _metric_value(body, "tokenplace_compute_nodes_registered") == 0
     assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
+
+
+def test_maintenance_gauges_use_single_multiprocess_snapshot(tmp_path) -> None:
+    """Multiprocess exposition must not emit per-worker maintenance gauges."""
+
+    multiprocess_dir = tmp_path / "prometheus"
+    multiprocess_dir.mkdir()
+    token = secrets.token_urlsafe(24)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PROMETHEUS_MULTIPROC_DIR": str(multiprocess_dir),
+            "TOKENPLACE_METRICS_TOKEN": token,
+        }
+    )
+    worker = """
+import os
+import sys
+
+import relay
+
+relay.app.config["TESTING"] = True
+with relay.app.test_client() as client:
+    registered = client.post(
+        "/api/v1/relay/servers/register",
+        json={"server_public_key": "node-a"},
+    )
+    assert registered.status_code == 200
+    assert client.get("/metrics").status_code == 401
+    response = client.get(
+        "/metrics",
+        headers={
+            "Authorization": "Bearer " + os.environ["TOKENPLACE_METRICS_TOKEN"]
+        },
+    )
+    body = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert os.environ["TOKENPLACE_METRICS_TOKEN"] not in body
+    if sys.argv[1] == "emit":
+        sys.stdout.write("\\n__METRICS__\\n" + body)
+"""
+
+    # Three independent workers each report one node. The final scrape is emitted
+    # by the last worker so its authoritative snapshot remains the most recent.
+    for mode in ("write", "write"):
+        subprocess.run(
+            [sys.executable, "-c", worker, mode],
+            cwd=Path(__file__).parents[2],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    exposed = subprocess.run(
+        [sys.executable, "-c", worker, "emit"],
+        cwd=Path(__file__).parents[2],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split("__METRICS__\n", 1)[1]
+
+    names = {
+        "tokenplace_build_info",
+        "tokenplace_instrumentation_up",
+        "tokenplace_compute_nodes_registered",
+        "tokenplace_compute_nodes_healthy",
+    }
+    samples = [
+        sample
+        for family in text_string_to_metric_families(exposed)
+        for sample in family.samples
+        if sample.name in names
+    ]
+    by_name = {
+        name: [sample for sample in samples if sample.name == name]
+        for name in names
+    }
+
+    assert all(len(metric_samples) == 1 for metric_samples in by_name.values())
+    assert all("pid" not in sample.labels for sample in samples)
+    assert by_name["tokenplace_build_info"][0].value == 1
+    assert by_name["tokenplace_instrumentation_up"][0].value == 1
+    assert by_name["tokenplace_compute_nodes_registered"][0].value == 1
+    assert by_name["tokenplace_compute_nodes_healthy"][0].value == 1
+    assert set(by_name["tokenplace_build_info"][0].labels) == {
+        "version",
+        "revision",
+    }
+    for name in names - {"tokenplace_build_info"}:
+        assert by_name[name][0].labels == {}
 
 
 def test_compute_node_gauges_follow_api_v1_lease_semantics(relay_client) -> None:

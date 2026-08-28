@@ -282,6 +282,7 @@ def _registration_keys(store, *node_ids):
     return [
         store._foundation.config.key("schema"),
         store._foundation.config.key("nodes:lease"),
+        store._foundation.config.key("cursor"),
         *(
             store._foundation.config.key("node", store._node_digest(node_id))
             for node_id in node_ids
@@ -872,13 +873,12 @@ def test_registration_renew_backfills_additive_scheduler_fields(valkey_server):
             "node", owner, SchedulerNodeState(healthy=True, claimed_work=0)
         )
     finally:
-        keys = list(
-            store._foundation._client.scan_iter(
-                store._foundation.config.key_prefix + "*"
-            )
+        store._foundation._client.delete(
+            store._foundation.config.key("schema"),
+            store._foundation.config.key("nodes:lease"),
+            store._foundation.config.key("cursor"),
+            node_key,
         )
-        if keys:
-            store._foundation._client.delete(*keys)
         store.close()
 
 
@@ -893,6 +893,12 @@ def test_enqueue_counts_queued_requests_hidden_by_earlier_reservations(valkey_se
     envelope = EncryptedRequestEnvelope(
         "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
     )
+    queued = None
+    reserved = None
+    cfg = store._foundation.config
+    node = store._node_digest("node")
+    queued_client, queued_request = store._identity("client-a", "queued")
+    reserved_client, reserved_request = store._identity("client-b", "reserved")
     try:
         store.register("node", _capabilities(concurrency=3), owner)
         late_deadline = time.time() + 60
@@ -928,13 +934,25 @@ def test_enqueue_counts_queued_requests_hidden_by_earlier_reservations(valkey_se
                 "cancel-b",
             )
     finally:
-        keys = list(
-            store._foundation._client.scan_iter(
-                store._foundation.config.key_prefix + "*"
-            )
+        reservation_keys = []
+        for selection in (queued, reserved):
+            if selection is not None and selection.reservation_token is not None:
+                token = hashlib.sha256(
+                    selection.reservation_token.encode("ascii")
+                ).hexdigest()
+                reservation_keys.append(cfg.key("reservation", token))
+        store._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", queued_client, queued_request),
+            cfg.key("request", reserved_client, reserved_request),
+            *reservation_keys,
         )
-        if keys:
-            store._foundation._client.delete(*keys)
         store.close()
 
 
@@ -1455,7 +1473,7 @@ def test_reader_incompatible_registration_reads_stop_before_state_access(
     valkey_server, operation
 ):
     store = _registration_store(valkey_server, uuid.uuid4().hex)
-    schema_key, lease_key, node_key = _registration_keys(store, "node-a")
+    schema_key, lease_key, cursor_key, node_key = _registration_keys(store, "node-a")
     incompatible = _manifest(reader_min=2, reader_max=2)
     malformed_hash = {b"node_id": b"malformed-application-payload"}
     malformed_member = b"malformed-index-member"
@@ -1490,7 +1508,7 @@ def test_reader_incompatible_registration_reads_stop_before_state_access(
             store._foundation._client.zrange(lease_key, 0, -1, withscores=True),
         )
     finally:
-        store._foundation._client.delete(schema_key, lease_key, node_key)
+        store._foundation._client.delete(schema_key, lease_key, cursor_key, node_key)
         store.close()
 
 
@@ -1500,7 +1518,7 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
     raw_credential = "raw-control-credential-marker"
     owner = _digest(raw_credential)
     node_digest = store._node_digest(node_id)
-    schema_key, lease_key, node_key = _registration_keys(store, node_id)
+    schema_key, lease_key, cursor_key, node_key = _registration_keys(store, node_id)
     expected_fields = {
         b"node_id",
         b"supported_model_ids",
@@ -1542,7 +1560,7 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
             marker not in value for marker in forbidden for value in persisted.values()
         )
     finally:
-        store._foundation._client.delete(schema_key, lease_key, node_key)
+        store._foundation._client.delete(schema_key, lease_key, cursor_key, node_key)
         store.close()
 
 

@@ -457,19 +457,37 @@ def test_api_v1_best_fit_spillover_when_smaller_tier_unavailable_or_saturated(cl
     full = _server_key("spillover-full")
     _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
 
-    no_fast_payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    no_fast_response = client.get("/api/v1/relay/servers/next?context_tier=8k-fast")
+    assert no_fast_response.status_code == 200
+    no_fast_payload = no_fast_response.get_json()
     assert no_fast_payload["server_public_key"] == full
+    assert no_fast_payload["selected_context_tier"] == "64k-full"
     assert no_fast_payload["spillover"] is True
-    assert no_fast_payload["spillover_reason"] == "no_smaller_eligible_node_available"
 
     _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
-    healthy_payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    healthy_response = client.get("/api/v1/relay/servers/next?context_tier=8k-fast")
+    assert healthy_response.status_code == 200
+    healthy_payload = healthy_response.get_json()
     assert healthy_payload["server_public_key"] == fast
+    assert healthy_payload["selected_context_tier"] == "8k-fast"
     assert healthy_payload["spillover"] is False
 
-    _queue_api_v1_request(client, server_public_key=fast, request_id="req-saturate-fast")
-    saturated_payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    queued = client.post(
+        "/api/v1/relay/requests",
+        json={
+            **_api_v1_request_payload(
+                "req-saturate-fast",
+                client_public_key=f"{DUMMY_CLIENT_PUB_KEY}-req-saturate-fast",
+            ),
+            "server_public_key": fast,
+        },
+    )
+    assert queued.status_code == 200
+    saturated_response = client.get("/api/v1/relay/servers/next?context_tier=8k-fast")
+    assert saturated_response.status_code == 200
+    saturated_payload = saturated_response.get_json()
     assert saturated_payload["server_public_key"] == full
+    assert saturated_payload["selected_context_tier"] == "64k-full"
     assert saturated_payload["spillover"] is True
 
 

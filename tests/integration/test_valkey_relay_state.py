@@ -689,6 +689,162 @@ def test_scheduler_selection_policy_prefers_lower_load_in_memory_and_valkey(
         second.close()
 
 
+def _race_select_and_reserve(stores, requests, deadline):
+    barrier = Barrier(len(requests))
+
+    def select(store, request):
+        barrier.wait(timeout=5)
+        return store.select_and_reserve(
+            "client", request, "qwen3-8b-instruct", "8k-fast", deadline
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(requests)) as pool:
+        futures = [
+            pool.submit(select, store, request)
+            for store, request in zip(stores, requests, strict=True)
+        ]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result(timeout=5))
+            except RelayStateNoCapacity as error:
+                outcomes.append(error)
+    return outcomes
+
+
+def test_selection_final_capacity_race_is_atomic_across_valkey_stores(valkey_server):
+    namespace = uuid.uuid4().hex
+    limits = dict(
+        max_reservations=1,
+        max_reservations_per_client=1,
+        max_reservations_per_node=1,
+        max_queue_depth_per_node=1,
+        max_request_lifecycles=1,
+    )
+    first = _registration_store(valkey_server, namespace, **limits)
+    second = _registration_store(valkey_server, namespace, **limits)
+    cfg = first._foundation.config
+    node_digest = first._node_digest("node")
+    requests = ("final-a", "final-b")
+    identities = [first._identity("client", request) for request in requests]
+    outcomes = []
+    try:
+        first.register("node", _capabilities(concurrency=1), _digest("owner"))
+        deadline = first._foundation.server_time()[0] + 60
+        outcomes = _race_select_and_reserve((first, second), requests, deadline)
+
+        created = [outcome for outcome in outcomes if not isinstance(outcome, Exception)]
+        assert len(created) == 1 and created[0].created
+        assert sum(isinstance(outcome, RelayStateNoCapacity) for outcome in outcomes) == 1
+        assert created[0].reservation_token is not None
+        assert len(first.list_reservations()) == 1
+        assert first._foundation._client.zcard(cfg.key("reservations:expiry")) == 1
+        assert first._foundation._client.zcard(cfg.key("requests:deadline")) == 1
+        assert first._foundation._client.hmget(
+            cfg.key("cursor"), "_count", "_activity"
+        ) == [b"1", b"1"]
+
+        existing = [
+            first._foundation._client.exists(cfg.key("request", client, request))
+            for client, request in identities
+        ]
+        assert sorted(existing) == [0, 1]
+
+        memory = InMemoryRelayStateStore(
+            RelayStateStoreConfig(namespace="final-slot-memory", **limits),
+            acknowledgement_key=b"k" * 32,
+        )
+        memory.register("node", _capabilities(concurrency=1), _digest("owner"))
+        memory_outcomes = _race_select_and_reserve(
+            (memory, memory), requests, time.time() + 60
+        )
+        assert sum(not isinstance(item, Exception) for item in memory_outcomes) == 1
+        assert sum(
+            isinstance(item, RelayStateNoCapacity) for item in memory_outcomes
+        ) == 1
+    finally:
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            *(cfg.key("request", client, request) for client, request in identities),
+        ]
+        keys.extend(
+            cfg.key("reservation", _digest(outcome.reservation_token))
+            for outcome in outcomes
+            if not isinstance(outcome, Exception) and outcome.reservation_token
+        )
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()
+
+
+def test_selection_once_only_same_identity_across_valkey_stores(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    cfg = first._foundation.config
+    node_digest = first._node_digest("node")
+    client, request = first._identity("client", "same")
+    outcomes = []
+    try:
+        first.register("node", _capabilities(concurrency=1), _digest("owner"))
+        deadline = first._foundation.server_time()[0] + 60
+        outcomes = _race_select_and_reserve(
+            (first, second), ("same", "same"), deadline
+        )
+
+        assert sum(outcome.created for outcome in outcomes) == 1
+        assert sum(outcome.reservation_token is not None for outcome in outcomes) == 1
+        created = next(outcome for outcome in outcomes if outcome.created)
+        existing = next(outcome for outcome in outcomes if not outcome.created)
+        assert existing.reservation_token is None
+        assert existing.selected_node_id == created.selected_node_id == "node"
+        assert existing.request_deadline_epoch == created.request_deadline_epoch
+        assert existing.reservation_expires_at_epoch == pytest.approx(
+            created.reservation_expires_at_epoch
+        )
+        assert len(first.list_reservations()) == 1
+        assert first._foundation._client.zcard(cfg.key("reservations:expiry")) == 1
+        assert first._foundation._client.zcard(cfg.key("requests:deadline")) == 1
+        assert first._foundation._client.hmget(
+            cfg.key("cursor"), "_count", "_activity"
+        ) == [b"1", b"1"]
+
+        memory = InMemoryRelayStateStore(
+            RelayStateStoreConfig(namespace="same-identity-memory"),
+            acknowledgement_key=b"k" * 32,
+        )
+        memory.register("node", _capabilities(concurrency=1), _digest("owner"))
+        memory_outcomes = _race_select_and_reserve(
+            (memory, memory), ("same", "same"), time.time() + 60
+        )
+        assert sum(outcome.created for outcome in memory_outcomes) == 1
+        assert sum(outcome.reservation_token is not None for outcome in memory_outcomes) == 1
+        assert len(memory.list_reservations()) == 1
+    finally:
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            cfg.key("request", client, request),
+        ]
+        keys.extend(
+            cfg.key("reservation", _digest(outcome.reservation_token))
+            for outcome in outcomes
+            if outcome.reservation_token
+        )
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()
+
+
 def test_scheduler_fairness_cursor_changes_only_for_new_reservations(valkey_server):
     namespace = uuid.uuid4().hex
     first = _registration_store(valkey_server, namespace, reservation_ttl_seconds=30)

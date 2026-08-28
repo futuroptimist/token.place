@@ -10700,7 +10700,13 @@ def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(mo
         popen_commands.append(command)
         return process
 
-    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', lambda *args, **kwargs: (_ for _ in ()).throw(OSError('no tmp')))
+    mkstemp_calls = []
+
+    def unavailable_mkstemp(*args, **kwargs):
+        mkstemp_calls.append((args, kwargs))
+        raise OSError('no tmp')
+
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', unavailable_mkstemp)
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
     monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
     monkeypatch.setattr(
@@ -10712,8 +10718,73 @@ def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(mo
     proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf')
 
     assert proxy._worker_tmpfile is None
+    assert len(mkstemp_calls) == 2
     assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
     assert proxy._process._token_place_command == [sys.executable, '<runtime-worker-code>']
+
+
+def test_subprocess_proxy_retries_worker_script_in_model_dir(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model_path = tmp_path / 'models' / 'model.gguf'
+    model_path.parent.mkdir()
+    model_path.write_bytes(b'GGUF')
+    real_mkstemp = model_manager_module.tempfile.mkstemp
+    mkstemp_calls = []
+    popen_commands = []
+
+    def model_adjacent_mkstemp(*args, **kwargs):
+        mkstemp_calls.append(kwargs.copy())
+        if len(mkstemp_calls) == 1:
+            raise OSError('ambient temp unavailable')
+        return real_mkstemp(*args, **kwargs)
+
+    class FakeStdin:
+        def write(self, value):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+        stdout = None
+        stderr = []
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        popen_commands.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', model_adjacent_mkstemp)
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_read_llama_subprocess_message',
+        lambda *args, **kwargs: {'status': 'ok'},
+    )
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path=str(model_path))
+    worker_script = proxy._worker_tmpfile
+
+    assert worker_script is not None
+    assert os.path.dirname(worker_script) == str(model_path.parent)
+    assert mkstemp_calls == [
+        {'suffix': '.py', 'prefix': '_token_place_worker_', 'dir': None},
+        {'suffix': '.py', 'prefix': '_token_place_worker_', 'dir': str(model_path.parent)},
+    ]
+    assert popen_commands == [[sys.executable, '-u', worker_script]]
+    assert '-c' not in popen_commands[0]
+
+    proxy.close()
+
+    assert not os.path.exists(worker_script)
 
 
 def test_subprocess_proxy_removes_temp_worker_script_when_popen_fails(monkeypatch):

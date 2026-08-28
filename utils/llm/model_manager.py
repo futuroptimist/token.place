@@ -2747,11 +2747,14 @@ class _SubprocessLlamaProxy:
         worker_capabilities: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> None:
+        normalized_model_path: Optional[str] = None
         if 'model_path' in kwargs and isinstance(kwargs.get('model_path'), str):
             kwargs = dict(kwargs)
             kwargs['model_path'] = os.path.abspath(kwargs['model_path'])
+            normalized_model_path = kwargs['model_path']
         elif args and isinstance(args[0], str):
             args = (os.path.abspath(args[0]), *args[1:])
+            normalized_model_path = args[0]
         self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _runtime_stage_timeout_seconds()
         self._expected_llama_module_identity = _valid_llama_module_identity(expected_llama_module_identity)
         self._worker_capabilities_ref = worker_capabilities if isinstance(worker_capabilities, dict) else None
@@ -2781,18 +2784,52 @@ class _SubprocessLlamaProxy:
         code = _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)
         # Write worker code to a temp file to avoid Windows command-line length
         # limit (CreateProcess caps at 32767 chars; the code is ~36KB).
+        def write_worker_script(*, directory: Optional[str] = None) -> str:
+            fd: Optional[int] = None
+            tmppath: Optional[str] = None
+            try:
+                fd, tmppath = tempfile.mkstemp(
+                    suffix='.py', prefix='_token_place_worker_', dir=directory
+                )
+                stream = os.fdopen(fd, 'w', encoding='utf-8')
+                fd = None
+                with stream:
+                    stream.write(code)
+                return tmppath
+            except Exception:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                if tmppath is not None:
+                    try:
+                        os.unlink(tmppath)
+                    except OSError:
+                        pass
+                raise
+
         try:
-            fd, tmppath = tempfile.mkstemp(suffix='.py', prefix='_token_place_worker_')
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(code)
+            tmppath = write_worker_script()
             self._worker_tmpfile = tmppath
             command = [sys.executable, '-u', tmppath]
         except OSError:
-            # Temp file creation failed (e.g. disk full, permissions); fall back
-            # to the -c form which may exceed Windows' 32767-char limit but is
-            # better than not launching at all.
-            self._worker_tmpfile = None
-            command = [sys.executable, '-u', '-c', code]
+            model_parent = (
+                os.path.dirname(normalized_model_path)
+                if normalized_model_path is not None
+                else None
+            )
+            try:
+                if model_parent is None or not os.path.isdir(model_parent):
+                    raise OSError('model parent unavailable')
+                tmppath = write_worker_script(directory=model_parent)
+                self._worker_tmpfile = tmppath
+                command = [sys.executable, '-u', tmppath]
+            except OSError:
+                # Both secure file locations failed; retain inline execution as
+                # the final fallback despite the Windows command-line limit.
+                self._worker_tmpfile = None
+                command = [sys.executable, '-u', '-c', code]
         env = _llama_cpp_runtime_worker_env()
         cwd = _llama_cpp_probe_subprocess_cwd()
         try:

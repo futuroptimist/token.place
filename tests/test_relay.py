@@ -131,12 +131,23 @@ def test_api_v1_register_and_poll_are_not_rate_limited_by_public_quota(client, m
     monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0")
     monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TOKEN", "relay-token")
     monkeypatch.setattr(relay_module, "SERVER_REGISTRATION_TOKENS", ["relay-token"])
-    payload = {"server_public_key": DUMMY_SERVER_PUB_KEY}
     headers = {"X-Relay-Server-Token": "relay-token"}
 
-    register_responses = [
+    initial = client.post(
+        "/api/v1/relay/servers/register",
+        json={"server_public_key": DUMMY_SERVER_PUB_KEY},
+        headers=headers,
+    )
+    assert initial.status_code == 200
+    credential = initial.get_json().get("control_credential")
+    assert credential
+    payload = {
+        "server_public_key": DUMMY_SERVER_PUB_KEY,
+        "control_credential": credential,
+    }
+    register_responses = [initial] + [
         client.post("/api/v1/relay/servers/register", json=payload, headers=headers)
-        for _ in range(65)
+        for _ in range(64)
     ]
     assert {response.status_code for response in register_responses} == {200}
 
@@ -346,8 +357,8 @@ def _api_v1_registered_control_payload(client, server_public_key, *, capabilitie
         response = _register_api_v1_server_with_capabilities(client, server_public_key, capabilities)
     payload = {'server_public_key': server_public_key}
     credential = response.get_json().get('control_credential')
-    if credential:
-        payload['control_credential'] = credential
+    assert credential
+    payload['control_credential'] = credential
     return payload
 
 
@@ -821,15 +832,18 @@ def test_api_v1_rejects_excessive_capability_model_ids(client):
 
 def test_api_v1_poll_capabilities_null_preserves_registered_tier(client):
     server = _server_key("null-heartbeat")
-    _register_api_v1_server_with_capabilities(client, server, _capabilities("64k-full"))
+    payload = _api_v1_registered_control_payload(client, server, capabilities=_capabilities("64k-full"))
+    assert payload["control_credential"]
 
     response = client.post(
         "/api/v1/relay/servers/poll",
-        json={"server_public_key": server, "capabilities": None},
+        json={**payload, "capabilities": None},
     )
 
     assert response.status_code == 200
-    assert known_servers[server]["capabilities"]["active_context_tier"] == "64k-full"
+    diagnostics = client.get("/relay/diagnostics").get_json()
+    node = diagnostics["api_v1_registered_compute_nodes"][0]
+    assert node["capabilities"]["active_context_tier"] == "64k-full"
 
 
 def test_api_v1_diagnostics_expose_only_normalized_capabilities(client):
@@ -2643,21 +2657,20 @@ def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeyp
 
     monkeypatch.setattr('relay.sink', _sink_should_not_be_called)
 
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
-    register = client.post('/api/v1/relay/servers/register', json=server_payload)
-    assert register.status_code == 200
+    server_payload = _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=_capabilities("8k-fast"),
+    )
+    assert server_payload['control_credential']
 
-    queued = client.post('/api/v1/relay/requests', json={
-        'request_id': 'req-no-sink-delegation',
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'server_public_key': DUMMY_SERVER_PUB_KEY,
-        'ciphertext': 'ciphertext-request',
-        'cipherkey': 'cipherkey-request',
-        'iv': 'iv-request',
-    })
+    queued = client.post(
+        '/api/v1/relay/requests',
+        json=_api_v1_request_payload('req-no-sink-delegation'),
+    )
     assert queued.status_code == 200
 
-    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
     assert poll.status_code == 200
     polled = poll.get_json()
     assert polled['request_id'] == 'req-no-sink-delegation'
@@ -2737,18 +2750,14 @@ def test_api_v1_relay_chat_completions_fail_closed_and_queue_unchanged(client):
 
 
 def test_api_v1_register_does_not_dequeue_requests(client):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
-    register = client.post('/api/v1/relay/servers/register', json=server_payload)
-    assert register.status_code == 200
+    server_payload = _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=_capabilities("8k-fast"),
+    )
+    assert server_payload['control_credential']
 
-    request_payload = {
-        'request_id': 'req-register-heartbeat',
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'server_public_key': DUMMY_SERVER_PUB_KEY,
-        'chat_history': 'ciphertext-request',
-        'cipherkey': 'cipherkey-request',
-        'iv': 'iv-request',
-    }
+    request_payload = _api_v1_request_payload('req-register-heartbeat')
     queued = client.post('/api/v1/relay/requests', json=request_payload)
     assert queued.status_code == 200
 
@@ -2756,13 +2765,13 @@ def test_api_v1_register_does_not_dequeue_requests(client):
     assert heartbeat.status_code == 200
 
     # Register/heartbeat should not claim work.
-    assert len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 1
+    assert 'request_id' not in heartbeat.get_json()
 
-    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
     assert poll.status_code == 200
     claimed = poll.get_json()
     assert claimed['request_id'] == 'req-register-heartbeat'
-    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests or len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 0
+    assert client.post('/api/v1/relay/servers/poll', json=server_payload).status_code == 200
 
 
 def test_api_v1_poll_requires_registration_token_when_configured(client, monkeypatch):

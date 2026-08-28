@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
+import subprocess
+import sys
+import textwrap
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -95,6 +100,104 @@ def test_required_sugarkube_metric_families_and_initialization(relay_client) -> 
     assert _metric_value(body, "tokenplace_instrumentation_up") == 1
     assert _metric_value(body, "tokenplace_compute_nodes_registered") == 0
     assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
+
+
+def test_maintenance_gauges_use_bounded_multiprocess_aggregation() -> None:
+    """Default multiprocess gauges expose one pid-labelled series per worker."""
+
+    for gauge in (
+        relay.BUILD_INFO,
+        relay.INSTRUMENTATION_UP,
+        relay.COMPUTE_NODES_REGISTERED,
+        relay.COMPUTE_NODES_HEALTHY,
+    ):
+        assert gauge._multiprocess_mode == "livemostrecent"
+
+
+def test_maintenance_gauges_multiprocess_exposition(tmp_path) -> None:
+    """Exercise authenticated Flask exposition after several isolated workers."""
+
+    multiprocess_dir = tmp_path / "prometheus"
+    multiprocess_dir.mkdir()
+    token = secrets.token_urlsafe(24)
+    env = os.environ.copy()
+    env["PROMETHEUS_MULTIPROC_DIR"] = str(multiprocess_dir)
+    env["TOKENPLACE_METRICS_TOKEN"] = token
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    worker = textwrap.dedent(
+        """
+        import base64
+        import sys
+        from datetime import datetime
+
+        import relay
+
+        for index in range(2):
+            relay.known_servers[f"node-{index}"] = {
+                relay.API_V1_SERVER_MARKER: True,
+                "last_ping": datetime.now(),
+                "last_ping_duration": 30,
+            }
+
+        with relay.app.test_client() as client:
+            unauthorized = client.get("/metrics")
+            authorized = client.get(
+                "/metrics",
+                headers={"Authorization": f"Bearer {sys.argv[1]}"},
+            )
+        if sys.argv[2] == "report":
+            body = base64.b64encode(authorized.data).decode("ascii")
+            print(f"MULTIPROCESS_RESULT:{unauthorized.status_code}:{authorized.status_code}:{body}")
+        """
+    )
+
+    result = None
+    for action in ("write", "write", "report"):
+        result = subprocess.run(
+            [sys.executable, "-c", worker, token, action],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    assert result is not None
+    marker = next(
+        line for line in result.stdout.splitlines() if line.startswith("MULTIPROCESS_RESULT:")
+    )
+    _, unauthorized_status, authorized_status, encoded_body = marker.split(":", 3)
+    assert unauthorized_status == "401"
+    assert authorized_status == "200"
+
+    import base64
+
+    body = base64.b64decode(encoded_body).decode("utf-8")
+    families = (
+        "tokenplace_build_info",
+        "tokenplace_instrumentation_up",
+        "tokenplace_compute_nodes_registered",
+        "tokenplace_compute_nodes_healthy",
+    )
+    samples = [line for line in body.splitlines() if line and not line.startswith("#")]
+    for family in families:
+        family_samples = [line for line in samples if line.startswith(family)]
+        assert len(family_samples) == 1
+        assert all("pid=" not in line for line in family_samples)
+
+    build_sample = next(line for line in samples if line.startswith("tokenplace_build_info"))
+    assert 'version="' in build_sample
+    assert 'revision="' in build_sample
+    for family in families[1:]:
+        sample = next(line for line in samples if line.startswith(family))
+        assert "version=" not in sample
+        assert "revision=" not in sample
+
+    assert _metric_value(body, "tokenplace_instrumentation_up") == 1
+    assert _metric_value(body, "tokenplace_compute_nodes_registered") == 2
+    assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 2
+    assert re.search(r"^tokenplace_build_info\{[^}]+\}\s+1(?:\.0)?$", body, re.MULTILINE)
+    assert token not in result.stdout
+    assert token not in result.stderr
 
 
 def test_compute_node_gauges_follow_api_v1_lease_semantics(relay_client) -> None:

@@ -217,18 +217,24 @@ def test_two_api_v1_nodes_poll_and_round_robin_without_control_plane_429(client,
 def test_api_v1_response_submissions_do_not_use_public_quota(client):
     """Encrypted response submissions have a higher control-plane budget."""
 
-    client_pending_request_ids[DUMMY_CLIENT_PUB_KEY] = {
-        f'rate-response-{index}': time.time() for index in range(65)
-    }
+    server_payload = _api_v1_registered_control_payload(
+        client, DUMMY_SERVER_PUB_KEY, capabilities=_capabilities()
+    )
     responses = [
         client.post(
             '/api/v1/relay/responses',
-            json=_api_v1_response_payload(f'rate-response-{index}'),
+            json=_api_v1_response_payload(
+                f'rate-response-{index}',
+                server_public_key=server_payload['server_public_key'],
+                control_credential=server_payload['control_credential'],
+            ),
         )
         for index in range(65)
     ]
 
-    assert {response.status_code for response in responses} == {200}
+    statuses = [response.status_code for response in responses]
+    assert set(statuses) == {410}
+    assert 429 not in statuses
 
 
 def test_api_v1_client_relay_read_paths_are_not_rate_limited_by_public_quota(client):
@@ -3696,14 +3702,29 @@ def _api_v1_request_payload(request_id, *, client_public_key=DUMMY_CLIENT_PUB_KE
     }
 
 
-def _api_v1_response_payload(request_id, *, client_public_key=DUMMY_CLIENT_PUB_KEY, ciphertext='ciphertext-response'):
-    return {
+def _api_v1_response_payload(
+    request_id,
+    *,
+    client_public_key=DUMMY_CLIENT_PUB_KEY,
+    ciphertext='ciphertext-response',
+    server_public_key=None,
+    control_credential=None,
+    claim_generation=None,
+):
+    payload = {
         'client_public_key': client_public_key,
         'request_id': request_id,
         'chat_history': ciphertext,
         'cipherkey': 'cipherkey-response',
         'iv': 'iv-response',
     }
+    if server_public_key is not None:
+        payload['server_public_key'] = server_public_key
+    if control_credential is not None:
+        payload['control_credential'] = control_credential
+    if claim_generation is not None:
+        payload['claim_generation'] = claim_generation
+    return payload
 
 
 def test_api_v1_expired_pending_response_submission_returns_gone(client, monkeypatch):

@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
+import subprocess
+import sys
+import textwrap
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -95,6 +100,94 @@ def test_required_sugarkube_metric_families_and_initialization(relay_client) -> 
     assert _metric_value(body, "tokenplace_instrumentation_up") == 1
     assert _metric_value(body, "tokenplace_compute_nodes_registered") == 0
     assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
+
+
+def test_maintenance_gauges_have_one_pid_free_multiprocess_snapshot(tmp_path) -> None:
+    """The production multiprocess exposition must not create per-worker gauges."""
+
+    script = textwrap.dedent(
+        """
+        import os
+        import re
+        import secrets
+        import subprocess
+        import sys
+
+        worker = '''
+        import relay
+        from prometheus_client import Gauge
+        Gauge("tokenplace_default_mode_control", "Regression control.").set(1)
+        relay.COMPUTE_NODES_REGISTERED.set(1)
+        relay.COMPUTE_NODES_HEALTHY.set(1)
+        '''
+        for _ in range(2):
+            subprocess.run([sys.executable, "-c", worker], check=True)
+
+        import relay
+        from prometheus_client import Gauge
+
+        Gauge("tokenplace_default_mode_control", "Regression control.").set(1)
+
+        token = secrets.token_urlsafe(24)
+        os.environ["TOKENPLACE_METRICS_TOKEN"] = token
+        client = relay.app.test_client()
+        assert client.get("/metrics").status_code == 401
+        relay.known_servers["node-a"] = {
+            relay.API_V1_SERVER_MARKER: True,
+            "last_ping": relay.datetime.now(),
+            "last_ping_duration": 30,
+        }
+        response = client.get(
+            "/metrics", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200
+        body = response.get_data(as_text=True)
+        assert token not in body
+
+        names = (
+            "tokenplace_build_info",
+            "tokenplace_instrumentation_up",
+            "tokenplace_compute_nodes_registered",
+            "tokenplace_compute_nodes_healthy",
+        )
+        series = {
+            name: [
+                line for line in body.splitlines()
+                if re.match(rf"^{name}(?:\\{{|\\s)", line)
+            ]
+            for name in names
+        }
+        assert all(len(lines) == 1 for lines in series.values()), series
+        assert all('pid=' not in lines[0] for lines in series.values()), series
+        assert 'version=' in series["tokenplace_build_info"][0]
+        assert 'revision=' in series["tokenplace_build_info"][0]
+        for name in names[1:]:
+            assert "{" not in series[name][0]
+        for name in names:
+            assert float(series[name][0].rsplit(" ", 1)[1]) == 1
+
+        # Prove the test exercises the real default multiprocess behavior: a
+        # maintenance gauge restored to the default mode would fail above.
+        control = [
+            line for line in body.splitlines()
+            if line.startswith("tokenplace_default_mode_control{")
+        ]
+        assert len(control) == 3
+        assert all('pid=' in line for line in control)
+        print("multiprocess metrics assertions passed")
+        """
+    )
+    env = os.environ.copy()
+    env["PROMETHEUS_MULTIPROC_DIR"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(Path(__file__).parents[2]),
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.splitlines()[-1] == "multiprocess metrics assertions passed"
 
 
 def test_compute_node_gauges_follow_api_v1_lease_semantics(relay_client) -> None:

@@ -845,6 +845,166 @@ def test_selection_once_only_same_identity_across_valkey_stores(valkey_server):
         second.close()
 
 
+@pytest.mark.parametrize(
+    ("bound", "limit", "occupation"),
+    [
+        ("global_reservation", "max_reservations", "reserved"),
+        ("per_client_reservation", "max_reservations_per_client", "reserved"),
+        ("per_node_reservation", "max_reservations_per_node", "reserved"),
+        ("global_lifecycle", "max_request_lifecycles", "reserved"),
+        ("per_node_queue_depth", "max_queue_depth_per_node", "queued"),
+        ("node_concurrency", None, "claimed"),
+    ],
+)
+def test_selection_capacity_bounds_match_memory_without_rejection_mutation(
+    valkey_server, bound, limit, occupation
+):
+    namespace = uuid.uuid4().hex
+    limits = dict(
+        max_reservations=8,
+        max_reservations_per_client=8,
+        max_reservations_per_node=8,
+        max_request_lifecycles=8,
+        max_queue_depth_per_node=8,
+        max_queued_requests=8,
+        max_queued_requests_per_client=8,
+    )
+    if limit is not None:
+        limits[limit] = 1
+    node_ids = (
+        ("node-a", "node-b")
+        if bound in {"global_reservation", "per_client_reservation", "global_lifecycle"}
+        else ("node-a",)
+    )
+    candidate_client = "client-a" if bound == "per_client_reservation" else "client-b"
+    first = _registration_store(valkey_server, namespace, **limits)
+    second = _registration_store(valkey_server, namespace, **limits)
+    cfg = first._foundation.config
+    occupant = None
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+
+    def prepare(store, deadline):
+        for node_id in node_ids:
+            concurrency = 1 if bound == "node_concurrency" else 8
+            store.register(
+                node_id, _capabilities(concurrency=concurrency), _digest(node_id)
+            )
+        if occupation == "claimed":
+            assert store.set_scheduler_state(
+                "node-a", _digest("node-a"), SchedulerNodeState(claimed_work=1)
+            )
+            return None
+        selected = store.select_and_reserve(
+            "client-a", "occupied", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        if occupation == "queued":
+            store.enqueue_encrypted_request(
+                "client-a",
+                "occupied",
+                selected.reservation_token,
+                selected.selected_node_id,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                envelope,
+                "cancel",
+            )
+        return selected
+
+    try:
+        deadline = first._foundation.server_time()[0] + 60
+        occupant = prepare(first, deadline)
+        candidate = first._identity(candidate_client, "candidate")
+        node_keys = [
+            cfg.key("node", first._node_digest(node_id)) for node_id in node_ids
+        ]
+        cursor_key = cfg.key("cursor")
+        candidate_key = cfg.key("request", *candidate)
+        queue_keys = [
+            cfg.key("queue", first._node_digest(node_id)) for node_id in node_ids
+        ]
+        before = {
+            "cursor": first._foundation._client.hgetall(cursor_key),
+            "nodes": [first._foundation._client.hgetall(key) for key in node_keys],
+            "deadlines": first._foundation._client.zrange(
+                cfg.key("requests:deadline"), 0, -1, withscores=True
+            ),
+            "expiries": first._foundation._client.zrange(
+                cfg.key("reservations:expiry"), 0, -1, withscores=True
+            ),
+            "queues": [first._foundation._client.xlen(key) for key in queue_keys],
+            "reservations": first.list_reservations(),
+        }
+        with pytest.raises(RelayStateNoCapacity) as valkey_error:
+            second.select_and_reserve(
+                candidate_client,
+                "candidate",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+            )
+
+        memory = InMemoryRelayStateStore(
+            RelayStateStoreConfig(namespace=f"capacity-{bound}", **limits),
+            acknowledgement_key=b"k" * 32,
+        )
+        prepare(memory, time.time() + 60)
+        with pytest.raises(type(valkey_error.value)):
+            memory.select_and_reserve(
+                candidate_client,
+                "candidate",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                time.time() + 60,
+            )
+
+        assert not first._foundation._client.exists(candidate_key)
+        assert first._foundation._client.hgetall(cursor_key) == before["cursor"]
+        assert [first._foundation._client.hgetall(key) for key in node_keys] == before[
+            "nodes"
+        ]
+        assert (
+            first._foundation._client.zrange(
+                cfg.key("requests:deadline"), 0, -1, withscores=True
+            )
+            == before["deadlines"]
+        )
+        assert (
+            first._foundation._client.zrange(
+                cfg.key("reservations:expiry"), 0, -1, withscores=True
+            )
+            == before["expiries"]
+        )
+        assert [first._foundation._client.xlen(key) for key in queue_keys] == before[
+            "queues"
+        ]
+        assert first.list_reservations() == before["reservations"]
+    finally:
+        client_a, occupied = first._identity("client-a", "occupied")
+        candidate_client_digest, candidate_request = first._identity(
+            candidate_client, "candidate"
+        )
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            *(cfg.key("node", first._node_digest(node_id)) for node_id in node_ids),
+            *(cfg.key("queue", first._node_digest(node_id)) for node_id in node_ids),
+            cfg.key("request", client_a, occupied),
+            cfg.key("request", candidate_client_digest, candidate_request),
+        ]
+        if occupant is not None and occupant.reservation_token is not None:
+            keys.append(cfg.key("reservation", _digest(occupant.reservation_token)))
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()
+
+
+
 def test_scheduler_fairness_cursor_changes_only_for_new_reservations(valkey_server):
     namespace = uuid.uuid4().hex
     first = _registration_store(valkey_server, namespace, reservation_ttl_seconds=30)

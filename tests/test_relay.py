@@ -297,10 +297,7 @@ def test_api_v1_next_server_no_registered_compute_nodes_message(client):
     assert response.status_code == 503
     data = response.get_json()
     assert data["error"]["code"] == "no_registered_compute_nodes"
-    assert (
-        data["error"]["message"]
-        == "No registered compute nodes are available on this relay."
-    )
+    assert data["error"]["message"] == "No compatible compute node is available"
 
 
 def test_next_server_one_server(client):

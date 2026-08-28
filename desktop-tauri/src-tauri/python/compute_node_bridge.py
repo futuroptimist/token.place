@@ -3113,8 +3113,6 @@ def headless_cpu_admission(args: Any) -> int:
                               identity=False, warm_load="not_started", evidence=False)
     runtime = None
     startup_emitted = False
-    diag_path = None  # TEMPORARY bounded diagnostic for PR #1715, see below.
-    controlled_false_diagnostic = False
     identity_values = [os.environ.get(name, "") for name in (
         "TOKENPLACE_APP_VERSION", "TOKENPLACE_BUILD_ID", "TOKENPLACE_TARGET_TRIPLE",
         "TOKENPLACE_BUNDLED_RUNTIME_ID", "TOKENPLACE_RUNTIME_ID")]
@@ -3163,146 +3161,93 @@ def headless_cpu_admission(args: Any) -> int:
         print(json.dumps({"type": "headless_internal", "phase": "startup_ready"},
                          sort_keys=True, separators=(",", ":")), flush=True)
         startup_emitted = True
-        # TEMPORARY bounded diagnostic for PR #1715 (warm_load_failed root
-        # cause investigation). Tags exactly which step in this window raised
-        # and writes only that phase name plus the exception's class name
-        # (never message/args/traceback) to a file next to the already-
-        # validated, already-writable model path -- not ambient TEMP -- so
-        # the CI step and this process are guaranteed to agree on the
-        # location. Remove once root cause is confirmed/fixed.
         model_dir = os.path.dirname(os.path.abspath(args.model))
-        diag_path = os.path.join(model_dir, "tokenplace-headless-diag.txt")
-        diag_phase = "readiness_fixture"
-        try:
-            _, fixture = authoritative_readiness_fixture()
-            with tempfile.TemporaryDirectory(
-                prefix="tokenplace-headless-", dir=model_dir,
-                ignore_cleanup_errors=True,
-            ) as directory:
-                diag_phase = "request_write"
-                request_path = os.path.join(directory, "request.json")
-                evidence_path = os.path.join(directory, "evidence.json")
-                with open(request_path, "w", encoding="utf-8") as handle:
-                    json.dump(fixture, handle, sort_keys=True, separators=(",", ":"))
-                old_request = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST")
-                old_evidence = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
-                os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"] = request_path
-                os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE"] = evidence_path
-                try:
-                    diag_phase = "ensure_api_v1_runtime_ready"
-                    ready = runtime.ensure_api_v1_runtime_ready()
-                    if ready is False:
-                        readiness_diagnostics = _safe_readiness_diagnostics(manager)
-                        validation = getattr(manager, "last_model_artifact_validation", None)
-                        if isinstance(validation, dict) and validation.get("valid") is False:
-                            failure_stage = "model_preflight"
-                        elif readiness_diagnostics.get("api_v1_readiness_result") == "failed":
-                            failure_stage = "authoritative_admission"
-                        elif getattr(manager, "llm", None) is None:
-                            failure_stage = "runtime_initialization"
-                        else:
-                            failure_stage = "unclassified"
-                        controlled_false_diagnostic = True
-                        runtime_init_error_category = getattr(
-                            manager, "last_runtime_init_error_category", None
-                        )
-                        if isinstance(runtime_init_error_category, str):
-                            from utils.llm.model_manager import _validated_init_safe_category
-                            if (_validated_init_safe_category(runtime_init_error_category)
-                                    != runtime_init_error_category):
-                                runtime_init_error_category = None
-                        else:
-                            runtime_init_error_category = None
-                        try:
-                            diagnostic = {
-                                "schema_version": 1,
-                                "outcome": "readiness_returned_false",
-                                "stage": failure_stage,
-                                "runtime_present": getattr(manager, "llm", None) is not None,
-                                "readiness": readiness_diagnostics,
-                            }
-                            if (failure_stage == "runtime_initialization"
-                                    and runtime_init_error_category is not None):
-                                diagnostic["runtime_init_error_category"] = (
-                                    runtime_init_error_category
-                                )
-                            with open(diag_path, "w", encoding="utf-8") as diag_handle:
-                                json.dump(diagnostic, diag_handle, sort_keys=True,
-                                          separators=(",", ":"))
-                        except Exception:
-                            pass
-                    diag_phase = "evidence_read"
-                    try:
-                        with open(evidence_path, encoding="utf-8") as handle:
-                            evidence = json.load(handle)
-                    except (OSError, ValueError, TypeError):
-                        evidence = None
-                finally:
-                    for name, previous in (
-                        ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", old_request),
-                        ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", old_evidence),
-                    ):
-                        if previous is None:
-                            os.environ.pop(name, None)
-                        else:
-                            os.environ[name] = previous
-            diag_phase = "classify_readiness"
-            diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
-            readiness = _headless_classify_readiness(ready, diagnostics, evidence, fixture)
-            diag_phase = "post_classify_return"
-            if readiness != "success":
-                if readiness == "authoritative_evidence_failed":
-                    result["warm_load_result"] = "ready"
-                    result["failure_code"] = "authoritative_evidence_failed"
-                    result["last_completed_phase"] = "warm_load_completed"
-                    return 6
-                result["failure_code"] = "warm_load_failed"
-                return 5
-            result["warm_load_result"] = "ready"
-            result["last_completed_phase"] = "warm_load_completed"
-            result.update(success=True, failure_code="none",
-                          authoritative_evidence_result="validated")
-            return 0
-        except Exception as _diag_exc:
-            # TEMPORARY bounded diagnostic for PR #1715: the file-based side
-            # channel has never once been observed downstream on hosted
-            # Windows despite an equivalent local reproduction proving the
-            # write succeeds there, and despite this same write never
-            # raising on hosted Windows either (ruled out via a dedicated
-            # exit-4 signal on an earlier commit). Narrow the timing window
-            # to its tightest possible point: verify the write is visible
-            # to THIS SAME PROCESS microseconds later, before anything else
-            # (cleanup, another process, real-time AV scanning) gets a
-            # chance to interfere. If even this immediate self-read
-            # disagrees with what was just written, that is unambiguous
-            # proof of something acting on the file within this process's
-            # own execution, not a downstream/cross-process timing issue.
-            expected_diag_content = f"{diag_phase}:{type(_diag_exc).__name__}"
-            self_check_ok = False
+        _, fixture = authoritative_readiness_fixture()
+        with tempfile.TemporaryDirectory(
+            prefix="tokenplace-headless-", dir=model_dir,
+            ignore_cleanup_errors=True,
+        ) as directory:
+            request_path = os.path.join(directory, "request.json")
+            evidence_path = os.path.join(directory, "evidence.json")
+            with open(request_path, "w", encoding="utf-8") as handle:
+                json.dump(fixture, handle, sort_keys=True, separators=(",", ":"))
+            old_request = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST")
+            old_evidence = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
+            os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"] = request_path
+            os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE"] = evidence_path
             try:
-                with open(diag_path, "w", encoding="utf-8") as _diag_handle:
-                    _diag_handle.write(expected_diag_content)
-                with open(diag_path, encoding="utf-8") as _diag_verify:
-                    self_check_ok = _diag_verify.read() == expected_diag_content
-            except Exception:
-                self_check_ok = False
-            if not self_check_ok:
-                # failure_code (forwarded verbatim by the Rust supervisor,
-                # unlike exit_code which it normalizes to a fixed 0/7) is
-                # otherwise unreachable as mock_runtime_rejected this late
-                # in the function, so its appearance here (instead of the
-                # normal warm_load_failed) is conclusive proof the file is
-                # not durably visible even to this same process immediately
-                # after writing it.
-                result["failure_code"] = "mock_runtime_rejected"
-                return 4
-            # Confirmed (previous commit): the write and an immediate
-            # read-back succeed, and the file survives a full ~1s monitored
-            # window within this process's own execution -- it is not being
-            # removed near-instantly by something reacting to the write
-            # itself. See the finally block below for the next check: does
-            # it survive past runtime.stop()/_close_llm_proxy cleanup too?
-            raise
+                ready = runtime.ensure_api_v1_runtime_ready()
+                if ready is False:
+                    diag_path = os.path.join(
+                        model_dir, "tokenplace-headless-diag.txt"
+                    )
+                    readiness_diagnostics = _safe_readiness_diagnostics(manager)
+                    validation = getattr(manager, "last_model_artifact_validation", None)
+                    if isinstance(validation, dict) and validation.get("valid") is False:
+                        failure_stage = "model_preflight"
+                    elif readiness_diagnostics.get("api_v1_readiness_result") == "failed":
+                        failure_stage = "authoritative_admission"
+                    elif getattr(manager, "llm", None) is None:
+                        failure_stage = "runtime_initialization"
+                    else:
+                        failure_stage = "unclassified"
+                    runtime_init_error_category = getattr(
+                        manager, "last_runtime_init_error_category", None
+                    )
+                    if isinstance(runtime_init_error_category, str):
+                        from utils.llm.model_manager import _validated_init_safe_category
+                        if (_validated_init_safe_category(runtime_init_error_category)
+                                != runtime_init_error_category):
+                            runtime_init_error_category = None
+                    else:
+                        runtime_init_error_category = None
+                    try:
+                        diagnostic = {
+                            "schema_version": 1,
+                            "outcome": "readiness_returned_false",
+                            "stage": failure_stage,
+                            "runtime_present": getattr(manager, "llm", None) is not None,
+                            "readiness": readiness_diagnostics,
+                        }
+                        if (failure_stage == "runtime_initialization"
+                                and runtime_init_error_category is not None):
+                            diagnostic["runtime_init_error_category"] = (
+                                runtime_init_error_category
+                            )
+                        with open(diag_path, "w", encoding="utf-8") as diag_handle:
+                            json.dump(diagnostic, diag_handle, sort_keys=True,
+                                      separators=(",", ":"))
+                    except Exception:
+                        pass
+                try:
+                    with open(evidence_path, encoding="utf-8") as handle:
+                        evidence = json.load(handle)
+                except (OSError, ValueError, TypeError):
+                    evidence = None
+            finally:
+                for name, previous in (
+                    ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", old_request),
+                    ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", old_evidence),
+                ):
+                    if previous is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = previous
+        diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
+        readiness = _headless_classify_readiness(ready, diagnostics, evidence, fixture)
+        if readiness != "success":
+            if readiness == "authoritative_evidence_failed":
+                result["warm_load_result"] = "ready"
+                result["failure_code"] = "authoritative_evidence_failed"
+                result["last_completed_phase"] = "warm_load_completed"
+                return 6
+            result["failure_code"] = "warm_load_failed"
+            return 5
+        result["warm_load_result"] = "ready"
+        result["last_completed_phase"] = "warm_load_completed"
+        result.update(success=True, failure_code="none",
+                      authoritative_evidence_result="validated")
+        return 0
     except Exception:
         if not startup_emitted:
             result["failure_code"] = "bridge_exited_before_startup_event"
@@ -3311,14 +3256,6 @@ def headless_cpu_admission(args: Any) -> int:
         return 7
     finally:
         cleanup_ok = True
-        # TEMPORARY bounded diagnostic for PR #1715: the diag file is known
-        # (previous commit) to survive a full ~1s monitored window inside
-        # this process before this point is ever reached. Check whether it
-        # survives runtime.stop()/_close_llm_proxy cleanup too, using two
-        # more failure_code values that are otherwise unreachable when the
-        # underlying result is warm_load_failed (both booleans, never a
-        # path or content).
-        diag_pre_cleanup = diag_path is not None and os.path.isfile(diag_path)
         if runtime is not None:
             try:
                 runtime.stop(shutdown_deadline=time.monotonic() + 2.0)
@@ -3331,17 +3268,10 @@ def headless_cpu_admission(args: Any) -> int:
                     manager.llm = None
             except Exception:
                 cleanup_ok = False
-        diag_post_cleanup = diag_path is not None and os.path.isfile(diag_path)
         if not cleanup_ok:
             result.update(success=False, failure_code="cleanup_failed")
         elif result["success"]:
             result["last_completed_phase"] = "cleanup_completed"
-        elif (result.get("failure_code") == "warm_load_failed"
-              and diag_pre_cleanup and not controlled_false_diagnostic):
-            result["failure_code"] = (
-                "packaged_runtime_identity_failed" if diag_post_cleanup
-                else "unsupported_backend"
-            )
         print(json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
         if not cleanup_ok:
             return 8

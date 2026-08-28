@@ -311,12 +311,7 @@ def test_headless_cpu_admission_rejects_mock_and_classifies_exceptions(
         monkeypatch, tmp_path, load_exception=RuntimeError("load failed"))
     assert compute_node_bridge.headless_cpu_admission(args) == 7
     records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    # TEMPORARY for PR #1715's active diagnostic: in a clean local
-    # environment the diag file written on exception survives cleanup, so
-    # the finally block relabels failure_code to the "still there after
-    # cleanup" bucket instead of leaving it as warm_load_failed. Revert to
-    # asserting "warm_load_failed" once the diagnostic is removed.
-    assert records[-1]["failure_code"] == "packaged_runtime_identity_failed"
+    assert records[-1]["failure_code"] == "warm_load_failed"
 
 
 def test_headless_cpu_admission_cleanup_failure_overrides_success(

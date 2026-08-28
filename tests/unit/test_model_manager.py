@@ -10672,7 +10672,7 @@ def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch, pos
     assert proxy._worker_tmpfile is None
 
 
-def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(monkeypatch):
+def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
 
     popen_commands = []
@@ -10715,12 +10715,88 @@ def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(mo
         lambda *args, **kwargs: {'status': 'ok'},
     )
 
-    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf')
+    model_path = tmp_path / 'missing' / 'model.gguf'
+    proxy = model_manager_module._SubprocessLlamaProxy(str(model_path))
 
     assert proxy._worker_tmpfile is None
-    assert len(mkstemp_calls) == 2
+    assert len(mkstemp_calls) == 1
     assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
     assert proxy._process._token_place_command == [sys.executable, '<runtime-worker-code>']
+
+
+@pytest.mark.parametrize('cleanup_raises', [False, True])
+def test_subprocess_proxy_cleans_partial_worker_script_when_fdopen_fails(
+    monkeypatch, tmp_path, cleanup_raises
+):
+    from utils.llm import model_manager as model_manager_module
+
+    descriptor = 123
+    partial_script = str(tmp_path / 'partial-worker.py')
+    cleanup_calls = []
+    popen_commands = []
+
+    def fake_close(fd):
+        cleanup_calls.append(('close', fd))
+        if cleanup_raises:
+            raise OSError('close unavailable')
+
+    def fake_unlink(path):
+        cleanup_calls.append(('unlink', path))
+        if cleanup_raises:
+            raise OSError('unlink unavailable')
+
+    class FakeStdin:
+        def write(self, value):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+        stdout = None
+        stderr = []
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        popen_commands.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        model_manager_module.tempfile,
+        'mkstemp',
+        lambda *args, **kwargs: (descriptor, partial_script),
+    )
+    monkeypatch.setattr(
+        model_manager_module.os,
+        'fdopen',
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError('fdopen unavailable')),
+    )
+    monkeypatch.setattr(model_manager_module.os, 'close', fake_close)
+    monkeypatch.setattr(model_manager_module.os, 'unlink', fake_unlink)
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(
+        model_manager_module._SubprocessLlamaProxy,
+        '_start_stderr_tail_reader',
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_read_llama_subprocess_message',
+        lambda *args, **kwargs: {'status': 'ok'},
+    )
+
+    model_path = tmp_path / 'missing' / 'model.gguf'
+    proxy = model_manager_module._SubprocessLlamaProxy(str(model_path))
+
+    assert cleanup_calls == [('close', descriptor), ('unlink', partial_script)]
+    assert proxy._worker_tmpfile is None
+    assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
 
 
 def test_subprocess_proxy_retries_worker_script_in_model_dir(monkeypatch, tmp_path):

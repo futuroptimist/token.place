@@ -3825,7 +3825,71 @@ def test_windows_installer_identity_native_load_probe_failure_is_privacy_safe(mo
         assert secret not in combined
 
 
-def test_windows_installer_identity_native_probe_failure_precedes_authoritative_gate(monkeypatch, tmp_path) -> None:
+def test_windows_installer_identity_native_load_probe_launch_error_is_privacy_safe(monkeypatch, tmp_path, capsys) -> None:
+    guard = _load_windows_installer_identity()
+    runtime = tmp_path / 'installed' / 'python-runtime'
+    runtime.mkdir(parents=True)
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    model = tmp_path / 'secret-model.gguf'
+    secret = f'launch secret {model}'
+    monkeypatch.setattr(guard, '_run', lambda *args, **kwargs: (_ for _ in ()).throw(OSError(secret)))
+
+    record = guard.run_native_load_probe(runtime.parent / 'token-place.exe', model)
+
+    assert record['exception_class'] == 'launch_failure'
+    assert secret not in capsys.readouterr().out
+
+
+def test_windows_installer_identity_native_load_probe_rejects_unhashable_phase(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    runtime = tmp_path / 'installed' / 'python-runtime'
+    runtime.mkdir(parents=True)
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    payload = {'schema_version': 1, 'phase': [], 'success': False, 'exception_class': 'RuntimeError'}
+    monkeypatch.setattr(
+        guard, '_run',
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, json.dumps(payload), ''),
+    )
+
+    record = guard.run_native_load_probe(runtime.parent / 'token-place.exe', tmp_path / 'tiny.gguf')
+
+    assert record['exception_class'] == 'malformed_output'
+
+
+@pytest.mark.parametrize('failure_at', ['mkdir', 'write'])
+def test_windows_installer_identity_native_load_probe_artifact_error_is_best_effort(
+    monkeypatch, tmp_path, capsys, failure_at,
+) -> None:
+    guard = _load_windows_installer_identity()
+    runtime = tmp_path / 'installed' / 'python-runtime'
+    runtime.mkdir(parents=True)
+    (runtime / 'python.exe').write_text('python', encoding='utf-8')
+    payload = {'schema_version': 1, 'phase': 'close', 'success': True, 'exception_class': None}
+    monkeypatch.setattr(
+        guard, '_run',
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, json.dumps(payload), ''),
+    )
+    artifact = tmp_path / 'artifacts' / 'native-load.json'
+    target = type(artifact.parent) if failure_at == 'mkdir' else type(artifact)
+    method = 'mkdir' if failure_at == 'mkdir' else 'write_text'
+    original = getattr(target, method)
+
+    def fail_selected(self, *args, **kwargs):
+        if self == (artifact.parent if failure_at == 'mkdir' else artifact):
+            raise OSError('private artifact failure')
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(target, method, fail_selected)
+    record = guard.run_native_load_probe(runtime.parent / 'token-place.exe', tmp_path / 'tiny.gguf', artifact)
+
+    assert record['success'] is True
+    assert capsys.readouterr().out.count('artifact_write_failure') == 1
+
+
+@pytest.mark.parametrize('probe_result', ['returned_failure', 'unexpected_exception'])
+def test_windows_installer_identity_native_probe_failure_precedes_authoritative_gate(
+    monkeypatch, tmp_path, probe_result,
+) -> None:
     guard = _load_windows_installer_identity()
     installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.17-x64-setup.exe', 'nsis', '0.1.17')
     exe = tmp_path / 'token-place.exe'
@@ -3847,10 +3911,13 @@ def test_windows_installer_identity_native_probe_failure_precedes_authoritative_
         'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID, 'bridge_preflight': 'ok',
         'model_artifact_inspect': 'ok', 'model_artifact_filename': guard.EXPECTED_MODEL_ARTIFACT_FILENAME,
     }))
-    monkeypatch.setattr(
-        guard, 'run_native_load_probe',
-        lambda *args: events.append('native-failed') or {'success': False},
-    )
+    def native_probe(*args):
+        events.append('native-failed')
+        if probe_result == 'unexpected_exception':
+            raise ValueError('private unexpected failure')
+        return {'success': False}
+
+    monkeypatch.setattr(guard, 'run_native_load_probe', native_probe)
     monkeypatch.setattr(
         guard, 'run_headless_cpu_admission',
         lambda *args: events.append('authoritative-ran') or _headless_cpu_success_result(),

@@ -935,17 +935,24 @@ def run_native_load_probe(exe: Path, model: Path, artifact_path: Path | None = N
             child = json.loads(result.stdout.strip())
         except json.JSONDecodeError:
             child = None
+        phase = child.get("phase") if isinstance(child, dict) else None
+        exception_class = child.get("exception_class") if isinstance(child, dict) else None
+        valid_exception_class = (
+            isinstance(exception_class, str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", exception_class) is not None
+        )
         valid = (
             isinstance(child, dict)
             and set(child) == {"schema_version", "phase", "success", "exception_class"}
             and type(child["schema_version"]) is int
             and child["schema_version"] == 1
             and type(child["success"]) is bool
-            and child["phase"] in {"import", "construct", "close"}
-            and (child["exception_class"] is None or (
-                isinstance(child["exception_class"], str)
-                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", child["exception_class"])
-            ))
+            and isinstance(phase, str)
+            and phase in {"import", "construct", "close"}
+            and (
+                (child["success"] is True and phase == "close" and exception_class is None)
+                or (child["success"] is False and valid_exception_class)
+            )
         )
         if valid and result.returncode == 0:
             record = {
@@ -974,9 +981,22 @@ def run_native_load_probe(exe: Path, model: Path, artifact_path: Path | None = N
             "stderr_present": False,
             "timed_out": True,
         }
+    except OSError:
+        record = {
+            "schema_version": 1,
+            "phase": "launch",
+            "success": False,
+            "exception_class": "launch_failure",
+            "exit_code": None,
+            "stderr_present": False,
+            "timed_out": False,
+        }
     if artifact_path is not None:
-        artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        artifact_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        try:
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError:
+            print("native_load_probe artifact_write_failure", flush=True)
     print(
         f"native_load_probe phase={record['phase']} success={str(record['success']).lower()} "
         f"category={record['exception_class'] or 'none'}",
@@ -1343,11 +1363,14 @@ def run_scenario(
                         raise InstallerIdentityError(f"operator smoke did not preserve seeded config field {key}")
             validate_installed_context_tiers(shortcut.target, env, artifact_dir, scenario.name)
             if tokenizer_boundary_model is not None:
-                run_native_load_probe(
-                    shortcut.target,
-                    tokenizer_boundary_model,
-                    artifact_dir.path(scenario.name, "native-load-probe") if artifact_dir else None,
-                )
+                try:
+                    run_native_load_probe(
+                        shortcut.target,
+                        tokenizer_boundary_model,
+                        artifact_dir.path(scenario.name, "native-load-probe") if artifact_dir else None,
+                    )
+                except Exception:
+                    print("native_load_probe probe_internal_error", flush=True)
                 run_headless_cpu_admission(
                     shortcut.target,
                     tokenizer_boundary_model,

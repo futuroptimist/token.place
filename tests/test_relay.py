@@ -498,7 +498,9 @@ def test_api_v1_best_fit_least_loaded_within_same_tier(client):
         _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast"))
     _queue_api_v1_request(client, server_public_key=busy, request_id="req-busy-queue")
 
-    payload = client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json()
+    response = client.get("/api/v1/relay/servers/next?context_tier=8k-fast")
+    assert response.status_code == 200
+    payload = response.get_json()
 
     assert payload["server_public_key"] == idle
     assert payload["selected_queue_depth"] == 0
@@ -909,12 +911,12 @@ def test_api_v1_diagnostics_expose_only_normalized_capabilities(client):
 
 def _queue_api_v1_request(client, *, server_public_key, request_id, client_public_key=None):
     response = client.post('/api/v1/relay/requests', json={
-        'request_id': request_id,
-        'client_public_key': client_public_key or f'{DUMMY_CLIENT_PUB_KEY}-{request_id}',
+        **_api_v1_request_payload(
+            request_id,
+            client_public_key=client_public_key or f'{DUMMY_CLIENT_PUB_KEY}-{request_id}',
+            cancel_token=f'cancel-proof-{request_id}',
+        ),
         'server_public_key': server_public_key,
-        'chat_history': f'ciphertext-{request_id}',
-        'cipherkey': f'cipherkey-{request_id}',
-        'iv': f'iv-{request_id}',
     })
     assert response.status_code == 200
     return response

@@ -119,7 +119,15 @@ def test_maintenance_gauges_use_single_multiprocess_snapshot(tmp_path) -> None:
 import os
 import sys
 
+from prometheus_client import Gauge
+
 import relay
+
+default_mode_control = Gauge(
+    "default_mode_control",
+    "Control gauge using the default multiprocess mode",
+)
+default_mode_control.set(1)
 
 relay.app.config["TESTING"] = True
 with relay.app.test_client() as client:
@@ -144,23 +152,31 @@ with relay.app.test_client() as client:
 
     # Three independent workers each report one node. The final scrape is emitted
     # by the last worker so its authoritative snapshot remains the most recent.
+    results = []
     for mode in ("write", "write"):
+        results.append(
+            subprocess.run(
+                [sys.executable, "-c", worker, mode],
+                cwd=Path(__file__).parents[2],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        )
+    results.append(
         subprocess.run(
-            [sys.executable, "-c", worker, mode],
+            [sys.executable, "-c", worker, "emit"],
             cwd=Path(__file__).parents[2],
             env=env,
             check=True,
             capture_output=True,
             text=True,
         )
-    exposed = subprocess.run(
-        [sys.executable, "-c", worker, "emit"],
-        cwd=Path(__file__).parents[2],
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.split("__METRICS__\n", 1)[1]
+    )
+    assert all(token not in result.stdout for result in results)
+    assert all(token not in result.stderr for result in results)
+    exposed = results[-1].stdout.split("__METRICS__\n", 1)[1]
 
     names = {
         "tokenplace_build_info",
@@ -178,7 +194,16 @@ with relay.app.test_client() as client:
         name: [sample for sample in samples if sample.name == name]
         for name in names
     }
+    control_samples = [
+        sample
+        for family in text_string_to_metric_families(exposed)
+        for sample in family.samples
+        if sample.name == "default_mode_control"
+    ]
 
+    assert len(control_samples) == len(results)
+    assert len({sample.labels["pid"] for sample in control_samples}) == len(results)
+    assert all(set(sample.labels) == {"pid"} for sample in control_samples)
     assert all(len(metric_samples) == 1 for metric_samples in by_name.values())
     assert all("pid" not in sample.labels for sample in samples)
     assert by_name["tokenplace_build_info"][0].value == 1

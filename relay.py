@@ -417,7 +417,12 @@ def _get_gauge(name: str, description: str, labels: list[str] | None = None) -> 
     existing = getattr(REGISTRY, "_names_to_collectors", {}).get(name)
     if existing is not None:
         return existing  # type: ignore[return-value]
-    return Gauge(name, description, labels or [])
+    return Gauge(
+        name,
+        description,
+        labels or [],
+        multiprocess_mode="livemostrecent",
+    )
 
 
 BUILD_INFO = _get_gauge(

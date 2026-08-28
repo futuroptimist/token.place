@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
+import subprocess
+import sys
+import textwrap
 from datetime import datetime, timedelta
 
 import pytest
@@ -95,6 +99,162 @@ def test_required_sugarkube_metric_families_and_initialization(relay_client) -> 
     assert _metric_value(body, "tokenplace_instrumentation_up") == 1
     assert _metric_value(body, "tokenplace_compute_nodes_registered") == 0
     assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
+
+
+def test_maintenance_gauges_are_single_series_in_multiprocess_exposition(
+    tmp_path,
+) -> None:
+    """Point-in-time relay gauges must not gain per-worker pid series."""
+
+    multiprocess_dir = tmp_path / "prometheus"
+    multiprocess_dir.mkdir()
+    environment = os.environ.copy()
+    environment["PROMETHEUS_MULTIPROC_DIR"] = str(multiprocess_dir)
+
+    worker = textwrap.dedent(
+        """
+        import relay
+
+        assert relay.BUILD_INFO._multiprocess_mode == "livemostrecent"
+        assert relay.INSTRUMENTATION_UP._multiprocess_mode == "livemostrecent"
+        assert relay.COMPUTE_NODES_REGISTERED._multiprocess_mode == "livemostrecent"
+        assert relay.COMPUTE_NODES_HEALTHY._multiprocess_mode == "livemostrecent"
+        relay.COMPUTE_NODES_REGISTERED.set(1)
+        relay.COMPUTE_NODES_HEALTHY.set(1)
+        """
+    )
+    for _ in range(2):
+        subprocess.run(
+            [sys.executable, "-c", worker],
+            check=True,
+            cwd=os.getcwd(),
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+
+    exposition = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                from prometheus_client import CollectorRegistry, generate_latest
+                from prometheus_client.multiprocess import MultiProcessCollector
+
+                registry = CollectorRegistry()
+                MultiProcessCollector(registry)
+                print(generate_latest(registry).decode(), end="")
+                """
+            ),
+        ],
+        check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    metric_names = {
+        "tokenplace_build_info",
+        "tokenplace_instrumentation_up",
+        "tokenplace_compute_nodes_registered",
+        "tokenplace_compute_nodes_healthy",
+    }
+    series = [
+        line
+        for line in exposition.splitlines()
+        if line and not line.startswith("#") and line.split("{")[0].split()[0] in metric_names
+    ]
+    assert len(series) == len(metric_names)
+    assert all("pid=" not in line for line in series)
+    assert all(float(line.rsplit(" ", 1)[1]) == 1 for line in series)
+
+    build_series = next(line for line in series if line.startswith("tokenplace_build_info"))
+    assert 'version="' in build_series
+    assert 'revision="' in build_series
+    assert all(
+        'version="' not in line and 'revision="' not in line
+        for line in series
+        if line != build_series
+    )
+
+
+def test_default_multiprocess_gauge_mode_exposes_per_process_pid(tmp_path) -> None:
+    """Prove the regression assertions detect the prometheus_client default."""
+
+    multiprocess_dir = tmp_path / "prometheus-default"
+    multiprocess_dir.mkdir()
+    environment = os.environ.copy()
+    environment["PROMETHEUS_MULTIPROC_DIR"] = str(multiprocess_dir)
+    worker = "from prometheus_client import Gauge; Gauge('probe', 'probe').set(1)"
+    for _ in range(2):
+        subprocess.run(
+            [sys.executable, "-c", worker],
+            check=True,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+    exposition = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from prometheus_client import CollectorRegistry, generate_latest; "
+                "from prometheus_client.multiprocess import MultiProcessCollector; "
+                "r=CollectorRegistry(); MultiProcessCollector(r); "
+                "print(generate_latest(r).decode(), end='')"
+            ),
+        ],
+        check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    probe_series = [line for line in exposition.splitlines() if line.startswith("probe{")]
+    assert len(probe_series) == 2
+    assert all("pid=" in line for line in probe_series)
+
+
+def test_metrics_auth_works_in_multiprocess_subprocess(tmp_path) -> None:
+    """Bearer protection remains active when multiprocess metrics are enabled."""
+
+    multiprocess_dir = tmp_path / "prometheus-auth"
+    multiprocess_dir.mkdir()
+    environment = os.environ.copy()
+    environment["PROMETHEUS_MULTIPROC_DIR"] = str(multiprocess_dir)
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import os
+                import secrets
+
+                token = secrets.token_urlsafe(24)
+                os.environ["TOKENPLACE_METRICS_TOKEN"] = token
+                import relay
+
+                relay.app.config["TESTING"] = True
+                with relay.app.test_client() as client:
+                    assert client.get("/metrics").status_code == 401
+                    response = client.get(
+                        "/metrics",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    assert response.status_code == 200
+                    assert token.encode() not in response.data
+                """
+            ),
+        ],
+        check=True,
+        cwd=os.getcwd(),
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_compute_node_gauges_follow_api_v1_lease_semantics(relay_client) -> None:

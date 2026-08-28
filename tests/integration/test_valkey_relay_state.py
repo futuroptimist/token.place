@@ -380,6 +380,128 @@ def test_scheduler_reservation_and_enqueue_are_shared_and_idempotent(valkey_serv
         second.close()
 
 
+def test_scheduler_state_contract_authentication_and_preservation(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner = _digest("scheduler-owner")
+    wrong_owner = _digest("wrong-scheduler-owner")
+    node_key = first._foundation.config.key(
+        "node", first._node_digest("scheduler-node")
+    )
+    unknown_key = first._foundation.config.key(
+        "node", first._node_digest("unknown-scheduler-node")
+    )
+    try:
+        first.register("scheduler-node", _capabilities(), owner)
+        assert first._foundation._client.hmget(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        ) == [b"1", b"0", b"0"]
+
+        updated = SchedulerNodeState(healthy=False, draining=True, claimed_work=1)
+        assert first.set_scheduler_state("scheduler-node", owner, updated)
+        assert second._foundation._client.hmget(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        ) == [b"0", b"1", b"1"]
+
+        unchanged = second._foundation._client.hgetall(node_key)
+        with pytest.raises(RelayStateCredentialMismatch):
+            second.set_scheduler_state(
+                "scheduler-node", wrong_owner, SchedulerNodeState()
+            )
+        assert second._foundation._client.hgetall(node_key) == unchanged
+
+        assert not second.set_scheduler_state(
+            "unknown-scheduler-node", owner, SchedulerNodeState()
+        )
+        assert not second._foundation._client.exists(unknown_key)
+
+        assert first.renew("scheduler-node", owner) is not None
+        assert (
+            second.renew(
+                "scheduler-node",
+                owner,
+                capabilities=dataclasses.replace(_capabilities(), max_concurrency=3),
+            )
+            is not None
+        )
+        first.register(
+            "scheduler-node",
+            dataclasses.replace(_capabilities(), max_concurrency=4),
+            owner,
+        )
+        assert second._foundation._client.hmget(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        ) == [b"0", b"1", b"1"]
+    finally:
+        first._foundation._client.delete(
+            *_registration_keys(first, "scheduler-node", "unknown-scheduler-node")
+        )
+        first.close()
+        second.close()
+
+
+def test_scheduler_state_lifecycle_unregister_and_inclusive_expiry(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner = _digest("scheduler-lifecycle-owner")
+    cfg = first._foundation.config
+    leases = cfg.key("nodes:lease")
+    cursor = cfg.key("cursor")
+    node_digest = first._node_digest("scheduler-node")
+    node_key = cfg.key("node", node_digest)
+    try:
+        first.register("scheduler-node", _capabilities(), owner)
+        assert second.unregister("scheduler-node", owner)
+        assert second.get("scheduler-node") is None
+        assert not first.set_scheduler_state(
+            "scheduler-node", owner, SchedulerNodeState()
+        )
+        with pytest.raises(RelayStateNoCapacity):
+            first.select_and_reserve(
+                "client",
+                "after-unregister",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                time.time() + 30,
+            )
+        assert not first._foundation._client.exists(node_key)
+        assert first._foundation._client.zscore(leases, node_digest) is None
+
+        first.register("scheduler-node", _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        cutoff = seconds + micros / 1_000_000
+        first._foundation._client.zadd(leases, {node_digest: cutoff})
+        assert not second.set_scheduler_state(
+            "scheduler-node", owner, SchedulerNodeState(draining=True)
+        )
+        with pytest.raises(RelayStateNoCapacity):
+            second.select_and_reserve(
+                "client",
+                "after-expiry",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                cutoff + 30,
+            )
+        assert second.get("scheduler-node") is None
+        assert not second._foundation._client.exists(node_key)
+        assert second._foundation._client.zscore(leases, node_digest) is None
+    finally:
+        first._foundation._client.delete(leases, cursor, node_key, cfg.key("schema"))
+        first.close()
+        second.close()
+
+
 @pytest.mark.parametrize(
     ("activities", "expected_evicted"),
     [((1, 2), "alpha"), ((1, 1), "alpha")],

@@ -8952,6 +8952,49 @@ def test_headless_admission_fixture_omits_legacy_chat_format(tmp_path):
     assert 'chat_format' not in llm.kwargs
 
 
+def test_runtime_init_error_category_survives_none_and_clears_on_retry(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'llama-3.1-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }.get(key, default)
+    manager = ModelManager(config)
+    Path(manager.model_path).write_text('fake')
+
+    class FailingLlama:
+        def __init__(self, **_kwargs):
+            raise model_manager_module.LlamaCppRuntimeInitError(
+                'PRIVATE constructor detail',
+                safe_error_category='runtime_model_vocab_failed',
+            )
+
+    class ReadyLlama:
+        def __init__(self, **_kwargs):
+            pass
+
+    capabilities = {'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}
+    with patch.object(manager, '_runtime_capabilities', return_value=capabilities), \
+         patch('utils.llm.model_manager._import_llama_cpp_runtime',
+               return_value=SimpleNamespace(Llama=FailingLlama)):
+        assert manager.get_llm_instance() is None
+
+    assert manager.last_runtime_init_error_category == 'runtime_model_vocab_failed'
+    assert 'PRIVATE' not in manager.last_runtime_init_error_category
+
+    with patch.object(manager, '_runtime_capabilities', return_value=capabilities), \
+         patch('utils.llm.model_manager._import_llama_cpp_runtime',
+               return_value=SimpleNamespace(Llama=ReadyLlama)):
+        assert manager.get_llm_instance() is not None
+
+    assert manager.last_runtime_init_error_category is None
+
+
 def test_headless_admission_fixture_uses_configured_subprocess_render_contract(
     monkeypatch, tmp_path
 ):

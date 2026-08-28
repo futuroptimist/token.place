@@ -5793,6 +5793,7 @@ class ModelManager:
         self.last_plain_completion_eval_return_code: Optional[int] = None
         self.worker_state = 'stopped'
         self.last_runtime_init_error: Optional[str] = None
+        self.last_runtime_init_error_category: Optional[str] = None
         self._qwen_64k_runtime_profiles: list[Dict[str, Any]] = []
         self._qwen_64k_selected_profile_index = 0
         self._qwen_64k_selected_profile_id: Optional[str] = None
@@ -6794,6 +6795,7 @@ class ModelManager:
                     else:
                         try:
                             self.last_runtime_init_error = None
+                            self.last_runtime_init_error_category = None
                             # Dynamically import Llama only when needed
                             self.log_info("Locating llama_cpp runtime for model initialization...")
                             llama_cpp = _import_llama_cpp_runtime(
@@ -7137,6 +7139,7 @@ class ModelManager:
                                 f"fallback_reason={compute_plan['fallback_reason'] or 'none'}"
                             )
                             self.worker_state = 'ready'
+                            self.last_runtime_init_error_category = None
                             self.last_worker_error_code = None
                             self.last_worker_exit_code = None
                             self.log_info("desktop.llama_cpp_worker.initialized event=worker_initialization worker_state=ready worker_generation=%s worker_restart_count=%s" % (self._llm_generation, self.worker_restart_count))
@@ -7144,6 +7147,13 @@ class ModelManager:
                             self.log_info("Llama model initialized successfully.")
                         except Exception as e:
                             self.llm = None
+                            if isinstance(e, LlamaCppRuntimeInitError):
+                                init_error_category = e.safe_error_category
+                            else:
+                                init_error_category = _classify_runtime_context_create_error(e)
+                            self.last_runtime_init_error_category = (
+                                _validated_init_safe_category(init_error_category)
+                            )
                             self.last_runtime_init_error = _redact_paths_from_text(e, limit=12000)
                             if isinstance(e, LlamaCppRuntimeStageTimeout):
                                 self.last_runtime_init_error = _format_runtime_stage_timeout(e)

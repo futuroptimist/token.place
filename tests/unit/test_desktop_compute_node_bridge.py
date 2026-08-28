@@ -105,7 +105,8 @@ def test_headless_boundary_requires_exact_authoritative_evidence(monkeypatch):
 def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
                                 evidence_valid=True, mock_runtime=False,
                                 load_exception=None, cleanup_exception=None,
-                                report_readiness_failure=True):
+                                report_readiness_failure=True,
+                                runtime_init_error_category=None):
     """Install a minimal runtime double while retaining the real evidence validator."""
     model = tmp_path / "model.gguf"
     model.write_bytes(b"fixture")
@@ -136,6 +137,7 @@ def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
         llm = None
         last_compute_diagnostics = {}
         last_runtime_init_error = "PRIVATE runtime path and raw exception"
+        last_runtime_init_error_category = runtime_init_error_category
         model_profile = {"provider": "qwen", "chat_template_policy": "gguf-jinja"}
 
         @staticmethod
@@ -216,10 +218,18 @@ def test_headless_cpu_admission_runtime_outcomes(
         "runtime_identity_validated")
 
 
+@pytest.mark.parametrize(
+    ("category", "expected_category"),
+    [
+        ("runtime_model_load_failed", "runtime_model_load_failed"),
+        ("PRIVATE invalid category", None),
+    ],
+)
 def test_headless_cpu_admission_false_readiness_writes_bounded_diagnostic(
-        monkeypatch, tmp_path, capsys):
+        monkeypatch, tmp_path, capsys, category, expected_category):
     args = _configure_headless_runtime(
-        monkeypatch, tmp_path, ready=False, report_readiness_failure=False)
+        monkeypatch, tmp_path, ready=False, report_readiness_failure=False,
+        runtime_init_error_category=category)
 
     assert compute_node_bridge.headless_cpu_admission(args) == 5
 
@@ -228,13 +238,16 @@ def test_headless_cpu_admission_false_readiness_writes_bounded_diagnostic(
     diagnostic = json.loads(
         (tmp_path / "tokenplace-headless-diag.txt").read_text(encoding="utf-8")
     )
-    assert diagnostic == {
+    expected = {
         "schema_version": 1,
         "outcome": "readiness_returned_false",
         "stage": "runtime_initialization",
         "runtime_present": False,
         "readiness": {},
     }
+    if expected_category is not None:
+        expected["runtime_init_error_category"] = expected_category
+    assert diagnostic == expected
     serialized = json.dumps(diagnostic)
     assert str(args.model) not in serialized
     assert "last_runtime_init_error" not in serialized

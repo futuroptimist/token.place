@@ -3203,20 +3203,32 @@ def headless_cpu_admission(args: Any) -> int:
                         else:
                             failure_stage = "unclassified"
                         controlled_false_diagnostic = True
+                        runtime_init_error_category = getattr(
+                            manager, "last_runtime_init_error_category", None
+                        )
+                        if isinstance(runtime_init_error_category, str):
+                            from utils.llm.model_manager import _validated_init_safe_category
+                            if (_validated_init_safe_category(runtime_init_error_category)
+                                    != runtime_init_error_category):
+                                runtime_init_error_category = None
+                        else:
+                            runtime_init_error_category = None
                         try:
-                            with open(diag_path, "w", encoding="utf-8") as diag_handle:
-                                json.dump(
-                                    {
-                                        "schema_version": 1,
-                                        "outcome": "readiness_returned_false",
-                                        "stage": failure_stage,
-                                        "runtime_present": getattr(manager, "llm", None) is not None,
-                                        "readiness": readiness_diagnostics,
-                                    },
-                                    diag_handle,
-                                    sort_keys=True,
-                                    separators=(",", ":"),
+                            diagnostic = {
+                                "schema_version": 1,
+                                "outcome": "readiness_returned_false",
+                                "stage": failure_stage,
+                                "runtime_present": getattr(manager, "llm", None) is not None,
+                                "readiness": readiness_diagnostics,
+                            }
+                            if (failure_stage == "runtime_initialization"
+                                    and runtime_init_error_category is not None):
+                                diagnostic["runtime_init_error_category"] = (
+                                    runtime_init_error_category
                                 )
+                            with open(diag_path, "w", encoding="utf-8") as diag_handle:
+                                json.dump(diagnostic, diag_handle, sort_keys=True,
+                                          separators=(",", ":"))
                         except Exception:
                             pass
                     diag_phase = "evidence_read"

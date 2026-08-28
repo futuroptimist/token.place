@@ -240,20 +240,37 @@ def test_api_v1_response_submissions_do_not_use_public_quota(client):
 def test_api_v1_client_relay_read_paths_are_not_rate_limited_by_public_quota(client):
     """Client discovery and response polling stay outside the public API quota."""
 
-    _register_api_v1_server(client, DUMMY_SERVER_PUB_KEY)
-    client_pending_request_ids[DUMMY_CLIENT_PUB_KEY] = {"request-1": time.time()}
+    capabilities = _capabilities()
+    capabilities["max_concurrency"] = 2
+    _api_v1_registered_control_payload(client, DUMMY_SERVER_PUB_KEY, capabilities=capabilities)
+    enqueue = client.post(
+        "/api/v1/relay/requests",
+        json=_api_v1_request_payload("request-1"),
+    )
+    assert enqueue.status_code == 200
+    retrieval_credential = enqueue.get_json().get("retrieval_credential")
+    assert retrieval_credential
 
     next_responses = [client.get("/api/v1/relay/servers/next") for _ in range(65)]
-    assert {response.status_code for response in next_responses} == {200}
+    next_statuses = [response.status_code for response in next_responses]
+    assert set(next_statuses) == {200}
+    assert 429 not in next_statuses
 
     retrieve_responses = [
         client.post(
             "/api/v1/relay/responses/retrieve",
-            json={"client_public_key": DUMMY_CLIENT_PUB_KEY, "request_id": "request-1"},
+            json={
+                "client_public_key": DUMMY_CLIENT_PUB_KEY,
+                "request_id": "request-1",
+                "retrieval_credential": retrieval_credential,
+            },
         )
         for _ in range(65)
     ]
-    assert {response.status_code for response in retrieve_responses} == {202}
+    retrieve_statuses = [response.status_code for response in retrieve_responses]
+    assert set(retrieve_statuses) == {202}
+    assert 429 not in retrieve_statuses
+    assert all(response.get_json()["status"] == "pending" for response in retrieve_responses)
 
 
 def test_inference_endpoint_removed(client):

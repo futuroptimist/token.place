@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+import relay
 from relay import JsonFormatter, app, known_servers
 
 
@@ -108,6 +109,28 @@ def test_compute_node_gauges_follow_api_v1_lease_semantics(relay_client) -> None
     assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
 
 
+def test_stale_node_health_honors_active_polling_and_in_flight_leases(
+    relay_client, monkeypatch
+) -> None:
+    now_monotonic = 1_000.0
+    monkeypatch.setattr(relay.time, "monotonic", lambda: now_monotonic)
+    _register_api_v1_node(relay_client)
+    node = known_servers["node-a"]
+    node["last_ping"] = datetime.now() - timedelta(seconds=120)
+
+    node["polling_until_monotonic"] = now_monotonic + 1
+    assert _metric_value(_scrape(relay_client), "tokenplace_compute_nodes_healthy") == 1
+    node["polling_until_monotonic"] = now_monotonic
+
+    node["api_v1_in_flight_requests"] = {
+        "request-a": {"expires_at": now_monotonic + 1}
+    }
+    assert _metric_value(_scrape(relay_client), "tokenplace_compute_nodes_healthy") == 1
+    node["api_v1_in_flight_requests"]["request-a"]["expires_at"] = now_monotonic
+
+    assert _metric_value(_scrape(relay_client), "tokenplace_compute_nodes_healthy") == 0
+
+
 def test_legacy_registration_is_not_counted_as_api_v1(relay_client) -> None:
     known_servers["legacy-node"] = {
         "public_key": "legacy-node",
@@ -146,6 +169,15 @@ def test_metrics_auth_rejects_incorrect_bearer_credential(
     assert response.status_code == 401
 
 
+@pytest.mark.parametrize("authorization", [None, "Bearer "])
+def test_metrics_auth_explicit_empty_token_fails_closed(
+    relay_client, monkeypatch, authorization
+) -> None:
+    monkeypatch.setenv("TOKENPLACE_METRICS_TOKEN", "")
+    headers = {"Authorization": authorization} if authorization is not None else {}
+    assert relay_client.get("/metrics", headers=headers).status_code == 401
+
+
 def test_metrics_auth_accepts_correct_credential_without_logging_it(
     relay_client, monkeypatch, caplog
 ) -> None:
@@ -166,11 +198,17 @@ def test_repeated_scrapes_are_read_only_for_relay_state(relay_client) -> None:
     before = {
         key: dict(value) for key, value in known_servers.items()
     }
+    request_series = (
+        'tokenplace_relay_requests_total{endpoint="api_v1_relay_servers_register",'
+        'method="POST",status="200"}'
+    )
+    before_scrapes = _metric_value(_scrape(relay_client), request_series)
 
     _scrape(relay_client)
-    _scrape(relay_client)
+    after_scrapes = _metric_value(_scrape(relay_client), request_series)
 
     assert known_servers == before
+    assert after_scrapes == before_scrapes
 
 
 def test_api_v1_model_catalog_remains_llama_31_only(relay_client) -> None:

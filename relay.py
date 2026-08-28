@@ -420,7 +420,6 @@ def _get_gauge(name: str, description: str, labels: list[str] | None = None) -> 
     return Gauge(name, description, labels or [])
 
 
-BUILD_METADATA = get_release_metadata(None)
 BUILD_INFO = _get_gauge(
     "tokenplace_build_info",
     "Public-safe token.place relay build metadata.",
@@ -440,6 +439,8 @@ COMPUTE_NODES_HEALTHY = _get_gauge(
 )
 
 try:
+    INSTRUMENTATION_UP.set(0)
+    BUILD_METADATA = get_release_metadata(None)
     BUILD_INFO.labels(
         BUILD_METADATA.get("version", "dev"),
         BUILD_METADATA.get("ref") or BUILD_METADATA.get("version", "dev"),
@@ -797,9 +798,11 @@ def _can_resolve_gpu_host(hostname: str) -> bool:
 def _metrics_token_is_valid() -> bool:
     """Validate optional metrics bearer authentication without exposing secrets."""
 
-    configured_token = os.environ.get("TOKENPLACE_METRICS_TOKEN", "")
-    if not configured_token:
+    configured_token = os.environ.get("TOKENPLACE_METRICS_TOKEN")
+    if configured_token is None:
         return True
+    if configured_token == "":
+        return False
     authorization = request.headers.get("Authorization", "")
     prefix = "Bearer "
     if not authorization.startswith(prefix):

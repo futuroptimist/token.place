@@ -17,6 +17,7 @@ import redis
 from relay_state_store import (
     ComputeNodeCapabilities,
     EncryptedRequestEnvelope,
+    InMemoryRelayStateStore,
     RelayStateCapacityExceeded,
     RelayStateCredentialMismatch,
     RelayStateInvalidReservation,
@@ -269,6 +270,41 @@ def _digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def _scheduler_policy_capabilities(
+    *, models=("qwen3-8b-instruct",), tier="8k-fast", concurrency=4
+):
+    tokens = 65536 if tier == "64k-full" else 8192
+    return dataclasses.replace(
+        _capabilities(concurrency=concurrency),
+        supported_model_ids=models,
+        active_context_tier=tier,
+        maximum_total_context_tokens=tokens,
+    )
+
+
+def _delete_scheduler_policy_state(store, node_ids, selections=()):
+    cfg = store._foundation.config
+    keys = [
+        cfg.key("schema"),
+        cfg.key("nodes:lease"),
+        cfg.key("cursor"),
+        cfg.key("reservations:expiry"),
+        cfg.key("requests:deadline"),
+    ]
+    keys.extend(cfg.key("node", store._node_digest(node)) for node in node_ids)
+    for client, request, selection in selections:
+        keys.append(
+            cfg.key(
+                "request",
+                hashlib.sha256(f"client\0{client}".encode()).hexdigest(),
+                hashlib.sha256(f"request\0{request}".encode()).hexdigest(),
+            )
+        )
+        if selection is not None and selection.reservation_token is not None:
+            keys.append(cfg.key("reservation", _digest(selection.reservation_token)))
+    store._foundation._client.delete(*keys)
+
+
 def _wait_until(predicate, timeout=1.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -498,6 +534,138 @@ def test_scheduler_state_lifecycle_unregister_and_inclusive_expiry(valkey_server
         assert second._foundation._client.zscore(leases, node_digest) is None
     finally:
         first._foundation._client.delete(leases, cursor, node_key, cfg.key("schema"))
+        first.close()
+        second.close()
+
+
+def test_scheduler_selection_policy_matches_in_memory_reference(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    memory = InMemoryRelayStateStore(
+        RelayStateStoreConfig(namespace="policy-memory"), acknowledgement_key=b"k" * 32
+    )
+    stores = (memory, first)
+    nodes = (
+        ("unsupported", _scheduler_policy_capabilities(models=("other",))),
+        ("too-small", _scheduler_policy_capabilities(models=("other",))),
+        ("unhealthy", _scheduler_policy_capabilities(tier="64k-full")),
+        ("draining", _scheduler_policy_capabilities(tier="64k-full")),
+        ("large", _scheduler_policy_capabilities(tier="64k-full")),
+        ("node-b", _scheduler_policy_capabilities()),
+        ("node-a", _scheduler_policy_capabilities()),
+    )
+    selections = []
+    try:
+        for store in stores:
+            for node, capabilities in nodes:
+                store.register(node, capabilities, _digest(node))
+            store.set_scheduler_state(
+                "unhealthy", _digest("unhealthy"), SchedulerNodeState(healthy=False)
+            )
+            store.set_scheduler_state(
+                "draining", _digest("draining"), SchedulerNodeState(draining=True)
+            )
+
+        deadline = time.time() + 60
+        # A 64k request excludes unsupported, insufficient, unhealthy, and draining
+        # nodes, leaving only the capable full-tier registration.
+        assert [
+            store.select_and_reserve(
+                "client", "full", "qwen3-8b-instruct", "64k-full", deadline
+            ).selected_node_id
+            for store in stores
+        ] == ["large", "large"]
+
+        # The smallest capable tier wins; equal least-loaded candidates then rotate
+        # in registration order (node-b before lexically earlier node-a).
+        memory_results = [
+            memory.select_and_reserve(
+                "memory", f"round-{index}", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+            for index in range(2)
+        ]
+        valkey_results = [
+            (first if index == 0 else second).select_and_reserve(
+                "valkey", f"round-{index}", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+            for index in range(2)
+        ]
+        assert [result.selected_node_id for result in memory_results] == [
+            "node-b", "node-a"
+        ]
+        assert [result.selected_node_id for result in valkey_results] == [
+            result.selected_node_id for result in memory_results
+        ]
+        selections.extend(
+            [("client", "full", None), *(
+                ("valkey", f"round-{index}", result)
+                for index, result in enumerate(valkey_results)
+            )]
+        )
+    finally:
+        _delete_scheduler_policy_state(first, [node for node, _ in nodes], selections)
+        first.close()
+        second.close()
+
+
+def test_scheduler_fairness_cursor_changes_only_for_new_reservations(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, reservation_ttl_seconds=30)
+    second = _registration_store(valkey_server, namespace, reservation_ttl_seconds=30)
+    cfg = first._foundation.config
+    cursor = cfg.key("cursor")
+    deadline = first._foundation.server_time()[0] + 300
+    selections = []
+    try:
+        for node in ("node-b", "node-a"):
+            first.register(node, _scheduler_policy_capabilities(), _digest(node))
+
+        initial = first._foundation._client.hgetall(cursor)
+        with pytest.raises(RelayStateNoCapacity):
+            second.select_and_reserve("client", "failed", "unsupported", "8k-fast", deadline)
+        assert first._foundation._client.hgetall(cursor) == initial
+        assert first._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+        assert first._foundation._client.zcard(cfg.key("requests:deadline")) == 0
+
+        created = first.select_and_reserve(
+            "client", "first", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        selections.append(("client", "first", created))
+        after_creation = first._foundation._client.hgetall(cursor)
+        retry = second.select_and_reserve(
+            "client", "first", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        assert not retry.created
+        assert first._foundation._client.hgetall(cursor) == after_creation
+
+        token = _digest(created.reservation_token)
+        reservation_key = cfg.key("reservation", token)
+        seconds, _ = first._foundation.server_time()
+        expired = seconds - 1
+        client_digest = hashlib.sha256(b"client\0client").hexdigest()
+        request_digest = hashlib.sha256(b"request\0first").hexdigest()
+        request_key = cfg.key("request", client_digest, request_digest)
+        first._foundation._client.hset(request_key, "deadline", repr(expired))
+        first._foundation._client.hset(reservation_key, "deadline", repr(expired))
+        first._foundation._client.zadd(
+            cfg.key("requests:deadline"),
+            {f"{client_digest}:{request_digest}": expired},
+        )
+
+        successor = second.select_and_reserve(
+            "client", "second", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        selections.append(("client", "second", successor))
+        assert created.selected_node_id == "node-b"
+        assert successor.selected_node_id == "node-a"
+        assert first._foundation._client.hget(cursor, "_activity") == b"2"
+        assert not first._foundation._client.exists(reservation_key)
+    finally:
+        _delete_scheduler_policy_state(
+            first, ("node-b", "node-a"),
+            [("client", "failed", None), *selections],
+        )
         first.close()
         second.close()
 

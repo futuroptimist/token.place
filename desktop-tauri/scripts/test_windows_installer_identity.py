@@ -917,7 +917,7 @@ def run_native_load_probe(exe: Path, model: Path, artifact_path: Path | None = N
         "try:\n"
         " import llama_cpp\n"
         " phase='construct';record['phase']=phase\n"
-        " llama=llama_cpp.Llama(model_path=sys.argv[1],n_ctx=512,n_gpu_layers=0,verbose=False)\n"
+        " llama=llama_cpp.Llama(model_path=sys.argv[1],n_ctx=8192,n_gpu_layers=0,verbose=False)\n"
         " phase='close';record['phase']=phase\n"
         " llama.close()\n"
         " record['success']=True\n"
@@ -928,6 +928,20 @@ def run_native_load_probe(exe: Path, model: Path, artifact_path: Path | None = N
     )
     command = [str(python_exe), "-I", "-c", code, str(model)]
     env = {key: os.environ[key] for key in ("SystemRoot", "TEMP", "TMP") if key in os.environ}
+    system_root = env.get("SystemRoot", r"C:\Windows")
+    env.update(
+        {
+            "PATH": ";".join(
+                (
+                    str(python_exe.parent),
+                    str(python_exe.parent / "Lib" / "site-packages" / "llama_cpp" / "lib"),
+                    str(Path(system_root) / "System32"),
+                )
+            ),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
     result: subprocess.CompletedProcess[str] | None = None
     try:
         result = _run(command, env=env, timeout=60, check=False, separate_stderr=True)
@@ -1364,19 +1378,22 @@ def run_scenario(
             validate_installed_context_tiers(shortcut.target, env, artifact_dir, scenario.name)
             if tokenizer_boundary_model is not None:
                 try:
-                    run_native_load_probe(
+                    run_headless_cpu_admission(
                         shortcut.target,
                         tokenizer_boundary_model,
-                        artifact_dir.path(scenario.name, "native-load-probe") if artifact_dir else None,
+                        env,
+                        artifact_dir.path(scenario.name, "headless-cpu-admission") if artifact_dir else None,
                     )
-                except Exception:
-                    print("native_load_probe probe_internal_error", flush=True)
-                run_headless_cpu_admission(
-                    shortcut.target,
-                    tokenizer_boundary_model,
-                    env,
-                    artifact_dir.path(scenario.name, "headless-cpu-admission") if artifact_dir else None,
-                )
+                except InstallerIdentityError:
+                    try:
+                        run_native_load_probe(
+                            shortcut.target,
+                            tokenizer_boundary_model,
+                            artifact_dir.path(scenario.name, "native-load-probe") if artifact_dir else None,
+                        )
+                    except Exception:
+                        print("native_load_probe probe_internal_error", flush=True)
+                    raise
             if sentinel_log.exists() and sentinel_log.read_text(encoding="utf-8").strip():
                 raise InstallerIdentityError("host tool/Python sentinel was invoked during installed-app validation")
         finally:

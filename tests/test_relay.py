@@ -428,12 +428,15 @@ def test_api_v1_best_fit_prefers_8k_for_repeated_8k_requests(client):
     _register_api_v1_server_with_capabilities(client, fast, _capabilities("8k-fast"))
     _register_api_v1_server_with_capabilities(client, full, _capabilities("64k-full"))
 
-    payloads = [client.get("/api/v1/relay/servers/next?context_tier=8k-fast").get_json() for _ in range(4)]
+    responses = [client.get("/api/v1/relay/servers/next?context_tier=8k-fast") for _ in range(4)]
+    assert [response.status_code for response in responses] == [200] * 4
+    payloads = [response.get_json() for response in responses]
 
     assert [payload["server_public_key"] for payload in payloads] == [fast] * 4
     assert {payload["selection_policy"] for payload in payloads} == {relay_module.API_V1_SELECTION_POLICY}
     assert {payload["spillover"] for payload in payloads} == {False}
-    assert payloads[-1]["eligible_tier_counts"] == {"8k-fast": 1, "64k-full": 1}
+    assert {payload["eligible_node_count"] for payload in payloads} == {1}
+    assert [payload["eligible_tier_counts"] for payload in payloads] == [{"8k-fast": 1}] * 4
 
 
 def test_api_v1_best_fit_64k_requests_never_route_to_8k(client):

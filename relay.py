@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from release_metadata import get_release_metadata, resolve_asset_version
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
-from prometheus_client import Counter, REGISTRY
+from prometheus_client import Counter, Gauge, REGISTRY
 from werkzeug.serving import make_server
 
 # Logging --------------------------------------------------------------------
@@ -411,6 +411,46 @@ def _get_request_counter() -> Counter:
 REQUEST_COUNTER = _get_request_counter()
 
 
+def _get_gauge(name: str, description: str, labels: list[str] | None = None) -> Gauge:
+    """Return a process-wide gauge without duplicating collectors on reload."""
+
+    existing = getattr(REGISTRY, "_names_to_collectors", {}).get(name)
+    if existing is not None:
+        return existing  # type: ignore[return-value]
+    return Gauge(name, description, labels or [])
+
+
+BUILD_INFO = _get_gauge(
+    "tokenplace_build_info",
+    "Public-safe token.place relay build metadata.",
+    ["version", "revision"],
+)
+INSTRUMENTATION_UP = _get_gauge(
+    "tokenplace_instrumentation_up",
+    "Whether relay metrics instrumentation initialized successfully.",
+)
+COMPUTE_NODES_REGISTERED = _get_gauge(
+    "tokenplace_compute_nodes_registered",
+    "Currently registered API v1 compute nodes.",
+)
+COMPUTE_NODES_HEALTHY = _get_gauge(
+    "tokenplace_compute_nodes_healthy",
+    "Healthy API v1 compute nodes under the relay lease semantics.",
+)
+
+try:
+    INSTRUMENTATION_UP.set(0)
+    BUILD_METADATA = get_release_metadata(None)
+    BUILD_INFO.labels(
+        BUILD_METADATA.get("version", "dev"),
+        BUILD_METADATA.get("ref") or BUILD_METADATA.get("version", "dev"),
+    ).set(1)
+    INSTRUMENTATION_UP.set(1)
+except Exception:  # pragma: no cover - defensive instrumentation initialization
+    LOGGER.error("metrics.initialization_failed", extra={"reason": "initialization_failed"})
+    INSTRUMENTATION_UP.set(0)
+
+
 def _load_server_registration_tokens():
     """Return configured relay server registration tokens."""
 
@@ -755,10 +795,77 @@ def _can_resolve_gpu_host(hostname: str) -> bool:
         return False
 
 
+def _metrics_token_is_valid() -> bool:
+    """Validate optional metrics bearer authentication without exposing secrets."""
+
+    configured_token = os.environ.get("TOKENPLACE_METRICS_TOKEN")
+    if configured_token is None:
+        return True
+    if configured_token == "":
+        return False
+    authorization = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return False
+    return secrets.compare_digest(authorization[len(prefix):], configured_token)
+
+
+def _api_v1_node_is_healthy(payload: dict[str, Any], now_monotonic: float) -> bool:
+    """Apply the existing API v1 lease exemptions without mutating relay state."""
+
+    polling_until = payload.get("polling_until_monotonic")
+    if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
+        return True
+
+    in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
+    if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
+        return True
+
+    in_flight_requests = payload.get("api_v1_in_flight_requests")
+    if isinstance(in_flight_requests, dict):
+        with api_v1_in_flight_requests_lock:
+            for entry in in_flight_requests.values():
+                expires_at = entry.get("expires_at") if isinstance(entry, dict) else entry
+                if isinstance(expires_at, (int, float)) and expires_at > now_monotonic:
+                    return True
+
+    stale_after = payload.get("last_ping_duration", _server_stale_seconds())
+    if not isinstance(stale_after, (int, float)):
+        stale_after = _server_stale_seconds()
+    return _server_ping_age_seconds(payload.get("last_ping")) <= max(float(stale_after), 1.0)
+
+
+def _update_compute_node_gauges() -> None:
+    """Snapshot authoritative API v1 registration state for Prometheus."""
+
+    now_monotonic = time.monotonic()
+    with server_round_robin_lock:
+        api_v1_payloads = [
+            payload
+            for payload in known_servers.values()
+            if isinstance(payload, dict) and bool(payload.get(API_V1_SERVER_MARKER))
+        ]
+        registered = len(api_v1_payloads)
+        healthy = sum(
+            1 for payload in api_v1_payloads if _api_v1_node_is_healthy(payload, now_monotonic)
+        )
+    COMPUTE_NODES_REGISTERED.set(registered)
+    COMPUTE_NODES_HEALTHY.set(healthy)
+
+
 @app.before_request
 def _record_request_start():
     g.request_start_time = time.time()
     g.request_id = request.headers.get("X-Request-Id") or secrets.token_hex(8)
+    if request.path.rstrip("/") == "/metrics":
+        if not _metrics_token_is_valid():
+            return Response("unauthorized\n", status=401, mimetype="text/plain")
+        try:
+            _update_compute_node_gauges()
+        except Exception:  # pragma: no cover - defensive scrape failure
+            LOGGER.error("metrics.gauge_update_failed", extra={"reason": "gauge_update_failed"})
+            return Response("metrics unavailable\n", status=503, mimetype="text/plain")
+    return None
 
 
 @app.after_request

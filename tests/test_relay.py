@@ -185,18 +185,22 @@ def test_two_api_v1_nodes_poll_and_round_robin_without_control_plane_429(client,
     monkeypatch.setenv("TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS", "0")
     server_a = _server_key("rate-node-a")
     server_b = _server_key("rate-node-b")
-    _register_api_v1_server(client, server_a)
-    _register_api_v1_server(client, server_b)
+    payload_a = _api_v1_registered_control_payload(
+        client, server_a, capabilities=_capabilities("8k-fast")
+    )
+    payload_b = _api_v1_registered_control_payload(
+        client, server_b, capabilities=_capabilities("8k-fast")
+    )
 
     for _ in range(65):
-        poll_a = client.post(
-            '/api/v1/relay/servers/poll', json={'server_public_key': server_a}
-        )
-        poll_b = client.post(
-            '/api/v1/relay/servers/poll', json={'server_public_key': server_b}
-        )
+        poll_a = client.post('/api/v1/relay/servers/poll', json=payload_a)
+        poll_b = client.post('/api/v1/relay/servers/poll', json=payload_b)
         assert poll_a.status_code == 200
         assert poll_b.status_code == 200
+        for poll in (poll_a, poll_b):
+            body = poll.get_json()
+            assert body['message'] == 'No requests available'
+            assert 'request_id' not in body
 
     assert [_next_api_v1_server_key(client) for _ in range(4)] == [
         server_a,
@@ -2771,7 +2775,11 @@ def test_api_v1_register_does_not_dequeue_requests(client):
     assert poll.status_code == 200
     claimed = poll.get_json()
     assert claimed['request_id'] == 'req-register-heartbeat'
-    assert client.post('/api/v1/relay/servers/poll', json=server_payload).status_code == 200
+    empty_poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert empty_poll.status_code == 200
+    empty = empty_poll.get_json()
+    assert empty['message'] == 'No requests available'
+    assert 'request_id' not in empty
 
 
 def test_api_v1_poll_requires_registration_token_when_configured(client, monkeypatch):

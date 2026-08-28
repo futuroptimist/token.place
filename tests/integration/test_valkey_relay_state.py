@@ -609,6 +609,86 @@ def test_scheduler_selection_policy_matches_in_memory_reference(valkey_server):
         second.close()
 
 
+def test_scheduler_selection_policy_filters_context_in_memory_and_valkey(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    memory = InMemoryRelayStateStore(
+        RelayStateStoreConfig(namespace="context-policy-memory"),
+        acknowledgement_key=b"k" * 32,
+    )
+    stores = (memory, first)
+    nodes = (
+        ("too-small", _scheduler_policy_capabilities()),
+        ("full-context", _scheduler_policy_capabilities(tier="64k-full")),
+    )
+    selection = None
+    try:
+        for store in stores:
+            for node, capabilities in nodes:
+                store.register(node, capabilities, _digest(node))
+
+        deadline = first._foundation.server_time()[0] + 60
+        memory_selection = memory.select_and_reserve(
+            "memory", "full-context", "qwen3-8b-instruct", "64k-full", deadline
+        )
+        selection = second.select_and_reserve(
+            "valkey", "full-context", "qwen3-8b-instruct", "64k-full", deadline
+        )
+        assert memory_selection.selected_node_id == "full-context"
+        assert selection.selected_node_id == memory_selection.selected_node_id
+    finally:
+        _delete_scheduler_policy_state(
+            first,
+            [node for node, _ in nodes],
+            (("valkey", "full-context", selection),),
+        )
+        first.close()
+        second.close()
+
+
+def test_scheduler_selection_policy_prefers_lower_load_in_memory_and_valkey(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    memory = InMemoryRelayStateStore(
+        RelayStateStoreConfig(namespace="load-policy-memory"),
+        acknowledgement_key=b"k" * 32,
+    )
+    stores = (memory, first)
+    nodes = ("earlier-loaded", "later-idle")
+    selection = None
+    try:
+        for store in stores:
+            for node in nodes:
+                store.register(node, _scheduler_policy_capabilities(), _digest(node))
+            store.set_scheduler_state(
+                "earlier-loaded",
+                _digest("earlier-loaded"),
+                SchedulerNodeState(claimed_work=2),
+            )
+
+        deadline = first._foundation.server_time()[0] + 60
+        memory_selection = memory.select_and_reserve(
+            "memory", "least-load", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        selection = second.select_and_reserve(
+            "valkey", "least-load", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        assert memory_selection.selected_node_id == "later-idle"
+        assert selection.selected_node_id == memory_selection.selected_node_id
+    finally:
+        _delete_scheduler_policy_state(
+            first, nodes, (("valkey", "least-load", selection),)
+        )
+        first.close()
+        second.close()
+
+
 def test_scheduler_fairness_cursor_changes_only_for_new_reservations(valkey_server):
     namespace = uuid.uuid4().hex
     first = _registration_store(valkey_server, namespace, reservation_ttl_seconds=30)

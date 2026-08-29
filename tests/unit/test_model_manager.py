@@ -10799,21 +10799,18 @@ def test_subprocess_proxy_cleans_partial_worker_script_when_fdopen_fails(
     assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
 
 
-def test_subprocess_proxy_retries_worker_script_in_model_dir(monkeypatch, tmp_path):
+def test_subprocess_proxy_uses_inline_code_without_writing_in_model_dir(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
 
     model_path = tmp_path / 'models' / 'model.gguf'
     model_path.parent.mkdir()
     model_path.write_bytes(b'GGUF')
-    real_mkstemp = model_manager_module.tempfile.mkstemp
     mkstemp_calls = []
     popen_commands = []
 
-    def model_adjacent_mkstemp(*args, **kwargs):
+    def unavailable_mkstemp(*args, **kwargs):
         mkstemp_calls.append(kwargs.copy())
-        if len(mkstemp_calls) == 1:
-            raise OSError('ambient temp unavailable')
-        return real_mkstemp(*args, **kwargs)
+        raise OSError('ambient temp unavailable')
 
     class FakeStdin:
         def write(self, value):
@@ -10837,7 +10834,7 @@ def test_subprocess_proxy_retries_worker_script_in_model_dir(monkeypatch, tmp_pa
         popen_commands.append(command)
         return FakeProcess()
 
-    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', model_adjacent_mkstemp)
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', unavailable_mkstemp)
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
     monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
     monkeypatch.setattr(
@@ -10847,20 +10844,13 @@ def test_subprocess_proxy_retries_worker_script_in_model_dir(monkeypatch, tmp_pa
     )
 
     proxy = model_manager_module._SubprocessLlamaProxy(model_path=str(model_path))
-    worker_script = proxy._worker_tmpfile
 
-    assert worker_script is not None
-    assert os.path.dirname(worker_script) == str(model_path.parent)
-    assert mkstemp_calls == [
-        {'suffix': '.py', 'prefix': '_token_place_worker_', 'dir': None},
-        {'suffix': '.py', 'prefix': '_token_place_worker_', 'dir': str(model_path.parent)},
-    ]
-    assert popen_commands == [[sys.executable, '-u', worker_script]]
-    assert '-c' not in popen_commands[0]
+    assert proxy._worker_tmpfile is None
+    assert mkstemp_calls == [{'suffix': '.py', 'prefix': '_token_place_worker_', 'dir': None}]
+    assert not list(model_path.parent.glob('_token_place_worker_*.py'))
+    assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
 
     proxy.close()
-
-    assert not os.path.exists(worker_script)
 
 
 def test_subprocess_proxy_removes_temp_worker_script_when_popen_fails(monkeypatch):

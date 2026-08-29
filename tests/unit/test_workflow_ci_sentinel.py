@@ -457,6 +457,50 @@ def test_macos_run_all_tests_pr_job_builds_llama_cpp_python_with_metal() -> None
     assert "-DCMAKE_APPLE_SILICON_PROCESSOR=arm64" in step_runs
 
 
+def test_linux_workflows_build_portable_llama_cpp_without_cached_wheels() -> None:
+    ci_job = _load_workflow(WORKFLOW_DIR / "ci.yml")["jobs"]["test"]
+    linux_job = _run_all_tests_jobs()["linux-run-all-tests"]
+
+    for workflow_name, job in (
+        ("ci.yml", ci_job),
+        ("run-all-tests-pr.yml", linux_job),
+    ):
+        install_steps = [
+            step
+            for step in _job_steps(job)
+            if step.get("name") == "Install Python dependencies"
+        ]
+        assert len(install_steps) == 1
+        install_step = install_steps[0]
+        env = install_step.get("env", {})
+        install_run = str(install_step.get("run", ""))
+
+        assert env.get("FORCE_CMAKE") == "1", (
+            f"{workflow_name} must rebuild llama_cpp_python for its Linux runner."
+        )
+        assert "-DGGML_NATIVE=off" in env.get("CMAKE_ARGS", ""), (
+            f"{workflow_name} must not tune llama_cpp_python for cached runner CPU features."
+        )
+        assert "pip install --no-cache-dir -r requirements.txt" in install_run, (
+            f"{workflow_name} must not reuse a machine-native cached llama_cpp_python wheel."
+        )
+        assert "pip show llama-cpp-python" in install_run
+        assert "lscpu" in install_run
+        assert "python -X faulthandler -c 'import llama_cpp" in install_run
+
+        job_runs = _step_runs(job)
+        assert "scripts/provision-ci-tiny-gguf.sh" in job_runs
+
+    assert "landing_chat_real_inference_with_desktop_bridge_api_v1" in _step_runs(
+        ci_job
+    )
+    assert "./run_all_tests.sh" in _step_runs(linux_job)
+    assert (
+        linux_job.get("env", {}).get("TOKENPLACE_REAL_E2E_MODEL_PATH")
+        == "${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf"
+    )
+
+
 def test_run_all_tests_pr_jobs_do_not_continue_on_error() -> None:
     for job_name, job in _run_all_tests_jobs().items():
         assert "continue-on-error" not in job, (

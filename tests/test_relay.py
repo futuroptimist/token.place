@@ -621,16 +621,34 @@ def test_api_v1_scheduler_helper_rejects_non_v1_capabilities(client):
 
 def test_api_v1_next_keeps_long_polling_server_eligible_when_last_ping_is_stale(client, monkeypatch):
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
+    monkeypatch.setenv(relay_module.API_V1_POLL_WAIT_SECONDS_ENV, '1.5')
+    relay_module._reset_api_v1_relay_state_store()
     server = _server_key("long-poll-eligible")
-    _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast"))
-    known_servers[server]["last_ping"] = datetime.now() - timedelta(seconds=5)
-    known_servers[server]["last_ping_duration"] = 1
-    known_servers[server]["polling_until_monotonic"] = time.monotonic() + 30
+    control_payload = _api_v1_registered_control_payload(
+        client, server, capabilities=_capabilities("8k-fast")
+    )
+    poll_result = {}
+
+    def poll_server():
+        with app.test_client() as poll_client:
+            poll_result["response"] = poll_client.post(
+                "/api/v1/relay/servers/poll", json=control_payload
+            )
+
+    poll_thread = threading.Thread(target=poll_server)
+    poll_thread.start()
+    time.sleep(1.1)
+    assert poll_thread.is_alive()
 
     response = client.get("/api/v1/relay/servers/next")
 
     assert response.status_code == 200
     assert response.get_json()["server_public_key"] == server
+    poll_thread.join(timeout=2)
+    assert not poll_thread.is_alive()
+    assert poll_result["response"].status_code == 200
+    assert poll_result["response"].get_json()["message"] == "No requests available"
+    assert "request_id" not in poll_result["response"].get_json()
 
 
 def test_api_v1_no_match_includes_safe_scheduler_metadata(client):

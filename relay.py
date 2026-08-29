@@ -3074,8 +3074,18 @@ def api_v1_relay_servers_poll():
         if registration is None:
             return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
         digest = _credential_digest(credential)
+        registration = store.renew(node, digest)
+        if registration is None:
+            return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+        lease_refresh_interval = max(min(store.config.lease_ttl_seconds / 2.0, 1.0), 0.05)
+        next_lease_refresh = time.monotonic() + lease_refresh_interval
         wait_deadline = time.monotonic() + _api_v1_poll_wait_seconds()
         while True:
+            if time.monotonic() >= next_lease_refresh:
+                registration = store.renew(node, digest)
+                if registration is None:
+                    return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+                next_lease_refresh = time.monotonic() + lease_refresh_interval
             result = store.claim_queued_request(node, digest, node)
             if result.state != 'empty' or time.monotonic() >= wait_deadline:
                 break

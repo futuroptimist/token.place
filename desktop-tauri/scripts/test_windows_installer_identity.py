@@ -1421,7 +1421,7 @@ def main() -> int:
         "--tokenizer-boundary-model",
         type=Path,
         default=None,
-        help="Tiny checksum-pinned GGUF required by the current-package headless CPU admission gate.",
+        help="Optional tiny checksum-pinned GGUF for explicit current-package headless CPU admission.",
     )
     args = parser.parse_args()
     if len(args.expected_build_id) != 12:
@@ -1429,16 +1429,15 @@ def main() -> int:
     if args.pr_current_windows_nsis is not None:
         if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)):
             raise InstallerIdentityError("--pr-current-windows-nsis cannot be combined with full release scenario arguments")
-        if args.tokenizer_boundary_model is None:
-            raise InstallerIdentityError("--tokenizer-boundary-model is required with --pr-current-windows-nsis")
-        if not args.tokenizer_boundary_model.is_file():
+        if args.tokenizer_boundary_model is not None and not args.tokenizer_boundary_model.is_file():
             raise InstallerIdentityError("--tokenizer-boundary-model must name an existing model file")
         scenario = build_current_package_scenario(args.pr_current_windows_nsis, args.expected_version)
         if sys.platform != "win32":
             print("validated current-package Windows NSIS PR-gate contract; real install runs only on hosted Windows")
             return 0
         artifacts = ScenarioArtifactDir(args.artifact_dir) if args.artifact_dir else None
-        run_scenario(scenario, args.expected_build_id, artifacts, args.tokenizer_boundary_model.resolve())
+        model = args.tokenizer_boundary_model.resolve() if args.tokenizer_boundary_model is not None else None
+        run_scenario(scenario, args.expected_build_id, artifacts, model)
         print(f"validated current-package Windows NSIS for {args.expected_version} build {args.expected_build_id}")
         return 0
     if args.tokenizer_boundary_model is not None:

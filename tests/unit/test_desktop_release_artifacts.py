@@ -3578,8 +3578,6 @@ def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_sc
     guard = _load_windows_installer_identity()
     current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
     current_nsis.write_text('artifact', encoding='utf-8')
-    model = tmp_path / 'tiny.gguf'
-    model.write_text('model', encoding='utf-8')
     artifact_dir = tmp_path / 'logs'
     calls = []
     monkeypatch.setattr(guard.sys, 'platform', 'win32')
@@ -3589,7 +3587,6 @@ def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_sc
         '--pr-current-windows-nsis', str(current_nsis),
         '--expected-version', '0.1.5',
         '--expected-build-id', 'abcdef123456',
-        '--tokenizer-boundary-model', str(model),
         '--artifact-dir', str(artifact_dir),
     ])
 
@@ -3601,7 +3598,28 @@ def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_sc
     assert scenario.previous is None
     assert build_id == 'abcdef123456'
     assert artifacts.root == artifact_dir
-    assert boundary_model == model.resolve()
+    assert boundary_model is None
+
+
+def test_windows_installer_identity_current_package_enables_explicit_headless_model(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
+    current_nsis.write_text('artifact', encoding='utf-8')
+    model = tmp_path / 'tiny.gguf'
+    model.write_text('model', encoding='utf-8')
+    calls = []
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, 'run_scenario', lambda *args: calls.append(args))
+    monkeypatch.setattr(sys, 'argv', [
+        'test_windows_installer_identity.py',
+        '--pr-current-windows-nsis', str(current_nsis),
+        '--expected-version', '0.1.5',
+        '--expected-build-id', 'abcdef123456',
+        '--tokenizer-boundary-model', str(model),
+    ])
+
+    assert guard.main() == 0
+    assert calls[0][3] == model.resolve()
 
 
 def test_windows_installer_identity_current_package_validates_contract_off_windows(monkeypatch, tmp_path, capsys) -> None:
@@ -3640,14 +3658,6 @@ def test_windows_installer_identity_rejects_invalid_current_package_arguments(mo
         '--expected-build-id', 'abcdef123456',
     ])
     with pytest.raises(guard.InstallerIdentityError, match='cannot be combined'):
-        guard.main()
-
-    monkeypatch.setattr(sys, 'argv', [
-        'test_windows_installer_identity.py',
-        '--pr-current-windows-nsis', str(current_nsis),
-        '--expected-build-id', 'abcdef123456',
-    ])
-    with pytest.raises(guard.InstallerIdentityError, match='tokenizer-boundary-model is required'):
         guard.main()
 
     monkeypatch.setattr(sys, 'argv', [
@@ -3698,25 +3708,28 @@ def test_windows_packaged_start_workflow_builds_and_validates_current_nsis() -> 
     assert 'prepare_windows_embedded_python_runtime.py' in workflow
     assert 'tauri build -- --target x86_64-pc-windows-msvc --bundles nsis' in workflow
     assert '--pr-current-windows-nsis' in workflow
-    assert '--tokenizer-boundary-model' in workflow
-    assert 'scripts/provision-ci-tiny-gguf.sh' in workflow
-    assert 'model_path="$(cygpath -u "$TOKENPLACE_REAL_E2E_MODEL_PATH")"' in workflow
-    assert 'bash scripts/provision-ci-tiny-gguf.sh "$model_path"' in workflow
-    assert '--tokenizer-boundary-model "${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf"' in workflow
-    assert workflow.count("'scripts/provision-ci-tiny-gguf.sh'") == 2
+    windows = workflow.split('  desktop-operator-packaged-e2e-windows:', 1)[1].split(
+        '  desktop-operator-packaged-inspect-python39-linux:', 1
+    )[0]
+    assert '--tokenizer-boundary-model' not in windows
+    assert 'Provision tiny GGUF for installed headless CPU admission' not in windows
+    assert 'Restore cached tiny GGUF for installed headless CPU admission' not in windows
     assert workflow.count("'desktop-tauri/scripts/test_windows_installer_identity.py'") == 2
     assert 'Print bounded headless-admission diagnostic on failure' not in workflow
     assert 'tokenplace-headless-diag.txt' not in workflow
-    assert '--operator-start-preflight' in Path('desktop-tauri/scripts/test_windows_installer_identity.py').read_text(encoding='utf-8')
+    assert 'Issue #1555 reserves native GPU proof for a GPU runner' in windows
+    assert '--operator-start-preflight-cpu-smoke' in Path(
+        'desktop-tauri/scripts/test_windows_installer_identity.py'
+    ).read_text(encoding='utf-8')
 
 
 def test_windows_packaged_start_workflow_cannot_be_only_filtered_cargo_tests() -> None:
     workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
-    packaged_gate = workflow.split('- name: Validate installed-package headless CPU admission and package identity', 1)[1]
+    packaged_gate = workflow.split('- name: Validate installed structural CPU smoke and package identity', 1)[1]
 
     assert 'test_windows_installer_identity.py' in packaged_gate
     assert '--pr-current-windows-nsis' in packaged_gate
-    assert '--tokenizer-boundary-model' in packaged_gate
+    assert '--tokenizer-boundary-model' not in packaged_gate.split('- name:', 1)[0]
     assert 'cargo test' not in packaged_gate.split('- name:', 1)[0]
 
 
@@ -3730,8 +3743,7 @@ def test_windows_headless_package_gate_preserves_downstream_checks_without_webdr
         assert forbidden not in lowered
     ordered = (
         'Build current-head Windows NSIS release package',
-        'Provision tiny GGUF for installed headless CPU admission',
-        'Validate installed-package headless CPU admission and package identity',
+        'Validate installed structural CPU smoke and package identity',
         'Run shared desktop parity checks (Windows)',
         'Run Windows CUDA capability handoff regressions (fakes)',
     )

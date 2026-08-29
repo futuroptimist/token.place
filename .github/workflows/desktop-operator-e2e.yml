@@ -264,21 +264,9 @@ jobs:
         working-directory: desktop-tauri
         run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
 
-      - name: Restore cached tiny GGUF for installed headless CPU admission
-        uses: actions/cache@v4
-        with:
-          path: .ci-models/stories15M-q4_0.gguf
-          key: ci-relay-landing-page-real-desktop-bridge-api-v1-stories15m-q4-rev-99dd1a73db5a37100bd4ae633f4cfce6560e1567-sha256-6151b1929d7f5aa3385d9ddef3393e55587c0a55de661562322bc51dfda93a04
-
-      - name: Provision tiny GGUF for installed headless CPU admission
-        shell: bash
-        env:
-          TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
-        run: |
-          model_path="$(cygpath -u "$TOKENPLACE_REAL_E2E_MODEL_PATH")"
-          bash scripts/provision-ci-tiny-gguf.sh "$model_path"
-
-      - name: Validate installed-package headless CPU admission and package identity
+      # Hosted Windows is driverless, so the cu124 runtime cannot import without
+      # nvcuda.dll. Issue #1555 reserves native GPU proof for a GPU runner.
+      - name: Validate installed structural CPU smoke and package identity
         shell: pwsh
         run: |
           $installers = @(Get-ChildItem 'desktop-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis' -Filter '*-setup.exe' -File)
@@ -290,7 +278,6 @@ jobs:
             --pr-current-windows-nsis $installers[0].FullName `
             --expected-version $version `
             --expected-build-id $buildId `
-            --tokenizer-boundary-model "${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf" `
             --artifact-dir "$env:RUNNER_TEMP/token-place-current-package-validation"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

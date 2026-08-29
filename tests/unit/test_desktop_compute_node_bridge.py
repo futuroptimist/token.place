@@ -231,15 +231,9 @@ def test_headless_cpu_admission_false_readiness_does_not_write_diag_sidecar(
     assert not (tmp_path / "tokenplace-headless-diag.txt").exists()
 
 
-def test_headless_cpu_admission_temp_dir_avoids_ambient_temp_env(
+def test_headless_cpu_admission_uses_process_temp_storage(
         monkeypatch, tmp_path, capsys):
-    """The installed package's sandboxed child process does not forward
-    TEMP/TMP/USERPROFILE, so tempfile.gettempdir() can resolve to an
-    unwritable location there even though every dev/portable context works.
-    The admission boundary must anchor its scratch directory next to the
-    already-validated, already-writable model path instead of relying on
-    ambient temp-dir resolution, and must tolerate a Windows cleanup race
-    if a still-running subprocess worker briefly holds a handle open."""
+    """Readable model inputs do not require writable parent directories."""
     args = _configure_headless_runtime(monkeypatch, tmp_path)
     captured = {}
     real_temporary_directory = compute_node_bridge.tempfile.TemporaryDirectory
@@ -252,7 +246,8 @@ def test_headless_cpu_admission_temp_dir_avoids_ambient_temp_env(
                         recording_temporary_directory)
 
     assert compute_node_bridge.headless_cpu_admission(args) == 0
-    assert captured.get("dir") == os.path.dirname(os.path.abspath(args.model))
+    assert captured.get("prefix") == "tokenplace-headless-"
+    assert "dir" not in captured
     assert captured.get("ignore_cleanup_errors") is True
 
 

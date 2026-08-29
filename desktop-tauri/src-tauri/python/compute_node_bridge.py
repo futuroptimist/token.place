@@ -3161,10 +3161,10 @@ def headless_cpu_admission(args: Any) -> int:
         print(json.dumps({"type": "headless_internal", "phase": "startup_ready"},
                          sort_keys=True, separators=(",", ":")), flush=True)
         startup_emitted = True
-        model_dir = os.path.dirname(os.path.abspath(args.model))
         _, fixture = authoritative_readiness_fixture()
+        # Model parents are read-only inputs; scratch uses process temporary storage.
         with tempfile.TemporaryDirectory(
-            prefix="tokenplace-headless-", dir=model_dir,
+            prefix="tokenplace-headless-",
             ignore_cleanup_errors=True,
         ) as directory:
             request_path = os.path.join(directory, "request.json")

@@ -3705,6 +3705,8 @@ def test_windows_packaged_start_workflow_builds_and_validates_current_nsis() -> 
     assert '--tokenizer-boundary-model "${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf"' in workflow
     assert workflow.count("'scripts/provision-ci-tiny-gguf.sh'") == 2
     assert workflow.count("'desktop-tauri/scripts/test_windows_installer_identity.py'") == 2
+    assert 'Print bounded headless-admission diagnostic on failure' not in workflow
+    assert 'tokenplace-headless-diag.txt' not in workflow
     assert '--operator-start-preflight' in Path('desktop-tauri/scripts/test_windows_installer_identity.py').read_text(encoding='utf-8')
 
 

@@ -1147,29 +1147,6 @@ def run_headless_cpu_admission(
         if terminal is not None:
             evidence["terminal_result"] = terminal
         artifact_path.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
-    # TEMPORARY bounded diagnostic for PR #1715 (warm_load_failed root cause
-    # investigation). Reads the diag file back in this same Python process
-    # (not a separate pwsh step reading a separately-derived path), using
-    # the exact same `model` Path object passed into this call, to remove
-    # any remaining doubt about cross-process/cross-step path derivation.
-    # Prints only a phase tag and an exception class name, never file
-    # contents beyond that. Removes the file after reading so it does not
-    # leak into later scenario runs. Remove once root cause is confirmed.
-    diag_path = model.parent / "tokenplace-headless-diag.txt"
-    diag_found = False
-    for _diag_attempt in range(10):
-        if diag_path.is_file():
-            print(f"headless_admission_diag_same_process_read={diag_path.read_text(encoding='utf-8', errors='ignore')!r} attempt={_diag_attempt}", flush=True)
-            diag_path.unlink(missing_ok=True)
-            diag_found = True
-            break
-        time.sleep(0.3)
-    if not diag_found:
-        try:
-            listing = sorted(p.name for p in model.parent.iterdir())
-        except OSError as exc:
-            listing = [f"<listdir failed: {type(exc).__name__}>"]
-        print(f"headless_admission_diag_same_process_read=<no diagnostic file written after retries> dir_listing={listing!r}", flush=True)
     if error is not None:
         raise error
     assert terminal is not None

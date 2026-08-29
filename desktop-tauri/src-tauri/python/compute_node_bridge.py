@@ -3177,48 +3177,6 @@ def headless_cpu_admission(args: Any) -> int:
             os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE"] = evidence_path
             try:
                 ready = runtime.ensure_api_v1_runtime_ready()
-                if ready is False:
-                    diag_path = os.path.join(
-                        model_dir, "tokenplace-headless-diag.txt"
-                    )
-                    readiness_diagnostics = _safe_readiness_diagnostics(manager)
-                    validation = getattr(manager, "last_model_artifact_validation", None)
-                    if isinstance(validation, dict) and validation.get("valid") is False:
-                        failure_stage = "model_preflight"
-                    elif readiness_diagnostics.get("api_v1_readiness_result") == "failed":
-                        failure_stage = "authoritative_admission"
-                    elif getattr(manager, "llm", None) is None:
-                        failure_stage = "runtime_initialization"
-                    else:
-                        failure_stage = "unclassified"
-                    runtime_init_error_category = getattr(
-                        manager, "last_runtime_init_error_category", None
-                    )
-                    if isinstance(runtime_init_error_category, str):
-                        from utils.llm.model_manager import _validated_init_safe_category
-                        if (_validated_init_safe_category(runtime_init_error_category)
-                                != runtime_init_error_category):
-                            runtime_init_error_category = None
-                    else:
-                        runtime_init_error_category = None
-                    try:
-                        diagnostic = {
-                            "schema_version": 1,
-                            "outcome": "readiness_returned_false",
-                            "stage": failure_stage,
-                            "runtime_present": getattr(manager, "llm", None) is not None,
-                            "readiness": readiness_diagnostics,
-                        }
-                        if (failure_stage == "runtime_initialization"
-                                and runtime_init_error_category is not None):
-                            diagnostic["runtime_init_error_category"] = (
-                                runtime_init_error_category
-                            )
-                        with open(diag_path, "w", encoding="utf-8") as diag_handle:
-                            json.dump(diagnostic, diag_handle, sort_keys=True,
-                                      separators=(",", ":"))
-                    except Exception:
-                        pass
                 try:
                     with open(evidence_path, encoding="utf-8") as handle:
                         evidence = json.load(handle)

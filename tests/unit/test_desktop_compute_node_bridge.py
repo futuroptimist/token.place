@@ -218,40 +218,17 @@ def test_headless_cpu_admission_runtime_outcomes(
         "runtime_identity_validated")
 
 
-@pytest.mark.parametrize(
-    ("category", "expected_category"),
-    [
-        ("runtime_model_load_failed", "runtime_model_load_failed"),
-        ("PRIVATE invalid category", None),
-    ],
-)
-def test_headless_cpu_admission_false_readiness_writes_bounded_diagnostic(
-        monkeypatch, tmp_path, capsys, category, expected_category):
+def test_headless_cpu_admission_false_readiness_does_not_write_diag_sidecar(
+        monkeypatch, tmp_path, capsys):
     args = _configure_headless_runtime(
         monkeypatch, tmp_path, ready=False, report_readiness_failure=False,
-        runtime_init_error_category=category)
+        runtime_init_error_category="runtime_model_load_failed")
 
     assert compute_node_bridge.headless_cpu_admission(args) == 5
 
     records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert records[-1]["failure_code"] == "warm_load_failed"
-    diagnostic = json.loads(
-        (tmp_path / "tokenplace-headless-diag.txt").read_text(encoding="utf-8")
-    )
-    expected = {
-        "schema_version": 1,
-        "outcome": "readiness_returned_false",
-        "stage": "runtime_initialization",
-        "runtime_present": False,
-        "readiness": {},
-    }
-    if expected_category is not None:
-        expected["runtime_init_error_category"] = expected_category
-    assert diagnostic == expected
-    serialized = json.dumps(diagnostic)
-    assert str(args.model) not in serialized
-    assert "last_runtime_init_error" not in serialized
-    assert "PRIVATE" not in serialized
+    assert not (tmp_path / "tokenplace-headless-diag.txt").exists()
 
 
 def test_headless_cpu_admission_temp_dir_avoids_ambient_temp_env(

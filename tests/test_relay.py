@@ -794,7 +794,10 @@ def test_api_v1_selection_model_filter_round_robin_and_no_match(client):
 
     no_match = client.get("/api/v1/relay/servers/next?model=model-a&context_tier=64k-full")
     assert no_match.status_code == 503
-    assert no_match.get_json()["error"]["code"] == "no_matching_compute_node"
+    assert no_match.get_json()["error"] == {
+        "code": "no_available_capacity",
+        "message": "No compatible compute node is available",
+    }
 
 
 

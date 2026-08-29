@@ -105,8 +105,7 @@ def test_headless_boundary_requires_exact_authoritative_evidence(monkeypatch):
 def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
                                 evidence_valid=True, mock_runtime=False,
                                 load_exception=None, cleanup_exception=None,
-                                report_readiness_failure=True,
-                                runtime_init_error_category=None):
+                                report_readiness_failure=True):
     """Install a minimal runtime double while retaining the real evidence validator."""
     model = tmp_path / "model.gguf"
     model.write_bytes(b"fixture")
@@ -137,7 +136,6 @@ def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
         llm = None
         last_compute_diagnostics = {}
         last_runtime_init_error = "PRIVATE runtime path and raw exception"
-        last_runtime_init_error_category = runtime_init_error_category
         model_profile = {"provider": "qwen", "chat_template_policy": "gguf-jinja"}
 
         @staticmethod
@@ -221,8 +219,7 @@ def test_headless_cpu_admission_runtime_outcomes(
 def test_headless_cpu_admission_false_readiness_does_not_write_diag_sidecar(
         monkeypatch, tmp_path, capsys):
     args = _configure_headless_runtime(
-        monkeypatch, tmp_path, ready=False, report_readiness_failure=False,
-        runtime_init_error_category="runtime_model_load_failed")
+        monkeypatch, tmp_path, ready=False, report_readiness_failure=False)
 
     assert compute_node_bridge.headless_cpu_admission(args) == 5
 

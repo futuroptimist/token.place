@@ -48,9 +48,15 @@ jobs:
         if: steps.prep.outputs.rc != '2'
       - name: Install Python dependencies
         if: steps.prep.outputs.rc != '2'
+        env:
+          CMAKE_ARGS: -DGGML_NATIVE=off
+          FORCE_CMAKE: '1'
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --no-cache-dir -r requirements.txt
+          python -m pip show llama-cpp-python
+          lscpu
+          (cd "$RUNNER_TEMP" && python -X faulthandler -c 'import llama_cpp; print(llama_cpp.__file__)')
       - name: Install Playwright browsers and system dependencies
         if: steps.prep.outputs.rc != '2'
         run: playwright install --with-deps chromium

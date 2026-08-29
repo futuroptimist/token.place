@@ -651,7 +651,7 @@ def test_api_v1_next_keeps_long_polling_server_eligible_when_last_ping_is_stale(
     assert "request_id" not in poll_result["response"].get_json()
 
 
-def test_api_v1_no_match_includes_safe_scheduler_metadata(client):
+def test_api_v1_incompatible_requested_model_reports_unavailable_capacity(client):
     server = _server_key("no-match-metadata")
     _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast", ["model-a"]))
 
@@ -659,12 +659,10 @@ def test_api_v1_no_match_includes_safe_scheduler_metadata(client):
     payload = response.get_json()
 
     assert response.status_code == 503
-    assert payload["error"]["code"] == "no_matching_compute_node"
-    assert payload["error"]["selection_policy"] == relay_module.API_V1_SELECTION_POLICY
-    assert payload["error"]["requested_context_tier"] == "8k-fast"
-    assert payload["error"]["requested_model"] == "model-b"
-    assert payload["error"]["eligible_node_count"] == 0
-    assert payload["error"]["eligible_tier_counts"] == {}
+    assert payload["error"] == {
+        "code": "no_available_capacity",
+        "message": "No compatible compute node is available",
+    }
 
 
 class _LockAssertingInFlightRequests(dict):

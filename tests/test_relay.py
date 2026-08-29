@@ -510,14 +510,29 @@ def test_api_v1_best_fit_least_loaded_within_same_tier(client):
 def test_api_v1_best_fit_least_in_flight_within_64k_tier(client):
     busy = _server_key("least-inflight-busy")
     idle = _server_key("least-inflight-idle")
-    for server in (busy, idle):
-        _register_api_v1_server_with_capabilities(client, server, _capabilities("64k-full"))
-    known_servers[busy]["capabilities"]["max_concurrency"] = 2
-    known_servers[busy]["api_v1_in_flight_requests"] = {
-        "req-in-flight": {"expires_at": time.monotonic() + 60, "client_public_key": DUMMY_CLIENT_PUB_KEY}
-    }
+    busy_capabilities = {**_capabilities("64k-full"), "max_concurrency": 2}
+    busy_payload = _api_v1_registered_control_payload(
+        client,
+        busy,
+        capabilities=busy_capabilities,
+    )
+    _register_api_v1_server_with_capabilities(client, idle, _capabilities("64k-full"))
+    _queue_api_v1_request(
+        client,
+        server_public_key=busy,
+        request_id="req-in-flight",
+        client_public_key=f"{DUMMY_CLIENT_PUB_KEY}-least-inflight",
+    )
 
-    payload = client.get("/api/v1/relay/servers/next?context_tier=64k-full").get_json()
+    poll = client.post("/api/v1/relay/servers/poll", json=busy_payload)
+    assert poll.status_code == 200
+    claimed = poll.get_json()
+    assert claimed["request_id"] == "req-in-flight"
+    assert isinstance(claimed["claim_generation"], int)
+
+    response = client.get("/api/v1/relay/servers/next?context_tier=64k-full")
+    assert response.status_code == 200
+    payload = response.get_json()
 
     assert payload["server_public_key"] == idle
     assert payload["selected_in_flight_count"] == 0

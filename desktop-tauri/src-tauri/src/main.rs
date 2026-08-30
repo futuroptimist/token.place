@@ -427,38 +427,9 @@ async fn start_compute_node(
         .await
         {
             eprintln!("desktop.compute_node.start_failure error={}", err);
-            let (log_file_path, native_startup_failure_category) = {
-                let mut status = compute_state.status.lock().await;
-                status.running = false;
-                status.registered = false;
-                status.last_error = Some(err.to_string());
-                status.native_startup_phase = compute_node::NativeStartupPhase::StartupTaskFailed;
-                status.native_startup_outcome = compute_node::NativeStartupOutcome::Failed;
-                if status.native_startup_failure_category
-                    == compute_node::NativeStartupFailureCategory::None
-                {
-                    status.native_startup_failure_category =
-                        compute_node::NativeStartupFailureCategory::StartupTaskFailed;
-                }
-                (
-                    status.log_file_path.clone(),
-                    status.native_startup_failure_category,
-                )
-            };
-            let _ = app.emit(
-                "compute_node_event",
-                serde_json::json!({
-                    "type": "error",
-                    "running": false,
-                    "registered": false,
-                    "last_error": err.to_string(),
-                    "message": err.to_string(),
-                    "log_file_path": log_file_path,
-                    "native_startup_phase": "startup_task_failed",
-                    "native_startup_outcome": "failed",
-                    "native_startup_failure_category": native_startup_failure_category,
-                }),
-            );
+            // The session-owned lifecycle helpers publish bounded cached
+            // terminal state.  Do not let this detached wrapper mutate or emit
+            // after a replacement session has been reserved.
         }
     };
     wait_for_compute_node_start_entry(task, entry_receiver).await

@@ -2949,7 +2949,7 @@ describe('desktop app start failure handling', () => {
   });
 
 
-  it('renders provisioning started event fields and locks controls', async () => {
+  it('keeps startup active for non-running provisioning started events', async () => {
     render(<App />);
 
     const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
@@ -2957,11 +2957,13 @@ describe('desktop app start failure handling', () => {
     const inspectButton = (await screen.findByText('Open debug log')) as HTMLButtonElement;
     const handler = eventHandlers.get('compute_node_event');
     expect(handler).toBeTruthy();
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+    fireEvent.click(startButton);
 
     handler?.({
       payload: {
         type: 'started',
-        running: true,
+        running: false,
         registered: false,
         relay_runtime_state: 'provisioning',
         runtime_provisioning_state: 'provisioning',
@@ -2977,7 +2979,7 @@ describe('desktop app start failure handling', () => {
       },
     });
 
-    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
     expect(screen.getByText(/Worker alive:/).textContent).toContain('no');
     expect(screen.getByText(/Provisioning state:/).textContent).toContain('provisioning');
     expect(screen.getByText(/Startup phase:/).textContent).toContain('cuda_build');

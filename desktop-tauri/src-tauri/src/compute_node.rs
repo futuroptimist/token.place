@@ -498,6 +498,28 @@ async fn reserve_starting_bridge_process_for_session(
     *stdin_slot = None;
     *process = Some(BridgeProcessRecord::new(session_id.to_string(), None, None));
     status.operator_session_id = Some(session_id.to_string());
+    // Bridge monotonic counters are scoped to an operator session.  Reserve a
+    // numeric pre-event baseline so the replacement bridge's sequence 1 and
+    // generation 1 records cannot be rejected against the previous run.
+    status.sequence = Some(0);
+    status.running = false;
+    status.registered = false;
+    status.relay_statuses.clear();
+    status.registered_relay_count = 0;
+    status.registered_relay_urls.clear();
+    status.active_relay_urls.clear();
+    status.worker_state = Some("starting".into());
+    status.worker_generation = None;
+    status.worker_restart_count = None;
+    status.worker_alive = Some(false);
+    status.last_worker_error_code = None;
+    status.last_worker_exit_code = None;
+    status.last_worker_restart_at_ms = None;
+    status.relay_runtime_state = Some("starting".into());
+    status.warm_load_state = None;
+    status.warm_load_enabled = None;
+    status.warm_load_duration_ms = None;
+    status.readiness_diagnostics.clear();
     status.native_startup_phase = NativeStartupPhase::SessionReserved;
     status.native_startup_outcome = NativeStartupOutcome::Accepted;
     status.native_startup_failure_category = NativeStartupFailureCategory::None;
@@ -1391,6 +1413,7 @@ fn startup_failure_status(
     operator_session_id: Option<String>,
     log_file_path: Option<String>,
     failure_category: NativeStartupFailureCategory,
+    sequence: u64,
 ) -> ComputeNodeStatus {
     let build_identity = crate::build_identity::build_identity();
     ComputeNodeStatus {
@@ -1440,7 +1463,7 @@ fn startup_failure_status(
         stop_cleanup_failure_count: None,
         stop_cleanup_warning: None,
         operator_session_id,
-        sequence: None,
+        sequence: Some(sequence),
         updated_at_ms: Some(current_time_ms()),
         log_file_path,
         readiness_diagnostics: Map::new(),
@@ -1490,12 +1513,14 @@ async fn complete_no_child_startup_failure(
         let mut process = state.bridge_process.lock().await;
         let mut status = state.status.lock().await;
         if status.operator_session_id.as_deref() == Some(session_id) {
+            let failure_sequence = status.sequence.unwrap_or(0).saturating_add(1);
             let mut failure_status = startup_failure_status(
                 request,
                 last_error,
                 Some(session_id.to_string()),
                 log_file_path,
                 native_failure_category,
+                failure_sequence,
             );
             failure_status.stop_cleanup_required = Some(false);
             failure_status.stop_cleanup_attempted = Some(false);
@@ -1556,12 +1581,16 @@ async fn complete_spawned_bridge_startup_failure(
         let mut process = state.bridge_process.lock().await;
         let mut status = state.status.lock().await;
         if status.operator_session_id.as_deref() == Some(session_id) {
+            status.sequence = Some(status.sequence.unwrap_or(0).saturating_add(1));
             status.running = false;
             status.registered = false;
             status.registered_relay_count = 0;
             status.registered_relay_urls.clear();
             status.active_relay_urls.clear();
-            status.relay_runtime_state = Some("stopped".into());
+            status.relay_runtime_state = Some("failed".into());
+            status.warm_load_state = Some("failed".into());
+            status.worker_state = Some("failed".into());
+            status.worker_alive = Some(false);
             status.last_error = Some(warning.clone());
             status.stop_cleanup_outcome = Some(outcome.into());
             status.stop_cleanup_warning = Some(warning.clone());
@@ -1952,14 +1981,6 @@ fn finalize_bridge_exit(
         status.native_startup_failure_category =
             NativeStartupFailureCategory::BridgeExitedBeforeStartupEvent;
     }
-    let preserve_failed_state = status.relay_runtime_state.as_deref() == Some("failed")
-        || status.warm_load_state.as_deref() == Some("failed");
-    if preserve_failed_state {
-        status.relay_runtime_state = Some("failed".into());
-    } else {
-        status.relay_runtime_state = Some("stopped".into());
-    }
-
     let should_read_recent_tail = !exit_status.success() || !saw_startup_event;
     let recent_tail = should_read_recent_tail
         .then(|| {
@@ -1967,6 +1988,14 @@ fn finalize_bridge_exit(
         })
         .flatten();
     let exit_error = bridge_exit_error(exit_status, saw_startup_event, recent_tail.as_deref());
+    if exit_error.is_some() {
+        status.worker_state = Some("failed".into());
+        status.worker_alive = Some(false);
+        status.warm_load_state = Some("failed".into());
+        status.relay_runtime_state = Some("failed".into());
+    } else if status.relay_runtime_state.as_deref() != Some("failed") {
+        status.relay_runtime_state = Some("stopped".into());
+    }
     if status.last_error.is_none() {
         status.last_error = exit_error.clone();
     }
@@ -1987,7 +2016,10 @@ fn finalize_bridge_exit(
             "registered_relay_count": 0,
             "registered_relay_urls": [],
             "active_relay_urls": [],
-            "relay_runtime_state": status.relay_runtime_state.as_deref().unwrap_or("stopped"),
+            "relay_runtime_state": "failed",
+            "warm_load_state": "failed",
+            "worker_state": "failed",
+            "worker_alive": false,
             "last_error": last_error,
             "message": last_error,
             "operator_session_id": expected_session_id,
@@ -3468,16 +3500,20 @@ pub async fn start_compute_node_with_entry_ack(
                                 == Some(session_id.as_str())
                                 && payload.get("type").and_then(Value::as_str) == Some("started");
                         if is_current_startup_event {
-                            if !promote_attached_bridge_after_startup_event(
-                                &state,
-                                &session_id,
-                                &payload,
-                            )
-                            .await
-                            {
+                            if payload.get("running").and_then(Value::as_bool) == Some(true) {
+                                if !promote_attached_bridge_after_startup_event(
+                                    &state,
+                                    &session_id,
+                                    &payload,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                                saw_startup_event = true;
+                            } else if !apply_compute_node_event_to_state(&state, &payload).await {
                                 continue;
                             }
-                            saw_startup_event = true;
                         } else if !apply_compute_node_event_to_state(&state, &payload).await {
                             continue;
                         }
@@ -6363,6 +6399,7 @@ mod tests {
             "sequence": 1,
             "running": false,
             "registered": false,
+            "worker_state": "provisioning",
             "runtime_provisioning_state": "provisioning"
         });
         assert!(
@@ -6374,10 +6411,21 @@ mod tests {
             .await,
             "provisioning progress must not promote the attached child"
         );
+        assert!(apply_compute_node_event_to_state(&state, &provisioning_event).await);
+        {
+            let status = state.status.lock().await;
+            assert_eq!(
+                status.operator_session_id.as_deref(),
+                Some("attach-session")
+            );
+            assert_eq!(status.sequence, Some(1));
+            assert_eq!(status.worker_state.as_deref(), Some("provisioning"));
+            assert!(!status.running);
+        }
         let stale_event = serde_json::json!({
             "type": "started",
             "operator_session_id": "stale-session",
-            "sequence": 1,
+            "sequence": 2,
             "running": true,
             "registered": false
         });
@@ -6389,7 +6437,7 @@ mod tests {
         let startup_event = serde_json::json!({
             "type": "started",
             "operator_session_id": "attach-session",
-            "sequence": 1,
+            "sequence": 2,
             "running": true,
             "registered": false
         });
@@ -7620,6 +7668,57 @@ mod tests {
             status.native_startup_failure_category,
             NativeStartupFailureCategory::ChildSpawnFailed
         );
+        assert_eq!(status.sequence, Some(1));
+        assert_eq!(status.worker_state.as_deref(), Some("failed"));
+        assert_eq!(status.relay_runtime_state.as_deref(), Some("failed"));
+        assert_eq!(status.warm_load_state.as_deref(), Some("failed"));
+        assert!(!status.running);
+        assert!(!status.registered);
+    }
+
+    #[tokio::test]
+    async fn replacement_reservation_resets_session_monotonic_state() {
+        let state = ComputeNodeState::default();
+        {
+            let mut status = state.status.lock().await;
+            status.operator_session_id = Some("old-session".into());
+            status.sequence = Some(91);
+            status.worker_generation = Some(17);
+            status.worker_restart_count = Some(8);
+            status.worker_state = Some("failed".into());
+            status.last_worker_error_code = Some("worker_crashed".into());
+        }
+
+        reserve_starting_bridge_process_for_session(&state, "replacement-session")
+            .await
+            .expect("reserve replacement");
+        let first_running = serde_json::json!({
+            "type": "started",
+            "operator_session_id": "replacement-session",
+            "sequence": 1,
+            "worker_generation": 1,
+            "worker_state": "running",
+            "running": true,
+            "registered": false
+        });
+        let mut status = state.status.lock().await;
+        assert_eq!(status.sequence, Some(0));
+        assert_eq!(status.worker_generation, None);
+        assert_eq!(status.worker_restart_count, None);
+        assert_eq!(status.last_worker_error_code, None);
+        assert!(update_status_from_event(&mut status, &first_running));
+        assert_eq!(status.sequence, Some(1));
+        assert_eq!(status.worker_generation, Some(1));
+        assert!(!update_status_from_event(&mut status, &first_running));
+        assert!(!update_status_from_event(
+            &mut status,
+            &serde_json::json!({
+                "type": "status",
+                "operator_session_id": "old-session",
+                "sequence": 92,
+                "running": true
+            })
+        ));
     }
 
     #[tokio::test]
@@ -7676,6 +7775,7 @@ mod tests {
             Some("session-1".into()),
             Some("/tmp/operator.log".into()),
             NativeStartupFailureCategory::BridgePreparationFailed,
+            1,
         );
 
         assert!(!status.running);
@@ -7985,12 +8085,13 @@ mod tests {
             None,
             None,
             NativeStartupFailureCategory::BridgePreparationFailed,
+            1,
         );
 
         assert!(!status.running);
         assert!(!status.registered);
         assert_eq!(status.operator_session_id, None);
-        assert_eq!(status.sequence, None);
+        assert_eq!(status.sequence, Some(1));
         assert_eq!(status.relay_runtime_state.as_deref(), Some("failed"));
         assert_eq!(status.warm_load_state.as_deref(), Some("failed"));
         assert!(status

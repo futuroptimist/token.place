@@ -1236,7 +1236,13 @@ export function App() {
       }
       computeStatusRef.current = next;
       setComputeStatus(next);
-      if (payload.type === 'started' || payload.type === 'error' || payload.type === 'stopped') {
+      // Provisioning progress uses `started` with running=false.  It belongs
+      // to the active attempt but is not the authoritative Running handshake.
+      if (
+        (payload.type === 'started' && payload.running === true) ||
+        payload.type === 'error' ||
+        payload.type === 'stopped'
+      ) {
         setIsStartingComputeNode(false);
       }
       if (payload.type === 'stopped') {

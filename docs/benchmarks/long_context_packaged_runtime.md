@@ -3,8 +3,9 @@
 The long-context harness turns the long-context macOS Metal evidence from #1566 into a repeatable,
 privacy-safe benchmark surface for downstream comparisons. Broad unit and contract CI remains
 deterministic and GPU-independent. The specialized `Desktop operator app e2e` workflow also
-provisions a checksum-pinned tiny real GGUF and launches desktop binaries for hosted application
-contract checks; these checks do not run physical-GPU or multi-minute benchmark validation.
+builds desktop binaries and, on hosted Windows, installs the current NSIS package for a driverless
+structural CPU smoke and package-identity check. These checks do not run a model, physical-GPU
+validation, or a multi-minute benchmark.
 
 ## Prerequisites for physical runs
 
@@ -489,6 +490,11 @@ pre-commit run --all-files
 git diff --check
 ./run_all_tests.sh PR
 ```
+
+The hosted-Windows structural gate verifies the installed application, bundled runtime/resource
+layout, poisoned-host-state isolation, CPU-only preflight, package identity, and cleanup. It does
+not use Selenium, `tauri-driver`, WebView2/EdgeDriver automation, or tokenizer-boundary model
+provisioning, and it does not produce authoritative long-context tokenizer evidence.
 
 Physical Metal/CUDA validation is manual and should attach only sanitized reports to #1566, #1608,
 or downstream validation. Do not claim 0.1.17 release validation or general semantic correctness

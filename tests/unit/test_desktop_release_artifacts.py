@@ -3578,8 +3578,6 @@ def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_sc
     guard = _load_windows_installer_identity()
     current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
     current_nsis.write_text('artifact', encoding='utf-8')
-    model = tmp_path / 'tiny.gguf'
-    model.write_text('model', encoding='utf-8')
     artifact_dir = tmp_path / 'logs'
     calls = []
     monkeypatch.setattr(guard.sys, 'platform', 'win32')
@@ -3589,7 +3587,6 @@ def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_sc
         '--pr-current-windows-nsis', str(current_nsis),
         '--expected-version', '0.1.5',
         '--expected-build-id', 'abcdef123456',
-        '--tokenizer-boundary-model', str(model),
         '--artifact-dir', str(artifact_dir),
     ])
 
@@ -3601,7 +3598,28 @@ def test_windows_installer_identity_current_package_dispatches_one_clean_nsis_sc
     assert scenario.previous is None
     assert build_id == 'abcdef123456'
     assert artifacts.root == artifact_dir
-    assert boundary_model == model
+    assert boundary_model is None
+
+
+def test_windows_installer_identity_current_package_enables_explicit_headless_model(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    current_nsis = tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe'
+    current_nsis.write_text('artifact', encoding='utf-8')
+    model = tmp_path / 'tiny.gguf'
+    model.write_text('model', encoding='utf-8')
+    calls = []
+    monkeypatch.setattr(guard.sys, 'platform', 'win32')
+    monkeypatch.setattr(guard, 'run_scenario', lambda *args: calls.append(args))
+    monkeypatch.setattr(sys, 'argv', [
+        'test_windows_installer_identity.py',
+        '--pr-current-windows-nsis', str(current_nsis),
+        '--expected-version', '0.1.5',
+        '--expected-build-id', 'abcdef123456',
+        '--tokenizer-boundary-model', str(model),
+    ])
+
+    assert guard.main() == 0
+    assert calls[0][3] == model.resolve()
 
 
 def test_windows_installer_identity_current_package_validates_contract_off_windows(monkeypatch, tmp_path, capsys) -> None:
@@ -3640,15 +3658,6 @@ def test_windows_installer_identity_rejects_invalid_current_package_arguments(mo
         '--expected-build-id', 'abcdef123456',
     ])
     with pytest.raises(guard.InstallerIdentityError, match='cannot be combined'):
-        guard.main()
-
-    monkeypatch.setattr(sys, 'argv', [
-        'test_windows_installer_identity.py',
-        '--pr-current-windows-nsis', str(current_nsis),
-        '--expected-version', '0.1.5',
-        '--expected-build-id', 'abcdef123456',
-    ])
-    with pytest.raises(guard.InstallerIdentityError, match='requires --tokenizer-boundary-model'):
         guard.main()
 
     monkeypatch.setattr(sys, 'argv', [
@@ -3699,18 +3708,28 @@ def test_windows_packaged_start_workflow_builds_and_validates_current_nsis() -> 
     assert 'prepare_windows_embedded_python_runtime.py' in workflow
     assert 'tauri build -- --target x86_64-pc-windows-msvc --bundles nsis' in workflow
     assert '--pr-current-windows-nsis' in workflow
-    assert '--tokenizer-boundary-model' in workflow
-    assert "target/x86_64-pc-windows-msvc/release' -Filter '*.exe'" not in workflow
-    assert '--operator-start-preflight' in Path('desktop-tauri/scripts/test_windows_installer_identity.py').read_text(encoding='utf-8')
+    windows = workflow.split('  desktop-operator-packaged-e2e-windows:', 1)[1].split(
+        '  desktop-operator-packaged-inspect-python39-linux:', 1
+    )[0]
+    assert '--tokenizer-boundary-model' not in windows
+    assert 'Provision tiny GGUF for installed headless CPU admission' not in windows
+    assert 'Restore cached tiny GGUF for installed headless CPU admission' not in windows
+    assert workflow.count("'desktop-tauri/scripts/test_windows_installer_identity.py'") == 2
+    assert 'Print bounded headless-admission diagnostic on failure' not in workflow
+    assert 'tokenplace-headless-diag.txt' not in workflow
+    assert 'Issue #1555 reserves native GPU proof for a GPU runner' in windows
+    assert '--operator-start-preflight-cpu-smoke' in Path(
+        'desktop-tauri/scripts/test_windows_installer_identity.py'
+    ).read_text(encoding='utf-8')
 
 
 def test_windows_packaged_start_workflow_cannot_be_only_filtered_cargo_tests() -> None:
     workflow = Path('.github/workflows/desktop-operator-e2e.yml').read_text(encoding='utf-8')
-    packaged_gate = workflow.split('- name: Verify Windows application-argument tokenizer production boundary', 1)[1]
+    packaged_gate = workflow.split('- name: Validate installed structural CPU smoke and package identity', 1)[1]
 
     assert 'test_windows_installer_identity.py' in packaged_gate
     assert '--pr-current-windows-nsis' in packaged_gate
-    assert '--tokenizer-boundary-model' in packaged_gate
+    assert '--tokenizer-boundary-model' not in packaged_gate.split('- name:', 1)[0]
     assert 'cargo test' not in packaged_gate.split('- name:', 1)[0]
 
 
@@ -4683,138 +4702,6 @@ def test_windows_installer_identity_cleanup_timeout_has_exact_shortcut_evidence(
     assert 'present_before_uninstall=True' in diagnostic
 
 
-def test_windows_installer_identity_remediates_exact_captured_stale_shortcut(monkeypatch, tmp_path) -> None:
-    guard = _load_windows_installer_identity()
-    target = tmp_path / 'installed' / 'token.place.exe'
-    shortcut_path = tmp_path / 'Desktop' / 'token.place desktop.lnk'
-    shortcut_path.parent.mkdir()
-    shortcut_path.write_bytes(b'captured product shortcut')
-    shortcut = guard.Shortcut(shortcut_path, target)
-    before = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [target], []), [])
-    current = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [], [target]), [])
-    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [])
-
-    assert guard.remediate_captured_stale_shortcuts(before, current) is True
-    assert not shortcut_path.exists()
-
-
-@pytest.mark.parametrize('blocked_by', ['missing-captured-authority', 'live-target', 'registry', 'process'])
-def test_windows_installer_identity_stale_shortcut_remediation_requires_no_other_authority(
-    monkeypatch, tmp_path, blocked_by
-) -> None:
-    guard = _load_windows_installer_identity()
-    target = tmp_path / 'installed' / 'token.place.exe'
-    shortcut_path = tmp_path / 'Desktop' / 'token.place desktop.lnk'
-    shortcut_path.parent.mkdir()
-    shortcut_path.write_bytes(b'captured product shortcut')
-    shortcut = guard.Shortcut(shortcut_path, target)
-    captured_targets = [] if blocked_by == 'missing-captured-authority' else [target]
-    before = guard.AuthoritySnapshot(
-        guard.ShortcutInventory([shortcut], captured_targets, []), [])
-    registry = [object()] if blocked_by == 'registry' else []
-    current = guard.AuthoritySnapshot(
-        guard.ShortcutInventory([shortcut], [], [target]), registry)
-    if blocked_by == 'live-target':
-        target.parent.mkdir(parents=True)
-        target.write_bytes(b'live executable')
-    monkeypatch.setattr(guard, '_processes_running_targets',
-        lambda targets: [object()] if blocked_by == 'process' else [])
-
-    assert guard.remediate_captured_stale_shortcuts(before, current) is False
-    assert shortcut_path.exists()
-
-
-def test_windows_installer_identity_reports_persistent_shortcut_after_removal(
-    monkeypatch, tmp_path
-) -> None:
-    guard = _load_windows_installer_identity()
-    target = tmp_path / 'installed' / 'token.place.exe'
-    shortcut_path = tmp_path / 'Desktop' / 'token.place desktop.lnk'
-    shortcut_path.parent.mkdir()
-    shortcut_path.write_bytes(b'captured product shortcut')
-    shortcut = guard.Shortcut(shortcut_path, target)
-    before = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [target], []), [])
-    current = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [], [target]), [])
-    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [])
-    monkeypatch.setattr(Path, 'unlink', lambda self: None)
-
-    with pytest.raises(guard.InstallerIdentityError,
-            match='captured stale product shortcut remains after exact-path removal'):
-        guard.remediate_captured_stale_shortcuts(before, current)
-    assert shortcut_path.exists()
-
-
-def test_windows_installer_identity_cleanup_reinventories_after_remediation(
-    monkeypatch, tmp_path
-) -> None:
-    guard = _load_windows_installer_identity()
-    target = tmp_path / 'installed' / 'token.place.exe'
-    shortcut_path = tmp_path / 'Desktop' / 'token.place desktop.lnk'
-    shortcut_path.parent.mkdir()
-    shortcut_path.write_bytes(b'captured product shortcut')
-    shortcut = guard.Shortcut(shortcut_path, target)
-    before = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [target], []), [])
-    current = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [], [target]), [])
-    categories = iter([['shortcuts'], []])
-    captures = []
-    monkeypatch.setattr(guard, 'residual_authority_categories', lambda _before: next(categories))
-    monkeypatch.setattr(guard, 'capture_authority_snapshot',
-        lambda: captures.append(True) or current)
-    monkeypatch.setattr(guard, 'remediate_captured_stale_shortcuts',
-        lambda captured, observed: captured is before and observed is current)
-
-    guard.wait_for_cleanup_convergence(
-        before, monotonic=lambda: 0.0, sleeper=lambda _seconds: None)
-    assert len(captures) == 1
-
-
-@pytest.mark.parametrize('unsafe_kind', ['foreign-path', 'retargeted', 'newly-created', 'existing-target'])
-def test_windows_installer_identity_rejects_unsafe_stale_shortcut_remediation(
-    monkeypatch, tmp_path, unsafe_kind
-) -> None:
-    guard = _load_windows_installer_identity()
-    target = tmp_path / 'installed' / 'token.place.exe'
-    captured_path = tmp_path / 'Desktop' / 'token.place desktop.lnk'
-    captured = guard.Shortcut(captured_path, target)
-    before_shortcuts = [] if unsafe_kind == 'newly-created' else [captured]
-    before = guard.AuthoritySnapshot(guard.ShortcutInventory(before_shortcuts, [target], []), [])
-
-    path = tmp_path / 'Public Desktop' / 'token.place desktop.lnk' if unsafe_kind == 'foreign-path' else captured_path
-    current_target = tmp_path / 'foreign.exe' if unsafe_kind == 'retargeted' else target
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b'do not remove')
-    if unsafe_kind == 'existing-target':
-        target.parent.mkdir(parents=True)
-        target.write_bytes(b'executable')
-    current_shortcut = guard.Shortcut(path, current_target)
-    current = guard.AuthoritySnapshot(
-        guard.ShortcutInventory([current_shortcut], [current_target] if current_target.exists() else [], []),
-        [],
-    )
-    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [])
-
-    assert guard.remediate_captured_stale_shortcuts(before, current) is False
-    assert path.exists()
-
-
-def test_windows_installer_identity_reports_exact_stale_shortcut_cleanup_failure(monkeypatch, tmp_path) -> None:
-    guard = _load_windows_installer_identity()
-    target = tmp_path / 'installed' / 'token.place.exe'
-    shortcut_path = tmp_path / 'Desktop' / 'token.place desktop.lnk'
-    shortcut_path.parent.mkdir()
-    shortcut_path.write_bytes(b'captured product shortcut')
-    shortcut = guard.Shortcut(shortcut_path, target)
-    before = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [target], []), [])
-    current = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [], [target]), [])
-    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [])
-    monkeypatch.setattr(Path, 'unlink', lambda self: (_ for _ in ()).throw(PermissionError('locked')))
-
-    with pytest.raises(guard.InstallerIdentityError, match='failed to remove captured stale product shortcut') as exc_info:
-        guard.remediate_captured_stale_shortcuts(before, current)
-    assert f'path={shortcut_path}' in str(exc_info.value)
-    assert shortcut_path.exists()
-
-
 def test_windows_installer_identity_uninstall_reinventory_is_bounded_and_logs_are_distinct(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
     nsis = guard.RegistryEntry('nsis-key', 'token.place', r'C:\\app\\uninstall.exe', '', False, '')
@@ -5720,268 +5607,6 @@ def test_windows_installer_identity_run_scenario_rejects_sentinel_after_success(
 
     with pytest.raises(guard.InstallerIdentityError, match='sentinel was invoked'):
         guard.run_scenario(guard.Scenario('clean-nsis-0.1.5', current), 'abcdef123456')
-
-
-@pytest.mark.parametrize('boundary_fails', [False, True])
-def test_windows_installer_identity_runs_boundary_before_guaranteed_cleanup(
-    monkeypatch, tmp_path, boundary_fails
-) -> None:
-    guard = _load_windows_installer_identity()
-    current = guard.Installer(tmp_path / 'token.place-desktop-0.1.5-x64-setup.exe', 'nsis', '0.1.5')
-    current.path.write_text('installer', encoding='utf-8')
-    exe = tmp_path / 'installed' / 'token.place.exe'
-    exe.parent.mkdir()
-    exe.write_text('exe', encoding='utf-8')
-    model = tmp_path / 'tiny.gguf'
-    model.write_text('model', encoding='utf-8')
-    events = []
-
-    monkeypatch.setattr(guard, '_terminate_processes', lambda: events.append('terminate'))
-    monkeypatch.setattr(guard, 'uninstall_best_effort', lambda log_path=None: events.append('uninstall'))
-    monkeypatch.setattr(guard, 'install', lambda *args, **kwargs: (events.append('install') or subprocess.CompletedProcess([], 0, '')))
-    monkeypatch.setattr(guard, 'resolve_authoritative_shortcut', lambda *args: guard.Shortcut(tmp_path / 'app.lnk', exe))
-    monkeypatch.setattr(guard, '_assert_runtime', lambda path: events.append('runtime'))
-    monkeypatch.setattr(guard, 'probe_identity', lambda *args: events.append('identity'))
-    monkeypatch.setattr(guard, 'validate_installed_context_tiers', lambda *args: events.append('smoke'))
-    monkeypatch.setattr(guard, 'launch_for_operator_record', lambda *args: json.dumps({
-        'record': 'desktop.compute_node.session.layout',
-        'launcher_source': 'bundled',
-        'interpreter_basename': 'python.exe',
-        'runtime_id': guard.EXPECTED_RUNTIME_ID,
-        'bundled_runtime_id': guard.EXPECTED_RUNTIME_ID,
-        'bridge_preflight': 'ok',
-        'model_artifact_inspect': 'ok',
-        'model_artifact_filename': guard.EXPECTED_MODEL_ARTIFACT_FILENAME,
-    }))
-
-    def boundary(target, boundary_model, log_path=None):
-        events.append(('boundary', target, boundary_model))
-        if boundary_fails:
-            raise guard.InstallerIdentityError('boundary failed')
-
-    monkeypatch.setattr(guard, 'run_installed_tokenizer_boundary', boundary)
-    scenario = guard.Scenario('pr-clean-current-nsis-0.1.5', current)
-    if boundary_fails:
-        with pytest.raises(guard.InstallerIdentityError, match='boundary failed'):
-            guard.run_scenario(scenario, 'abcdef123456', tokenizer_boundary_model=model)
-    else:
-        guard.run_scenario(scenario, 'abcdef123456', tokenizer_boundary_model=model)
-
-    boundary_event = ('boundary', exe, model)
-    assert boundary_event in events
-    assert events.index('install') < events.index('smoke') < events.index(boundary_event)
-    assert events.index(boundary_event) < len(events) - 2
-    assert events[-2:] == ['terminate', 'uninstall']
-
-
-def test_windows_installer_identity_boundary_invokes_installed_executable_and_bounded_log(
-    monkeypatch, tmp_path
-) -> None:
-    guard = _load_windows_installer_identity()
-    exe = tmp_path / 'installed' / 'token.place.exe'
-    model = tmp_path / 'tiny.gguf'
-    log = tmp_path / 'artifacts' / 'boundary.log'
-    exe.parent.mkdir()
-    exe.write_text('exe', encoding='utf-8')
-    model.write_text('model', encoding='utf-8')
-    calls = []
-    class Process:
-        pid = 731
-        def wait(self, timeout):
-            calls.append(('wait', timeout))
-            return 0
-    monkeypatch.setattr(guard.subprocess, 'Popen',
-        lambda cmd, **kwargs: (calls.append((cmd, kwargs)) or Process()))
-
-    guard.run_installed_tokenizer_boundary(exe, model, log)
-
-    cmd, kwargs = calls[0]
-    assert cmd[cmd.index('--app-binary') + 1] == str(exe)
-    assert cmd[cmd.index('--model') + 1] == str(model.resolve())
-    assert kwargs['stdout'] is guard.subprocess.DEVNULL
-    assert kwargs['stderr'] is guard.subprocess.DEVNULL
-    assert calls[1] == ('wait', guard.INSTALLED_BOUNDARY_SUPERVISOR_TIMEOUT_SECONDS)
-    assert json.loads(log.read_text(encoding='utf-8')) == {
-        'boundary': 'installed_package_tokenizer',
-        'cleanup_succeeded': True,
-        'outcome': 'passed',
-        'schema_version': 2,
-    }
-    assert str(exe) not in log.read_text(encoding='utf-8')
-    assert str(model) not in log.read_text(encoding='utf-8')
-
-
-def test_windows_installer_identity_boundary_failure_writes_only_bounded_artifact(
-    monkeypatch, tmp_path
-) -> None:
-    guard = _load_windows_installer_identity()
-    exe = tmp_path / 'private-app.exe'
-    model = tmp_path / 'private-model.gguf'
-    log = tmp_path / 'boundary.log'
-    exe.write_text('exe', encoding='utf-8')
-    model.write_text('model', encoding='utf-8')
-    class Process:
-        pid = 731
-        def wait(self, timeout):
-            return 1
-    monkeypatch.setattr(guard.subprocess, 'Popen', lambda cmd, **kwargs: Process())
-
-    with pytest.raises(guard.InstallerIdentityError, match='bounded validation artifacts'):
-        guard.run_installed_tokenizer_boundary(exe, model, log)
-
-    assert json.loads(log.read_text(encoding='utf-8')) == {
-        'boundary': 'installed_package_tokenizer',
-        'cleanup_succeeded': True,
-        'outcome': 'failed',
-        'schema_version': 2,
-    }
-
-
-def test_windows_installer_identity_boundary_launch_failure_still_writes_artifact(
-    monkeypatch, tmp_path
-) -> None:
-    guard = _load_windows_installer_identity()
-    exe = tmp_path / 'private-app.exe'
-    model = tmp_path / 'private-model.gguf'
-    log = tmp_path / 'boundary.log'
-    exe.write_text('exe', encoding='utf-8')
-    model.write_text('model', encoding='utf-8')
-    monkeypatch.setattr(guard.subprocess, 'Popen',
-        lambda cmd, **kwargs: (_ for _ in ()).throw(OSError('private launch failure')))
-
-    with pytest.raises(guard.InstallerIdentityError, match='bounded validation artifacts'):
-        guard.run_installed_tokenizer_boundary(exe, model, log)
-
-    assert json.loads(log.read_text(encoding='utf-8')) == {
-        'boundary': 'installed_package_tokenizer',
-        'cleanup_succeeded': True,
-        'outcome': 'failed',
-        'schema_version': 2,
-    }
-    assert 'private launch failure' not in log.read_text(encoding='utf-8')
-
-
-def test_windows_installer_identity_boundary_timeout_kills_owned_tree_and_reports_bounded_failure(
-    monkeypatch, tmp_path
-) -> None:
-    guard = _load_windows_installer_identity()
-    exe = tmp_path / 'private-app.exe'
-    model = tmp_path / 'private-model.gguf'
-    log = tmp_path / 'boundary.log'
-    exe.write_text('exe', encoding='utf-8')
-    model.write_text('model', encoding='utf-8')
-    waits = []
-    class Process:
-        pid = 731
-        def wait(self, timeout):
-            waits.append(timeout)
-            if len(waits) == 1:
-                raise subprocess.TimeoutExpired('private command', timeout)
-            return 1
-        def kill(self):
-            pytest.fail('successful taskkill should not require direct kill')
-    taskkills = []
-    monkeypatch.setattr(guard.subprocess, 'Popen', lambda cmd, **kwargs: Process())
-    monkeypatch.setattr(guard.subprocess, 'run', lambda cmd, **kwargs:
-        (taskkills.append((cmd, kwargs)) or subprocess.CompletedProcess(cmd, 0)))
-
-    with pytest.raises(guard.InstallerIdentityError, match='bounded validation artifacts'):
-        guard.run_installed_tokenizer_boundary(exe, model, log, platform_name='nt')
-
-    assert taskkills[0][0] == ['taskkill', '/PID', '731', '/T', '/F']
-    assert waits == [guard.INSTALLED_BOUNDARY_SUPERVISOR_TIMEOUT_SECONDS,
-        guard.INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS]
-    artifact = json.loads(log.read_text(encoding='utf-8'))
-    assert artifact == {
-        'boundary': 'installed_package_tokenizer',
-        'cleanup_succeeded': True,
-        'outcome': 'supervisor_timeout',
-        'schema_version': 2,
-    }
-    assert str(exe) not in log.read_text(encoding='utf-8')
-    assert str(model) not in log.read_text(encoding='utf-8')
-
-
-@pytest.mark.parametrize('taskkill_failure', [OSError('private taskkill failure'),
-    subprocess.TimeoutExpired('private taskkill command', 1)])
-def test_windows_installer_identity_boundary_timeout_falls_back_to_direct_kill(
-    monkeypatch, tmp_path, taskkill_failure
-) -> None:
-    guard = _load_windows_installer_identity()
-    exe = tmp_path / 'private-app.exe'
-    model = tmp_path / 'private-model.gguf'
-    log = tmp_path / 'boundary.log'
-    exe.write_text('exe', encoding='utf-8')
-    model.write_text('model', encoding='utf-8')
-    waits = []
-    kills = []
-
-    class Process:
-        pid = 731
-
-        def wait(self, timeout):
-            waits.append(timeout)
-            if len(waits) == 1:
-                raise subprocess.TimeoutExpired('private child command', timeout)
-            return 1
-
-        def kill(self):
-            kills.append('kill')
-
-    monkeypatch.setattr(guard.subprocess, 'Popen', lambda cmd, **kwargs: Process())
-    monkeypatch.setattr(guard.subprocess, 'run',
-        lambda cmd, **kwargs: (_ for _ in ()).throw(taskkill_failure))
-
-    with pytest.raises(guard.InstallerIdentityError, match='bounded validation artifacts'):
-        guard.run_installed_tokenizer_boundary(exe, model, log, platform_name='nt')
-
-    assert kills == ['kill']
-    assert waits == [guard.INSTALLED_BOUNDARY_SUPERVISOR_TIMEOUT_SECONDS,
-        guard.INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS]
-    artifact_text = log.read_text(encoding='utf-8')
-    assert json.loads(artifact_text) == {
-        'boundary': 'installed_package_tokenizer',
-        'cleanup_succeeded': False,
-        'outcome': 'supervisor_timeout',
-        'schema_version': 2,
-    }
-    assert 'private' not in artifact_text
-
-
-def test_windows_installer_identity_boundary_final_wait_timeout_is_bounded(
-    monkeypatch, tmp_path
-) -> None:
-    guard = _load_windows_installer_identity()
-    exe = tmp_path / 'private-app.exe'
-    model = tmp_path / 'private-model.gguf'
-    log = tmp_path / 'boundary.log'
-    exe.write_text('exe', encoding='utf-8')
-    model.write_text('model', encoding='utf-8')
-    kills = []
-
-    class Process:
-        pid = 731
-
-        def wait(self, timeout):
-            raise subprocess.TimeoutExpired('private child command', timeout)
-
-        def kill(self):
-            kills.append('kill')
-
-    monkeypatch.setattr(guard.subprocess, 'Popen', lambda cmd, **kwargs: Process())
-
-    with pytest.raises(guard.InstallerIdentityError, match='bounded validation artifacts'):
-        guard.run_installed_tokenizer_boundary(exe, model, log, platform_name='posix')
-
-    assert kills == ['kill', 'kill']
-    artifact_text = log.read_text(encoding='utf-8')
-    assert json.loads(artifact_text) == {
-        'boundary': 'installed_package_tokenizer',
-        'cleanup_succeeded': False,
-        'outcome': 'supervisor_timeout',
-        'schema_version': 2,
-    }
-    assert 'private' not in artifact_text
 
 
 

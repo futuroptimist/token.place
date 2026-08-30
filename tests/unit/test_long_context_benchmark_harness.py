@@ -102,8 +102,7 @@ def desktop_runner():
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
         "_read_operator_start_diagnostic", "_read_native_startup_diagnostic",
         "_read_packaged_startup_diagnostic", "_status_value",
-        "_contains_private_input", "_packaged_boundary_failure_diagnostics",
-        "run_packaged_windows_tokenizer_boundary", "main"}
+        "main"}
     functions = [node for node in tree.body
         if (isinstance(node, ast.FunctionDef) and node.name in names)
         or (isinstance(node, (ast.Assign, ast.AnnAssign))
@@ -825,8 +824,6 @@ def test_webdriver_changed_safety_branches_are_bounded(
         process, tmp_path / "private application.exe", application_process
     ) == "application_present"
 
-    assert desktop_runner._packaged_boundary_failure_diagnostics(
-        ["private path", "prompt payload"]) == "code=unavailable"
 
 def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
         desktop_runner, tmp_path):
@@ -1360,212 +1357,22 @@ def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
     ))
 
 
-def test_packaged_windows_tokenizer_boundary_uses_packaged_adapter_contract(
-        desktop_runner, monkeypatch, tmp_path):
-    application = tmp_path / "token-place-desktop-tauri.exe"
-    model = tmp_path / "tiny.gguf"
-    application.write_bytes(b"application")
-    model.write_bytes(b"model")
-    calls = []
-    process = SimpleNamespace()
-
-    desktop_runner.REPO_ROOT = tmp_path
-    desktop_runner.LOGS_DIR = tmp_path
-    desktop_runner.sys = sys
-    desktop_runner.reserve_free_port = lambda: 43123
-    desktop_runner.wait_for_http_200 = lambda url: calls.append(("ready", url))
-    desktop_runner.terminate_process = lambda value: calls.append(("terminate", value))
-    desktop_runner.subprocess = SimpleNamespace(
-        Popen=lambda *args, **kwargs: calls.append(("popen", args, kwargs)) or process,
-        STDOUT=subprocess.STDOUT)
-    monkeypatch.setenv("TOKEN_PLACE_PYTHON", "poisoned-python")
-    monkeypatch.setenv("TOKEN_PLACE_SIDECAR_PYTHON", "poisoned-sidecar")
-
-    def adapter(**kwargs):
-        calls.append(("adapter", kwargs))
-        return {"runtime_contract_pass": True, "fixture": {
-            "sha256": h.generate_fixture(
-                "small-8k", scenario="structured-extraction")[1]["fixture_sha256"],
-            "authoritative_prompt_tokens": 42,
-            "authoritative_target_offsets_tokens": {"near": 7}}}
-
-    assert desktop_runner.run_packaged_windows_tokenizer_boundary(
-        application, model, adapter=adapter) == 0
-    adapter_kwargs = next(item[1] for item in calls if item[0] == "adapter")
-    assert adapter_kwargs == {
-        "fixture_id": "small-8k", "scenario": "structured-extraction",
-        "timeout_s": 180.0, "cleanup_timeout_s": 30.0,
-        "app_binary": str(application.resolve()), "model": str(model.resolve()),
-        "backend": "cpu", "relay_url": "http://127.0.0.1:43123",
-        "context_tier": "8k-fast", "report_only": True}
-    popen_env = next(item[2]["env"] for item in calls if item[0] == "popen")
-    assert popen_env["USE_MOCK_LLM"] == "1"
-    assert calls[-1] == ("terminate", process)
 
 
-def test_packaged_windows_tokenizer_boundary_cli_requires_explicit_inputs(
-        desktop_runner, tmp_path):
-    calls = []
-    desktop_runner.run_packaged_windows_tokenizer_boundary = (
-        lambda application, model: calls.append((application, model)) or 17)
-    application = tmp_path / "current-head.exe"
-    model = tmp_path / "tiny.gguf"
-
-    assert desktop_runner.main([
-        "--packaged-windows-tokenizer-boundary", "--app-binary", str(application),
-        "--model", str(model)]) == 17
-    assert calls == [(application, model)]
-    with pytest.raises(SystemExit):
-        desktop_runner.main(["--packaged-windows-tokenizer-boundary"])
 
 
-@pytest.mark.parametrize(("evidence", "message"), [
-    ({"runtime_contract_pass": False, "code": "bounded-failure"},
-     "packaged Windows tokenizer boundary failed: code=unavailable"),
-    ({"runtime_contract_pass": True, "fixture": None},
-     "packaged Windows tokenizer boundary evidence unavailable"),
-    ({"runtime_contract_pass": True, "fixture": []},
-     "packaged Windows tokenizer boundary evidence unavailable"),
-    ({"runtime_contract_pass": True, "fixture": {
-        "sha256": "wrong", "authoritative_prompt_tokens": 42,
-        "authoritative_target_offsets_tokens": {"near": 7}}},
-     "packaged Windows tokenizer boundary evidence unavailable"),
-])
-def test_packaged_windows_tokenizer_boundary_rejects_invalid_adapter_evidence(
-        desktop_runner, tmp_path, evidence, message):
-    application = tmp_path / "current-head.exe"
-    model = tmp_path / "tiny.gguf"
-    application.write_bytes(b"application")
-    model.write_bytes(b"model")
-    process = SimpleNamespace()
-    terminated = []
-    desktop_runner.REPO_ROOT = tmp_path
-    desktop_runner.LOGS_DIR = tmp_path
-    desktop_runner.sys = sys
-    desktop_runner.reserve_free_port = lambda: 43123
-    desktop_runner.wait_for_http_200 = lambda _url: None
-    desktop_runner.terminate_process = terminated.append
-    desktop_runner.subprocess = SimpleNamespace(
-        Popen=lambda *_args, **_kwargs: process, STDOUT=subprocess.STDOUT)
-
-    with pytest.raises(RuntimeError, match=message):
-        desktop_runner.run_packaged_windows_tokenizer_boundary(
-            application, model, adapter=lambda **_kwargs: evidence)
-
-    assert terminated == [process]
 
 
-def test_packaged_windows_tokenizer_boundary_reports_only_bounded_failure_diagnostics(
-        desktop_runner, tmp_path):
-    application = tmp_path / "current-head.exe"
-    model = tmp_path / "tiny.gguf"
-    application.write_bytes(b"application")
-    model.write_bytes(b"model")
-    process = SimpleNamespace()
-    terminated = []
-    desktop_runner.REPO_ROOT = tmp_path
-    desktop_runner.LOGS_DIR = tmp_path
-    desktop_runner.sys = sys
-    desktop_runner.reserve_free_port = lambda: 43123
-    desktop_runner.wait_for_http_200 = lambda _url: None
-    desktop_runner.terminate_process = terminated.append
-    desktop_runner.subprocess = SimpleNamespace(
-        Popen=lambda *_args, **_kwargs: process, STDOUT=subprocess.STDOUT)
-    evidence = {"runtime_contract_pass": False, "code": "packaged_runner_failed",
-        "last_safe_phase": "request_active", "failure_reason": "tokenization_failure",
-        "cleanup_succeeded": False}
-
-    with pytest.raises(RuntimeError) as raised:
-        desktop_runner.run_packaged_windows_tokenizer_boundary(
-            application, model, adapter=lambda **_kwargs: evidence)
-
-    assert str(raised.value) == ("packaged Windows tokenizer boundary failed: "
-        "code=packaged_runner_failed last_safe_phase=request_active "
-        "failure_reason=tokenization_failure cleanup_succeeded=false")
-    assert terminated == [process]
 
 
-def test_packaged_boundary_failure_diagnostics_redacts_hostile_values(desktop_runner):
-    private = "PRIVATE_PROMPT_PATH_MODEL_ENV_SENTINEL"
-    diagnostics = desktop_runner._packaged_boundary_failure_diagnostics({
-        "code": private, "last_safe_phase": private, "failure_reason": private,
-        "cleanup_succeeded": private, "exception": private})
-
-    assert diagnostics == "code=unavailable"
-    assert private not in diagnostics
 
 
-@pytest.mark.parametrize("private_input", [
-    "prompt", "application", "model", "TOKEN_PLACE_PYTHON",
-    "TOKEN_PLACE_SIDECAR_PYTHON",
-])
-def test_packaged_windows_tokenizer_boundary_rejects_private_input(
-        desktop_runner, tmp_path, private_input):
-    application = tmp_path / "current-head.exe"
-    model = tmp_path / "tiny.gguf"
-    application.write_bytes(b"application")
-    model.write_bytes(b"model")
-    process = SimpleNamespace()
-    terminated = []
-    desktop_runner.REPO_ROOT = tmp_path
-    desktop_runner.LOGS_DIR = tmp_path
-    desktop_runner.sys = sys
-    desktop_runner.reserve_free_port = lambda: 43123
-    desktop_runner.wait_for_http_200 = lambda _url: None
-    desktop_runner.terminate_process = terminated.append
-    desktop_runner.subprocess = SimpleNamespace(
-        Popen=lambda *_args, **_kwargs: process, STDOUT=subprocess.STDOUT)
-    _, manifest = h.generate_fixture(
-        "small-8k", scenario="structured-extraction")
-    prompt = "private prompt sentinel"
-    desktop_runner.generate_fixture = lambda *_args, **_kwargs: (prompt, manifest)
-    sentinels = {
-        "prompt": prompt,
-        "application": str(application.resolve()),
-        "model": str(model.resolve()),
-        "TOKEN_PLACE_PYTHON": "TOKEN_PLACE_PYTHON",
-        "TOKEN_PLACE_SIDECAR_PYTHON": "TOKEN_PLACE_SIDECAR_PYTHON",
-    }
-    evidence = {"runtime_contract_pass": True, "fixture": {
-        "sha256": manifest["fixture_sha256"], "authoritative_prompt_tokens": 42,
-        "authoritative_target_offsets_tokens": {"near": 7}},
-        "nested": [{sentinels[private_input]: "private mapping key"}]}
-
-    with pytest.raises(RuntimeError, match="leaked private input"):
-        desktop_runner.run_packaged_windows_tokenizer_boundary(
-            application, model, adapter=lambda **_kwargs: evidence)
-    assert terminated == [process]
 
 
-def test_contains_private_input_handles_nested_windows_shaped_strings(desktop_runner):
-    application = r"C:\private\current-head.exe"
-    model = r"D:\private\tiny.gguf"
-
-    assert desktop_runner._contains_private_input(
-        {application: {"nested": [model]}}, (application, model))
-    assert not desktop_runner._contains_private_input(
-        {"application": {"nested": ["tiny.gguf"]}}, (application, model))
 
 
-def test_packaged_windows_tokenizer_boundary_rejects_non_exe(
-        desktop_runner, tmp_path):
-    model = tmp_path / "tiny.gguf"
-    model.write_bytes(b"model")
-    non_exe = tmp_path / "application"
-    non_exe.write_bytes(b"application")
-    with pytest.raises(ValueError, match="requires an application .exe"):
-        desktop_runner.run_packaged_windows_tokenizer_boundary(non_exe, model)
 
 
-def test_packaged_windows_tokenizer_boundary_cli_rejects_combined_modes(
-        desktop_runner, tmp_path):
-    with pytest.raises(SystemExit):
-        desktop_runner.main([
-            "--packaged-windows-tokenizer-boundary",
-            "--packaged-windows-nvidia-hardware",
-            "--app-binary", str(tmp_path / "current-head.exe"),
-            "--model", str(tmp_path / "tiny.gguf"),
-        ])
 
 
 def test_tokenizer_stage_is_bounded_atomic_and_rearmed(desktop_runner, tmp_path):

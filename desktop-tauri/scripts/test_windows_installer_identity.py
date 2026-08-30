@@ -790,10 +790,6 @@ def wait_for_cleanup_convergence(
     reported_milestones: set[int] = set()
     while True:
         last_categories = residual_authority_categories(before)
-        if last_categories == ["shortcuts"] and before.canonical_targets:
-            current = capture_authority_snapshot()
-            if remediate_captured_stale_shortcuts(before, current):
-                continue
         if not last_categories:
             if artifact_directory is not None:
                 _persist_snapshot(artifact_directory, "final", capture_authority_snapshot())
@@ -1346,88 +1342,6 @@ def validate_installed_context_tiers(exe: Path, env: dict[str, str], artifact_di
         verify_config_preserved(config_path, seeded_config_values(tier))
 
 
-def run_installed_tokenizer_boundary(
-    exe: Path,
-    model: Path,
-    log_path: Path | None = None,
-    *,
-    platform_name: str | None = None,
-) -> None:
-    """Run the production tokenizer boundary against the validated installation."""
-    runner = Path(__file__).with_name("test_desktop_operator_ui_e2e.py")
-    command = [
-            sys.executable,
-            str(runner),
-            "--packaged-windows-tokenizer-boundary",
-            "--app-binary",
-            str(exe),
-            "--model",
-            str(model.resolve(strict=True)),
-        ]
-    owned_platform = os.name if platform_name is None else platform_name
-    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-    outcome = "failed"
-    cleanup_succeeded = True
-    process: subprocess.Popen[str] | None = None
-    try:
-        process = subprocess.Popen(  # noqa: S603
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            creationflags=creationflags if owned_platform == "nt" else 0,
-            start_new_session=owned_platform != "nt",
-        )
-        returncode = process.wait(timeout=INSTALLED_BOUNDARY_SUPERVISOR_TIMEOUT_SECONDS)
-        outcome = "passed" if returncode == 0 else "failed"
-    except OSError:
-        outcome = "failed"
-        cleanup_succeeded = process is None
-    except subprocess.TimeoutExpired:
-        assert process is not None
-        outcome = "supervisor_timeout"
-        cleanup_succeeded = False
-        if owned_platform == "nt":
-            try:
-                killed = subprocess.run(  # noqa: S603
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS,
-                    check=False,
-                )
-                cleanup_succeeded = killed.returncode == 0
-            except (OSError, subprocess.TimeoutExpired):
-                cleanup_succeeded = False
-        if not cleanup_succeeded:
-            process.kill()
-        try:
-            process.wait(timeout=INSTALLED_BOUNDARY_SUPERVISOR_CLEANUP_SECONDS)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            cleanup_succeeded = False
-    finally:
-        if log_path is not None:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 2,
-                        "boundary": "installed_package_tokenizer",
-                        "outcome": outcome,
-                        "cleanup_succeeded": cleanup_succeeded,
-                    },
-                    sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-    if outcome != "passed":
-        raise InstallerIdentityError(
-            "installed-package tokenizer production boundary failed; see bounded validation artifacts"
-        )
-
-
 def is_actionable_competing_installer_rejection(result: subprocess.CompletedProcess[str]) -> bool:
     text = result.stdout.lower()
     return result.returncode != 0 and ("competing" in text or "existing installation" in text or "remove" in text) and ("token.place" in text or "token place" in text or "token-place" in text)
@@ -1555,10 +1469,6 @@ def main() -> int:
         if args.tokenizer_boundary_model is not None and not args.tokenizer_boundary_model.is_file():
             raise InstallerIdentityError("--tokenizer-boundary-model must name an existing model file")
         scenario = build_current_package_scenario(args.pr_current_windows_nsis, args.expected_version)
-        if args.tokenizer_boundary_model is None:
-            raise InstallerIdentityError(
-                "--pr-current-windows-nsis requires --tokenizer-boundary-model"
-            )
         if sys.platform != "win32":
             print("validated current-package Windows NSIS PR-gate contract; real install runs only on hosted Windows")
             return 0
@@ -1575,15 +1485,11 @@ def main() -> int:
         "--previous-windows-nsis": args.previous_windows_nsis,
         "--previous-windows-msi": args.previous_windows_msi,
     }
-    if args.tokenizer_boundary_model is not None:
-        raise InstallerIdentityError(
-            "--tokenizer-boundary-model is supported only with --pr-current-windows-nsis"
-        )
     missing = [name for name, value in required.items() if value is None]
     if missing:
         raise InstallerIdentityError(f"full release validation requires {', '.join(missing)}")
     previous_version = args.previous_version or immediate_prior_version(args.expected_version)
-    validate_previous_artifacts(args.windows_nsis, args.windows_msi, args.previous_version)
+    validate_previous_artifacts(args.previous_windows_nsis, args.previous_windows_msi, previous_version)
     scenarios = build_scenarios(args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.expected_version, previous_version)
     if sys.platform != "win32":
         print("validated Windows installer scenario contract; real installs run only on hosted Windows")

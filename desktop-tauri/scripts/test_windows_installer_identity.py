@@ -742,6 +742,39 @@ def verify_authority_removed(before: AuthoritySnapshot) -> None:
         raise InstallerIdentityError(f"authority remains after uninstall: {', '.join(categories)}")
 
 
+def remediate_captured_stale_shortcuts(before: AuthoritySnapshot, current: AuthoritySnapshot) -> bool:
+    """Remove only unchanged, captured shortcuts whose installed targets are gone."""
+    captured_targets = {_canonical_path(target) for target in before.canonical_targets}
+    captured_pairs = {
+        (_canonical_path(shortcut.path), _canonical_path(shortcut.target))
+        for shortcut in before.shortcuts.shortcuts
+    }
+    if not captured_targets or not captured_pairs:
+        return False
+    if any(_canonical_path(shortcut.target) not in captured_targets for shortcut in before.shortcuts.shortcuts):
+        return False
+    if current.registry or not current.shortcuts.shortcuts:
+        return False
+    if any(target.exists() for target in before.canonical_targets):
+        return False
+    if _processes_running_targets(before.canonical_targets):
+        return False
+
+    for shortcut in current.shortcuts.shortcuts:
+        pair = (_canonical_path(shortcut.path), _canonical_path(shortcut.target))
+        if not shortcut.path.exists() or shortcut.target.exists() or pair not in captured_pairs:
+            return False
+
+    for shortcut in current.shortcuts.shortcuts:
+        try:
+            shortcut.path.unlink()
+        except OSError as exc:
+            raise InstallerIdentityError(f"failed to remove captured stale shortcut: {shortcut.path}") from exc
+        if shortcut.path.exists():
+            raise InstallerIdentityError(f"captured stale shortcut remains after unlink: {shortcut.path}")
+    return True
+
+
 def wait_for_cleanup_convergence(
     before: AuthoritySnapshot,
     *,
@@ -762,6 +795,10 @@ def wait_for_cleanup_convergence(
                 _persist_snapshot(artifact_directory, "final", capture_authority_snapshot())
             print(f"cleanup converged after {monotonic() - started:.1f}s; residual authority: none")
             return
+        if last_categories == ["shortcuts"]:
+            current = capture_authority_snapshot()
+            if remediate_captured_stale_shortcuts(before, current):
+                continue
         now = monotonic()
         elapsed = now - started
         for milestone in (0, 20, 60, 90):

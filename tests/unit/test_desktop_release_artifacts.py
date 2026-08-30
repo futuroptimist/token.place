@@ -4523,6 +4523,7 @@ def test_windows_installer_identity_cleanup_polling_converges_without_sleeping_r
         return now['value']
 
     monkeypatch.setattr(guard, 'residual_authority_categories', fake_residual)
+    monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: snapshot)
     guard.wait_for_cleanup_convergence(
         snapshot,
         deadline_seconds=2,
@@ -4531,6 +4532,113 @@ def test_windows_installer_identity_cleanup_polling_converges_without_sleeping_r
         sleeper=sleeps.append,
     )
     assert sleeps == [0.25, 0.25]
+
+
+def _shortcut_snapshot(guard, shortcut, *, target_captured=True, registry=None):
+    return guard.AuthoritySnapshot(
+        guard.ShortcutInventory(
+            [shortcut],
+            [shortcut.target] if target_captured else [],
+            [] if target_captured else [shortcut.target],
+        ),
+        registry or [],
+    )
+
+
+def test_windows_installer_identity_cleanup_remediates_exact_captured_stale_shortcut_and_reinventories(
+    monkeypatch, tmp_path
+) -> None:
+    guard = _load_windows_installer_identity()
+    target = tmp_path / 'installed' / 'token.place.exe'
+    target.parent.mkdir()
+    target.write_text('exe', encoding='utf-8')
+    shortcut = guard.Shortcut(tmp_path / 'token.place desktop.lnk', target)
+    shortcut.path.write_text('shortcut', encoding='utf-8')
+    before = _shortcut_snapshot(guard, shortcut)
+    target.unlink()
+    current = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [], [target]), [])
+    categories = iter([['shortcuts'], []])
+    captures = []
+
+    monkeypatch.setattr(guard, 'residual_authority_categories', lambda snapshot: next(categories))
+    monkeypatch.setattr(guard, 'capture_authority_snapshot', lambda: captures.append(current) or current)
+    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [])
+
+    guard.wait_for_cleanup_convergence(before, sleeper=lambda _: pytest.fail('remediation should not sleep'))
+
+    assert not shortcut.path.exists()
+    assert captures == [current]
+
+
+@pytest.mark.parametrize('refusal', ['missing_capture', 'registry', 'live_target', 'process', 'foreign', 'retargeted'])
+def test_windows_installer_identity_cleanup_refuses_unsafe_shortcut_remediation(monkeypatch, tmp_path, refusal) -> None:
+    guard = _load_windows_installer_identity()
+    target = tmp_path / 'installed' / 'token.place.exe'
+    target.parent.mkdir()
+    target.write_text('exe', encoding='utf-8')
+    captured = guard.Shortcut(tmp_path / 'token.place desktop.lnk', target)
+    captured.path.write_text('shortcut', encoding='utf-8')
+    before = _shortcut_snapshot(guard, captured, target_captured=refusal != 'missing_capture')
+    if refusal != 'live_target':
+        target.unlink()
+    remaining = captured
+    if refusal == 'foreign':
+        remaining = guard.Shortcut(tmp_path / 'foreign.lnk', target)
+        remaining.path.write_text('foreign', encoding='utf-8')
+    elif refusal == 'retargeted':
+        remaining = guard.Shortcut(captured.path, tmp_path / 'other.exe')
+    registry = [guard.RegistryEntry('key', 'token.place', '', '', False, '')] if refusal == 'registry' else []
+    current = guard.AuthoritySnapshot(guard.ShortcutInventory([remaining], [], [remaining.target]), registry)
+    monkeypatch.setattr(
+        guard,
+        '_processes_running_targets',
+        lambda targets: ['running'] if refusal == 'process' else [],
+    )
+
+    assert guard.remediate_captured_stale_shortcuts(before, current) is False
+    assert remaining.path.exists()
+
+
+def test_windows_installer_identity_cleanup_refuses_new_shortcut_mixed_with_capture(monkeypatch, tmp_path) -> None:
+    guard = _load_windows_installer_identity()
+    target = tmp_path / 'token.place.exe'
+    target.write_text('exe', encoding='utf-8')
+    captured = guard.Shortcut(tmp_path / 'captured.lnk', target)
+    captured.path.write_text('captured', encoding='utf-8')
+    before = _shortcut_snapshot(guard, captured)
+    target.unlink()
+    foreign = guard.Shortcut(tmp_path / 'new.lnk', target)
+    foreign.path.write_text('new', encoding='utf-8')
+    current = guard.AuthoritySnapshot(guard.ShortcutInventory([captured, foreign], [], [target]), [])
+    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [])
+
+    assert guard.remediate_captured_stale_shortcuts(before, current) is False
+    assert captured.path.exists()
+    assert foreign.path.exists()
+
+
+@pytest.mark.parametrize('unlink_mode', ['raises', 'persists'])
+def test_windows_installer_identity_cleanup_unlink_failure_names_exact_shortcut(
+    monkeypatch, tmp_path, unlink_mode
+) -> None:
+    guard = _load_windows_installer_identity()
+    target = tmp_path / 'token.place.exe'
+    target.write_text('exe', encoding='utf-8')
+    shortcut = guard.Shortcut(tmp_path / 'token.place desktop.lnk', target)
+    shortcut.path.write_text('shortcut', encoding='utf-8')
+    before = _shortcut_snapshot(guard, shortcut)
+    target.unlink()
+    current = guard.AuthoritySnapshot(guard.ShortcutInventory([shortcut], [], [target]), [])
+    monkeypatch.setattr(guard, '_processes_running_targets', lambda targets: [])
+
+    if unlink_mode == 'raises':
+        monkeypatch.setattr(guard.Path, 'unlink', lambda self: (_ for _ in ()).throw(PermissionError('denied')))
+    else:
+        monkeypatch.setattr(guard.Path, 'unlink', lambda self: None)
+
+    with pytest.raises(guard.InstallerIdentityError) as exc_info:
+        guard.remediate_captured_stale_shortcuts(before, current)
+    assert str(shortcut.path) in str(exc_info.value)
 
 
 def test_windows_installer_identity_cleanup_polling_reports_residual_categories(monkeypatch) -> None:

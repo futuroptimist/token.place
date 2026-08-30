@@ -1482,6 +1482,161 @@ describe('desktop app start failure handling', () => {
     vi.useRealTimers();
   });
 
+  it('reconciles authoritative terminal failure and ignores late completion', async () => {
+    let statusCalls = 0;
+    let resolveStart: () => void = () => {};
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'previous-session',
+            sequence: 8,
+          });
+        }
+        if (statusCalls === 2) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'previous-session',
+            sequence: 9,
+            worker_state: 'failed',
+            relay_runtime_state: 'failed',
+            last_error: 'stale failure',
+          });
+        }
+        if (statusCalls === 3) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'current-session',
+            sequence: 2,
+            worker_state: 'starting',
+            relay_runtime_state: 'starting',
+            warm_load_state: 'warming',
+          });
+        }
+        if (statusCalls === 4) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'current-session',
+            sequence: 1,
+            worker_state: 'failed',
+            relay_runtime_state: 'failed',
+            last_error: 'regressive failure',
+          });
+        }
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: 3,
+          worker_state: 'failed',
+          relay_runtime_state: 'failed',
+          warm_load_state: 'failed',
+          last_worker_error_code: 'warm_load_failed',
+          last_error: 'warm load failed',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise<void>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startButton);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750);
+    });
+
+    expect(statusCalls).toBe(5);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Worker state:/).textContent).toContain('failed');
+    expect(screen.getByText(/Last worker error code:/).textContent).toContain('warm_load_failed');
+    expect(screen.getByText(/Last error:/).textContent).toContain('warm load failed');
+    expect(startButton.disabled).toBe(false);
+    const callsAfterFailure = statusCalls;
+
+    await act(async () => {
+      resolveStart();
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(statusCalls).toBe(callsAfterFailure);
+    expect(startButton.disabled).toBe(false);
+  });
+
+  it('stops operator during warm load after authoritative ownership', async () => {
+    let statusCalls = 0;
+    let stopCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return Promise.resolve({ running: false, registered: false });
+        }
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: statusCalls - 1,
+          worker_state: 'starting',
+          relay_runtime_state: 'starting',
+          runtime_provisioning_state: 'provisioning',
+          warm_load_state: 'warming',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      if (command === 'stop_compute_node') {
+        stopCalls += 1;
+        return Promise.resolve(undefined);
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    const stopButton = (await screen.findByText('Stop operator')) as HTMLButtonElement;
+    const relayInput = screen.getByLabelText('Relay URL 1') as HTMLInputElement;
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+    expect(stopButton.disabled).toBe(true);
+    vi.useFakeTimers();
+    fireEvent.click(startButton);
+    expect(stopButton.disabled).toBe(true);
+
+    await act(async () => Promise.resolve());
+
+    expect(stopButton.disabled).toBe(false);
+    expect(startButton.disabled).toBe(true);
+    expect(relayInput.disabled).toBe(true);
+    const callsBeforeStop = statusCalls;
+    fireEvent.click(stopButton);
+    await act(async () => Promise.resolve());
+
+    expect(stopCalls).toBe(1);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Worker state:/).textContent).toContain('stopped');
+    expect(startButton.disabled).toBe(false);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(statusCalls).toBe(callsBeforeStop);
+    expect(stopCalls).toBe(1);
+  });
+
   it('continues reconciling the active start after ten seconds', async () => {
     let statusCalls = 0;
     invokeMock.mockImplementation((command: string) => {

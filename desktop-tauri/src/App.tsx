@@ -926,6 +926,14 @@ function mergeAuthoritativeNonRunningStatus(
     return prev;
   }
 
+  const terminalType = authoritativeTerminalNonRunningType(payload);
+  if (terminalType !== null) {
+    const mergeBase = isReplacementSession
+      ? { ...prev, operator_session_id: null, sequence: null }
+      : prev;
+    return mergeComputeStatusEvent(mergeBase, { ...payload, type: terminalType });
+  }
+
   return {
     ...prev,
     operator_session_id: payloadSession,
@@ -946,6 +954,49 @@ function mergeAuthoritativeNonRunningStatus(
       prev.native_startup_failure_category
     ),
   };
+}
+
+function authoritativeTerminalNonRunningType(
+  payload: Record<string, unknown>
+): 'error' | 'stopped' | null {
+  if (payload.running !== false) {
+    return null;
+  }
+  if (payload.worker_state === 'failed' && payload.relay_runtime_state === 'failed') {
+    return 'error';
+  }
+  if (
+    payload.worker_state === 'stopped' &&
+    payload.relay_runtime_state === 'stopped' &&
+    payload.warm_load_state === 'stopped'
+  ) {
+    return 'stopped';
+  }
+  return null;
+}
+
+function canStopOwnedComputeNodeStart(
+  status: ComputeNodeStatus,
+  isStarting: boolean,
+  priorSessionId: string | null
+): boolean {
+  if (status.running) {
+    return true;
+  }
+  if (
+    !isStarting ||
+    status.operator_session_id === null ||
+    status.operator_session_id === priorSessionId ||
+    authoritativeTerminalNonRunningType(status as unknown as Record<string, unknown>) !== null
+  ) {
+    return false;
+  }
+  return (
+    status.worker_state === 'starting' ||
+    status.worker_state === 'provisioning' ||
+    status.runtime_provisioning_state === 'provisioning' ||
+    status.warm_load_state === 'warming'
+  );
 }
 
 function mergeAuthoritativeComputeStatus(
@@ -1248,6 +1299,11 @@ export function App() {
     () => computeStatus.running || operatorControlsDisabled,
     [computeStatus.running, operatorControlsDisabled]
   );
+  const canStopComputeNode = canStopOwnedComputeNodeStart(
+    computeStatus,
+    isStartingComputeNode,
+    computeNodePriorSessionRef.current
+  ) && !isStoppingComputeNode;
   const canChangeContextTier = useMemo(
     () => isStoppedOrIdleOperatorStatus(computeStatus, isStartingComputeNode, isStoppingComputeNode),
     [computeStatus, isStartingComputeNode, isStoppingComputeNode]
@@ -1417,6 +1473,17 @@ export function App() {
             if (next !== previous) {
               computeStatusRef.current = next;
               setComputeStatus(next);
+            }
+            const terminalType = authoritativeTerminalNonRunningType(
+              snapshot as Record<string, unknown>
+            );
+            if (next !== previous && terminalType !== null) {
+              cancelComputeNodeReconciliation();
+              setIsStartingComputeNode(false);
+              if (terminalType === 'error' && next.last_error) {
+                setError(next.last_error);
+              }
+              return;
             }
             if (next.running) {
               computeNodePriorSessionRef.current = null;
@@ -1695,7 +1762,7 @@ export function App() {
         <div style={{ display: 'flex', gap: 8 }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
           <button
-            disabled={!computeStatus.running || operatorControlsDisabled}
+            disabled={!canStopComputeNode}
             onClick={stopComputeNode}
           >
             Stop operator

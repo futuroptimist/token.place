@@ -9,7 +9,7 @@ run multi-minute inference.
 
 Physical packaged-runtime mode is intentionally fail-closed. Run it only on a machine with:
 
-- a built or installed token.place desktop application at version `0.1.16`;
+- a built or installed token.place desktop application at version `0.1.17`;
 - the existing pinned `llama_cpp_python==0.3.32` packaged runtime;
 - Qwen3 8B Q4_K_M or another explicitly recorded local model artifact;
 - macOS Apple Silicon with Metal or Windows with NVIDIA/CUDA for GPU validation, with CPU only where
@@ -77,7 +77,7 @@ the subprocess boundary and are orchestration evidence, never physical Metal/CUD
 
 This #1566 physical-validation follow-up to #1631 and #1634 does not claim Windows/CUDA success from
 unit tests. After merge, rerun the same one-cell Windows/CUDA `small-8k` / `single-needle` /
-`64k-full` physical gate against unchanged desktop `0.1.16` and `llama_cpp_python==0.3.32` before
+`64k-full` physical gate against unchanged desktop `0.1.17` and `llama_cpp_python==0.3.32` before
 attempting `8k-fast` classification or the six-cell matrix. Physical macOS/Metal validation also
 remains outstanding.
 
@@ -385,7 +385,7 @@ unchanged worker session, restart failure, and malformed evidence are runtime-co
 `--report-only` cannot suppress them.
 
 The command above is the genuine-hardware procedure. It was not executed during development of
-this harness change; a packaged 0.1.16 application, model, relay, and supported hardware are
+this harness change; a packaged 0.1.17 application, model, relay, and supported hardware are
 required before recording physical evidence.
 
 ## Physical process-tree memory
@@ -474,7 +474,7 @@ git diff --check
 ```
 
 Physical Metal/CUDA validation is manual and should attach only sanitized reports to #1566, #1608,
-or downstream validation. Do not claim 0.1.16 release validation or general semantic correctness
+or downstream validation. Do not claim 0.1.17 release validation or general semantic correctness
 from a report-only baseline.
 
 ### Qwen 64K KV allocation diagnostics

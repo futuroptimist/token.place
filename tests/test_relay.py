@@ -1776,12 +1776,7 @@ def test_relay_diagnostics_separates_legacy_from_api_v1_compute_node_count(clien
     """Diagnostics should expose an API v1-eligible count for landing chat capacity."""
     api_v1_server_key = _server_key("diagnostics-api-v1-usable")
     legacy_server_key = _server_key("diagnostics-legacy-only")
-    known_servers[api_v1_server_key] = {
-        "public_key": api_v1_server_key,
-        "last_ping": datetime.now(),
-        "last_ping_duration": 10,
-        relay_module.API_V1_SERVER_MARKER: True,
-    }
+    _register_api_v1_server(client, api_v1_server_key)
     known_servers[legacy_server_key] = {
         "public_key": legacy_server_key,
         "last_ping": datetime.now(),

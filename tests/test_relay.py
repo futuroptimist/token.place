@@ -2424,24 +2424,18 @@ def test_streaming_state_lifecycle(client):
 
 
 def test_api_v1_relay_route_contract_e2ee_flow(client):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
-    register = client.post('/api/v1/relay/servers/register', json=server_payload)
-    assert register.status_code == 200
-
-    request_payload = {
-        'request_id': 'req-123',
-        'protocol': 'tokenplace_api_v1_relay_e2ee',
-        'version': 1,
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'server_public_key': DUMMY_SERVER_PUB_KEY,
-        'chat_history': 'ciphertext-request',
-        'cipherkey': 'cipherkey-request',
-        'iv': 'iv-request',
-    }
+    server_payload = _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=_capabilities("8k-fast"),
+    )
+    request_payload = _api_v1_request_payload('req-123')
     queued = client.post('/api/v1/relay/requests', json=request_payload)
     assert queued.status_code == 200
+    retrieval_credential = queued.get_json()['retrieval_credential']
+    assert retrieval_credential
 
-    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
     assert poll.status_code == 200
     polled_payload = poll.get_json()
     assert polled_payload['chat_history'] == 'ciphertext-request'
@@ -2451,20 +2445,23 @@ def test_api_v1_relay_route_contract_e2ee_flow(client):
     assert polled_payload['request_id'] == 'req-123'
     assert polled_payload['protocol'] == 'tokenplace_api_v1_relay_e2ee'
     assert polled_payload['version'] == 1
+    claim_generation = polled_payload['claim_generation']
+    assert isinstance(claim_generation, int)
 
-    response_payload = {
-        'request_id': 'req-123',
-        'protocol': 'tokenplace_api_v1_relay_e2ee',
-        'version': 1,
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'chat_history': 'ciphertext-response',
-        'cipherkey': 'cipherkey-response',
-        'iv': 'iv-response',
-    }
+    response_payload = _api_v1_response_payload(
+        'req-123',
+        server_public_key=DUMMY_SERVER_PUB_KEY,
+        control_credential=server_payload['control_credential'],
+        claim_generation=claim_generation,
+    )
     source = client.post('/api/v1/relay/responses', json=response_payload)
     assert source.status_code == 200
 
-    retrieved = client.post('/api/v1/relay/responses/retrieve', json={'client_public_key': DUMMY_CLIENT_PUB_KEY})
+    retrieved = client.post('/api/v1/relay/responses/retrieve', json={
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'request_id': 'req-123',
+        'retrieval_credential': retrieval_credential,
+    })
     assert retrieved.status_code == 200
     retrieved_payload = retrieved.get_json()
     assert retrieved_payload['chat_history'] == 'ciphertext-response'

@@ -1844,17 +1844,11 @@ def test_relay_diagnostics_evicts_stale_compute_nodes_before_counting(client, mo
     monkeypatch.setenv("TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS", "1")
     live_server_key = _server_key("diagnostics-live")
     stale_server_key = _server_key("diagnostics-stale")
-    known_servers[live_server_key] = {
-        "public_key": live_server_key,
-        "last_ping": datetime.now(),
-        "last_ping_duration": 10,
-        relay_module.API_V1_SERVER_MARKER: True,
-    }
+    _register_api_v1_server(client, live_server_key)
     known_servers[stale_server_key] = {
         "public_key": stale_server_key,
         "last_ping": datetime.now() - timedelta(seconds=5),
         "last_ping_duration": 1,
-        relay_module.API_V1_SERVER_MARKER: True,
     }
 
     response = client.get("/relay/diagnostics")

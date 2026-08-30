@@ -809,8 +809,10 @@ def test_api_v1_missing_capabilities_are_not_qwen_capable(client):
     payload = response.get_json()
 
     assert response.status_code == 503
-    assert payload["error"]["code"] == "no_matching_compute_node"
-    assert payload["error"]["requested_model"] == "qwen3-8b-instruct"
+    assert payload["error"] == {
+        "code": "no_available_capacity",
+        "message": "No compatible compute node is available",
+    }
 
 
 def test_api_v1_selection_resolves_old_llama_alias_to_qwen_and_skips_stale_llama_nodes(client):

@@ -112,6 +112,7 @@ def test_maintenance_gauges_use_single_multiprocess_snapshot(tmp_path) -> None:
     env.update(
         {
             "PROMETHEUS_MULTIPROC_DIR": str(multiprocess_dir),
+            "TOKENPLACE_IMAGE_TAG": "sha-deadbee",
             "TOKENPLACE_METRICS_TOKEN": token,
         }
     )
@@ -214,8 +215,29 @@ with relay.app.test_client() as client:
         "version",
         "revision",
     }
+    assert by_name["tokenplace_build_info"][0].labels == {
+        "version": "sha-deadbee",
+        "revision": "sha-deadbee",
+    }
     for name in names - {"tokenplace_build_info"}:
         assert by_name[name][0].labels == {}
+
+
+@pytest.mark.parametrize("image_tag", [None, ""])
+def test_build_info_labels_fall_back_to_release_metadata(
+    monkeypatch, image_tag
+) -> None:
+    if image_tag is None:
+        monkeypatch.delenv("TOKENPLACE_IMAGE_TAG", raising=False)
+    else:
+        monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", image_tag)
+    monkeypatch.setattr(
+        relay,
+        "get_release_metadata",
+        lambda _root: {"version": "0.1.1", "ref": "sha-release"},
+    )
+
+    assert relay._get_build_info_labels() == ("0.1.1", "sha-release")
 
 
 def test_compute_node_gauges_follow_api_v1_lease_semantics(relay_client) -> None:

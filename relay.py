@@ -443,13 +443,22 @@ COMPUTE_NODES_HEALTHY = _get_gauge(
     "Healthy API v1 compute nodes under the relay lease semantics.",
 )
 
+
+def _get_build_info_labels() -> tuple[str, str]:
+    """Return the immutable deployment tag, falling back to release metadata."""
+
+    image_tag = os.environ.get("TOKENPLACE_IMAGE_TAG")
+    if image_tag:
+        return image_tag, image_tag
+
+    build_metadata = get_release_metadata(None)
+    version = build_metadata.get("version", "dev")
+    return version, build_metadata.get("ref") or version
+
+
 try:
     INSTRUMENTATION_UP.set(0)
-    BUILD_METADATA = get_release_metadata(None)
-    BUILD_INFO.labels(
-        BUILD_METADATA.get("version", "dev"),
-        BUILD_METADATA.get("ref") or BUILD_METADATA.get("version", "dev"),
-    ).set(1)
+    BUILD_INFO.labels(*_get_build_info_labels()).set(1)
     INSTRUMENTATION_UP.set(1)
 except Exception:  # pragma: no cover - defensive instrumentation initialization
     LOGGER.error("metrics.initialization_failed", extra={"reason": "initialization_failed"})

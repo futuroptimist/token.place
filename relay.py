@@ -443,15 +443,12 @@ COMPUTE_NODES_HEALTHY = _get_gauge(
     "Healthy API v1 compute nodes under the relay lease semantics.",
 )
 
-_MAX_BUILD_INFO_LABEL_LENGTH = 80
-
 
 def _get_build_info_labels() -> tuple[str, str]:
     """Return the immutable deployment tag, falling back to release metadata."""
 
-    image_tag = os.environ.get("TOKENPLACE_IMAGE_TAG", "").strip()
+    image_tag = os.environ.get("TOKENPLACE_IMAGE_TAG")
     if image_tag:
-        image_tag = image_tag[:_MAX_BUILD_INFO_LABEL_LENGTH]
         return image_tag, image_tag
 
     build_metadata = get_release_metadata(None)

@@ -223,7 +223,7 @@ with relay.app.test_client() as client:
         assert by_name[name][0].labels == {}
 
 
-@pytest.mark.parametrize("image_tag", [None, "", " \t\n"])
+@pytest.mark.parametrize("image_tag", [None, ""])
 def test_build_info_labels_fall_back_to_release_metadata(
     monkeypatch, image_tag
 ) -> None:
@@ -238,21 +238,6 @@ def test_build_info_labels_fall_back_to_release_metadata(
     )
 
     assert relay._get_build_info_labels() == ("0.1.1", "sha-release")
-
-
-@pytest.mark.parametrize(
-    ("image_tag", "expected"),
-    [
-        ("  sha-deadbee\n", "sha-deadbee"),
-        ("sha-" + "a" * 100, "sha-" + "a" * 76),
-    ],
-)
-def test_build_info_labels_strip_and_bound_image_tag(
-    monkeypatch, image_tag, expected
-) -> None:
-    monkeypatch.setenv("TOKENPLACE_IMAGE_TAG", image_tag)
-
-    assert relay._get_build_info_labels() == (expected, expected)
 
 
 def test_compute_node_gauges_follow_api_v1_lease_semantics(relay_client) -> None:

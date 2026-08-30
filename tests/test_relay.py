@@ -2606,30 +2606,32 @@ def test_api_v1_response_retrieve_matches_request_id_without_dropping_other_resp
 
 
 def test_api_v1_response_retrieve_returns_pending_for_known_request_id(client):
-    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=_capabilities('8k-fast'),
+    )
     queued = client.post(
         '/api/v1/relay/requests',
-        json={
-            'request_id': 'req-pending',
-            'client_public_key': DUMMY_CLIENT_PUB_KEY,
-            'server_public_key': DUMMY_SERVER_PUB_KEY,
-            'chat_history': 'ciphertext-request',
-            'cipherkey': 'cipherkey-request',
-            'iv': 'iv-request',
-            'protocol': 'tokenplace_api_v1_relay_e2ee',
-            'version': 1,
-        },
+        json=_api_v1_request_payload('req-pending'),
     )
     assert queued.status_code == 200
+    queued_payload = queued.get_json()
+    retrieval_credential = queued_payload['retrieval_credential']
+    assert retrieval_credential
 
     pending = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-pending'},
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-pending',
+            'retrieval_credential': retrieval_credential,
+        },
     )
     assert pending.status_code == 202
     pending_payload = pending.get_json()
     assert pending_payload['status'] == 'pending'
-    assert 0 < pending_payload['request_deadline_remaining_seconds'] <= queued.get_json()['request_ttl_seconds']
+    assert 0 < pending_payload['request_deadline_remaining_seconds'] <= queued_payload['request_ttl_seconds']
     assert pending_payload['request_ttl_seconds'] == pending_payload['request_deadline_remaining_seconds']
 
 

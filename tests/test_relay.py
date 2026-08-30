@@ -856,26 +856,27 @@ def test_api_v1_selection_reports_bounded_capacity_for_saturated_node(client):
     }
 
 
-def test_api_v1_filtered_round_robin_key_ignores_load_score_changes(client):
+def test_api_v1_round_robin_progress_survives_equal_authoritative_load_changes(client):
     a = _server_key("rr-load-a")
     b = _server_key("rr-load-b")
-    capabilities = _capabilities("8k-fast", ["model-a"])
+    capabilities = _capabilities("8k-fast", ["model-a", "qwen3-8b-instruct"])
     capabilities["max_concurrency"] = 4
     _register_api_v1_server_with_capabilities(client, a, dict(capabilities))
     _register_api_v1_server_with_capabilities(client, b, dict(capabilities))
 
-    assert client.get("/api/v1/relay/servers/next?model=model-a").status_code == 200
-    keys_after_idle_selection = set(relay_module.api_v1_filtered_round_robin_next_positions)
-    known_servers[a]["api_v1_in_flight_requests"] = {
-        "req-in-flight": {"expires_at": time.monotonic() + 60, "client_public_key": DUMMY_CLIENT_PUB_KEY}
-    }
-    known_servers[b]["api_v1_in_flight_requests"] = {
-        "req-in-flight": {"expires_at": time.monotonic() + 60, "client_public_key": DUMMY_CLIENT_PUB_KEY}
-    }
+    first = client.get("/api/v1/relay/servers/next?model=model-a")
+    assert first.status_code == 200
+    assert first.get_json()["server_public_key"] == a
 
-    assert client.get("/api/v1/relay/servers/next?model=model-a").status_code == 200
+    _queue_api_v1_request(client, server_public_key=a, request_id="rr-load-a")
+    _queue_api_v1_request(client, server_public_key=b, request_id="rr-load-b")
 
-    assert set(relay_module.api_v1_filtered_round_robin_next_positions) == keys_after_idle_selection
+    second = client.get("/api/v1/relay/servers/next?model=model-a")
+    third = client.get("/api/v1/relay/servers/next?model=model-a")
+    assert second.status_code == 200
+    assert second.get_json()["server_public_key"] == b
+    assert third.status_code == 200
+    assert third.get_json()["server_public_key"] == a
 
 
 def test_api_v1_filtered_round_robin_is_stable_across_alternating_filters(client):

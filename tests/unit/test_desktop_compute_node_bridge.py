@@ -104,7 +104,8 @@ def test_headless_boundary_requires_exact_authoritative_evidence(monkeypatch):
 
 def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
                                 evidence_valid=True, mock_runtime=False,
-                                load_exception=None, cleanup_exception=None):
+                                load_exception=None, cleanup_exception=None,
+                                report_readiness_failure=True):
     """Install a minimal runtime double while retaining the real evidence validator."""
     model = tmp_path / "model.gguf"
     model.write_bytes(b"fixture")
@@ -134,6 +135,8 @@ def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
         use_mock_llm = mock_runtime
         llm = None
         last_compute_diagnostics = {}
+        last_runtime_init_error = "PRIVATE runtime path and raw exception"
+        model_profile = {"provider": "qwen", "chat_template_policy": "gguf-jinja"}
 
         @staticmethod
         def _close_llm_proxy(_loaded):
@@ -144,13 +147,21 @@ def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
             self.model_manager = Manager()
 
         def ensure_api_v1_runtime_ready(self):
+            manager = self.model_manager
+            assert manager.headless_admission_fixture is True
+            assert manager.model_path == os.path.abspath(model)
+            assert manager.model_profile["provider"] == "headless-admission-fixture"
+            assert manager.model_profile["chat_template_policy"] == "headless-plain-chat"
             if load_exception:
                 raise load_exception
             self.model_manager.last_compute_diagnostics = {
-                "api_v1_readiness_result": "passed" if ready else "failed",
                 "api_v1_readiness_tokenizer_render_bridge_available": ready,
                 "api_v1_readiness_prompt_tokens": 7,
             }
+            if ready or report_readiness_failure:
+                self.model_manager.last_compute_diagnostics[
+                    "api_v1_readiness_result"
+                ] = "passed" if ready else "failed"
             if ready:
                 with open(os.environ[
                     "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"
@@ -203,6 +214,38 @@ def test_headless_cpu_admission_runtime_outcomes(
         "cleanup_completed" if expected_exit == 0 else
         "warm_load_completed" if expected_exit == 6 else
         "runtime_identity_validated")
+
+
+def test_headless_cpu_admission_false_readiness_does_not_write_diag_sidecar(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, ready=False, report_readiness_failure=False)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 5
+
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[-1]["failure_code"] == "warm_load_failed"
+    assert not (tmp_path / "tokenplace-headless-diag.txt").exists()
+
+
+def test_headless_cpu_admission_uses_process_temp_storage(
+        monkeypatch, tmp_path, capsys):
+    """Readable model inputs do not require writable parent directories."""
+    args = _configure_headless_runtime(monkeypatch, tmp_path)
+    captured = {}
+    real_temporary_directory = compute_node_bridge.tempfile.TemporaryDirectory
+
+    def recording_temporary_directory(*args_, **kwargs):
+        captured.update(kwargs)
+        return real_temporary_directory(*args_, **kwargs)
+
+    monkeypatch.setattr(compute_node_bridge.tempfile, "TemporaryDirectory",
+                        recording_temporary_directory)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 0
+    assert captured.get("prefix") == "tokenplace-headless-"
+    assert "dir" not in captured
+    assert captured.get("ignore_cleanup_errors") is True
 
 
 def test_headless_cpu_admission_fail_closed_paths(monkeypatch, tmp_path, capsys):

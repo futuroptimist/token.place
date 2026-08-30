@@ -1549,6 +1549,7 @@ def _api_v1_server_diagnostics() -> list[dict[str, Any]]:
             "max_concurrency": capabilities.max_concurrency,
             "load_score": queue_depth + in_flight,
             "capabilities": {
+                "api_version": "v1",
                 "supported_model_ids": list(capabilities.supported_model_ids),
                 "active_context_tier": capabilities.active_context_tier,
                 "maximum_total_context_tokens": capabilities.maximum_total_context_tokens,

@@ -830,22 +830,30 @@ def test_api_v1_selection_resolves_old_llama_alias_to_qwen_and_skips_stale_llama
     assert payload["resolved_model"] == "qwen3-8b-instruct"
     assert payload["selected_model_support"] == ["qwen3-8b-instruct"]
 
-def test_api_v1_selection_reports_capacity_exhaustion_separately(client):
+def test_api_v1_selection_reports_bounded_capacity_for_saturated_node(client):
     server = _server_key("saturated-capacity")
-    _register_api_v1_server_with_capabilities(client, server, _capabilities("8k-fast", ["model-a"]))
-    known_servers[server]["api_v1_in_flight_requests"] = {
-        "req-in-flight": {"expires_at": time.monotonic() + 60, "client_public_key": DUMMY_CLIENT_PUB_KEY}
-    }
+    _register_api_v1_server_with_capabilities(
+        client,
+        server,
+        _capabilities("8k-fast", ["model-a", "qwen3-8b-instruct"]),
+    )
+    _queue_api_v1_request(
+        client,
+        server_public_key=server,
+        request_id="saturated-capacity-request",
+        client_public_key=f"{DUMMY_CLIENT_PUB_KEY}-saturated-capacity",
+    )
 
     response = client.get("/api/v1/relay/servers/next?model=model-a&context_tier=8k-fast")
     payload = response.get_json()
 
     assert response.status_code == 503
-    assert payload["error"]["code"] == "no_available_capacity"
-    assert payload["error"]["eligible_tier_counts"] == {"8k-fast": 1}
-    assert payload["error"]["capacity_limited_node_count"] == 1
-    assert payload["error"]["capacity_limited_tier_counts"] == {"8k-fast": 1}
-    assert "at capacity" in payload["error"]["message"]
+    assert payload == {
+        "error": {
+            "code": "no_available_capacity",
+            "message": "No compatible compute node is available",
+        }
+    }
 
 
 def test_api_v1_filtered_round_robin_key_ignores_load_score_changes(client):

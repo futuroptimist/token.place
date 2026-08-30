@@ -2636,33 +2636,38 @@ def test_api_v1_response_retrieve_returns_pending_for_known_request_id(client):
 
 
 def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(client, monkeypatch):
-    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
-    queued = client.post(
-        '/api/v1/relay/requests',
-        json={
-            'request_id': 'req-long-running',
-            'client_public_key': DUMMY_CLIENT_PUB_KEY,
-            'server_public_key': DUMMY_SERVER_PUB_KEY,
-            'chat_history': 'ciphertext-request',
-            'cipherkey': 'cipherkey-request',
-            'iv': 'iv-request',
-            'protocol': 'tokenplace_api_v1_relay_e2ee',
-            'version': 1,
-        },
-    )
-    assert queued.status_code == 200
+    monkeypatch.setenv(relay_module.API_V1_REQUEST_DEADLINE_SECONDS_ENV, '300')
+    monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '600')
+    relay_module._reset_api_v1_relay_state_store()
+    store = relay_module._api_v1_store()
+    epoch = [time.time()]
+    monkeypatch.setattr(store, '_epoch_time', lambda: epoch[0])
+    monkeypatch.setattr(relay_module.time, 'time', lambda: epoch[0])
 
-    pending_entry = client_pending_request_ids[DUMMY_CLIENT_PUB_KEY]['req-long-running']
-    queued_at = pending_entry['queued_at'] if isinstance(pending_entry, dict) else pending_entry
-    monkeypatch.setattr(relay_module, 'PENDING_REQUEST_TTL_SECONDS', 300.0)
-    monkeypatch.setattr(relay_module.time, 'time', lambda: queued_at + 299.0)
+    _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=_capabilities('8k-fast'),
+    )
+    queued = client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-long-running'))
+    assert queued.status_code == 200
+    retrieval_credential = queued.get_json()['retrieval_credential']
+    assert retrieval_credential
+
+    epoch[0] += 299.0
 
     pending = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-long-running'},
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-long-running',
+            'retrieval_credential': retrieval_credential,
+        },
     )
     assert pending.status_code == 202
-    assert pending.get_json()['status'] == 'pending'
+    pending_payload = pending.get_json()
+    assert pending_payload['status'] == 'pending'
+    assert 0 < pending_payload['request_deadline_remaining_seconds'] <= 1.0
 
 
 def test_api_v1_response_retrieve_returns_terminal_after_unregistered_server_drops_queue(client):

@@ -7951,7 +7951,7 @@ def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
     assert proxy._closed is True
 
 
-def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_format_body=None):
+def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_format_body=None, init_kwargs=None):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()
     (package_dir / '__init__.py').write_text(llama_body)
@@ -7970,7 +7970,7 @@ def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_forma
     )
     assert process.stdin is not None
     assert process.stdout is not None
-    process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+    process.stdin.write(json.dumps({'args': [], 'kwargs': init_kwargs or {}}) + '\n')
     process.stdin.flush()
     init = process.stdout.readline()
     assert init.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:')
@@ -8301,6 +8301,81 @@ class Llama:
     )
 
     assert response == {'status': 'ok', 'result': {'prompt_tokens': 4}}
+    assert 'secret prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_uses_marked_headless_fallback(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'fixture prompt'}]],
+            'kwargs': {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'token_place_headless_admission_fixture': True,
+            },
+        },
+        llama_body=r"""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def apply_chat_template(self, messages, **kwargs):
+        raise AssertionError('apply_chat_template must not be invoked without metadata')
+    def tokenizer(self):
+        return object()
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt.decode('utf-8') == '<|im_start|>user\nfixture prompt<|im_end|>\n<|im_start|>assistant\n'
+        return [10, 20, 30]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 3}}
+    assert 'fixture prompt' not in json.dumps(response)
+
+
+def test_subprocess_proxy_controls_headless_worker_marker():
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._lock = model_manager_module.Lock()
+    proxy._timeout_seconds = 1
+    proxy._closed = False
+    proxy._rpc = MagicMock(return_value={'result': {'prompt_tokens': 2}})
+
+    proxy.render_and_tokenize_chat([], token_place_headless_admission_fixture=True)
+    assert 'token_place_headless_admission_fixture' not in proxy._rpc.call_args.args[0]['kwargs']
+
+    proxy._headless_admission_fixture = True
+    proxy.render_and_tokenize_chat([], token_place_headless_admission_fixture=False)
+    assert proxy._rpc.call_args.args[0]['kwargs']['token_place_headless_admission_fixture'] is True
+
+
+def test_llama_worker_headless_fallback_ignores_environment_and_filename(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKEN_PLACE_HEADLESS_ADMISSION_FIXTURE', '1')
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        init_kwargs={'model_path': str(tmp_path / 'stories15M-q4_0.gguf')},
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def apply_chat_template(self, messages, **kwargs):
+        raise RuntimeError('missing chat template metadata')
+    def tokenizer(self):
+        return object()
+    def tokenize(self, prompt, add_bos=False):
+        return [1]
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_render_exception'
     assert 'secret prompt' not in json.dumps(response)
 
 
@@ -8840,6 +8915,138 @@ def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
     assert manager.last_compute_diagnostics['rope_yarn_enabled'] is False
     assert manager.last_yarn_rope_diagnostics['active'] is False
     assert manager.last_yarn_rope_diagnostics['required'] is False
+
+
+def test_headless_admission_fixture_omits_legacy_chat_format(tmp_path):
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'llama-3.1-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.chat_format': 'llama-3',
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }.get(key, default)
+    manager = ModelManager(config)
+    manager.headless_admission_fixture = True
+    Path(manager.model_path).write_text('fake')
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            return '<fixture>'
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
+            self.kwargs = dict(model_path=model_path, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=verbose)
+
+        def tokenizer(self):
+            assert self._headless_admission_fixture is True
+            return FakeTokenizer()
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        llm = manager.get_llm_instance()
+
+    assert llm is not None
+    assert llm._headless_admission_fixture is True
+    assert 'chat_format' not in llm.kwargs
+
+
+def test_headless_admission_fixture_uses_configured_subprocess_render_contract(
+    monkeypatch, tmp_path
+):
+    from utils.compute_node_runtime import authoritative_readiness_fixture
+    from utils.llm import model_manager as model_manager_module
+    from utils.networking.relay_client import RelayClient
+
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    module_path = package_dir / '__init__.py'
+    module_path.write_text(
+        "class Llama:\n"
+        "    metadata = {'tokenizer.chat_template': '{{ messages }}'}\n"
+        "    def __init__(self, **kwargs):\n"
+        "        assert 'chat_format' not in kwargs\n"
+        "    def apply_chat_template(self, *args, **kwargs):\n"
+        "        raise AssertionError('marked fixture must use stable fallback')\n"
+        "    def create_chat_completion(self, **kwargs):\n"
+        "        return {'choices': [{'message': {'content': 'ok'}}]}\n"
+        "    def tokenize(self, prompt, add_bos=False):\n"
+        "        return list(prompt)\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'llama-3.1-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.chat_format': 'llama-3',
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }.get(key, default)
+    manager = ModelManager(config)
+    manager.headless_admission_fixture = True
+    manager.model_profile = dict(manager.model_profile)
+    manager.model_profile.update({
+        'provider': 'headless-admission-fixture',
+        'chat_template_policy': 'headless-plain-chat',
+    })
+    Path(manager.model_path).write_text('fake')
+    facade = model_manager_module._SubprocessLlamaCppModule(str(module_path))
+
+    with patch(
+        'utils.llm.model_manager._import_llama_cpp_runtime', return_value=facade
+    ), patch.object(
+        manager,
+        '_runtime_capabilities',
+        return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None},
+    ):
+        llm = manager.get_llm_instance()
+
+    try:
+        assert isinstance(llm, model_manager_module._SubprocessLlamaProxy)
+        assert llm is manager.llm
+        assert llm._headless_admission_fixture is True
+        content, fixture = authoritative_readiness_fixture()
+        messages = [{'role': 'user', 'content': content}]
+        count = RelayClient._api_v1_render_and_tokenize_chat_prompt(
+            llm, messages, model_profile=manager.model_profile
+        )
+        assert isinstance(count, int) and count > 0, getattr(
+            llm, '_token_place_last_render_tokenize_error', None
+        )
+
+        request_path = tmp_path / 'request.json'
+        evidence_path = tmp_path / 'evidence.json'
+        request_path.write_text(json.dumps(fixture), encoding='utf-8')
+        monkeypatch.setenv(
+            'TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST', str(request_path)
+        )
+        monkeypatch.setenv(
+            'TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE', str(evidence_path)
+        )
+        monkeypatch.setenv('TOKENPLACE_RUNTIME_ID', 'test-runtime')
+        RelayClient._api_v1_record_benchmark_tokenizer_observation(
+            llm,
+            messages,
+            full_prompt_tokens=count,
+            enable_thinking=None,
+            model_profile=manager.model_profile,
+        )
+        evidence = json.loads(evidence_path.read_text(encoding='utf-8'))
+        assert evidence['method'] == 'packaged_admission_render_and_tokenize_chat'
+        assert evidence['total_prompt_tokens'] == count
+        assert set(evidence['target_offsets_tokens']) == set(
+            fixture['target_prefix_utf8_bytes']
+        )
+        assert all(value > 0 for value in evidence['target_offsets_tokens'].values())
+    finally:
+        if llm is not None:
+            llm.close()
 
 
 def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):
@@ -10423,7 +10630,7 @@ def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch, pos
     assert proxy._worker_tmpfile is None
 
 
-def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(monkeypatch):
+def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
 
     popen_commands = []
@@ -10451,7 +10658,13 @@ def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(mo
         popen_commands.append(command)
         return process
 
-    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', lambda *args, **kwargs: (_ for _ in ()).throw(OSError('no tmp')))
+    mkstemp_calls = []
+
+    def unavailable_mkstemp(*args, **kwargs):
+        mkstemp_calls.append((args, kwargs))
+        raise OSError('no tmp')
+
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', unavailable_mkstemp)
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
     monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
     monkeypatch.setattr(
@@ -10460,11 +10673,142 @@ def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(mo
         lambda *args, **kwargs: {'status': 'ok'},
     )
 
-    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf')
+    model_path = tmp_path / 'missing' / 'model.gguf'
+    proxy = model_manager_module._SubprocessLlamaProxy(str(model_path))
 
     assert proxy._worker_tmpfile is None
+    assert len(mkstemp_calls) == 1
     assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
     assert proxy._process._token_place_command == [sys.executable, '<runtime-worker-code>']
+
+
+@pytest.mark.parametrize('cleanup_raises', [False, True])
+def test_subprocess_proxy_cleans_partial_worker_script_when_fdopen_fails(
+    monkeypatch, tmp_path, cleanup_raises
+):
+    from utils.llm import model_manager as model_manager_module
+
+    descriptor = 123
+    partial_script = str(tmp_path / 'partial-worker.py')
+    cleanup_calls = []
+    popen_commands = []
+
+    def fake_close(fd):
+        cleanup_calls.append(('close', fd))
+        if cleanup_raises:
+            raise OSError('close unavailable')
+
+    def fake_unlink(path):
+        cleanup_calls.append(('unlink', path))
+        if cleanup_raises:
+            raise OSError('unlink unavailable')
+
+    class FakeStdin:
+        def write(self, value):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+        stdout = None
+        stderr = []
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        popen_commands.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        model_manager_module.tempfile,
+        'mkstemp',
+        lambda *args, **kwargs: (descriptor, partial_script),
+    )
+    monkeypatch.setattr(
+        model_manager_module.os,
+        'fdopen',
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError('fdopen unavailable')),
+    )
+    monkeypatch.setattr(model_manager_module.os, 'close', fake_close)
+    monkeypatch.setattr(model_manager_module.os, 'unlink', fake_unlink)
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(
+        model_manager_module._SubprocessLlamaProxy,
+        '_start_stderr_tail_reader',
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_read_llama_subprocess_message',
+        lambda *args, **kwargs: {'status': 'ok'},
+    )
+
+    model_path = tmp_path / 'missing' / 'model.gguf'
+    proxy = model_manager_module._SubprocessLlamaProxy(str(model_path))
+
+    assert cleanup_calls == [('close', descriptor), ('unlink', partial_script)]
+    assert proxy._worker_tmpfile is None
+    assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
+
+
+def test_subprocess_proxy_uses_inline_code_without_writing_in_model_dir(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model_path = tmp_path / 'models' / 'model.gguf'
+    model_path.parent.mkdir()
+    model_path.write_bytes(b'GGUF')
+    mkstemp_calls = []
+    popen_commands = []
+
+    def unavailable_mkstemp(*args, **kwargs):
+        mkstemp_calls.append(kwargs.copy())
+        raise OSError('ambient temp unavailable')
+
+    class FakeStdin:
+        def write(self, value):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+        stdout = None
+        stderr = []
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        popen_commands.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', unavailable_mkstemp)
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_read_llama_subprocess_message',
+        lambda *args, **kwargs: {'status': 'ok'},
+    )
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path=str(model_path))
+
+    assert proxy._worker_tmpfile is None
+    assert mkstemp_calls == [{'suffix': '.py', 'prefix': '_token_place_worker_', 'dir': None}]
+    assert not list(model_path.parent.glob('_token_place_worker_*.py'))
+    assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
+
+    proxy.close()
 
 
 def test_subprocess_proxy_removes_temp_worker_script_when_popen_fails(monkeypatch):

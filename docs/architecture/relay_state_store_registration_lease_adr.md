@@ -9,8 +9,10 @@
 Correctness-critical relay coordination currently lives in process-local globals. A typed
 `RelayStateStore` boundary is needed before that state can safely move to a shared backend. This
 first, deliberately small slice defines only compute-node registration, renewal, lookup/listing,
-lease expiry, and explicit unregistration. It includes an atomic, lock-protected memory backend
-but is not connected to `relay.py`; current routes and runtime behavior therefore remain unchanged.
+lease expiry, and explicit unregistration. It includes an atomic, lock-protected memory backend and
+an internal Valkey registration component using the shared schema and reviewed-script foundation.
+The incomplete Valkey component is not a `RelayStateStore` implementation and is not connected to
+`relay.py`; current routes and runtime behavior therefore remain unchanged.
 
 The public API expresses lifecycle transitions rather than generic key/value access. Configuration
 makes an environment/cluster namespace, schema version, authoritative lease TTL, compute-node
@@ -36,10 +38,12 @@ metadata.
 
 ## Backend contract and consequences
 
-The backend tests obtain stores through a factory. A future Valkey implementation will be added to
-that factory and must pass the same deterministic lifecycle, bounds, defensive-read, clock, and
-concurrency suite. This provides a backend-neutral behavioral baseline without choosing Valkey
-keys, transactions, scripts, or discovery mechanisms prematurely.
+The backend tests share a registration-only contract helper between the in-memory store and the
+internal Valkey component. This deliberately does not parameterize the complete `RelayStateStore`
+suite or imply that the partial Valkey component conforms to that protocol. Valkey mutations use
+one bounded reviewed transition script and authoritative server time; lookups and listings remain
+read-only and exclude leases at the inclusive expiry boundary. The registration hash allowlist is
+updated field-by-field so additive fields written by a compatible future revision survive renewal.
 
 Memory-only operation and a registration-only boundary keep this change reviewable and avoid a
 partial runtime migration that could imply false horizontal-scaling guarantees. This PR is a
@@ -54,7 +58,7 @@ The following remain future design and implementation work:
 - terminal transitions (completion, failure, and cancellation), queues, claims/reclaim, responses,
   tombstones, and outcome deduplication;
 - scheduler reservations and cursors, shared rate limits, and functional availability;
-- Valkey data structures, transactions/server-side scripts, and failure semantics;
+- Valkey transitions beyond registration and leases, including scheduler reservations and queues;
 - Sentinel discovery and HA deployment topology;
 - schema-compatible rolling-upgrade policy.
 

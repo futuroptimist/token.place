@@ -32,6 +32,7 @@ from relay_state_store import RelayStateStoreError
 from relay_state_store import ResponseAcceptanceResult
 from relay_state_store import ResponseRetrievalResult
 from relay_state_store import SchedulerNodeState
+from tests.registration_store_contract import assert_registration_contract
 
 # isort: on
 
@@ -88,6 +89,15 @@ def digest(value: str) -> str:
 
 def digest_with_domain(value: str, domain: bytes) -> str:
     return hashlib.sha256(domain + value.encode()).hexdigest()
+
+
+def test_registration_only_shared_backend_contract(capabilities):
+    store = InMemoryRelayStateStore(
+        RelayStateStoreConfig(namespace="testing.shared", max_compute_nodes=1),
+        acknowledgement_key=b"a" * 32,
+        epoch_time=EpochClock(),
+    )
+    assert_registration_contract(store, capabilities, digest)
 
 
 def envelope(ciphertext="ciphertext"):
@@ -1764,6 +1774,34 @@ def test_live_claim_control_read_renews_without_creating_tombstone(
     assert result.state == "continued"
     assert result.lease_expires_at_epoch == clock.value + 10
     assert store.control_tombstones() == ()
+
+
+def test_claimed_request_returns_only_the_matching_live_node_claim(
+    store_factory, capabilities
+):
+    store, _ = registered_store(store_factory, capabilities)
+    claim = claimed_work(store)
+    queued, resolved_claim = store.claimed_request("node-a", "request-a")
+
+    assert queued.request_id == "request-a"
+    assert resolved_claim.generation == claim.generation
+    assert resolved_claim.lease_expires_at_epoch == claim.lease_expires_at_epoch
+    assert resolved_claim.request_deadline_epoch == claim.request_deadline_epoch
+    assert store.claimed_request("node-a", "missing-request") is None
+    assert store.claimed_request("missing-node", "request-a") is None
+
+
+def test_claimed_request_validates_request_identity_length(store_factory, capabilities):
+    store, _ = registered_store(
+        store_factory, capabilities, max_identity_bytes=8
+    )
+
+    with pytest.raises(RelayStateStoreError, match="request identity is invalid"):
+        store.claimed_request("node-a", "request-too-long")
+
+    for request_id in (None, ""):
+        with pytest.raises(RelayStateStoreError, match="request id is required"):
+            store.claimed_request("node-a", request_id)
 
 
 @pytest.mark.parametrize("status", ["cancelled", "expired"])

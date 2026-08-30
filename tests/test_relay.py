@@ -46,6 +46,7 @@ def client():
     os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = "1"
     # Reset state before each test
     known_servers.clear()
+    relay_module._reset_api_v1_relay_state_store()
     relay_module.server_round_robin_next_index = 0
     relay_module.api_v1_filtered_round_robin_next_positions.clear()
     client_inference_requests.clear()
@@ -83,6 +84,7 @@ def client():
         os.environ["TOKENPLACE_ENABLE_LEGACY_RELAY_ROUTES"] = previous_legacy_flag
     # Clean up state after test (optional, as fixture resets before)
     known_servers.clear()
+    relay_module._reset_api_v1_relay_state_store()
     relay_module.server_round_robin_next_index = 0
     relay_module.api_v1_filtered_round_robin_next_positions.clear()
     client_inference_requests.clear()

@@ -2781,16 +2781,36 @@ class _SubprocessLlamaProxy:
         code = _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)
         # Write worker code to a temp file to avoid Windows command-line length
         # limit (CreateProcess caps at 32767 chars; the code is ~36KB).
+        def write_worker_script(*, directory: Optional[str] = None) -> str:
+            fd: Optional[int] = None
+            tmppath: Optional[str] = None
+            try:
+                fd, tmppath = tempfile.mkstemp(
+                    suffix='.py', prefix='_token_place_worker_', dir=directory
+                )
+                stream = os.fdopen(fd, 'w', encoding='utf-8')
+                fd = None
+                with stream:
+                    stream.write(code)
+                return tmppath
+            except Exception:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                if tmppath is not None:
+                    try:
+                        os.unlink(tmppath)
+                    except OSError:
+                        pass
+                raise
+
         try:
-            fd, tmppath = tempfile.mkstemp(suffix='.py', prefix='_token_place_worker_')
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(code)
+            tmppath = write_worker_script()
             self._worker_tmpfile = tmppath
             command = [sys.executable, '-u', tmppath]
         except OSError:
-            # Temp file creation failed (e.g. disk full, permissions); fall back
-            # to the -c form which may exceed Windows' 32767-char limit but is
-            # better than not launching at all.
             self._worker_tmpfile = None
             command = [sys.executable, '-u', '-c', code]
         env = _llama_cpp_runtime_worker_env()
@@ -3357,6 +3377,10 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
     def render_and_tokenize_chat(self, *args, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs.pop('token_place_headless_admission_fixture', None)
+        if getattr(self, '_headless_admission_fixture', False):
+            kwargs['token_place_headless_admission_fixture'] = True
         with self._lock:
             try:
                 message = self._rpc({'method': 'render_and_tokenize_chat', 'args': args, 'kwargs': kwargs}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_prompt_render_tokenize')
@@ -4362,6 +4386,7 @@ def _type_error_is_unexpected_keyword(exc, keyword):
 
 def _render_chat_with_runtime_template(llama, args, kwargs):
     kwargs = dict(kwargs)
+    headless_fixture = kwargs.pop('token_place_headless_admission_fixture', False) is True
 
     def _rejection_diagnostics(rejected_kwarg, *, include_generation_category=True):
         diagnostics = {
@@ -4431,6 +4456,14 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
             except Exception:
                 tokenizer = None
         render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
+    if headless_fixture:
+        return _render_testing_chat_template_fallback(args, kwargs), {
+            'direct_apply_chat_template': direct_apply_available,
+            'metadata_template': False,
+            'jinja_renderer': False,
+        }
+    template = None
+    metadata_qwen_evidence = False
     render_exc = None
     rejected_render_kwarg = None
     if callable(render):
@@ -6086,7 +6119,9 @@ class ModelManager:
             'n_ctx': n_ctx,
             'verbose': llama_cpp_verbose_logging_enabled(),
         }
-        if self.model_profile.get('provider') == 'qwen':
+        if getattr(self, 'headless_admission_fixture', False) is True:
+            pass
+        elif self.model_profile.get('provider') == 'qwen':
             if self._chat_template_mode() != 'gguf-jinja':
                 raise RuntimeError('Qwen runtime requires GGUF/Jinja chat template policy')
         else:
@@ -6887,6 +6922,8 @@ class ModelManager:
                                             self._qwen_64k_profile_attempt_ids.append(profile_id)
                                 try:
                                     llm_instance = Llama(**runtime_kwargs)
+                                    if getattr(self, 'headless_admission_fixture', False) is True:
+                                        setattr(llm_instance, '_headless_admission_fixture', True)
                                     if is_qwen_64k and isinstance(profile_id, str):
                                         ids = [p.get('profile_id') for p in self._qwen_64k_runtime_profiles]
                                         self._qwen_64k_selected_profile_index = ids.index(profile_id) if profile_id in ids else 0

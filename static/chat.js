@@ -507,7 +507,10 @@ new Vue({
             try {
                 const params = new URLSearchParams({
                     model: this.selectedModelId,
-                    context_tier: requestedContextTier
+                    context_tier: requestedContextTier,
+                    ...(options.clientPublicKey ? { client_public_key: options.clientPublicKey } : {}),
+                    ...(options.requestId ? { request_id: options.requestId } : {}),
+                    ...(options.cancelToken ? { cancel_token: options.cancelToken } : {})
                 });
                 const response = await fetch(`/api/v1/relay/servers/next?${params.toString()}`, { cache: 'no-store' });
                 if (!response.ok) {
@@ -558,7 +561,11 @@ new Vue({
                     selected_context_window_tokens: Number.isInteger(data && data.selected_context_window_tokens)
                         ? data.selected_context_window_tokens
                         : null,
-                    selection_policy: data && typeof data.selection_policy === 'string' ? data.selection_policy : ''
+                    selection_policy: data && typeof data.selection_policy === 'string' ? data.selection_policy : '',
+                    reservation_token: data && typeof data.reservation_token === 'string' ? data.reservation_token : '',
+                    request_deadline_epoch: data && Number.isFinite(data.request_deadline_epoch) ? data.request_deadline_epoch : null,
+                    requested_model: data && typeof data.requested_model === 'string' ? data.requested_model : this.selectedModelId,
+                    requested_context_tier: data && typeof data.requested_context_tier === 'string' ? data.requested_context_tier : requestedContextTier
                 };
                 return true;
             } catch (error) {
@@ -1126,7 +1133,8 @@ new Vue({
                         },
                         body: JSON.stringify({
                             client_public_key: clientPublicKeyB64,
-                            request_id: requestId
+                            request_id: requestId,
+                            retrieval_credential: activeRequest.retrievalCredential
                         }),
                         signal: activeRequest.retrievalController.signal
                     }));
@@ -1246,6 +1254,9 @@ new Vue({
 
             const apiV1Messages = options.apiV1Messages || this.createApiV1Messages(messageContent);
             const tierResolution = options.tierResolution || this.resolveContextTierForRequest(apiV1Messages, this.selectedContextTier);
+            const requestId = this.createRequestId();
+            const cancelToken = this.createRequestId();
+            const clientPublicKeyB64 = this.encodeClientPublicKeyForApi();
             const selectedServerContextTierForRequest = this.selectedProfileMetadata && this.selectedProfileMetadata.selected_context_tier
                 ? this.selectedProfileMetadata.selected_context_tier
                 : '';
@@ -1263,7 +1274,10 @@ new Vue({
                 );
             const selectedServer = await this.ensureSelectedServer({
                 requestedContextTier: tierResolution.requestedContextTier,
-                forceReselect
+                forceReselect: true,
+                clientPublicKey: clientPublicKeyB64,
+                requestId,
+                cancelToken
             });
             if (selectedServer !== true) {
                 return selectedServer;
@@ -1272,9 +1286,6 @@ new Vue({
                 ? this.selectedProfileMetadata.selected_context_tier
                 : '';
 
-            const requestId = this.createRequestId();
-            const cancelToken = this.createRequestId();
-            const clientPublicKeyB64 = this.encodeClientPublicKeyForApi();
             const plaintextEnvelope = {
                 protocol: 'tokenplace_api_v1_relay_e2ee',
                 version: 1,
@@ -1309,7 +1320,11 @@ new Vue({
                     ciphertext: encryptedData.ciphertext,
                     cipherkey: encryptedData.cipherkey,
                     iv: encryptedData.iv,
-                    cancel_token: cancelToken
+                    cancel_token: cancelToken,
+                    reservation_token: this.selectedProfileMetadata.reservation_token,
+                    requested_model: this.selectedProfileMetadata.requested_model,
+                    requested_context_tier: this.selectedProfileMetadata.requested_context_tier,
+                    request_deadline_epoch: this.selectedProfileMetadata.request_deadline_epoch
                 };
 
                 const dispatchResponse = await fetch('/api/v1/relay/requests', {
@@ -1344,6 +1359,7 @@ new Vue({
                     clientPublicKey: clientPublicKeyB64,
                     requestId,
                     cancelToken,
+                    retrievalCredential: this.selectedProfileMetadata.reservation_token,
                     cancelled: false,
                     cancellationAttempted: false,
                     cancellationConfirmed: false,
@@ -1366,6 +1382,9 @@ new Vue({
                     admissionPayload = await dispatchResponse.json();
                 } catch (_jsonError) {
                     admissionPayload = null;
+                }
+                if (admissionPayload && typeof admissionPayload.retrieval_credential === 'string') {
+                    activeRelayRequest.retrievalCredential = admissionPayload.retrieval_credential;
                 }
                 if (this.activeRelayRequest !== activeRelayRequest || activeRelayRequest.cancelled) {
                     return RELAY_REQUEST_TERMINATED;

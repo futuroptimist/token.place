@@ -8,11 +8,13 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
+
+from utils import compute_node_runtime
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -25,6 +27,295 @@ SPEC = importlib.util.spec_from_file_location('desktop_compute_node_bridge', MOD
 compute_node_bridge = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(compute_node_bridge)
+
+
+def test_headless_boundary_result_contract_is_privacy_safe():
+    result = compute_node_bridge._headless_result(
+        success=False, phase="warm_load_completed",
+        failure_code="authoritative_evidence_failed", identity=True,
+        warm_load="ready", evidence=False,
+    )
+
+    assert result == {
+        "schema_version": 1,
+        "success": False,
+        "last_completed_phase": "warm_load_completed",
+        "failure_code": "authoritative_evidence_failed",
+        "packaged_runtime_identity": "validated",
+        "selected_backend": "cpu",
+        "warm_load_result": "ready",
+        "authoritative_evidence_result": "failed",
+    }
+    assert not ({"model_path", "prompt", "tokens", "environment"} & result.keys())
+
+
+def test_headless_boundary_rejects_non_cpu_before_runtime(monkeypatch, tmp_path, capsys):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"fixture")
+    args = SimpleNamespace(mode="gpu", model=str(model), context_tier="8k-fast",
+                           startup_timeout_seconds=1)
+    monkeypatch.setattr(
+        compute_node_bridge, "ensure_desktop_python_dependencies",
+        lambda: pytest.fail("runtime must not start"),
+    )
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["failure_code"] == "invalid_arguments"
+    assert result["warm_load_result"] == "not_started"
+
+
+@pytest.mark.parametrize(
+    ("ready", "diagnostics", "expected"),
+    [
+        (False, {}, "warm_load_failed"),
+        (False, {"api_v1_readiness_result": "failed"}, "warm_load_failed"),
+        (True, {"api_v1_readiness_result": "passed"}, "authoritative_evidence_failed"),
+        (True, {
+            "api_v1_readiness_result": "passed",
+            "api_v1_readiness_tokenizer_render_bridge_available": True,
+            "api_v1_readiness_prompt_tokens": 7,
+        }, "authoritative_evidence_failed"),
+    ],
+)
+def test_headless_boundary_readiness_classification(ready, diagnostics, expected):
+    assert compute_node_bridge._headless_classify_readiness(ready, diagnostics) == expected
+
+
+def test_headless_boundary_requires_exact_authoritative_evidence(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundle-1")
+    diagnostics = {
+        "api_v1_readiness_result": "passed",
+        "api_v1_readiness_tokenizer_render_bridge_available": True,
+        "api_v1_readiness_prompt_tokens": 7,
+    }
+    fixture = {"fixture_sha256": "abc", "target_prefix_utf8_bytes": {"midpoint": 4}}
+    evidence = {
+        "method": "packaged_admission_render_and_tokenize_chat",
+        "runtime_identity": "bundle-1", "fixture_sha256": "abc",
+        "total_prompt_tokens": 7, "target_offsets_tokens": {"midpoint": 3},
+    }
+    assert compute_node_bridge._headless_classify_readiness(
+        True, diagnostics, evidence, fixture) == "success"
+    evidence["runtime_identity"] = "source-tree"
+    assert compute_node_bridge._headless_classify_readiness(
+        True, diagnostics, evidence, fixture) == "authoritative_evidence_failed"
+
+
+def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
+                                evidence_valid=True, mock_runtime=False,
+                                load_exception=None, cleanup_exception=None,
+                                report_readiness_failure=True):
+    """Install a minimal runtime double while retaining the real evidence validator."""
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"fixture")
+    for name, value in {
+        "TOKENPLACE_APP_VERSION": "1.0.0",
+        "TOKENPLACE_BUILD_ID": "build-1",
+        "TOKENPLACE_TARGET_TRIPLE": "test-target",
+        "TOKENPLACE_BUNDLED_RUNTIME_ID": "bundle-1",
+        "TOKENPLACE_RUNTIME_ID": "bundle-1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        compute_node_bridge, "ensure_desktop_python_dependencies",
+        lambda: {"ok": "true"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_ensure_desktop_llama_runtime_for_context",
+        lambda _mode, _tier: {"selected_backend": "cpu"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_load_context_profile_helpers",
+        lambda: (lambda manager, tier: setattr(manager, "context_tier", tier),
+                 lambda tier: tier),
+    )
+
+    class Manager:
+        use_mock_llm = mock_runtime
+        llm = None
+        last_compute_diagnostics = {}
+        last_runtime_init_error = "PRIVATE runtime path and raw exception"
+        model_profile = {"provider": "qwen", "chat_template_policy": "gguf-jinja"}
+
+        @staticmethod
+        def _close_llm_proxy(_loaded):
+            return True
+
+    class Runtime:
+        def __init__(self, _config):
+            self.model_manager = Manager()
+
+        def ensure_api_v1_runtime_ready(self):
+            manager = self.model_manager
+            assert manager.headless_admission_fixture is True
+            assert manager.model_path == os.path.abspath(model)
+            assert manager.model_profile["provider"] == "headless-admission-fixture"
+            assert manager.model_profile["chat_template_policy"] == "headless-plain-chat"
+            if load_exception:
+                raise load_exception
+            self.model_manager.last_compute_diagnostics = {
+                "api_v1_readiness_tokenizer_render_bridge_available": ready,
+                "api_v1_readiness_prompt_tokens": 7,
+            }
+            if ready or report_readiness_failure:
+                self.model_manager.last_compute_diagnostics[
+                    "api_v1_readiness_result"
+                ] = "passed" if ready else "failed"
+            if ready:
+                with open(os.environ[
+                    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"
+                ], encoding="utf-8") as handle:
+                    fixture = json.load(handle)
+                evidence = {
+                    "method": "packaged_admission_render_and_tokenize_chat",
+                    "runtime_identity": "bundle-1",
+                    "fixture_sha256": fixture["fixture_sha256"],
+                    "total_prompt_tokens": 7,
+                    "target_offsets_tokens": {"midpoint": 3},
+                }
+                if not evidence_valid:
+                    evidence["fixture_sha256"] = "wrong"
+                with open(os.environ[
+                    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE"
+                ], "w", encoding="utf-8") as handle:
+                    json.dump(evidence, handle)
+            return ready
+
+        def stop(self, **_kwargs):
+            if cleanup_exception:
+                raise cleanup_exception
+
+    monkeypatch.setattr(compute_node_runtime, "ComputeNodeRuntime", Runtime)
+    return SimpleNamespace(mode="cpu", model=str(model), context_tier="8k-fast",
+                           startup_timeout_seconds=1)
+
+
+@pytest.mark.parametrize(
+    ("ready", "evidence_valid", "expected_code", "expected_exit"),
+    [
+        (True, True, "none", 0),
+        (False, True, "warm_load_failed", 5),
+        (True, False, "authoritative_evidence_failed", 6),
+    ],
+)
+def test_headless_cpu_admission_runtime_outcomes(
+        monkeypatch, tmp_path, capsys, ready, evidence_valid,
+        expected_code, expected_exit):
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, ready=ready, evidence_valid=evidence_valid)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == expected_exit
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[0] == {"type": "headless_internal", "phase": "startup_ready"}
+    assert records[-1]["failure_code"] == expected_code
+    assert records[-1]["success"] is (expected_exit == 0)
+    assert records[-1]["last_completed_phase"] == (
+        "cleanup_completed" if expected_exit == 0 else
+        "warm_load_completed" if expected_exit == 6 else
+        "runtime_identity_validated")
+
+
+def test_headless_cpu_admission_false_readiness_does_not_write_diag_sidecar(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, ready=False, report_readiness_failure=False)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 5
+
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[-1]["failure_code"] == "warm_load_failed"
+    assert not (tmp_path / "tokenplace-headless-diag.txt").exists()
+
+
+def test_headless_cpu_admission_uses_process_temp_storage(
+        monkeypatch, tmp_path, capsys):
+    """Readable model inputs do not require writable parent directories."""
+    args = _configure_headless_runtime(monkeypatch, tmp_path)
+    captured = {}
+    real_temporary_directory = compute_node_bridge.tempfile.TemporaryDirectory
+
+    def recording_temporary_directory(*args_, **kwargs):
+        captured.update(kwargs)
+        return real_temporary_directory(*args_, **kwargs)
+
+    monkeypatch.setattr(compute_node_bridge.tempfile, "TemporaryDirectory",
+                        recording_temporary_directory)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 0
+    assert captured.get("prefix") == "tokenplace-headless-"
+    assert "dir" not in captured
+    assert captured.get("ignore_cleanup_errors") is True
+
+
+def test_headless_cpu_admission_fail_closed_paths(monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "wrong")
+    assert compute_node_bridge.headless_cpu_admission(args) == 3
+    assert json.loads(capsys.readouterr().out)["failure_code"] == \
+        "packaged_runtime_identity_failed"
+
+    monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "bundle-1")
+    monkeypatch.setattr(compute_node_bridge, "ensure_desktop_python_dependencies",
+                        lambda: {"ok": "false"})
+    assert compute_node_bridge.headless_cpu_admission(args) == 3
+    capsys.readouterr()
+
+    monkeypatch.setattr(compute_node_bridge, "ensure_desktop_python_dependencies",
+                        lambda: {"ok": "true"})
+    monkeypatch.setattr(compute_node_bridge,
+                        "_ensure_desktop_llama_runtime_for_context",
+                        lambda *_args: {"selected_backend": "gpu"})
+    assert compute_node_bridge.headless_cpu_admission(args) == 2
+    assert json.loads(capsys.readouterr().out)["failure_code"] == "unsupported_backend"
+
+
+def test_headless_cpu_admission_rejects_mock_and_classifies_exceptions(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(monkeypatch, tmp_path, mock_runtime=True)
+    assert compute_node_bridge.headless_cpu_admission(args) == 4
+    assert json.loads(capsys.readouterr().out)["failure_code"] == "mock_runtime_rejected"
+
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, load_exception=RuntimeError("load failed"))
+    assert compute_node_bridge.headless_cpu_admission(args) == 7
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[-1]["failure_code"] == "warm_load_failed"
+
+
+def test_headless_cpu_admission_cleanup_failure_overrides_success(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, cleanup_exception=RuntimeError("stop failed"))
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 8
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[-1]["failure_code"] == "cleanup_failed"
+    assert records[-1]["success"] is False
+    assert records[-1]["last_completed_phase"] == "warm_load_completed"
+
+
+def test_gpu_preflight_rejects_silent_cpu_fallback(monkeypatch, capsys):
+    monkeypatch.setattr(
+        compute_node_bridge, "ensure_desktop_python_dependencies",
+        lambda: {"ok": "true"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_load_context_profile_helpers",
+        lambda: (None, lambda tier: tier),
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_ensure_desktop_llama_runtime_for_context",
+        lambda mode, tier: {"selected_backend": "cpu", "runtime_action": "fallback"},
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "compute_node_bridge.py", "--operator-runtime-preflight", "--mode", "gpu",
+    ])
+
+    assert compute_node_bridge.main() == 1
+    event = json.loads(capsys.readouterr().out)
+    assert event["startup_result"] == "runtime_validation_failed"
+
 
 @pytest.fixture(autouse=True)
 def _default_desktop_runtime_arch(monkeypatch):

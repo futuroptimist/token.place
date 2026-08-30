@@ -269,6 +269,18 @@ def stage_native_dll_artifacts(m: dict, cache: Path, staged: Path) -> None:
 NATIVE_IMPORT_DIAGNOSTIC_CODES = {126, 127, 193}
 STAGED_NATIVE_IMPORT_VALID = "native_import_valid"
 STAGED_NATIVE_IMPORT_EXTERNAL_DRIVER_UNAVAILABLE = "external_driver_unavailable"
+
+def log_staged_native_import_state(state: str) -> None:
+    if state not in (
+        STAGED_NATIVE_IMPORT_VALID,
+        STAGED_NATIVE_IMPORT_EXTERNAL_DRIVER_UNAVAILABLE,
+    ):
+        raise RuntimePrepError("staged native import returned unexpected state")
+    print(json.dumps({
+        "record": "windows_runtime.staged_native_import",
+        "schema_version": 1,
+        "state": state,
+    }, sort_keys=True, separators=(",", ":")))
 NATIVE_LLAMA_DIRECTORY = "Lib/site-packages/llama_cpp/lib"
 APP_LOCAL_MSVC_DLLS = {"msvcp140.dll", "vcomp140.dll", "vcruntime140_1.dll"}
 
@@ -914,7 +926,8 @@ def prepare(m: dict) -> None:
         stage_native_dll_artifacts(m, cache, staged)
         prune_packaging_unused_non_x64_launchers(staged)
         pe_closure=validate_runtime_payload(staged, m)
-        validate_staged_native_import(staged, m, pe_closure)
+        native_import_state = validate_staged_native_import(staged, m, pe_closure)
+        log_staged_native_import_state(native_import_state)
         for notice in m.get('runtime_notices',[]): (staged/notice['path']).write_text(f"{notice['name']} redistribution notice: {notice['license']}\n", encoding='utf-8')
         write_provenance(staged, m, pe_closure)
         backup=tmp/'old-runtime'

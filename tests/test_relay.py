@@ -2529,52 +2529,80 @@ def test_queue_client_response_serializes_concurrent_updates(monkeypatch):
 
 
 def test_api_v1_response_retrieve_matches_request_id_without_dropping_other_responses(client):
-    response_one = {
-        'request_id': 'req-1',
-        'protocol': 'tokenplace_api_v1_relay_e2ee',
-        'version': 1,
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'chat_history': 'ciphertext-response-1',
-        'cipherkey': 'cipherkey-response-1',
-        'iv': 'iv-response-1',
-    }
-    response_two = {
-        'request_id': 'req-2',
-        'protocol': 'tokenplace_api_v1_relay_e2ee',
-        'version': 1,
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'chat_history': 'ciphertext-response-2',
-        'cipherkey': 'cipherkey-response-2',
-        'iv': 'iv-response-2',
-    }
+    capabilities = _capabilities('8k-fast')
+    capabilities['max_concurrency'] = 2
+    server_payload = _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=capabilities,
+    )
+    retrieval_credentials = {}
+    for request_id in ('req-1', 'req-2'):
+        queued = client.post('/api/v1/relay/requests', json=_api_v1_request_payload(request_id))
+        assert queued.status_code == 200
+        retrieval_credentials[request_id] = queued.get_json()['retrieval_credential']
+        assert retrieval_credentials[request_id]
+    assert retrieval_credentials['req-1'] != retrieval_credentials['req-2']
 
-    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, 'req-1')
-    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, 'req-2')
-    assert client.post('/api/v1/relay/responses', json=response_one).status_code == 200
-    assert client.post('/api/v1/relay/responses', json=response_two).status_code == 200
+    claim_generations = {}
+    for _ in range(2):
+        polled = client.post('/api/v1/relay/servers/poll', json=server_payload)
+        assert polled.status_code == 200
+        polled_payload = polled.get_json()
+        claim_generation = polled_payload['claim_generation']
+        assert isinstance(claim_generation, int)
+        claim_generations[polled_payload['request_id']] = claim_generation
+    assert set(claim_generations) == {'req-1', 'req-2'}
+
+    for request_id in ('req-1', 'req-2'):
+        response = client.post(
+            '/api/v1/relay/responses',
+            json=_api_v1_response_payload(
+                request_id,
+                ciphertext=f'ciphertext-response-{request_id[-1]}',
+                server_public_key=DUMMY_SERVER_PUB_KEY,
+                control_credential=server_payload['control_credential'],
+                claim_generation=claim_generations[request_id],
+            ),
+        )
+        assert response.status_code == 200
 
     missing = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-missing'},
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-missing',
+            'retrieval_credential': retrieval_credentials['req-1'],
+        },
     )
-    assert missing.status_code == 404
-    assert len(client_responses[DUMMY_CLIENT_PUB_KEY]) == 2
+    assert missing.status_code == 403
+    assert missing.get_json() == {
+        'error': {'code': 403, 'message': 'Missing or invalid retrieval proof'},
+    }
 
     retrieved_two = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-2'},
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-2',
+            'retrieval_credential': retrieval_credentials['req-2'],
+        },
     )
     assert retrieved_two.status_code == 200
     assert retrieved_two.get_json()['request_id'] == 'req-2'
-    assert client_responses[DUMMY_CLIENT_PUB_KEY]['request_id'] == 'req-1'
+    assert retrieved_two.get_json()['chat_history'] == 'ciphertext-response-2'
 
     retrieved_one = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-1'},
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-1',
+            'retrieval_credential': retrieval_credentials['req-1'],
+        },
     )
     assert retrieved_one.status_code == 200
     assert retrieved_one.get_json()['request_id'] == 'req-1'
-    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+    assert retrieved_one.get_json()['chat_history'] == 'ciphertext-response-1'
 
 
 def test_api_v1_response_retrieve_returns_pending_for_known_request_id(client):

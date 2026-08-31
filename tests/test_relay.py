@@ -2803,18 +2803,13 @@ def test_api_v1_relay_plaintext_messages_are_rejected(client):
 
 
 def test_api_v1_relay_requests_requires_client_public_key(client):
-    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    payload = _api_v1_request_payload('req-missing-client-key')
+    del payload['client_public_key']
 
-    response = client.post('/api/v1/relay/requests', json={
-        'request_id': 'req-missing-client-key',
-        'server_public_key': DUMMY_SERVER_PUB_KEY,
-        'ciphertext': 'ciphertext-request',
-        'cipherkey': 'cipherkey-request',
-        'iv': 'iv-request',
-    })
+    response = client.post('/api/v1/relay/requests', json=payload)
 
     assert response.status_code == 400
-    assert response.get_json() == {'error': {'message': 'Missing client public key', 'code': 400}}
+    assert response.get_json() == {'error': {'message': 'Invalid request data', 'code': 400}}
 
 
 def test_api_v1_register_and_poll_do_not_delegate_to_legacy_sink(client, monkeypatch):

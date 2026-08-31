@@ -2938,34 +2938,43 @@ def test_api_v1_register_does_not_dequeue_requests(client):
 
 
 def test_api_v1_poll_requires_registration_token_when_configured(client, monkeypatch):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
-    known_servers[DUMMY_SERVER_PUB_KEY] = {
-        'public_key': DUMMY_SERVER_PUB_KEY,
-        'last_ping': datetime.now(),
-        'last_ping_duration': 10,
-    }
-    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [{
-        'request_id': 'req-auth',
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'chat_history': 'ciphertext-request',
-        'cipherkey': 'cipherkey-request',
-        'iv': 'iv-request',
-        'e2ee_v1': True,
-    }]
-
     monkeypatch.setattr(relay_module, 'SERVER_REGISTRATION_TOKENS', ['expected-token'])
+    registration_headers = {'X-Relay-Server-Token': 'expected-token'}
+    registration = client.post(
+        '/api/v1/relay/servers/register',
+        json={
+            'server_public_key': DUMMY_SERVER_PUB_KEY,
+            'capabilities': _capabilities('8k-fast'),
+        },
+        headers=registration_headers,
+    )
+    assert registration.status_code == 200
+    control_credential = registration.get_json().get('control_credential')
+    assert control_credential
+    server_payload = {
+        'server_public_key': DUMMY_SERVER_PUB_KEY,
+        'control_credential': control_credential,
+    }
 
-    unauthorized = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    queued = client.post('/api/v1/relay/requests', json=_api_v1_request_payload('req-auth'))
+    assert queued.status_code == 200
+
+    unauthorized = client.post('/api/v1/relay/servers/poll', json=server_payload)
     assert unauthorized.status_code == 401
-    assert len(client_inference_requests[DUMMY_SERVER_PUB_KEY]) == 1
+    assert unauthorized.get_json() == {
+        'error': {'message': 'Missing or invalid relay server token', 'code': 401}
+    }
 
     authorized = client.post(
         '/api/v1/relay/servers/poll',
         json=server_payload,
-        headers={'X-Relay-Server-Token': 'expected-token'},
+        headers=registration_headers,
     )
     assert authorized.status_code == 200
-    assert authorized.get_json()['request_id'] == 'req-auth'
+    claimed = authorized.get_json()
+    assert claimed['request_id'] == 'req-auth'
+    assert claimed['chat_history'] == 'ciphertext-request'
+    assert isinstance(claimed['claim_generation'], int)
 
 
 def test_legacy_relay_routes_return_410_by_default(client, monkeypatch):

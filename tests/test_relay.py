@@ -2847,35 +2847,33 @@ def test_api_v1_register_advertises_configured_poll_wait(client, monkeypatch):
 
 
 def test_api_v1_poll_skips_legacy_queue_items_and_claims_e2ee_only(client):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
-    register = client.post('/api/v1/relay/servers/register', json=server_payload)
-    assert register.status_code == 200
+    server_payload = _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=_capabilities("8k-fast"),
+    )
+    legacy_sentinel = {
+        'client_public_key': DUMMY_CLIENT_PUB_KEY,
+        'chat_history': 'legacy-plaintext',
+        'cipherkey': 'legacy-key',
+        'iv': 'legacy-iv',
+    }
+    expected_legacy_queue = [legacy_sentinel.copy()]
+    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [legacy_sentinel]
 
-    client_inference_requests[DUMMY_SERVER_PUB_KEY] = [
-        {
-            'client_public_key': DUMMY_CLIENT_PUB_KEY,
-            'chat_history': 'legacy-plaintext',
-            'cipherkey': 'legacy-key',
-            'iv': 'legacy-iv',
-        },
-        {
-            'client_public_key': DUMMY_CLIENT_PUB_KEY,
-            'chat_history': 'ciphertext-request',
-            'cipherkey': 'cipherkey-request',
-            'iv': 'iv-request',
-            'request_id': 'req-e2ee-only',
-            'protocol': 'tokenplace_api_v1_relay_e2ee',
-            'version': 1,
-            'e2ee_v1': True,
-        },
-    ]
+    queued = client.post(
+        '/api/v1/relay/requests',
+        json=_api_v1_request_payload('req-e2ee-only'),
+    )
+    assert queued.status_code == 200
 
-    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
     assert poll.status_code == 200
     payload = poll.get_json()
     assert payload['request_id'] == 'req-e2ee-only'
     assert payload['chat_history'] == 'ciphertext-request'
-    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
+    assert isinstance(payload['claim_generation'], int)
+    assert client_inference_requests[DUMMY_SERVER_PUB_KEY] == expected_legacy_queue
 
 
 def test_api_v1_relay_response_plaintext_is_rejected(client):

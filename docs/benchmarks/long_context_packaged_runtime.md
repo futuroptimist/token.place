@@ -1,9 +1,11 @@
 # Long-context packaged-runtime benchmark harness
 
 The long-context harness turns the long-context macOS Metal evidence from #1566 into a repeatable,
-privacy-safe benchmark surface for downstream comparisons. Ordinary CI runs only deterministic unit and
-contract tests; it does **not** download a model, require a GPU, launch a packaged desktop app, or
-run multi-minute inference.
+privacy-safe benchmark surface for downstream comparisons. Broad unit and contract CI remains
+deterministic and GPU-independent. The specialized `Desktop operator app e2e` workflow also
+builds desktop binaries and, on hosted Windows, installs the current NSIS package for a driverless
+structural CPU smoke and package-identity check. These checks do not run a model, physical-GPU
+validation, or a multi-minute benchmark.
 
 ## Prerequisites for physical runs
 
@@ -119,12 +121,28 @@ needle occurs once and deterministic similar-but-distinct markers are decoys. Th
 heading/prose ambiguity. Its canary literal is not disclosed by the instructions and occurs once.
 
 In explicit long-context benchmark mode, the packaged runner passes only the fixture hash, validated UTF-8 prefix cut
-points, and an owner-only evidence location to the bundled sidecar. During normal authoritative
-admission, the sidecar verifies the actual final user message against that hash and sends the full
-message and every prefix through the same loaded `llm_instance`, `render_and_tokenize_chat` bridge,
-chat-template policy, and thinking option. It atomically writes bounded counts and runtime identity;
-it never writes prompt text, target values, ciphertext, credentials, or request identifiers. The
-seam is inert unless the manual long-context benchmark runner explicitly supplies both environment variables.
+points, and an owner-only evidence location to the bundled sidecar. During authoritative admission,
+the sidecar verifies the actual final user message against that hash and first sends the full message
+and every prefix through the same loaded `llm_instance`, `render_and_tokenize_chat` bridge,
+chat-template policy, and thinking option. If that bridge is unavailable, each message is instead
+rendered and tokenized by the active runtime used for admission; evidence is published only when an
+authoritative count is available for the full message and every prefix. If either active-runtime
+operation cannot produce a count, evidence generation fails closed rather than substituting an
+estimate or partial observation. Both paths atomically write only bounded counts and runtime
+identity; neither writes prompt text, rendered text, target values, ciphertext, credentials, or
+request identifiers. The seam is inert unless the manual long-context benchmark runner explicitly
+supplies both environment variables.
+
+A separate atomically replaced `evidence.json.stage.json` sibling carries the production-boundary
+handshake. Its closed schema contains only a schema version, a monotonic stage number, and an
+allowlisted low-cardinality category. Rust records argument parsing and validated handoff; Python
+acknowledges receipt and records validation, tokenizer, identity, and publication outcomes. The
+runner verifies that handshake, then re-arms it immediately before the benchmark submission so a
+readiness request cannot masquerade as benchmark activity. The stage file never contains paths,
+prompts, responses, payloads, identifiers, secrets, credentials, or exception text. Missing
+post-arm producer activity is classified as `python_producer_not_invoked`; all other failures retain
+their most specific safe category and produce a `not_run` report with zero completed trials and no
+semantic or performance claim.
 
 The harness requires method `packaged_admission_render_and_tokenize_chat`, matching bundled runtime
 identity and total/progress counts, the exact target key set, unique ordered positive prefix counts,
@@ -463,7 +481,7 @@ only failure. Strict/default mode and every runtime-contract failure exit nonzer
 
 ## CI versus hardware validation
 
-Ordinary CI should run:
+Broad deterministic, GPU-independent CI should run:
 
 ```bash
 python -m pytest -q tests/unit/test_long_context_benchmark_harness.py
@@ -472,6 +490,11 @@ pre-commit run --all-files
 git diff --check
 ./run_all_tests.sh PR
 ```
+
+The hosted-Windows structural gate verifies the installed application, bundled runtime/resource
+layout, poisoned-host-state isolation, CPU-only preflight, package identity, and cleanup. It does
+not use Selenium, `tauri-driver`, WebView2/EdgeDriver automation, or tokenizer-boundary model
+provisioning, and it does not produce authoritative long-context tokenizer evidence.
 
 Physical Metal/CUDA validation is manual and should attach only sanitized reports to #1566, #1608,
 or downstream validation. Do not claim 0.1.17 release validation or general semantic correctness

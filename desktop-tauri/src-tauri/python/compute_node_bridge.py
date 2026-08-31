@@ -763,12 +763,18 @@ def _relay_runtime_state(
 ) -> str:
     if warm_load_state == "failed":
         return "failed"
+    if not warm_load_enabled:
+        return "ready" if running else "stopped"
+    if warm_load_state == "not_started":
+        return "starting" if running else "stopped"
+    # Warm-load progress is meaningful before the runtime-ready handshake.
+    # Keep reporting that phase while ``running`` remains false so callers can
+    # distinguish provisioning from a stopped bridge without treating it as
+    # authoritative Running state.
+    if warm_load_state == "warming":
+        return "warming"
     if not running:
         return "stopped"
-    if not warm_load_enabled:
-        return "ready"
-    if warm_load_state == "not_started":
-        return "starting"
     return warm_load_state
 
 
@@ -850,7 +856,11 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     return {
         "type": "started",
-        "running": True,
+        # Provisioning heartbeats deliberately retain the historical event
+        # type, but they are not the operator startup handshake.  The native
+        # parent must keep the attached process in Starting until the later
+        # runtime-ready ``started`` event reports Running.
+        "running": False,
         "registered": False,
         "registered_relay_count": 0,
         "registered_relay_urls": [],
@@ -1495,10 +1505,17 @@ def run(args: argparse.Namespace) -> int:
         return _sanitize_public_payload(payload)
 
     def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
+        # Status heartbeats emitted by the warm-load gate are progress only.
+        # Reporting them as running lets the native supervisor observe a
+        # transient Running state before the runtime-ready ``started`` event,
+        # after which a genuine warm-load failure looks like a Running
+        # regression.  Once warm-load is ready (or deliberately disabled),
+        # relay-poll status updates remain authoritative Running updates.
+        runtime_ready = not warm_load_enabled or warm_load_state == "ready"
         emit_operator_event(
             build_status_payload(
                 event_type="status",
-                running=True,
+                running=runtime_ready,
                 registered=registered,
                 active_relay_url=active_relay_url,
                 current_last_error=current_last_error,
@@ -1673,19 +1690,6 @@ def run(args: argparse.Namespace) -> int:
         warm_load_fatal = True
 
     last_error: Optional[str] = None
-    emit_operator_event(
-        build_status_payload(
-            event_type="started",
-            running=True,
-            registered=False,
-            active_relay_url=runtime.relay_client.relay_url,
-            current_last_error=None,
-            extra={
-                "llama_repo_stub_imported": repo_llama_cpp_shim_imported,
-                "use_mock_llm": bool(getattr(runtime.model_manager, "use_mock_llm", False)),
-            },
-        )
-    )
     if runtime_path == "sidecar":
         print(
             "desktop.compute_node_bridge.runtime_path.relay_uses_bridge "
@@ -1760,7 +1764,7 @@ def run(args: argparse.Namespace) -> int:
             emit_operator_event(
                 build_status_payload(
                     event_type="status",
-                    running=True,
+                    running=False,
                     registered=False,
                     active_relay_url=runtime.relay_client.relay_url,
                     current_last_error=last_error,
@@ -1809,7 +1813,7 @@ def run(args: argparse.Namespace) -> int:
                 emit_operator_event(
                     build_status_payload(
                         event_type="status",
-                        running=True,
+                        running=False,
                         registered=False,
                         active_relay_url=runtime.relay_client.relay_url,
                         current_last_error=last_error,
@@ -2577,6 +2581,25 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         if warm_runtime_before_registration():
+            # ``started`` is the native supervisor's runtime-ready handshake,
+            # not merely proof that Python imports and process attachment
+            # succeeded.  Emit it only after the active packaged runtime has
+            # passed the same warm-load gate that protects relay registration.
+            emit_operator_event(
+                build_status_payload(
+                    event_type="started",
+                    running=True,
+                    registered=False,
+                    active_relay_url=runtime.relay_client.relay_url,
+                    current_last_error=None,
+                    extra={
+                        "llama_repo_stub_imported": repo_llama_cpp_shim_imported,
+                        "use_mock_llm": bool(
+                            getattr(runtime.model_manager, "use_mock_llm", False)
+                        ),
+                    },
+                )
+            )
             for relay_runtime in runtimes:
                 thread = threading.Thread(
                     target=poll_relay_loop,

@@ -55,15 +55,25 @@ PACKAGED_SETUP_BUDGET_S = 300.0
 PACKAGED_FINALIZATION_BUDGET_S = 120.0
 PACKAGED_PHASE_STATUS_VERSION = "packaged-runner-phase-v2"
 PACKAGED_PHASES = (
-    "runner_startup", "webdriver_ready", "desktop_ready", "operator_ready",
+    "runner_startup", "webdriver_ready", "desktop_session_started", "desktop_ready", "operator_ready",
     "landing_page_ready", "request_active", "response_received",
     "cancellation_validation", "evidence_finalization", "cleanup",
 )
 PACKAGED_FAILURE_REASONS = frozenset({
     "cleanup_failure",
+    "application_arguments_absent", "application_arguments_malformed",
+    "rust_python_handoff_failed", "python_producer_not_invoked",
+    "request_validation_failure", "fixture_hash_validation_failure",
+    "active_runtime_tokenizer_unavailable", "runtime_identity_unavailable",
+    "tokenization_failure", "evidence_publication_failure",
     "vue_not_ready", "client_keypair_not_ready", "model_selection_not_ready",
     "requested_context_tier_not_applied", "message_input_not_populated",
     "send_button_not_enabled", "packaged_runner_failure",
+    "native_driver_unavailable", "webdriver_session_creation_failed",
+    "webdriver_driver_version_mismatch", "webdriver_transport_failure",
+    "webdriver_capabilities_rejected", "webdriver_application_startup_failed",
+    "tauri_driver_exited", "desktop_ui_not_ready",
+    "operator_running_not_reached", "operator_registration_not_reached",
     "authoritative_local_progress_missing", "local_prefill_phase_missing",
     "local_generating_phase_missing", "positive_generated_token_progress_missing",
     "local_timing_record_malformed", "response_usage_missing_or_inconsistent",

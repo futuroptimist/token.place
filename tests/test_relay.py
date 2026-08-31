@@ -2725,32 +2725,61 @@ def test_api_v1_response_retrieve_returns_terminal_after_unregistered_server_dro
 
 
 def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(client):
-    response_payload = {
-        'request_id': 'req-mismatch-1',
-        'protocol': 'tokenplace_api_v1_relay_e2ee',
-        'version': 1,
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'chat_history': 'ciphertext-response',
-        'cipherkey': 'cipherkey-response',
-        'iv': 'iv-response',
-    }
-    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, 'req-mismatch-1')
-    assert client.post('/api/v1/relay/responses', json=response_payload).status_code == 200
+    control_payload = _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=_capabilities('8k-fast'),
+    )
+    enqueue = client.post(
+        '/api/v1/relay/requests',
+        json=_api_v1_request_payload('req-mismatch-1'),
+    )
+    assert enqueue.status_code == 200
+    retrieval_credential = enqueue.get_json()['retrieval_credential']
+    assert retrieval_credential
+
+    poll = client.post('/api/v1/relay/servers/poll', json=control_payload)
+    assert poll.status_code == 200
+    claimed = poll.get_json()
+    assert claimed['request_id'] == 'req-mismatch-1'
+    claim_generation = claimed['claim_generation']
+    assert isinstance(claim_generation, int)
+
+    submitted = client.post(
+        '/api/v1/relay/responses',
+        json=_api_v1_response_payload(
+            'req-mismatch-1',
+            server_public_key=DUMMY_SERVER_PUB_KEY,
+            control_credential=control_payload['control_credential'],
+            claim_generation=claim_generation,
+        ),
+    )
+    assert submitted.status_code == 200
 
     mismatch = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-other'},
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-other',
+            'retrieval_credential': retrieval_credential,
+        },
     )
-    assert mismatch.status_code == 404
-    assert client_responses[DUMMY_CLIENT_PUB_KEY]['request_id'] == 'req-mismatch-1'
+    assert mismatch.status_code == 403
+    assert mismatch.get_json() == {
+        'error': {'code': 403, 'message': 'Missing or invalid retrieval proof'}
+    }
 
     retrieved = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-mismatch-1'},
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-mismatch-1',
+            'retrieval_credential': retrieval_credential,
+        },
     )
     assert retrieved.status_code == 200
     assert retrieved.get_json()['request_id'] == 'req-mismatch-1'
-    assert DUMMY_CLIENT_PUB_KEY not in client_responses
+    assert retrieved.get_json()['chat_history'] == 'ciphertext-response'
 
 
 def test_api_v1_relay_plaintext_messages_are_rejected(client):

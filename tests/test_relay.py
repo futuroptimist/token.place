@@ -2671,39 +2671,57 @@ def test_api_v1_response_retrieve_stays_pending_for_long_running_valid_interval(
 
 
 def test_api_v1_response_retrieve_returns_terminal_after_unregistered_server_drops_queue(client):
-    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    control_payload = _api_v1_registered_control_payload(
+        client, DUMMY_SERVER_PUB_KEY, capabilities=_capabilities("8k-fast")
+    )
     queued = client.post(
         '/api/v1/relay/requests',
-        json={
-            'request_id': 'req-abandoned',
-            'client_public_key': DUMMY_CLIENT_PUB_KEY,
-            'server_public_key': DUMMY_SERVER_PUB_KEY,
-            'chat_history': 'ciphertext-request',
-            'cipherkey': 'cipherkey-request',
-            'iv': 'iv-request',
-            'protocol': 'tokenplace_api_v1_relay_e2ee',
-            'version': 1,
-        },
+        json=_api_v1_request_payload('req-abandoned'),
     )
     assert queued.status_code == 200
+    retrieval_credential = queued.get_json()['retrieval_credential']
+    assert retrieval_credential
 
     pending = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-abandoned',
+            'retrieval_credential': retrieval_credential,
+        },
     )
     assert pending.status_code == 202
     assert pending.get_json()['status'] == 'pending'
 
-    unregistered = client.post('/api/v1/relay/servers/unregister', json={'server_public_key': DUMMY_SERVER_PUB_KEY, 'control_credential': register.get_json()['control_credential']})
+    unregistered = client.post('/api/v1/relay/servers/unregister', json=control_payload)
     assert unregistered.status_code == 200
+    assert unregistered.get_json()['removed'] is True
 
-    unknown = client.post(
+    terminal_response = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-abandoned'},
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-abandoned',
+            'retrieval_credential': retrieval_credential,
+        },
     )
-    assert unknown.status_code == 410
-    assert unknown.get_json()['error']['status'] == 'cancelled'
-    assert unknown.get_json()['error']['reason'] == 'server_unregistered'
+    assert terminal_response.status_code == 410
+    assert terminal_response.get_json() == {
+        'error': {
+            'message': 'Request completed_unavailable',
+            'code': 'completed_unavailable',
+            'status': 'completed_unavailable',
+            'reason': 'completed_unavailable',
+        }
+    }
+
+    store = relay_module._api_v1_store()
+    assert store.queued_requests(DUMMY_SERVER_PUB_KEY) == ()
+    terminals = store.terminal_records()
+    assert len(terminals) == 1
+    assert terminals[0].outcome == 'cancelled'
+    assert terminals[0].reason == 'server_unregistered'
+    assert terminals[0].retrieval_state == 'completed_unavailable'
 
 
 def test_api_v1_response_retrieve_request_id_mismatch_keeps_single_response(client):

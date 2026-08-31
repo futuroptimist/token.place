@@ -43,9 +43,54 @@ const BENCHMARK_TOKENIZER_REQUEST_ARG: &str =
     "--token-place-long-context-benchmark-tokenizer-request=";
 const BENCHMARK_TOKENIZER_EVIDENCE_ARG: &str =
     "--token-place-long-context-benchmark-tokenizer-evidence=";
+const BENCHMARK_TOKENIZER_REQUEST_ARG_NAME: &str =
+    "--token-place-long-context-benchmark-tokenizer-request";
+const BENCHMARK_TOKENIZER_EVIDENCE_ARG_NAME: &str =
+    "--token-place-long-context-benchmark-tokenizer-evidence";
 
 fn benchmark_stage_path(evidence: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.stage.json", evidence.display()))
+    let mut stage = evidence.as_os_str().to_os_string();
+    stage.push(".stage.json");
+    PathBuf::from(stage)
+}
+
+#[cfg(unix)]
+fn os_str_starts_with(value: &OsStr, prefix: &str) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().starts_with(prefix.as_bytes())
+}
+
+#[cfg(windows)]
+fn os_str_starts_with(value: &OsStr, prefix: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    value
+        .encode_wide()
+        .zip(prefix.encode_utf16())
+        .all(|(value_unit, prefix_unit)| value_unit == prefix_unit)
+        && value.encode_wide().count() >= prefix.encode_utf16().count()
+}
+
+fn strip_ascii_os_str_prefix(value: &OsStr, prefix: &str) -> Option<OsString> {
+    if !os_str_starts_with(value, prefix) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        return Some(OsString::from_vec(
+            value.as_bytes()[prefix.len()..].to_vec(),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        return Some(OsString::from_wide(
+            &value
+                .encode_wide()
+                .skip(prefix.encode_utf16().count())
+                .collect::<Vec<_>>(),
+        ));
+    }
 }
 
 #[cfg(windows)]
@@ -133,19 +178,20 @@ where
     let mut evidence_arg = None;
     let mut invalid_args = false;
     for arg in args {
-        let Some(arg) = arg.to_str() else {
-            continue;
-        };
-        if let Some(value) = arg.strip_prefix(BENCHMARK_TOKENIZER_REQUEST_ARG) {
-            invalid_args |=
-                request_arg.replace(OsString::from(value)).is_some() || value.is_empty();
-        } else if let Some(value) = arg.strip_prefix(BENCHMARK_TOKENIZER_EVIDENCE_ARG) {
-            invalid_args |=
-                evidence_arg.replace(OsString::from(value)).is_some() || value.is_empty();
+        if let Some(value) = strip_ascii_os_str_prefix(&arg, BENCHMARK_TOKENIZER_REQUEST_ARG) {
+            invalid_args |= request_arg.replace(value.clone()).is_some() || value.is_empty();
+        } else if let Some(value) =
+            strip_ascii_os_str_prefix(&arg, BENCHMARK_TOKENIZER_EVIDENCE_ARG)
+        {
+            invalid_args |= evidence_arg.replace(value.clone()).is_some() || value.is_empty();
+        } else if os_str_starts_with(&arg, BENCHMARK_TOKENIZER_REQUEST_ARG_NAME)
+            || os_str_starts_with(&arg, BENCHMARK_TOKENIZER_EVIDENCE_ARG_NAME)
+        {
+            invalid_args = true;
         }
     }
     if invalid_args || request_arg.is_some() != evidence_arg.is_some() {
-        if let Some(evidence) = evidence_arg.as_ref() {
+        if let Some(evidence) = evidence_arg.as_ref().filter(|value| !value.is_empty()) {
             if publish_benchmark_stage(Path::new(evidence), 10, "application_arguments_malformed")
                 .is_err()
             {
@@ -4513,6 +4559,102 @@ mod tests {
             command.value(BENCHMARK_TOKENIZER_EVIDENCE_ENV),
             Some(evidence.as_os_str())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_tokenizer_non_utf8_stage_path_publication_is_exact() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let temp = TempDir::new().expect("tempdir");
+        let evidence = temp
+            .path()
+            .join(OsString::from_vec(b"evidence-\x81.json".to_vec()));
+
+        let mut expected_stage = evidence.clone().into_os_string();
+        expected_stage.push(".stage.json");
+        let expected_stage = PathBuf::from(expected_stage);
+        assert_eq!(benchmark_stage_path(&evidence), expected_stage);
+        assert!(!expected_stage.exists());
+
+        let lossy_stage = PathBuf::from(format!("{}.stage.json", evidence.display()));
+        assert_ne!(
+            lossy_stage.as_os_str().as_bytes(),
+            expected_stage.as_os_str().as_bytes()
+        );
+        assert!(!lossy_stage.exists());
+
+        publish_benchmark_stage(&evidence, 10, "application_arguments_accepted")
+            .expect("replace exact non-UTF-8 stage path");
+        assert!(expected_stage.is_file());
+        let stage: Value = serde_json::from_slice(
+            &std::fs::read(&expected_stage).expect("exact non-UTF-8 stage state"),
+        )
+        .expect("valid stage JSON");
+        assert_eq!(stage["category"], "application_arguments_accepted");
+        assert!(!lossy_stage.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benchmark_tokenizer_non_utf8_command_line_pair_is_authoritative() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let request = temp
+            .path()
+            .join(OsString::from_vec(b"request-\x80.json".to_vec()));
+        let evidence = temp
+            .path()
+            .join(OsString::from_vec(b"evidence-\x81.json".to_vec()));
+        let mut request_arg = OsString::from(BENCHMARK_TOKENIZER_REQUEST_ARG);
+        request_arg.push(&request);
+        let mut evidence_arg = OsString::from(BENCHMARK_TOKENIZER_EVIDENCE_ARG);
+        evidence_arg.push(&evidence);
+
+        assert_eq!(
+            benchmark_tokenizer_handoff(
+                [request_arg.clone(), evidence_arg.clone()],
+                Some(OsString::from("poisoned-request")),
+                Some(OsString::from("poisoned-evidence")),
+            ),
+            (
+                Some(request.clone().into_os_string()),
+                Some(evidence.clone().into_os_string()),
+            )
+        );
+
+        let empty_request = OsString::from(BENCHMARK_TOKENIZER_REQUEST_ARG);
+        let empty_evidence = OsString::from(BENCHMARK_TOKENIZER_EVIDENCE_ARG);
+        let mut malformed_request = OsString::from(BENCHMARK_TOKENIZER_REQUEST_ARG_NAME);
+        malformed_request.push(OsString::from_vec(b"\x80".to_vec()));
+        for invalid in [
+            vec![request_arg.clone()],
+            vec![evidence_arg.clone()],
+            vec![
+                request_arg.clone(),
+                request_arg.clone(),
+                evidence_arg.clone(),
+            ],
+            vec![
+                request_arg.clone(),
+                evidence_arg.clone(),
+                evidence_arg.clone(),
+            ],
+            vec![empty_request.clone(), evidence_arg.clone()],
+            vec![request_arg.clone(), empty_evidence],
+            vec![malformed_request, evidence_arg.clone()],
+        ] {
+            assert_eq!(
+                benchmark_tokenizer_handoff(
+                    invalid,
+                    Some(OsString::from("poisoned-request")),
+                    Some(OsString::from("poisoned-evidence")),
+                ),
+                (None, None),
+                "recognized malformed non-UTF-8 arguments must fail closed",
+            );
+        }
     }
 
     async fn acknowledge_stopped_event_for_test(state: &ComputeNodeState, session_id: &str) {

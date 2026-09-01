@@ -3243,26 +3243,40 @@ def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
 
 
 def test_api_v1_poll_delivers_fifo_for_multiple_requests(client):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
-    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    capabilities = _capabilities('8k-fast')
+    capabilities['max_concurrency'] = 2
+    server_payload = _api_v1_registered_control_payload(
+        client, DUMMY_SERVER_PUB_KEY, capabilities=capabilities
+    )
 
     for request_id in ("req-fifo-1", "req-fifo-2"):
-        queued = client.post('/api/v1/relay/requests', json={
-            'request_id': request_id,
-            'client_public_key': DUMMY_CLIENT_PUB_KEY,
-            'server_public_key': DUMMY_SERVER_PUB_KEY,
-            'chat_history': f'ciphertext-{request_id}',
-            'cipherkey': 'cipherkey-request',
-            'iv': 'iv-request',
-        })
+        request_payload = _api_v1_request_payload(request_id)
+        request_payload['chat_history'] = f'ciphertext-{request_id}'
+        queued = client.post('/api/v1/relay/requests', json=request_payload)
         assert queued.status_code == 200
 
-    first = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
-    second = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    first = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    second = client.post('/api/v1/relay/servers/poll', json=server_payload)
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.get_json()['request_id'] == 'req-fifo-1'
-    assert second.get_json()['request_id'] == 'req-fifo-2'
+    first_payload = first.get_json()
+    second_payload = second.get_json()
+    assert first_payload['request_id'] == 'req-fifo-1'
+    assert second_payload['request_id'] == 'req-fifo-2'
+    assert first_payload['chat_history'] == 'ciphertext-req-fifo-1'
+    assert second_payload['chat_history'] == 'ciphertext-req-fifo-2'
+    for payload in (first_payload, second_payload):
+        assert isinstance(payload['claim_generation'], int)
+        assert not isinstance(payload['claim_generation'], bool)
+        assert '_queued_at' not in payload
+
+    store = relay_module._api_v1_store()
+    assert store.queued_requests(DUMMY_SERVER_PUB_KEY) == ()
+    for request_id in ('req-fifo-1', 'req-fifo-2'):
+        claimed = store.claimed_request(DUMMY_SERVER_PUB_KEY, request_id)
+        assert claimed is not None
+        assert claimed[0].client_public_key == DUMMY_CLIENT_PUB_KEY
+        assert claimed[1].selected_node_id == DUMMY_SERVER_PUB_KEY
 
 
 def test_api_v1_poll_refreshes_server_lease(client, monkeypatch):

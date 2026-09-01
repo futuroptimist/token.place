@@ -33,7 +33,7 @@ def test_packaged_webview2_session_launches_attaches_and_terminates(monkeypatch,
     launches = []
     targets = []
     driver_calls = []
-    terminated = []
+    cleaned = []
 
     monkeypatch.setattr(ui_e2e, "reserve_free_port", lambda: 49152)
     monkeypatch.setattr(
@@ -51,12 +51,15 @@ def test_packaged_webview2_session_launches_attaches_and_terminates(monkeypatch,
         "start_driver",
         lambda app, **kwargs: driver_calls.append((app, kwargs)) or "driver",
     )
-    monkeypatch.setattr(ui_e2e, "terminate_process", terminated.append)
+    monkeypatch.setattr(
+        ui_e2e, "_cleanup_owned_process_tree",
+        lambda candidate, remaining: cleaned.append((candidate, remaining())) or True)
 
     with ui_e2e.packaged_windows_webview2_session(
-            application, {"BASE": "preserved"}, None) as launched:
+            application, {"BASE": "preserved"}, None,
+            platform_name="nt") as launched:
         assert launched == (process, "driver")
-        assert terminated == []
+        assert cleaned == []
 
     command, kwargs = launches[0]
     assert command == [
@@ -70,7 +73,9 @@ def test_packaged_webview2_session_launches_attaches_and_terminates(monkeypatch,
     assert targets == [(process, 49152, 90.0)]
     assert driver_calls == [
         (application, {"debugger_address": "127.0.0.1:49152"})]
-    assert terminated == [process]
+    assert len(cleaned) == 1
+    assert cleaned[0][0] is process
+    assert 0 < cleaned[0][1] <= 10.0
 
 
 @pytest.mark.parametrize(
@@ -86,7 +91,7 @@ def test_packaged_webview2_session_fails_closed_and_cleans_up(
     application = tmp_path / "token-place.exe"
     application.write_bytes(b"app")
     process = _ApplicationProcess()
-    terminated = []
+    cleaned = []
     monkeypatch.setattr(ui_e2e, "reserve_free_port", lambda: 49152)
 
     def launch(*_args, **_kwargs):
@@ -106,14 +111,25 @@ def test_packaged_webview2_session_fails_closed_and_cleans_up(
     monkeypatch.setattr(ui_e2e.subprocess, "Popen", launch)
     monkeypatch.setattr(ui_e2e, "wait_for_webview2_devtools", target)
     monkeypatch.setattr(ui_e2e, "start_driver", driver)
-    monkeypatch.setattr(ui_e2e, "terminate_process", terminated.append)
+    monkeypatch.setattr(
+        ui_e2e, "_cleanup_owned_process_tree",
+        lambda candidate, remaining: cleaned.append(candidate) or True)
 
     with pytest.raises(RuntimeError, match=f"^{expected_error}$"):
         with ui_e2e.packaged_windows_webview2_session(
-                application, {}, None):
+                application, {}, None, platform_name="nt"):
             pytest.fail("a failed session must not be yielded")
 
-    assert terminated == ([] if failure_stage == "launch" else [process])
+    assert cleaned == ([] if failure_stage == "launch" else [process])
+
+
+def test_packaged_webview2_session_rejects_non_windows(monkeypatch, tmp_path):
+    application = tmp_path / "token-place"
+    application.write_bytes(b"app")
+    with pytest.raises(RuntimeError, match="^webdriver_application_startup_failed$"):
+        with ui_e2e.packaged_windows_webview2_session(
+                application, {}, None, platform_name="posix"):
+            pytest.fail("a non-Windows session must not be yielded")
 
 
 def _profile(model: Path, *, size: int | None = None, digest: str | None = None):

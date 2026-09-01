@@ -832,8 +832,10 @@ def wait_for_webview2_devtools(
 @contextlib.contextmanager
 def packaged_windows_webview2_session(
         app_binary: Path, env: dict[str, str], log_handle,
-        timeout_seconds: float = 90.0):
+        timeout_seconds: float = 90.0, *, platform_name: str | None = None):
     """Launch, attach to, and always stop an installed native WebView2 app."""
+    if (os.name if platform_name is None else platform_name) != "nt":
+        raise RuntimeError("webdriver_application_startup_failed")
     devtools_port = reserve_free_port()
     application_env = env.copy()
     application_env.update({
@@ -858,13 +860,22 @@ def packaged_windows_webview2_session(
             raise RuntimeError("webdriver_application_startup_failed") from exc
         wait_for_webview2_devtools(
             application_process, devtools_port, timeout_seconds)
-        driver = start_driver(
-            app_binary, debugger_address=f"127.0.0.1:{devtools_port}")
+        try:
+            driver = start_driver(
+                app_binary, debugger_address=f"127.0.0.1:{devtools_port}")
+        except Exception as exc:
+            category, _, _ = _classify_webdriver_session_failure(
+                exc, application_process)
+            raise RuntimeError(category) from exc
         yield application_process, driver
     finally:
         if application_process is not None:
             with contextlib.suppress(Exception):
-                terminate_process(application_process)
+                cleanup_deadline = time.monotonic() + 10.0
+                _cleanup_owned_process_tree(
+                    application_process,
+                    lambda: max(0.0, cleanup_deadline - time.monotonic()),
+                )
 
 
 def start_landing_driver() -> webdriver.Chrome:
@@ -2441,13 +2452,14 @@ def main(argv: list[str] | None = None) -> int:
         text=True,
     )
 
+    driver_log_handle = driver_log.open("w", encoding="utf-8")
     tauri_driver = subprocess.Popen(  # noqa: S603
         tauri_driver_command(),
         # Keep cwd aligned with src-tauri so runtime asset resolution for ../dist works
         # when the app starts under tauri-driver in CI.
         cwd=TAURI_ROOT,
         env=env,
-        stdout=driver_log.open("w", encoding="utf-8"),
+        stdout=driver_log_handle,
         stderr=subprocess.STDOUT,
         text=True,
     )
@@ -2455,7 +2467,6 @@ def main(argv: list[str] | None = None) -> int:
     driver: webdriver.Remote | None = None
     landing_driver: webdriver.Chrome | None = None
     application_stack = contextlib.ExitStack()
-    application_log_handle = None
     model_path = args.model.resolve(strict=True) if hardware_mode else resolve_real_e2e_model_path()
     try:
         wait_for_http_200(f"{relay_url}/livez")
@@ -2479,10 +2490,9 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(f"missing desktop binary: {app_binary}")
 
         if hardware_mode:
-            application_log_handle = driver_log.open("a", encoding="utf-8")
             _, driver = application_stack.enter_context(
                 packaged_windows_webview2_session(
-                    app_binary, env, application_log_handle))
+                    app_binary, env, driver_log_handle))
         else:
             driver = start_driver(app_binary)
         wait = WebDriverWait(driver, 45)
@@ -2639,10 +2649,9 @@ def main(argv: list[str] | None = None) -> int:
             with contextlib.suppress(Exception):
                 driver.quit()
         application_stack.close()
-        if application_log_handle is not None:
-            application_log_handle.close()
         with contextlib.suppress(Exception):
             terminate_process(tauri_driver)
+        driver_log_handle.close()
         with contextlib.suppress(Exception):
             terminate_process(relay)
         shutil.rmtree(isolated_home, ignore_errors=True)

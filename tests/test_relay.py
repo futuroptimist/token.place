@@ -3172,37 +3172,56 @@ def test_api_v1_poll_fails_closed_if_server_unregistered_before_authoritative_cl
 
 
 def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypatch):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
-    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    server_payload = _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=_capabilities('8k-fast'),
+    )
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.5')
+    store = relay_module._api_v1_store()
+    original_claim = store.claim_queued_request
+    empty_queue_observed = threading.Event()
+
+    def _observe_empty_queue(*args, **kwargs):
+        claim = original_claim(*args, **kwargs)
+        if claim.state == 'empty':
+            empty_queue_observed.set()
+        return claim
+
+    monkeypatch.setattr(store, 'claim_queued_request', _observe_empty_queue)
 
     result = {}
 
     def _poll():
         with app.test_client() as polling_client:
-            response = polling_client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+            response = polling_client.post('/api/v1/relay/servers/poll', json=server_payload)
             result['status'] = response.status_code
             result['json'] = response.get_json()
 
     poll_thread = threading.Thread(target=_poll)
     poll_thread.start()
-    time.sleep(0.05)
+    assert empty_queue_observed.wait(timeout=1.0)
 
-    queued = client.post('/api/v1/relay/requests', json={
-        'request_id': 'req-long-poll-dispatch',
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'server_public_key': DUMMY_SERVER_PUB_KEY,
-        'chat_history': 'ciphertext-request',
-        'cipherkey': 'cipherkey-request',
-        'iv': 'iv-request',
-    })
-    assert queued.status_code == 200
+    _queue_api_v1_request(
+        client,
+        server_public_key=DUMMY_SERVER_PUB_KEY,
+        request_id='req-long-poll-dispatch',
+        client_public_key=DUMMY_CLIENT_PUB_KEY,
+    )
 
     poll_thread.join(timeout=1.0)
     assert not poll_thread.is_alive()
     assert result['status'] == 200
     assert result['json']['request_id'] == 'req-long-poll-dispatch'
+    assert result['json']['chat_history'] == 'ciphertext-request'
+    assert isinstance(result['json']['claim_generation'], int)
+    assert not isinstance(result['json']['claim_generation'], bool)
     assert '_queued_at' not in result['json']
+    assert store.queued_requests(DUMMY_SERVER_PUB_KEY) == ()
+    claimed = store.claimed_request(DUMMY_SERVER_PUB_KEY, 'req-long-poll-dispatch')
+    assert claimed is not None
+    assert claimed[0].client_public_key == DUMMY_CLIENT_PUB_KEY
+    assert claimed[1].selected_node_id == DUMMY_SERVER_PUB_KEY
 
 
 def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):

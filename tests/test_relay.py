@@ -3302,13 +3302,28 @@ def test_api_v1_poll_refreshes_server_lease(client, monkeypatch):
 
 
 def test_api_v1_stale_server_expires_without_poll_heartbeat(client, monkeypatch):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY}
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
-    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
-    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
-    known_servers[DUMMY_SERVER_PUB_KEY]['last_ping'] = datetime.now() - timedelta(seconds=2)
-    expired = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    relay_module._reset_api_v1_relay_state_store()
+    store = relay_module._api_v1_store()
+    epoch = [time.time()]
+    monkeypatch.setattr(store, '_epoch_time', lambda: epoch[0])
+    server_payload = _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=_capabilities('8k-fast'),
+    )
+
+    epoch[0] += 2.0
+    expired = client.post('/api/v1/relay/servers/poll', json=server_payload)
+
     assert expired.status_code == 404
+    assert expired.get_json() == {
+        'error': {
+            'message': 'Server with the specified public key not found',
+            'code': 404,
+        }
+    }
+    assert store.get(DUMMY_SERVER_PUB_KEY) is None
 
 
 def test_api_v1_poll_long_wait_ignores_unrelated_server_wakeups(client, monkeypatch):

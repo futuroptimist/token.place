@@ -323,15 +323,17 @@ def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining
     record_progress("operator_running")
 
     registration_deadline = time.monotonic() + setup_remaining()
+    terminal_allowance = min(0.5, max(0.0, registration_deadline - time.monotonic()))
+    ordinary_polling_deadline = registration_deadline - terminal_allowance
 
     def authoritative_registration_observed(_driver) -> bool:
-        remaining = registration_deadline - time.monotonic()
+        remaining = ordinary_polling_deadline - time.monotonic()
         if remaining <= 0:
             return False
         record_relay_observation("polled")
         try:
             registered = fetch_relay_diagnostics_count(
-                relay_url, timeout_seconds=max(0.05, min(remaining, 0.5))) == 1
+                relay_url, timeout_seconds=min(remaining, 0.5)) == 1
         except Exception:
             return False
         if registered:
@@ -339,11 +341,22 @@ def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining
         return registered
 
     try:
-        WebDriverWait(driver, max(0.0, registration_deadline - time.monotonic()),
+        WebDriverWait(driver, max(0.0, ordinary_polling_deadline - time.monotonic()),
             poll_frequency=0.25).until(authoritative_registration_observed)
     except Exception:
-        record_relay_observation("not_reached")
-        fail_closed("operator_registration_not_reached")
+        remaining = registration_deadline - time.monotonic()
+        terminal_registered = False
+        if remaining > 0:
+            record_relay_observation("polled")
+            try:
+                terminal_registered = fetch_relay_diagnostics_count(
+                    relay_url, timeout_seconds=min(remaining, 0.5)) == 1
+            except Exception:
+                terminal_registered = False
+        if not terminal_registered:
+            record_relay_observation("not_reached")
+            fail_closed("operator_registration_not_reached")
+        record_relay_observation("registered")
     record_progress("operator_registered")
 
 

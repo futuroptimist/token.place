@@ -1275,14 +1275,20 @@ def test_relay_baseline_retries_transient_failure(desktop_runner):
 
 
 def test_post_start_operator_state_accepts_terminal_authoritative_registration(
-        desktop_runner):
+        desktop_runner, monkeypatch):
     progress = []
     relay_observations = []
+    clock = [100.0]
+    monkeypatch.setattr(desktop_runner.time, "monotonic", lambda: clock[0])
     desktop_runner._read_operator_start_diagnostic = lambda _driver: {
         "start_handler_state": "entered", "invocation_state": "resolved"}
     desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
+    fetches = []
     counts = iter((0, 1))
-    desktop_runner.fetch_relay_diagnostics_count = lambda *_args, **_kwargs: next(counts)
+    def fetch(_relay_url, timeout_seconds):
+        fetches.append((clock[0], timeout_seconds))
+        return next(counts)
+    desktop_runner.fetch_relay_diagnostics_count = fetch
 
     class Wait:
         calls = 0
@@ -1296,14 +1302,73 @@ def test_post_start_operator_state_accepts_terminal_authoritative_registration(
                 assert predicate(object()) is True
                 return True
             assert predicate(object()) is False
-            assert predicate(object()) is True
-            return True
+            clock[0] = 100.5
+            raise TimeoutError("ordinary polling expired")
     desktop_runner.WebDriverWait = Wait
     desktop_runner.wait_for_post_start_operator_state(
         object(), lambda: 9, progress.append, pytest.fail, "https://relay.example",
         relay_observations.append)
     assert progress == ["operator_running", "operator_registered"]
     assert relay_observations == ["polled", "polled", "registered"]
+    assert fetches[0][0] < fetches[1][0]
+    assert 0 < fetches[1][1] <= 101.0 - fetches[1][0]
+
+
+@pytest.mark.parametrize("terminal_result", [0, RuntimeError(
+    "https://hostile.example/private prompt-secret")])
+def test_post_start_operator_state_terminal_authoritative_failure_is_sanitized(
+        desktop_runner, monkeypatch, terminal_result):
+    observations = []
+    progress = []
+    clock = [100.0]
+    monkeypatch.setattr(desktop_runner.time, "monotonic", lambda: clock[0])
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "entered", "invocation_state": "resolved"}
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
+    fetches = []
+
+    def fetch(_relay_url, timeout_seconds):
+        fetches.append((clock[0], timeout_seconds))
+        if len(fetches) == 1:
+            return 0
+        if isinstance(terminal_result, Exception):
+            raise terminal_result
+        return terminal_result
+
+    desktop_runner.fetch_relay_diagnostics_count = fetch
+
+    class Wait:
+        calls = 0
+
+        def __init__(self, _driver, _timeout, **_kwargs):
+            pass
+
+        def until(self, predicate):
+            type(self).calls += 1
+            if self.calls == 1:
+                assert predicate(object()) is True
+                return True
+            assert predicate(object()) is False
+            clock[0] = 100.5
+            raise TimeoutError("https://hostile.example/ordinary prompt-secret")
+
+    desktop_runner.WebDriverWait = Wait
+
+    def fail_closed(reason):
+        raise RuntimeError(reason) from None
+
+    with pytest.raises(RuntimeError, match="^operator_registration_not_reached$") as raised:
+        desktop_runner.wait_for_post_start_operator_state(
+            object(), lambda: 1, progress.append, fail_closed, "https://hostile.example",
+            observations.append)
+
+    assert len(fetches) == 2
+    assert fetches[0][0] < fetches[1][0]
+    assert 0 < fetches[1][1] <= 101.0 - fetches[1][0]
+    assert observations == ["polled", "polled", "not_reached"]
+    assert progress == ["operator_running"]
+    assert "hostile.example" not in str(raised.value)
+    assert "prompt-secret" not in str(raised.value)
 
 
 def test_post_start_operator_state_retries_transient_relay_failure(desktop_runner):

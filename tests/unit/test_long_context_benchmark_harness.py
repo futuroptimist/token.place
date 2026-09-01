@@ -98,6 +98,7 @@ def desktop_runner():
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
         "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
         "wait_for_post_start_operator_state",
+        "fetch_relay_diagnostics_count",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
         "_read_operator_start_diagnostic", "_read_native_startup_diagnostic",
@@ -1262,6 +1263,7 @@ def test_post_start_operator_state_distinguishes_registration_failure(desktop_ru
             raise RuntimeError("https://private.example prompt-secret")
 
     desktop_runner.WebDriverWait = Wait
+    desktop_runner.fetch_relay_diagnostics_count = lambda *_args, **_kwargs: 0
 
     def fail_closed(reason):
         raise RuntimeError(reason) from None
@@ -1272,6 +1274,64 @@ def test_post_start_operator_state_distinguishes_registration_failure(desktop_ru
 
     assert progress == ["operator_running"]
     assert "private.example" not in str(raised.value)
+
+
+@pytest.mark.parametrize(("baseline", "terminal", "succeeds"), [
+    (0, 1, True),
+    (0, 0, False),
+    (1, 1, False),
+])
+def test_post_start_operator_state_uses_attempt_specific_terminal_observation(
+        desktop_runner, baseline, terminal, succeeds):
+    progress = []
+    observations = []
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "entered", "invocation_state": "resolved"}
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
+    desktop_runner.fetch_relay_diagnostics_count = lambda *_args, **_kwargs: terminal
+
+    class Wait:
+        calls = 0
+        def __init__(self, _driver, _timeout, **_kwargs):
+            pass
+        def until(self, predicate):
+            type(self).calls += 1
+            if self.calls == 1:
+                return predicate(object())
+            raise RuntimeError("deadline")
+
+    desktop_runner.WebDriverWait = Wait
+    def invoke():
+        desktop_runner.wait_for_post_start_operator_state(
+            object(), lambda: 9, progress.append,
+            lambda reason: (_ for _ in ()).throw(RuntimeError(reason)),
+            "https://relay.example", baseline,
+            lambda polling, registration: observations.append((polling, registration)))
+    if succeeds:
+        invoke()
+        assert progress == ["operator_running", "operator_registered"]
+        assert observations[-1] == ("started", "registered")
+    else:
+        with pytest.raises(RuntimeError, match="^operator_registration_not_reached$"):
+            invoke()
+        assert progress == ["operator_running"]
+        assert observations == [("started", "not_reached")]
+
+
+def test_packaged_diagnostic_prefers_authoritative_observation_over_lagging_ui(
+        desktop_runner):
+    diagnostic = desktop_runner._read_packaged_startup_diagnostic(
+        _packaged_status_driver({
+            "Startup phase": "warm_load", "Provisioning state": "provisioning",
+            "Relay runtime state": "ready", "Worker state": "ready",
+            "Last worker error code": "none", "Last worker exit code": "none",
+            "Registered": "no (0/1 relays)",
+        }), {"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "bridge_attached"}, "ready", "started", "registered")
+
+    assert diagnostic["relay_polling_state"] == "started"
+    assert diagnostic["registration_state"] == "registered"
+    assert diagnostic["startup_boundary"] == "registered"
 
 
 def test_post_start_operator_state_rejects_optimistic_running_without_active_attempt(
@@ -3847,7 +3907,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         if ready_error:
             raise ready_error
 
-    def post_start(_driver, _remaining, record_progress, fail_closed):
+    def post_start(_driver, _remaining, record_progress, fail_closed, *_args):
         if operator_error:
             if str(operator_error) in {
                     "handoff_failure", "submit_failure", "final_stage_failure"}:
@@ -3930,6 +3990,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "fill_input_by_label": lambda *_args: None,
         "benchmark_operator_mode": lambda _backend: "cpu",
         "wait_for_start_operator_enabled": lambda *_args, **_kwargs: None,
+        "fetch_relay_diagnostics_count": lambda *_args, **_kwargs: 0,
         "wait_for_post_start_operator_state": post_start,
         "_validate_operator_tokenizer_handoff": lambda _evidence, fail_closed: (
             fail_closed("rust_python_handoff_failed")

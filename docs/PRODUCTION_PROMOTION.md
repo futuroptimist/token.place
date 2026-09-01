@@ -1,5 +1,8 @@
 # token.place staging-to-production promotion checklist
 
+The frozen Qwen candidate identity and Step 05 evidence handoff are recorded in
+[desktop-v0.1.17](releases/desktop-v0.1.17.md).
+
 Use this checklist for every relay promotion from staging to production. It is intentionally
 repeatable and focused on the release risks that have regressed before: API v1 model identity,
 landing-chat routing, relay-blind E2EE privacy, live compute-node diagnostics, production secrets,

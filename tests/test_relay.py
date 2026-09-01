@@ -3014,33 +3014,40 @@ def test_legacy_next_server_can_be_enabled_with_compatibility_flag(client, monke
 
 
 def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphertext_only(client):
-    register = client.post('/api/v1/relay/servers/register', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    server_payload = _api_v1_registered_control_payload(
+        client,
+        DUMMY_SERVER_PUB_KEY,
+        capabilities=_capabilities('8k-fast'),
+    )
 
     request_plaintext = 'PLAINTEXT_REQUEST_SENTINEL_DO_NOT_STORE'
-    request_payload = {
-        'protocol': 'tokenplace_api_v1_relay_e2ee',
-        'version': 1,
-        'request_id': 'req-provider-style',
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'server_public_key': DUMMY_SERVER_PUB_KEY,
-        'ciphertext': 'ciphertext-request-provider-style',
+    request_payload = _api_v1_request_payload('req-provider-style') | {
+        'chat_history': 'ciphertext-request-provider-style',
         'cipherkey': 'cipherkey-request-provider-style',
         'iv': 'iv-request-provider-style',
     }
 
     queued = client.post('/api/v1/relay/requests', json=request_payload)
     assert queued.status_code == 200
-    relay_state = client_inference_requests[DUMMY_SERVER_PUB_KEY][0]
-    assert relay_state['protocol'] == 'tokenplace_api_v1_relay_e2ee'
-    assert relay_state['version'] == 1
-    assert relay_state['request_id'] == 'req-provider-style'
-    assert relay_state['e2ee_v1'] is True
-    assert 'messages' not in relay_state
-    assert request_plaintext not in json.dumps(relay_state)
+    retrieval_credential = queued.get_json()['retrieval_credential']
+    assert retrieval_credential
+    authoritative_requests = relay_module._api_v1_store().queued_requests(DUMMY_SERVER_PUB_KEY)
+    assert len(authoritative_requests) == 1
+    relay_state = authoritative_requests[0]
+    assert relay_state.client_public_key == DUMMY_CLIENT_PUB_KEY
+    assert relay_state.request_id == 'req-provider-style'
+    assert relay_state.envelope.protocol == 'tokenplace_api_v1_relay_e2ee'
+    assert relay_state.envelope.version == 1
+    assert relay_state.envelope.ciphertext == 'ciphertext-request-provider-style'
+    assert relay_state.envelope.cipherkey == 'cipherkey-request-provider-style'
+    assert relay_state.envelope.iv == 'iv-request-provider-style'
+    assert request_plaintext not in repr(relay_state)
+    assert request_plaintext not in repr(relay_state.envelope)
+    assert client_inference_requests.get(DUMMY_SERVER_PUB_KEY, []) == []
 
     polled = client.post(
         '/api/v1/relay/servers/poll',
-        json={'server_public_key': DUMMY_SERVER_PUB_KEY},
+        json=server_payload,
     )
     assert polled.status_code == 200
     polled_payload = polled.get_json()
@@ -3048,35 +3055,58 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
     assert polled_payload['version'] == 1
     assert polled_payload['request_id'] == 'req-provider-style'
     assert polled_payload['chat_history'] == 'ciphertext-request-provider-style'
+    assert polled_payload['cipherkey'] == 'cipherkey-request-provider-style'
+    assert polled_payload['iv'] == 'iv-request-provider-style'
+    assert isinstance(polled_payload['claim_generation'], int)
     assert request_plaintext not in json.dumps(polled_payload)
 
     response_plaintext = 'PLAINTEXT_RESPONSE_SENTINEL_DO_NOT_STORE'
-    response_payload = {
+    response_payload = _api_v1_response_payload(
+        'req-provider-style',
+        ciphertext='ciphertext-response-provider-style',
+        server_public_key=DUMMY_SERVER_PUB_KEY,
+        control_credential=server_payload['control_credential'],
+        claim_generation=polled_payload['claim_generation'],
+    ) | {
         'protocol': 'tokenplace_api_v1_relay_e2ee',
         'version': 1,
-        'request_id': 'req-provider-style',
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'ciphertext': 'ciphertext-response-provider-style',
         'cipherkey': 'cipherkey-response-provider-style',
         'iv': 'iv-response-provider-style',
     }
     submitted = client.post('/api/v1/relay/responses', json=response_payload)
     assert submitted.status_code == 200
-    queued_response = client_responses[DUMMY_CLIENT_PUB_KEY]
-    assert queued_response['protocol'] == 'tokenplace_api_v1_relay_e2ee'
-    assert queued_response['request_id'] == 'req-provider-style'
-    assert 'api_v1_response' not in queued_response
-    assert response_plaintext not in json.dumps(queued_response)
+    authoritative_responses = relay_module._api_v1_store().response_records()
+    assert len(authoritative_responses) == 1
+    queued_response = authoritative_responses[0]
+    assert queued_response.client_public_key == DUMMY_CLIENT_PUB_KEY
+    assert queued_response.request_id == 'req-provider-style'
+    assert queued_response.envelope.protocol == 'tokenplace_api_v1_relay_e2ee'
+    assert queued_response.envelope.version == 1
+    assert queued_response.envelope.ciphertext == 'ciphertext-response-provider-style'
+    assert queued_response.envelope.cipherkey == 'cipherkey-response-provider-style'
+    assert queued_response.envelope.iv == 'iv-response-provider-style'
+    assert response_plaintext not in repr(queued_response)
+    assert response_plaintext not in repr(queued_response.envelope)
 
     retrieved = client.post(
         '/api/v1/relay/responses/retrieve',
-        json={'client_public_key': DUMMY_CLIENT_PUB_KEY, 'request_id': 'req-provider-style'},
+        json={
+            'client_public_key': DUMMY_CLIENT_PUB_KEY,
+            'request_id': 'req-provider-style',
+            'retrieval_credential': retrieval_credential,
+        },
     )
     assert retrieved.status_code == 200
     retrieved_payload = retrieved.get_json()
     assert retrieved_payload['request_id'] == 'req-provider-style'
+    assert retrieved_payload['protocol'] == 'tokenplace_api_v1_relay_e2ee'
+    assert retrieved_payload['version'] == 1
     assert retrieved_payload['chat_history'] == 'ciphertext-response-provider-style'
+    assert retrieved_payload['ciphertext'] == 'ciphertext-response-provider-style'
+    assert retrieved_payload['cipherkey'] == 'cipherkey-response-provider-style'
+    assert retrieved_payload['iv'] == 'iv-response-provider-style'
     assert response_plaintext not in json.dumps(retrieved_payload)
+    assert DUMMY_CLIENT_PUB_KEY not in client_responses
 
 
 def test_api_v1_poll_clears_popped_work_if_server_unregistered_before_dispatch(client, monkeypatch):

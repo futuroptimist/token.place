@@ -3109,46 +3109,65 @@ def test_api_v1_provider_envelope_is_queued_polled_responded_and_retrieved_ciphe
     assert DUMMY_CLIENT_PUB_KEY not in client_responses
 
 
-def test_api_v1_poll_clears_popped_work_if_server_unregistered_before_dispatch(client, monkeypatch):
+def test_api_v1_poll_fails_closed_if_server_unregistered_before_authoritative_claim(client, monkeypatch):
     server_payload = _api_v1_registered_control_payload(client, DUMMY_SERVER_PUB_KEY, capabilities=_capabilities('8k-fast'))
 
-    queued = client.post('/api/v1/relay/requests', json={
-        'request_id': 'req-requeue-on-unregister-race',
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'server_public_key': DUMMY_SERVER_PUB_KEY,
-        'chat_history': 'ciphertext-request',
-        'cipherkey': 'cipherkey-request',
-        'iv': 'iv-request',
-    })
+    queued = client.post(
+        '/api/v1/relay/requests',
+        json=_api_v1_request_payload('req-requeue-on-unregister-race'),
+    )
     assert queued.status_code == 200
+    retrieval_credential = queued.get_json()['retrieval_credential']
+    assert retrieval_credential
 
-    original_pop = relay_module._pop_next_api_v1_request
+    store = relay_module._api_v1_store()
+    original_claim = store.claim_queued_request
+    unregister_attempted = False
 
-    def _pop_then_unregister(public_key):
-        popped = original_pop(public_key)
-        if popped is not None:
-            relay_module._record_api_v1_server_unregistered(public_key)
-            relay_module._remove_known_server(public_key)
-        return popped
+    def _unregister_then_claim(node_id, control_credential_digest, consumer_identity):
+        nonlocal unregister_attempted
+        assert not unregister_attempted
+        unregister_attempted = True
+        transition = store.unregister_node_and_transition_work(
+            node_id,
+            control_credential_digest,
+        )
+        assert transition.state == 'complete'
+        return original_claim(node_id, control_credential_digest, consumer_identity)
 
-    monkeypatch.setattr(relay_module, '_pop_next_api_v1_request', _pop_then_unregister)
+    monkeypatch.setattr(store, 'claim_queued_request', _unregister_then_claim)
 
-    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
-    assert poll.status_code == 404
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
+    assert poll.status_code == 403
+    assert poll.get_json() == {
+        'error': {
+            'message': 'Missing or invalid relay server control credential',
+            'code': 403,
+        }
+    }
+    assert unregister_attempted
 
-    assert DUMMY_SERVER_PUB_KEY not in client_inference_requests
-    assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    assert store.queued_requests(DUMMY_SERVER_PUB_KEY) == ()
+    assert store.claimed_request(DUMMY_SERVER_PUB_KEY, 'req-requeue-on-unregister-race') is None
+    terminals = store.terminal_records()
+    assert len(terminals) == 1
+    assert terminals[0].outcome == 'cancelled'
+    assert terminals[0].reason == 'server_unregistered'
+    assert terminals[0].retrieval_state == 'completed_unavailable'
 
     retrieved = client.post('/api/v1/relay/responses/retrieve', json={
         'client_public_key': DUMMY_CLIENT_PUB_KEY,
         'request_id': 'req-requeue-on-unregister-race',
+        'retrieval_credential': retrieval_credential,
     })
     assert retrieved.status_code == 410
-    assert retrieved.get_json()['error'] == {
-        'message': 'Request cancelled',
-        'code': 'cancelled',
-        'status': 'cancelled',
-        'reason': 'server_unregistered',
+    assert retrieved.get_json() == {
+        'error': {
+            'message': 'Request completed_unavailable',
+            'code': 'completed_unavailable',
+            'status': 'completed_unavailable',
+            'reason': 'completed_unavailable',
+        }
     }
 
 

@@ -8,10 +8,11 @@ This note is the canonical architecture baseline for the API v1 E2EE migration r
 - **API v1 is non-streaming.** Responses are returned only after full model generation is
   complete.
 - **Do not add streaming to API v1** for relay/client-server inference paths.
-- **API v1 chat is text-only.** The v0.1.0 runtime target is a single Llama 3-family text
-  model, not a multimodal model. Chat completion payloads must not accept, transform, summarize,
-  placeholder, or otherwise pretend to support image content blocks such as `image_url`,
-  `input_image`, or `image`; these requests must fail closed at validation/runtime boundaries.
+- **API v1 chat is text-only.** The canonical runtime target is Qwen3 8B Q4_K_M, exposed as
+  `qwen3-8b-instruct`, not a multimodal model. Chat completion payloads must not accept, transform,
+  summarize, provide placeholders for, or otherwise pretend to support image content blocks such
+  as `image_url`, `input_image`, or `image`; these requests must fail closed at validation/runtime
+  boundaries.
 
 ## Runtime routing rules (must-follow)
 

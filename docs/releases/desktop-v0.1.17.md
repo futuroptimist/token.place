@@ -26,10 +26,11 @@ evergreen [production promotion checklist](../PRODUCTION_PROMOTION.md) for the l
 - Release: [desktop-v0.1.17](https://github.com/futuroptimist/token.place/releases/tag/desktop-v0.1.17).
 
 API v1 remains the only active runtime target and is non-streaming: a response is returned only
-after complete model output generation. All distributed inference must remain relay-blind E2EE;
-relay-owned state, logs, diagnostics, and evidence may contain ciphertext only plus safe routing
-metadata and must fail closed if E2EE cannot be preserved. Packaging CI establishes build evidence,
-not physical Windows or macOS qualification.
+after complete model output generation. All distributed inference must remain relay-blind E2EE.
+Relay-owned operational state may contain only ciphertext plus safe routing metadata and must fail
+closed if E2EE cannot be preserved; logs, diagnostics, and Step 05 evidence must not record
+ciphertext bodies or plaintext payload content. Packaging CI establishes build evidence, not
+physical Windows or macOS qualification.
 
 ## Step 05 staging handoff and evidence template
 

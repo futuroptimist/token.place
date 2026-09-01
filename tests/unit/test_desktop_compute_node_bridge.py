@@ -333,6 +333,8 @@ def test_structured_provisioning_payload_omits_unknown_deadline(monkeypatch):
     payload = compute_node_bridge._structured_provisioning_payload(args, phase='dependency_check', started_at=10.0)
 
     assert payload['runtime_provisioning_state'] == 'provisioning'
+    assert payload['type'] == 'started'
+    assert payload['running'] is False
     assert payload['startup_phase'] == 'dependency_check'
     assert payload['startup_elapsed_ms'] == 2500
     assert payload['startup_deadline_ms'] is None
@@ -3625,6 +3627,12 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
     assert "stop" not in events
     captured = capsys.readouterr()
     output_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+    assert not any(
+        event.get("type") == "started"
+        and event.get("running") is True
+        and event.get("runtime_provisioning_state") != "provisioning"
+        for event in output_events
+    )
     error_event = next(event for event in output_events if event.get("type") == "error")
     assert error_event["warm_load_state"] == "failed"
     assert error_event["relay_runtime_state"] == "failed"
@@ -3723,6 +3731,12 @@ def test_run_stops_when_pre_registration_runtime_warmup_fails(capsys, monkeypatc
     assert status == 1
     assert calls == ["warm"]
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert not any(
+        event.get("type") == "started"
+        and event.get("running") is True
+        and event.get("runtime_provisioning_state") != "provisioning"
+        for event in events
+    )
     payload = next(event for event in events if event.get("type") == "error")
     assert payload["type"] == "error"
 
@@ -3749,9 +3763,89 @@ def test_run_does_not_warm_when_disabled(capsys, monkeypatch):
     assert call_order == ["poll", "poll"]
     output = capsys.readouterr()
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    started_index = next(i for i, event in enumerate(events) if event.get("type") == "started")
+    registered_index = next(
+        i for i, event in enumerate(events) if event.get("registered") is True
+    )
+    assert started_index < registered_index
     status_events = [event for event in events if event.get("type") == "status"]
     assert any(event.get("registered") is True for event in status_events)
     assert all(event.get("relay_runtime_state") == "ready" for event in status_events)
+
+
+def test_run_warm_load_success_starts_once_then_registers_and_keeps_polling(
+    capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    timeline = []
+    original_emit = compute_node_bridge.emit
+
+    def record_operator_event(payload):
+        timeline.append(("event", dict(payload)))
+        original_emit(payload)
+
+    class WarmLoadRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            timeline.append(("warm_load", "started"))
+            timeline.append(("warm_load", "completed"))
+            return True
+
+        def register_and_poll_once(self):
+            timeline.append(("relay_poll", None))
+            return {"next_ping_in_x_seconds": 0}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmLoadRuntime)
+    monkeypatch.setattr(compute_node_bridge, "emit", record_operator_event)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "stop_requested",
+        lambda: sum(kind == "relay_poll" for kind, _value in timeline) >= 2,
+    )
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    args = SimpleNamespace(
+        model="/tmp/model.gguf",
+        mode="cpu",
+        relay_url="https://token.place",
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    runtime_started = [
+        (index, payload)
+        for index, (kind, payload) in enumerate(timeline)
+        if kind == "event"
+        and payload.get("type") == "started"
+        and payload.get("running") is True
+        and payload.get("runtime_provisioning_state") != "provisioning"
+    ]
+    assert len(runtime_started) == 1
+    started_index, started_payload = runtime_started[0]
+    pre_start_statuses = [
+        payload
+        for index, (kind, payload) in enumerate(timeline)
+        if index < started_index and kind == "event" and payload.get("type") == "status"
+    ]
+    assert pre_start_statuses
+    assert all(payload.get("running") is False for payload in pre_start_statuses)
+    warm_completed_index = timeline.index(("warm_load", "completed"))
+    first_poll_index = next(
+        index for index, (kind, _value) in enumerate(timeline) if kind == "relay_poll"
+    )
+    registered_index = next(
+        index
+        for index, (kind, payload) in enumerate(timeline)
+        if kind == "event" and payload.get("registered") is True
+    )
+
+    assert warm_completed_index < started_index < first_poll_index < registered_index
+    assert started_payload["warm_load_enabled"] is True
+    assert started_payload["warm_load_state"] == "ready"
+    assert sum(kind == "relay_poll" for kind, _value in timeline) == 2
+    assert any(
+        kind == "relay_poll" for kind, _value in timeline[registered_index + 1 :]
+    )
+    _ = capsys.readouterr()
 
 
 def test_run_sidecar_runtime_path_warms_bridge_before_registration_without_dual_opt_in(capsys, monkeypatch):
@@ -6584,6 +6678,7 @@ def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monk
         if event.get('type') == 'status' and event.get('startup_phase') == 'warm_load'
     ]
     assert warming_status_events
+    assert all(event['running'] is False for event in warming_status_events)
     assert 'desktop.compute_node_bridge.model_init.still_warming' not in output.err
 
 
@@ -6672,6 +6767,7 @@ def test_warm_load_post_deadline_future_completion_treated_as_timeout(capsys, mo
         if e.get('type') == 'status' and e.get('startup_phase') == 'warm_load'
     ]
     assert timeout_status_events, "expected at least one warm_load status event from the timeout path"
+    assert all(event['running'] is False for event in timeout_status_events)
 
 
 def test_runtime_public_value_redacts_secret_path_diagnostics():

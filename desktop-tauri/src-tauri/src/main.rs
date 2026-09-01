@@ -22,7 +22,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 #[derive(Default)]
 struct AppState {
@@ -414,32 +414,39 @@ async fn start_compute_node(
     request: ComputeNodeRequest,
 ) -> Result<(), String> {
     let compute_state = state.compute_node.clone();
-    tokio::spawn(async move {
-        if let Err(err) =
-            compute_node::start_compute_node(app.clone(), compute_state.clone(), request).await
+    let (entry_sender, entry_receiver) = oneshot::channel();
+    // This task must outlive the IPC command future that acknowledges Start.
+    // Use Tauri's application runtime rather than the command's Tokio context.
+    let task = async move {
+        if let Err(err) = compute_node::start_compute_node_with_entry_ack(
+            app.clone(),
+            compute_state.clone(),
+            request,
+            Some(entry_sender),
+        )
+        .await
         {
             eprintln!("desktop.compute_node.start_failure error={}", err);
-            let log_file_path = {
-                let mut status = compute_state.status.lock().await;
-                status.running = false;
-                status.registered = false;
-                status.last_error = Some(err.to_string());
-                status.log_file_path.clone()
-            };
-            let _ = app.emit(
-                "compute_node_event",
-                serde_json::json!({
-                    "type": "error",
-                    "running": false,
-                    "registered": false,
-                    "last_error": err.to_string(),
-                    "message": err.to_string(),
-                    "log_file_path": log_file_path,
-                }),
-            );
+            // The session-owned lifecycle helpers publish bounded cached
+            // terminal state.  Do not let this detached wrapper mutate or emit
+            // after a replacement session has been reserved.
         }
-    });
-    Ok(())
+    };
+    wait_for_compute_node_start_entry(task, entry_receiver).await
+}
+
+fn spawn_compute_node_start_task(task: impl std::future::Future<Output = ()> + Send + 'static) {
+    tauri::async_runtime::spawn(task);
+}
+
+async fn wait_for_compute_node_start_entry(
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+    entry_receiver: oneshot::Receiver<()>,
+) -> Result<(), String> {
+    spawn_compute_node_start_task(task);
+    entry_receiver
+        .await
+        .map_err(|_| "compute node startup failed before session reservation".to_string())
 }
 
 #[tauri::command]
@@ -767,6 +774,33 @@ fn main() {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn compute_node_start_task_acknowledges_entry_before_wrapper_success_and_continues() {
+        let (entry_sender, entry_receiver) = oneshot::channel();
+        let (continue_sender, continue_receiver) = oneshot::channel();
+        let (completed_sender, completed_receiver) = std::sync::mpsc::channel();
+
+        tauri::async_runtime::block_on(wait_for_compute_node_start_entry(
+            async move {
+                entry_sender.send(()).expect("acknowledge durable entry");
+                continue_receiver
+                    .await
+                    .expect("release startup continuation");
+                completed_sender
+                    .send(())
+                    .expect("signal detached task completion");
+            },
+            entry_receiver,
+        ))
+        .expect("command wrapper must wait for durable startup entry");
+        continue_sender
+            .send(())
+            .expect("command wrapper may be dropped after acknowledgement");
+        completed_receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("startup task must continue after the wrapper returns");
+    }
 
     fn std_command_env_value(command: &std::process::Command, key: &str) -> Option<String> {
         command

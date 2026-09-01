@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App, normalizeDesktopConfig } from './App';
 
@@ -20,6 +20,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 
 describe('desktop app start failure handling', () => {
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
   });
 
@@ -194,6 +195,33 @@ describe('desktop app start failure handling', () => {
     });
   };
 
+  it('exposes bounded native startup attribution with safe defaults', async () => {
+    mockInitialComputeStatus({
+      native_startup_phase: 'bridge_attached',
+      native_startup_outcome: 'running',
+      native_startup_failure_category: 'bridge_exited_before_startup_event',
+    });
+
+    const { container } = render(<App />);
+    const shell = container.querySelector('main');
+    await waitFor(() => expect(shell?.getAttribute('data-application-initialization')).toBe('ready'));
+    expect(shell?.getAttribute('data-native-startup-phase')).toBe('bridge_attached');
+    expect(shell?.getAttribute('data-native-startup-outcome')).toBe('running');
+    expect(shell?.getAttribute('data-native-startup-failure')).toBe('bridge_exited_before_startup_event');
+
+    cleanup();
+    mockInitialComputeStatus({
+      native_startup_phase: 'C:\\private\\model.gguf',
+      native_startup_outcome: 'prompt SECRET',
+      native_startup_failure_category: 'raw exception',
+    });
+    const fallback = render(<App />).container.querySelector('main');
+    await waitFor(() => expect(fallback?.getAttribute('data-application-initialization')).toBe('ready'));
+    expect(fallback?.getAttribute('data-native-startup-phase')).toBe('not_started');
+    expect(fallback?.getAttribute('data-native-startup-outcome')).toBe('not_started');
+    expect(fallback?.getAttribute('data-native-startup-failure')).toBe('none');
+  });
+
   it('moves local inference from starting to failed when invoke rejects', async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'start_inference') {
@@ -260,7 +288,7 @@ describe('desktop app start failure handling', () => {
 
 
   it.each(['desktop_python_runtime_missing', 'desktop_python_runtime_invalid'])(
-    'keeps Start operator enabled after mount-time %s model inspection failure',
+    'keeps operator setup ready after mount-time %s model inspection failure',
     async (code) => {
       invokeMock.mockImplementation((command: string) => {
         if (command === 'detect_backend') {
@@ -303,7 +331,7 @@ describe('desktop app start failure handling', () => {
         return Promise.resolve(undefined);
       });
 
-      render(<App />);
+      const { container } = render(<App />);
 
       await screen.findByText(/The bundled token\.place runtime is missing or damaged/);
       expect(document.body.textContent ?? '').toContain(`Diagnostic code: ${code}`);
@@ -311,11 +339,12 @@ describe('desktop app start failure handling', () => {
       expect(((await screen.findByText('Start local inference')) as HTMLButtonElement).disabled).toBe(true);
       expect(((await screen.findByText('Download')) as HTMLButtonElement).disabled).toBe(true);
       const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
-      await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
-
-      fireEvent.click(startOperatorButton);
-
-      await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('start_compute_node', expect.any(Object)));
+      expect(startOperatorButton.disabled).toBe(false);
+      expect((screen.getByLabelText('Model GGUF path') as HTMLInputElement).value)
+        .toBe('C:\\Users\\operator\\Models\\qwen.gguf');
+      expect((container.querySelector('main') as HTMLElement).dataset.applicationInitialization)
+        .toBe('ready');
+      expect(invokeMock).not.toHaveBeenCalledWith('start_compute_node', expect.any(Object));
     }
   );
 
@@ -1086,6 +1115,772 @@ describe('desktop app start failure handling', () => {
       },
     });
     await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+  });
+
+  it('accepts the native running status before later startup and registration events', async () => {
+    mockInitialComputeStatus({
+      running: false,
+      registered: false,
+      operator_session_id: 'previous-session',
+      sequence: 8,
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    const computeHandler = eventHandlers.get('compute_node_event');
+    expect(computeHandler).toBeTruthy();
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: false,
+        operator_session_id: 'attached-bridge-session',
+        sequence: 0,
+        worker_state: 'starting',
+        last_error: null,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    await waitFor(() => {
+      const shell = screen.getByRole('main');
+      expect(shell.getAttribute('data-operator-start-handler')).toBe('entered');
+      expect(shell.getAttribute('data-operator-start-native-event')).toBe('running_accepted');
+      expect(shell.getAttribute('data-operator-start-render')).toBe('running');
+    });
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Worker state:/).textContent).toContain('starting');
+
+    computeHandler?.({
+      payload: {
+        type: 'started',
+        running: true,
+        registered: false,
+        operator_session_id: 'attached-bridge-session',
+        sequence: 1,
+        worker_state: 'starting',
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: true,
+        operator_session_id: 'attached-bridge-session',
+        sequence: 2,
+        worker_state: 'ready',
+        relay_runtime_state: 'ready',
+        warm_load_state: 'ready',
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText(/Registered:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Worker state:/).textContent).toContain('ready');
+
+    computeHandler?.({
+      payload: {
+        type: 'stopped',
+        running: false,
+        registered: false,
+        operator_session_id: 'previous-session',
+        sequence: 9,
+      },
+    });
+    computeHandler?.({
+      payload: {
+        type: 'status',
+        running: true,
+        registered: false,
+        operator_session_id: 'attached-bridge-session',
+        sequence: 2,
+      },
+    });
+
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(screen.getByText(/Registered:/).textContent).toContain('yes');
+    await waitFor(() => {
+      const shell = screen.getByRole('main');
+      expect(shell.getAttribute('data-operator-start-native-event')).toBe('running_rejected');
+      expect(shell.getAttribute('data-operator-start-render')).toBe('running');
+    });
+  });
+
+  it('reconciles authoritative running state when the running event is missed', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'previous-session',
+            sequence: 8,
+          });
+        }
+        if (statusCalls === 2) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'previous-session',
+            sequence: 9,
+          });
+        }
+        return Promise.resolve({
+          running: true,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: 0,
+          worker_state: 'starting',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() => expect(statusCalls).toBeGreaterThanOrEqual(2));
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    await waitFor(() => {
+      const shell = screen.getByRole('main');
+      expect(shell.getAttribute('data-operator-start-invocation')).toBe('pending');
+      expect(shell.getAttribute('data-operator-start-polling')).toBe('running_accepted');
+      expect(shell.getAttribute('data-operator-start-render')).toBe('running');
+    });
+    expect(screen.getByText(/Registered:/).textContent).toContain('no');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+  });
+
+  it('accepts an authoritative same-session running snapshot after restart', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({
+          running: statusCalls > 1,
+          registered: false,
+          operator_session_id: 'existing-session',
+          sequence: statusCalls === 1 ? 8 : 9,
+          worker_state: statusCalls === 1 ? 'stopped' : 'starting',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    fireEvent.click(startOperatorButton);
+
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('existing-session');
+    expect(statusCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  it('diagnoses a rejected polling snapshot before accepting the active session', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve(statusCalls < 4 ? {
+          running: statusCalls === 3,
+          registered: false,
+          operator_session_id: 'previous-session',
+          sequence: statusCalls === 1 ? 8 : statusCalls === 2 ? 9 : 7,
+        } : {
+          running: true,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: 0,
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    expect(screen.getByRole('main').getAttribute('data-operator-start-polling')).toBe('not_running');
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(screen.getByRole('main').getAttribute('data-operator-start-polling')).toBe('running_rejected');
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(screen.getByRole('main').getAttribute('data-operator-start-polling')).toBe('running_accepted');
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    vi.useRealTimers();
+  });
+
+  it('retains bounded startup diagnostics from the active non-running replacement session', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'previous-session',
+            sequence: 8,
+          });
+        }
+        if (statusCalls === 2) {
+          return Promise.resolve({
+            running: false,
+            operator_session_id: 'previous-session',
+            sequence: 9,
+            native_startup_phase: 'startup_task_failed',
+            native_startup_outcome: 'failed',
+            native_startup_failure_category: 'startup_task_failed',
+          });
+        }
+        if (statusCalls === 3) {
+          return Promise.resolve({
+            running: false,
+            operator_session_id: 'current-session',
+            sequence: 1,
+            native_startup_phase: 'session_reserved',
+            native_startup_outcome: 'pending',
+            native_startup_failure_category: 'none',
+          });
+        }
+        if (statusCalls === 4) {
+          return Promise.resolve({
+            running: false,
+            operator_session_id: 'current-session',
+            sequence: 0,
+            native_startup_phase: 'startup_task_failed',
+            native_startup_outcome: 'failed',
+          });
+        }
+        if (statusCalls === 5) {
+          return Promise.resolve({
+            running: false,
+            operator_session_id: 'current-session',
+            sequence: 2,
+            native_startup_phase: 'bridge_launch_prepared',
+          });
+        }
+        return Promise.resolve({
+          running: true,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: 3,
+          worker_state: 'starting',
+          native_startup_phase: 'bridge_attached',
+          native_startup_outcome: 'running',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    const shell = screen.getByRole('main');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('previous-session');
+    expect(shell.getAttribute('data-native-startup-phase')).toBe('not_started');
+
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+    expect(shell.getAttribute('data-native-startup-phase')).toBe('session_reserved');
+    expect(shell.getAttribute('data-native-startup-outcome')).toBe('pending');
+    expect(shell.getAttribute('data-native-startup-failure')).toBe('none');
+
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(shell.getAttribute('data-native-startup-phase')).toBe('session_reserved');
+    expect(shell.getAttribute('data-native-startup-outcome')).toBe('pending');
+
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(shell.getAttribute('data-native-startup-phase')).toBe('bridge_launch_prepared');
+    expect(shell.getAttribute('data-native-startup-outcome')).toBe('pending');
+
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(shell.getAttribute('data-native-startup-phase')).toBe('bridge_attached');
+    expect(shell.getAttribute('data-native-startup-outcome')).toBe('running');
+    vi.useRealTimers();
+  });
+
+  it('accepts an authoritative running snapshot that completes a partial event sequence', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({
+          running: statusCalls > 1,
+          registered: false,
+          operator_session_id: statusCalls === 1 ? 'previous-session' : 'current-session',
+          sequence: statusCalls === 1 ? 8 : 1,
+          worker_state: 'starting',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    await act(async () => {
+      eventHandlers.get('compute_node_event')?.({
+        payload: {
+          type: 'started',
+          operator_session_id: 'current-session',
+          sequence: 1,
+          worker_state: 'starting',
+        },
+      });
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    expect(statusCalls).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+    vi.useRealTimers();
+  });
+
+  it('reconciles authoritative terminal failure and ignores late completion', async () => {
+    let statusCalls = 0;
+    let resolveStart: () => void = () => {};
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'previous-session',
+            sequence: 8,
+          });
+        }
+        if (statusCalls === 2) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'previous-session',
+            sequence: 9,
+            worker_state: 'failed',
+            relay_runtime_state: 'failed',
+            last_error: 'stale failure',
+          });
+        }
+        if (statusCalls === 3) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'current-session',
+            sequence: 2,
+            worker_state: 'starting',
+            relay_runtime_state: 'starting',
+            warm_load_state: 'warming',
+          });
+        }
+        if (statusCalls === 4) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: 'current-session',
+            sequence: 1,
+            worker_state: 'failed',
+            relay_runtime_state: 'failed',
+            last_error: 'regressive failure',
+          });
+        }
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: 3,
+          worker_state: 'failed',
+          relay_runtime_state: 'failed',
+          warm_load_state: 'failed',
+          last_worker_error_code: 'warm_load_failed',
+          last_error: 'warm load failed',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise<void>((resolve) => {
+          resolveStart = resolve;
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startButton);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750);
+    });
+
+    expect(statusCalls).toBe(5);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Worker state:/).textContent).toContain('failed');
+    expect(screen.getByText(/Last worker error code:/).textContent).toContain('warm_load_failed');
+    expect(screen.getByText(/Last error:/).textContent).toContain('warm load failed');
+    expect(startButton.disabled).toBe(false);
+    const callsAfterFailure = statusCalls;
+
+    await act(async () => {
+      resolveStart();
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(statusCalls).toBe(callsAfterFailure);
+    expect(startButton.disabled).toBe(false);
+  });
+
+  it('stops operator during warm load after authoritative ownership', async () => {
+    let statusCalls = 0;
+    let stopCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        if (statusCalls === 1) {
+          return Promise.resolve({ running: false, registered: false });
+        }
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: statusCalls - 1,
+          worker_state: 'starting',
+          relay_runtime_state: 'starting',
+          runtime_provisioning_state: 'provisioning',
+          warm_load_state: 'warming',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      if (command === 'stop_compute_node') {
+        stopCalls += 1;
+        return Promise.resolve(undefined);
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    const stopButton = (await screen.findByText('Stop operator')) as HTMLButtonElement;
+    const relayInput = screen.getByLabelText('Relay URL 1') as HTMLInputElement;
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+    expect(stopButton.disabled).toBe(true);
+    vi.useFakeTimers();
+    fireEvent.click(startButton);
+    expect(stopButton.disabled).toBe(true);
+
+    await act(async () => Promise.resolve());
+
+    expect(stopButton.disabled).toBe(false);
+    expect(startButton.disabled).toBe(true);
+    expect(relayInput.disabled).toBe(true);
+    const callsBeforeStop = statusCalls;
+    fireEvent.click(stopButton);
+    await act(async () => Promise.resolve());
+
+    expect(stopCalls).toBe(1);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    expect(screen.getByText(/Worker state:/).textContent).toContain('stopped');
+    expect(startButton.disabled).toBe(false);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(statusCalls).toBe(callsBeforeStop);
+    expect(stopCalls).toBe(1);
+  });
+
+  it('continues reconciling the active start after ten seconds', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        if (statusCalls < 45) {
+          return Promise.resolve({
+            running: false,
+            registered: false,
+            operator_session_id: statusCalls === 1 ? null : 'current-session',
+            sequence: statusCalls,
+          });
+        }
+        return Promise.resolve({
+          running: true,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: statusCalls,
+          worker_state: 'starting',
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(12_000);
+    });
+
+    expect(statusCalls).toBeGreaterThanOrEqual(45);
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+    vi.useRealTimers();
+  });
+
+  it('stops authoritative reconciliation when the start fails', async () => {
+    let rejectStart: (reason: Error) => void = () => {};
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({ running: false, registered: false });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise((_, reject) => {
+          rejectStart = reject;
+        });
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => rejectStart(new Error('start failed')));
+    expect(screen.getByRole('main').getAttribute('data-operator-start-invocation')).toBe('rejected');
+    const callsAfterFailure = statusCalls;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(statusCalls).toBe(callsAfterFailure);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+    vi.useRealTimers();
+  });
+
+  it('stops authoritative reconciliation when an accepted error event terminates a pending start', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          operator_session_id: statusCalls === 1 ? null : 'current-session',
+          sequence: statusCalls === 1 ? null : statusCalls - 1,
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    await act(async () => {
+      eventHandlers.get('compute_node_event')?.({
+        payload: {
+          type: 'error',
+          running: false,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: statusCalls,
+          last_error: 'operator terminated',
+        },
+      });
+    });
+    const callsAfterError = statusCalls;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(statusCalls).toBe(callsAfterError);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+  });
+
+  it('stops authoritative reconciliation when an accepted stopped event follows a returned start', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({
+          running: false,
+          registered: false,
+          operator_session_id: statusCalls === 1 ? null : 'current-session',
+          sequence: statusCalls === 1 ? null : statusCalls - 1,
+        });
+      }
+      if (command === 'start_compute_node') {
+        return Promise.resolve(undefined);
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    await act(async () => {
+      eventHandlers.get('compute_node_event')?.({
+        payload: {
+          type: 'stopped',
+          running: false,
+          registered: false,
+          operator_session_id: 'current-session',
+          sequence: statusCalls,
+        },
+      });
+    });
+    const callsAfterStopped = statusCalls;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(statusCalls).toBe(callsAfterStopped);
+    expect(screen.getByText(/Running:/).textContent).toContain('no');
+  });
+
+  it('keeps reconciling a current start after rejecting a stale terminal event', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({
+          running: statusCalls >= 3,
+          registered: false,
+          operator_session_id: statusCalls === 1 ? 'previous-session' : 'current-session',
+          sequence: statusCalls === 1 ? 8 : statusCalls - 1,
+        });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+
+    await act(async () => {
+      eventHandlers.get('compute_node_event')?.({
+        payload: {
+          type: 'stopped',
+          running: false,
+          registered: false,
+          operator_session_id: 'previous-session',
+          sequence: 7,
+        },
+      });
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    expect(statusCalls).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/Running:/).textContent).toContain('yes');
+    expect(screen.getByText(/Operator session ID:/).textContent).toContain('current-session');
+  });
+
+  it('stops authoritative reconciliation when the component unmounts', async () => {
+    let statusCalls = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_compute_node_status') {
+        statusCalls += 1;
+        return Promise.resolve({ running: false, registered: false });
+      }
+      if (command === 'start_compute_node') {
+        return new Promise(() => {});
+      }
+      return mockInitialCommand(command);
+    });
+
+    const view = render(<App />);
+    const startOperatorButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
+    await waitFor(() => expect(startOperatorButton.disabled).toBe(false));
+    vi.useFakeTimers();
+    fireEvent.click(startOperatorButton);
+    await act(async () => Promise.resolve());
+    view.unmount();
+    const callsAfterUnmount = statusCalls;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(statusCalls).toBe(callsAfterUnmount);
+    vi.useRealTimers();
   });
 
   it('surfaces a fresh restart startup error while ignoring stale old-session events', async () => {
@@ -2154,7 +2949,7 @@ describe('desktop app start failure handling', () => {
   });
 
 
-  it('renders provisioning started event fields and locks controls', async () => {
+  it('keeps startup active for non-running provisioning started events', async () => {
     render(<App />);
 
     const startButton = (await screen.findByText('Start operator')) as HTMLButtonElement;
@@ -2162,11 +2957,13 @@ describe('desktop app start failure handling', () => {
     const inspectButton = (await screen.findByText('Open debug log')) as HTMLButtonElement;
     const handler = eventHandlers.get('compute_node_event');
     expect(handler).toBeTruthy();
+    await waitFor(() => expect(startButton.disabled).toBe(false));
+    fireEvent.click(startButton);
 
     handler?.({
       payload: {
         type: 'started',
-        running: true,
+        running: false,
         registered: false,
         relay_runtime_state: 'provisioning',
         runtime_provisioning_state: 'provisioning',
@@ -2182,7 +2979,7 @@ describe('desktop app start failure handling', () => {
       },
     });
 
-    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('yes'));
+    await waitFor(() => expect(screen.getByText(/Running:/).textContent).toContain('no'));
     expect(screen.getByText(/Worker alive:/).textContent).toContain('no');
     expect(screen.getByText(/Provisioning state:/).textContent).toContain('provisioning');
     expect(screen.getByText(/Startup phase:/).textContent).toContain('cuda_build');
@@ -2580,6 +3377,118 @@ describe('desktop app start failure handling', () => {
     expect(contextSelect.disabled).toBe(true);
   });
 
+});
+
+describe('desktop application initialization barrier', () => {
+  const deferred = <T,>() => {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+  };
+
+  afterEach(() => cleanup());
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    listenMock.mockReset();
+    listenMock.mockResolvedValue(() => {});
+  });
+
+  it('stays pending until every mandatory initialization result is committed', async () => {
+    const backend = deferred<Record<string, unknown>>();
+    const config = deferred<Record<string, unknown>>();
+    const status = deferred<Record<string, unknown>>();
+    const artifact = deferred<Record<string, unknown>>();
+    invokeMock.mockImplementation((command: string) => ({
+      detect_backend: backend.promise,
+      load_config: config.promise,
+      get_compute_node_status: status.promise,
+      inspect_model_artifact: artifact.promise,
+    }[command] ?? Promise.resolve(undefined)));
+
+    const { container } = render(<App />);
+    const shell = container.querySelector('main') as HTMLElement;
+    expect(shell.dataset.applicationInitialization).toBe('pending');
+
+    await act(async () => backend.resolve({ availability_label: 'CPU available' }));
+    expect(shell.dataset.applicationInitialization).toBe('pending');
+    await act(async () => config.resolve({ model_path: '/persisted.gguf', relay_base_url: 'https://token.place' }));
+    expect(shell.dataset.applicationInitialization).toBe('pending');
+    await act(async () => status.resolve({ running: false, registered: false }));
+    await waitFor(() => expect(shell.dataset.applicationInitialization).toBe('ready'));
+    expect((screen.getByLabelText('Model GGUF path') as HTMLInputElement).value).toBe('/persisted.gguf');
+    expect(screen.queryByText('Runtime GGUF filename:')).toBeNull();
+
+    await act(async () => artifact.resolve({ filename: 'persisted.gguf', exists: true }));
+    expect(await screen.findByText('persisted.gguf')).toBeTruthy();
+  });
+
+  it('does not overwrite automation input when delayed artifact inspection completes', async () => {
+    const artifact = deferred<Record<string, unknown>>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'inspect_model_artifact') return artifact.promise;
+      return Promise.resolve({
+        detect_backend: { availability_label: 'CPU available' },
+        load_config: { model_path: '/persisted.gguf', relay_base_url: 'https://token.place' },
+        get_compute_node_status: { running: false, registered: false },
+      }[command]);
+    });
+    const { container } = render(<App />);
+    await waitFor(() => expect(
+      (container.querySelector('main') as HTMLElement).dataset.applicationInitialization
+    ).toBe('ready'));
+    const modelInput = screen.getByLabelText('Model GGUF path') as HTMLInputElement;
+    const relayInput = screen.getByLabelText('Relay URL 1') as HTMLInputElement;
+    const modeSelect = screen.getByText('Compute mode').nextElementSibling as HTMLSelectElement;
+    const tierSelect = screen.getByLabelText('Context tier') as HTMLSelectElement;
+    fireEvent.change(modelInput, { target: { value: '/automation.gguf' } });
+    fireEvent.change(relayInput, { target: { value: 'https://automation.token.place' } });
+    fireEvent.change(modeSelect, { target: { value: 'cpu' } });
+    fireEvent.change(tierSelect, { target: { value: '64k-full' } });
+    await act(async () => artifact.resolve({ filename: 'persisted.gguf', exists: true }));
+    expect(modelInput.value).toBe('/automation.gguf');
+    expect(relayInput.value).toBe('https://automation.token.place');
+    expect(modeSelect.value).toBe('cpu');
+    expect(tierSelect.value).toBe('64k-full');
+  });
+
+  it('keeps ready initialization after optional artifact inspection rejects', async () => {
+    const artifact = deferred<Record<string, unknown>>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'inspect_model_artifact') return artifact.promise;
+      return Promise.resolve(command === 'load_config'
+        ? { model_path: '/persisted.gguf', relay_base_url: 'https://token.place' }
+        : command === 'get_compute_node_status'
+          ? { running: false, registered: false }
+          : { availability_label: 'CPU available' });
+    });
+    const { container } = render(<App />);
+    const shell = container.querySelector('main') as HTMLElement;
+    await waitFor(() => expect(shell.dataset.applicationInitialization).toBe('ready'));
+
+    await act(async () => artifact.reject(new Error('artifact inspection unavailable')));
+
+    expect(shell.dataset.applicationInitialization).toBe('ready');
+    expect(screen.getByText(/Error:/).textContent).toContain('artifact inspection unavailable');
+    expect((screen.getByText('Start operator') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('fails closed when a required initialization operation rejects', async () => {
+    invokeMock.mockImplementation((command: string) => command === 'get_compute_node_status'
+      ? Promise.reject(new Error('status unavailable'))
+      : Promise.resolve(command === 'load_config'
+        ? { model_path: '', relay_base_url: 'https://token.place' }
+        : {}));
+    const { container } = render(<App />);
+    await waitFor(() => expect(
+      (container.querySelector('main') as HTMLElement).dataset.applicationInitialization
+    ).toBe('failed'));
+    expect(screen.getByText(/Error:/).textContent).toContain('status unavailable');
+  });
 });
 
 describe('desktop Python runtime error normalization', () => {

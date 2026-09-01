@@ -1157,6 +1157,7 @@ class RelayClient:
         self._polling_stopped_by_request = False
         self._api_v1_control_wakeup = threading.Event()
         self._registration_token: Optional[str] = None
+        self._api_v1_write_benchmark_stage("python_handoff_received")
         configured_servers: List[Any] = []
         self._cluster_only = False
 
@@ -3967,6 +3968,36 @@ class RelayClient:
         return None
 
     @classmethod
+    def _api_v1_write_benchmark_stage(cls, category: str, stage: int = 30) -> bool:
+        """Atomically publish only a bounded, privacy-safe benchmark stage."""
+        allowed = {
+            "python_handoff_received", "request_validation_failure",
+            "fixture_hash_validation_failure", "active_runtime_tokenizer_unavailable",
+            "runtime_identity_unavailable", "tokenization_failure",
+            "evidence_publication_failure", "authoritative_evidence_published",
+        }
+        evidence_name = os.getenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
+        if category not in allowed or not evidence_name:
+            return False
+        output = Path(f"{evidence_name}.stage.json")
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=".tokenizer-stage-", suffix=".tmp",
+                dir=output.parent)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump({"version": 1, "stage": stage, "category": category}, handle,
+                        sort_keys=True, separators=(",", ":"))
+                os.replace(temporary, output)
+                return True
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return False
+
+    @classmethod
     def _api_v1_record_benchmark_tokenizer_observation(
         cls,
         llm_instance: Any,
@@ -3981,42 +4012,85 @@ class RelayClient:
         evidence_name = os.getenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
         if not config_name or not evidence_name:
             return
+        failure_category = "request_validation_failure"
         try:
             raw = Path(config_name).read_text(encoding="utf-8")
             if len(raw.encode("utf-8")) > 16384:
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
                 return
-            config = json.loads(raw)
+            try:
+                config = json.loads(raw)
+            except json.JSONDecodeError:
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                return
+            if not isinstance(config, dict):
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                return
             target_offsets = config.get("target_prefix_utf8_bytes")
-            if (not isinstance(config, dict) or not isinstance(target_offsets, dict)
+            if (not isinstance(target_offsets, dict)
                     or not target_offsets or not all(isinstance(k, str) and isinstance(v, int)
                     for k, v in target_offsets.items())):
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
                 return
             user_indexes = [index for index, message in enumerate(messages)
                 if isinstance(message, dict) and message.get("role") == "user"]
             if not user_indexes:
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
                 return
             user_index = user_indexes[-1]
             content = messages[user_index].get("content")
             if not isinstance(content, str):
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
                 return
             content_bytes = content.encode("utf-8")
             if hashlib.sha256(content_bytes).hexdigest() != config.get("fixture_sha256"):
+                cls._api_v1_write_benchmark_stage("fixture_hash_validation_failure", 50)
                 return
             counts: Dict[str, int] = {}
+            failure_category = "tokenization_failure"
             for key, offset in sorted(target_offsets.items(), key=lambda item: item[1]):
-                if offset <= 0 or offset >= len(content_bytes):
+                if isinstance(offset, bool) or offset <= 0 or offset >= len(content_bytes):
+                    cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
                     return
-                prefix = content_bytes[:offset].decode("utf-8")
+                try:
+                    prefix = content_bytes[:offset].decode("utf-8")
+                except UnicodeDecodeError:
+                    cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                    return
                 prefix_messages = [dict(message) for message in messages]
                 prefix_messages[user_index]["content"] = prefix
                 count = cls._api_v1_render_and_tokenize_chat_prompt(
                     llm_instance, prefix_messages, enable_thinking=enable_thinking,
                     model_profile=model_profile)
                 if count is None:
+                    rendered_prefix = cls._api_v1_render_chat_prompt(
+                        llm_instance,
+                        prefix_messages,
+                        enable_thinking=enable_thinking,
+                        allow_chat_format_fallback=True,
+                    )
+                    count = (
+                        cls._api_v1_tokenize_rendered_prompt(llm_instance, rendered_prefix)
+                        if rendered_prefix is not None
+                        else None
+                    )
+                if count is None:
+                    tokenizers_present = (callable(getattr(llm_instance,
+                        "render_and_tokenize_chat", None))
+                        or callable(getattr(llm_instance, "tokenize", None)))
+                    cls._api_v1_write_benchmark_stage(
+                        "tokenization_failure" if tokenizers_present
+                        else "active_runtime_tokenizer_unavailable",
+                        65 if tokenizers_present else 60)
+                    return
+                if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                    cls._api_v1_write_benchmark_stage("tokenization_failure", 65)
                     return
                 counts[key] = count
+            failure_category = "runtime_identity_unavailable"
             runtime_identity = os.getenv("TOKENPLACE_RUNTIME_ID", "")
             if not runtime_identity:
+                cls._api_v1_write_benchmark_stage("runtime_identity_unavailable", 70)
                 return
             evidence = {"method": "packaged_admission_render_and_tokenize_chat",
                 "runtime_identity": runtime_identity,
@@ -4043,6 +4117,7 @@ class RelayClient:
                     }
                     evidence["kv_runtime"] = dict(runtime_diagnostic)
             output = Path(evidence_name)
+            failure_category = "evidence_publication_failure"
             output.parent.mkdir(parents=True, exist_ok=True)
             fd, temporary = tempfile.mkstemp(prefix=".long-context-tokenizer-", dir=output.parent)
             try:
@@ -4051,9 +4126,14 @@ class RelayClient:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(evidence, handle, sort_keys=True, separators=(",", ":"))
                 os.replace(temporary, output)
+                cls._api_v1_write_benchmark_stage("authoritative_evidence_published", 100)
             finally:
                 Path(temporary).unlink(missing_ok=True)
-        except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+            stages = {"request_validation_failure": 40, "tokenization_failure": 65,
+                "runtime_identity_unavailable": 70,
+                "evidence_publication_failure": 90}
+            cls._api_v1_write_benchmark_stage(failure_category, stages[failure_category])
             return
 
     @staticmethod
@@ -4362,7 +4442,6 @@ class RelayClient:
             enable_thinking=admission_enable_thinking,
             model_profile=model_profile,
         )
-        admission_bridge_used = prompt_tokens is not None
         if prompt_tokens is None:
             rendered_prompt = self._api_v1_render_chat_prompt(
                 llm_instance,
@@ -4375,7 +4454,7 @@ class RelayClient:
                 if rendered_prompt is not None
                 else None
             )
-        if admission_bridge_used and prompt_tokens is not None:
+        if prompt_tokens is not None:
             self._api_v1_record_benchmark_tokenizer_observation(
                 llm_instance, messages, full_prompt_tokens=prompt_tokens,
                 enable_thinking=admission_enable_thinking, model_profile=model_profile)

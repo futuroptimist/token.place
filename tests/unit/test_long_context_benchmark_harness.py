@@ -16,34 +16,228 @@ from scripts.long_context_benchmark import benchmark_harness as h
 RUNNER_SOURCE = Path(__file__).parents[2] / "desktop-tauri/scripts/test_desktop_operator_ui_e2e.py"
 
 
+class _WebDriverException(Exception):
+    def __init__(self, message):
+        super().__init__(message)
+        self.msg = message
+
+
+class NoSuchElementException(_WebDriverException):
+    pass
+
+
+class StaleElementReferenceException(_WebDriverException):
+    pass
+
+
+class InvalidArgumentException(_WebDriverException):
+    pass
+
+
+class SessionNotCreatedException(_WebDriverException):
+    pass
+
+
+class ReadTimeoutError(Exception):
+    """Dependency-free stand-in for urllib3.exceptions.ReadTimeoutError."""
+
+
+class ConnectTimeoutError(Exception):
+    pass
+
+
+class NewConnectionError(Exception):
+    pass
+
+
+class ProtocolError(Exception):
+    pass
+
+
+def test_desktop_runner_imports_trusted_urllib3_transport_exceptions():
+    tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
+    transport_import = next(node for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "urllib3.exceptions")
+    namespace = {}
+    exec(compile(ast.Module(body=[transport_import], type_ignores=[]),
+        str(RUNNER_SOURCE), "exec"), namespace)
+
+    assert {name: value.__module__ for name, value in namespace.items()
+        if name in {"ConnectTimeoutError", "NewConnectionError", "ProtocolError",
+            "ReadTimeoutError"}} == {
+        "ConnectTimeoutError": "urllib3.exceptions",
+        "NewConnectionError": "urllib3.exceptions",
+        "ProtocolError": "urllib3.exceptions",
+        "ReadTimeoutError": "urllib3.exceptions",
+    }
+
+
 @pytest.fixture
 def desktop_runner():
     tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
+    assignments = {
+        "NATIVE_WEBDRIVER_URL", "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION",
+        "WEBDRIVER_COMPATIBILITY_RESULTS", "WEBDRIVER_EXCEPTION_FAMILIES",
+        "WEBDRIVER_PROCESS_POSTURES", "WEBDRIVER_SESSION_ELAPSED_BUCKETS",
+        "WEBDRIVER_TARGET_CATEGORIES", "WEBDRIVER_READINESS_CATEGORIES",
+        "OPERATOR_START_DIAGNOSTIC_ALLOWLISTS",
+        "OPERATOR_START_DIAGNOSTIC_DEFAULTS",
+        "NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS", "NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS",
+        "PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS",
+        "PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS",
+    }
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
         "_populate_and_submit_packaged_prompt", "_is_windows_sharing_violation", "_write_benchmark_phase",
         "_is_windows_checkpoint_contention",
         "_remove_owned_path", "_cleanup_owned_process_tree", "_quit_webdriver",
         "_read_primary_tokenizer_observation", "tokenizer_handoff_args",
-        "tauri_driver_environment", "start_driver"}
+        "tokenizer_stage_path", "_write_tokenizer_stage", "_read_tokenizer_stage",
+        "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
+        "_validate_final_tokenizer_stage",
+        "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
+        "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
+        "wait_for_post_start_operator_state",
+        "_classify_webdriver_session_failure", "_webdriver_process_posture",
+        "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
+        "_read_operator_start_diagnostic", "_read_native_startup_diagnostic",
+        "_read_packaged_startup_diagnostic", "_status_value",
+        "main"}
     functions = [node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in names]
+        if (isinstance(node, ast.FunctionDef) and node.name in names)
+        or (isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(isinstance(target, ast.Name) and target.id in assignments
+                for target in (node.targets if isinstance(node, ast.Assign)
+                    else [node.target])))
+        ]
     module = ModuleType("desktop_runner_under_test")
     namespace = module.__dict__
     namespace.update({"webdriver": SimpleNamespace(Chrome=object, Remote=object,
         ChromeOptions=object), "ActionChains": object,
-        "time": time, "By": SimpleNamespace(CSS_SELECTOR="css"),
+        "time": time, "By": SimpleNamespace(CSS_SELECTOR="css", XPATH="xpath"),
         "os": os, "json": json, "tempfile": __import__("tempfile"),
+        "argparse": __import__("argparse"),
         "shutil": __import__("shutil"), "Path": Path,
         "subprocess": subprocess, "Callable": __import__("typing").Callable,
         "psutil": __import__("psutil"),
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
+        "NoSuchElementException": NoSuchElementException,
+        "NoSuchFrameException": _WebDriverException,
+        "StaleElementReferenceException": StaleElementReferenceException,
+        "WebDriverException": _WebDriverException,
         "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
+        "NATIVE_WEBDRIVER_URL": "http://127.0.0.1:4445",
+        "urlopen": None,
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
-        "apply_benchmark_context_tier": h.apply_benchmark_context_tier})
+        "PACKAGED_PHASES": h.PACKAGED_PHASES,
+        "SessionNotCreatedException": SessionNotCreatedException,
+        "InvalidArgumentException": InvalidArgumentException,
+        "ReadTimeoutError": ReadTimeoutError, "ConnectTimeoutError": ConnectTimeoutError,
+        "NewConnectionError": NewConnectionError, "ProtocolError": ProtocolError,
+        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v7",
+        "WEBDRIVER_COMPATIBILITY_RESULTS": frozenset({"match", "mismatch", "unknown"}),
+        "WEBDRIVER_EXCEPTION_FAMILIES": frozenset({"read_timeout", "connection_failure",
+            "capability_rejection", "driver_version_mismatch", "application_startup_failure",
+            "tauri_driver_exit", "unknown"}),
+        "WEBDRIVER_PROCESS_POSTURES": frozenset({"tauri_driver_exited", "native_driver_only",
+            "application_present", "webview_descendants_present", "unknown"}),
+        "WEBDRIVER_SESSION_ELAPSED_BUCKETS": frozenset({"under_5_seconds",
+            "5_to_29_seconds", "30_to_89_seconds", "90_seconds_or_more", "unknown"}),
+        "WEBDRIVER_TARGET_CATEGORIES": frozenset({"attachable_target", "no_target", "unknown"}),
+        "WEBDRIVER_READINESS_CATEGORIES": frozenset({"ready", "no_window_handle",
+            "wrong_handle", "missing_shell", "missing_required_controls",
+            "initialization_pending", "application_initialization_failed",
+            "webdriver_failure", "unknown"}),
+        "OPERATOR_START_DIAGNOSTIC_ALLOWLISTS": {
+            "start_handler_state": frozenset({"not_entered", "entered"}),
+            "invocation_state": frozenset({"not_started", "pending", "resolved", "rejected"}),
+            "native_event_observation": frozenset({"none", "running_received", "running_accepted", "running_rejected"}),
+            "polling_observation": frozenset({"none", "not_running", "running_accepted", "running_rejected", "command_failed"}),
+            "render_state": frozenset({"not_running", "running", "running_regressed"}),
+        },
+        "OPERATOR_START_DIAGNOSTIC_DEFAULTS": {
+            "start_handler_state": "not_entered", "invocation_state": "not_started",
+            "native_event_observation": "none", "polling_observation": "none",
+            "render_state": "not_running",
+        },
+        "LOGS_DIR": Path.cwd() / ".desktop-e2e-logs",
+        "apply_benchmark_context_tier": h.apply_benchmark_context_tier,
+        "generate_fixture": h.generate_fixture,
+        "invoke_packaged_runtime_adapter": h.invoke_packaged_runtime_adapter})
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
     return module
+
+
+def test_webdriver_readiness_requires_valid_native_status(desktop_runner, monkeypatch):
+    desktop_runner.os = SimpleNamespace(name="posix")
+    responses = iter([
+        OSError("hostile refused C:\\private\\prompt"),
+        {"value": {"ready": False, "message": "hostile MODEL_SENTINEL"}},
+        {"value": "malformed C:\\private\\path"},
+        {"value": {"ready": True}},
+    ])
+    calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps(self.payload).encode()
+
+    def open_status(url, timeout):
+        calls.append((url, timeout))
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return Response(result)
+
+    monkeypatch.setattr(desktop_runner, "urlopen", open_status)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    desktop_runner.wait_for_webdriver_ready(
+        SimpleNamespace(poll=lambda: None), timeout_seconds=10)
+    assert len(calls) == 4
+    assert all(url == "http://127.0.0.1:4444/status" for url, _ in calls)
+
+
+@pytest.mark.parametrize(("process_exit", "expected"), [
+    (7, "tauri_driver_exited"),
+    (None, "webdriver_transport_failure"),
+])
+def test_webdriver_readiness_failure_is_bounded(
+        desktop_runner, monkeypatch, process_exit, expected):
+    clock = SimpleNamespace(value=-1.0)
+    def monotonic():
+        clock.value += 1.0
+        return clock.value
+    monkeypatch.setattr(desktop_runner.time, "monotonic", monotonic)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(desktop_runner, "urlopen", lambda *_args, **_kwargs: None)
+    with pytest.raises(RuntimeError, match=f"^{expected}$") as raised:
+        desktop_runner.wait_for_webdriver_ready(
+            SimpleNamespace(poll=lambda: process_exit), timeout_seconds=0.5)
+    assert "private" not in str(raised.value)
+
+
+def test_webdriver_readiness_detects_driver_exit_after_transient_status(
+        desktop_runner, monkeypatch):
+    polls = iter([None, 9])
+    monkeypatch.setattr(desktop_runner, "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("private response")))
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="^tauri_driver_exited$") as raised:
+        desktop_runner.wait_for_webdriver_ready(
+            SimpleNamespace(poll=lambda: next(polls)), timeout_seconds=10)
+
+    assert "private" not in str(raised.value)
 
 
 def test_packaged_tokenizer_handoff_uses_paired_application_arguments(desktop_runner, tmp_path):
@@ -62,36 +256,1075 @@ def test_packaged_tokenizer_handoff_uses_paired_application_arguments(desktop_ru
 
 def test_start_driver_passes_resolved_application_and_tokenizer_arguments(
         desktop_runner, tmp_path):
-    capabilities = {}
+    desktop_runner.os = SimpleNamespace(name="posix")
     remote_calls = []
-
-    class FakeChromeOptions:
-        def set_capability(self, name, value):
-            capabilities[name] = value
 
     def fake_remote(**kwargs):
         remote_calls.append(kwargs)
         return "driver"
 
-    desktop_runner.webdriver = SimpleNamespace(
-        ChromeOptions=FakeChromeOptions, Remote=fake_remote)
+    desktop_runner.webdriver = SimpleNamespace(Remote=fake_remote)
     application = (tmp_path / "application with spaces.exe").resolve()
     request = tmp_path / "request with spaces.json"
     evidence = tmp_path / "evidence with spaces.json"
     arguments = desktop_runner.tokenizer_handoff_args(request, evidence)
 
     assert desktop_runner.start_driver(application, application_args=arguments) == "driver"
-    assert capabilities["tauri:options"] == {
-        "application": str(application),
-        "args": [
-            f"--token-place-long-context-benchmark-tokenizer-request={request}",
-            f"--token-place-long-context-benchmark-tokenizer-evidence={evidence}",
-        ],
+    options = remote_calls[0]["options"]
+    assert options.to_capabilities() == {
+        "browserName": "wry",
+        "tauri:options": {
+            "application": str(application),
+            "args": [
+                f"--token-place-long-context-benchmark-tokenizer-request={request}",
+                f"--token-place-long-context-benchmark-tokenizer-evidence={evidence}",
+            ],
+        },
     }
+    assert "goog:chromeOptions" not in options.to_capabilities()
+    assert all(not argument.startswith("--edge-webview-switches=")
+        for argument in options.to_capabilities()["tauri:options"]["args"])
+    assert options._ignore_local_proxy is False
     assert remote_calls == [{
         "command_executor": "http://127.0.0.1:4444",
         "options": remote_calls[0]["options"],
     }]
+
+
+def test_start_driver_uses_exact_windows_native_webview2_capabilities(
+        desktop_runner, tmp_path):
+    remote_calls = []
+    desktop_runner.webdriver = SimpleNamespace(
+        Remote=lambda **kwargs: remote_calls.append(kwargs) or "driver")
+    desktop_runner.os = SimpleNamespace(name="nt")
+    application = (tmp_path / "current head.exe").resolve()
+    arguments = ["--request=private value", "--evidence=private value"]
+
+    assert desktop_runner.start_driver(
+        application, application_args=arguments,
+        debugger_address="127.0.0.1:49152") == "driver"
+    options = remote_calls[0]["options"]
+    assert remote_calls[0]["command_executor"] == "http://127.0.0.1:4445"
+    assert options.to_capabilities() == {
+        "browserName": "webview2",
+        "ms:edgeChromium": True,
+        "ms:edgeOptions": {"debuggerAddress": "127.0.0.1:49152"},
+    }
+    assert "binary" not in options.to_capabilities()["ms:edgeOptions"]
+    assert "args" not in options.to_capabilities()["ms:edgeOptions"]
+    assert "webviewOptions" not in options.to_capabilities()["ms:edgeOptions"]
+    assert "tauri:options" not in options.to_capabilities()
+    assert "goog:chromeOptions" not in options.to_capabilities()
+
+
+def test_webview2_devtools_waits_for_owned_application(desktop_runner, monkeypatch):
+    responses = iter([
+        OSError("hostile C:\\private\\prompt"),
+        {"Browser": "WebView2", "webSocketDebuggerUrl": "ws://browser"},
+        [{"type": "page", "webSocketDebuggerUrl": ""}],
+        [{"type": "browser", "webSocketDebuggerUrl": "ws://browser"}],
+        [{"type": "page", "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/id"}],
+    ])
+    requested = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode()
+
+    def open_devtools(url, **_kwargs):
+        requested.append(url)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return Response(result)
+
+    monkeypatch.setattr(desktop_runner, "urlopen", open_devtools)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    desktop_runner.wait_for_webview2_devtools(
+        SimpleNamespace(poll=lambda: None), 49152, 5)
+    assert requested == ["http://127.0.0.1:49152/json/list"] * 5
+
+
+def test_ui_ready_selects_application_handle_without_optional_artifact_panel(
+        desktop_runner):
+    class Wait:
+        def __init__(self, driver, timeout, poll_frequency):
+            self.driver = driver
+
+        def until(self, condition):
+            return condition(self.driver) or condition(self.driver)
+
+    class SwitchTo:
+        def __init__(self, driver):
+            self.driver = driver
+
+        def window(self, handle):
+            self.driver.current = handle
+
+        def default_content(self):
+            return None
+
+    class Driver:
+        current = None
+        handle_reads = 0
+
+        def __init__(self):
+            self.switch_to = SwitchTo(self)
+
+        @property
+        def window_handles(self):
+            self.handle_reads += 1
+            return [] if self.handle_reads == 1 else ["unrelated", "application"]
+
+        def execute_script(self, _script):
+            if "applicationInitialization" in _script:
+                return "ready"
+            return ("token.place desktop MVP"
+                if "document.title" in _script and self.current == "application"
+                else "unrelated" if "document.title" in _script else "complete")
+
+        def find_elements(self, _by, locator):
+            if self.current != "application":
+                return []
+            if "Runtime resolved path" in locator:
+                raise AssertionError("optional artifact panel must not be queried")
+            return [object()]
+
+    desktop_runner.WebDriverWait = Wait
+    driver = Driver()
+    desktop_runner.wait_for_ui_ready(driver, timeout_seconds=3)
+    assert driver.current == "application"
+
+
+@pytest.mark.parametrize(("handles", "expected"), [
+    ([], "no_window_handle"),
+    (["unrelated"], "wrong_handle"),
+])
+def test_ui_ready_failure_is_bounded_and_preserves_deadline(
+        desktop_runner, handles, expected):
+    waits = []
+
+    class Wait:
+        def __init__(self, driver, timeout, poll_frequency):
+            waits.append((timeout, poll_frequency))
+            self.driver = driver
+
+        def until(self, condition):
+            condition(self.driver)
+            return False
+
+    driver = SimpleNamespace(
+        window_handles=handles,
+        switch_to=SimpleNamespace(window=lambda _handle: None, default_content=lambda: None),
+        execute_script=lambda script: (
+            "ready" if "applicationInitialization" in script
+            else "unrelated" if "document.title" in script else "complete"),
+        find_elements=lambda *_args: [],
+    )
+    desktop_runner.WebDriverWait = Wait
+    with pytest.raises(RuntimeError, match=f"^{expected}$"):
+        desktop_runner.wait_for_ui_ready(driver, timeout_seconds=7.5)
+    assert waits == [(7.5, 0.25)]
+
+
+@pytest.mark.parametrize(("available", "expected"), [
+    (set(), "missing_shell"),
+    ({"shell"}, "missing_required_controls"),
+])
+def test_ui_ready_classifies_application_shell_and_controls(
+        desktop_runner, available, expected):
+    class Wait:
+        def __init__(self, driver, timeout, poll_frequency):
+            self.driver = driver
+
+        def until(self, condition):
+            condition(self.driver)
+            return False
+
+    def find_elements(_by, locator):
+        if "//h1" in locator:
+            return [object()] if "shell" in available else []
+        if "Model GGUF path" in locator:
+            return [object()] if "model" in available else []
+        if "Relay URL 1" in locator:
+            return [object()] if "relay" in available else []
+        return []
+
+    desktop_runner.WebDriverWait = Wait
+    driver = SimpleNamespace(
+        window_handles=["application"],
+        switch_to=SimpleNamespace(window=lambda _handle: None, default_content=lambda: None),
+        execute_script=lambda script: (
+            "ready" if "applicationInitialization" in script
+            else "token.place desktop MVP" if "document.title" in script else "complete"),
+        find_elements=find_elements,
+    )
+    with pytest.raises(RuntimeError, match=f"^{expected}$"):
+        desktop_runner.wait_for_ui_ready(driver, timeout_seconds=2)
+
+
+@pytest.mark.parametrize("failure_point", [
+    "document_loading",
+    "window_switch",
+    "window_handles",
+])
+def test_ui_ready_classifies_transient_webdriver_failures(
+        desktop_runner, failure_point):
+    class Wait:
+        def __init__(self, driver, timeout, poll_frequency):
+            self.driver = driver
+
+        def until(self, condition):
+            condition(self.driver)
+            return False
+
+    class Driver:
+        switch_to = SimpleNamespace(
+            window=lambda _handle: None,
+            default_content=lambda: None,
+        )
+
+        @property
+        def window_handles(self):
+            if failure_point == "window_handles":
+                raise desktop_runner.WebDriverException("private window sentinel")
+            return ["application"]
+
+        def execute_script(self, script):
+            if failure_point == "window_switch":
+                raise desktop_runner.WebDriverException("private session sentinel")
+            if "applicationInitialization" in script:
+                return "ready"
+            return "loading" if "readyState" in script else "token.place desktop MVP"
+
+        def find_elements(self, *_args):
+            raise AssertionError("controls must not be queried before document readiness")
+
+    desktop_runner.WebDriverWait = Wait
+    expected = ("wrong_handle" if failure_point == "document_loading"
+        else "webdriver_failure")
+    with pytest.raises(RuntimeError, match=f"^{expected}$") as exc_info:
+        desktop_runner.wait_for_ui_ready(Driver(), timeout_seconds=2)
+    assert "private" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(("initialization", "expected"), [
+    ("pending", "initialization_pending"),
+    ("failed", "application_initialization_failed"),
+])
+def test_ui_ready_requires_completed_application_initialization(
+        desktop_runner, initialization, expected):
+    class Wait:
+        def __init__(self, driver, timeout, poll_frequency):
+            self.driver = driver
+
+        def until(self, condition):
+            return condition(self.driver)
+
+    def execute_script(script):
+        if "applicationInitialization" in script:
+            return initialization
+        return "token.place desktop MVP" if "document.title" in script else "complete"
+
+    desktop_runner.WebDriverWait = Wait
+    driver = SimpleNamespace(
+        window_handles=["application"],
+        switch_to=SimpleNamespace(window=lambda _handle: None, default_content=lambda: None),
+        execute_script=execute_script,
+        find_elements=lambda *_args: [object()],
+    )
+    with pytest.raises(RuntimeError, match=f"^{expected}$"):
+        desktop_runner.wait_for_ui_ready(driver, timeout_seconds=2)
+
+
+@pytest.mark.parametrize(("poll", "expected"), [
+    (7, "webdriver_application_startup_failed"),
+    (None, "webdriver_transport_failure"),
+])
+def test_webview2_devtools_failure_is_bounded(
+        desktop_runner, monkeypatch, poll, expected):
+    clock = SimpleNamespace(value=-1.0)
+    def monotonic():
+        clock.value += 1.0
+        return clock.value
+    monkeypatch.setattr(desktop_runner.time, "monotonic", monotonic)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(desktop_runner, "urlopen", lambda *_args, **_kwargs: None)
+    with pytest.raises(RuntimeError, match=f"^{expected}$"):
+        desktop_runner.wait_for_webview2_devtools(
+            SimpleNamespace(poll=lambda: poll), 49152, 0.5)
+
+
+def test_tauri_driver_command_selects_explicit_windows_native_driver(
+        desktop_runner, monkeypatch, tmp_path):
+    edge_dir = tmp_path / "edge driver"
+    edge_dir.mkdir()
+    edge_driver = edge_dir / "msedgedriver.exe"
+    edge_driver.write_bytes(b"driver")
+    monkeypatch.setenv("EDGEWEBDRIVER", str(edge_dir))
+    monkeypatch.setenv("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "match")
+    desktop_runner.os = SimpleNamespace(name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
+    monkeypatch.setattr(desktop_runner.shutil, "which",
+        lambda name: "tauri-driver.exe" if name == "tauri-driver" else None)
+
+    assert desktop_runner.tauri_driver_command() == [
+        "tauri-driver.exe", "--port", "4444", "--native-port", "4445", "--native-driver",
+        str(edge_driver.resolve()),
+    ]
+
+
+def test_webdriver_readiness_uses_explicit_windows_native_endpoint(
+        desktop_runner, monkeypatch):
+    requested = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"value":{"ready":true}}'
+
+    desktop_runner.os = SimpleNamespace(name="nt")
+    monkeypatch.setattr(desktop_runner, "urlopen",
+        lambda url, **_kwargs: requested.append(url) or Response())
+    desktop_runner.wait_for_webdriver_ready(
+        SimpleNamespace(poll=lambda: None), timeout_seconds=1)
+
+    assert requested == ["http://127.0.0.1:4445/status"]
+
+
+def test_tauri_driver_command_requires_exported_verified_windows_path(
+        desktop_runner, monkeypatch, tmp_path):
+    edge_driver = tmp_path / "msedgedriver.exe"
+    edge_driver.write_bytes(b"driver")
+    monkeypatch.delenv("EDGEWEBDRIVER", raising=False)
+    monkeypatch.setenv("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "match")
+    desktop_runner.os = SimpleNamespace(name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
+    monkeypatch.setattr(desktop_runner.shutil, "which", lambda name: {
+        "tauri-driver": "tauri-driver.exe",
+        "msedgedriver.exe": str(edge_driver),
+    }.get(name))
+
+    with pytest.raises(RuntimeError, match="^native_driver_unavailable$"):
+        desktop_runner.tauri_driver_command()
+
+
+def test_tauri_driver_command_fails_bounded_when_windows_driver_missing(
+        desktop_runner, monkeypatch, tmp_path):
+    private = str(tmp_path / "private-edge-location")
+    monkeypatch.setenv("EDGEWEBDRIVER", private)
+    monkeypatch.setenv("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "match")
+    desktop_runner.os = SimpleNamespace(name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
+    monkeypatch.setattr(desktop_runner.shutil, "which",
+        lambda name: "tauri-driver.exe" if name == "tauri-driver" else None)
+
+    with pytest.raises(RuntimeError, match="^native_driver_unavailable$") as raised:
+        desktop_runner.tauri_driver_command()
+    assert private not in str(raised.value)
+
+
+@pytest.mark.parametrize("compatibility", [None, "unknown", "mismatch", "hostile-private-path"])
+def test_tauri_driver_command_fails_closed_without_verified_compatibility(
+        desktop_runner, monkeypatch, tmp_path, compatibility):
+    driver = tmp_path / "msedgedriver.exe"
+    driver.write_bytes(b"driver")
+    monkeypatch.setenv("EDGEWEBDRIVER", str(driver))
+    if compatibility is None:
+        monkeypatch.delenv("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", raising=False)
+    else:
+        monkeypatch.setenv("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", compatibility)
+    desktop_runner.os = SimpleNamespace(
+        name="nt", environ=os.environ, access=os.access, X_OK=os.X_OK)
+
+    with pytest.raises(RuntimeError, match="^native_driver_unavailable$") as raised:
+        desktop_runner.tauri_driver_command()
+    assert str(tmp_path) not in str(raised.value)
+
+
+@pytest.mark.parametrize(("exception", "process_exit", "expected"), [
+    (SessionNotCreatedException("This version of msedgedriver only supports Microsoft Edge version 1"),
+        None, "webdriver_driver_version_mismatch"),
+    (InvalidArgumentException("hostile C:\\private\\prompt capability"),
+        None, "webdriver_capabilities_rejected"),
+    (Exception("ignored"), 1, "tauri_driver_exited"),
+    (SessionNotCreatedException("application failed to launch C:\\private\\model"),
+        None, "webdriver_application_startup_failed"),
+    (SessionNotCreatedException("cannot find Microsoft Edge binary C:\\private\\model"),
+        None, "webdriver_application_startup_failed"),
+])
+def test_webdriver_session_failure_categories_are_bounded(
+        desktop_runner, exception, process_exit, expected):
+    category, state, _family = desktop_runner._classify_webdriver_session_failure(
+        exception, SimpleNamespace(poll=lambda: process_exit))
+    assert category == expected
+    assert state == ("exited" if process_exit is not None else "running")
+    assert "private" not in category
+
+
+def test_webdriver_session_failure_transport_and_safe_fallback(desktop_runner):
+    transport = SimpleNamespace(msg="connection refused C:\\private\\prompt")
+    assert desktop_runner._classify_webdriver_session_failure(
+        transport, SimpleNamespace(poll=lambda: None)) == (
+            "webdriver_transport_failure", "running", "connection_failure")
+    hostile = SimpleNamespace(msg="C:\\private\\prompt MODEL_SENTINEL")
+    assert desktop_runner._classify_webdriver_session_failure(
+        hostile, SimpleNamespace(poll=lambda: None))[0] == "webdriver_session_creation_failed"
+
+
+@pytest.mark.parametrize("exception_type", [
+    ConnectTimeoutError,
+    NewConnectionError,
+    ProtocolError,
+])
+def test_webdriver_session_dependency_transport_failures_are_bounded(
+        desktop_runner, exception_type):
+    failure = exception_type("hostile C:\\private\\prompt MODEL_SENTINEL")
+
+    assert desktop_runner._classify_webdriver_session_failure(
+        failure, SimpleNamespace(poll=lambda: None)) == (
+            "webdriver_transport_failure", "running", "connection_failure")
+
+
+def test_webdriver_session_timeout_is_bounded_and_redacted(desktop_runner):
+    private = "C:\\private\\application.exe --secret-prompt"
+    timeout = SimpleNamespace(msg=f"HTTP connection read timed out while opening {private}")
+    category, state, family = desktop_runner._classify_webdriver_session_failure(
+        timeout, SimpleNamespace(poll=lambda: None))
+    assert (category, state, family) == (
+        "webdriver_transport_failure", "running", "read_timeout")
+    assert private not in category
+
+
+@pytest.mark.parametrize("exception", [
+    ReadTimeoutError("hostile C:\\private\\model --secret-prompt"),
+    Exception("HTTP connection read timed out at C:\\private\\application.exe"),
+])
+def test_webdriver_read_timeout_without_msg_is_classified(desktop_runner, exception):
+    assert not hasattr(exception, "msg")
+    assert desktop_runner._classify_webdriver_session_failure(
+        exception, SimpleNamespace(poll=lambda: None)) == (
+            "webdriver_transport_failure", "running", "read_timeout")
+
+
+def test_real_urllib3_read_timeout_without_msg_is_classified(desktop_runner):
+    from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
+
+    timeout = Urllib3ReadTimeoutError(None, None, "C:\\private\\prompt timed out")
+    assert not hasattr(timeout, "msg")
+    desktop_runner.ReadTimeoutError = Urllib3ReadTimeoutError
+    assert desktop_runner._classify_webdriver_session_failure(
+        timeout, SimpleNamespace(poll=lambda: None)) == (
+            "webdriver_transport_failure", "running", "read_timeout")
+
+
+def test_webdriver_process_posture_and_elapsed_are_bounded(
+        desktop_runner, monkeypatch, tmp_path):
+    application_path = (tmp_path / "private application.exe").resolve()
+
+    class Child:
+        def __init__(self, executable, children=()):
+            self.executable = executable
+            self._children = list(children)
+
+        def exe(self):
+            return str(self.executable)
+
+        def children(self, recursive):
+            assert recursive is True
+            return self._children
+
+    webview = Child(tmp_path / "private WebView sentinel.exe")
+    application = Child(application_path, [webview])
+    native = Child(tmp_path / "private native driver.exe")
+    monkeypatch.setattr(desktop_runner.psutil, "Process",
+        lambda _pid: SimpleNamespace(children=lambda recursive: [native, application]))
+    process = SimpleNamespace(pid=17, poll=lambda: None)
+
+    assert desktop_runner._webdriver_process_posture(process, application_path) == (
+        "webview_descendants_present")
+    assert [desktop_runner._webdriver_session_elapsed_bucket(value) for value in
+        (1, 5, 30, 90, "hostile")] == [
+            "under_5_seconds", "5_to_29_seconds", "30_to_89_seconds",
+            "90_seconds_or_more", "unknown"]
+
+
+def test_webdriver_process_posture_handles_bounded_edge_cases(
+        desktop_runner, monkeypatch, tmp_path):
+    app = tmp_path / "private application.exe"
+    process = SimpleNamespace(pid=17, poll=lambda: 1)
+    assert desktop_runner._webdriver_process_posture(process, app) == "tauri_driver_exited"
+
+    process.poll = lambda: None
+    monkeypatch.setattr(desktop_runner.psutil, "Process",
+        lambda _pid: SimpleNamespace(children=lambda recursive: []))
+    assert desktop_runner._webdriver_process_posture(process, app) == "unknown"
+
+    native = SimpleNamespace(exe=lambda: str(tmp_path / "private native driver.exe"))
+    monkeypatch.setattr(desktop_runner.psutil, "Process",
+        lambda _pid: SimpleNamespace(children=lambda recursive: [native]))
+    assert desktop_runner._webdriver_process_posture(process, app) == "native_driver_only"
+
+    unreadable = SimpleNamespace(exe=lambda: (_ for _ in ()).throw(
+        desktop_runner.psutil.Error("private process sentinel")))
+    application = SimpleNamespace(exe=lambda: str(app.resolve()),
+        children=lambda recursive: (_ for _ in ()).throw(
+            desktop_runner.psutil.Error("private child sentinel")))
+    monkeypatch.setattr(desktop_runner.psutil, "Process",
+        lambda _pid: SimpleNamespace(children=lambda recursive: [unreadable, application]))
+    assert desktop_runner._webdriver_process_posture(process, app) == "application_present"
+
+    monkeypatch.setattr(desktop_runner.psutil, "Process",
+        lambda _pid: (_ for _ in ()).throw(desktop_runner.psutil.Error("private sentinel")))
+    assert desktop_runner._webdriver_process_posture(process, app) == "unknown"
+
+
+def test_webdriver_changed_safety_branches_are_bounded(
+        desktop_runner, monkeypatch, tmp_path):
+    desktop_runner.os = SimpleNamespace(name="nt")
+
+    def remote(**kwargs):
+        kwargs["options"].to_capabilities()
+
+    desktop_runner.webdriver = SimpleNamespace(Remote=remote)
+    with pytest.raises(RuntimeError, match="^webdriver_application_startup_failed$"):
+        desktop_runner.start_driver(tmp_path / "private application.exe")
+
+    edge_driver = tmp_path / "msedgedriver.exe"
+    edge_driver.write_bytes(b"driver")
+    desktop_runner.os = SimpleNamespace(name="nt", environ={
+        "TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY": "match",
+        "EDGEWEBDRIVER": str(edge_driver),
+    })
+    monkeypatch.setattr(desktop_runner.shutil, "which", lambda _name: None)
+    with pytest.raises(RuntimeError, match="tauri-driver binary not found"):
+        desktop_runner.tauri_driver_command()
+
+    process = SimpleNamespace(pid=17, poll=lambda: None)
+    application_process = SimpleNamespace(pid=23, poll=lambda: None)
+    application = SimpleNamespace(children=lambda recursive: [object()])
+    monkeypatch.setattr(desktop_runner.psutil, "Process", lambda _pid: application)
+    assert desktop_runner._webdriver_process_posture(
+        process, tmp_path / "private application.exe", application_process
+    ) == "webview_descendants_present"
+    application.children = lambda recursive: (_ for _ in ()).throw(
+        desktop_runner.psutil.Error("private child sentinel"))
+    assert desktop_runner._webdriver_process_posture(
+        process, tmp_path / "private application.exe", application_process
+    ) == "application_present"
+
+
+def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
+        desktop_runner, tmp_path):
+    desktop_runner.LOGS_DIR = tmp_path
+    desktop_runner._write_webdriver_diagnostic(
+        "C:\\private\\prompt", "MODEL_SENTINEL", "SECRET_EXCEPTION",
+        "read_timeout", "application_present", "30_to_89_seconds",
+        "C:\\private\\target", "SECRET_READINESS")
+    artifact = tmp_path / "packaged-webdriver-diagnostic.json"
+    assert json.loads(artifact.read_text()) == {
+        "schema_version": "packaged-webdriver-diagnostic-v7",
+        "browser_driver_compatibility": "unknown",
+        "tauri_driver_state": "unknown",
+        "webdriver_failure_category": "webdriver_session_creation_failed",
+        "exception_family": "read_timeout",
+        "process_posture": "application_present",
+        "session_elapsed_bucket": "30_to_89_seconds",
+        "target_category": "unknown",
+        "readiness_category": "unknown",
+        "operator_progress": "not_started",
+        "start_handler_state": "not_entered",
+        "invocation_state": "not_started",
+        "native_event_observation": "none",
+        "polling_observation": "none",
+        "render_state": "not_running",
+        "native_startup_phase": "not_started",
+        "native_startup_outcome": "not_started",
+        "native_startup_failure_category": "none",
+        **desktop_runner.PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS,
+    }
+    assert not list(tmp_path.glob("*.tmp"))
+    assert "private" not in artifact.read_text()
+    assert "SENTINEL" not in artifact.read_text()
+
+
+def test_webdriver_diagnostic_clamps_invalid_v3_enums(desktop_runner, tmp_path):
+    desktop_runner.LOGS_DIR = tmp_path
+    hostile = "C:\\private\\application.exe --secret-prompt MODEL_SENTINEL"
+
+    desktop_runner._write_webdriver_diagnostic(
+        "match", "running", "none", hostile, hostile, hostile,
+        "attachable_target", "ready")
+
+    artifact = json.loads(
+        (tmp_path / "packaged-webdriver-diagnostic.json").read_text())
+    assert artifact == {
+        "schema_version": "packaged-webdriver-diagnostic-v7",
+        "browser_driver_compatibility": "match",
+        "tauri_driver_state": "running",
+        "webdriver_failure_category": "none",
+        "exception_family": "unknown",
+        "process_posture": "unknown",
+        "session_elapsed_bucket": "unknown",
+        "target_category": "attachable_target",
+        "readiness_category": "ready",
+        "operator_progress": "not_started",
+        "start_handler_state": "not_entered",
+        "invocation_state": "not_started",
+        "native_event_observation": "none",
+        "polling_observation": "none",
+        "render_state": "not_running",
+        "native_startup_phase": "not_started",
+        "native_startup_outcome": "not_started",
+        "native_startup_failure_category": "none",
+        **desktop_runner.PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS,
+    }
+    assert "private" not in json.dumps(artifact)
+    assert "SENTINEL" not in json.dumps(artifact)
+
+
+def test_webdriver_diagnostic_clamps_hostile_operator_progress(desktop_runner, tmp_path):
+    desktop_runner.LOGS_DIR = tmp_path
+    desktop_runner._write_webdriver_diagnostic(
+        "match", "running", "none", target_category="attachable_target",
+        readiness_category="ready", operator_progress="C:\\private\\prompt SECRET")
+    artifact = json.loads(
+        (tmp_path / "packaged-webdriver-diagnostic.json").read_text())
+    assert artifact["operator_progress"] == "not_started"
+    assert "private" not in json.dumps(artifact)
+    assert "SECRET" not in json.dumps(artifact)
+
+
+def test_operator_start_diagnostic_collects_only_allowlisted_dom_values(desktop_runner):
+    values = {
+        "data-operator-start-handler": "entered",
+        "data-operator-start-invocation": "pending",
+        "data-operator-start-native-event": "running_accepted",
+        "data-operator-start-polling": "running_rejected",
+        "data-operator-start-render": "running_regressed",
+    }
+    shell = SimpleNamespace(get_attribute=lambda name: values[name])
+    driver = SimpleNamespace(find_element=lambda *_args: shell)
+
+    assert desktop_runner._read_operator_start_diagnostic(driver) == {
+        "start_handler_state": "entered",
+        "invocation_state": "pending",
+        "native_event_observation": "running_accepted",
+        "polling_observation": "running_rejected",
+        "render_state": "running_regressed",
+    }
+
+    hostile = "C:\\private\\prompt SECRET raw exception"
+    values.update({name: hostile for name in values})
+    assert desktop_runner._read_operator_start_diagnostic(driver) == {
+        "start_handler_state": "not_entered",
+        "invocation_state": "not_started",
+        "native_event_observation": "none",
+        "polling_observation": "none",
+        "render_state": "not_running",
+    }
+
+
+@pytest.mark.parametrize("driver", [
+    None,
+    SimpleNamespace(find_element=lambda *_args: (_ for _ in ()).throw(
+        NoSuchElementException("private missing shell /secret/path"))),
+    SimpleNamespace(find_element=lambda *_args: (_ for _ in ()).throw(
+        StaleElementReferenceException("private stale shell /secret/path"))),
+    SimpleNamespace(find_element=lambda *_args: (_ for _ in ()).throw(
+        _WebDriverException("private webdriver failure /secret/path"))),
+])
+def test_operator_start_diagnostic_defaults_without_available_shell(
+        desktop_runner, driver):
+    diagnostic = desktop_runner._read_operator_start_diagnostic(driver)
+
+    assert diagnostic == {
+        "start_handler_state": "not_entered",
+        "invocation_state": "not_started",
+        "native_event_observation": "none",
+        "polling_observation": "none",
+        "render_state": "not_running",
+    }
+    assert "private" not in json.dumps(diagnostic)
+
+
+def test_native_startup_diagnostic_collects_and_clamps_fixed_values(desktop_runner):
+    values = {
+        "data-native-startup-phase": "running_status_publication",
+        "data-native-startup-outcome": "publication_suppressed",
+        "data-native-startup-failure": "bridge_exited_before_startup_event",
+    }
+    shell = SimpleNamespace(get_attribute=lambda name: values[name])
+    driver = SimpleNamespace(find_element=lambda *_args: shell)
+
+    assert desktop_runner._read_native_startup_diagnostic(driver) == {
+        "native_startup_phase": "running_status_publication",
+        "native_startup_outcome": "publication_suppressed",
+        "native_startup_failure_category": "bridge_exited_before_startup_event",
+    }
+
+    hostile = "C:\\private\\model.gguf prompt SECRET raw exception"
+    values.update({name: hostile for name in values})
+    assert desktop_runner._read_native_startup_diagnostic(driver) == {
+        "native_startup_phase": "not_started",
+        "native_startup_outcome": "not_started",
+        "native_startup_failure_category": "none",
+    }
+
+
+@pytest.mark.parametrize("driver", [
+    None,
+    SimpleNamespace(find_element=lambda *_args: (_ for _ in ()).throw(
+        NoSuchElementException("private missing shell /secret/path"))),
+])
+def test_native_startup_diagnostic_defaults_without_available_shell(
+        desktop_runner, driver):
+    assert desktop_runner._read_native_startup_diagnostic(driver) == {
+        "native_startup_phase": "not_started",
+        "native_startup_outcome": "not_started",
+        "native_startup_failure_category": "none",
+    }
+
+
+@pytest.mark.parametrize("failure", [
+    StaleElementReferenceException("private stale shell /secret/path"),
+    _WebDriverException("private webdriver failure /secret/path"),
+])
+def test_native_startup_diagnostic_clamps_webdriver_failures(
+        desktop_runner, failure):
+    driver = SimpleNamespace(
+        find_element=lambda *_args: (_ for _ in ()).throw(failure))
+
+    diagnostic = desktop_runner._read_native_startup_diagnostic(driver)
+
+    assert diagnostic == {
+        "native_startup_phase": "not_started",
+        "native_startup_outcome": "not_started",
+        "native_startup_failure_category": "none",
+    }
+    assert "private" not in json.dumps(diagnostic)
+
+
+def test_native_startup_diagnostic_is_preserved_without_private_data(desktop_runner, tmp_path):
+    desktop_runner.LOGS_DIR = tmp_path
+    desktop_runner._write_webdriver_diagnostic(
+        "match", "running", "operator_running_not_reached",
+        native_startup_diagnostic={
+            "native_startup_phase": "startup_task_failed",
+            "native_startup_outcome": "failed",
+            "native_startup_failure_category": "child_spawn_failed",
+            "private": "C:\\private\\model.gguf prompt SECRET raw exception",
+        })
+    artifact_text = (tmp_path / "packaged-webdriver-diagnostic.json").read_text()
+    artifact = json.loads(artifact_text)
+    assert artifact["native_startup_phase"] == "startup_task_failed"
+    assert artifact["native_startup_outcome"] == "failed"
+    assert artifact["native_startup_failure_category"] == "child_spawn_failed"
+    assert "private" not in artifact_text
+    assert "SECRET" not in artifact_text
+
+
+def _packaged_status_driver(values):
+    def find_element(_by, locator):
+        label = next((label for label in values if f"'{label}:'" in locator), None)
+        if label is None:
+            raise NoSuchElementException("private unknown status C:\\secret")
+        return SimpleNamespace(text=values[label])
+    return SimpleNamespace(find_element=find_element)
+
+
+@pytest.mark.parametrize(("operator", "native", "statuses", "readiness", "boundary"), [
+    ({"start_handler_state": "not_entered", "invocation_state": "not_started"},
+        {}, {}, "ready", "handler_not_entered"),
+    ({"start_handler_state": "entered", "invocation_state": "pending"},
+        {}, {}, "ready", "invocation_pending"),
+    ({"start_handler_state": "entered", "invocation_state": "rejected"},
+        {}, {}, "ready", "invocation_rejected"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "not_started"}, {}, "ready", "native_not_reached"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "session_reserved"}, {}, "ready",
+        "native_preparation_not_reached"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "bridge_launch_prepared"}, {}, "ready",
+        "bridge_launch_not_reached"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "bridge_attached"},
+        {"Relay runtime state": "warming"}, "ready", "warm_load_pending"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "bridge_attached"},
+        {"Relay runtime state": "ready"}, "ready", "warm_load_ready"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "startup_task_failed"},
+        {"Relay runtime state": "failed", "Last worker error code": "warm_load_timeout"},
+        "ready", "warm_load_timed_out"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "startup_task_failed"},
+        {"Relay runtime state": "failed"}, "ready", "warm_load_failed"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "bridge_attached",
+         "native_startup_failure_category": "bridge_exited_before_startup_event"},
+        {"Last worker exit code": "0"}, "ready", "bridge_exited_clean"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "bridge_attached",
+         "native_startup_failure_category": "bridge_exited_before_startup_event"},
+        {"Last worker exit code": "-1073741819"}, "ready", "bridge_exited_nonzero"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "bridge_attached"}, {},
+        "application_initialization_failed", "readiness_rejected"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "running_status_publication"},
+        {"Relay runtime state": "processing", "Registered": "no (0/1 relays)"},
+        "ready", "registration_not_reached"),
+    ({"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "running_status_publication"},
+        {"Relay runtime state": "ready", "Registered": "yes (1/1 relays)"},
+        "ready", "registered"),
+])
+def test_packaged_startup_boundaries_are_bounded(
+        desktop_runner, operator, native, statuses, readiness, boundary):
+    diagnostic = desktop_runner._read_packaged_startup_diagnostic(
+        _packaged_status_driver(statuses), operator, native, readiness)
+
+    assert diagnostic["startup_boundary"] == boundary
+    assert all(diagnostic[field] in allowed
+        for field, allowed in desktop_runner.PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS.items())
+
+
+def test_packaged_startup_diagnostic_clamps_private_malformed_values(
+        desktop_runner, tmp_path):
+    hostile = "C:\\private\\model.gguf prompt SECRET raw exception"
+    diagnostic = desktop_runner._read_packaged_startup_diagnostic(
+        _packaged_status_driver({
+            "Startup phase": hostile,
+            "Provisioning state": hostile,
+            "Relay runtime state": hostile,
+            "Worker state": hostile,
+            "Last worker error code": hostile,
+            "Last worker exit code": hostile,
+            "Registered": hostile,
+        }), {"start_handler_state": hostile, "invocation_state": hostile}, {}, "ready")
+    assert diagnostic == {
+        **desktop_runner.PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS,
+        "startup_boundary": "handler_not_entered",
+        "bridge_exit_posture": "unknown",
+        "relay_polling_state": "unknown",
+        "registration_state": "unknown",
+    }
+
+    desktop_runner.LOGS_DIR = tmp_path
+    desktop_runner._write_webdriver_diagnostic(
+        "match", "running", "operator_running_not_reached",
+        packaged_startup_diagnostic={field: hostile for field in diagnostic})
+    artifact_text = (tmp_path / "packaged-webdriver-diagnostic.json").read_text()
+    artifact = json.loads(artifact_text)
+    assert {field: artifact[field] for field in diagnostic} == \
+        desktop_runner.PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS
+    assert "private" not in artifact_text
+    assert "SECRET" not in artifact_text
+
+
+def test_packaged_startup_projects_worker_polling_and_registration(desktop_runner):
+    before_polling = desktop_runner._read_packaged_startup_diagnostic(
+        _packaged_status_driver({
+            "Startup phase": "warm_load", "Provisioning state": "provisioning",
+            "Relay runtime state": "warming", "Worker state": "provisioning",
+            "Last worker error code": "none", "Last worker exit code": "none",
+            "Registered": "no (0/1 relays)",
+        }), {"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "bridge_attached"})
+    assert before_polling == {
+        "startup_boundary": "warm_load_pending",
+        "startup_phase": "warm_load",
+        "runtime_provisioning_state": "provisioning",
+        "warm_load_state": "pending",
+        "worker_state": "provisioning",
+        "worker_error_code": "none",
+        "bridge_exit_posture": "not_observed",
+        "relay_polling_state": "not_started",
+        "registration_state": "not_reached",
+    }
+
+    after_polling = desktop_runner._read_packaged_startup_diagnostic(
+        _packaged_status_driver({
+            "Startup phase": "ready", "Provisioning state": "ready",
+            "Relay runtime state": "processing", "Worker state": "ready",
+            "Last worker error code": "none", "Last worker exit code": "none",
+            "Registered": "yes (1/1 relays)",
+        }), {"start_handler_state": "entered", "invocation_state": "resolved"},
+        {"native_startup_phase": "running_status_publication"})
+    assert after_polling["relay_polling_state"] == "started"
+    assert after_polling["registration_state"] == "registered"
+    assert after_polling["startup_boundary"] == "registered"
+
+
+def test_operator_start_diagnostic_is_preserved_in_failure_artifact(desktop_runner, tmp_path):
+    desktop_runner.LOGS_DIR = tmp_path
+    diagnostic = {
+        "start_handler_state": "entered",
+        "invocation_state": "rejected",
+        "native_event_observation": "running_received",
+        "polling_observation": "command_failed",
+        "render_state": "not_running",
+        "private_field": "C:\\private\\model.gguf prompt SECRET",
+    }
+    desktop_runner._write_webdriver_diagnostic(
+        "match", "running", "operator_running_not_reached",
+        operator_start_diagnostic=diagnostic)
+
+    artifact_text = (tmp_path / "packaged-webdriver-diagnostic.json").read_text()
+    artifact = json.loads(artifact_text)
+    assert {field: artifact[field] for field in diagnostic if field != "private_field"} == {
+        field: value for field, value in diagnostic.items() if field != "private_field"
+    }
+    assert "private" not in artifact_text
+    assert "SECRET" not in artifact_text
+
+
+def test_post_start_operator_state_records_running_and_registration(desktop_runner):
+    progress = []
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "entered", "invocation_state": "resolved"}
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
+    desktop_runner._status_value = lambda _driver, label: "yes" if label == "Registered" else "no"
+
+    class Wait:
+        def __init__(self, _driver, timeout, **_kwargs):
+            assert timeout == 9
+
+        def until(self, predicate):
+            assert predicate(object()) is True
+
+    desktop_runner.WebDriverWait = Wait
+    desktop_runner.wait_for_post_start_operator_state(
+        object(), lambda: 9, progress.append, pytest.fail)
+
+    assert progress == ["operator_running", "operator_registered"]
+
+
+def test_post_start_operator_state_distinguishes_running_failure(desktop_runner):
+    private_error = "C:\\private\\model.gguf prompt-secret"
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "entered", "invocation_state": "resolved"}
+    class Wait:
+        def __init__(self, _driver, _timeout, **_kwargs):
+            pass
+
+        def until(self, predicate):
+            assert predicate(object()) is True
+            return True
+
+    desktop_runner.WebDriverWait = Wait
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError(private_error)))
+    failures = []
+
+    def fail_closed(reason):
+        failures.append(reason)
+        raise RuntimeError(reason) from None
+
+    with pytest.raises(RuntimeError, match="^operator_running_not_reached$") as raised:
+        desktop_runner.wait_for_post_start_operator_state(
+            object(), lambda: 9, pytest.fail, fail_closed)
+
+    assert failures == ["operator_running_not_reached"]
+    assert private_error not in str(raised.value)
+
+
+def test_post_start_operator_state_distinguishes_registration_failure(desktop_runner):
+    progress = []
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "entered", "invocation_state": "resolved"}
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
+
+    class Wait:
+        calls = 0
+
+        def __init__(self, _driver, _timeout, **_kwargs):
+            pass
+
+        def until(self, predicate):
+            type(self).calls += 1
+            if self.calls == 1:
+                assert predicate(object()) is True
+                return True
+            raise RuntimeError("https://private.example prompt-secret")
+
+    desktop_runner.WebDriverWait = Wait
+
+    def fail_closed(reason):
+        raise RuntimeError(reason) from None
+
+    with pytest.raises(RuntimeError, match="^operator_registration_not_reached$") as raised:
+        desktop_runner.wait_for_post_start_operator_state(
+            object(), lambda: 9, progress.append, fail_closed)
+
+    assert progress == ["operator_running"]
+    assert "private.example" not in str(raised.value)
+
+
+def test_post_start_operator_state_rejects_optimistic_running_without_active_attempt(
+        desktop_runner):
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "not_entered", "invocation_state": "not_started"}
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: pytest.fail(
+        "stale Running state must not be inspected before active-attempt evidence")
+
+    class Wait:
+        def __init__(self, _driver, _timeout, **_kwargs):
+            pass
+
+        def until(self, predicate):
+            assert predicate(object()) is False
+            raise RuntimeError("bounded active-attempt wait expired")
+
+    desktop_runner.WebDriverWait = Wait
+
+    def fail_closed(reason):
+        raise RuntimeError(reason) from None
+
+    with pytest.raises(RuntimeError, match="^operator_running_not_reached$"):
+        desktop_runner.wait_for_post_start_operator_state(
+            object(), lambda: 9, pytest.fail, fail_closed)
+
+
+def test_post_start_operator_state_reports_missing_active_attempt_before_running(
+        desktop_runner):
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "not_entered", "invocation_state": "not_started"}
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
+    failures = []
+
+    class Wait:
+        calls = 0
+
+        def __init__(self, _driver, _timeout, **_kwargs):
+            pass
+
+        def until(self, predicate):
+            type(self).calls += 1
+            if self.calls == 1:
+                assert predicate(object()) is False
+                raise RuntimeError("private stale-state detail")
+            return True
+
+    desktop_runner.WebDriverWait = Wait
+    desktop_runner._status_value = lambda _driver, _label: "yes"
+    desktop_runner.wait_for_post_start_operator_state(
+        object(), lambda: 9, lambda _progress: None, failures.append)
+
+    assert failures == ["operator_running_not_reached"]
 
 
 def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
@@ -99,13 +1332,179 @@ def test_tauri_driver_environment_removes_poisoned_tokenizer_handoff(
     keys = (
         "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST",
         "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE",
+        "TOKEN_PLACE_PYTHON",
+        "TOKEN_PLACE_SIDECAR_PYTHON",
     )
     for key in keys:
         monkeypatch.setenv(key, f"poisoned {key}")
 
-    env = desktop_runner.tauri_driver_environment(tmp_path / "isolated home")
+    isolated_home = tmp_path / "isolated home"
+    env = desktop_runner.tauri_driver_environment(isolated_home)
 
     assert all(key not in env for key in keys)
+    assert env["HOME"] == str(isolated_home)
+    assert env["XDG_CONFIG_HOME"] == str(isolated_home / ".config")
+    assert env["XDG_DATA_HOME"] == str(isolated_home / ".local/share")
+    assert env["APPDATA"] == str(isolated_home / "AppData/Roaming")
+    assert env["WEBVIEW2_USER_DATA_FOLDER"] == str(
+        (isolated_home / "WebView2").resolve(strict=True))
+    assert all(path.is_dir() for path in (
+        isolated_home,
+        isolated_home / ".config",
+        isolated_home / ".local/share",
+        isolated_home / "AppData/Roaming",
+        isolated_home / "WebView2",
+    ))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_tokenizer_stage_is_bounded_atomic_and_rearmed(desktop_runner, tmp_path):
+    evidence = tmp_path / "sentinel-private-path-payload.json"
+    desktop_runner._write_tokenizer_stage(evidence, "python_producer_not_invoked", 35)
+    stage = desktop_runner.tokenizer_stage_path(evidence)
+    assert json.loads(stage.read_text(encoding="utf-8")) == {
+        "version": 1, "stage": 35, "category": "python_producer_not_invoked"}
+    assert "sentinel-private-path-payload" not in stage.read_text(encoding="utf-8")
+    assert desktop_runner._read_tokenizer_stage(evidence) == "python_producer_not_invoked"
+    assert not list(tmp_path.glob(".tokenizer-runner-stage-*.tmp"))
+
+
+def test_tokenizer_stage_rejects_non_allowlisted_category(desktop_runner, tmp_path):
+    with pytest.raises(ValueError, match="invalid tokenizer stage category"):
+        desktop_runner._write_tokenizer_stage(
+            tmp_path / "evidence.json", "sentinel-private-category", 35)
+    assert not list(tmp_path.iterdir())
+
+
+def test_tokenizer_stage_rejects_missing_file(desktop_runner, tmp_path):
+    with pytest.raises(RuntimeError, match="application_arguments_absent"):
+        desktop_runner._read_tokenizer_stage(tmp_path / "missing-evidence.json")
+
+
+@pytest.mark.parametrize("value", [[], "malformed", None, 7, {"version": 1}])
+def test_tokenizer_stage_rejects_non_object_or_malformed_json(
+        desktop_runner, tmp_path, value):
+    evidence = tmp_path / "evidence.json"
+    desktop_runner.tokenizer_stage_path(evidence).write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="application_arguments_malformed"):
+        desktop_runner._read_tokenizer_stage(evidence)
+
+
+@pytest.mark.parametrize("stage", [True, 29, 31])
+def test_tokenizer_stage_rejects_bool_or_mismatched_stage(desktop_runner, tmp_path, stage):
+    evidence = tmp_path / "evidence.json"
+    desktop_runner.tokenizer_stage_path(evidence).write_text(json.dumps({
+        "version": 1, "stage": stage, "category": "python_handoff_received"}),
+        encoding="utf-8")
+    with pytest.raises(RuntimeError, match="application_arguments_malformed"):
+        desktop_runner._read_tokenizer_stage(evidence)
+
+
+def test_tokenizer_stage_runner_boundaries_are_directly_enforced(desktop_runner, tmp_path):
+    evidence = tmp_path / "evidence.json"
+    stage_path = desktop_runner.tokenizer_stage_path(evidence)
+
+    def publish(category, stage):
+        stage_path.write_text(json.dumps({
+            "version": 1, "stage": stage, "category": category,
+        }), encoding="utf-8")
+
+    def fail_closed(reason):
+        raise RuntimeError(reason)
+
+    for category, stage, expected in (
+        ("application_arguments_absent", 0, "application_arguments_absent"),
+        ("application_arguments_malformed", 10, "application_arguments_malformed"),
+        ("application_arguments_accepted", 10, "rust_python_handoff_failed"),
+    ):
+        publish(category, stage)
+        with pytest.raises(RuntimeError, match=expected):
+            desktop_runner._validate_operator_tokenizer_handoff(evidence, fail_closed)
+
+    publish("python_handoff_received", 30)
+    desktop_runner._validate_operator_tokenizer_handoff(evidence, fail_closed)
+    stage_path.unlink()
+    with pytest.raises(RuntimeError, match="application_arguments_absent"):
+        desktop_runner._validate_operator_tokenizer_handoff(evidence, fail_closed)
+    recorded = []
+    desktop_runner._validate_operator_tokenizer_handoff(evidence, recorded.append)
+    assert recorded == ["application_arguments_absent"]
+
+    driver_log = tmp_path / "driver.log"
+    driver_log.write_bytes(b"bounded-log")
+    assert desktop_runner._rearm_tokenizer_stage(evidence, driver_log) == 11
+    assert desktop_runner._read_tokenizer_stage(evidence) == "python_producer_not_invoked"
+
+    with pytest.raises(RuntimeError, match="python_producer_not_invoked"):
+        desktop_runner._validate_final_tokenizer_stage(evidence, fail_closed)
+    publish("authoritative_evidence_published", 100)
+    desktop_runner._validate_final_tokenizer_stage(evidence, fail_closed)
+    stage_path.write_text("not-json", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="application_arguments_absent"):
+        desktop_runner._validate_final_tokenizer_stage(evidence, fail_closed)
+    recorded.clear()
+    desktop_runner._validate_final_tokenizer_stage(evidence, recorded.append)
+    assert recorded == ["application_arguments_absent"]
+
+
+@pytest.mark.parametrize(("category", "stage"), [
+    ("application_arguments_accepted", 10),
+    ("rust_python_handoff_failed", 20),
+    ("rust_python_handoff_accepted", 20),
+])
+def test_tokenizer_handoff_converts_incomplete_stages_to_specific_failure(
+        desktop_runner, tmp_path, category, stage):
+    evidence = tmp_path / "private-request-path.json"
+    desktop_runner.tokenizer_stage_path(evidence).write_text(json.dumps({
+        "version": 1, "stage": stage, "category": category,
+    }), encoding="utf-8")
+    failures = []
+
+    desktop_runner._validate_operator_tokenizer_handoff(evidence, failures.append)
+
+    assert failures == ["rust_python_handoff_failed"]
+    assert "private-request-path" not in failures[0]
+
+
+@pytest.mark.parametrize(("category", "stage"), [
+    ("python_producer_not_invoked", 35),
+    ("request_validation_failure", 40),
+    ("fixture_hash_validation_failure", 50),
+    ("active_runtime_tokenizer_unavailable", 60),
+    ("tokenization_failure", 65),
+    ("runtime_identity_unavailable", 70),
+    ("evidence_publication_failure", 90),
+])
+def test_tokenizer_stage_finalization_preserves_allowlisted_producer_failure(
+        desktop_runner, tmp_path, category, stage):
+    evidence = tmp_path / "payload-secret-exception-text.json"
+    desktop_runner.tokenizer_stage_path(evidence).write_text(json.dumps({
+        "version": 1, "stage": stage, "category": category,
+    }), encoding="utf-8")
+    failures = []
+
+    desktop_runner._validate_final_tokenizer_stage(evidence, failures.append)
+
+    assert failures == [category]
+    assert all(sentinel not in failures[0]
+        for sentinel in ("payload", "secret", "exception", str(evidence)))
 
 
 def _phase_write(desktop_runner, path, *, clock, sleeper, platform_name="nt"):
@@ -164,6 +1563,25 @@ def test_phase_checkpoint_windows_permission_deadline_is_bounded_and_sanitized(
     assert len(attempts) == 4
     assert "private" not in str(raised.value)
     assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
+
+
+def test_webview2_devtools_detects_owned_application_exit_after_poll(
+        desktop_runner, monkeypatch):
+    polls = iter([None, 7])
+    clock = SimpleNamespace(value=0.0)
+    def monotonic():
+        clock.value += 0.01
+        return clock.value
+    monkeypatch.setattr(desktop_runner.time, "monotonic", monotonic)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(desktop_runner, "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("private response")))
+
+    with pytest.raises(RuntimeError, match="^webdriver_application_startup_failed$") as raised:
+        desktop_runner.wait_for_webview2_devtools(
+            SimpleNamespace(poll=lambda: next(polls)), 49152, 1)
+
+    assert "private" not in str(raised.value)
 
 
 def test_phase_checkpoint_does_not_retry_unrelated_error(
@@ -1908,6 +3326,7 @@ def test_nonzero_normal_exit_requires_final_cleanup_checkpoint(
 @pytest.mark.parametrize(("primary_reason", "expected_reason"), [
     (None, "cleanup_failure"),
     ("send_button_not_enabled", "send_button_not_enabled"),
+    ("tokenization_failure", "tokenization_failure"),
 ])
 def test_nonzero_cleanup_failure_is_categorical_and_preserves_primary(
         tmp_path, primary_reason, expected_reason):
@@ -1923,6 +3342,10 @@ def test_nonzero_cleanup_failure_is_categorical_and_preserves_primary(
         cleanup_timeout_s=1, subprocess_run=failed_runner)
     assert result["failure_reason"] == expected_reason
     assert result["cleanup_succeeded"] is False
+    if primary_reason == "tokenization_failure":
+        assert result["pass"] is False
+        assert "semantic" not in result
+        assert "performance" not in result
 
 
 @pytest.mark.parametrize(("contents", "expected"), [
@@ -2301,13 +3724,19 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     tree = ast.parse(source)
     wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
         "_write_benchmark_phase", "_remove_owned_path",
-        "tauri_driver_environment", "run_long_context_packaged_mode"}
+        "tauri_driver_environment", "tokenizer_stage_path", "_write_tokenizer_stage",
+        "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS, "psutil": __import__("psutil"),
+        "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
+        "_write_webdriver_diagnostic": lambda *_args: None,
+        "_read_operator_start_diagnostic": lambda _driver: {},
+        "_read_native_startup_diagnostic": lambda _driver: {},
+        "_read_packaged_startup_diagnostic": lambda *_args: {},
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
         namespace)
@@ -2331,18 +3760,283 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
     assert checkpoint["cleanup_succeeded"] is True
 
 
+@pytest.mark.parametrize(("command_error", "gate_error", "launch_error", "devtools_error",
+    "start_error", "ready_error", "operator_error", "expected_reason", "expected_phase",
+    "expected_progress"), [
+    (None, None, None, None, RuntimeError("private session exception /secret/path"),
+        None, None, "webdriver_session_creation_failed", "webdriver_ready", "not_started"),
+    (None, None, OSError("private launch exception /secret/path"), None, None, None, None,
+        "webdriver_application_startup_failed", "webdriver_ready", "not_started"),
+    (None, None, None, RuntimeError("webdriver_application_startup_failed"), None, None,
+        None, "webdriver_application_startup_failed", "webdriver_ready", "not_started"),
+    (None, None, None, RuntimeError("webdriver_transport_failure"), None, None, None,
+        "webdriver_transport_failure", "webdriver_ready", "not_started"),
+    (None, None, None, None, None, RuntimeError("private readiness exception /secret/path"),
+        None, "desktop_ui_not_ready", "desktop_session_started", "not_started"),
+    (None, None, None, None, None, None, RuntimeError("packaged_runner_failure"),
+        "packaged_runner_failure", "desktop_ready", "operator_started"),
+    (None, None, None, None, None, None, RuntimeError("operator_running_not_reached"),
+        "operator_running_not_reached", "desktop_ready", "operator_started"),
+    (None, None, None, None, None, None, RuntimeError("operator_registration_not_reached"),
+        "operator_registration_not_reached", "desktop_ready", "operator_running"),
+    (None, RuntimeError("tauri_driver_exited"), None, None, None, None, None,
+        "tauri_driver_exited", "runner_startup", "not_started"),
+    (None, RuntimeError("webdriver_transport_failure"), None, None, None, None, None,
+        "webdriver_transport_failure", "runner_startup", "not_started"),
+    (RuntimeError("native_driver_unavailable"), None, None, None, None, None, None,
+        "native_driver_unavailable", "runner_startup", "not_started"),
+    (RuntimeError("packaged_runner_failure"), None, None, None,
+        None, None, None, "packaged_runner_failure", "runner_startup", "not_started"),
+    (None, None, None, None, None, RuntimeError("posix readiness failure"), None,
+        "desktop_ui_not_ready", "desktop_session_started", "not_started"),
+    (None, None, None, None, None, None, RuntimeError("handoff_failure"),
+        "rust_python_handoff_failed", "operator_ready", "operator_registered"),
+    (None, None, None, None, None, None, RuntimeError("submit_failure"),
+        "packaged_runner_failure", "operator_ready", "operator_registered"),
+    (None, None, None, None, None, None, RuntimeError("final_stage_failure"),
+        "tokenization_failure", "response_received", "operator_registered"),
+])
+def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
+        tmp_path, command_error, gate_error, launch_error, devtools_error, start_error,
+        ready_error, operator_error, expected_reason, expected_phase, expected_progress):
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {"tauri_driver_environment", "tokenizer_stage_path",
+        "_write_tokenizer_stage", "_webdriver_session_elapsed_bucket",
+        "_webdriver_process_posture", "run_long_context_packaged_mode"}
+    functions = [node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    checkpoints = []
+    process = SimpleNamespace(pid=1234)
+    application_process = SimpleNamespace(pid=1235)
+    driver = SimpleNamespace(
+        find_element=lambda *_args: SimpleNamespace(click=lambda: None),
+        execute_script=lambda *_args: None,
+    )
+    start_calls = []
+    popen_calls = []
+    cleaned_pids = []
+    memory_roots = []
+
+    def popen(args, **kwargs):
+        popen_calls.append((args, kwargs))
+        if args != ["tauri-driver"] and launch_error:
+            raise launch_error
+        return process if args == ["tauri-driver"] else application_process
+
+    def start(*args, **kwargs):
+        start_calls.append((args, kwargs))
+        if start_error:
+            raise start_error
+        return driver
+
+    def webdriver_ready(*_args, **_kwargs):
+        if gate_error:
+            raise gate_error
+
+    def webview2_ready(*_args, **_kwargs):
+        if devtools_error:
+            raise devtools_error
+
+    def driver_command():
+        if command_error:
+            raise command_error
+        return ["tauri-driver"]
+
+    def ready(*_args, **_kwargs):
+        if ready_error:
+            raise ready_error
+
+    def post_start(_driver, _remaining, record_progress, fail_closed):
+        if operator_error:
+            if str(operator_error) in {
+                    "handoff_failure", "submit_failure", "final_stage_failure"}:
+                record_progress("operator_running")
+                record_progress("operator_registered")
+                return
+            if str(operator_error) == "operator_registration_not_reached":
+                record_progress("operator_running")
+            if str(operator_error) in h.PACKAGED_FAILURE_REASONS:
+                fail_closed(str(operator_error))
+            raise operator_error
+
+    fake_os = SimpleNamespace(**vars(os))
+    fake_os.name = "posix" if str(ready_error) == "posix readiness failure" else "nt"
+    diagnostics = []
+    class MemorySampler:
+        def __init__(self, pid):
+            memory_roots.append(pid)
+
+        def sample(self):
+            return True
+
+        def summary(self):
+            return {"peak_rss_bytes": 1}
+
+    class LandingBrowser:
+        def set_page_load_timeout(self, _timeout):
+            pass
+
+        def set_script_timeout(self, _timeout):
+            pass
+
+        def get(self, _url):
+            pass
+
+        def execute_script(self, script):
+            if "FinalMetadata" in script:
+                return {"prompt_tokens": 1, "completion_tokens": 1,
+                    "finish_reason": "stop"}
+            if "GenerationSettings" in script:
+                return {"supplied": {}, "omitted_runtime_default": []}
+            if "return {p:" in script:
+                return {"p": {"sequence": 1}, "h": [{"role": "assistant",
+                    "content": "bounded response", "isTyping": False,
+                    "finishReason": "stop"}], "b": False, "t": "8k-fast"}
+            return None
+
+    namespace = {
+        "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
+        "os": fake_os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "By": SimpleNamespace(XPATH="xpath"),
+        "WEBDRIVER_READINESS_CATEGORIES": frozenset({"ready", "no_window_handle",
+            "wrong_handle", "missing_shell", "missing_required_controls",
+            "webdriver_failure", "unknown"}),
+        "_classify_webdriver_session_failure": lambda _exc, _process: (
+            "webdriver_session_creation_failed", "running", "unknown"),
+            "_write_webdriver_diagnostic": lambda *args: diagnostics.append(args),
+            "_read_native_startup_diagnostic": lambda _driver: {
+                "native_startup_phase": "startup_task_failed",
+                "native_startup_outcome": "failed",
+                "native_startup_failure_category": "child_spawn_failed",
+            },
+            "_read_packaged_startup_diagnostic": lambda *_args: {},
+            "_read_operator_start_diagnostic": lambda _driver: {
+                "start_handler_state": "entered", "invocation_state": "resolved",
+                "native_event_observation": "running_rejected",
+                "polling_observation": "not_running", "render_state": "not_running",
+            },
+        "psutil": __import__("psutil"),
+        "subprocess": SimpleNamespace(
+            Popen=popen, STDOUT=-2),
+        "tauri_driver_command": driver_command, "TAURI_ROOT": tmp_path,
+        "OwnedProcessTreeMemorySampler": MemorySampler,
+        "wait_for_webdriver_ready": webdriver_ready,
+        "wait_for_webview2_devtools": webview2_ready,
+        "reserve_free_port": lambda: 49152,
+        "start_driver": start, "tokenizer_handoff_args": lambda *_args: [
+            "--tokenizer-request=request.json", "--tokenizer-evidence=evidence.json"],
+        "wait_for_ui_ready": ready,
+        "fill_input_by_label": lambda *_args: None,
+        "benchmark_operator_mode": lambda _backend: "cpu",
+        "wait_for_start_operator_enabled": lambda *_args, **_kwargs: None,
+        "wait_for_post_start_operator_state": post_start,
+        "_validate_operator_tokenizer_handoff": lambda _evidence, fail_closed: (
+            fail_closed("rust_python_handoff_failed")
+            if str(operator_error) == "handoff_failure" else None),
+        "_status_value": lambda _driver, label: {
+            "Launcher source": "bundled", "Backend selected": "cpu",
+            "Backend used": "cpu", "Runtime ID": "runtime",
+        }.get(label, "bounded"),
+        "_readiness_diagnostics_map": lambda _driver: {},
+        "packaged_runtime_configuration": lambda *_args: {},
+        "start_landing_driver": LandingBrowser,
+        "_prepare_packaged_landing_page": lambda *_args: None,
+        "_rearm_tokenizer_stage": lambda _evidence, _log: 0,
+        "_populate_and_submit_packaged_prompt": lambda *_args, **kwargs: (
+            kwargs["before_submit"](),
+            (_ for _ in ()).throw(RuntimeError("packaged_runner_failure")),
+        )[-1] if str(operator_error) == "submit_failure" else (
+            kwargs["before_submit"]() or time.monotonic()),
+        "classify_benchmark_landing_state": h.classify_benchmark_landing_state,
+        "parse_packaged_local_telemetry": lambda _text: {},
+        "observe_post_terminal": lambda *_args, **_kwargs: [],
+        "_validate_final_tokenizer_stage": lambda _evidence, fail_closed: (
+            fail_closed("tokenization_failure")
+            if str(operator_error) == "final_stage_failure" else None),
+        "_validate_packaged_failure_reason": lambda reason: reason,
+        "_write_benchmark_phase": lambda *_args, **kwargs: checkpoints.append(dict(kwargs)),
+        "_cleanup_owned_process_tree": lambda owned, *_args: (
+            cleaned_pids.append(owned.pid) or True),
+        "_quit_webdriver": lambda *_args: True,
+        "_remove_owned_path": lambda *_args, **_kwargs: True,
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
+        namespace)
+    app = tmp_path / "current-head.exe"
+    app.write_bytes(b"app")
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"model")
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps({
+        "phase_status_version": h.PACKAGED_PHASE_STATUS_VERSION,
+        "phase_status_phases": list(h.PACKAGED_PHASES), "setup_timeout_s": 10,
+        "cleanup_timeout_s": 1,
+        "model": str(model), "relay_url": "https://relay.example",
+        "backend": "cpu", "context_tier": "8k-fast",
+        "request_timeout_s": 1, "finalization_timeout_s": 1,
+        "prompt": "bounded prompt",
+        "manifest": {"fixture_sha256": "0" * 64, "targets": {}},
+    }))
+
+    with pytest.raises(RuntimeError, match=f"^{expected_reason}$") as raised:
+        namespace["run_long_context_packaged_mode"](
+            request_path, tmp_path / "evidence.json", tmp_path / "phase.json", app)
+
+    assert raised.value.__cause__ is None
+    assert "private" not in str(raised.value)
+    assert checkpoints[-1]["last_safe_phase"] == expected_phase
+    assert checkpoints[-1]["failure_reason"] == expected_reason
+    assert checkpoints[-1]["cleanup_succeeded"] is True
+    assert diagnostics[-1][-4] == expected_progress
+    assert diagnostics[-1][-3]["start_handler_state"] == "entered"
+    assert diagnostics[-1][-2] == {
+        "native_startup_phase": "startup_task_failed",
+        "native_startup_outcome": "failed",
+        "native_startup_failure_category": "child_spawn_failed",
+    }
+    assert diagnostics[-1][-1] == {}
+    assert len(start_calls) == (
+        0 if command_error or gate_error or launch_error or devtools_error else 1)
+    if fake_os.name == "nt" and not command_error and not gate_error and not launch_error:
+        app_args, app_kwargs = popen_calls[1]
+        assert app_args == [str(app.resolve()),
+            "--edge-webview-switches=--remote-debugging-port=49152",
+            "--tokenizer-request=request.json", "--tokenizer-evidence=evidence.json"]
+        assert app_kwargs["cwd"] == app.parent
+        assert "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS" not in app_kwargs["env"]
+        webview2_user_data = Path(app_kwargs["env"]["WEBVIEW2_USER_DATA_FOLDER"])
+        assert webview2_user_data.resolve(strict=True) == (
+            Path(app_kwargs["env"]["HOME"]) / "WebView2").resolve(strict=True)
+        assert webview2_user_data.is_absolute()
+        assert webview2_user_data.is_dir()
+        assert app_kwargs["env"]["TAURI_AUTOMATION"] == "true"
+        assert app_kwargs["env"]["TAURI_WEBVIEW_AUTOMATION"] == "true"
+        if not devtools_error:
+            assert start_calls[0][1]["application_args"] == app_args[2:]
+            assert start_calls[0][1]["debugger_address"] == "127.0.0.1:49152"
+        assert memory_roots == [1235]
+        assert sorted(cleaned_pids) == [1234, 1235]
+
+
 def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
     wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
         "_write_benchmark_phase", "_remove_owned_path",
-        "tauri_driver_environment", "run_long_context_packaged_mode"}
+        "tauri_driver_environment", "tokenizer_stage_path", "_write_tokenizer_stage",
+        "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS, "psutil": __import__("psutil"),
+        "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
+        "_write_webdriver_diagnostic": lambda *_args: None,
+        "_read_operator_start_diagnostic": lambda _driver: {},
+        "_read_native_startup_diagnostic": lambda _driver: {},
+        "_read_packaged_startup_diagnostic": lambda *_args: {},
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
         namespace)
@@ -2371,7 +4065,8 @@ def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowanc
     tree = ast.parse(source)
     wanted = {"_is_windows_sharing_violation", "_is_windows_checkpoint_contention",
         "_write_benchmark_phase",
-        "_remove_owned_path", "tauri_driver_environment", "run_long_context_packaged_mode"}
+        "_remove_owned_path", "tauri_driver_environment", "tokenizer_stage_path",
+        "_write_tokenizer_stage", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     now = [0.0]
@@ -2381,6 +4076,12 @@ def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowanc
         "tempfile": __import__("tempfile"), "os": os,
         "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "_classify_webdriver_session_failure": lambda _exc, _process: (
+            "webdriver_session_creation_failed", "running"),
+        "_write_webdriver_diagnostic": lambda *_args: None,
+        "_read_operator_start_diagnostic": lambda _driver: {},
+        "_read_native_startup_diagnostic": lambda _driver: {},
+        "_read_packaged_startup_diagnostic": lambda *_args: {},
         "psutil": __import__("psutil"), "sys": sys,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"),
@@ -2427,7 +4128,8 @@ def test_packaged_runner_log_close_failure_preserves_primary_and_finishes_cleanu
     """A log-close fault cannot interrupt owned cleanup or final reporting."""
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"tauri_driver_environment", "run_long_context_packaged_mode"}
+    wanted = {"tauri_driver_environment", "tokenizer_stage_path",
+        "_write_tokenizer_stage", "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     events = []
@@ -2459,10 +4161,15 @@ def test_packaged_runner_log_close_failure_preserves_primary_and_finishes_cleanu
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
+        "_classify_webdriver_session_failure": lambda _exc, _process: ("webdriver_session_creation_failed", "running"),
+        "_write_webdriver_diagnostic": lambda *_args: None,
+        "_read_operator_start_diagnostic": lambda _driver: {},
+        "_read_native_startup_diagnostic": lambda _driver: {},
+        "_read_packaged_startup_diagnostic": lambda *_args: {},
         "subprocess": SimpleNamespace(Popen=lambda *_args, **_kwargs: process, STDOUT=-2),
         "tauri_driver_command": lambda: ["tauri-driver"], "TAURI_ROOT": tmp_path,
         "OwnedProcessTreeMemorySampler": lambda _pid: object(),
-        "wait_for_port": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        "wait_for_webdriver_ready": lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("primary packaged failure")),
         "_write_benchmark_phase": lambda *_args, **kwargs: checkpoints.append(dict(kwargs)),
         "_cleanup_owned_process_tree": lambda owned, _remaining: (

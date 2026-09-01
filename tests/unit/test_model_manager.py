@@ -4838,6 +4838,7 @@ def test_subprocess_proxy_uses_windows_process_group_creationflags(monkeypatch, 
 
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
     monkeypatch.setattr(model_manager_module.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200, raising=False)
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_legacy_fixture_transport', True)
 
     model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
 

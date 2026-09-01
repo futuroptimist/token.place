@@ -3329,43 +3329,74 @@ def test_api_v1_stale_server_expires_without_poll_heartbeat(client, monkeypatch)
 def test_api_v1_poll_long_wait_ignores_unrelated_server_wakeups(client, monkeypatch):
     server_one = base64.b64encode(b"server_public_key_1").decode("utf-8")
     server_two = base64.b64encode(b"server_public_key_2").decode("utf-8")
-    assert client.post('/api/v1/relay/servers/register', json={'server_public_key': server_one}).status_code == 200
-    assert client.post('/api/v1/relay/servers/register', json={'server_public_key': server_two}).status_code == 200
+    server_one_payload = _api_v1_registered_control_payload(
+        client,
+        server_one,
+        capabilities=_capabilities('8k-fast', models=['model-for-server-one']),
+    )
+    server_two_payload = _api_v1_registered_control_payload(
+        client,
+        server_two,
+        capabilities=_capabilities('8k-fast'),
+    )
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.25')
+    store = relay_module._api_v1_store()
+    original_claim = store.claim_queued_request
+    empty_claims = 0
+    first_empty = threading.Event()
+    unrelated_wakeup_observed = threading.Event()
+
+    def _observe_server_one_empty(*args, **kwargs):
+        nonlocal empty_claims
+        claim = original_claim(*args, **kwargs)
+        if args[0] == server_one and claim.state == 'empty':
+            empty_claims += 1
+            (first_empty if empty_claims == 1 else unrelated_wakeup_observed).set()
+        return claim
+
+    monkeypatch.setattr(store, 'claim_queued_request', _observe_server_one_empty)
 
     result = {}
 
     def _poll_server_one():
-        with app.test_client() as polling_client:
-            response = polling_client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_one})
-            result['status'] = response.status_code
-            result['json'] = response.get_json()
+        try:
+            with app.test_client() as polling_client:
+                response = polling_client.post('/api/v1/relay/servers/poll', json=server_one_payload)
+                result['status'] = response.status_code
+                result['json'] = response.get_json()
+        except Exception as exc:  # pragma: no cover - asserted in the parent thread
+            result['error'] = exc
 
     poll_thread = threading.Thread(target=_poll_server_one)
     poll_thread.start()
-    time.sleep(0.05)
+    assert first_empty.wait(timeout=1.0)
 
-    queued = client.post('/api/v1/relay/requests', json={
-        'request_id': 'req-for-server-two',
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'server_public_key': server_two,
-        'chat_history': 'ciphertext-request',
-        'cipherkey': 'cipherkey-request',
-        'iv': 'iv-request',
-    })
+    queued = _queue_api_v1_request(
+        client,
+        server_public_key=server_two,
+        request_id='req-for-server-two',
+        client_public_key=DUMMY_CLIENT_PUB_KEY,
+    )
     assert queued.status_code == 200
 
-    time.sleep(0.05)
+    assert unrelated_wakeup_observed.wait(timeout=1.0)
     assert poll_thread.is_alive()
 
-    poll_server_two = client.post('/api/v1/relay/servers/poll', json={'server_public_key': server_two})
+    poll_server_two = client.post('/api/v1/relay/servers/poll', json=server_two_payload)
     assert poll_server_two.status_code == 200
-    assert poll_server_two.get_json()['request_id'] == 'req-for-server-two'
+    server_two_result = poll_server_two.get_json()
+    assert server_two_result['request_id'] == 'req-for-server-two'
+    assert server_two_result['chat_history'] == 'ciphertext-request'
 
-    poll_thread.join(timeout=0.5)
+    poll_thread.join(timeout=1.0)
     assert not poll_thread.is_alive()
+    assert 'error' not in result
     assert result['status'] == 200
-    assert result['json']['message'] == 'No requests available'
+    assert result['json'] == {
+        'message': 'No requests available',
+        'next_ping_in_x_seconds': 0,
+        'poll_wait_seconds': 0.25,
+    }
 
 
 def test_api_v1_poll_long_wait_wakes_on_shared_queue_legacy_compat_enqueue(client, monkeypatch):

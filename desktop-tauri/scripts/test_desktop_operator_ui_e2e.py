@@ -109,6 +109,28 @@ def fetch_relay_diagnostics_count(relay_url: str, *, timeout_seconds: float) -> 
     return int(payload["total_api_v1_registered_compute_nodes"])
 
 
+def require_clean_relay_registration_baseline(
+        relay_url: str, *, timeout_seconds: float, fail_closed,
+        record_relay_observation) -> int:
+    """Require an authoritative empty relay before starting this attempt."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail_closed("operator_registration_not_reached")
+        record_relay_observation("polled")
+        try:
+            registered = fetch_relay_diagnostics_count(
+                relay_url, timeout_seconds=max(0.05, min(remaining, 0.5)))
+        except Exception:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            continue
+        if registered != 0:
+            record_relay_observation("not_reached")
+            fail_closed("operator_registration_not_reached")
+        return registered
+
+
 def wait_for_relay_diagnostics_count(relay_url: str, expected_count: int, timeout_seconds: float) -> float:
     started = time.monotonic()
     deadline = started + timeout_seconds
@@ -275,7 +297,7 @@ def wait_for_running_stability(
 
 
 def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining,
-        record_progress, fail_closed) -> None:
+        record_progress, fail_closed, relay_url: str, record_relay_observation) -> None:
     """Require the two ordered post-click operator boundaries fail closed."""
     active_attempt_ready = True
     try:
@@ -299,11 +321,42 @@ def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining
     if not running_stable:
         fail_closed("operator_running_not_reached")
     record_progress("operator_running")
+
+    registration_deadline = time.monotonic() + setup_remaining()
+    terminal_allowance = min(0.5, max(0.0, registration_deadline - time.monotonic()))
+    ordinary_polling_deadline = registration_deadline - terminal_allowance
+
+    def authoritative_registration_observed(_driver) -> bool:
+        remaining = ordinary_polling_deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        record_relay_observation("polled")
+        try:
+            registered = fetch_relay_diagnostics_count(
+                relay_url, timeout_seconds=min(remaining, 0.5)) == 1
+        except Exception:
+            return False
+        if registered:
+            record_relay_observation("registered")
+        return registered
+
     try:
-        WebDriverWait(driver, setup_remaining()).until(
-            lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+        WebDriverWait(driver, max(0.0, ordinary_polling_deadline - time.monotonic()),
+            poll_frequency=0.25).until(authoritative_registration_observed)
     except Exception:
-        fail_closed("operator_registration_not_reached")
+        remaining = registration_deadline - time.monotonic()
+        terminal_registered = False
+        if remaining > 0:
+            record_relay_observation("polled")
+            try:
+                terminal_registered = fetch_relay_diagnostics_count(
+                    relay_url, timeout_seconds=min(remaining, 0.5)) == 1
+            except Exception:
+                terminal_registered = False
+        if not terminal_registered:
+            record_relay_observation("not_reached")
+            fail_closed("operator_registration_not_reached")
+        record_relay_observation("registered")
     record_progress("operator_registered")
 
 
@@ -1015,7 +1068,7 @@ def _read_native_startup_diagnostic(driver: webdriver.Remote | None) -> dict[str
 
 def _read_packaged_startup_diagnostic(driver: webdriver.Remote | None,
         operator_start: dict[str, str], native_startup: dict[str, str],
-        readiness_category: str = "unknown") -> dict[str, str]:
+        readiness_category: str = "unknown", relay_observation: str = "not_started") -> dict[str, str]:
     """Project only bounded status labels into the durable startup diagnostic."""
     result = PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS.copy()
     if driver is None:
@@ -1067,8 +1120,13 @@ def _read_packaged_startup_diagnostic(driver: webdriver.Remote | None,
         "pending" if relay_runtime in {"provisioning", "starting", "warming", "recovering"}
         else "not_started" if relay_runtime in {"idle", "stopped"} else "unknown")
     result["relay_polling_state"] = (
-        "started" if registered == "yes" or relay_runtime in {"processing", "recovering"}
+        "started" if relay_observation in {"polled", "registered", "not_reached"}
+        or registered == "yes" or relay_runtime in {"processing", "recovering"}
         else "not_started" if relay_runtime != "unknown" else "unknown")
+    if relay_observation == "registered":
+        result["registration_state"] = "registered"
+    elif relay_observation == "not_reached":
+        result["registration_state"] = "not_reached"
 
     handler = operator_start.get("start_handler_state")
     invocation = operator_start.get("invocation_state")
@@ -1753,9 +1811,13 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     webdriver_target_category = "unknown"
     webdriver_readiness_category = "unknown"
     operator_progress = "not_started"
+    relay_observation = "not_started"
     def record_operator_progress(progress: str) -> None:
         nonlocal operator_progress
         operator_progress = progress
+    def record_relay_observation(observation: str) -> None:
+        nonlocal relay_observation
+        relay_observation = observation
     try:
         setup_remaining()
         try:
@@ -1861,10 +1923,14 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             timeout_seconds=setup_remaining())
         operator_progress = "operator_enabled"
         setup_remaining()
+        require_clean_relay_registration_baseline(
+            request["relay_url"], timeout_seconds=setup_remaining(),
+            fail_closed=fail_closed, record_relay_observation=record_relay_observation)
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
         operator_progress = "operator_started"
         wait_for_post_start_operator_state(
-            driver, setup_remaining, record_operator_progress, fail_closed)
+            driver, setup_remaining, record_operator_progress, fail_closed,
+            request["relay_url"], record_relay_observation)
         write_phase("operator_ready")
 
         _validate_operator_tokenizer_handoff(tokenizer_evidence, fail_closed)
@@ -2063,7 +2129,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         native_startup_diagnostic = _read_native_startup_diagnostic(driver)
         packaged_startup_diagnostic = _read_packaged_startup_diagnostic(
             driver, operator_start_diagnostic, native_startup_diagnostic,
-            webdriver_readiness_category)
+            webdriver_readiness_category, relay_observation)
         _write_webdriver_diagnostic(
             os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
             tauri_driver_state, webdriver_failure_category, webdriver_exception_family,

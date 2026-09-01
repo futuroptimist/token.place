@@ -3225,18 +3225,20 @@ def test_api_v1_poll_long_wait_dispatches_when_request_arrives(client, monkeypat
 
 
 def test_api_v1_poll_long_wait_timeout_returns_no_work(client, monkeypatch):
-    server_payload = {'server_public_key': DUMMY_SERVER_PUB_KEY, 'capabilities': _capabilities('8k-fast')}
-    assert client.post('/api/v1/relay/servers/register', json=server_payload).status_code == 200
+    server_payload = _api_v1_registered_control_payload(
+        client, DUMMY_SERVER_PUB_KEY, capabilities=_capabilities('8k-fast')
+    )
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_POLL_WAIT_SECONDS', '0.01')
 
     started = time.monotonic()
-    poll = client.post('/api/v1/relay/servers/poll', json={'server_public_key': DUMMY_SERVER_PUB_KEY})
+    poll = client.post('/api/v1/relay/servers/poll', json=server_payload)
     elapsed = time.monotonic() - started
     assert poll.status_code == 200
     payload = poll.get_json()
     assert payload['message'] == 'No requests available'
     assert payload['next_ping_in_x_seconds'] == 0
     assert payload['poll_wait_seconds'] == 0.01
+    assert 'request_id' not in payload
     assert elapsed >= 0.008
 
 

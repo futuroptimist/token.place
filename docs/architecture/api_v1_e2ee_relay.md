@@ -10,8 +10,9 @@ This note is the canonical architecture baseline for the API v1 E2EE migration r
 - **Do not add streaming to API v1** for relay/client-server inference paths.
 - **API v1 chat is text-only.** The canonical runtime target is Qwen3 8B Q4_K_M, exposed as
   `qwen3-8b-instruct`, not a multimodal model. Chat completion payloads must not accept, transform,
-  summarize, placeholder, or otherwise pretend to support image content blocks such as `image_url`,
-  `input_image`, or `image`; these requests must fail closed at validation/runtime boundaries.
+  summarize, provide placeholders for, or otherwise pretend to support image content blocks such
+  as `image_url`, `input_image`, or `image`; these requests must fail closed at validation/runtime
+  boundaries.
 
 ## Runtime routing rules (must-follow)
 

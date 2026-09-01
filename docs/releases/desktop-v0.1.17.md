@@ -27,10 +27,10 @@ evergreen [production promotion checklist](../PRODUCTION_PROMOTION.md) for the l
 
 API v1 remains the only active runtime target and is non-streaming: a response is returned only
 after complete model output generation. All distributed inference must remain relay-blind E2EE.
-Relay-owned operational state may contain only ciphertext plus safe routing metadata and must fail
-closed if E2EE cannot be preserved; logs, diagnostics, and Step 05 evidence must not record
-ciphertext bodies or plaintext payload content. Packaging CI establishes build evidence, not
-physical Windows or macOS qualification.
+Relay transport and relay-owned operational state may handle only ciphertext envelopes plus safe
+routing metadata, and processing must fail closed if E2EE cannot be preserved. Logs, diagnostics,
+and Step 05 evidence must retain no plaintext, keys, ciphertext bodies, prompts, or responses.
+Packaging CI establishes build evidence, not physical Windows or macOS qualification.
 
 ## Step 05 staging handoff and evidence template
 
@@ -39,9 +39,10 @@ Step 05 must be performed on isolated real hosts and recorded without asserting 
 1. Deploy immutable relay tag `main-8618c9a` to staging and verify that the live image resolves to
    the relay index digest above. Record deployment timestamp, relay build ID, full image tag and
    digest, and chart package/app versions.
-2. Verify the downloaded installer and model checksums against this record before installation.
-   Record artifact names, architectures, hashes, model ID/profile/file, and a checksum for the
-   complete installed bundle.
+2. Verify only the downloaded installer and model hashes against the frozen immutable values in
+   this record before installation. Record artifact names, architectures, hashes, and model
+   ID/profile/file. After finalizing the evidence bundle, calculate and record its SHA-256; this new
+   evidence-bundle checksum is not compared with the immutable candidate hashes.
 3. On an isolated real Windows 11 CUDA host, install the candidate and record hardware, driver,
    detected CUDA backend, desktop build ID, start/finish timestamps, and latency. Separately repeat
    on an isolated real macOS Apple Silicon host, recording hardware, OS, detected Metal backend,
@@ -56,8 +57,9 @@ Step 05 must be performed on isolated real hosts and recorded without asserting 
    failover after the sticky node is made unavailable. Then stop work and prove the queue and
    in-flight counts drain to zero (or document a fail-closed terminal outcome).
 7. Preserve timestamps, desktop and relay build IDs, immutable tags/digests, artifact and model
-   hashes, bundle checksum, per-host latency, architecture, hardware, and confirmed acceleration
-   backend. Evidence must contain **no plaintext, keys, ciphertext bodies, prompts, or responses**.
+   hashes, evidence-bundle checksum, per-host latency, architecture, hardware, and confirmed
+   acceleration backend. Evidence must contain **no plaintext, keys, ciphertext bodies, prompts,
+   or responses**.
 
 ## Production rollback gate
 

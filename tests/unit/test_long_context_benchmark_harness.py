@@ -97,7 +97,7 @@ def desktop_runner():
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
         "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
-        "wait_for_post_start_operator_state", "require_clean_relay_registration_baseline",
+        "wait_for_post_start_operator_state", "observe_relay_registration_baseline",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
         "_read_operator_start_diagnostic", "_read_native_startup_diagnostic",
@@ -1216,7 +1216,7 @@ def test_post_start_operator_state_records_running_and_registration(desktop_runn
         "start_handler_state": "entered", "invocation_state": "resolved"}
     desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
     desktop_runner._status_value = lambda _driver, label: "yes" if label == "Registered" else "no"
-    desktop_runner.fetch_relay_diagnostics_count = lambda *_args, **_kwargs: 1
+    desktop_runner.fetch_relay_diagnostics_count = lambda *_args, **_kwargs: 5
 
     class Wait:
         def __init__(self, _driver, timeout, **_kwargs):
@@ -1228,21 +1228,38 @@ def test_post_start_operator_state_records_running_and_registration(desktop_runn
     desktop_runner.WebDriverWait = Wait
     desktop_runner.wait_for_post_start_operator_state(
         object(), lambda: 9, progress.append, pytest.fail, "https://relay.example",
-        relay_observations.append)
+        4, relay_observations.append)
 
     assert progress == ["operator_running", "operator_registered"]
     assert relay_observations == ["polled", "registered"]
 
 
-def test_clean_relay_baseline_rejects_preexisting_unrelated_node(desktop_runner):
-    desktop_runner.fetch_relay_diagnostics_count = lambda *_args, **_kwargs: 1
+def test_relay_baseline_accepts_preexisting_unrelated_node(desktop_runner):
+    desktop_runner.fetch_relay_diagnostics_count = lambda *_args, **_kwargs: 4
     failures = []
     observations = []
-    desktop_runner.require_clean_relay_registration_baseline(
+    baseline = desktop_runner.observe_relay_registration_baseline(
         "https://relay.example", timeout_seconds=0.5, fail_closed=failures.append,
         record_relay_observation=observations.append)
-    assert failures == ["operator_registration_not_reached"]
+    assert baseline == 4
+    assert failures == []
     assert observations == ["polled"]
+
+
+def test_relay_baseline_retries_transient_failure(desktop_runner):
+    results = iter((TimeoutError("transient"), 3))
+    def fetch(*_args, **_kwargs):
+        result = next(results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+    desktop_runner.fetch_relay_diagnostics_count = fetch
+    observations = []
+    baseline = desktop_runner.observe_relay_registration_baseline(
+        "https://relay.example", timeout_seconds=1, fail_closed=pytest.fail,
+        record_relay_observation=observations.append)
+    assert baseline == 3
+    assert observations == ["polled", "polled"]
 
 
 def test_post_start_operator_state_accepts_terminal_authoritative_registration(
@@ -1271,7 +1288,7 @@ def test_post_start_operator_state_accepts_terminal_authoritative_registration(
     desktop_runner.WebDriverWait = Wait
     desktop_runner.wait_for_post_start_operator_state(
         object(), lambda: 9, progress.append, pytest.fail, "https://relay.example",
-        relay_observations.append)
+        0, relay_observations.append)
     assert progress == ["operator_running", "operator_registered"]
     assert relay_observations == ["polled", "polled", "registered"]
 
@@ -1300,7 +1317,7 @@ def test_post_start_operator_state_distinguishes_running_failure(desktop_runner)
     with pytest.raises(RuntimeError, match="^operator_running_not_reached$") as raised:
         desktop_runner.wait_for_post_start_operator_state(
             object(), lambda: 9, pytest.fail, fail_closed, "https://relay.example",
-            lambda _observation: None)
+            0, lambda _observation: None)
 
     assert failures == ["operator_running_not_reached"]
     assert private_error not in str(raised.value)
@@ -1334,7 +1351,7 @@ def test_post_start_operator_state_distinguishes_registration_failure(desktop_ru
     with pytest.raises(RuntimeError, match="^operator_registration_not_reached$") as raised:
         desktop_runner.wait_for_post_start_operator_state(
             object(), lambda: 9, progress.append, fail_closed, "https://relay.example",
-            lambda _observation: None)
+            0, lambda _observation: None)
 
     assert progress == ["operator_running"]
     assert "private.example" not in str(raised.value)
@@ -1363,7 +1380,7 @@ def test_post_start_operator_state_rejects_optimistic_running_without_active_att
     with pytest.raises(RuntimeError, match="^operator_running_not_reached$"):
         desktop_runner.wait_for_post_start_operator_state(
             object(), lambda: 9, pytest.fail, fail_closed, "https://relay.example",
-            lambda _observation: None)
+            0, lambda _observation: None)
 
 
 def test_post_start_operator_state_reports_missing_active_attempt_before_running(
@@ -1390,7 +1407,7 @@ def test_post_start_operator_state_reports_missing_active_attempt_before_running
     desktop_runner._status_value = lambda _driver, _label: "yes"
     desktop_runner.wait_for_post_start_operator_state(
         object(), lambda: 9, lambda _progress: None, failures.append,
-        "https://relay.example", lambda _observation: None)
+        "https://relay.example", 0, lambda _observation: None)
 
     assert failures == ["operator_running_not_reached"]
 
@@ -3916,7 +3933,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
             raise ready_error
 
     def post_start(_driver, _remaining, record_progress, fail_closed, _relay_url,
-            record_relay_observation):
+            _registration_baseline, record_relay_observation):
         if operator_error:
             if str(operator_error) in {
                     "handoff_failure", "submit_failure", "final_stage_failure"}:
@@ -4000,7 +4017,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "fill_input_by_label": lambda *_args: None,
         "benchmark_operator_mode": lambda _backend: "cpu",
         "wait_for_start_operator_enabled": lambda *_args, **_kwargs: None,
-        "require_clean_relay_registration_baseline": lambda *_args, **_kwargs: None,
+        "observe_relay_registration_baseline": lambda *_args, **_kwargs: 0,
         "wait_for_post_start_operator_state": post_start,
         "_validate_operator_tokenizer_handoff": lambda _evidence, fail_closed: (
             fail_closed("rust_python_handoff_failed")

@@ -109,10 +109,10 @@ def fetch_relay_diagnostics_count(relay_url: str, *, timeout_seconds: float) -> 
     return int(payload["total_api_v1_registered_compute_nodes"])
 
 
-def observe_relay_registration_baseline(
+def require_clean_relay_registration_baseline(
         relay_url: str, *, timeout_seconds: float, fail_closed,
         record_relay_observation) -> int:
-    """Capture the relay count before this attempt, retrying transient failures."""
+    """Require an authoritative empty relay before starting this attempt."""
     deadline = time.monotonic() + timeout_seconds
     while True:
         remaining = deadline - time.monotonic()
@@ -120,10 +120,15 @@ def observe_relay_registration_baseline(
             fail_closed("operator_registration_not_reached")
         record_relay_observation("polled")
         try:
-            return fetch_relay_diagnostics_count(
+            registered = fetch_relay_diagnostics_count(
                 relay_url, timeout_seconds=max(0.05, min(remaining, 0.5)))
         except Exception:
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            continue
+        if registered != 0:
+            record_relay_observation("not_reached")
+            fail_closed("operator_registration_not_reached")
+        return registered
 
 
 def wait_for_relay_diagnostics_count(relay_url: str, expected_count: int, timeout_seconds: float) -> float:
@@ -292,8 +297,7 @@ def wait_for_running_stability(
 
 
 def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining,
-        record_progress, fail_closed, relay_url: str, registration_baseline: int,
-        record_relay_observation) -> None:
+        record_progress, fail_closed, relay_url: str, record_relay_observation) -> None:
     """Require the two ordered post-click operator boundaries fail closed."""
     active_attempt_ready = True
     try:
@@ -318,11 +322,16 @@ def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining
         fail_closed("operator_running_not_reached")
     record_progress("operator_running")
 
-    def authoritative_registration_observed(timeout_seconds: float) -> bool:
+    registration_deadline = time.monotonic() + setup_remaining()
+
+    def authoritative_registration_observed(_driver) -> bool:
+        remaining = registration_deadline - time.monotonic()
+        if remaining <= 0:
+            return False
         record_relay_observation("polled")
         try:
             registered = fetch_relay_diagnostics_count(
-                relay_url, timeout_seconds=timeout_seconds) > registration_baseline
+                relay_url, timeout_seconds=max(0.05, min(remaining, 0.5))) == 1
         except Exception:
             return False
         if registered:
@@ -330,14 +339,11 @@ def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining
         return registered
 
     try:
-        WebDriverWait(driver, setup_remaining(), poll_frequency=0.25).until(
-            lambda _d: authoritative_registration_observed(0.5))
+        WebDriverWait(driver, max(0.0, registration_deadline - time.monotonic()),
+            poll_frequency=0.25).until(authoritative_registration_observed)
     except Exception:
-        # WebDriverWait does not run its predicate once its deadline has passed.
-        # Make one final authoritative observation so a registration published at
-        # that edge cannot be misclassified because the packaged UI is stale.
-        if not authoritative_registration_observed(0.5):
-            fail_closed("operator_registration_not_reached")
+        record_relay_observation("not_reached")
+        fail_closed("operator_registration_not_reached")
     record_progress("operator_registered")
 
 
@@ -1101,11 +1107,13 @@ def _read_packaged_startup_diagnostic(driver: webdriver.Remote | None,
         "pending" if relay_runtime in {"provisioning", "starting", "warming", "recovering"}
         else "not_started" if relay_runtime in {"idle", "stopped"} else "unknown")
     result["relay_polling_state"] = (
-        "started" if relay_observation in {"polled", "registered"}
+        "started" if relay_observation in {"polled", "registered", "not_reached"}
         or registered == "yes" or relay_runtime in {"processing", "recovering"}
         else "not_started" if relay_runtime != "unknown" else "unknown")
     if relay_observation == "registered":
         result["registration_state"] = "registered"
+    elif relay_observation == "not_reached":
+        result["registration_state"] = "not_reached"
 
     handler = operator_start.get("start_handler_state")
     invocation = operator_start.get("invocation_state")
@@ -1902,14 +1910,14 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             timeout_seconds=setup_remaining())
         operator_progress = "operator_enabled"
         setup_remaining()
-        registration_baseline = observe_relay_registration_baseline(
+        require_clean_relay_registration_baseline(
             request["relay_url"], timeout_seconds=setup_remaining(),
             fail_closed=fail_closed, record_relay_observation=record_relay_observation)
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
         operator_progress = "operator_started"
         wait_for_post_start_operator_state(
             driver, setup_remaining, record_operator_progress, fail_closed,
-            request["relay_url"], registration_baseline, record_relay_observation)
+            request["relay_url"], record_relay_observation)
         write_phase("operator_ready")
 
         _validate_operator_tokenizer_handoff(tokenizer_evidence, fail_closed)

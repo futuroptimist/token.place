@@ -96,7 +96,8 @@ def desktop_runner():
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
-        "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
+        "start_driver", "wait_for_webview2_devtools", "launch_webview2_application",
+        "wait_for_ui_ready",
         "wait_for_post_start_operator_state", "require_clean_relay_registration_baseline",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
@@ -118,7 +119,8 @@ def desktop_runner():
         "os": os, "json": json, "tempfile": __import__("tempfile"),
         "argparse": __import__("argparse"),
         "shutil": __import__("shutil"), "Path": Path,
-        "subprocess": subprocess, "Callable": __import__("typing").Callable,
+        "subprocess": subprocess, "contextlib": __import__("contextlib"),
+        "Callable": __import__("typing").Callable,
         "psutil": __import__("psutil"),
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
         "TimeoutException": TimeoutError, "RuntimeError": RuntimeError,
@@ -128,6 +130,8 @@ def desktop_runner():
         "WebDriverException": _WebDriverException,
         "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
         "NATIVE_WEBDRIVER_URL": "http://127.0.0.1:4445",
+        "reserve_free_port": lambda: 49152,
+        "terminate_process": lambda _process: None,
         "urlopen": None,
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
         "PACKAGED_PHASES": h.PACKAGED_PHASES,
@@ -352,6 +356,85 @@ def test_webview2_devtools_waits_for_owned_application(desktop_runner, monkeypat
     desktop_runner.wait_for_webview2_devtools(
         SimpleNamespace(poll=lambda: None), 49152, 5)
     assert requested == ["http://127.0.0.1:49152/json/list"] * 5
+
+
+def test_webview2_packaged_launch_supplies_switch_and_waits_for_target(
+        desktop_runner, monkeypatch, tmp_path):
+    application = tmp_path / "installed app.exe"
+    application.write_text("candidate")
+    process = SimpleNamespace(pid=123, poll=lambda: None)
+    launches = []
+    waits = []
+    monkeypatch.setattr(desktop_runner.subprocess, "Popen",
+        lambda args, **kwargs: launches.append((args, kwargs)) or process)
+    monkeypatch.setattr(desktop_runner, "wait_for_webview2_devtools",
+        lambda *args: waits.append(args))
+
+    launched, debugger_address = desktop_runner.launch_webview2_application(
+        application, {"BASE": "kept"}, object(), 12.5)
+
+    assert launched is process
+    assert debugger_address == "127.0.0.1:49152"
+    assert launches[0][0] == [str(application.resolve()),
+        "--edge-webview-switches=--remote-debugging-port=49152"]
+    assert launches[0][1]["env"] == {
+        "BASE": "kept", "TAURI_AUTOMATION": "true",
+        "TAURI_WEBVIEW_AUTOMATION": "true"}
+    assert waits == [(process, 49152, 12.5)]
+
+
+@pytest.mark.parametrize("failure", [
+    OSError("application did not start"),
+    RuntimeError("webdriver_transport_failure"),
+])
+def test_webview2_packaged_launch_fails_closed_and_terminates_started_process(
+        desktop_runner, monkeypatch, tmp_path, failure):
+    application = tmp_path / "installed app.exe"
+    application.write_text("candidate")
+    process = SimpleNamespace(pid=123, poll=lambda: None)
+    terminated = []
+    if isinstance(failure, OSError):
+        monkeypatch.setattr(desktop_runner.subprocess, "Popen",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(failure))
+    else:
+        monkeypatch.setattr(desktop_runner.subprocess, "Popen",
+            lambda *_args, **_kwargs: process)
+        monkeypatch.setattr(desktop_runner, "wait_for_webview2_devtools",
+            lambda *_args: (_ for _ in ()).throw(failure))
+    monkeypatch.setattr(desktop_runner, "terminate_process",
+        lambda owned: terminated.append(owned))
+
+    expected = ("webdriver_application_startup_failed"
+        if isinstance(failure, OSError) else "webdriver_transport_failure")
+    with pytest.raises(RuntimeError, match=expected):
+        desktop_runner.launch_webview2_application(
+            application, {}, object(), 1)
+    assert terminated == ([] if isinstance(failure, OSError) else [process])
+
+
+def test_packaged_hardware_main_attaches_and_cleans_up_owned_application():
+    tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
+    main = next(node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main")
+    calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)]
+    launch = next(call for call in calls
+        if isinstance(call.func, ast.Name)
+        and call.func.id == "launch_webview2_application")
+    start = next(call for call in calls
+        if isinstance(call.func, ast.Name) and call.func.id == "start_driver")
+    cleanup = next(call for call in calls
+        if isinstance(call.func, ast.Name) and call.func.id == "terminate_process"
+        and call.args and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == "application_process")
+
+    assert any(keyword.arg == "debugger_address"
+        and isinstance(keyword.value, ast.Name)
+        and keyword.value.id == "debugger_address" for keyword in start.keywords)
+    assignment = next(node for node in ast.walk(main)
+        if isinstance(node, ast.Assign) and node.value is launch)
+    assert [target.id for target in assignment.targets[0].elts] == [
+        "application_process", "debugger_address"]
+    assert cleanup is not None
 
 
 def test_ui_ready_selects_application_handle_without_optional_artifact_panel(
@@ -4036,6 +4119,27 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         if devtools_error:
             raise devtools_error
 
+    def launch_webview2(app_binary, env, output, timeout_seconds,
+            *, application_args=None, process_started=None):
+        application_env = dict(env)
+        application_env.update({"TAURI_AUTOMATION": "true",
+            "TAURI_WEBVIEW_AUTOMATION": "true"})
+        try:
+            launched = popen([str(app_binary.resolve()),
+                "--edge-webview-switches=--remote-debugging-port=49152",
+                *list(application_args or [])], cwd=app_binary.resolve().parent,
+                env=application_env, stdout=output, stderr=-2, text=True)
+        except (OSError, ValueError):
+            raise RuntimeError("webdriver_application_startup_failed") from None
+        if process_started is not None:
+            process_started(launched)
+        try:
+            webview2_ready(launched, 49152, timeout_seconds)
+        except Exception:
+            cleaned_pids.append(launched.pid)
+            raise
+        return launched, "127.0.0.1:49152"
+
     def driver_command():
         if command_error:
             raise command_error
@@ -4123,6 +4227,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "OwnedProcessTreeMemorySampler": MemorySampler,
         "wait_for_webdriver_ready": webdriver_ready,
         "wait_for_webview2_devtools": webview2_ready,
+        "launch_webview2_application": launch_webview2,
         "reserve_free_port": lambda: 49152,
         "start_driver": start, "tokenizer_handoff_args": lambda *_args: [
             "--tokenizer-request=request.json", "--tokenizer-evidence=evidence.json"],

@@ -96,7 +96,8 @@ def desktop_runner():
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
-        "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
+        "start_driver", "wait_for_webview2_devtools", "launch_windows_packaged_webview2",
+        "wait_for_ui_ready",
         "wait_for_post_start_operator_state", "require_clean_relay_registration_baseline",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
@@ -117,7 +118,7 @@ def desktop_runner():
         "time": time, "By": SimpleNamespace(CSS_SELECTOR="css", XPATH="xpath"),
         "os": os, "json": json, "tempfile": __import__("tempfile"),
         "argparse": __import__("argparse"),
-        "shutil": __import__("shutil"), "Path": Path,
+        "shutil": __import__("shutil"), "contextlib": __import__("contextlib"), "Path": Path,
         "subprocess": subprocess, "Callable": __import__("typing").Callable,
         "psutil": __import__("psutil"),
         "Keys": SimpleNamespace(SHIFT="SHIFT", ENTER="ENTER"),
@@ -167,6 +168,69 @@ def desktop_runner():
         "invoke_packaged_runtime_adapter": h.invoke_packaged_runtime_adapter})
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
     return module
+
+
+def test_windows_packaged_webview2_launches_and_waits_for_attachable_target(
+        desktop_runner, monkeypatch, tmp_path):
+    app = tmp_path / "token-place.exe"
+    app.write_bytes(b"app")
+    process = SimpleNamespace(pid=42)
+    popen_calls = []
+    waits = []
+    monkeypatch.setattr(desktop_runner, "reserve_free_port", lambda: 49152,
+        raising=False)
+    monkeypatch.setattr(desktop_runner.subprocess, "Popen",
+        lambda args, **kwargs: popen_calls.append((args, kwargs)) or process)
+    monkeypatch.setattr(desktop_runner, "wait_for_webview2_devtools",
+        lambda *args: waits.append(args))
+
+    launched, debugger_address = desktop_runner.launch_windows_packaged_webview2(
+        app, {"BASE": "kept"}, object(), timeout_seconds=12.5)
+
+    assert launched is process
+    assert debugger_address == "127.0.0.1:49152"
+    args, kwargs = popen_calls[0]
+    assert args == [str(app.resolve()),
+        "--edge-webview-switches=--remote-debugging-port=49152"]
+    assert kwargs["cwd"] == app.parent
+    assert kwargs["env"] == {
+        "BASE": "kept", "TAURI_AUTOMATION": "true",
+        "TAURI_WEBVIEW_AUTOMATION": "true",
+    }
+    assert waits == [(process, 49152, 12.5)]
+
+
+@pytest.mark.parametrize("failure", [
+    RuntimeError("webdriver_application_startup_failed"),
+    RuntimeError("webdriver_transport_failure"),
+])
+def test_windows_packaged_webview2_target_failure_terminates_application(
+        desktop_runner, monkeypatch, tmp_path, failure):
+    app = tmp_path / "token-place.exe"
+    app.write_bytes(b"app")
+    process = SimpleNamespace(pid=42)
+    terminated = []
+    monkeypatch.setattr(desktop_runner, "reserve_free_port", lambda: 49152,
+        raising=False)
+    monkeypatch.setattr(desktop_runner.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(desktop_runner, "wait_for_webview2_devtools",
+        lambda *_args: (_ for _ in ()).throw(failure))
+    monkeypatch.setattr(desktop_runner, "terminate_process",
+        lambda owned: terminated.append(owned), raising=False)
+
+    with pytest.raises(RuntimeError, match=f"^{failure}$"):
+        desktop_runner.launch_windows_packaged_webview2(app, {}, object())
+
+    assert terminated == [process]
+
+
+def test_hardware_main_attaches_driver_and_owns_application_cleanup():
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    main_source = source[source.index("def main("):]
+
+    assert "application_process, debugger_address = launch_windows_packaged_webview2(" in main_source
+    assert "driver = start_driver(app_binary, debugger_address=debugger_address)" in main_source
+    assert "terminate_process(application_process)" in main_source
 
 
 def test_webdriver_readiness_requires_valid_native_status(desktop_runner, monkeypatch):

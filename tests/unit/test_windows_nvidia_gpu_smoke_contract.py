@@ -25,6 +25,23 @@ UI_SPEC.loader.exec_module(ui_e2e)
 class _ApplicationProcess:
     pid = 4321
 
+    def wait(self, timeout):
+        del timeout
+
+
+class _OwnedProcess:
+    def __init__(self, name, events, children=()):
+        self.name = name
+        self.events = events
+        self._children = children
+
+    def children(self, recursive):
+        assert recursive is True
+        return list(self._children)
+
+    def terminate(self):
+        self.events.append(f"terminate:{self.name}")
+
 
 def test_packaged_webview2_session_launches_attaches_and_terminates(monkeypatch, tmp_path):
     application = tmp_path / "token-place.exe"
@@ -33,7 +50,9 @@ def test_packaged_webview2_session_launches_attaches_and_terminates(monkeypatch,
     launches = []
     targets = []
     driver_calls = []
-    cleaned = []
+    cleanup_events = []
+    descendant = _OwnedProcess("descendant", cleanup_events)
+    root = _OwnedProcess("root", cleanup_events, [descendant])
 
     monkeypatch.setattr(ui_e2e, "reserve_free_port", lambda: 49152)
     monkeypatch.setattr(
@@ -51,15 +70,14 @@ def test_packaged_webview2_session_launches_attaches_and_terminates(monkeypatch,
         "start_driver",
         lambda app, **kwargs: driver_calls.append((app, kwargs)) or "driver",
     )
-    monkeypatch.setattr(
-        ui_e2e, "_cleanup_owned_process_tree",
-        lambda candidate, remaining: cleaned.append((candidate, remaining())) or True)
+    monkeypatch.setattr(ui_e2e.psutil, "Process", lambda pid: root)
+    monkeypatch.setattr(ui_e2e.psutil, "wait_procs", lambda processes, timeout: (processes, []))
 
     with ui_e2e.packaged_windows_webview2_session(
             application, {"BASE": "preserved"}, None,
             platform_name="nt") as launched:
         assert launched == (process, "driver")
-        assert cleaned == []
+        assert cleanup_events == []
 
     command, kwargs = launches[0]
     assert command == [
@@ -73,9 +91,7 @@ def test_packaged_webview2_session_launches_attaches_and_terminates(monkeypatch,
     assert targets == [(process, 49152, 90.0)]
     assert driver_calls == [
         (application, {"debugger_address": "127.0.0.1:49152"})]
-    assert len(cleaned) == 1
-    assert cleaned[0][0] is process
-    assert 0 < cleaned[0][1] <= 10.0
+    assert cleanup_events == ["terminate:descendant", "terminate:root"]
 
 
 @pytest.mark.parametrize(
@@ -91,7 +107,9 @@ def test_packaged_webview2_session_fails_closed_and_cleans_up(
     application = tmp_path / "token-place.exe"
     application.write_bytes(b"app")
     process = _ApplicationProcess()
-    cleaned = []
+    cleanup_events = []
+    descendant = _OwnedProcess("descendant", cleanup_events)
+    root = _OwnedProcess("root", cleanup_events, [descendant])
     monkeypatch.setattr(ui_e2e, "reserve_free_port", lambda: 49152)
 
     def launch(*_args, **_kwargs):
@@ -111,16 +129,25 @@ def test_packaged_webview2_session_fails_closed_and_cleans_up(
     monkeypatch.setattr(ui_e2e.subprocess, "Popen", launch)
     monkeypatch.setattr(ui_e2e, "wait_for_webview2_devtools", target)
     monkeypatch.setattr(ui_e2e, "start_driver", driver)
-    monkeypatch.setattr(
-        ui_e2e, "_cleanup_owned_process_tree",
-        lambda candidate, remaining: cleaned.append(candidate) or True)
+    monkeypatch.setattr(ui_e2e.psutil, "Process", lambda pid: root)
+    monkeypatch.setattr(ui_e2e.psutil, "wait_procs", lambda processes, timeout: (processes, []))
 
     with pytest.raises(RuntimeError, match=f"^{expected_error}$"):
         with ui_e2e.packaged_windows_webview2_session(
                 application, {}, None, platform_name="nt"):
             pytest.fail("a failed session must not be yielded")
 
-    assert cleaned == ([] if failure_stage == "launch" else [process])
+    assert cleanup_events == ([] if failure_stage == "launch" else [
+        "terminate:descendant", "terminate:root"])
+
+
+def test_packaged_hardware_processes_share_one_log_handle():
+    main_source = UI_PATH.read_text(encoding="utf-8").split(
+        "def main(argv:", 1)[1]
+    assert main_source.count('driver_log.open("w", encoding="utf-8")') == 1
+    assert 'driver_log.open("a"' not in main_source
+    assert "stdout=driver_log_handle" in main_source
+    assert "app_binary, env, driver_log_handle" in main_source
 
 
 def test_packaged_webview2_session_rejects_non_windows(monkeypatch, tmp_path):

@@ -2648,10 +2648,12 @@ def main(argv: list[str] | None = None) -> int:
         if driver is not None:
             with contextlib.suppress(Exception):
                 driver.quit()
-        application_stack.close()
+        with contextlib.suppress(Exception):
+            application_stack.close()
         with contextlib.suppress(Exception):
             terminate_process(tauri_driver)
-        driver_log_handle.close()
+        with contextlib.suppress(Exception):
+            driver_log_handle.close()
         with contextlib.suppress(Exception):
             terminate_process(relay)
         shutil.rmtree(isolated_home, ignore_errors=True)

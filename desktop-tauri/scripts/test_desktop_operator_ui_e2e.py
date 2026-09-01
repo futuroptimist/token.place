@@ -829,6 +829,27 @@ def wait_for_webview2_devtools(
     raise RuntimeError("webdriver_transport_failure") from None
 
 
+def launch_packaged_windows_webview2(
+        app_binary: Path, application_args: list[str], env: dict[str, str],
+        output) -> tuple[subprocess.Popen, int, str]:
+    """Launch a packaged app with an attachable, isolated WebView2 target."""
+    devtools_port = reserve_free_port()
+    application_env = env.copy()
+    application_env.update({
+        "TAURI_AUTOMATION": "true",
+        "TAURI_WEBVIEW_AUTOMATION": "true",
+    })
+    webview2_automation_arg = (
+        "--edge-webview-switches="
+        f"--remote-debugging-port={devtools_port}")
+    resolved_binary = app_binary.resolve(strict=True)
+    application_process = subprocess.Popen(
+        [str(resolved_binary), webview2_automation_arg, *application_args],
+        cwd=resolved_binary.parent, env=application_env,
+        stdout=output, stderr=subprocess.STDOUT, text=True)  # noqa: S603
+    return application_process, devtools_port, f"127.0.0.1:{devtools_port}"
+
+
 def start_landing_driver() -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
@@ -1844,21 +1865,10 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         application_args = tokenizer_handoff_args(tokenizer_request, tokenizer_evidence)
         debugger_address = None
         if os.name == "nt":
-            devtools_port = reserve_free_port()
-            application_env = env.copy()
-            application_env.update({
-                "TAURI_AUTOMATION": "true",
-                "TAURI_WEBVIEW_AUTOMATION": "true",
-            })
-            webview2_automation_arg = (
-                "--edge-webview-switches="
-                f"--remote-debugging-port={devtools_port}")
             try:
-                application_process = subprocess.Popen(
-                    [str(app_binary.resolve(strict=True)), webview2_automation_arg,
-                        *application_args],
-                    cwd=app_binary.resolve(strict=True).parent, env=application_env,
-                    stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
+                application_process, devtools_port, debugger_address = (
+                    launch_packaged_windows_webview2(
+                        app_binary, application_args, env, driver_log_handle))
             except (OSError, ValueError):
                 webdriver_failure_category = "webdriver_application_startup_failed"
                 webdriver_exception_family = "application_startup_failure"
@@ -1879,7 +1889,6 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
                 webdriver_process_posture = _webdriver_process_posture(
                     process, app_binary, application_process)
                 fail_closed(reason)
-            debugger_address = f"127.0.0.1:{devtools_port}"
         else:
             memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
         session_started = time.monotonic()
@@ -2382,6 +2391,8 @@ def main(argv: list[str] | None = None) -> int:
     Path(env["XDG_CONFIG_HOME"]).mkdir(parents=True, exist_ok=True)
     Path(env["XDG_DATA_HOME"]).mkdir(parents=True, exist_ok=True)
     Path(env["APPDATA"]).mkdir(parents=True, exist_ok=True)
+    env["WEBVIEW2_USER_DATA_FOLDER"] = str(isolated_home / "WebView2")
+    Path(env["WEBVIEW2_USER_DATA_FOLDER"]).mkdir(parents=True, exist_ok=True)
 
     relay = subprocess.Popen(  # noqa: S603
         [
@@ -2413,6 +2424,7 @@ def main(argv: list[str] | None = None) -> int:
 
     driver: webdriver.Remote | None = None
     landing_driver: webdriver.Chrome | None = None
+    application_process: subprocess.Popen[str] | None = None
     model_path = args.model.resolve(strict=True) if hardware_mode else resolve_real_e2e_model_path()
     try:
         wait_for_http_200(f"{relay_url}/livez")
@@ -2435,7 +2447,13 @@ def main(argv: list[str] | None = None) -> int:
         if not app_binary.exists():
             raise RuntimeError(f"missing desktop binary: {app_binary}")
 
-        driver = start_driver(app_binary)
+        debugger_address = None
+        if hardware_mode:
+            application_process, devtools_port, debugger_address = (
+                launch_packaged_windows_webview2(app_binary, [], env, driver_log.open(
+                    "a", encoding="utf-8")))
+            wait_for_webview2_devtools(application_process, devtools_port, 90)
+        driver = start_driver(app_binary, debugger_address=debugger_address)
         wait = WebDriverWait(driver, 45)
         wait_for_ui_ready(driver)
 
@@ -2589,6 +2607,9 @@ def main(argv: list[str] | None = None) -> int:
         if driver is not None:
             with contextlib.suppress(Exception):
                 driver.quit()
+        if application_process is not None:
+            with contextlib.suppress(Exception):
+                terminate_process(application_process)
         with contextlib.suppress(Exception):
             terminate_process(tauri_driver)
         with contextlib.suppress(Exception):

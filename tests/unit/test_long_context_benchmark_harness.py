@@ -96,7 +96,8 @@ def desktop_runner():
         "_validate_operator_tokenizer_handoff", "_rearm_tokenizer_stage",
         "_validate_final_tokenizer_stage",
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
-        "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
+        "start_driver", "wait_for_webview2_devtools",
+        "launch_packaged_windows_webview2", "wait_for_ui_ready",
         "wait_for_post_start_operator_state", "require_clean_relay_registration_baseline",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
@@ -315,6 +316,32 @@ def test_start_driver_uses_exact_windows_native_webview2_capabilities(
     assert "webviewOptions" not in options.to_capabilities()["ms:edgeOptions"]
     assert "tauri:options" not in options.to_capabilities()
     assert "goog:chromeOptions" not in options.to_capabilities()
+
+
+def test_packaged_windows_webview2_launches_application_for_native_attach(
+        desktop_runner, tmp_path, monkeypatch):
+    application = tmp_path / "installed application.exe"
+    application.write_bytes(b"application")
+    launched_process = SimpleNamespace(pid=1234)
+    popen_calls = []
+    desktop_runner.reserve_free_port = lambda: 49152
+    monkeypatch.setattr(desktop_runner.subprocess, "Popen",
+        lambda args, **kwargs: popen_calls.append((args, kwargs)) or launched_process)
+
+    process, port, debugger_address = desktop_runner.launch_packaged_windows_webview2(
+        application, ["--application-argument"], {"HOME": "isolated"}, "log")
+
+    assert process is launched_process
+    assert port == 49152
+    assert debugger_address == "127.0.0.1:49152"
+    args, kwargs = popen_calls[0]
+    assert args == [str(application.resolve()),
+        "--edge-webview-switches=--remote-debugging-port=49152",
+        "--application-argument"]
+    assert kwargs["cwd"] == application.parent
+    assert kwargs["env"]["TAURI_AUTOMATION"] == "true"
+    assert kwargs["env"]["TAURI_WEBVIEW_AUTOMATION"] == "true"
+    assert kwargs["stdout"] == "log"
 
 
 def test_webview2_devtools_waits_for_owned_application(desktop_runner, monkeypatch):
@@ -4001,7 +4028,8 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     tree = ast.parse(source)
     wanted = {"tauri_driver_environment", "tokenizer_stage_path",
         "_write_tokenizer_stage", "_webdriver_session_elapsed_bucket",
-        "_webdriver_process_posture", "run_long_context_packaged_mode"}
+        "_webdriver_process_posture", "launch_packaged_windows_webview2",
+        "run_long_context_packaged_mode"}
     functions = [node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted]
     checkpoints = []

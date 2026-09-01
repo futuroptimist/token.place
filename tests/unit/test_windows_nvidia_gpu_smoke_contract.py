@@ -345,11 +345,22 @@ def test_ui_hardware_mode_is_fail_closed_and_uses_rust_lifecycle():
     assert 'env["USE_MOCK_LLM"] = "1"' not in hardware_branch.split("else:", 1)[0]
 
 
+def test_ui_hardware_mode_launches_and_attaches_to_packaged_webview2():
+    source = UI_PATH.read_text(encoding="utf-8")
+    hardware_launch = source.rsplit("debugger_address = None", 1)[1].split(
+        "wait = WebDriverWait", 1)[0]
+    assert "launch_packaged_windows_webview2(app_binary, [], env" in " ".join(
+        hardware_launch.split())
+    assert "wait_for_webview2_devtools(application_process, devtools_port, 90)" in hardware_launch
+    assert "start_driver(app_binary, debugger_address=debugger_address)" in hardware_launch
+
+
 def test_ui_e2e_cleanup_cannot_mask_primary_test_failure():
     source = UI_PATH.read_text(encoding="utf-8")
     finally_block = source.split("\n    finally:", 1)[1].split("\n\n    return 0", 1)[0]
     assert finally_block.count("contextlib.suppress(Exception)") >= 3
     assert "driver.quit()" in finally_block
+    assert "terminate_process(application_process)" in finally_block
     assert "terminate_process(tauri_driver)" in finally_block
     assert "terminate_process(relay)" in finally_block
 

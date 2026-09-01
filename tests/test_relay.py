@@ -3472,15 +3472,25 @@ def test_api_v1_round_robin_preserves_next_node_after_selected_server_unregister
 
 def test_api_v1_round_robin_preserves_next_node_after_earlier_server_eviction(client, monkeypatch):
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
-    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    monkeypatch.setenv(relay_module.API_V1_POLL_WAIT_SECONDS_ENV, '0')
+    relay_module._reset_api_v1_relay_state_store()
+    store = relay_module._api_v1_store()
+    epoch = [time.time()]
+    monkeypatch.setattr(store, '_epoch_time', lambda: epoch[0])
     server_a = _server_key('cursor_evicted_a')
     server_b = _server_key('cursor_evicted_b')
     server_c = _server_key('cursor_evicted_c')
+    control_payloads = {}
     for server_key in (server_a, server_b, server_c):
-        _register_api_v1_server(client, server_key)
+        control_payloads[server_key] = _api_v1_registered_control_payload(
+            client, server_key, capabilities=_capabilities('8k-fast')
+        )
 
     assert _next_api_v1_server_key(client) == server_a
-    known_servers[server_a]['last_ping'] = datetime.now() - timedelta(seconds=5)
+    epoch[0] += 0.5
+    for server_key in (server_b, server_c):
+        assert client.post('/api/v1/relay/servers/poll', json=control_payloads[server_key]).status_code == 200
+    epoch[0] += 0.6
 
     assert [_next_api_v1_server_key(client) for _ in range(4)] == [
         server_b,
@@ -3488,20 +3498,30 @@ def test_api_v1_round_robin_preserves_next_node_after_earlier_server_eviction(cl
         server_b,
         server_c,
     ]
-    assert server_a not in known_servers
+    assert store.get(server_a) is None
 
 
 def test_api_v1_round_robin_does_not_skip_after_next_cursor_target_expires(client, monkeypatch):
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
-    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    monkeypatch.setenv(relay_module.API_V1_POLL_WAIT_SECONDS_ENV, '0')
+    relay_module._reset_api_v1_relay_state_store()
+    store = relay_module._api_v1_store()
+    epoch = [time.time()]
+    monkeypatch.setattr(store, '_epoch_time', lambda: epoch[0])
     server_a = _server_key('cursor_target_expired_a')
     server_b = _server_key('cursor_target_expired_b')
     server_c = _server_key('cursor_target_expired_c')
+    control_payloads = {}
     for server_key in (server_a, server_b, server_c):
-        _register_api_v1_server(client, server_key)
+        control_payloads[server_key] = _api_v1_registered_control_payload(
+            client, server_key, capabilities=_capabilities('8k-fast')
+        )
 
     assert _next_api_v1_server_key(client) == server_a
-    known_servers[server_b]['last_ping'] = datetime.now() - timedelta(seconds=5)
+    epoch[0] += 0.5
+    for server_key in (server_a, server_c):
+        assert client.post('/api/v1/relay/servers/poll', json=control_payloads[server_key]).status_code == 200
+    epoch[0] += 0.6
 
     assert [_next_api_v1_server_key(client) for _ in range(4)] == [
         server_c,
@@ -3509,7 +3529,7 @@ def test_api_v1_round_robin_does_not_skip_after_next_cursor_target_expires(clien
         server_c,
         server_a,
     ]
-    assert server_b not in known_servers
+    assert store.get(server_b) is None
 
 
 
@@ -3722,7 +3742,11 @@ def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(clie
 
 def test_api_v1_round_robin_skips_expired_and_unregistered_nodes(client, monkeypatch):
     monkeypatch.setenv('TOKEN_PLACE_API_V1_RELAY_SERVER_LEASE_SECONDS', '1')
-    monkeypatch.setenv('TOKEN_PLACE_RELAY_SERVER_TTL_SECONDS', '1')
+    monkeypatch.setenv(relay_module.API_V1_POLL_WAIT_SECONDS_ENV, '0')
+    relay_module._reset_api_v1_relay_state_store()
+    store = relay_module._api_v1_store()
+    epoch = [time.time()]
+    monkeypatch.setattr(store, '_epoch_time', lambda: epoch[0])
     server_a = _server_key('skip_a')
     server_b = _server_key('skip_b')
     server_c = _server_key('skip_c')
@@ -3732,14 +3756,18 @@ def test_api_v1_round_robin_skips_expired_and_unregistered_nodes(client, monkeyp
 
     assert [_next_api_v1_server_key(client) for _ in range(3)] == [server_a, server_b, server_c]
 
-    known_servers[server_b]['last_ping'] = datetime.now() - timedelta(seconds=5)
+    epoch[0] += 0.5
+    for server_key in (server_a, server_c):
+        assert client.post('/api/v1/relay/servers/poll', json=control_payloads[server_key]).status_code == 200
+    epoch[0] += 0.6
     assert [_next_api_v1_server_key(client) for _ in range(4)] == [server_a, server_c, server_a, server_c]
-    assert server_b not in known_servers
+    assert store.get(server_b) is None
 
     unregistered = client.post('/api/v1/relay/servers/unregister', json=control_payloads[server_a])
     assert unregistered.status_code == 200
     assert unregistered.get_json()['removed'] is True
     assert [_next_api_v1_server_key(client) for _ in range(2)] == [server_c, server_c]
+    assert store.get(server_a) is None
 
 
 def test_api_v1_reregistered_round_robin_node_reenters_at_end(client):

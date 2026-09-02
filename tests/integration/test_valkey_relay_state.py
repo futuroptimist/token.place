@@ -2647,3 +2647,97 @@ def test_expire_lost_reply_does_not_consume_a_hidden_retry_batch(valkey_server):
         store._foundation._client.evalsha = original_evalsha
         store._foundation._client.delete(*_registration_keys(store, *node_ids))
         store.close()
+
+
+def test_atomic_claim_reclaim_renewal_and_defensive_reads_are_shared(valkey_server):
+    namespace = uuid.uuid4().hex
+    config = dict(claim_ttl_seconds=0.08, lease_ttl_seconds=2)
+    first = _registration_store(valkey_server, namespace, **config)
+    second = _registration_store(valkey_server, namespace, **config)
+    owner = _digest("claim-owner")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    deadline = time.time() + 5
+    selection = None
+    try:
+        first.register("claim-node", _capabilities(concurrency=2), owner)
+        selection = first.select_and_reserve(
+            "claim-client",
+            "claim-request",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            "cancel",
+        )
+        assert selection.reservation_token
+        first.enqueue_encrypted_request(
+            "claim-client",
+            "claim-request",
+            selection.reservation_token,
+            "claim-node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
+        )
+
+        with pytest.raises(RelayStateCredentialMismatch):
+            second.claim_queued_request("claim-node", _digest("wrong"), "consumer")
+        first_claim = first.claim_queued_request("claim-node", owner, "consumer")
+        assert first_claim.state == "claimed" and first_claim.generation == 1
+        assert (
+            second.claim_queued_request("claim-node", owner, "consumer").state
+            == "empty"
+        )
+        assert len(second.active_claims("claim-node")) == 1
+        assert second.claimed_request("claim-node", "claim-request") is not None
+
+        renewed = second.renew_claim(
+            "claim-node", owner, "consumer", "claim-client", "claim-request", 1
+        )
+        assert renewed.state == "continued" and renewed.generation == 1
+        assert (
+            second.renew_claim(
+                "claim-node", owner, "other", "claim-client", "claim-request", 1
+            ).state
+            == "owner_mismatch"
+        )
+
+        time.sleep(0.1)
+        reclaimed = second.claim_queued_request("claim-node", owner, "consumer-2")
+        assert reclaimed.state == "reclaimed" and reclaimed.generation == 2
+        assert (
+            first.renew_claim(
+                "claim-node", owner, "consumer", "claim-client", "claim-request", 1
+            ).state
+            == "stale_generation"
+        )
+        claim_hash = first._foundation.config.key(
+            "claim", *first._identity("claim-client", "claim-request")
+        )
+        stored = first._foundation._client.hgetall(claim_hash)
+        assert b"consumer-2" not in b"".join(stored.values())
+        assert b"envelope" not in stored
+    finally:
+        cfg = first._foundation.config
+        client, request = first._identity("claim-client", "claim-request")
+        node = first._node_digest("claim-node")
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", client, request),
+            cfg.key("claim", client, request),
+        ]
+        if selection and selection.reservation_token:
+            keys.append(cfg.key("reservation", _digest(selection.reservation_token)))
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()

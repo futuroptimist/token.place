@@ -30,6 +30,19 @@ smoke = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(smoke)
 
 
+def test_gate_load_prepends_missing_repository_root(monkeypatch):
+    monkeypatch.setattr(sys, "path", [entry for entry in sys.path if entry != str(ROOT)])
+    spec = importlib.util.spec_from_file_location(
+        "windows_nvidia_gpu_smoke_test_without_repo_path", SMOKE_PATH
+    )
+    assert spec and spec.loader
+
+    isolated_smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated_smoke)
+
+    assert sys.path[0] == str(ROOT)
+
+
 def _load_ui_e2e_contract() -> ModuleType:
     """Load only the dependency-free packaged WebView2 contract under test."""
     tree = ast.parse(UI_PATH.read_text(encoding="utf-8"))

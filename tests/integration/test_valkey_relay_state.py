@@ -326,6 +326,96 @@ def _registration_keys(store, *node_ids):
     ]
 
 
+def test_claim_reclaim_renewal_is_atomic_across_independent_clients(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.05)
+    second = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.05)
+    owner = _digest("owner")
+    node_digest = first._node_digest("node")
+    client = hashlib.sha256(b"client\0client").hexdigest()
+    request = hashlib.sha256(b"request\0request").hexdigest()
+    cfg = first._foundation.config
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    try:
+        first.register("node", _capabilities(), owner)
+        deadline = time.time() + 30
+        selected = first.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        first.enqueue_encrypted_request(
+            "client",
+            "request",
+            selected.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            claims = list(
+                pool.map(
+                    lambda store: store.claim_queued_request("node", owner, "worker"),
+                    (first, second),
+                )
+            )
+        assert sorted(result.state for result in claims) == ["claimed", "empty"]
+        winning = next(result for result in claims if result.state == "claimed")
+        assert (
+            first.claimed_request("node", "request")[1].generation == winning.generation
+        )
+        assert len(second.active_claims("node")) == 1
+        renewed = second.renew_claim(
+            "node", owner, "worker", "client", "request", winning.generation
+        )
+        assert renewed.state == "continued" and renewed.generation == winning.generation
+        assert (
+            second.renew_claim(
+                "node", owner, "wrong-worker", "client", "request", winning.generation
+            ).state
+            == "owner_mismatch"
+        )
+        time.sleep(0.07)
+        assert first.active_claims("node") == ()
+        reclaimed = second.claim_queued_request("node", owner, "replacement")
+        assert reclaimed.state == "reclaimed"
+        assert reclaimed.generation > winning.generation
+        assert (
+            first.renew_claim(
+                "node", owner, "worker", "client", "request", winning.generation
+            ).state
+            == "stale_generation"
+        )
+        assert first._foundation._client.xlen(cfg.key("queue", node_digest)) == 1
+        assert (
+            first._foundation._client.hget(
+                cfg.key("request", client, request), "envelope"
+            )
+            == b'{"protocol":"tokenplace_api_v1_relay_e2ee","version":1,"ciphertext":"ciphertext","cipherkey":"cipherkey","iv":"iv"}'
+        )
+        assert b"envelope" not in first._foundation._client.hgetall(
+            cfg.key("claim", client, request)
+        )
+    finally:
+        first._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node_digest),
+            cfg.key("queue", node_digest),
+            cfg.key("request", client, request),
+            cfg.key("claim", client, request),
+        )
+        first.close()
+        second.close()
+
+
 def test_scheduler_reservation_and_enqueue_are_shared_and_idempotent(valkey_server):
     namespace = uuid.uuid4().hex
     first = _registration_store(valkey_server, namespace)
@@ -1002,7 +1092,6 @@ def test_selection_capacity_bounds_match_memory_without_rejection_mutation(
         first._foundation._client.delete(*keys)
         first.close()
         second.close()
-
 
 
 def test_scheduler_fairness_cursor_changes_only_for_new_reservations(valkey_server):

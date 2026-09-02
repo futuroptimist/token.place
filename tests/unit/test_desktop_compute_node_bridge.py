@@ -2856,7 +2856,10 @@ def _communicate_with_packaged_bridge_cleanup(proc):
     return stdout, stderr
 
 
-def test_packaged_bridge_timeout_cleanup_is_bounded_and_preserves_diagnostic(monkeypatch):
+@pytest.mark.parametrize('platform', ['linux', 'win32'])
+def test_packaged_bridge_timeout_cleanup_is_bounded_and_preserves_diagnostic(
+    monkeypatch, platform,
+):
     class _Pipe:
         closed = False
 
@@ -2872,6 +2875,7 @@ def test_packaged_bridge_timeout_cleanup_is_bounded_and_preserves_diagnostic(mon
 
         def __init__(self):
             self.communicate_calls = []
+            self.kill_calls = 0
 
         def communicate(self, input=None, timeout=None):
             self.communicate_calls.append((input, timeout))
@@ -2883,10 +2887,24 @@ def test_packaged_bridge_timeout_cleanup_is_bounded_and_preserves_diagnostic(mon
             return None
 
         def kill(self):
-            return None
+            self.kill_calls += 1
 
     proc = _Process()
-    monkeypatch.setattr(os, 'killpg', lambda *_args: None)
+    monkeypatch.setattr(sys, 'platform', platform)
+    killpg_calls = []
+    taskkill_calls = []
+    monkeypatch.setattr(
+        os,
+        'killpg',
+        lambda pid, sig: killpg_calls.append((pid, sig)),
+        raising=False,
+    )
+
+    def fake_taskkill(command, **kwargs):
+        taskkill_calls.append((command, kwargs))
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(subprocess, 'run', fake_taskkill)
 
     with pytest.raises(pytest.fail.Exception, match='(?s)primary stdout.*cleanup failures'):
         _communicate_with_packaged_bridge_cleanup(proc)
@@ -2898,6 +2916,22 @@ def test_packaged_bridge_timeout_cleanup_is_bounded_and_preserves_diagnostic(mon
         (None, 5),
     ]
     assert all(pipe.closed for pipe in (proc.stdin, proc.stdout, proc.stderr))
+    if platform == 'win32':
+        assert killpg_calls == []
+        assert taskkill_calls == [(
+            ['taskkill', '/PID', '123', '/T', '/F'],
+            {
+                'check': False,
+                'stdout': subprocess.DEVNULL,
+                'stderr': subprocess.DEVNULL,
+                'timeout': 5,
+            },
+        )]
+        assert proc.kill_calls == 3
+    else:
+        assert killpg_calls == [(123, signal.SIGKILL)]
+        assert taskkill_calls == []
+        assert proc.kill_calls == 2
 
 
 def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_path):

@@ -1,7 +1,9 @@
 import ast
 import copy
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -85,6 +87,7 @@ def desktop_runner():
         "NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS", "NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS",
         "PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS",
         "PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS",
+        "BRIDGE_RESET_FINGERPRINT_PATTERN", "MAX_FRESH_BRIDGE_LOG_BYTES",
     }
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
@@ -98,6 +101,8 @@ def desktop_runner():
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
         "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
         "wait_for_post_start_operator_state", "require_clean_relay_registration_baseline",
+        "relay_public_key_fingerprint", "fetch_relay_registered_node_fingerprints",
+        "fresh_bridge_fingerprint",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
         "_read_operator_start_diagnostic", "_read_native_startup_diagnostic",
@@ -115,7 +120,8 @@ def desktop_runner():
     namespace.update({"webdriver": SimpleNamespace(Chrome=object, Remote=object,
         ChromeOptions=object), "ActionChains": object,
         "time": time, "By": SimpleNamespace(CSS_SELECTOR="css", XPATH="xpath"),
-        "os": os, "json": json, "tempfile": __import__("tempfile"),
+        "os": os, "json": json, "hashlib": hashlib, "re": re,
+        "tempfile": __import__("tempfile"),
         "argparse": __import__("argparse"),
         "shutil": __import__("shutil"), "Path": Path,
         "subprocess": subprocess, "Callable": __import__("typing").Callable,
@@ -166,6 +172,8 @@ def desktop_runner():
         "generate_fixture": h.generate_fixture,
         "invoke_packaged_runtime_adapter": h.invoke_packaged_runtime_adapter})
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(RUNNER_SOURCE), "exec"), namespace)
+    module.actual_fresh_bridge_fingerprint = module.fresh_bridge_fingerprint
+    module.fresh_bridge_fingerprint = lambda *_args: "0123456789ab"
     return module
 
 
@@ -1228,7 +1236,7 @@ def test_post_start_operator_state_records_running_and_registration(desktop_runn
         "start_handler_state": "entered", "invocation_state": "resolved"}
     desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
     desktop_runner._status_value = lambda _driver, label: "yes" if label == "Registered" else "no"
-    desktop_runner.fetch_relay_diagnostics_count = lambda *_args, **_kwargs: 1
+    desktop_runner.fetch_relay_registered_node_fingerprints = lambda *_args, **_kwargs: ("0123456789ab",)
 
     class Wait:
         def __init__(self, _driver, timeout, **_kwargs):
@@ -1247,7 +1255,7 @@ def test_post_start_operator_state_records_running_and_registration(desktop_runn
 
 
 def test_clean_relay_baseline_rejects_preexisting_unrelated_node(desktop_runner):
-    desktop_runner.fetch_relay_diagnostics_count = lambda *_args, **_kwargs: 4
+    desktop_runner.fetch_relay_registered_node_fingerprints = lambda *_args, **_kwargs: ("111111111111", "222222222222", "333333333333", "444444444444")
     def fail_closed(reason):
         raise RuntimeError(reason) from None
     observations = []
@@ -1259,19 +1267,113 @@ def test_clean_relay_baseline_rejects_preexisting_unrelated_node(desktop_runner)
 
 
 def test_relay_baseline_retries_transient_failure(desktop_runner):
-    results = iter((TimeoutError("transient"), 0))
+    results = iter((TimeoutError("transient"), ()))
     def fetch(*_args, **_kwargs):
         result = next(results)
         if isinstance(result, Exception):
             raise result
         return result
-    desktop_runner.fetch_relay_diagnostics_count = fetch
+    desktop_runner.fetch_relay_registered_node_fingerprints = fetch
     observations = []
     baseline = desktop_runner.require_clean_relay_registration_baseline(
         "https://relay.example", timeout_seconds=1, fail_closed=pytest.fail,
         record_relay_observation=observations.append)
     assert baseline == 0
     assert observations == ["polled", "polled"]
+
+
+def test_bridge_fingerprint_matches_relay_client(desktop_runner):
+    from utils.networking.relay_client import RelayClient
+
+    public_key = "-----BEGIN PUBLIC KEY-----\nidentity-bound-test\n-----END PUBLIC KEY-----"
+    assert desktop_runner.relay_public_key_fingerprint(public_key) == (
+        RelayClient._api_v1_public_key_fingerprint(public_key))
+
+
+def test_fresh_bridge_fingerprint_ignores_prior_session(desktop_runner, tmp_path):
+    fresh_bridge_fingerprint = desktop_runner.actual_fresh_bridge_fingerprint
+    log = tmp_path / "runner-owned.log"
+    stale = ("desktop.compute_node_bridge.relay_client.reset "
+        "operator_session_id=prior key_fingerprint=aaaaaaaaaaaa\n")
+    log.write_text(stale, encoding="utf-8")
+    boundary = log.stat().st_size
+
+    assert fresh_bridge_fingerprint(log, boundary) is None
+
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("desktop.compute_node.stderr line="
+            "desktop.compute_node_bridge.relay_client.reset "
+            "operator_session_id=current key_fingerprint=0123456789ab\n")
+    assert fresh_bridge_fingerprint(log, boundary) == "0123456789ab"
+
+
+@pytest.mark.parametrize("nodes", [
+    ("fedcba987654",),
+    ("0123456789ab", "fedcba987654"),
+])
+def test_authoritative_identity_rejects_unrelated_or_contaminated_relay(
+        desktop_runner, nodes):
+    desktop_runner._read_operator_start_diagnostic = lambda _driver: {
+        "start_handler_state": "entered", "invocation_state": "resolved"}
+    desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
+    desktop_runner._status_value = lambda *_args: "yes"
+    desktop_runner.fetch_relay_registered_node_fingerprints = lambda *_args, **_kwargs: nodes
+
+    class Wait:
+        calls = 0
+        def __init__(self, _driver, _timeout, **_kwargs):
+            pass
+        def until(self, predicate):
+            type(self).calls += 1
+            if self.calls == 1:
+                assert predicate(object()) is True
+                return True
+            assert predicate(object()) is False
+            raise TimeoutError("bounded")
+
+    desktop_runner.WebDriverWait = Wait
+    with pytest.raises(RuntimeError, match="^operator_registration_not_reached$"):
+        desktop_runner.wait_for_post_start_operator_state(
+            object(), lambda: 0.01, lambda _progress: None,
+            lambda reason: (_ for _ in ()).throw(RuntimeError(reason)),
+            "https://relay.example", lambda _observation: None)
+
+
+@pytest.mark.parametrize("nodes", [None, {}, [None], [{}], [{"server_public_key": 3}]])
+def test_relay_node_diagnostics_malformed_data_fails_closed(
+        desktop_runner, monkeypatch, nodes):
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return None
+        def read(self):
+            return json.dumps({"api_v1_registered_compute_nodes": nodes}).encode()
+
+    monkeypatch.setattr(desktop_runner, "urlopen", lambda *_args, **_kwargs: Response())
+    with pytest.raises(ValueError, match="^relay diagnostics node") as raised:
+        desktop_runner.fetch_relay_registered_node_fingerprints(
+            "https://relay.example", timeout_seconds=0.1)
+    assert "server_public_key" not in str(raised.value)
+
+
+def test_relay_node_diagnostics_does_not_return_or_report_raw_key(
+        desktop_runner, monkeypatch):
+    raw_key = "raw-public-key-must-not-escape"
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return None
+        def read(self):
+            return json.dumps({"api_v1_registered_compute_nodes": [
+                {"server_public_key": raw_key}]}).encode()
+
+    monkeypatch.setattr(desktop_runner, "urlopen", lambda *_args, **_kwargs: Response())
+    result = desktop_runner.fetch_relay_registered_node_fingerprints(
+        "https://relay.example", timeout_seconds=0.1)
+    assert result == (hashlib.sha256(raw_key.encode()).hexdigest()[:12],)
+    assert raw_key not in repr(result)
 
 
 def test_post_start_operator_state_accepts_terminal_authoritative_registration(
@@ -1284,11 +1386,11 @@ def test_post_start_operator_state_accepts_terminal_authoritative_registration(
         "start_handler_state": "entered", "invocation_state": "resolved"}
     desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
     fetches = []
-    counts = iter((0, 1))
+    counts = iter(((), ("0123456789ab",)))
     def fetch(_relay_url, timeout_seconds):
         fetches.append((clock[0], timeout_seconds))
         return next(counts)
-    desktop_runner.fetch_relay_diagnostics_count = fetch
+    desktop_runner.fetch_relay_registered_node_fingerprints = fetch
 
     class Wait:
         calls = 0
@@ -1314,7 +1416,7 @@ def test_post_start_operator_state_accepts_terminal_authoritative_registration(
     assert 0 < fetches[1][1] <= 101.0 - fetches[1][0]
 
 
-@pytest.mark.parametrize("terminal_result", [0, RuntimeError(
+@pytest.mark.parametrize("terminal_result", [(), RuntimeError(
     "https://hostile.example/private prompt-secret")])
 def test_post_start_operator_state_terminal_authoritative_failure_is_sanitized(
         desktop_runner, monkeypatch, terminal_result):
@@ -1330,12 +1432,12 @@ def test_post_start_operator_state_terminal_authoritative_failure_is_sanitized(
     def fetch(_relay_url, timeout_seconds):
         fetches.append((clock[0], timeout_seconds))
         if len(fetches) == 1:
-            return 0
+            return ()
         if isinstance(terminal_result, Exception):
             raise terminal_result
         return terminal_result
 
-    desktop_runner.fetch_relay_diagnostics_count = fetch
+    desktop_runner.fetch_relay_registered_node_fingerprints = fetch
 
     class Wait:
         calls = 0
@@ -1377,13 +1479,13 @@ def test_post_start_operator_state_retries_transient_relay_failure(desktop_runne
     desktop_runner._read_operator_start_diagnostic = lambda _driver: {
         "start_handler_state": "entered", "invocation_state": "resolved"}
     desktop_runner.wait_for_running_stability = lambda *_args, **_kwargs: None
-    results = iter((TimeoutError("hostile relay detail"), 1))
+    results = iter((TimeoutError("hostile relay detail"), ("0123456789ab",)))
     def fetch(*_args, **_kwargs):
         result = next(results)
         if isinstance(result, Exception):
             raise result
         return result
-    desktop_runner.fetch_relay_diagnostics_count = fetch
+    desktop_runner.fetch_relay_registered_node_fingerprints = fetch
 
     class Wait:
         calls = 0
@@ -1456,7 +1558,7 @@ def test_post_start_operator_state_distinguishes_registration_failure(desktop_ru
             raise RuntimeError("https://private.example prompt-secret")
 
     desktop_runner.WebDriverWait = Wait
-    desktop_runner.fetch_relay_diagnostics_count = lambda *_args, **_kwargs: 0
+    desktop_runner.fetch_relay_registered_node_fingerprints = lambda *_args, **_kwargs: ()
 
     def fail_closed(reason):
         raise RuntimeError(reason) from None
@@ -4046,7 +4148,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
             raise ready_error
 
     def post_start(_driver, _remaining, record_progress, fail_closed, _relay_url,
-            record_relay_observation):
+            record_relay_observation, *_identity_args):
         if operator_error:
             if str(operator_error) in {
                     "handoff_failure", "submit_failure", "final_stage_failure"}:

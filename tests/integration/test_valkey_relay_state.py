@@ -391,6 +391,19 @@ def test_scheduler_reservation_and_enqueue_are_shared_and_idempotent(valkey_serv
         assert selection_after_enqueue.state == "queued"
         assert first.list_reservations() == ()
         assert first.queued_requests("node")[0].envelope == envelope
+        claimed = first.claim_queued_request("node", owner, "consumer")
+        assert claimed.state == "claimed" and claimed.generation == 1
+        assert claimed.envelope == envelope
+        assert second.claim_queued_request("node", owner, "other").state == "empty"
+        renewed = second.renew_claim(
+            "node", owner, "consumer", "client", "request", claimed.generation
+        )
+        assert renewed.state == "continued" and renewed.generation == claimed.generation
+        assert first.active_claims("node")[0].generation == claimed.generation
+        queued_claim = second.claimed_request("node", "request")
+        assert queued_claim is not None
+        assert queued_claim[0].envelope == envelope
+        assert queued_claim[1].generation == claimed.generation
     finally:
         cfg = first._foundation.config
         client = hashlib.sha256(b"client\0client").hexdigest()
@@ -405,6 +418,8 @@ def test_scheduler_reservation_and_enqueue_are_shared_and_idempotent(valkey_serv
             cfg.key("node", node),
             cfg.key("queue", node),
             cfg.key("request", client, request),
+            cfg.key("claim", client, request),
+            cfg.key("claims:expiry"),
         ]
         if selected is not None and selected.reservation_token is not None:
             token = hashlib.sha256(

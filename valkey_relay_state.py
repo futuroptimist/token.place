@@ -26,6 +26,9 @@ from relay_state_store import (
     ComputeNodeRegistration,
     EncryptedRequestEnvelope,
     EnqueueResult,
+    ClaimRecord,
+    ClaimRenewalResult,
+    ClaimResult,
     QueuedRequest,
     RelayStateCapacityExceeded,
     RelayStateConflict,
@@ -1098,6 +1101,114 @@ ENQUEUE_SCRIPT = ReviewedScript(
     "7506042454cbe0deabd9066f16510c297352e9b1a26f0cc385a79314d84c6888",  # pragma: allowlist secret
     True,
 )
+
+CLAIM_QUEUED_SOURCE = r"""
+local leases, node, queue, claims, cursor = unpack(KEYS)
+local node_digest, owner, consumer = ARGV[1], ARGV[2], ARGV[3]
+local prefix, ttl = ARGV[4], tonumber(ARGV[5])
+local max_claims, max_node, max_queue = tonumber(ARGV[6]), tonumber(ARGV[7]), tonumber(ARGV[8])
+local t = redis.call('TIME'); local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local lease_score = redis.call('ZSCORE', leases, node_digest)
+local registration = redis.call('HMGET', node, 'node_id', 'control_credential_digest',
+  'lease_expires_at_epoch', 'scheduler_draining')
+if not lease_score or not registration[1] or tonumber(lease_score) <= now or
+   tonumber(registration[3]) <= now or registration[4] ~= '0' then return {'owner'} end
+if registration[2] ~= owner then return {'owner'} end
+local entries = redis.call('XRANGE', queue, '-', '+', 'COUNT', max_queue)
+for _, entry in ipairs(entries) do
+  local fields = entry[2]; local client, request
+  for i = 1, #fields, 2 do
+    if fields[i] == 'client' then client = fields[i+1] end
+    if fields[i] == 'request' then request = fields[i+1] end
+  end
+  if not client or not request then return {'schema'} end
+  local request_key = prefix .. 'request:' .. client .. ':' .. request
+  local claim_key = prefix .. 'claim:' .. client .. ':' .. request
+  local values = redis.call('HMGET', request_key, 'state', 'client', 'request',
+    'client_public_key', 'request_id', 'node_id', 'deadline', 'envelope',
+    'enqueued_at', 'sequence', 'queue_entry')
+  if not values[1] then
+    -- A concurrently cleaned lifecycle is no longer eligible.
+  elseif not values[11] or values[2] ~= client or values[3] ~= request or
+         values[6] ~= registration[1] or values[11] ~= entry[1] or
+         (values[1] ~= 'queued' and values[1] ~= 'claimed') then return {'schema'}
+  else
+    local deadline = tonumber(values[7]); local sequence = tonumber(values[10])
+    if not deadline or not sequence then return {'schema'} end
+    local old = redis.call('HMGET', claim_key, 'lease_expires', 'generation')
+    local old_lease = tonumber(old[1]); local live = old_lease and old_lease > now
+    if deadline > now and not live then
+      local live_members = redis.call('ZRANGEBYSCORE', claims, '(' .. now, '+inf',
+        'LIMIT', 0, max_claims)
+      if #live_members >= max_claims then return {'capacity'} end
+      local node_count = 0
+      for _, member in ipairs(live_members) do
+        local c, r = string.match(member, '^([0-9a-f]+):([0-9a-f]+)$')
+        if not c or not r then return {'schema'} end
+        local selected = redis.call('HGET', prefix .. 'claim:' .. c .. ':' .. r, 'node_digest')
+        if not selected then return {'schema'} end
+        if selected == node_digest then node_count = node_count + 1 end
+      end
+      if node_count >= max_node then return {'capacity'} end
+      local generation = redis.call('HINCRBY', cursor, '_claim_generation', 1)
+      local lease = math.min(now + ttl, deadline)
+      if lease <= now then return {'empty'} end
+      redis.call('HSET', claim_key, 'client', client, 'request', request,
+        'node_digest', node_digest, 'node_id', registration[1], 'owner', owner,
+        'consumer', consumer, 'deadline', values[7], 'sequence', values[10],
+        'generation', generation, 'lease_expires', lease)
+      redis.call('ZADD', claims, lease, client .. ':' .. request)
+      redis.call('HSET', request_key, 'state', 'claimed')
+      return {old[2] and 'reclaimed' or 'claimed', tostring(generation), tostring(lease),
+        values[7], values[4], values[5], values[8]}
+    end
+  end
+end
+return {'empty'}
+"""
+CLAIM_QUEUED_SCRIPT = ReviewedScript(
+    "claim_queued_request_v1",
+    CLAIM_QUEUED_SOURCE,
+    "8dfea8d1ec3d93cab8251be6559f7f8da6fdf3440547cb420c515ecfc8a9593c",  # pragma: allowlist secret
+    True,
+)
+
+RENEW_CLAIM_SOURCE = r"""
+local leases, node, request_key, claim_key, claims = unpack(KEYS)
+local node_digest, owner, consumer, client, request = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
+local generation, ttl = tonumber(ARGV[6]), tonumber(ARGV[7])
+local t = redis.call('TIME'); local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local registration = redis.call('HMGET', node, 'node_id', 'control_credential_digest', 'lease_expires_at_epoch')
+local score = redis.call('ZSCORE', leases, node_digest)
+if not registration[1] or registration[2] ~= owner or not score or
+   tonumber(score) <= now or tonumber(registration[3]) <= now then return {'owner_mismatch'} end
+local claim = redis.call('HMGET', claim_key, 'client', 'request', 'node_digest', 'node_id',
+  'owner', 'consumer', 'deadline', 'generation', 'lease_expires')
+if not claim[1] then return {'missing_or_expired'} end
+if not claim[9] then return {'schema'} end
+local deadline, current, lease = tonumber(claim[7]), tonumber(claim[8]), tonumber(claim[9])
+if not deadline or not current or not lease then return {'schema'} end
+if deadline <= now then return {'missing_or_expired'} end
+if current ~= generation then return {'stale_generation', tostring(current)} end
+if claim[1] ~= client or claim[2] ~= request or claim[3] ~= node_digest or
+   claim[4] ~= registration[1] or claim[5] ~= owner or claim[6] ~= consumer then
+  return {'owner_mismatch'}
+end
+if lease <= now or redis.call('HGET', request_key, 'state') ~= 'claimed' then
+  return {'missing_or_expired'}
+end
+local renewed = math.min(now + ttl, deadline)
+if renewed <= now then return {'missing_or_expired'} end
+redis.call('HSET', claim_key, 'lease_expires', renewed)
+redis.call('ZADD', claims, renewed, client .. ':' .. request)
+return {'continued', tostring(current), tostring(renewed)}
+"""
+RENEW_CLAIM_SCRIPT = ReviewedScript(
+    "renew_claim_v1",
+    RENEW_CLAIM_SOURCE,
+    "69858a7ec49e7d648c3f57e0b1d5b45ac1bf90bef3a570f390bc490466438197",  # pragma: allowlist secret
+    True,
+)
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
     {
         SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT,
@@ -1105,6 +1216,8 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         SCHEDULER_STATE_SCRIPT.name: SCHEDULER_STATE_SCRIPT,
         SELECT_AND_RESERVE_SCRIPT.name: SELECT_AND_RESERVE_SCRIPT,
         ENQUEUE_SCRIPT.name: ENQUEUE_SCRIPT,
+        CLAIM_QUEUED_SCRIPT.name: CLAIM_QUEUED_SCRIPT,
+        RENEW_CLAIM_SCRIPT.name: RENEW_CLAIM_SCRIPT,
     }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
@@ -1692,6 +1805,14 @@ class ValkeyRegistrationStore:
 
         return digest(client_public_key, b"client\0"), digest(request_id, b"request\0")
 
+    def _consumer_identity_digest(self, value: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise RelayStateStoreError("consumer identity is invalid")
+        encoded = value.encode("utf-8")
+        if len(encoded) > self.config.max_consumer_identity_bytes:
+            raise RelayStateStoreError("consumer identity is invalid")
+        return hashlib.sha256(b"consumer\0" + encoded).hexdigest()
+
     def _model_tier_deadline(
         self, model: str, tier: str, deadline: float
     ) -> tuple[str, str, float]:
@@ -2106,3 +2227,318 @@ class ValkeyRegistrationStore:
                     "state schema incompatible"
                 ) from None
         return tuple(records)
+
+    @staticmethod
+    def _decode_envelope(raw: bytes, maximum: int) -> EncryptedRequestEnvelope:
+        if not isinstance(raw, bytes) or len(raw) > maximum:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            value = json.loads(raw)
+            if not isinstance(value, dict) or set(value) != {
+                "protocol",
+                "version",
+                "ciphertext",
+                "cipherkey",
+                "iv",
+            }:
+                raise ValueError
+            return EncryptedRequestEnvelope(**value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+
+    def claim_queued_request(
+        self, node_id: str, control_credential_digest: str, consumer_identity: str
+    ) -> ClaimResult:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        consumer = self._consumer_identity_digest(consumer_identity)
+        digest = self._node_digest(node_id)
+        cfg = self._foundation.config
+        result = self._foundation.execute(
+            CLAIM_QUEUED_SCRIPT.name,
+            (
+                cfg.key("nodes:lease"),
+                cfg.key("node", digest),
+                cfg.key("queue", digest),
+                cfg.key("claims:expiry"),
+                cfg.key("cursor"),
+            ),
+            (
+                digest.encode(),
+                control_credential_digest.encode(),
+                consumer.encode(),
+                cfg.key_prefix.encode(),
+                repr(float(self.config.claim_ttl_seconds)).encode(),
+                str(self.config.max_claims).encode(),
+                str(self.config.max_claims_per_node).encode(),
+                str(self.config.max_queue_depth_per_node).encode(),
+            ),
+        )
+        status, values = self._ascii_status(result)
+        if status == "owner":
+            raise RelayStateCredentialMismatch("claim owner is invalid")
+        if status == "capacity":
+            raise RelayStateCapacityExceeded("claim capacity reached")
+        if status == "schema":
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if status == "empty" and not values:
+            return ClaimResult("empty")
+        if status not in {"claimed", "reclaimed"} or len(values) != 6:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            generation = int(self._decode_text(values[0]))
+            lease = float(self._decode_text(values[1]))
+            deadline = float(self._decode_text(values[2]))
+            client_public_key = self._decode_text(values[3])
+            request_id = self._decode_text(values[4])
+            envelope = self._decode_envelope(values[5], self.config.max_envelope_bytes)
+            if (
+                generation < 1
+                or not math.isfinite(lease)
+                or not math.isfinite(deadline)
+            ):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        return ClaimResult(
+            status, generation, lease, deadline, client_public_key, request_id, envelope
+        )
+
+    def renew_claim(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+    ) -> ClaimRenewalResult:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        consumer = self._consumer_identity_digest(consumer_identity)
+        client, request = self._identity(client_public_key, request_id)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise RelayStateStoreError("claim generation is invalid")
+        node_digest = self._node_digest(node_id)
+        cfg = self._foundation.config
+        result = self._foundation.execute(
+            RENEW_CLAIM_SCRIPT.name,
+            (
+                cfg.key("nodes:lease"),
+                cfg.key("node", node_digest),
+                cfg.key("request", client, request),
+                cfg.key("claim", client, request),
+                cfg.key("claims:expiry"),
+            ),
+            (
+                node_digest.encode(),
+                control_credential_digest.encode(),
+                consumer.encode(),
+                client.encode(),
+                request.encode(),
+                str(generation).encode(),
+                repr(float(self.config.claim_ttl_seconds)).encode(),
+            ),
+        )
+        status, values = self._ascii_status(result)
+        if status in {"owner_mismatch", "missing_or_expired"} and not values:
+            return ClaimRenewalResult(status)
+        if status == "stale_generation" and len(values) == 1:
+            try:
+                return ClaimRenewalResult(status, int(self._decode_text(values[0])))
+            except ValueError:
+                pass
+        if status == "continued" and len(values) == 2:
+            try:
+                current = int(self._decode_text(values[0]))
+                lease = float(self._decode_text(values[1]))
+                if current < 1 or not math.isfinite(lease):
+                    raise ValueError
+                return ClaimRenewalResult(status, current, lease)
+            except ValueError:
+                pass
+        if status == "schema":
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        raise ValkeySchemaIncompatibleError("state schema incompatible")
+
+    def renew_claim_or_read_control(
+        self, *args: object, acknowledge: bool = False
+    ) -> ClaimRenewalResult:
+        if acknowledge:
+            raise RelayStateStoreError("control tombstone behavior is unavailable")
+        return self.renew_claim(*args)  # type: ignore[arg-type]
+
+    def _read_claim(self, client: str, request: str, now: float) -> ClaimRecord | None:
+        cfg = self._foundation.config
+        fields = (
+            b"client",
+            b"request",
+            b"consumer",
+            b"node_id",
+            b"owner",
+            b"deadline",
+            b"sequence",
+            b"generation",
+            b"lease_expires",
+        )
+        raw_values = self._foundation._call(
+            self._foundation._client.hmget, cfg.key("claim", client, request), fields
+        )
+        if (
+            isinstance(raw_values, list)
+            and raw_values
+            and all(v is None for v in raw_values)
+        ):
+            return None
+        if (
+            not isinstance(raw_values, list)
+            or len(raw_values) != len(fields)
+            or any(not isinstance(v, bytes) for v in raw_values)
+            or sum(len(v) for v in raw_values) > _MAX_RESULT_BYTES
+        ):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        raw = dict(zip(fields, raw_values))
+        request_fields = (b"envelope", b"state")
+        request_values = self._foundation._call(
+            self._foundation._client.hmget,
+            cfg.key("request", client, request),
+            request_fields,
+        )
+        if (
+            not isinstance(request_values, list)
+            or len(request_values) != 2
+            or any(not isinstance(v, bytes) for v in request_values)
+        ):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            decoded = [self._decode_text(raw[field]) for field in fields[:5]]
+            deadline, sequence, generation, lease = (
+                float(raw[b"deadline"]),
+                int(raw[b"sequence"]),
+                int(raw[b"generation"]),
+                float(raw[b"lease_expires"]),
+            )
+            if (
+                decoded[0] != client
+                or decoded[1] != request
+                or any(not _SHA256_RE.fullmatch(v) for v in decoded[:3])
+                or not all(math.isfinite(v) for v in (deadline, lease))
+                or sequence < 1
+                or generation < 1
+                or deadline <= now
+                or lease <= now
+                or request_values[1] != b"claimed"
+            ):
+                return None
+            envelope = self._decode_envelope(
+                request_values[0], self.config.max_envelope_bytes
+            )
+            return ClaimRecord(
+                client,
+                request,
+                decoded[2],
+                decoded[3],
+                decoded[4],
+                deadline,
+                envelope,
+                sequence,
+                generation,
+                lease,
+            )
+        except (TypeError, ValueError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+
+    def active_claims(self, node_id: str) -> tuple[ClaimRecord, ...]:
+        self._validate_node_id(node_id)
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        seconds, micros = self._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        cfg = self._foundation.config
+        members = self._foundation._call(
+            self._foundation._client.zrangebyscore,
+            cfg.key("claims:expiry"),
+            f"({now}",
+            "+inf",
+            start=0,
+            num=self.config.max_claims,
+        )
+        records = []
+        for raw in members:
+            member = self._decode_text(raw)
+            parts = member.split(":")
+            if len(parts) != 2 or any(not _SHA256_RE.fullmatch(v) for v in parts):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            claim = self._read_claim(parts[0], parts[1], now)
+            if claim is not None and claim.selected_node_id == node_id:
+                records.append(claim)
+        return tuple(sorted(records, key=lambda item: item.sequence))
+
+    def claimed_request(
+        self, node_id: str, request_id: str
+    ) -> tuple[QueuedRequest, ClaimRecord] | None:
+        self._validate_node_id(node_id)
+        _, request = self._identity("placeholder", request_id)
+        claim = next(
+            (
+                item
+                for item in self.active_claims(node_id)
+                if item.request_identity_digest == request
+            ),
+            None,
+        )
+        if claim is None:
+            return None
+        cfg = self._foundation.config
+        fields = (
+            b"client_public_key",
+            b"request_id",
+            b"node_id",
+            b"model",
+            b"tier",
+            b"deadline",
+            b"envelope",
+            b"enqueued_at",
+            b"sequence",
+            b"state",
+        )
+        values = self._foundation._call(
+            self._foundation._client.hmget,
+            cfg.key(
+                "request", claim.client_identity_digest, claim.request_identity_digest
+            ),
+            fields,
+        )
+        if (
+            not isinstance(values, list)
+            or len(values) != len(fields)
+            or any(not isinstance(value, bytes) for value in values)
+        ):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        raw = dict(zip(fields, values))
+        try:
+            deadline = float(raw[b"deadline"])
+            enqueued = float(raw[b"enqueued_at"])
+            sequence = int(raw[b"sequence"])
+            if raw[b"state"] != b"claimed" or sequence != claim.sequence:
+                raise ValueError
+            queued = QueuedRequest(
+                claim.client_identity_digest,
+                claim.request_identity_digest,
+                self._decode_text(raw[b"client_public_key"]),
+                self._decode_text(raw[b"request_id"]),
+                self._decode_text(raw[b"node_id"]),
+                self._decode_text(raw[b"model"]),
+                self._decode_text(raw[b"tier"]),
+                deadline,
+                self._decode_envelope(raw[b"envelope"], self.config.max_envelope_bytes),
+                enqueued,
+                sequence,
+            )
+        except (TypeError, ValueError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        return queued, claim

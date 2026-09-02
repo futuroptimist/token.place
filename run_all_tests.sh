@@ -183,6 +183,10 @@ fi
 # 3. Run API tests
 run_test "API Tests" "$PYTHON_CMD -m pytest tests/test_api.py -v $COVERAGE_ARGS" "Testing API functionality and compatibility"
 
+# 3a. Run relay API v1 lifecycle tests (registration, queueing, polling,
+# progress, cancellation, control, and eviction contracts).
+run_test "Relay API v1 Lifecycle Tests" "$PYTHON_CMD -m pytest tests/test_relay.py -v $COVERAGE_ARGS" "Testing the relay's API v1 registration/queue/lifecycle contract"
+
 # 3b. Run security audits (Bandit)
 run_test "Security Audit (Bandit)" "$PYTHON_CMD -m pytest tests/test_security_bandit.py -v $COVERAGE_ARGS" "Scanning the codebase for medium/high Bandit findings"
 

@@ -2794,6 +2794,226 @@ def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_s
         first.close()
         second.close()
 
+def _enqueue_claim_fixture(store, node_id, owner, client, request, deadline):
+    selection = store.select_and_reserve(
+        client, request, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+    )
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    store.enqueue_encrypted_request(
+        client,
+        request,
+        selection.reservation_token,
+        node_id,
+        "qwen3-8b-instruct",
+        "8k-fast",
+        deadline,
+        envelope,
+        "cancel",
+    )
+    return envelope
+
+
+def test_claim_capacity_fails_closed_on_malformed_live_claim_authority(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    cfg = store._foundation.config
+    owner = _digest("authority-owner")
+    node_id = "authority-node"
+    node = store._node_digest(node_id)
+    client_id, request_id = "target-client", "target-request"
+    client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
+    malformed_client, malformed_request = "a" * 64, "b" * 64
+    malformed_member = f"{malformed_client}:{malformed_request}"
+    malformed_key = cfg.key("claim", malformed_client, malformed_request)
+    deadline = time.time() + 60
+    try:
+        store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node_id, owner, client_id, request_id, deadline)
+        target_key = cfg.key("request", client, request)
+        cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
+
+        store._foundation._client.hset(malformed_key, "node_digest", node)
+        store._foundation._client.zadd(
+            cfg.key("claims:expiry"), {malformed_member: deadline}
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.claim_queued_request(node_id, owner, "consumer")
+        assert store._foundation._client.hget(target_key, "state") == b"queued"
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+
+        store._foundation._client.hset(
+            malformed_key,
+            mapping={
+                "client": malformed_client,
+                "request": malformed_request,
+                "node_digest": node,
+                "node_id": node_id,
+                "owner_digest": owner,
+                "consumer_digest": _digest("consumer-authority"),
+                "deadline": deadline,
+                "sequence": 1,
+                "generation": 1,
+                "lease_expires": deadline - 1,
+            },
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.claim_queued_request(node_id, owner, "consumer")
+        assert store._foundation._client.hget(target_key, "state") == b"queued"
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", client, request),
+            malformed_key,
+        )
+        store.close()
+
+
+def test_claim_reclaim_is_independent_of_bounded_expired_index_cleanup(
+    valkey_server,
+):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        claim_ttl_seconds=30,
+        node_transition_batch_size=1,
+    )
+    cfg = store._foundation.config
+    owner, node_id = _digest("reclaim-owner"), "reclaim-node"
+    node = store._node_digest(node_id)
+    client_id, request_id = "reclaim-client", "reclaim-request"
+    client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    deadline = time.time() + 60
+    backlog = [f"{'a' * 63}{i}:{'b' * 63}{i}" for i in range(3)]
+    try:
+        store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node_id, owner, client_id, request_id, deadline)
+        first = store.claim_queued_request(node_id, owner, "consumer-one")
+        expired = time.time() - 1
+        store._foundation._client.hset(
+            cfg.key("claim", client, request), "lease_expires", expired
+        )
+        store._foundation._client.zadd(cfg.key("claims:expiry"), {member: expired})
+        store._foundation._client.zadd(
+            cfg.key("claims:expiry"),
+            {
+                backlog_member: expired - index - 1
+                for index, backlog_member in enumerate(backlog)
+            },
+        )
+
+        reclaimed = store.claim_queued_request(node_id, owner, "consumer-two")
+
+        assert reclaimed.state == "reclaimed"
+        assert reclaimed.generation > first.generation
+        assert (
+            store._foundation._client.zscore(cfg.key("claims:expiry"), member) > expired
+        )
+        assert (
+            sum(
+                store._foundation._client.zscore(cfg.key("claims:expiry"), item)
+                is not None
+                for item in backlog
+            )
+            == len(backlog) - 1
+        )
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", client, request),
+            cfg.key("claim", client, request),
+        )
+        store.close()
+
+
+def test_claim_capacity_counts_only_complete_live_claims(valkey_server):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_claims=1, max_claims_per_node=1
+    )
+    cfg = store._foundation.config
+    owner = _digest("capacity-owner")
+    nodes = ("capacity-a", "capacity-b")
+    digests = tuple(store._node_digest(node) for node in nodes)
+    identities = (
+        ("capacity-client-a", "capacity-request-a"),
+        ("capacity-client-b", "capacity-request-b"),
+        ("capacity-client-c", "capacity-request-c"),
+    )
+    hashed = tuple(
+        (
+            hashlib.sha256(f"client\0{client}".encode()).hexdigest(),
+            hashlib.sha256(f"request\0{request}".encode()).hexdigest(),
+        )
+        for client, request in identities
+    )
+    deadline = time.time() + 60
+    try:
+        for node in nodes:
+            store.register(node, _capabilities(), owner)
+        for node, (client, request) in zip(nodes, identities[:2]):
+            _enqueue_claim_fixture(store, node, owner, client, request, deadline)
+        live = store.claim_queued_request(nodes[0], owner, "consumer-a")
+        with pytest.raises(RelayStateCapacityExceeded):
+            store.claim_queued_request(nodes[1], owner, "consumer-b")
+        _enqueue_claim_fixture(store, nodes[0], owner, *identities[2], deadline)
+        per_node_store = ValkeyRegistrationStore(
+            store._foundation, dataclasses.replace(store.config, max_claims=2)
+        )
+        with pytest.raises(RelayStateCapacityExceeded):
+            per_node_store.claim_queued_request(nodes[0], owner, "consumer-c")
+
+        first_client, first_request = hashed[0]
+        expired = time.time() - 1
+        store._foundation._client.hset(
+            cfg.key("claim", first_client, first_request), "lease_expires", expired
+        )
+        store._foundation._client.zadd(
+            cfg.key("claims:expiry"), {f"{first_client}:{first_request}": expired}
+        )
+        second = store.claim_queued_request(nodes[1], owner, "consumer-b")
+        assert live.state == "claimed"
+        assert second.state == "claimed"
+    finally:
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+        ]
+        keys.extend(cfg.key("node", node) for node in digests)
+        keys.extend(cfg.key("queue", node) for node in digests)
+        for client, request in hashed:
+            keys.extend(
+                (cfg.key("request", client, request), cfg.key("claim", client, request))
+            )
+        store._foundation._client.delete(*keys)
+        store.close()
+
+
+
+
 def test_claim_result_budget_accepts_large_bounded_result(valkey_server):
     namespace = uuid.uuid4().hex
     max_envelope_bytes = 20_000

@@ -1115,8 +1115,15 @@ ENQUEUE_SCRIPT = ReviewedScript(
 CLAIM_SOURCE = """\
 local leases, node, queue, expiries, cursor = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
 local prefix, node_digest, node_id, owner, consumer = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
-local ttl, max_global, max_node, queue_bound = tonumber(ARGV[6]), tonumber(ARGV[7]), tonumber(ARGV[8]), tonumber(ARGV[9])
+local ttl, max_global, max_node, queue_bound, cleanup_bound = tonumber(ARGV[6]), tonumber(ARGV[7]), tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10])
 local t = redis.call('TIME'); local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local function digest(value)
+  return value and string.len(value) == 64 and not string.find(value, '[^0-9a-f]')
+end
+local function finite(value)
+  local number = tonumber(value)
+  return number and number == number and math.abs(number) ~= math.huge and number
+end
 local indexed_lease = redis.call('ZSCORE', leases, node_digest)
 if not indexed_lease or tonumber(indexed_lease) <= now or redis.call('EXISTS', node) == 0 then return {'owner'} end
 local nv = redis.call('HMGET', node, 'node_id', 'control_credential_digest', 'scheduler_draining', 'lease_expires_at_epoch')
@@ -1147,24 +1154,37 @@ for _, entry in ipairs(entries) do
     else
       local old_deadline=tonumber(old[7]); local old_sequence=tonumber(old[8]); local old_generation=tonumber(old[9]); local old_expiry=tonumber(old[10])
       local indexed_expiry=redis.call('ZSCORE',expiries,member)
-      if not old_deadline or not old_sequence or not old_generation or old_generation < 1 or not old_expiry or not indexed_expiry or
+      if not old_deadline or not old_sequence or not old_generation or old_generation < 1 or not old_expiry or
          old[1]~=client or old[2]~=request or old[3]~=node_digest or old[4]~=node_id or
-         old_deadline~=deadline or old_sequence~=sequence or tonumber(indexed_expiry)~=old_expiry or
+         not digest(old[3]) or not digest(old[5]) or not digest(old[6]) or
+         old_deadline~=deadline or old_sequence~=sequence or (indexed_expiry and tonumber(indexed_expiry)~=old_expiry) or
+         (old_expiry > now and not indexed_expiry) or
          rv[1]~='claimed' or tonumber(rv[12])~=old_generation then return {'schema'} end
       if old_expiry <= now then reclaim = true else reclaim = nil end
     end
     if reclaim ~= nil then
     local live = redis.call('ZRANGEBYSCORE', expiries, '(' .. now, '+inf', 'LIMIT', 0, max_global + 1)
-    if #live >= max_global then return {'capacity'} end
     local node_live = 0
     for _, live_member in ipairs(live) do
       local sep = string.find(live_member, ':', 1, true)
-      if not sep then return {'schema'} end
-      local live_claim = prefix .. 'claim:' .. string.sub(live_member,1,sep-1) .. ':' .. string.sub(live_member,sep+1)
-      local claim_node_digest = redis.call('HGET', live_claim, 'node_digest')
-      if not claim_node_digest then return {'schema'} end
-      if claim_node_digest == node_digest then node_live = node_live + 1 end
+      local live_client = sep and string.sub(live_member,1,sep-1)
+      local live_request = sep and string.sub(live_member,sep+1)
+      if not digest(live_client) or not digest(live_request) then return {'schema'} end
+      local live_claim = prefix .. 'claim:' .. live_client .. ':' .. live_request
+      local lv = redis.call('HMGET',live_claim,unpack(fields)); local lv_present=0
+      for i=1,#lv do if lv[i] then lv_present=lv_present+1 end end
+      local live_deadline=finite(lv[7]); local live_sequence=finite(lv[8]); local live_generation=finite(lv[9]); local live_expiry=finite(lv[10])
+      local live_score=finite(redis.call('ZSCORE',expiries,live_member))
+      if lv_present ~= #fields or lv[1]~=live_client or lv[2]~=live_request or
+         not digest(lv[3]) or not lv[4] or string.len(lv[4]) == 0 or not digest(lv[5]) or not digest(lv[6]) or
+         not live_deadline or not live_sequence or live_sequence < 1 or live_sequence % 1 ~= 0 or
+         not live_generation or live_generation < 1 or live_generation % 1 ~= 0 or
+         not live_expiry or not live_score or live_score ~= live_expiry or live_expiry <= now then return {'schema'} end
+      if lv[3] == node_digest then node_live = node_live + 1 end
     end
+    local expired = redis.call('ZRANGEBYSCORE', expiries, '-inf', now, 'LIMIT', 0, cleanup_bound)
+    if #expired > 0 then redis.call('ZREM', expiries, unpack(expired)) end
+    if #live >= max_global then return {'capacity'} end
     if node_live >= max_node then return {'capacity'} end
     local generation=redis.call('HINCRBY',cursor,'_claim_generation',1)
     local expires=math.min(now+ttl,deadline)
@@ -1182,7 +1202,7 @@ return {'empty'}
 CLAIM_SCRIPT = ReviewedScript(
     "claim_queued_request_v1",
     CLAIM_SOURCE,
-    "b68989cb47644cd61b6a45295793f987a2368d97843778058cf8c410b07af828",  # pragma: allowlist secret
+    "41d47efe407868a829640a350a5727cc5d179259851b93ea7f13ea1aaf8a129b",  # pragma: allowlist secret
     True,
 )
 
@@ -2106,6 +2126,7 @@ class ValkeyRegistrationStore:
             str(self.config.max_claims).encode(),
             str(self.config.max_claims_per_node).encode(),
             str(self.config.max_queue_depth_per_node).encode(),
+            str(self.config.node_transition_batch_size).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(

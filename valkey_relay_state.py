@@ -664,6 +664,10 @@ local function reclaim(c, q)
     end
     if ec ~= c or eq ~= q then return false, 'schema' end
     redis.call('XDEL', prefix .. 'queue:' .. v[4], v[8])
+    if state == 'claimed' then
+      redis.call('DEL', prefix .. 'claim:' .. c .. ':' .. q)
+      redis.call('ZREM', prefix .. 'claims:expiry', c .. ':' .. q)
+    end
   else
     local expires = tonumber(v[7])
     if not v[6] or not expires then return false, 'schema' end
@@ -924,7 +928,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "1dc7d0952fe4c080e42fc94ec5dd2da3aaa66cd9fcb4edf4fff95755f3a322a0",  # pragma: allowlist secret
+    "389fc52552c89aa804834830ef66fa197e4e97f6b62b7e0af6c0b5ee67c605a8",  # pragma: allowlist secret
     True,
 )
 
@@ -978,6 +982,10 @@ local function reclaim(c, q)
     end
     if ec ~= c or eq ~= q then return false, 'schema' end
     redis.call('XDEL', prefix .. 'queue:' .. v[4], v[8])
+    if lifecycle_state == 'claimed' then
+      redis.call('DEL', prefix .. 'claim:' .. c .. ':' .. q)
+      redis.call('ZREM', prefix .. 'claims:expiry', c .. ':' .. q)
+    end
   else
     local expires = tonumber(v[7])
     if not v[6] or not expires then return false, 'schema' end
@@ -1098,7 +1106,7 @@ return {'created', 'queued', values[7], tostring(sequence)}
 ENQUEUE_SCRIPT = ReviewedScript(
     "enqueue_encrypted_request_v1",
     ENQUEUE_SOURCE,
-    "7506042454cbe0deabd9066f16510c297352e9b1a26f0cc385a79314d84c6888",  # pragma: allowlist secret
+    "62224003ccbab921f2ab7c1a74bf2564fb5eed5f28f198c25a374eb9986d9904",  # pragma: allowlist secret
     True,
 )
 CLAIM_SOURCE = """\
@@ -1118,9 +1126,9 @@ for _, member in ipairs(live) do
   local sep = string.find(member, ':', 1, true)
   if not sep then return {'schema'} end
   local ck = prefix .. 'claim:' .. string.sub(member,1,sep-1) .. ':' .. string.sub(member,sep+1)
-  local nd = redis.call('HGET', ck, 'node_digest')
-  if not nd then return {'schema'} end
-  if nd == node_digest then node_live = node_live + 1 end
+  local claim_node_digest = redis.call('HGET', ck, 'node_digest')
+  if not claim_node_digest then return {'schema'} end
+  if claim_node_digest == node_digest then node_live = node_live + 1 end
 end
 if node_live >= max_node then return {'capacity'} end
 local entries = redis.call('XRANGE', queue, '-', '+', 'COUNT', queue_bound)
@@ -1154,7 +1162,7 @@ return {'empty'}
 CLAIM_SCRIPT = ReviewedScript(
     "claim_queued_request_v1",
     CLAIM_SOURCE,
-    "242d4d9e9ceca4950a77df09a1a54eaba588ae68c8f7b563cd8494ff03aba748",  # pragma: allowlist secret
+    "cadd8a83304b9ad9f1b28fcffb23463162af715e2239c26e8057945b514142bd",  # pragma: allowlist secret
     True,
 )
 
@@ -1166,7 +1174,7 @@ local lease=redis.call('ZSCORE',leases,node_digest)
 if not lease or tonumber(lease)<=now or redis.call('EXISTS',node)==0 then return {'owner_mismatch'} end
 local nv=redis.call('HMGET',node,'node_id','control_credential_digest','scheduler_draining')
 if not nv[1] or not nv[2] or not nv[3] then return {'schema'} end
-if nv[1]~=node_id or nv[2]~=owner or nv[3]~='0' then return {'owner_mismatch'} end
+if nv[1]~=node_id or nv[2]~=owner then return {'owner_mismatch'} end
 local cv=redis.call('HMGET',claim,'client','request','node_digest','node_id','owner_digest','consumer_digest','deadline','generation','lease_expires')
 local present=0 for i=1,#cv do if cv[i] then present=present+1 end end
 if present==0 then return {'missing_or_expired'} elseif present~=#cv then return {'schema'} end
@@ -1185,7 +1193,7 @@ return {'continued',tostring(current),tostring(renewed)}
 RENEW_CLAIM_SCRIPT = ReviewedScript(
     "renew_claim_v1",
     RENEW_CLAIM_SOURCE,
-    "ff259684a0354ddbc546c05fd911545dbe1723cb64f6d7953c011137e40013a4",  # pragma: allowlist secret
+    "091ab1b8d4568bd0d54d1d4bd5deeadb195feea081928e436bc580a05980019d",  # pragma: allowlist secret
     True,
 )
 
@@ -2024,7 +2032,7 @@ class ValkeyRegistrationStore:
         if not isinstance(consumer_identity, str) or not consumer_identity:
             raise RelayStateStoreError("consumer identity is invalid")
         encoded = consumer_identity.encode("utf-8")
-        if len(encoded) > self.config.max_identity_bytes:
+        if len(encoded) > self.config.max_consumer_identity_bytes:
             raise RelayStateStoreError("consumer identity is invalid")
         return hashlib.sha256(b"consumer\0" + encoded).hexdigest()
 
@@ -2237,6 +2245,7 @@ class ValkeyRegistrationStore:
             b"envelope",
             b"enqueued_at",
             b"sequence",
+            b"claim_generation",
         )
         for member_raw in members:
             member = self._decode_text(member_raw)
@@ -2283,6 +2292,7 @@ class ValkeyRegistrationStore:
                     or r[b"request"] != c[b"request"]
                     or r[b"node_id"] != c[b"node_id"]
                     or int(r[b"sequence"]) != seq
+                    or int(r[b"claim_generation"]) != gen
                 ):
                     raise ValueError
                 env = self._decode_request_envelope(r[b"envelope"])
@@ -2326,7 +2336,10 @@ class ValkeyRegistrationStore:
     ) -> tuple[QueuedRequest, ClaimRecord] | None:
         if not isinstance(request_id, str) or not request_id:
             raise RelayStateStoreError("request id is required")
-        digest = hashlib.sha256(b"request\0" + request_id.encode()).hexdigest()
+        encoded = request_id.encode("utf-8")
+        if len(encoded) > self.config.max_identity_bytes:
+            raise RelayStateStoreError("request identity is invalid")
+        digest = hashlib.sha256(b"request\0" + encoded).hexdigest()
         return next(
             (
                 pair

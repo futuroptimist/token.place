@@ -1853,6 +1853,12 @@ def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(
         store._foundation._client.zadd(
             cfg.key("requests:deadline"), {client + ":" + request: expired_deadline}
         )
+        claim_key = cfg.key("claim", client, request)
+        if state == "claimed":
+            store._foundation._client.hset(claim_key, mapping={"generation": 1})
+            store._foundation._client.zadd(
+                cfg.key("claims:expiry"), {client + ":" + request: queued_deadline}
+            )
         cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
 
         with pytest.raises(RelayStateInvalidReservation):
@@ -1868,12 +1874,16 @@ def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(
         ) is None
         assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
         assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+        assert not store._foundation._client.exists(claim_key)
+        assert store._foundation._client.zscore(
+            cfg.key("claims:expiry"), client + ":" + request
+        ) is None
 
     finally:
         keys = [
             cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
             cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node), cfg.key("queue", node),
+            cfg.key("claims:expiry"), cfg.key("node", node), cfg.key("queue", node),
         ]
         for client_public_key, request_id in identities:
             keys.append(
@@ -2662,6 +2672,7 @@ def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_s
     client_digest = hashlib.sha256(b"client\0claim-client").hexdigest()
     request_digest = hashlib.sha256(b"request\0claim-request").hexdigest()
     node_digest = first._node_digest("claim-node")
+    cfg = first._foundation.config
     try:
         first.register("claim-node", _capabilities(concurrency=2), owner)
         selection = first.select_and_reserve(
@@ -2713,6 +2724,24 @@ def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_s
             winner.generation,
         )
         assert renewed.state == "continued" and renewed.generation == winner.generation
+        first.set_scheduler_state(
+            "claim-node", owner, SchedulerNodeState(draining=True, claimed_work=1)
+        )
+        renewed = second.renew_claim(
+            "claim-node", owner, "consumer", "claim-client", "claim-request",
+            winner.generation,
+        )
+        assert renewed.state == "continued"
+        first.set_scheduler_state("claim-node", owner, SchedulerNodeState())
+        request_key = cfg.key("request", client_digest, request_digest)
+        first._foundation._client.hset(
+            request_key, "claim_generation", winner.generation + 1
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            first.active_claims("claim-node")
+        first._foundation._client.hset(
+            request_key, "claim_generation", winner.generation
+        )
         assert (
             first.renew_claim(
                 "claim-node",
@@ -2742,7 +2771,6 @@ def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_s
             == "stale_generation"
         )
     finally:
-        cfg = first._foundation.config
         keys = [
             cfg.key("schema"),
             cfg.key("nodes:lease"),

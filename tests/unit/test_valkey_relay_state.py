@@ -926,6 +926,27 @@ def test_scheduler_cancellation_proof_validation_is_typed(token):
         store._cancellation_digest(token)
 
 
+def test_consumer_identity_uses_its_specific_byte_bound():
+    foundation = Mock(spec=ValkeyFoundation)
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(
+        store.config, max_identity_bytes=8, max_consumer_identity_bytes=4
+    )
+
+    with pytest.raises(RelayStateStoreError, match="consumer identity is invalid"):
+        store._consumer_digest("12345")
+
+
+def test_claimed_request_validates_identity_before_reading_state():
+    foundation = Mock(spec=ValkeyFoundation)
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(store.config, max_identity_bytes=4)
+
+    with pytest.raises(RelayStateStoreError, match="request identity is invalid"):
+        store.claimed_request("node-a", "12345")
+    foundation.read_manifest.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("result", "expected"),
     [

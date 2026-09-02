@@ -1223,11 +1223,14 @@ local function finite(value)
   return number and number==number and math.abs(number)~=math.huge and number
 end
 local lease=redis.call('ZSCORE',leases,node_digest)
-if not lease or tonumber(lease)<=now or redis.call('EXISTS',node)==0 then return {'owner_mismatch'} end
+if not lease or redis.call('EXISTS',node)==0 then return {'owner_mismatch'} end
+local indexed_node_lease=finite(lease)
+if not indexed_node_lease then return {'schema'} end
+if indexed_node_lease<=now then return {'owner_mismatch'} end
 local nv=redis.call('HMGET',node,'node_id','control_credential_digest','scheduler_draining','lease_expires_at_epoch')
 if not nv[1] or not nv[2] or not nv[3] then return {'schema'} end
-local node_lease=tonumber(nv[4])
-if not node_lease or math.abs(node_lease-tonumber(lease))>0.000001 then return {'schema'} end
+local node_lease=finite(nv[4])
+if not node_lease or node_lease~=indexed_node_lease then return {'schema'} end
 if nv[1]~=node_id or nv[2]~=owner or (nv[3]~='0' and nv[3]~='1') then return {'owner_mismatch'} end
 local cv=redis.call('HMGET',claim,'client','request','node_digest','node_id','owner_digest','consumer_digest','deadline','sequence','generation','lease_expires')
 local present=0 for i=1,#cv do if cv[i] then present=present+1 end end
@@ -1253,7 +1256,7 @@ return {'continued',tostring(current),tostring(renewed)}
 RENEW_CLAIM_SCRIPT = ReviewedScript(
     "renew_claim_v1",
     RENEW_CLAIM_SOURCE,
-    "1d49310715988bf6b1cf5040d870a49ca21a0760a4b498da2feba673fc44f95f",  # pragma: allowlist secret
+    "5c7299dea0b983823406b69ca4da3c4b9ce51b326825a3d78a7d9a25fefbe811",  # pragma: allowlist secret
     True,
 )
 
@@ -2365,6 +2368,7 @@ class ValkeyRegistrationStore:
             b"client_public_key",
             b"request_id",
             b"node_id",
+            b"node_digest",
             b"model",
             b"tier",
             b"deadline",
@@ -2454,6 +2458,10 @@ class ValkeyRegistrationStore:
                     or r[b"request"] != c[b"request"]
                     or r[b"node_id"] != c[b"node_id"]
                     or not 0 < len(r[b"node_id"]) <= self.config.max_node_id_bytes
+                    or self._decode_text(r[b"node_digest"]) != claim_node_digest
+                    or not _SHA256_RE.fullmatch(
+                        self._decode_text(r[b"node_digest"])
+                    )
                     or request_deadline != deadline
                     or request_sequence != seq
                     or request_generation != gen

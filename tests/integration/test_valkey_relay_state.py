@@ -314,6 +314,15 @@ def _wait_until(predicate, timeout=1.0):
     pytest.fail("bounded polling condition was not reached")
 
 
+def _wait_for_server_epoch(store, boundary, timeout=2.0):
+    """Wait for an inclusive lease boundary using only Valkey's clock."""
+
+    def boundary_reached():
+        seconds, micros = store._foundation.server_time()
+        return seconds + micros / 1_000_000 >= boundary
+
+    _wait_until(boundary_reached, timeout=timeout)
+
 def _registration_keys(store, *node_ids):
     return [
         store._foundation.config.key("schema"),
@@ -2753,7 +2762,7 @@ def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_s
             ).state
             == "owner_mismatch"
         )
-        time.sleep(0.1)
+        _wait_for_server_epoch(first, renewed.lease_expires_at_epoch)
         assert first.active_claims("claim-node") == ()
         reclaimed = second.claim_queued_request("claim-node", owner, "consumer-2")
         assert (
@@ -2814,6 +2823,281 @@ def _enqueue_claim_fixture(store, node_id, owner, client, request, deadline):
     )
     return envelope
 
+
+def _claim_authority_snapshot(store, node_id, client_id, request_id):
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
+    node = store._node_digest(node_id)
+    datastore = store._foundation._client
+    return (
+        datastore.hgetall(cfg.key("request", client, request)),
+        datastore.hgetall(cfg.key("claim", client, request)),
+        datastore.hgetall(cfg.key("cursor")),
+        datastore.xrange(cfg.key("queue", node)),
+        datastore.zrange(cfg.key("claims:expiry"), 0, -1, withscores=True),
+    )
+
+def test_renew_claim_authenticates_exact_live_authority(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, claim_ttl_seconds=2)
+    second = _registration_store(valkey_server, namespace, claim_ttl_seconds=2)
+    owner = _digest("exact-renew-owner")
+    node_id = "exact-renew-node"
+    identity = ("exact-renew-client", "exact-renew-request")
+    deadline = first._foundation.server_time()[0] + 60
+    cfg = first._foundation.config
+    node = first._node_digest(node_id)
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    try:
+        first.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node_id, owner, *identity, deadline)
+        claim = first.claim_queued_request(node_id, owner, "exact-consumer")
+
+        rejected = (
+            (
+                node_id,
+                _digest("other-owner"),
+                "exact-consumer",
+                *identity,
+                claim.generation,
+            ),
+            (node_id, owner, "other-consumer", *identity, claim.generation),
+            ("other-node", owner, "exact-consumer", *identity, claim.generation),
+            (
+                node_id,
+                owner,
+                "exact-consumer",
+                "other-client",
+                identity[1],
+                claim.generation,
+            ),
+            (
+                node_id,
+                owner,
+                "exact-consumer",
+                identity[0],
+                "other-request",
+                claim.generation,
+            ),
+            (node_id, owner, "exact-consumer", *identity, claim.generation + 1),
+        )
+        for arguments in rejected:
+            before = _claim_authority_snapshot(first, node_id, *identity)
+            assert second.renew_claim(*arguments).state != "continued"
+            assert _claim_authority_snapshot(first, node_id, *identity) == before
+
+        renewed = second.renew_claim(
+            node_id, owner, "exact-consumer", *identity, claim.generation
+        )
+        assert renewed.state == "continued"
+        assert renewed.generation == claim.generation
+    finally:
+        first._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", client, request),
+            cfg.key("claim", client, request),
+        )
+        first.close()
+        second.close()
+
+@pytest.mark.parametrize("removal", ("unregister", "expiry"))
+def test_generation_and_owner_fencing_survives_node_id_reuse(valkey_server, removal):
+    namespace = uuid.uuid4().hex
+    stores = [
+        _registration_store(
+            valkey_server, namespace, lease_ttl_seconds=0.05, claim_ttl_seconds=2
+        )
+        for _ in range(2)
+    ]
+    first, second = stores
+    old_owner, new_owner = _digest("old-owner"), _digest("new-owner")
+    node_id = "reused-node"
+    identities = (("reuse-client", "request-old"), ("reuse-client", "request-new"))
+    cfg = first._foundation.config
+    node = first._node_digest(node_id)
+    try:
+        registration = first.register(node_id, _capabilities(), old_owner)
+        deadline = first._foundation.server_time()[0] + 60
+        _enqueue_claim_fixture(first, node_id, old_owner, *identities[0], deadline)
+        old = second.claim_queued_request(node_id, old_owner, "old-consumer")
+        if removal == "unregister":
+            assert second.unregister(node_id, old_owner)
+        else:
+            _wait_for_server_epoch(first, registration.lease_expires_at_epoch)
+
+        second.register(node_id, _capabilities(), new_owner)
+        _enqueue_claim_fixture(second, node_id, new_owner, *identities[1], deadline)
+        new = first.claim_queued_request(node_id, new_owner, "new-consumer")
+        assert new.generation > old.generation
+        assert (
+            first.renew_claim(
+                node_id, old_owner, "old-consumer", *identities[0], old.generation
+            ).state
+            == "owner_mismatch"
+        )
+        assert (
+            first.renew_claim(
+                node_id, new_owner, "old-consumer", *identities[0], old.generation
+            ).state
+            == "owner_mismatch"
+        )
+    finally:
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+        ]
+        for client_id, request_id in identities:
+            client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
+            request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
+            keys.extend(
+                (cfg.key("request", client, request), cfg.key("claim", client, request))
+            )
+        first._foundation._client.delete(*keys)
+        for store in stores:
+            store.close()
+
+def test_concurrent_renewal_and_reclaim_has_coherent_generation(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.08)
+    second = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.08)
+    owner, node_id = _digest("race-owner"), "race-node"
+    identity = ("race-client", "race-request")
+    cfg = first._foundation.config
+    node = first._node_digest(node_id)
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    try:
+        first.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(
+            first, node_id, owner, *identity, first._foundation.server_time()[0] + 60
+        )
+        old = first.claim_queued_request(node_id, owner, "old-consumer")
+        _wait_for_server_epoch(first, old.lease_expires_at_epoch)
+        barrier = Barrier(2)
+
+        def renew():
+            barrier.wait()
+            return first.renew_claim(
+                node_id, owner, "old-consumer", *identity, old.generation
+            )
+
+        def reclaim():
+            barrier.wait()
+            return second.claim_queued_request(node_id, owner, "new-consumer")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            renewal_future = pool.submit(renew)
+            reclaim_future = pool.submit(reclaim)
+        renewal, reclaimed = renewal_future.result(), reclaim_future.result()
+        assert renewal.state in {"missing_or_expired", "stale_generation"}
+        assert reclaimed.state == "reclaimed"
+        assert reclaimed.generation > old.generation
+        live = first.active_claims(node_id)
+        assert len(live) == 1 and live[0].generation == reclaimed.generation
+        assert first._foundation._client.xlen(cfg.key("queue", node)) == 1
+        assert (
+            len(first._foundation._client.hgetall(cfg.key("request", client, request)))
+            > 0
+        )
+    finally:
+        first._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", client, request),
+            cfg.key("claim", client, request),
+        )
+        first.close()
+        second.close()
+
+@pytest.mark.parametrize("removal", ("unregister", "expiry"))
+def test_concurrent_renewal_and_registration_removal_fences_former_owner(
+    valkey_server, removal
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server, namespace, lease_ttl_seconds=0.08, claim_ttl_seconds=2
+    )
+    second = _registration_store(
+        valkey_server, namespace, lease_ttl_seconds=0.08, claim_ttl_seconds=2
+    )
+    owner, new_owner = _digest("removal-owner"), _digest("replacement-owner")
+    node_id = "removal-node"
+    identity = ("removal-client", "removal-request")
+    cfg = first._foundation.config
+    node = first._node_digest(node_id)
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    try:
+        registration = first.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(
+            first, node_id, owner, *identity, first._foundation.server_time()[0] + 60
+        )
+        claim = first.claim_queued_request(node_id, owner, "removal-consumer")
+        if removal == "expiry":
+            _wait_for_server_epoch(first, registration.lease_expires_at_epoch)
+        barrier = Barrier(2)
+
+        def renew():
+            barrier.wait()
+            return first.renew_claim(
+                node_id, owner, "removal-consumer", *identity, claim.generation
+            )
+
+        def remove():
+            barrier.wait()
+            if removal == "unregister":
+                return second.unregister(node_id, owner)
+            return second.register(node_id, _capabilities(), new_owner)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            renewal_future = pool.submit(renew)
+            removal_future = pool.submit(remove)
+        renewal = renewal_future.result()
+        removed = removal_future.result()
+        assert renewal.state in {"continued", "owner_mismatch"}
+        assert removed
+        assert (
+            first.renew_claim(
+                node_id, owner, "removal-consumer", *identity, claim.generation
+            ).state
+            == "owner_mismatch"
+        )
+    finally:
+        first._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", client, request),
+            cfg.key("claim", client, request),
+        )
+        first.close()
+        second.close()
 
 def test_claim_capacity_fails_closed_on_malformed_live_claim_authority(
     valkey_server,
@@ -3410,6 +3694,10 @@ def test_claim_result_budget_accepts_large_bounded_result(valkey_server):
     )
     deadline = time.time() + 10
     cfg = store._foundation.config
+    selection = None
+    node = store._node_digest("large-claim-node")
+    client = hashlib.sha256(f"client\0{client_public_key}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
     try:
         store.register("large-claim-node", _capabilities(), owner)
         selection = store.select_and_reserve(
@@ -3448,7 +3736,19 @@ def test_claim_result_budget_accepts_large_bounded_result(valkey_server):
             == 1
         )
     finally:
-        keys = tuple(store._foundation._client.scan_iter(match=f"{cfg.key_prefix}*"))
-        if keys:
-            store._foundation._client.delete(*keys)
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", client, request),
+            cfg.key("claim", client, request),
+        ]
+        if selection is not None and selection.reservation_token is not None:
+            keys.append(cfg.key("reservation", _digest(selection.reservation_token)))
+        store._foundation._client.delete(*keys)
         store.close()

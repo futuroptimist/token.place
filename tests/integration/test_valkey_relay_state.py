@@ -3116,6 +3116,172 @@ def test_claim_capacity_fails_closed_on_nonlive_or_mismatched_lifecycle_authorit
         store.close()
 
 
+def test_renew_claim_fails_closed_on_malformed_expiry_authority(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    cfg = store._foundation.config
+    owner, node_id = _digest("renew-authority-owner"), "renew-authority-node"
+    identity = ("renew-authority-client", "renew-authority-request")
+    client, request = (
+        hashlib.sha256(f"{domain}\0{value}".encode()).hexdigest()
+        for domain, value in zip(("client", "request"), identity)
+    )
+    member = f"{client}:{request}"
+    claim_key = cfg.key("claim", client, request)
+    request_key = cfg.key("request", client, request)
+    node_digest = store._node_digest(node_id)
+    deadline = time.time() + 60
+    try:
+        store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node_id, owner, *identity, deadline)
+        claimed = store.claim_queued_request(node_id, owner, "renew-consumer")
+        datastore = store._foundation._client
+
+        for indexed_expiry in (None, claimed.lease_expires_at_epoch + 1):
+            claim_before = datastore.hgetall(claim_key)
+            request_before = datastore.hgetall(request_key)
+            datastore.zrem(cfg.key("claims:expiry"), member)
+            if indexed_expiry is not None:
+                datastore.zadd(cfg.key("claims:expiry"), {member: indexed_expiry})
+            index_before = datastore.zrange(
+                cfg.key("claims:expiry"), 0, -1, withscores=True
+            )
+
+            with pytest.raises(
+                ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+            ):
+                store.renew_claim(
+                    node_id,
+                    owner,
+                    "renew-consumer",
+                    *identity,
+                    claimed.generation,
+                )
+
+            assert datastore.hgetall(claim_key) == claim_before
+            assert datastore.hgetall(request_key) == request_before
+            assert (
+                datastore.zrange(cfg.key("claims:expiry"), 0, -1, withscores=True)
+                == index_before
+            )
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node_digest),
+            cfg.key("queue", node_digest),
+            request_key,
+            claim_key,
+        )
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("record", "field", "value"),
+    (
+        ("claim", "node_digest", b"\xffredacted-invalid-utf8"),
+        ("request", "model", b"m" * 129),
+        ("request", "client_public_key", b"i" * 8193),
+        ("claim", "deadline", b"nan"),
+        ("claim", "lease_expires", b"inf"),
+        ("claim", "lease_expires", b"9999999999"),
+        ("request", "enqueued_at", b"-inf"),
+        ("request", "queue_entry", b"01-0"),
+    ),
+)
+def test_claim_reads_fail_closed_on_malformed_bounded_fields(
+    valkey_server, record, field, value
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    cfg = store._foundation.config
+    owner, node_id = _digest("read-authority-owner"), "read-authority-node"
+    identity = ("read-authority-client", "read-authority-request")
+    client, request = (
+        hashlib.sha256(f"{domain}\0{item}".encode()).hexdigest()
+        for domain, item in zip(("client", "request"), identity)
+    )
+    node_digest = store._node_digest(node_id)
+    keys = {
+        "claim": cfg.key("claim", client, request),
+        "request": cfg.key("request", client, request),
+    }
+    try:
+        store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node_id, owner, *identity, time.time() + 60)
+        store.claim_queued_request(node_id, owner, "read-consumer")
+        store._foundation._client.hset(keys[record], field, value)
+        if field == "lease_expires" and value == b"9999999999":
+            store._foundation._client.zadd(
+                cfg.key("claims:expiry"), {f"{client}:{request}": float(value)}
+            )
+
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ) as caught:
+            store.active_claims(node_id)
+
+        rendered = f"{caught.value!s}{caught.value!r}"
+        assert "redacted-invalid-utf8" not in rendered
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node_digest),
+            cfg.key("queue", node_digest),
+            *keys.values(),
+        )
+        store.close()
+
+
+def test_claim_reads_tolerate_complete_post_snapshot_removal(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    cfg = store._foundation.config
+    owner, node_id = _digest("removed-read-owner"), "removed-read-node"
+    identity = ("removed-read-client", "removed-read-request")
+    client, request = (
+        hashlib.sha256(f"{domain}\0{item}".encode()).hexdigest()
+        for domain, item in zip(("client", "request"), identity)
+    )
+    node_digest = store._node_digest(node_id)
+    claim_key = cfg.key("claim", client, request)
+    request_key = cfg.key("request", client, request)
+    original_call = store._foundation._call
+    try:
+        store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node_id, owner, *identity, time.time() + 60)
+        store.claim_queued_request(node_id, owner, "removed-read-consumer")
+
+        def remove_before_claim_read(operation, *args, **kwargs):
+            if operation == store._foundation._client.hmget and args[0] == claim_key:
+                store._foundation._client.delete(claim_key, request_key)
+            return original_call(operation, *args, **kwargs)
+
+        store._foundation._call = remove_before_claim_read
+        assert store.active_claims(node_id) == ()
+    finally:
+        store._foundation._call = original_call
+        store._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node_digest),
+            cfg.key("queue", node_digest),
+            request_key,
+            claim_key,
+        )
+        store.close()
+
+
 def test_claim_result_budget_accepts_large_bounded_result(valkey_server):
     namespace = uuid.uuid4().hex
     max_envelope_bytes = 20_000

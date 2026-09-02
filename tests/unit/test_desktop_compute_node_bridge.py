@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -2900,6 +2901,11 @@ class ComputeNodeRuntime:
 
     env = os.environ.copy()
     env.pop('PYTHONPATH', None)
+    process_group_kwargs = (
+        {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
+        if os.name == 'nt'
+        else {'start_new_session': True}
+    )
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -2918,16 +2924,34 @@ class ComputeNodeRuntime:
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        **process_group_kwargs,
     )
-    assert proc.stdin is not None
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-    proc.stdin.write('{"type":"cancel"}\n')
-    proc.stdin.flush()
-    proc.stdin.close()
-    proc.wait(timeout=10)
-    stdout = proc.stdout.read()
-    stderr = proc.stderr.read()
+    try:
+        # Drain both pipes while the bridge exits.  Waiting before reading can
+        # deadlock on Windows when its smaller pipe buffer fills with startup
+        # diagnostics, preventing the child from reaching shutdown.
+        stdout, stderr = proc.communicate(
+            input='{"type":"cancel"}\n', timeout=10
+        )
+    except subprocess.TimeoutExpired:
+        if os.name == 'nt':
+            subprocess.run(
+                ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+        stdout, stderr = proc.communicate(timeout=5)
+        pytest.fail(
+            f'packaged bridge did not stop after cancel: stdout={stdout!r} stderr={stderr!r}'
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate(timeout=5)
 
     assert proc.returncode == 0, stderr
     events = [json.loads(line) for line in stdout.splitlines() if line.strip()]

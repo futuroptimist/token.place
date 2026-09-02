@@ -2647,3 +2647,121 @@ def test_expire_lost_reply_does_not_consume_a_hidden_retry_batch(valkey_server):
         store._foundation._client.evalsha = original_evalsha
         store._foundation._client.delete(*_registration_keys(store, *node_ids))
         store.close()
+
+
+def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.08)
+    second = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.08)
+    owner = _digest("claim-owner")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    deadline = time.time() + 10
+    selection = None
+    client_digest = hashlib.sha256(b"client\0claim-client").hexdigest()
+    request_digest = hashlib.sha256(b"request\0claim-request").hexdigest()
+    node_digest = first._node_digest("claim-node")
+    try:
+        first.register("claim-node", _capabilities(concurrency=2), owner)
+        selection = first.select_and_reserve(
+            "claim-client",
+            "claim-request",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            "cancel",
+        )
+        first.enqueue_encrypted_request(
+            "claim-client",
+            "claim-request",
+            selection.reservation_token,
+            "claim-node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            claims = list(
+                pool.map(
+                    lambda store: store.claim_queued_request(
+                        "claim-node", owner, "consumer"
+                    ),
+                    (first, second),
+                )
+            )
+        winner = next(result for result in claims if result.state == "claimed")
+        assert [result.state for result in claims].count("claimed") == 1
+        assert [result.state for result in claims].count("empty") == 1
+        assert first.queued_requests("claim-node") == ()
+        assert (
+            first.claimed_request("claim-node", "claim-request")[1].generation
+            == winner.generation
+        )
+        assert (
+            first.active_claims("claim-node")[0].consumer_identity_digest
+            == hashlib.sha256(b"consumer\0consumer").hexdigest()
+        )
+        renewed = second.renew_claim(
+            "claim-node",
+            owner,
+            "consumer",
+            "claim-client",
+            "claim-request",
+            winner.generation,
+        )
+        assert renewed.state == "continued" and renewed.generation == winner.generation
+        assert (
+            first.renew_claim(
+                "claim-node",
+                owner,
+                "wrong",
+                "claim-client",
+                "claim-request",
+                winner.generation,
+            ).state
+            == "owner_mismatch"
+        )
+        time.sleep(0.1)
+        assert first.active_claims("claim-node") == ()
+        reclaimed = second.claim_queued_request("claim-node", owner, "consumer-2")
+        assert (
+            reclaimed.state == "reclaimed" and reclaimed.generation > winner.generation
+        )
+        assert (
+            first.renew_claim(
+                "claim-node",
+                owner,
+                "consumer",
+                "claim-client",
+                "claim-request",
+                winner.generation,
+            ).state
+            == "stale_generation"
+        )
+    finally:
+        cfg = first._foundation.config
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node_digest),
+            cfg.key("queue", node_digest),
+            cfg.key("request", client_digest, request_digest),
+            cfg.key("claim", client_digest, request_digest),
+        ]
+        if selection is not None and selection.reservation_token is not None:
+            keys.append(
+                cfg.key(
+                    "reservation",
+                    hashlib.sha256(selection.reservation_token.encode()).hexdigest(),
+                )
+            )
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()

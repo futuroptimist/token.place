@@ -1,14 +1,14 @@
 import concurrent.futures
 import dataclasses
-import math
+import hashlib
 import logging
+import math
 import shutil
 import socket
 import subprocess
 import time
-import uuid
-import hashlib
 import traceback
+import uuid
 from threading import Barrier
 
 import pytest
@@ -16,24 +16,28 @@ import redis
 
 from relay_state_store import (
     ComputeNodeCapabilities,
+    EncryptedRequestEnvelope,
+    InMemoryRelayStateStore,
     RelayStateCapacityExceeded,
     RelayStateCredentialMismatch,
+    RelayStateInvalidReservation,
+    RelayStateNoCapacity,
     RelayStateStoreConfig,
+    SchedulerNodeState,
 )
-
+from tests.registration_store_contract import assert_registration_contract
 from valkey_relay_state import (
-    DirectPrimary,
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
+    DirectPrimary,
     SchemaManifest,
     ValkeyConfig,
     ValkeyFoundation,
-    ValkeyRegistrationStore,
     ValkeyReadOnlyError,
+    ValkeyRegistrationStore,
     ValkeySchemaIncompatibleError,
     ValkeyUnavailableError,
 )
-from tests.registration_store_contract import assert_registration_contract
 
 
 def _free_port():
@@ -266,6 +270,41 @@ def _digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def _scheduler_policy_capabilities(
+    *, models=("qwen3-8b-instruct",), tier="8k-fast", concurrency=4
+):
+    tokens = 65536 if tier == "64k-full" else 8192
+    return dataclasses.replace(
+        _capabilities(concurrency=concurrency),
+        supported_model_ids=models,
+        active_context_tier=tier,
+        maximum_total_context_tokens=tokens,
+    )
+
+
+def _delete_scheduler_policy_state(store, node_ids, selections=()):
+    cfg = store._foundation.config
+    keys = [
+        cfg.key("schema"),
+        cfg.key("nodes:lease"),
+        cfg.key("cursor"),
+        cfg.key("reservations:expiry"),
+        cfg.key("requests:deadline"),
+    ]
+    keys.extend(cfg.key("node", store._node_digest(node)) for node in node_ids)
+    for client, request, selection in selections:
+        keys.append(
+            cfg.key(
+                "request",
+                hashlib.sha256(f"client\0{client}".encode()).hexdigest(),
+                hashlib.sha256(f"request\0{request}".encode()).hexdigest(),
+            )
+        )
+        if selection is not None and selection.reservation_token is not None:
+            keys.append(cfg.key("reservation", _digest(selection.reservation_token)))
+    store._foundation._client.delete(*keys)
+
+
 def _wait_until(predicate, timeout=1.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -279,11 +318,1689 @@ def _registration_keys(store, *node_ids):
     return [
         store._foundation.config.key("schema"),
         store._foundation.config.key("nodes:lease"),
+        store._foundation.config.key("cursor"),
         *(
             store._foundation.config.key("node", store._node_digest(node_id))
             for node_id in node_ids
         ),
     ]
+
+
+def test_scheduler_reservation_and_enqueue_are_shared_and_idempotent(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner = _digest("owner")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    deadline = time.time() + 30
+    selected = None
+    try:
+        registered = first.register("node", _capabilities(concurrency=1), owner)
+        node_key = first._foundation.config.key("node", first._node_digest("node"))
+        assert first._foundation._client.hmget(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        ) == [b"1", b"0", b"0"]
+        assert second.set_scheduler_state(
+            "node", owner, SchedulerNodeState(healthy=True, claimed_work=0)
+        )
+
+        selected = first.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        assert selected.created and selected.selected_node_id == registered.node_id
+        assert selected.reservation_token is not None
+        retry = second.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        assert not retry.created and retry.reservation_token is None
+        assert len(second.list_reservations()) == 1
+
+        queued = second.enqueue_encrypted_request(
+            "client",
+            "request",
+            selected.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
+        )
+        assert queued.created and queued.sequence == 1
+        repeated = first.enqueue_encrypted_request(
+            "client",
+            "request",
+            selected.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
+        )
+        assert not repeated.created and repeated.sequence == queued.sequence
+        selection_after_enqueue = second.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        assert not selection_after_enqueue.created
+        assert selection_after_enqueue.state == "queued"
+        assert first.list_reservations() == ()
+        assert first.queued_requests("node")[0].envelope == envelope
+    finally:
+        cfg = first._foundation.config
+        client = hashlib.sha256(b"client\0client").hexdigest()
+        request = hashlib.sha256(b"request\0request").hexdigest()
+        node = first._node_digest("node")
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", client, request),
+        ]
+        if selected is not None and selected.reservation_token is not None:
+            token = hashlib.sha256(
+                selected.reservation_token.encode("ascii")
+            ).hexdigest()
+            keys.append(cfg.key("reservation", token))
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()
+
+
+def test_scheduler_state_contract_authentication_and_preservation(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner = _digest("scheduler-owner")
+    wrong_owner = _digest("wrong-scheduler-owner")
+    node_key = first._foundation.config.key(
+        "node", first._node_digest("scheduler-node")
+    )
+    unknown_key = first._foundation.config.key(
+        "node", first._node_digest("unknown-scheduler-node")
+    )
+    try:
+        first.register("scheduler-node", _capabilities(), owner)
+        assert first._foundation._client.hmget(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        ) == [b"1", b"0", b"0"]
+
+        updated = SchedulerNodeState(healthy=False, draining=True, claimed_work=1)
+        assert first.set_scheduler_state("scheduler-node", owner, updated)
+        assert second._foundation._client.hmget(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        ) == [b"0", b"1", b"1"]
+
+        unchanged = second._foundation._client.hgetall(node_key)
+        with pytest.raises(RelayStateCredentialMismatch):
+            second.set_scheduler_state(
+                "scheduler-node", wrong_owner, SchedulerNodeState()
+            )
+        assert second._foundation._client.hgetall(node_key) == unchanged
+
+        assert not second.set_scheduler_state(
+            "unknown-scheduler-node", owner, SchedulerNodeState()
+        )
+        assert not second._foundation._client.exists(unknown_key)
+
+        assert first.renew("scheduler-node", owner) is not None
+        assert (
+            second.renew(
+                "scheduler-node",
+                owner,
+                capabilities=dataclasses.replace(_capabilities(), max_concurrency=3),
+            )
+            is not None
+        )
+        first.register(
+            "scheduler-node",
+            dataclasses.replace(_capabilities(), max_concurrency=4),
+            owner,
+        )
+        assert second._foundation._client.hmget(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        ) == [b"0", b"1", b"1"]
+    finally:
+        first._foundation._client.delete(
+            *_registration_keys(first, "scheduler-node", "unknown-scheduler-node")
+        )
+        first.close()
+        second.close()
+
+
+def test_scheduler_state_lifecycle_unregister_and_inclusive_expiry(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner = _digest("scheduler-lifecycle-owner")
+    cfg = first._foundation.config
+    leases = cfg.key("nodes:lease")
+    cursor = cfg.key("cursor")
+    node_digest = first._node_digest("scheduler-node")
+    node_key = cfg.key("node", node_digest)
+    try:
+        first.register("scheduler-node", _capabilities(), owner)
+        assert second.unregister("scheduler-node", owner)
+        assert second.get("scheduler-node") is None
+        assert not first.set_scheduler_state(
+            "scheduler-node", owner, SchedulerNodeState()
+        )
+        with pytest.raises(RelayStateNoCapacity):
+            first.select_and_reserve(
+                "client",
+                "after-unregister",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                time.time() + 30,
+            )
+        assert not first._foundation._client.exists(node_key)
+        assert first._foundation._client.zscore(leases, node_digest) is None
+
+        first.register("scheduler-node", _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        cutoff = seconds + micros / 1_000_000
+        first._foundation._client.zadd(leases, {node_digest: cutoff})
+        assert not second.set_scheduler_state(
+            "scheduler-node", owner, SchedulerNodeState(draining=True)
+        )
+        with pytest.raises(RelayStateNoCapacity):
+            second.select_and_reserve(
+                "client",
+                "after-expiry",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                cutoff + 30,
+            )
+        assert second.get("scheduler-node") is None
+        assert not second._foundation._client.exists(node_key)
+        assert second._foundation._client.zscore(leases, node_digest) is None
+    finally:
+        first._foundation._client.delete(leases, cursor, node_key, cfg.key("schema"))
+        first.close()
+        second.close()
+
+
+def test_scheduler_selection_policy_matches_in_memory_reference(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    memory = InMemoryRelayStateStore(
+        RelayStateStoreConfig(namespace="policy-memory"), acknowledgement_key=b"k" * 32
+    )
+    stores = (memory, first)
+    nodes = (
+        ("unsupported", _scheduler_policy_capabilities(models=("other",))),
+        ("too-small", _scheduler_policy_capabilities(models=("other",))),
+        ("unhealthy", _scheduler_policy_capabilities(tier="64k-full")),
+        ("draining", _scheduler_policy_capabilities(tier="64k-full")),
+        ("large", _scheduler_policy_capabilities(tier="64k-full")),
+        ("node-b", _scheduler_policy_capabilities()),
+        ("node-a", _scheduler_policy_capabilities()),
+    )
+    selections = []
+    try:
+        for store in stores:
+            for node, capabilities in nodes:
+                store.register(node, capabilities, _digest(node))
+            store.set_scheduler_state(
+                "unhealthy", _digest("unhealthy"), SchedulerNodeState(healthy=False)
+            )
+            store.set_scheduler_state(
+                "draining", _digest("draining"), SchedulerNodeState(draining=True)
+            )
+
+        deadline = time.time() + 60
+        # A 64k request excludes unsupported, insufficient, unhealthy, and draining
+        # nodes, leaving only the capable full-tier registration.
+        assert [
+            store.select_and_reserve(
+                "client", "full", "qwen3-8b-instruct", "64k-full", deadline
+            ).selected_node_id
+            for store in stores
+        ] == ["large", "large"]
+
+        # The smallest capable tier wins; equal least-loaded candidates then rotate
+        # in registration order (node-b before lexically earlier node-a).
+        memory_results = [
+            memory.select_and_reserve(
+                "memory", f"round-{index}", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+            for index in range(2)
+        ]
+        valkey_results = [
+            (first if index == 0 else second).select_and_reserve(
+                "valkey", f"round-{index}", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+            for index in range(2)
+        ]
+        assert [result.selected_node_id for result in memory_results] == [
+            "node-b", "node-a"
+        ]
+        assert [result.selected_node_id for result in valkey_results] == [
+            result.selected_node_id for result in memory_results
+        ]
+        selections.extend(
+            [("client", "full", None), *(
+                ("valkey", f"round-{index}", result)
+                for index, result in enumerate(valkey_results)
+            )]
+        )
+    finally:
+        _delete_scheduler_policy_state(first, [node for node, _ in nodes], selections)
+        first.close()
+        second.close()
+
+
+def test_scheduler_selection_policy_filters_context_in_memory_and_valkey(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    memory = InMemoryRelayStateStore(
+        RelayStateStoreConfig(namespace="context-policy-memory"),
+        acknowledgement_key=b"k" * 32,
+    )
+    stores = (memory, first)
+    nodes = (
+        ("too-small", _scheduler_policy_capabilities()),
+        ("full-context", _scheduler_policy_capabilities(tier="64k-full")),
+    )
+    selection = None
+    try:
+        for store in stores:
+            for node, capabilities in nodes:
+                store.register(node, capabilities, _digest(node))
+
+        deadline = first._foundation.server_time()[0] + 60
+        memory_selection = memory.select_and_reserve(
+            "memory", "full-context", "qwen3-8b-instruct", "64k-full", deadline
+        )
+        selection = second.select_and_reserve(
+            "valkey", "full-context", "qwen3-8b-instruct", "64k-full", deadline
+        )
+        assert memory_selection.selected_node_id == "full-context"
+        assert selection.selected_node_id == memory_selection.selected_node_id
+    finally:
+        _delete_scheduler_policy_state(
+            first,
+            [node for node, _ in nodes],
+            (("valkey", "full-context", selection),),
+        )
+        first.close()
+        second.close()
+
+
+def test_scheduler_selection_policy_prefers_lower_load_in_memory_and_valkey(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    memory = InMemoryRelayStateStore(
+        RelayStateStoreConfig(namespace="load-policy-memory"),
+        acknowledgement_key=b"k" * 32,
+    )
+    stores = (memory, first)
+    nodes = ("earlier-loaded", "later-idle")
+    selection = None
+    try:
+        for store in stores:
+            for node in nodes:
+                store.register(node, _scheduler_policy_capabilities(), _digest(node))
+            store.set_scheduler_state(
+                "earlier-loaded",
+                _digest("earlier-loaded"),
+                SchedulerNodeState(claimed_work=2),
+            )
+
+        deadline = first._foundation.server_time()[0] + 60
+        memory_selection = memory.select_and_reserve(
+            "memory", "least-load", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        selection = second.select_and_reserve(
+            "valkey", "least-load", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        assert memory_selection.selected_node_id == "later-idle"
+        assert selection.selected_node_id == memory_selection.selected_node_id
+    finally:
+        _delete_scheduler_policy_state(
+            first, nodes, (("valkey", "least-load", selection),)
+        )
+        first.close()
+        second.close()
+
+
+def _race_select_and_reserve(stores, requests, deadline):
+    barrier = Barrier(len(requests))
+
+    def select(store, request):
+        barrier.wait(timeout=5)
+        return store.select_and_reserve(
+            "client", request, "qwen3-8b-instruct", "8k-fast", deadline
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(requests)) as pool:
+        futures = [
+            pool.submit(select, store, request)
+            for store, request in zip(stores, requests, strict=True)
+        ]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result(timeout=5))
+            except RelayStateNoCapacity as error:
+                outcomes.append(error)
+    return outcomes
+
+
+def test_selection_final_capacity_race_is_atomic_across_valkey_stores(valkey_server):
+    namespace = uuid.uuid4().hex
+    limits = dict(
+        max_reservations=1,
+        max_reservations_per_client=1,
+        max_reservations_per_node=1,
+        max_queue_depth_per_node=1,
+        max_request_lifecycles=1,
+    )
+    first = _registration_store(valkey_server, namespace, **limits)
+    second = _registration_store(valkey_server, namespace, **limits)
+    cfg = first._foundation.config
+    node_digest = first._node_digest("node")
+    requests = ("final-a", "final-b")
+    identities = [first._identity("client", request) for request in requests]
+    outcomes = []
+    try:
+        first.register("node", _capabilities(concurrency=1), _digest("owner"))
+        deadline = first._foundation.server_time()[0] + 60
+        outcomes = _race_select_and_reserve((first, second), requests, deadline)
+
+        created = [outcome for outcome in outcomes if not isinstance(outcome, Exception)]
+        assert len(created) == 1 and created[0].created
+        assert sum(isinstance(outcome, RelayStateNoCapacity) for outcome in outcomes) == 1
+        assert created[0].reservation_token is not None
+        assert len(first.list_reservations()) == 1
+        assert first._foundation._client.zcard(cfg.key("reservations:expiry")) == 1
+        assert first._foundation._client.zcard(cfg.key("requests:deadline")) == 1
+        assert first._foundation._client.hmget(
+            cfg.key("cursor"), "_count", "_activity"
+        ) == [b"1", b"1"]
+
+        existing = [
+            first._foundation._client.exists(cfg.key("request", client, request))
+            for client, request in identities
+        ]
+        assert sorted(existing) == [0, 1]
+
+        memory = InMemoryRelayStateStore(
+            RelayStateStoreConfig(namespace="final-slot-memory", **limits),
+            acknowledgement_key=b"k" * 32,
+        )
+        memory.register("node", _capabilities(concurrency=1), _digest("owner"))
+        memory_outcomes = _race_select_and_reserve(
+            (memory, memory), requests, time.time() + 60
+        )
+        assert sum(not isinstance(item, Exception) for item in memory_outcomes) == 1
+        assert sum(
+            isinstance(item, RelayStateNoCapacity) for item in memory_outcomes
+        ) == 1
+    finally:
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            *(cfg.key("request", client, request) for client, request in identities),
+        ]
+        keys.extend(
+            cfg.key("reservation", _digest(outcome.reservation_token))
+            for outcome in outcomes
+            if not isinstance(outcome, Exception) and outcome.reservation_token
+        )
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()
+
+
+def test_selection_once_only_same_identity_across_valkey_stores(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    cfg = first._foundation.config
+    node_digest = first._node_digest("node")
+    client, request = first._identity("client", "same")
+    outcomes = []
+    try:
+        first.register("node", _capabilities(concurrency=1), _digest("owner"))
+        deadline = first._foundation.server_time()[0] + 60
+        outcomes = _race_select_and_reserve(
+            (first, second), ("same", "same"), deadline
+        )
+
+        assert sum(outcome.created for outcome in outcomes) == 1
+        assert sum(outcome.reservation_token is not None for outcome in outcomes) == 1
+        created = next(outcome for outcome in outcomes if outcome.created)
+        existing = next(outcome for outcome in outcomes if not outcome.created)
+        assert existing.reservation_token is None
+        assert existing.selected_node_id == created.selected_node_id == "node"
+        assert existing.request_deadline_epoch == created.request_deadline_epoch
+        assert existing.reservation_expires_at_epoch == pytest.approx(
+            created.reservation_expires_at_epoch
+        )
+        assert len(first.list_reservations()) == 1
+        assert first._foundation._client.zcard(cfg.key("reservations:expiry")) == 1
+        assert first._foundation._client.zcard(cfg.key("requests:deadline")) == 1
+        assert first._foundation._client.hmget(
+            cfg.key("cursor"), "_count", "_activity"
+        ) == [b"1", b"1"]
+
+        memory = InMemoryRelayStateStore(
+            RelayStateStoreConfig(namespace="same-identity-memory"),
+            acknowledgement_key=b"k" * 32,
+        )
+        memory.register("node", _capabilities(concurrency=1), _digest("owner"))
+        memory_outcomes = _race_select_and_reserve(
+            (memory, memory), ("same", "same"), time.time() + 60
+        )
+        assert sum(outcome.created for outcome in memory_outcomes) == 1
+        assert sum(outcome.reservation_token is not None for outcome in memory_outcomes) == 1
+        assert len(memory.list_reservations()) == 1
+    finally:
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            cfg.key("request", client, request),
+        ]
+        keys.extend(
+            cfg.key("reservation", _digest(outcome.reservation_token))
+            for outcome in outcomes
+            if outcome.reservation_token
+        )
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
+    ("bound", "limit", "occupation"),
+    [
+        ("global_reservation", "max_reservations", "reserved"),
+        ("per_client_reservation", "max_reservations_per_client", "reserved"),
+        ("per_node_reservation", "max_reservations_per_node", "reserved"),
+        ("global_lifecycle", "max_request_lifecycles", "reserved"),
+        ("per_node_queue_depth", "max_queue_depth_per_node", "queued"),
+        ("node_concurrency", None, "claimed"),
+    ],
+)
+def test_selection_capacity_bounds_match_memory_without_rejection_mutation(
+    valkey_server, bound, limit, occupation
+):
+    namespace = uuid.uuid4().hex
+    limits = dict(
+        max_reservations=8,
+        max_reservations_per_client=8,
+        max_reservations_per_node=8,
+        max_request_lifecycles=8,
+        max_queue_depth_per_node=8,
+        max_queued_requests=8,
+        max_queued_requests_per_client=8,
+    )
+    if limit is not None:
+        limits[limit] = 1
+    node_ids = (
+        ("node-a", "node-b")
+        if bound in {"global_reservation", "per_client_reservation", "global_lifecycle"}
+        else ("node-a",)
+    )
+    candidate_client = "client-a" if bound == "per_client_reservation" else "client-b"
+    first = _registration_store(valkey_server, namespace, **limits)
+    second = _registration_store(valkey_server, namespace, **limits)
+    cfg = first._foundation.config
+    occupant = None
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+
+    def prepare(store, deadline):
+        for node_id in node_ids:
+            concurrency = 1 if bound == "node_concurrency" else 8
+            store.register(
+                node_id, _capabilities(concurrency=concurrency), _digest(node_id)
+            )
+        if occupation == "claimed":
+            assert store.set_scheduler_state(
+                "node-a", _digest("node-a"), SchedulerNodeState(claimed_work=1)
+            )
+            return None
+        selected = store.select_and_reserve(
+            "client-a", "occupied", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        if occupation == "queued":
+            store.enqueue_encrypted_request(
+                "client-a",
+                "occupied",
+                selected.reservation_token,
+                selected.selected_node_id,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                envelope,
+                "cancel",
+            )
+        return selected
+
+    try:
+        deadline = first._foundation.server_time()[0] + 60
+        occupant = prepare(first, deadline)
+        candidate = first._identity(candidate_client, "candidate")
+        node_keys = [
+            cfg.key("node", first._node_digest(node_id)) for node_id in node_ids
+        ]
+        cursor_key = cfg.key("cursor")
+        candidate_key = cfg.key("request", *candidate)
+        queue_keys = [
+            cfg.key("queue", first._node_digest(node_id)) for node_id in node_ids
+        ]
+        before = {
+            "cursor": first._foundation._client.hgetall(cursor_key),
+            "nodes": [first._foundation._client.hgetall(key) for key in node_keys],
+            "deadlines": first._foundation._client.zrange(
+                cfg.key("requests:deadline"), 0, -1, withscores=True
+            ),
+            "expiries": first._foundation._client.zrange(
+                cfg.key("reservations:expiry"), 0, -1, withscores=True
+            ),
+            "queues": [first._foundation._client.xlen(key) for key in queue_keys],
+            "reservations": first.list_reservations(),
+        }
+        with pytest.raises(RelayStateNoCapacity) as valkey_error:
+            second.select_and_reserve(
+                candidate_client,
+                "candidate",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+            )
+
+        memory = InMemoryRelayStateStore(
+            RelayStateStoreConfig(namespace=f"capacity-{bound}", **limits),
+            acknowledgement_key=b"k" * 32,
+        )
+        prepare(memory, time.time() + 60)
+        with pytest.raises(type(valkey_error.value)):
+            memory.select_and_reserve(
+                candidate_client,
+                "candidate",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                time.time() + 60,
+            )
+
+        assert not first._foundation._client.exists(candidate_key)
+        assert first._foundation._client.hgetall(cursor_key) == before["cursor"]
+        assert [first._foundation._client.hgetall(key) for key in node_keys] == before[
+            "nodes"
+        ]
+        assert (
+            first._foundation._client.zrange(
+                cfg.key("requests:deadline"), 0, -1, withscores=True
+            )
+            == before["deadlines"]
+        )
+        assert (
+            first._foundation._client.zrange(
+                cfg.key("reservations:expiry"), 0, -1, withscores=True
+            )
+            == before["expiries"]
+        )
+        assert [first._foundation._client.xlen(key) for key in queue_keys] == before[
+            "queues"
+        ]
+        assert first.list_reservations() == before["reservations"]
+    finally:
+        client_a, occupied = first._identity("client-a", "occupied")
+        candidate_client_digest, candidate_request = first._identity(
+            candidate_client, "candidate"
+        )
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            *(cfg.key("node", first._node_digest(node_id)) for node_id in node_ids),
+            *(cfg.key("queue", first._node_digest(node_id)) for node_id in node_ids),
+            cfg.key("request", client_a, occupied),
+            cfg.key("request", candidate_client_digest, candidate_request),
+        ]
+        if occupant is not None and occupant.reservation_token is not None:
+            keys.append(cfg.key("reservation", _digest(occupant.reservation_token)))
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()
+
+
+
+def test_scheduler_fairness_cursor_changes_only_for_new_reservations(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, reservation_ttl_seconds=30)
+    second = _registration_store(valkey_server, namespace, reservation_ttl_seconds=30)
+    cfg = first._foundation.config
+    cursor = cfg.key("cursor")
+    deadline = first._foundation.server_time()[0] + 300
+    selections = []
+    try:
+        for node in ("node-b", "node-a"):
+            first.register(node, _scheduler_policy_capabilities(), _digest(node))
+
+        initial = first._foundation._client.hgetall(cursor)
+        with pytest.raises(RelayStateNoCapacity):
+            second.select_and_reserve("client", "failed", "unsupported", "8k-fast", deadline)
+        assert first._foundation._client.hgetall(cursor) == initial
+        assert first._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+        assert first._foundation._client.zcard(cfg.key("requests:deadline")) == 0
+
+        created = first.select_and_reserve(
+            "client", "first", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        selections.append(("client", "first", created))
+        after_creation = first._foundation._client.hgetall(cursor)
+        retry = second.select_and_reserve(
+            "client", "first", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        assert not retry.created
+        assert first._foundation._client.hgetall(cursor) == after_creation
+
+        token = _digest(created.reservation_token)
+        reservation_key = cfg.key("reservation", token)
+        seconds, _ = first._foundation.server_time()
+        expired = seconds - 1
+        client_digest = hashlib.sha256(b"client\0client").hexdigest()
+        request_digest = hashlib.sha256(b"request\0first").hexdigest()
+        request_key = cfg.key("request", client_digest, request_digest)
+        first._foundation._client.hset(request_key, "deadline", repr(expired))
+        first._foundation._client.hset(reservation_key, "deadline", repr(expired))
+        first._foundation._client.zadd(
+            cfg.key("requests:deadline"),
+            {f"{client_digest}:{request_digest}": expired},
+        )
+
+        successor = second.select_and_reserve(
+            "client", "second", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        selections.append(("client", "second", successor))
+        assert created.selected_node_id == "node-b"
+        assert successor.selected_node_id == "node-a"
+        assert first._foundation._client.hget(cursor, "_activity") == b"2"
+        assert not first._foundation._client.exists(reservation_key)
+    finally:
+        _delete_scheduler_policy_state(
+            first, ("node-b", "node-a"),
+            [("client", "failed", None), *selections],
+        )
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
+    ("activities", "expected_evicted"),
+    [((1, 2), "alpha"), ((1, 1), "alpha")],
+)
+def test_cursor_fingerprint_index_preserves_additive_fields_and_evicts_deterministically(
+    valkey_server, activities, expected_evicted
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=2
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    fingerprints = {name: _digest(name) for name in ("alpha", "beta")}
+    deadline = time.time() + 30
+    selected = None
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        store._foundation._client.hset(
+            cfg.key("node", node_digest),
+            "supported_model_ids",
+            '["qwen3-8b-instruct","new-model"]',
+        )
+        additive = {f"additive:{index}": f"value-{index}" for index in range(1_000)}
+        metadata = {"_count": 2, "_activity": 2, "_fp:1": fingerprints["alpha"],
+                    "_fp:2": fingerprints["beta"], **additive}
+        for index, name in enumerate(("alpha", "beta")):
+            metadata[fingerprints[name]] = node_digest
+            metadata["a:" + fingerprints[name]] = activities[index]
+        store._foundation._client.hset(cursor, mapping=metadata)
+
+        selected = store.select_and_reserve(
+            "client", "request", "new-model", "8k-fast", deadline
+        )
+        new_fingerprint = _digest("new-model\x008k-fast")
+        evicted = fingerprints[expected_evicted]
+        assert store._foundation._client.hmget(cursor, *additive) == [
+            value.encode() for value in additive.values()
+        ]
+        assert store._foundation._client.hget(cursor, evicted) is None
+        assert store._foundation._client.hget(cursor, "a:" + evicted) is None
+        assert new_fingerprint.encode() in store._foundation._client.hmget(
+            cursor, "_fp:1", "_fp:2"
+        )
+    finally:
+        token = (_digest(selected.reservation_token) if selected and
+                 selected.reservation_token else _digest("unused"))
+        client, request = store._identity("client", "request")
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("reservation", token),
+        )
+        store.close()
+
+
+def test_cursor_fingerprint_index_protects_active_fingerprints(valkey_server):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=2
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    active, inactive = _digest("active"), _digest("inactive")
+    active_client, active_request = _digest("active-client"), _digest("active-request")
+    active_key = cfg.key("request", active_client, active_request)
+    deadline = time.time() + 30
+    selected = None
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        store._foundation._client.hset(
+            cfg.key("node", node_digest), "supported_model_ids",
+            '["qwen3-8b-instruct","new-model"]',
+        )
+        store._foundation._client.hset(cursor, mapping={
+            "_count": 2, "_activity": 2, "_fp:1": active, "_fp:2": inactive,
+            active: node_digest, "a:" + active: 1,
+            inactive: node_digest, "a:" + inactive: 2,
+        })
+        store._foundation._client.hset(
+            active_key,
+            mapping={"state": "reserved", "node_digest": node_digest,
+                     "fingerprint": active},
+        )
+        store._foundation._client.zadd(
+            cfg.key("requests:deadline"),
+            {active_client + ":" + active_request: deadline},
+        )
+
+        selected = store.select_and_reserve(
+            "client", "request", "new-model", "8k-fast", deadline
+        )
+        assert store._foundation._client.hget(cursor, active) == node_digest.encode()
+        assert store._foundation._client.hget(cursor, inactive) is None
+    finally:
+        token = (_digest(selected.reservation_token) if selected and
+                 selected.reservation_token else _digest("unused"))
+        client, request = store._identity("client", "request")
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest), active_key,
+            cfg.key("request", client, request), cfg.key("reservation", token),
+        )
+        store.close()
+
+
+@pytest.mark.parametrize("corruption", ["count", "duplicate", "mapping", "activity"])
+def test_cursor_fingerprint_index_malformed_metadata_fails_without_mutation(
+    valkey_server, corruption
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=2
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    first, second = _digest("first"), _digest("second")
+    deadline = time.time() + 30
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        metadata = {"_count": 2, "_activity": 2, "_fp:1": first,
+                    "_fp:2": second, first: node_digest, second: node_digest,
+                    "a:" + first: 1, "a:" + second: 2, "additive": "kept"}
+        if corruption == "count": metadata["_count"] = 1
+        if corruption == "duplicate": metadata["_fp:2"] = first
+        if corruption == "mapping": del metadata[first]
+        if corruption == "activity": metadata["a:" + first] = "bad"
+        store._foundation._client.hset(cursor, mapping=metadata)
+        before = store._foundation._client.hgetall(cursor)
+        client, request = store._identity("client", "request")
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.select_and_reserve(
+                "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+        assert store._foundation._client.hgetall(cursor) == before
+        assert not store._foundation._client.exists(cfg.key("request", client, request))
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+        assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 0
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+        )
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "activity",
+    [None, "1", "02", "9223372036854775807"],
+    ids=["missing", "regressed", "noncanonical", "nonincrementable"],
+)
+def test_cursor_fingerprint_index_rejects_invalid_global_activity_without_mutation(
+    valkey_server, monkeypatch, activity
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=3
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    first, second = _digest("first"), _digest("second")
+    client, request = store._identity("client", "request")
+    raw_token = "a" * 64
+    token = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
+    deadline = time.time() + 30
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        metadata = {
+            "_count": 2,
+            "_fp:1": first,
+            "_fp:2": second,
+            first: node_digest,
+            second: node_digest,
+            "a:" + first: 1,
+            "a:" + second: 2,
+            "additive": "kept",
+        }
+        if activity is not None:
+            metadata["_activity"] = activity
+        store._foundation._client.hset(cursor, mapping=metadata)
+        before = store._foundation._client.hgetall(cursor)
+        monkeypatch.setattr("valkey_relay_state.secrets.token_hex", lambda _: raw_token)
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.select_and_reserve(
+                "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+
+        assert store._foundation._client.hgetall(cursor) == before
+        assert not store._foundation._client.exists(
+            cfg.key("request", client, request), cfg.key("reservation", token)
+        )
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+        assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 0
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("reservation", token),
+        )
+        store.close()
+
+
+def test_cursor_fingerprint_index_activity_advances_monotonically(valkey_server):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=3
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    first, second = _digest("first"), _digest("second")
+    new_fingerprint = _digest("qwen3-8b-instruct\x008k-fast")
+    selected = None
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        store._foundation._client.hset(cursor, mapping={
+            "_count": 2, "_activity": 9, "_fp:1": first, "_fp:2": second,
+            first: node_digest, second: node_digest,
+            "a:" + first: 4, "a:" + second: 9,
+        })
+        selected = store.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", time.time() + 30
+        )
+        assert store._foundation._client.hmget(
+            cursor, "_activity", "a:" + new_fingerprint
+        ) == [b"10", b"10"]
+    finally:
+        client, request = store._identity("client", "request")
+        token = _digest(selected.reservation_token) if selected else _digest("unused")
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("reservation", token),
+        )
+        store.close()
+
+
+def test_cursor_fingerprint_index_empty_cursor_initializes_activity(valkey_server):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=2
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    selected = None
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        selected = store.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", time.time() + 30
+        )
+        assert store._foundation._client.hmget(cursor, "_count", "_activity") == [
+            b"1", b"1"
+        ]
+    finally:
+        client, request = store._identity("client", "request")
+        token = _digest(selected.reservation_token) if selected else _digest("unused")
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("reservation", token),
+        )
+        store.close()
+
+
+@pytest.mark.parametrize("count", ["00", "01", "02"])
+def test_cursor_fingerprint_index_rejects_noncanonical_count_without_mutation(
+    valkey_server, monkeypatch, count
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=3
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    client, request = store._identity("client", "request")
+    raw_token = "a" * 64
+    token = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        metadata = {"_count": count, "_activity": "2", "additive": "kept"}
+        if count != "00":
+            first = _digest("first")
+            metadata.update({"_fp:1": first, first: node_digest, "a:" + first: "1"})
+        if count == "02":
+            second = _digest("second")
+            metadata.update({"_fp:2": second, second: node_digest, "a:" + second: "2"})
+        store._foundation._client.hset(cursor, mapping=metadata)
+        before = store._foundation._client.hgetall(cursor)
+        monkeypatch.setattr("valkey_relay_state.secrets.token_hex", lambda _: raw_token)
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.select_and_reserve(
+                "client", "request", "qwen3-8b-instruct", "8k-fast", time.time() + 30
+            )
+
+        assert store._foundation._client.hgetall(cursor) == before
+        assert not store._foundation._client.exists(
+            cfg.key("request", client, request), cfg.key("reservation", token)
+        )
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+        assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 0
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("reservation", token),
+        )
+        store.close()
+
+
+@pytest.mark.parametrize("count", [None, "0"], ids=["absent", "zero"])
+def test_cursor_fingerprint_index_rejects_empty_count_with_positive_activity(
+    valkey_server, count
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=2
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    client, request = store._identity("client", "request")
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        metadata = {"_activity": "1", "additive": "kept"}
+        if count is not None:
+            metadata["_count"] = count
+        store._foundation._client.hset(cursor, mapping=metadata)
+        before = store._foundation._client.hgetall(cursor)
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.select_and_reserve(
+                "client", "request", "qwen3-8b-instruct", "8k-fast", time.time() + 30
+            )
+
+        assert store._foundation._client.hgetall(cursor) == before
+        assert not store._foundation._client.exists(cfg.key("request", client, request))
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+        assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 0
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest), cfg.key("request", client, request),
+        )
+        store.close()
+
+
+def test_cursor_fingerprint_index_explicit_zero_count_initializes(valkey_server):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=2
+    )
+    cfg = store._foundation.config
+    cursor = cfg.key("cursor")
+    node_digest = store._node_digest("node")
+    selected = None
+    try:
+        store.register("node", _capabilities(), _digest("owner"))
+        store._foundation._client.hset(
+            cursor, mapping={"_count": "0", "_activity": "0", "additive": "kept"}
+        )
+        selected = store.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", time.time() + 30
+        )
+        assert store._foundation._client.hmget(
+            cursor, "_count", "_activity", "additive"
+        ) == [b"1", b"1", b"kept"]
+    finally:
+        client, request = store._identity("client", "request")
+        token = _digest(selected.reservation_token) if selected else _digest("unused")
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("reservation", token),
+        )
+        store.close()
+
+
+@pytest.mark.parametrize("state", ["queued", "claimed"])
+@pytest.mark.parametrize("corruption", ["missing", "wrong_identity"])
+def test_idempotent_retries_require_exact_stream_authority(
+    valkey_server, state, corruption
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner = _digest("owner")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    deadline = time.time() + 30
+    selected = None
+    cfg = first._foundation.config
+    client, request = first._identity("client", "request")
+    node = first._node_digest("node")
+    request_key = cfg.key("request", client, request)
+    queue_key = cfg.key("queue", node)
+    try:
+        first.register("node", _capabilities(), owner)
+        selected = first.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        queued = first.enqueue_encrypted_request(
+            "client", "request", selected.reservation_token, "node",
+            "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel",
+        )
+        entry = first._foundation._client.hget(request_key, "queue_entry")
+        assert entry is not None
+        if state == "claimed":
+            first._foundation._client.hset(request_key, "state", "claimed")
+
+        cursor_before = first._foundation._client.hgetall(cfg.key("cursor"))
+        node_before = first._foundation._client.hgetall(cfg.key("node", node))
+        assert not second.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+        ).created
+        assert not second.enqueue_encrypted_request(
+            "client", "request", selected.reservation_token, "node",
+            "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel",
+        ).created
+        assert first._foundation._client.xlen(queue_key) == 1
+        assert queued.sequence == 1
+
+        if corruption == "missing":
+            assert first._foundation._client.xdel(queue_key, entry) == 1
+        else:
+            wrong = first._foundation._client.xadd(
+                queue_key, {"client": _digest("wrong"), "request": request}
+            )
+            first._foundation._client.hset(request_key, "queue_entry", wrong)
+        lifecycle_before = first._foundation._client.hgetall(request_key)
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            second.select_and_reserve(
+                "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            second.enqueue_encrypted_request(
+                "client", "request", selected.reservation_token, "node",
+                "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel",
+            )
+        assert first._foundation._client.hgetall(request_key) == lifecycle_before
+        assert first._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+        assert first._foundation._client.hgetall(cfg.key("node", node)) == node_before
+    finally:
+        token = (
+            hashlib.sha256(selected.reservation_token.encode("ascii")).hexdigest()
+            if selected is not None and selected.reservation_token is not None
+            else "unused"
+        )
+        first._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node), queue_key, request_key,
+            cfg.key("reservation", token),
+        )
+        first.close()
+        second.close()
+
+
+def test_registration_renew_backfills_additive_scheduler_fields(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    owner = _digest("owner")
+    node_key = store._foundation.config.key("node", store._node_digest("node"))
+    try:
+        store.register("node", _capabilities(), owner)
+        store._foundation._client.hdel(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        )
+
+        store.renew("node", owner)
+
+        assert store._foundation._client.hmget(
+            node_key,
+            "scheduler_healthy",
+            "scheduler_draining",
+            "scheduler_claimed_work",
+        ) == [b"1", b"0", b"0"]
+        assert store.set_scheduler_state(
+            "node", owner, SchedulerNodeState(healthy=True, claimed_work=0)
+        )
+    finally:
+        store._foundation._client.delete(
+            store._foundation.config.key("schema"),
+            store._foundation.config.key("nodes:lease"),
+            store._foundation.config.key("cursor"),
+            node_key,
+        )
+        store.close()
+
+
+def test_enqueue_counts_queued_requests_hidden_by_earlier_reservations(valkey_server):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        max_queued_requests=1,
+        max_queued_requests_per_client=2,
+    )
+    owner = _digest("owner")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    queued = None
+    reserved = None
+    cfg = store._foundation.config
+    node = store._node_digest("node")
+    queued_client, queued_request = store._identity("client-a", "queued")
+    reserved_client, reserved_request = store._identity("client-b", "reserved")
+    try:
+        store.register("node", _capabilities(concurrency=3), owner)
+        late_deadline = time.time() + 60
+        queued = store.select_and_reserve(
+            "client-a", "queued", "qwen3-8b-instruct", "8k-fast", late_deadline
+        )
+        store.enqueue_encrypted_request(
+            "client-a",
+            "queued",
+            queued.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            late_deadline,
+            envelope,
+            "cancel-a",
+        )
+        early_deadline = time.time() + 30
+        reserved = store.select_and_reserve(
+            "client-b", "reserved", "qwen3-8b-instruct", "8k-fast", early_deadline
+        )
+
+        with pytest.raises(RelayStateNoCapacity, match="^no scheduler capacity$"):
+            store.enqueue_encrypted_request(
+                "client-b",
+                "reserved",
+                reserved.reservation_token,
+                "node",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                early_deadline,
+                envelope,
+                "cancel-b",
+            )
+    finally:
+        reservation_keys = []
+        for selection in (queued, reserved):
+            if selection is not None and selection.reservation_token is not None:
+                token = hashlib.sha256(
+                    selection.reservation_token.encode("ascii")
+                ).hexdigest()
+                reservation_keys.append(cfg.key("reservation", token))
+        store._foundation._client.delete(
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("request", queued_client, queued_request),
+            cfg.key("request", reserved_client, reserved_request),
+            *reservation_keys,
+        )
+        store.close()
+
+
+def test_claimed_lifecycle_counts_toward_all_queue_capacity(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        max_queue_depth_per_node=1,
+        max_queued_requests=1,
+        max_queued_requests_per_client=1,
+        max_reservations_per_client=1,
+    )
+    owner = _digest("owner")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    deadline = time.time() + 60
+    first = None
+    second = None
+    cfg = store._foundation.config
+    client = hashlib.sha256(b"client\0client").hexdigest()
+    request = hashlib.sha256(b"request\0request").hexdigest()
+    other_client = hashlib.sha256(b"other\0other").hexdigest()
+    other_request = hashlib.sha256(b"request\0second").hexdigest()
+    node = store._node_digest("node")
+    other_node = store._node_digest("other-node")
+    try:
+        store.register("node", _capabilities(concurrency=2), owner)
+        store.register("other-node", _capabilities(concurrency=2), owner)
+        first = store.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        store.enqueue_encrypted_request(
+            "client",
+            "request",
+            first.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
+        )
+        request_key = cfg.key("request", client, request)
+        store._foundation._client.hset(request_key, "state", "claimed")
+        cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
+
+        retry = store.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        assert not retry.created and retry.state == "claimed"
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+        with pytest.raises(RelayStateNoCapacity, match="^no scheduler capacity$"):
+            store.select_and_reserve(
+                "client", "second", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+
+        second = store.select_and_reserve(
+            "other", "second", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        assert second.selected_node_id == "other-node"
+        with pytest.raises(RelayStateNoCapacity, match="^no scheduler capacity$"):
+            store.enqueue_encrypted_request(
+                "other",
+                "second",
+                second.reservation_token,
+                "other-node",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                envelope,
+                "other-cancel",
+            )
+    finally:
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node),
+            cfg.key("node", other_node),
+            cfg.key("queue", node),
+            cfg.key("queue", other_node),
+            cfg.key("request", client, request),
+            cfg.key("request", client, other_request),
+            cfg.key("request", other_client, other_request),
+        ]
+        if first is not None and first.reservation_token:
+            keys.append(cfg.key("reservation", _digest(first.reservation_token)))
+        if second is not None and second.reservation_token:
+            keys.append(cfg.key("reservation", _digest(second.reservation_token)))
+        store._foundation._client.delete(*keys)
+        store.close()
+
+
+def test_queued_requests_filters_claimed_and_expired_but_rejects_malformed_live(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    owner = _digest("owner")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    deadline = time.time() + 60
+    selected = None
+    cfg = store._foundation.config
+    client = hashlib.sha256(b"client\0client").hexdigest()
+    request = hashlib.sha256(b"request\0request").hexdigest()
+    node = store._node_digest("node")
+    request_key = cfg.key("request", client, request)
+    try:
+        store.register("node", _capabilities(), owner)
+        selected = store.select_and_reserve(
+            "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+        )
+        store.enqueue_encrypted_request(
+            "client", "request", selected.reservation_token, "node",
+            "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel"
+        )
+        store._foundation._client.hset(request_key, "state", "claimed")
+        assert store.queued_requests("node") == ()
+        store._foundation._client.hset(
+            request_key, mapping={"state": "queued", "deadline": time.time() - 1}
+        )
+        assert store.queued_requests("node") == ()
+        store._foundation._client.hset(
+            request_key, mapping={"deadline": time.time() + 60, "sequence": "bad"}
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.queued_requests("node")
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node), cfg.key("queue", node), request_key,
+        )
+        store.close()
+
+
+def test_missing_indexed_lifecycle_fails_closed_without_mutation(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    owner = _digest("owner")
+    cfg = store._foundation.config
+    node = store._node_digest("node")
+    missing = "a" * 64 + ":" + "b" * 64
+    deadline = time.time() + 60
+    try:
+        store.register("node", _capabilities(), owner)
+        store._foundation._client.zadd(cfg.key("requests:deadline"), {missing: deadline})
+        before = store._foundation._client.hgetall(cfg.key("cursor"))
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.select_and_reserve(
+                "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
+            )
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == before
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node),
+        )
+        store.close()
+
+
+@pytest.mark.parametrize("state", ["queued", "claimed"])
+def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(
+    valkey_server, state
+):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        reservation_ttl_seconds=0.03,
+        node_transition_batch_size=1,
+        max_queued_requests=1,
+        max_queued_requests_per_client=1,
+        max_queue_depth_per_node=4,
+        max_reservations=4,
+        max_reservations_per_client=4,
+        max_reservations_per_node=4,
+    )
+    cfg = store._foundation.config
+    owner = _digest("owner")
+    node = store._node_digest("node")
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    identities = []
+    try:
+        store.register("node", _capabilities(concurrency=4), owner)
+        seconds, micros = store._foundation.server_time()
+        queued_deadline = seconds + micros / 1_000_000 + 30
+        queued = store.select_and_reserve(
+            "queued-client", "queued-request", "qwen3-8b-instruct", "8k-fast",
+            queued_deadline,
+        )
+        store.enqueue_encrypted_request(
+            "queued-client", "queued-request", queued.reservation_token, "node",
+            "qwen3-8b-instruct", "8k-fast", queued_deadline, envelope, "cancel",
+        )
+        identities.append(("queued-client", "queued-request"))
+        client = hashlib.sha256(b"client\0queued-client").hexdigest()
+        request = hashlib.sha256(b"request\0queued-request").hexdigest()
+        request_key = cfg.key("request", client, request)
+        expired_deadline = seconds + micros / 1_000_000 - 1
+        store._foundation._client.hset(
+            request_key, mapping={"state": state, "deadline": expired_deadline}
+        )
+        store._foundation._client.zadd(
+            cfg.key("requests:deadline"), {client + ":" + request: expired_deadline}
+        )
+        cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
+
+        with pytest.raises(RelayStateInvalidReservation):
+            store.select_and_reserve(
+                "queued-client", "queued-request", "qwen3-8b-instruct",
+                "8k-fast", expired_deadline,
+            )
+
+        assert store._foundation._client.xlen(cfg.key("queue", node)) == 0
+        assert not store._foundation._client.exists(request_key)
+        assert store._foundation._client.zscore(
+            cfg.key("requests:deadline"), client + ":" + request
+        ) is None
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+
+    finally:
+        keys = [
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node), cfg.key("queue", node),
+        ]
+        for client_public_key, request_id in identities:
+            keys.append(
+                cfg.key(
+                    "request",
+                    hashlib.sha256(f"client\0{client_public_key}".encode()).hexdigest(),
+                    hashlib.sha256(f"request\0{request_id}".encode()).hexdigest(),
+                )
+            )
+        store._foundation._client.delete(*keys)
+        store.close()
+
+
+def test_malformed_expired_queue_authority_blocks_admission_without_mutation(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    cfg = store._foundation.config
+    owner = _digest("owner")
+    node = store._node_digest("node")
+    client = hashlib.sha256(b"client\0expired").hexdigest()
+    request = hashlib.sha256(b"request\0malformed").hexdigest()
+    request_key = cfg.key("request", client, request)
+    member = client + ":" + request
+    try:
+        store.register("node", _capabilities(), owner)
+        store._foundation._client.hset(
+            request_key,
+            mapping={
+                "state": "queued", "client": client, "request": request,
+                "node_digest": node, "deadline": time.time() - 1,
+                "queue_entry": "missing-0",
+            },
+        )
+        store._foundation._client.zadd(
+            cfg.key("requests:deadline"), {member: time.time() - 1}
+        )
+        cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.select_and_reserve(
+                "new", "request", "qwen3-8b-instruct", "8k-fast",
+                time.time() + 30,
+            )
+        assert store._foundation._client.exists(request_key)
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node), cfg.key("queue", node), request_key,
+        )
+        store.close()
+
+
+def test_expired_addressed_reservation_is_reclaimed_beyond_cleanup_batch(
+    valkey_server,
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, node_transition_batch_size=1,
+        max_reservations=4, max_reservations_per_client=4,
+        max_reservations_per_node=4,
+    )
+    cfg = store._foundation.config
+    owner = _digest("owner")
+    node = store._node_digest("node")
+    records = []
+    try:
+        store.register("node", _capabilities(concurrency=4), owner)
+        seconds, micros = store._foundation.server_time()
+        future = seconds + micros / 1_000_000 + 30
+        for index in range(3):
+            client_name, request_name = f"client-{index}", f"request-{index}"
+            result = store.select_and_reserve(
+                client_name, request_name, "qwen3-8b-instruct", "8k-fast", future
+            )
+            client = hashlib.sha256(f"client\0{client_name}".encode()).hexdigest()
+            request = hashlib.sha256(f"request\0{request_name}".encode()).hexdigest()
+            token = _digest(result.reservation_token)
+            records.append((client_name, request_name, client, request, token))
+
+        expired = seconds + micros / 1_000_000 - 1
+        for offset, (_, _, client, request, token) in enumerate(records):
+            score = expired - (len(records) - offset)
+            store._foundation._client.hset(
+                cfg.key("request", client, request),
+                mapping={"deadline": score, "reservation_expires": score},
+            )
+            store._foundation._client.hset(
+                cfg.key("reservation", token),
+                mapping={"deadline": score, "reservation_expires": score},
+            )
+            store._foundation._client.zadd(
+                cfg.key("requests:deadline"), {client + ":" + request: score}
+            )
+            store._foundation._client.zadd(
+                cfg.key("reservations:expiry"), {token: score}
+            )
+
+        cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
+        target = records[-1]
+        target_deadline = expired - 1
+        with pytest.raises(RelayStateInvalidReservation):
+            store.select_and_reserve(
+                target[0], target[1], "qwen3-8b-instruct", "8k-fast",
+                target_deadline,
+            )
+
+        assert not store._foundation._client.exists(
+            cfg.key("request", target[2], target[3]),
+            cfg.key("reservation", target[4]),
+        )
+        assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 1
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 1
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+    finally:
+        keys = [
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("node", node), cfg.key("queue", node),
+        ]
+        for _, _, client, request, token in records:
+            keys.extend(
+                [cfg.key("request", client, request), cfg.key("reservation", token)]
+            )
+        store._foundation._client.delete(*keys)
+        store.close()
 
 
 def _mark_registrations_due(store, node_ids):
@@ -442,7 +2159,7 @@ def test_reader_incompatible_registration_reads_stop_before_state_access(
     valkey_server, operation
 ):
     store = _registration_store(valkey_server, uuid.uuid4().hex)
-    schema_key, lease_key, node_key = _registration_keys(store, "node-a")
+    schema_key, lease_key, cursor_key, node_key = _registration_keys(store, "node-a")
     incompatible = _manifest(reader_min=2, reader_max=2)
     malformed_hash = {b"node_id": b"malformed-application-payload"}
     malformed_member = b"malformed-index-member"
@@ -477,7 +2194,7 @@ def test_reader_incompatible_registration_reads_stop_before_state_access(
             store._foundation._client.zrange(lease_key, 0, -1, withscores=True),
         )
     finally:
-        store._foundation._client.delete(schema_key, lease_key, node_key)
+        store._foundation._client.delete(schema_key, lease_key, cursor_key, node_key)
         store.close()
 
 
@@ -487,7 +2204,7 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
     raw_credential = "raw-control-credential-marker"
     owner = _digest(raw_credential)
     node_digest = store._node_digest(node_id)
-    schema_key, lease_key, node_key = _registration_keys(store, node_id)
+    schema_key, lease_key, cursor_key, node_key = _registration_keys(store, node_id)
     expected_fields = {
         b"node_id",
         b"supported_model_ids",
@@ -501,6 +2218,10 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
         b"control_credential_digest",
         b"registered_at_epoch",
         b"lease_expires_at_epoch",
+        b"scheduler_healthy",
+        b"scheduler_draining",
+        b"scheduler_claimed_work",
+        b"registration_order",
     }
     forbidden = (
         raw_credential.encode(),
@@ -525,7 +2246,7 @@ def test_registration_persistence_uses_only_approved_redacted_values(valkey_serv
             marker not in value for marker in forbidden for value in persisted.values()
         )
     finally:
-        store._foundation._client.delete(schema_key, lease_key, node_key)
+        store._foundation._client.delete(schema_key, lease_key, cursor_key, node_key)
         store.close()
 
 

@@ -829,6 +829,55 @@ def wait_for_webview2_devtools(
     raise RuntimeError("webdriver_transport_failure") from None
 
 
+@contextlib.contextmanager
+def packaged_windows_webview2_session(
+        app_binary: Path, env: dict[str, str], log_handle,
+        timeout_seconds: float = 90.0, *, platform_name: str | None = None):
+    """Launch, attach to, and always stop an installed native WebView2 app."""
+    if (os.name if platform_name is None else platform_name) != "nt":
+        raise RuntimeError("webdriver_application_startup_failed")
+    devtools_port = reserve_free_port()
+    application_env = env.copy()
+    application_env.update({
+        "TAURI_AUTOMATION": "true",
+        "TAURI_WEBVIEW_AUTOMATION": "true",
+    })
+    webview2_automation_arg = (
+        "--edge-webview-switches="
+        f"--remote-debugging-port={devtools_port}")
+    application_process: subprocess.Popen[str] | None = None
+    try:
+        try:
+            application_process = subprocess.Popen(
+                [str(app_binary.resolve(strict=True)), webview2_automation_arg],
+                cwd=app_binary.resolve(strict=True).parent,
+                env=application_env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )  # noqa: S603
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("webdriver_application_startup_failed") from exc
+        wait_for_webview2_devtools(
+            application_process, devtools_port, timeout_seconds)
+        try:
+            driver = start_driver(
+                app_binary, debugger_address=f"127.0.0.1:{devtools_port}")
+        except Exception as exc:
+            category, _, _ = _classify_webdriver_session_failure(
+                exc, application_process)
+            raise RuntimeError(category) from exc
+        yield application_process, driver
+    finally:
+        if application_process is not None:
+            with contextlib.suppress(Exception):
+                cleanup_deadline = time.monotonic() + 10.0
+                _cleanup_owned_process_tree(
+                    application_process,
+                    lambda: max(0.0, cleanup_deadline - time.monotonic()),
+                )
+
+
 def start_landing_driver() -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
@@ -2382,6 +2431,9 @@ def main(argv: list[str] | None = None) -> int:
     Path(env["XDG_CONFIG_HOME"]).mkdir(parents=True, exist_ok=True)
     Path(env["XDG_DATA_HOME"]).mkdir(parents=True, exist_ok=True)
     Path(env["APPDATA"]).mkdir(parents=True, exist_ok=True)
+    webview2_user_data = isolated_home / "WebView2"
+    webview2_user_data.mkdir(parents=True, exist_ok=True)
+    env["WEBVIEW2_USER_DATA_FOLDER"] = str(webview2_user_data.resolve(strict=True))
 
     relay = subprocess.Popen(  # noqa: S603
         [
@@ -2400,19 +2452,21 @@ def main(argv: list[str] | None = None) -> int:
         text=True,
     )
 
+    driver_log_handle = driver_log.open("w", encoding="utf-8")
     tauri_driver = subprocess.Popen(  # noqa: S603
         tauri_driver_command(),
         # Keep cwd aligned with src-tauri so runtime asset resolution for ../dist works
         # when the app starts under tauri-driver in CI.
         cwd=TAURI_ROOT,
         env=env,
-        stdout=driver_log.open("w", encoding="utf-8"),
+        stdout=driver_log_handle,
         stderr=subprocess.STDOUT,
         text=True,
     )
 
     driver: webdriver.Remote | None = None
     landing_driver: webdriver.Chrome | None = None
+    application_stack = contextlib.ExitStack()
     model_path = args.model.resolve(strict=True) if hardware_mode else resolve_real_e2e_model_path()
     try:
         wait_for_http_200(f"{relay_url}/livez")
@@ -2435,7 +2489,12 @@ def main(argv: list[str] | None = None) -> int:
         if not app_binary.exists():
             raise RuntimeError(f"missing desktop binary: {app_binary}")
 
-        driver = start_driver(app_binary)
+        if hardware_mode:
+            _, driver = application_stack.enter_context(
+                packaged_windows_webview2_session(
+                    app_binary, env, driver_log_handle))
+        else:
+            driver = start_driver(app_binary)
         wait = WebDriverWait(driver, 45)
         wait_for_ui_ready(driver)
 
@@ -2590,7 +2649,11 @@ def main(argv: list[str] | None = None) -> int:
             with contextlib.suppress(Exception):
                 driver.quit()
         with contextlib.suppress(Exception):
+            application_stack.close()
+        with contextlib.suppress(Exception):
             terminate_process(tauri_driver)
+        with contextlib.suppress(Exception):
+            driver_log_handle.close()
         with contextlib.suppress(Exception):
             terminate_process(relay)
         shutil.rmtree(isolated_home, ignore_errors=True)

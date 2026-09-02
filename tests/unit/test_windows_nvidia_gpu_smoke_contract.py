@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+import ast
+import argparse
+import contextlib
 import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import Callable
 
+import psutil
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -15,6 +26,257 @@ SPEC = importlib.util.spec_from_file_location("windows_nvidia_gpu_smoke_test", S
 assert SPEC and SPEC.loader
 smoke = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(smoke)
+
+
+def _load_ui_e2e_contract() -> ModuleType:
+    """Load only the dependency-free packaged WebView2 contract under test."""
+    tree = ast.parse(UI_PATH.read_text(encoding="utf-8"))
+    names = {
+        "_classify_webdriver_session_failure",
+        "_cleanup_owned_process_tree",
+        "main",
+        "packaged_windows_webview2_session",
+    }
+    functions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in names
+    ]
+    assert {node.name for node in functions} == names
+    module = ModuleType("desktop_operator_ui_e2e_contract")
+    module.__dict__.update({
+        "Callable": Callable,
+        "argparse": argparse,
+        "ConnectTimeoutError": type("ConnectTimeoutError", (Exception,), {}),
+        "InvalidArgumentException": type("InvalidArgumentException", (Exception,), {}),
+        "NewConnectionError": type("NewConnectionError", (Exception,), {}),
+        "Path": Path,
+        "ProtocolError": type("ProtocolError", (Exception,), {}),
+        "ReadTimeoutError": type("ReadTimeoutError", (Exception,), {}),
+        "SessionNotCreatedException": type("SessionNotCreatedException", (Exception,), {}),
+        "contextlib": contextlib,
+        "LOGS_DIR": Path("unused-logs"),
+        "os": os,
+        "psutil": psutil,
+        "REPO_ROOT": Path("unused-repository"),
+        "reserve_free_port": lambda: 0,
+        "shutil": shutil,
+        "start_driver": lambda *_args, **_kwargs: None,
+        "subprocess": subprocess,
+        "sys": sys,
+        "TAURI_ROOT": Path("unused-tauri"),
+        "tempfile": tempfile,
+        "time": time,
+        "TimeoutException": type("TimeoutException", (Exception,), {}),
+        "wait_for_webview2_devtools": lambda *_args, **_kwargs: None,
+        "webdriver": SimpleNamespace(Remote=object, Chrome=object),
+        "WebDriverException": type("WebDriverException", (Exception,), {}),
+    })
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(UI_PATH), "exec"),
+        module.__dict__)
+    return module
+
+
+ui_e2e = _load_ui_e2e_contract()
+
+
+def test_ui_contract_loader_does_not_execute_selenium_imports():
+    assert "selenium" not in ui_e2e.__dict__
+
+
+class _ApplicationProcess:
+    pid = 4321
+
+    def wait(self, timeout):
+        del timeout
+
+
+class _OwnedProcess:
+    def __init__(self, name, events, children=()):
+        self.name = name
+        self.events = events
+        self._children = children
+
+    def children(self, recursive):
+        assert recursive is True
+        return list(self._children)
+
+    def terminate(self):
+        self.events.append(f"terminate:{self.name}")
+
+
+def test_packaged_webview2_session_launches_attaches_and_terminates(monkeypatch, tmp_path):
+    application = tmp_path / "token-place.exe"
+    application.write_bytes(b"app")
+    process = _ApplicationProcess()
+    launches = []
+    targets = []
+    driver_calls = []
+    cleanup_events = []
+    descendant = _OwnedProcess("descendant", cleanup_events)
+    root = _OwnedProcess("root", cleanup_events, [descendant])
+
+    monkeypatch.setattr(ui_e2e, "reserve_free_port", lambda: 49152)
+    monkeypatch.setattr(
+        ui_e2e.subprocess,
+        "Popen",
+        lambda command, **kwargs: launches.append((command, kwargs)) or process,
+    )
+    monkeypatch.setattr(
+        ui_e2e,
+        "wait_for_webview2_devtools",
+        lambda candidate, port, timeout: targets.append((candidate, port, timeout)),
+    )
+    monkeypatch.setattr(
+        ui_e2e,
+        "start_driver",
+        lambda app, **kwargs: driver_calls.append((app, kwargs)) or "driver",
+    )
+    monkeypatch.setattr(ui_e2e.psutil, "Process", lambda pid: root)
+    monkeypatch.setattr(ui_e2e.psutil, "wait_procs", lambda processes, timeout: (processes, []))
+
+    with ui_e2e.packaged_windows_webview2_session(
+            application, {"BASE": "preserved"}, None,
+            platform_name="nt") as launched:
+        assert launched == (process, "driver")
+        assert cleanup_events == []
+
+    command, kwargs = launches[0]
+    assert command == [
+        str(application.resolve()),
+        "--edge-webview-switches=--remote-debugging-port=49152",
+    ]
+    assert kwargs["cwd"] == application.parent
+    assert kwargs["env"]["BASE"] == "preserved"
+    assert kwargs["env"]["TAURI_AUTOMATION"] == "true"
+    assert kwargs["env"]["TAURI_WEBVIEW_AUTOMATION"] == "true"
+    assert targets == [(process, 49152, 90.0)]
+    assert driver_calls == [
+        (application, {"debugger_address": "127.0.0.1:49152"})]
+    assert cleanup_events == ["terminate:descendant", "terminate:root"]
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_error"),
+    [
+        ("launch", "webdriver_application_startup_failed"),
+        ("target", "webdriver_transport_failure"),
+        ("driver", "webdriver_session_creation_failed"),
+    ],
+)
+def test_packaged_webview2_session_fails_closed_and_cleans_up(
+        monkeypatch, tmp_path, failure_stage, expected_error):
+    application = tmp_path / "token-place.exe"
+    application.write_bytes(b"app")
+    process = _ApplicationProcess()
+    cleanup_events = []
+    descendant = _OwnedProcess("descendant", cleanup_events)
+    root = _OwnedProcess("root", cleanup_events, [descendant])
+    monkeypatch.setattr(ui_e2e, "reserve_free_port", lambda: 49152)
+
+    def launch(*_args, **_kwargs):
+        if failure_stage == "launch":
+            raise OSError("cannot launch")
+        return process
+
+    def target(*_args):
+        if failure_stage == "target":
+            raise RuntimeError("webdriver_transport_failure")
+
+    def driver(*_args, **_kwargs):
+        if failure_stage == "driver":
+            raise RuntimeError("webdriver_session_creation_failed")
+        pytest.fail("driver must not start before an attachable target")
+
+    monkeypatch.setattr(ui_e2e.subprocess, "Popen", launch)
+    monkeypatch.setattr(ui_e2e, "wait_for_webview2_devtools", target)
+    monkeypatch.setattr(ui_e2e, "start_driver", driver)
+    monkeypatch.setattr(ui_e2e.psutil, "Process", lambda pid: root)
+    monkeypatch.setattr(ui_e2e.psutil, "wait_procs", lambda processes, timeout: (processes, []))
+
+    with pytest.raises(RuntimeError, match=f"^{expected_error}$"):
+        with ui_e2e.packaged_windows_webview2_session(
+                application, {}, None, platform_name="nt"):
+            pytest.fail("a failed session must not be yielded")
+
+    assert cleanup_events == ([] if failure_stage == "launch" else [
+        "terminate:descendant", "terminate:root"])
+
+
+def test_packaged_hardware_processes_share_one_log_handle():
+    main_source = UI_PATH.read_text(encoding="utf-8").split(
+        "def main(argv:", 1)[1]
+    assert main_source.count('driver_log.open("w", encoding="utf-8")') == 1
+    assert 'driver_log.open("a"' not in main_source
+    assert "stdout=driver_log_handle" in main_source
+    assert "app_binary, env, driver_log_handle" in main_source
+
+
+def test_packaged_hardware_main_uses_shared_log_and_closes_writers(
+        monkeypatch, tmp_path):
+    """Exercise the packaged setup and teardown lines included in patch coverage."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    app = tmp_path / "token-place.exe"
+    model = tmp_path / "model.gguf"
+    app.write_bytes(b"app")
+    model.write_bytes(b"model")
+    processes = []
+    terminated = []
+    session_calls = []
+
+    class Process:
+        pass
+
+    def popen(*_args, **kwargs):
+        process = Process()
+        process.stdout = kwargs["stdout"]
+        processes.append(process)
+        return process
+
+    @contextlib.contextmanager
+    def packaged_session(binary, env, log_handle):
+        session_calls.append((binary, env, log_handle))
+        yield Process(), object()
+
+    monkeypatch.setattr(ui_e2e, "LOGS_DIR", logs)
+    monkeypatch.setattr(ui_e2e, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ui_e2e, "TAURI_ROOT", tmp_path)
+    monkeypatch.setattr(ui_e2e, "reserve_free_port", lambda: 49152)
+    monkeypatch.setattr(ui_e2e.subprocess, "Popen", popen)
+    monkeypatch.setattr(ui_e2e, "tauri_driver_command", lambda: ["tauri-driver"], raising=False)
+    monkeypatch.setattr(ui_e2e, "wait_for_http_200", lambda _url: None, raising=False)
+    monkeypatch.setattr(ui_e2e, "wait_for_port", lambda *_args, **_kwargs: None, raising=False)
+    monkeypatch.setattr(ui_e2e, "ensure_alive", lambda *_args: None, raising=False)
+    monkeypatch.setattr(ui_e2e, "packaged_windows_webview2_session", packaged_session)
+    monkeypatch.setattr(
+        ui_e2e, "WebDriverWait",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("stop after attach")),
+        raising=False,
+    )
+    monkeypatch.setattr(ui_e2e, "terminate_process", terminated.append, raising=False)
+    monkeypatch.setattr(ui_e2e.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path / "home"))
+
+    with pytest.raises(RuntimeError, match="stop after attach"):
+        ui_e2e.main([
+            "--packaged-windows-nvidia-hardware",
+            "--app-binary", str(app),
+            "--model", str(model),
+        ])
+
+    assert len(processes) == 2
+    assert session_calls[0][2] is processes[1].stdout
+    assert processes[1].stdout.closed
+    assert terminated == [processes[1], processes[0]]
+
+
+def test_packaged_webview2_session_rejects_non_windows(monkeypatch, tmp_path):
+    application = tmp_path / "token-place"
+    application.write_bytes(b"app")
+    with pytest.raises(RuntimeError, match="^webdriver_application_startup_failed$"):
+        with ui_e2e.packaged_windows_webview2_session(
+                application, {}, None, platform_name="posix"):
+            pytest.fail("a non-Windows session must not be yielded")
 
 
 def _profile(model: Path, *, size: int | None = None, digest: str | None = None):

@@ -654,6 +654,20 @@ def test_script_result_decoder_rejects_unbounded_or_unsupported_values(result):
         foundation.server_time()
 
 
+def test_unrelated_reviewed_script_keeps_generic_result_byte_budget():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.return_value = [
+        b"x" * (valkey_relay_state._MAX_RESULT_BYTES + 1)
+    ]
+
+    with pytest.raises(ValkeyScriptError, match="invalid reviewed script result"):
+        foundation.server_time()
+
+
 def test_false_ping_is_unavailable():
     foundation = ValkeyFoundation.__new__(ValkeyFoundation)
     foundation.config = config()

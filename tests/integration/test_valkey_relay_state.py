@@ -1656,7 +1656,7 @@ def test_claimed_lifecycle_counts_toward_all_queue_capacity(valkey_server):
     envelope = EncryptedRequestEnvelope(
         "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
     )
-    deadline = time.time() + 60
+    deadline = time.time() + 10
     first = None
     second = None
     cfg = store._foundation.config
@@ -2667,7 +2667,7 @@ def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_s
     envelope = EncryptedRequestEnvelope(
         "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
     )
-    deadline = time.time() + 10
+    deadline = time.time() + 60
     selection = None
     client_digest = hashlib.sha256(b"client\0claim-client").hexdigest()
     request_digest = hashlib.sha256(b"request\0claim-request").hexdigest()
@@ -2793,3 +2793,67 @@ def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_s
         first._foundation._client.delete(*keys)
         first.close()
         second.close()
+
+def test_claim_result_budget_accepts_large_bounded_result(valkey_server):
+    namespace = uuid.uuid4().hex
+    max_envelope_bytes = 20_000
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        max_envelope_bytes=max_envelope_bytes,
+        claim_ttl_seconds=1,
+    )
+    owner = _digest("large-claim-owner")
+    client_public_key = "c" * (store.config.max_identity_bytes - 1)
+    request_id = "r" * (store.config.max_identity_bytes - 1)
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee",
+        1,
+        "x" * 18_000,
+        "cipherkey",
+        "iv",
+    )
+    deadline = time.time() + 10
+    cfg = store._foundation.config
+    try:
+        store.register("large-claim-node", _capabilities(), owner)
+        selection = store.select_and_reserve(
+            client_public_key,
+            request_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            "cancel",
+        )
+        store.enqueue_encrypted_request(
+            client_public_key,
+            request_id,
+            selection.reservation_token,
+            "large-claim-node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
+        )
+
+        claim = store.claim_queued_request(
+            "large-claim-node", owner, "large-result-consumer"
+        )
+
+        assert claim.state == "claimed"
+        assert claim.client_public_key == client_public_key
+        assert claim.request_id == request_id
+        assert claim.envelope == envelope
+        assert len(store.active_claims("large-claim-node")) == 1
+        assert (
+            store._foundation._client.xlen(
+                cfg.key("queue", store._node_digest("large-claim-node"))
+            )
+            == 1
+        )
+    finally:
+        keys = tuple(store._foundation._client.scan_iter(match=f"{cfg.key_prefix}*"))
+        if keys:
+            store._foundation._client.delete(*keys)
+        store.close()

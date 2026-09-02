@@ -49,6 +49,7 @@ _MAX_RETRIES = 5
 _MAX_RESULT_BYTES = 65_536
 _MAX_RESULT_ITEMS = 1_024
 _MAX_RESULT_DEPTH = 8
+_CLAIM_RESULT_METADATA_BYTES = 4_096
 _MAX_MANIFEST_SCRIPTS = 64
 _MAX_CONNECTIONS = 32
 _MAX_RATE_LIMIT_WINDOW = 2**63 - 1
@@ -2111,7 +2112,11 @@ class ValkeyRegistrationStore:
                 CLAIM_SCRIPT.name,
                 keys,
                 args,
-                max_result_bytes=self.config.max_envelope_bytes + 4_096,
+                max_result_bytes=(
+                    self.config.max_envelope_bytes
+                    + (2 * self.config.max_identity_bytes)
+                    + _CLAIM_RESULT_METADATA_BYTES
+                ),
             )
         )
         if status == "owner":
@@ -2137,9 +2142,15 @@ class ValkeyRegistrationStore:
                 raise ValueError
         except ValueError:
             raise ValkeySchemaIncompatibleError("state schema incompatible") from None
-        envelope_raw = values[5]
+        client_public_key, request_id, envelope_raw = values[3:]
         if (
-            not isinstance(envelope_raw, bytes)
+            not isinstance(client_public_key, bytes)
+            or not client_public_key
+            or len(client_public_key) > self.config.max_identity_bytes
+            or not isinstance(request_id, bytes)
+            or not request_id
+            or len(request_id) > self.config.max_identity_bytes
+            or not isinstance(envelope_raw, bytes)
             or len(envelope_raw) > self.config.max_envelope_bytes
         ):
             raise ValkeySchemaIncompatibleError("state schema incompatible")
@@ -2148,8 +2159,8 @@ class ValkeyRegistrationStore:
             generation,
             lease,
             deadline,
-            self._decode_text(values[3]),
-            self._decode_text(values[4]),
+            self._decode_text(client_public_key),
+            self._decode_text(request_id),
             self._decode_request_envelope(envelope_raw),
         )
 

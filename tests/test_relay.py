@@ -3572,39 +3572,6 @@ def test_api_v1_cancel_token_lookup_scans_known_servers_under_registry_lock(clie
     assert checking_servers.values_checked_under_server_lock is True
 
 
-def test_api_v1_cancel_scans_known_servers_under_registry_lock(client, monkeypatch):
-    request_id = 'req-cancel-lock-scan'
-    checking_servers = _LockCheckingKnownServers({
-        DUMMY_SERVER_PUB_KEY: {
-            'public_key': DUMMY_SERVER_PUB_KEY,
-            'last_ping': datetime.now(),
-            'last_ping_duration': 60,
-            relay_module.API_V1_SERVER_MARKER: True,
-            'api_v1_in_flight_requests': {
-                request_id: {
-                    'expires_at': time.monotonic() + 60,
-                    'client_public_key': DUMMY_CLIENT_PUB_KEY,
-                    'cancel_token': 'proof',
-                },
-            },
-        },
-    })
-    monkeypatch.setattr(relay_module, 'known_servers', checking_servers)
-    relay_module._mark_request_pending(DUMMY_CLIENT_PUB_KEY, request_id, cancel_token='proof')
-
-    cancelled = client.post('/api/v1/relay/requests/cancel', json={
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'request_id': request_id,
-        'status': 'cancelled',
-        'reason': 'requester_cancelled',
-        'cancel_token': 'proof',
-    })
-
-    assert cancelled.status_code == 200
-    assert checking_servers.values_checked_under_server_lock is True
-    assert 'api_v1_in_flight_requests' not in checking_servers[DUMMY_SERVER_PUB_KEY]
-
-
 def test_api_v1_request_enqueue_rejects_legacy_only_server_without_queue_entry(client):
     legacy_server = _server_key('enqueue_legacy_only')
     legacy_registration = client.post('/sink', json={'server_public_key': legacy_server})

@@ -2891,6 +2891,8 @@ def test_packaged_bridge_timeout_cleanup_is_bounded_and_preserves_diagnostic(
 
     proc = _Process()
     monkeypatch.setattr(sys, 'platform', platform)
+    simulated_sigkill = 9
+    monkeypatch.setattr(signal, 'SIGKILL', simulated_sigkill, raising=False)
     killpg_calls = []
     taskkill_calls = []
     monkeypatch.setattr(
@@ -2929,7 +2931,7 @@ def test_packaged_bridge_timeout_cleanup_is_bounded_and_preserves_diagnostic(
         )]
         assert proc.kill_calls == 3
     else:
-        assert killpg_calls == [(123, signal.SIGKILL)]
+        assert killpg_calls == [(123, simulated_sigkill)]
         assert taskkill_calls == []
         assert proc.kill_calls == 2
 

@@ -6,6 +6,7 @@ import ast
 import argparse
 import contextlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -343,6 +344,37 @@ def test_canonical_model_contract_returns_repository_profile():
     assert profile["filename"].endswith(".gguf")
     assert isinstance(profile["artifact_size_bytes"], int)
     assert isinstance(profile["artifact_sha256"], str)
+
+
+def test_direct_gate_load_resolves_repository_profile_without_pythonpath(tmp_path):
+    code = """
+import importlib.util
+import json
+import sys
+
+gate_path = sys.argv[1]
+spec = importlib.util.spec_from_file_location("isolated_windows_nvidia_gate", gate_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError("could not load Windows NVIDIA gate")
+gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate)
+print(json.dumps(gate._canonical_model_contract()))
+"""
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code, str(SMOKE_PATH)],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    profile = json.loads(result.stdout)
+    assert profile["profile_id"] == "qwen3-8b-q4-k-m"
+    assert profile["filename"].endswith(".gguf")
 
 
 def test_materialize_nsis_requires_windows(monkeypatch, tmp_path):

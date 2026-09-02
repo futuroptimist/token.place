@@ -3577,18 +3577,26 @@ def test_api_v1_request_enqueue_rejects_legacy_only_server_without_queue_entry(c
     legacy_registration = client.post('/sink', json={'server_public_key': legacy_server})
     assert legacy_registration.status_code == 200
 
-    response = client.post('/api/v1/relay/requests', json={
-        'request_id': 'req-legacy-only',
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'server_public_key': legacy_server,
-        'chat_history': 'ciphertext-request',
-        'cipherkey': 'cipherkey-request',
-        'iv': 'iv-request',
-    })
+    response = client.post('/api/v1/relay/requests', json=(
+        _api_v1_request_payload('req-legacy-only')
+        | {'server_public_key': legacy_server}
+    ))
 
-    assert response.status_code == 404
+    assert response.status_code == 503
+    assert response.get_json() == {
+        'error': {
+            'message': 'Relay queue is at capacity',
+            'code': 'no_available_capacity',
+        }
+    }
     assert legacy_server not in client_inference_requests
     assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    store = relay_module._api_v1_store()
+    assert store.get(legacy_server) is None
+    assert store.queued_requests(legacy_server) == ()
+    assert store.claimed_request(legacy_server, 'req-legacy-only') is None
+    assert store.list_reservations() == ()
+    assert store.terminal_records() == ()
 
 
 def test_api_v1_request_enqueue_rejects_removed_server_without_queue_entry(client):
@@ -3596,18 +3604,26 @@ def test_api_v1_request_enqueue_rejects_removed_server_without_queue_entry(clien
     control_payload = _api_v1_registered_control_payload(client, server_key, capabilities=_capabilities('8k-fast'))
     assert client.post('/api/v1/relay/servers/unregister', json=control_payload).status_code == 200
 
-    response = client.post('/api/v1/relay/requests', json={
-        'request_id': 'req-removed-server',
-        'client_public_key': DUMMY_CLIENT_PUB_KEY,
-        'server_public_key': server_key,
-        'chat_history': 'ciphertext-request',
-        'cipherkey': 'cipherkey-request',
-        'iv': 'iv-request',
-    })
+    response = client.post('/api/v1/relay/requests', json=(
+        _api_v1_request_payload('req-removed-server')
+        | {'server_public_key': server_key}
+    ))
 
-    assert response.status_code == 404
+    assert response.status_code == 503
+    assert response.get_json() == {
+        'error': {
+            'message': 'Relay queue is at capacity',
+            'code': 'no_available_capacity',
+        }
+    }
     assert server_key not in client_inference_requests
     assert DUMMY_CLIENT_PUB_KEY not in client_pending_request_ids
+    store = relay_module._api_v1_store()
+    assert store.get(server_key) is None
+    assert store.queued_requests(server_key) == ()
+    assert store.claimed_request(server_key, 'req-removed-server') is None
+    assert store.list_reservations() == ()
+    assert store.terminal_records() == ()
 
 
 def test_api_v1_round_robin_request_queueing_preserves_per_server_isolation(client):

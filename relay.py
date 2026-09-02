@@ -1549,6 +1549,7 @@ def _api_v1_server_diagnostics() -> list[dict[str, Any]]:
             "max_concurrency": capabilities.max_concurrency,
             "load_score": queue_depth + in_flight,
             "capabilities": {
+                "api_version": "v1",
                 "supported_model_ids": list(capabilities.supported_model_ids),
                 "active_context_tier": capabilities.active_context_tier,
                 "maximum_total_context_tokens": capabilities.maximum_total_context_tokens,
@@ -2228,8 +2229,8 @@ def next_server():
 @app.route('/api/v1/relay/servers/next', methods=['GET'])
 def api_v1_relay_servers_next():
     """Atomically select and reserve an API-v1 compute node."""
-    model = (request.args.get("model") or DEFAULT_MODEL_IDS[0]).strip().lower()
-    model = MODEL_ALIASES.get(model, model)
+    requested_model = (request.args.get("model") or DEFAULT_MODEL_IDS[0]).strip().lower()
+    canonical_model = MODEL_ALIASES.get(requested_model, requested_model)
     tier = (request.args.get("context_tier") or DEFAULT_CONTEXT_TIER).strip()
     if tier not in CONTEXT_TIER_ORDER:
         return jsonify({'error': {'message': 'Unsupported context_tier', 'code': 'invalid_context_tier'}}), 400
@@ -2238,7 +2239,9 @@ def api_v1_relay_servers_next():
     cancel_token = request.args.get("cancel_token") or secrets.token_hex(32)
     deadline = time.time() + _api_v1_request_deadline_seconds()
     try:
-        result = _api_v1_store().select_and_reserve(client_key, request_id, model, tier, deadline, cancel_token)
+        result = _api_v1_store().select_and_reserve(
+            client_key, request_id, canonical_model, tier, deadline, cancel_token
+        )
         registration = _api_v1_store().get(result.selected_node_id)
         if registration is None:
             raise RelayStateNoCapacity("no scheduler capacity")
@@ -2250,7 +2253,8 @@ def api_v1_relay_servers_next():
         caps = registration.capabilities
         payload = {
             'server_public_key': result.selected_node_id,
-            'requested_context_tier': tier, 'requested_model': model, 'resolved_model': result.requested_model_id,
+            'requested_context_tier': tier, 'requested_model': requested_model,
+            'resolved_model': result.requested_model_id,
             'selected_context_tier': caps.active_context_tier,
             'selected_context_window_tokens': caps.maximum_total_context_tokens,
             'selected_model_support': list(caps.supported_model_ids),
@@ -3074,8 +3078,18 @@ def api_v1_relay_servers_poll():
         if registration is None:
             return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
         digest = _credential_digest(credential)
+        registration = store.renew(node, digest)
+        if registration is None:
+            return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+        lease_refresh_interval = max(min(store.config.lease_ttl_seconds / 2.0, 1.0), 0.05)
+        next_lease_refresh = time.monotonic() + lease_refresh_interval
         wait_deadline = time.monotonic() + _api_v1_poll_wait_seconds()
         while True:
+            if time.monotonic() >= next_lease_refresh:
+                registration = store.renew(node, digest)
+                if registration is None:
+                    return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
+                next_lease_refresh = time.monotonic() + lease_refresh_interval
             result = store.claim_queued_request(node, digest, node)
             if result.state != 'empty' or time.monotonic() >= wait_deadline:
                 break

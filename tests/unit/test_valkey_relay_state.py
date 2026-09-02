@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import math
+import re
 import traceback
 from unittest.mock import Mock, patch
 
@@ -26,7 +27,15 @@ from valkey_relay_state import (
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
 )
-from relay_state_store import RelayStateStoreConfig, RelayStateStoreError
+from relay_state_store import (
+    EncryptedRequestEnvelope,
+    RelayStateConflict,
+    RelayStateCredentialMismatch,
+    RelayStateInvalidReservation,
+    RelayStateStoreConfig,
+    RelayStateStoreError,
+    SchedulerNodeState,
+)
 
 
 def config(**changes):
@@ -67,6 +76,16 @@ def registration_store_with_foundation(foundation):
     store._foundation = foundation
     store._config = RelayStateStoreConfig(namespace="testing.unit")
     return store
+
+
+def test_select_script_contains_no_scan_commands():
+    assert (
+        re.search(
+            r"redis\.call\(['\"](?:HSCAN|SCAN|KEYS)['\"]",
+            valkey_relay_state.SELECT_AND_RESERVE_SOURCE,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -854,3 +873,111 @@ def test_registration_deadline_failure_is_typed_before_record_decoding():
         )
 
     assert foundation.execute.call_args.args[2][4] == b"1.7976931348623157e+308"
+
+
+@pytest.mark.parametrize(
+    "result",
+    [None, [], [b"\xff"], [1]],
+)
+def test_scheduler_result_status_rejects_malformed_values(result):
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        ValkeyRegistrationStore._ascii_status(result)
+
+
+@pytest.mark.parametrize("value", ["text", b"x" * 65_537, b"\xff"])
+def test_scheduler_text_decoder_rejects_unbounded_or_invalid_values(value):
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        ValkeyRegistrationStore._decode_text(value)
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (("", "request"), "request identity is invalid"),
+        (("client", "x" * 8_193), "request identity is invalid"),
+    ],
+)
+def test_scheduler_identity_validation_is_typed(args, message):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    with pytest.raises(RelayStateStoreError, match=message):
+        store._identity(*args)
+
+
+@pytest.mark.parametrize(
+    ("model", "tier", "deadline", "message"),
+    [
+        ("", "8k-fast", 10, "requested model is invalid"),
+        ("model", "unknown", 10, "requested context tier is invalid"),
+        ("model", "8k-fast", math.inf, "request deadline must be finite"),
+    ],
+)
+def test_scheduler_request_validation_is_typed(model, tier, deadline, message):
+    store = registration_store_with_foundation(Mock(spec=ValkeyFoundation))
+    with pytest.raises(RelayStateStoreError, match=message):
+        store._model_tier_deadline(model, tier, deadline)
+
+
+@pytest.mark.parametrize("token", [None, "", "x" * 1_025])
+def test_scheduler_cancellation_proof_validation_is_typed(token):
+    store = registration_store_with_foundation(Mock(spec=ValkeyFoundation))
+    with pytest.raises(RelayStateStoreError, match="cancellation proof is invalid"):
+        store._cancellation_digest(token)
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ([b"credential_mismatch"], RelayStateCredentialMismatch),
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"ok", b"extra"], ValkeySchemaIncompatibleError),
+    ],
+)
+def test_scheduler_state_translates_fixed_script_results(result, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+    with pytest.raises(expected):
+        store.set_scheduler_state("node-a", "a" * 64, SchedulerNodeState())
+
+
+def test_scheduler_state_rejects_wrong_state_type_before_dispatch():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    with pytest.raises(RelayStateStoreError, match="scheduler state"):
+        store.set_scheduler_state("node-a", "a" * 64, object())
+    foundation.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ([b"invalid"], RelayStateInvalidReservation),
+        ([b"conflict"], RelayStateConflict),
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"created"], ValkeySchemaIncompatibleError),
+    ],
+)
+def test_enqueue_translates_fixed_script_results(result, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    with pytest.raises(expected):
+        store.enqueue_encrypted_request(
+            "client",
+            "request",
+            "a" * 64,
+            "node-a",
+            "model",
+            "8k-fast",
+            10,
+            envelope,
+            "cancel",
+        )

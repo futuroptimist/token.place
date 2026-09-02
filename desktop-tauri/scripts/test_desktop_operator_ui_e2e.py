@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -109,9 +110,90 @@ def fetch_relay_diagnostics_count(relay_url: str, *, timeout_seconds: float) -> 
     return int(payload["total_api_v1_registered_compute_nodes"])
 
 
+def fetch_api_v1_registered_node_fingerprints(
+        relay_url: str, *, timeout_seconds: float) -> list[str]:
+    """Return validated API-v1 node fingerprints without retaining public keys."""
+    with urlopen(f"{relay_url}/relay/diagnostics", timeout=timeout_seconds) as response:  # nosec B310
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("malformed relay diagnostics")
+    nodes = payload.get("api_v1_registered_compute_nodes")
+    if not isinstance(nodes, list):
+        raise ValueError("malformed API-v1 registered node diagnostics")
+    declared_count = payload.get("total_api_v1_registered_compute_nodes")
+    if (isinstance(declared_count, bool)
+            or not isinstance(declared_count, int)
+            or declared_count < 0
+            or declared_count != len(nodes)):
+        raise ValueError("malformed API-v1 registered node count")
+    fingerprints = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise ValueError("malformed API-v1 registered node")
+        public_key = node.get("server_public_key")
+        if not isinstance(public_key, str) or not public_key:
+            raise ValueError("malformed API-v1 registered node public key")
+        fingerprints.append(hashlib.sha256(
+            public_key.encode("utf-8", errors="ignore")).hexdigest()[:12])
+    return fingerprints
+
+
+_BRIDGE_RESET_PATTERN = re.compile(
+    r"\bdesktop\.compute_node_bridge\.relay_client\.reset\s+"
+    r"operator_session_id=([^\s]+).*?\bkey_fingerprint=([0-9a-f]{12})\b")
+_MAX_FRESH_BRIDGE_LOG_BYTES = 65_536
+
+
+def _bridge_reset_observations(handle) -> list[tuple[str, str]]:
+    """Scan reset records chunkwise without accumulating the log suffix."""
+    observations: list[tuple[str, str]] = []
+    pending = ""
+    while chunk := handle.read(_MAX_FRESH_BRIDGE_LOG_BYTES):
+        text = pending + chunk.decode("utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        pending = ""
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            pending = lines.pop()[-_MAX_FRESH_BRIDGE_LOG_BYTES:]
+        for line in lines:
+            observations.extend(
+                (match.group(1), match.group(2))
+                for match in _BRIDGE_RESET_PATTERN.finditer(line)
+            )
+    if pending:
+        observations.extend(
+            (match.group(1), match.group(2))
+            for match in _BRIDGE_RESET_PATTERN.finditer(pending)
+        )
+    return observations
+
+
+def fresh_bridge_key_fingerprint(log_path: Path, start_offset: int) -> str | None:
+    """Find exactly one session-bound reset emitted after the Start boundary."""
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(start_offset)
+            observations = _bridge_reset_observations(handle)
+    except (OSError, ValueError):
+        return None
+    if len(observations) != 1:
+        return None
+    return observations[0][1]
+
+
+def authoritative_registration_matches(relay_url: str, *, timeout_seconds: float,
+        bridge_log: Path, bridge_log_start_offset: int) -> bool:
+    """Require relay exclusivity and identity equality for this Start operation."""
+    local_fingerprint = fresh_bridge_key_fingerprint(
+        bridge_log, bridge_log_start_offset)
+    registered_nodes = fetch_api_v1_registered_node_fingerprints(
+        relay_url, timeout_seconds=timeout_seconds)
+    return (local_fingerprint is not None
+        and registered_nodes == [local_fingerprint])
+
+
 def require_clean_relay_registration_baseline(
         relay_url: str, *, timeout_seconds: float, fail_closed,
-        record_relay_observation) -> int:
+        record_relay_observation) -> list[str]:
     """Require an authoritative empty relay before starting this attempt."""
     deadline = time.monotonic() + timeout_seconds
     while True:
@@ -120,12 +202,12 @@ def require_clean_relay_registration_baseline(
             fail_closed("operator_registration_not_reached")
         record_relay_observation("polled")
         try:
-            registered = fetch_relay_diagnostics_count(
+            registered = fetch_api_v1_registered_node_fingerprints(
                 relay_url, timeout_seconds=max(0.05, min(remaining, 0.5)))
         except Exception:
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
             continue
-        if registered != 0:
+        if registered:
             record_relay_observation("not_reached")
             fail_closed("operator_registration_not_reached")
         return registered
@@ -297,7 +379,8 @@ def wait_for_running_stability(
 
 
 def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining,
-        record_progress, fail_closed, relay_url: str, record_relay_observation) -> None:
+        record_progress, fail_closed, relay_url: str, record_relay_observation,
+        bridge_log: Path, bridge_log_start_offset: int) -> None:
     """Require the two ordered post-click operator boundaries fail closed."""
     active_attempt_ready = True
     try:
@@ -332,8 +415,10 @@ def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining
             return False
         record_relay_observation("polled")
         try:
-            registered = fetch_relay_diagnostics_count(
-                relay_url, timeout_seconds=min(remaining, 0.5)) == 1
+            registered = authoritative_registration_matches(
+                relay_url, timeout_seconds=min(remaining, 0.5),
+                bridge_log=bridge_log,
+                bridge_log_start_offset=bridge_log_start_offset)
         except Exception:
             return False
         if registered:
@@ -349,8 +434,10 @@ def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining
         if remaining > 0:
             record_relay_observation("polled")
             try:
-                terminal_registered = fetch_relay_diagnostics_count(
-                    relay_url, timeout_seconds=min(remaining, 0.5)) == 1
+                terminal_registered = authoritative_registration_matches(
+                    relay_url, timeout_seconds=min(remaining, 0.5),
+                    bridge_log=bridge_log,
+                    bridge_log_start_offset=bridge_log_start_offset)
             except Exception:
                 terminal_registered = False
         if not terminal_registered:
@@ -1975,11 +2062,14 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         require_clean_relay_registration_baseline(
             request["relay_url"], timeout_seconds=setup_remaining(),
             fail_closed=fail_closed, record_relay_observation=record_relay_observation)
+        driver_log_handle.flush()
+        bridge_log_start_offset = driver_log.stat().st_size
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
         operator_progress = "operator_started"
         wait_for_post_start_operator_state(
             driver, setup_remaining, record_operator_progress, fail_closed,
-            request["relay_url"], record_relay_observation)
+            request["relay_url"], record_relay_observation, driver_log,
+            bridge_log_start_offset)
         write_phase("operator_ready")
 
         _validate_operator_tokenizer_handoff(tokenizer_evidence, fail_closed)

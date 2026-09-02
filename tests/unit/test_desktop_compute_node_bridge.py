@@ -2952,22 +2952,41 @@ class ComputeNodeRuntime:
         if proc.poll() is None:
             try:
                 if sys.platform == 'win32':
-                    subprocess.run(
+                    taskkill_result = subprocess.run(
                         ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
                         check=False,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         timeout=5,
                     )
+                    if taskkill_result.returncode != 0:
+                        proc.kill()
                 else:
                     os.killpg(proc.pid, signal.SIGKILL)
             except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        try:
+            proc.communicate(timeout=5)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            try:
                 proc.kill()
+            except OSError:
+                pass
             try:
                 proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate(timeout=5)
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                # A descendant can keep inherited pipe handles open even after
+                # the bridge is dead. Cleanup is best-effort and must not mask
+                # the test's original assertion or timeout failure.
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except OSError:
+                            pass
 
 
 def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tmp_path):

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from textwrap import dedent
 from types import ModuleType, SimpleNamespace
 from typing import Callable
 
@@ -347,19 +348,23 @@ def test_canonical_model_contract_returns_repository_profile():
 
 
 def test_direct_gate_load_resolves_repository_profile_without_pythonpath(tmp_path):
-    code = """
-import importlib.util
-import json
-import sys
+    code = dedent(
+        """
+        import importlib.util
+        import json
+        import sys
 
-gate_path = sys.argv[1]
-spec = importlib.util.spec_from_file_location("isolated_windows_nvidia_gate", gate_path)
-if spec is None or spec.loader is None:
-    raise RuntimeError("could not load Windows NVIDIA gate")
-gate = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(gate)
-print(json.dumps(gate._canonical_model_contract()))
-"""
+        gate_path = sys.argv[1]
+        spec = importlib.util.spec_from_file_location(
+            "isolated_windows_nvidia_gate", gate_path
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("could not load Windows NVIDIA gate")
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        print(json.dumps(gate._canonical_model_contract()))
+        """
+    )
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
 

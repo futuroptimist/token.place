@@ -1175,11 +1175,19 @@ for _, entry in ipairs(entries) do
       for i=1,#lv do if lv[i] then lv_present=lv_present+1 end end
       local live_deadline=finite(lv[7]); local live_sequence=finite(lv[8]); local live_generation=finite(lv[9]); local live_expiry=finite(lv[10])
       local live_score=finite(redis.call('ZSCORE',expiries,live_member))
+      local live_request_key=prefix .. 'request:' .. live_client .. ':' .. live_request
+      local lifecycle=redis.call('HMGET',live_request_key,'state','client','request','node_id','node_digest','deadline','sequence','claim_generation')
+      local lifecycle_present=0
+      for i=1,#lifecycle do if lifecycle[i] then lifecycle_present=lifecycle_present+1 end end
       if lv_present ~= #fields or lv[1]~=live_client or lv[2]~=live_request or
          not digest(lv[3]) or not lv[4] or string.len(lv[4]) == 0 or not digest(lv[5]) or not digest(lv[6]) or
          not live_deadline or not live_sequence or live_sequence < 1 or live_sequence % 1 ~= 0 or
          not live_generation or live_generation < 1 or live_generation % 1 ~= 0 or
-         not live_expiry or not live_score or live_score ~= live_expiry or live_expiry <= now then return {'schema'} end
+         not live_expiry or not live_score or live_score ~= live_expiry or live_expiry <= now or
+         live_deadline <= now or live_expiry > live_deadline or lifecycle_present ~= #lifecycle or
+         lifecycle[1] ~= 'claimed' or lifecycle[2] ~= live_client or lifecycle[3] ~= live_request or
+         lifecycle[4] ~= lv[4] or lifecycle[5] ~= lv[3] or finite(lifecycle[6]) ~= live_deadline or
+         finite(lifecycle[7]) ~= live_sequence or finite(lifecycle[8]) ~= live_generation then return {'schema'} end
       if lv[3] == node_digest then node_live = node_live + 1 end
     end
     local expired = redis.call('ZRANGEBYSCORE', expiries, '-inf', now, 'LIMIT', 0, cleanup_bound)
@@ -1202,7 +1210,7 @@ return {'empty'}
 CLAIM_SCRIPT = ReviewedScript(
     "claim_queued_request_v1",
     CLAIM_SOURCE,
-    "41d47efe407868a829640a350a5727cc5d179259851b93ea7f13ea1aaf8a129b",  # pragma: allowlist secret
+    "70a4c142082c9192a39886ee6046a54c34bee48974f2d9cb97392e4836096695",  # pragma: allowlist secret
     True,
 )
 

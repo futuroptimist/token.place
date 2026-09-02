@@ -3014,6 +3014,108 @@ def test_claim_capacity_counts_only_complete_live_claims(valkey_server):
 
 
 
+def test_claim_capacity_fails_closed_on_nonlive_or_mismatched_lifecycle_authority(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex, claim_ttl_seconds=30)
+    cfg = store._foundation.config
+    owner = _digest("lifecycle-authority-owner")
+    authority_node, target_node = "authority-node", "target-node"
+    authority_identity = ("authority-client", "authority-request")
+    target_identity = ("target-client", "target-request")
+    authority_digests, target_digests = tuple(
+        (
+            hashlib.sha256(f"client\0{client}".encode()).hexdigest(),
+            hashlib.sha256(f"request\0{request}".encode()).hexdigest(),
+        )
+        for client, request in (authority_identity, target_identity)
+    )
+    authority_request_key = cfg.key("request", *authority_digests)
+    authority_claim_key = cfg.key("claim", *authority_digests)
+    target_request_key = cfg.key("request", *target_digests)
+    target_claim_key = cfg.key("claim", *target_digests)
+    authority_member = ":".join(authority_digests)
+    deadline = time.time() + 120
+    try:
+        for node_id in (authority_node, target_node):
+            store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(
+            store, authority_node, owner, *authority_identity, deadline
+        )
+        store.claim_queued_request(authority_node, owner, "authority-consumer")
+        _enqueue_claim_fixture(store, target_node, owner, *target_identity, deadline)
+
+        client = store._foundation._client
+        request_authority = client.hgetall(authority_request_key)
+        claim_authority = client.hgetall(authority_claim_key)
+        original_score = client.zscore(cfg.key("claims:expiry"), authority_member)
+        seconds, micros = client.time()
+        server_now = seconds + micros / 1_000_000
+        cases = (
+            (
+                {b"deadline": str(server_now).encode()},
+                {b"deadline": str(server_now).encode()},
+                server_now + 20,
+            ),
+            (
+                {b"deadline": str(server_now + 10).encode()},
+                {b"deadline": str(server_now + 10).encode()},
+                server_now + 20,
+            ),
+            (None, {}, original_score),
+            ({b"state": b"queued"}, {}, original_score),
+            ({b"node_id": b"other-node"}, {}, original_score),
+            ({b"deadline": str(deadline - 1).encode()}, {}, original_score),
+            ({b"sequence": b"999"}, {}, original_score),
+            ({b"claim_generation": b"999"}, {}, original_score),
+        )
+        for lifecycle_changes, claim_changes, score in cases:
+            client.delete(authority_request_key, authority_claim_key)
+            client.hset(authority_claim_key, mapping=claim_authority)
+            if lifecycle_changes is not None:
+                client.hset(
+                    authority_request_key,
+                    mapping={**request_authority, **lifecycle_changes},
+                )
+            if claim_changes:
+                client.hset(authority_claim_key, mapping=claim_changes)
+            client.zadd(cfg.key("claims:expiry"), {authority_member: score})
+            target_before = client.hgetall(target_request_key)
+            cursor_before = client.hgetall(cfg.key("cursor"))
+            capacity_before = client.zrange(
+                cfg.key("claims:expiry"), 0, -1, withscores=True
+            )
+
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                store.claim_queued_request(target_node, owner, "target-consumer")
+
+            assert client.hgetall(target_request_key) == target_before
+            assert client.hgetall(cfg.key("cursor")) == cursor_before
+            assert (
+                client.zrange(cfg.key("claims:expiry"), 0, -1, withscores=True)
+                == capacity_before
+            )
+            assert client.exists(target_claim_key) == 0
+    finally:
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            authority_request_key,
+            authority_claim_key,
+            target_request_key,
+            target_claim_key,
+        ]
+        for node_id in (authority_node, target_node):
+            node_digest = store._node_digest(node_id)
+            keys.extend((cfg.key("node", node_digest), cfg.key("queue", node_digest)))
+        store._foundation._client.delete(*keys)
+        store.close()
+
+
 def test_claim_result_budget_accepts_large_bounded_result(valkey_server):
     namespace = uuid.uuid4().hex
     max_envelope_bytes = 20_000

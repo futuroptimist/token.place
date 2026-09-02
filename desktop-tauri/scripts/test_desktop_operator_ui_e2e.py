@@ -120,6 +120,12 @@ def fetch_api_v1_registered_node_fingerprints(
     nodes = payload.get("api_v1_registered_compute_nodes")
     if not isinstance(nodes, list):
         raise ValueError("malformed API-v1 registered node diagnostics")
+    declared_count = payload.get("total_api_v1_registered_compute_nodes")
+    if (isinstance(declared_count, bool)
+            or not isinstance(declared_count, int)
+            or declared_count < 0
+            or declared_count != len(nodes)):
+        raise ValueError("malformed API-v1 registered node count")
     fingerprints = []
     for node in nodes:
         if not isinstance(node, dict):
@@ -143,17 +149,14 @@ def fresh_bridge_key_fingerprint(log_path: Path, start_offset: int) -> str | Non
     try:
         with log_path.open("rb") as handle:
             handle.seek(start_offset)
-            content = handle.read(_MAX_FRESH_BRIDGE_LOG_BYTES + 1)
+            content = handle.read(_MAX_FRESH_BRIDGE_LOG_BYTES)
     except (OSError, ValueError):
         return None
-    if len(content) > _MAX_FRESH_BRIDGE_LOG_BYTES:
-        return None
     text = content.decode("utf-8", errors="replace")
-    observations = {(match.group(1), match.group(2))
-        for match in _BRIDGE_RESET_PATTERN.finditer(text)}
+    observations = list(_BRIDGE_RESET_PATTERN.finditer(text))
     if len(observations) != 1:
         return None
-    return next(iter(observations))[1]
+    return observations[0].group(2)
 
 
 def authoritative_registration_matches(relay_url: str, *, timeout_seconds: float,

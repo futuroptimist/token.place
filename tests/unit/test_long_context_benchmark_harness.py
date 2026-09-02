@@ -1298,6 +1298,27 @@ def test_fresh_bridge_fingerprint_ignores_prior_session_log_content(
     assert desktop_runner.fresh_bridge_key_fingerprint(log, 0) is None
 
 
+def test_fresh_bridge_fingerprint_rejects_duplicate_identical_emissions(
+        desktop_runner, tmp_path):
+    log = tmp_path / "runner.log"
+    reset = ("desktop.compute_node_bridge.relay_client.reset "
+        "operator_session_id=current key_fingerprint=abcdef123456\n")
+    log.write_text(reset * 2, encoding="utf-8")
+
+    assert desktop_runner.fresh_bridge_key_fingerprint(log, 0) is None
+
+
+def test_fresh_bridge_fingerprint_ignores_later_bytes_beyond_read_cap(
+        desktop_runner, tmp_path):
+    log = tmp_path / "runner.log"
+    reset = ("desktop.compute_node_bridge.relay_client.reset "
+        "operator_session_id=current key_fingerprint=abcdef123456\n")
+    log.write_text(reset + "x" * desktop_runner._MAX_FRESH_BRIDGE_LOG_BYTES,
+        encoding="utf-8")
+
+    assert desktop_runner.fresh_bridge_key_fingerprint(log, 0) == "abcdef123456"
+
+
 @pytest.mark.parametrize("relay_fingerprints, expected", [
     (["abcdef123456"], True),
     (["111111111111"], False),
@@ -1332,11 +1353,34 @@ def test_api_v1_registered_nodes_malformed_or_absent_fail_closed(
             "https://relay.example", timeout_seconds=0.5)
 
 
+@pytest.mark.parametrize("declared_count", [None, True, -1, 0, 2])
+def test_api_v1_registered_nodes_reject_invalid_or_inconsistent_count(
+        desktop_runner, declared_count):
+    payload = {
+        "total_api_v1_registered_compute_nodes": declared_count,
+        "api_v1_registered_compute_nodes": [{"server_public_key": "public-key"}],
+    }
+
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self):
+            return json.dumps(payload).encode()
+
+    desktop_runner.urlopen = lambda *_args, **_kwargs: Response()
+    with pytest.raises(ValueError, match="^malformed API-v1 registered node count$"):
+        desktop_runner.fetch_api_v1_registered_node_fingerprints(
+            "https://relay.example", timeout_seconds=0.5)
+
+
 def test_node_fingerprint_matches_relay_client_without_exposing_key(desktop_runner):
     from utils.networking.relay_client import RelayClient
 
     public_key = "private-public-key-material"
-    payload = {"api_v1_registered_compute_nodes": [
+    payload = {"total_api_v1_registered_compute_nodes": 1,
+        "api_v1_registered_compute_nodes": [
         {"server_public_key": public_key}]}
 
     class Response:
@@ -1411,7 +1455,7 @@ def test_post_start_operator_state_terminal_authoritative_failure_is_sanitized(
     def fetch(_relay_url, timeout_seconds):
         fetches.append((clock[0], timeout_seconds))
         if len(fetches) == 1:
-            return 0
+            return []
         if isinstance(terminal_result, Exception):
             raise terminal_result
         return terminal_result

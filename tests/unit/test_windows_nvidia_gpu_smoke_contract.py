@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import ast
+import argparse
 import contextlib
 import importlib.util
 import os
+import shutil
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -30,6 +34,7 @@ def _load_ui_e2e_contract() -> ModuleType:
     names = {
         "_classify_webdriver_session_failure",
         "_cleanup_owned_process_tree",
+        "main",
         "packaged_windows_webview2_session",
     }
     functions = [
@@ -41,6 +46,7 @@ def _load_ui_e2e_contract() -> ModuleType:
     module = ModuleType("desktop_operator_ui_e2e_contract")
     module.__dict__.update({
         "Callable": Callable,
+        "argparse": argparse,
         "ConnectTimeoutError": type("ConnectTimeoutError", (Exception,), {}),
         "InvalidArgumentException": type("InvalidArgumentException", (Exception,), {}),
         "NewConnectionError": type("NewConnectionError", (Exception,), {}),
@@ -49,13 +55,22 @@ def _load_ui_e2e_contract() -> ModuleType:
         "ReadTimeoutError": type("ReadTimeoutError", (Exception,), {}),
         "SessionNotCreatedException": type("SessionNotCreatedException", (Exception,), {}),
         "contextlib": contextlib,
+        "LOGS_DIR": Path("unused-logs"),
         "os": os,
         "psutil": psutil,
+        "REPO_ROOT": Path("unused-repository"),
         "reserve_free_port": lambda: 0,
+        "shutil": shutil,
         "start_driver": lambda *_args, **_kwargs: None,
         "subprocess": subprocess,
+        "sys": sys,
+        "TAURI_ROOT": Path("unused-tauri"),
+        "tempfile": tempfile,
         "time": time,
+        "TimeoutException": type("TimeoutException", (Exception,), {}),
         "wait_for_webview2_devtools": lambda *_args, **_kwargs: None,
+        "webdriver": SimpleNamespace(Remote=object, Chrome=object),
+        "WebDriverException": type("WebDriverException", (Exception,), {}),
     })
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(UI_PATH), "exec"),
         module.__dict__)
@@ -195,6 +210,64 @@ def test_packaged_hardware_processes_share_one_log_handle():
     assert 'driver_log.open("a"' not in main_source
     assert "stdout=driver_log_handle" in main_source
     assert "app_binary, env, driver_log_handle" in main_source
+
+
+def test_packaged_hardware_main_uses_shared_log_and_closes_writers(
+        monkeypatch, tmp_path):
+    """Exercise the packaged setup and teardown lines included in patch coverage."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    app = tmp_path / "token-place.exe"
+    model = tmp_path / "model.gguf"
+    app.write_bytes(b"app")
+    model.write_bytes(b"model")
+    processes = []
+    terminated = []
+    session_calls = []
+
+    class Process:
+        pass
+
+    def popen(*_args, **kwargs):
+        process = Process()
+        process.stdout = kwargs["stdout"]
+        processes.append(process)
+        return process
+
+    @contextlib.contextmanager
+    def packaged_session(binary, env, log_handle):
+        session_calls.append((binary, env, log_handle))
+        yield Process(), object()
+
+    monkeypatch.setattr(ui_e2e, "LOGS_DIR", logs)
+    monkeypatch.setattr(ui_e2e, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ui_e2e, "TAURI_ROOT", tmp_path)
+    monkeypatch.setattr(ui_e2e, "reserve_free_port", lambda: 49152)
+    monkeypatch.setattr(ui_e2e.subprocess, "Popen", popen)
+    monkeypatch.setattr(ui_e2e, "tauri_driver_command", lambda: ["tauri-driver"], raising=False)
+    monkeypatch.setattr(ui_e2e, "wait_for_http_200", lambda _url: None, raising=False)
+    monkeypatch.setattr(ui_e2e, "wait_for_port", lambda *_args, **_kwargs: None, raising=False)
+    monkeypatch.setattr(ui_e2e, "ensure_alive", lambda *_args: None, raising=False)
+    monkeypatch.setattr(ui_e2e, "packaged_windows_webview2_session", packaged_session)
+    monkeypatch.setattr(
+        ui_e2e, "WebDriverWait",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("stop after attach")),
+        raising=False,
+    )
+    monkeypatch.setattr(ui_e2e, "terminate_process", terminated.append, raising=False)
+    monkeypatch.setattr(ui_e2e.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path / "home"))
+
+    with pytest.raises(RuntimeError, match="stop after attach"):
+        ui_e2e.main([
+            "--packaged-windows-nvidia-hardware",
+            "--app-binary", str(app),
+            "--model", str(model),
+        ])
+
+    assert len(processes) == 2
+    assert session_calls[0][2] is processes[1].stdout
+    assert processes[1].stdout.closed
+    assert terminated == [processes[1], processes[0]]
 
 
 def test_packaged_webview2_session_rejects_non_windows(monkeypatch, tmp_path):

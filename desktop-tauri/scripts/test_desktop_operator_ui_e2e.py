@@ -144,19 +144,40 @@ _BRIDGE_RESET_PATTERN = re.compile(
 _MAX_FRESH_BRIDGE_LOG_BYTES = 65_536
 
 
+def _bridge_reset_observations(handle) -> list[tuple[str, str]]:
+    """Scan reset records chunkwise without accumulating the log suffix."""
+    observations: list[tuple[str, str]] = []
+    pending = ""
+    while chunk := handle.read(_MAX_FRESH_BRIDGE_LOG_BYTES):
+        text = pending + chunk.decode("utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        pending = ""
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            pending = lines.pop()[-_MAX_FRESH_BRIDGE_LOG_BYTES:]
+        for line in lines:
+            observations.extend(
+                (match.group(1), match.group(2))
+                for match in _BRIDGE_RESET_PATTERN.finditer(line)
+            )
+    if pending:
+        observations.extend(
+            (match.group(1), match.group(2))
+            for match in _BRIDGE_RESET_PATTERN.finditer(pending)
+        )
+    return observations
+
+
 def fresh_bridge_key_fingerprint(log_path: Path, start_offset: int) -> str | None:
-    """Read one session-bound bridge fingerprint emitted after the Start boundary."""
+    """Find exactly one session-bound reset emitted after the Start boundary."""
     try:
         with log_path.open("rb") as handle:
             handle.seek(start_offset)
-            content = handle.read(_MAX_FRESH_BRIDGE_LOG_BYTES)
+            observations = _bridge_reset_observations(handle)
     except (OSError, ValueError):
         return None
-    text = content.decode("utf-8", errors="replace")
-    observations = list(_BRIDGE_RESET_PATTERN.finditer(text))
     if len(observations) != 1:
         return None
-    return observations[0].group(2)
+    return observations[0][1]
 
 
 def authoritative_registration_matches(relay_url: str, *, timeout_seconds: float,
@@ -359,7 +380,7 @@ def wait_for_running_stability(
 
 def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining,
         record_progress, fail_closed, relay_url: str, record_relay_observation,
-        bridge_log: Path = Path("."), bridge_log_start_offset: int = 0) -> None:
+        bridge_log: Path, bridge_log_start_offset: int) -> None:
     """Require the two ordered post-click operator boundaries fail closed."""
     active_attempt_ready = True
     try:

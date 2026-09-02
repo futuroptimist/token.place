@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import ast
+import contextlib
 import importlib.util
+import os
+import subprocess
+import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import Callable
 
+import psutil
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,10 +23,50 @@ assert SPEC and SPEC.loader
 smoke = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(smoke)
 
-UI_SPEC = importlib.util.spec_from_file_location("desktop_operator_ui_e2e", UI_PATH)
-assert UI_SPEC and UI_SPEC.loader
-ui_e2e = importlib.util.module_from_spec(UI_SPEC)
-UI_SPEC.loader.exec_module(ui_e2e)
+
+def _load_ui_e2e_contract() -> ModuleType:
+    """Load only the dependency-free packaged WebView2 contract under test."""
+    tree = ast.parse(UI_PATH.read_text(encoding="utf-8"))
+    names = {
+        "_classify_webdriver_session_failure",
+        "_cleanup_owned_process_tree",
+        "packaged_windows_webview2_session",
+    }
+    functions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in names
+    ]
+    assert {node.name for node in functions} == names
+    module = ModuleType("desktop_operator_ui_e2e_contract")
+    module.__dict__.update({
+        "Callable": Callable,
+        "ConnectTimeoutError": type("ConnectTimeoutError", (Exception,), {}),
+        "InvalidArgumentException": type("InvalidArgumentException", (Exception,), {}),
+        "NewConnectionError": type("NewConnectionError", (Exception,), {}),
+        "Path": Path,
+        "ProtocolError": type("ProtocolError", (Exception,), {}),
+        "ReadTimeoutError": type("ReadTimeoutError", (Exception,), {}),
+        "SessionNotCreatedException": type("SessionNotCreatedException", (Exception,), {}),
+        "contextlib": contextlib,
+        "os": os,
+        "psutil": psutil,
+        "reserve_free_port": lambda: 0,
+        "start_driver": lambda *_args, **_kwargs: None,
+        "subprocess": subprocess,
+        "time": time,
+        "wait_for_webview2_devtools": lambda *_args, **_kwargs: None,
+    })
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(UI_PATH), "exec"),
+        module.__dict__)
+    return module
+
+
+ui_e2e = _load_ui_e2e_contract()
+
+
+def test_ui_contract_loader_does_not_execute_selenium_imports():
+    assert "selenium" not in ui_e2e.__dict__
 
 
 class _ApplicationProcess:

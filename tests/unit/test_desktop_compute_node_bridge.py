@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -2900,6 +2901,12 @@ class ComputeNodeRuntime:
 
     env = os.environ.copy()
     env.pop('PYTHONPATH', None)
+    env['TOKENPLACE_OPERATOR_LOG_FILE'] = str(tmp_path / 'operator.log')
+    popen_process_group = (
+        {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
+        if sys.platform == 'win32'
+        else {'start_new_session': True}
+    )
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -2918,23 +2925,49 @@ class ComputeNodeRuntime:
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        cwd=tmp_path,
+        **popen_process_group,
     )
-    assert proc.stdin is not None
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-    proc.stdin.write('{"type":"cancel"}\n')
-    proc.stdin.flush()
-    proc.stdin.close()
-    proc.wait(timeout=10)
-    stdout = proc.stdout.read()
-    stderr = proc.stderr.read()
+    stdout = ''
+    stderr = ''
+    try:
+        # Drain both pipes while the bridge shuts down.  Waiting before reading
+        # can deadlock on Windows once its smaller pipe buffer fills.
+        stdout, stderr = proc.communicate(input='{"type":"cancel"}\n', timeout=10)
 
-    assert proc.returncode == 0, stderr
-    events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
-    started = next(event for event in events if event.get('type') == 'started')
-    assert started.get('context_tier') == '8k-fast'
-    assert any(event.get('type') == 'stopped' for event in events)
-    assert "No module named 'utils'" not in stdout
+        assert proc.returncode == 0, stderr
+        events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+        started = next(event for event in events if event.get('type') == 'started')
+        assert started.get('context_tier') == '8k-fast'
+        assert any(event.get('type') == 'stopped' for event in events)
+        assert "No module named 'utils'" not in stdout
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ''
+        stderr = exc.stderr or ''
+        pytest.fail(
+            'packaged bridge did not stop within 10 seconds'
+            f'\nstdout:\n{stdout}\nstderr:\n{stderr}',
+        )
+    finally:
+        if proc.poll() is None:
+            try:
+                if sys.platform == 'win32':
+                    subprocess.run(
+                        ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                    )
+                else:
+                    os.killpg(proc.pid, signal.SIGKILL)
+            except (OSError, subprocess.TimeoutExpired):
+                proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate(timeout=5)
 
 
 def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tmp_path):

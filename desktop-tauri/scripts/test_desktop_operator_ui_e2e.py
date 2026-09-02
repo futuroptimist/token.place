@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -109,6 +110,66 @@ def fetch_relay_diagnostics_count(relay_url: str, *, timeout_seconds: float) -> 
     return int(payload["total_api_v1_registered_compute_nodes"])
 
 
+def fetch_api_v1_registered_compute_nodes(
+        relay_url: str, *, timeout_seconds: float) -> list[dict[str, object]]:
+    """Return the authoritative API-v1 node set, rejecting partial diagnostics."""
+    with urlopen(f"{relay_url}/relay/diagnostics", timeout=timeout_seconds) as response:  # nosec B310
+        payload = json.loads(response.read().decode("utf-8"))
+    nodes = payload.get("api_v1_registered_compute_nodes")
+    if not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes):
+        raise ValueError("malformed_api_v1_registered_compute_nodes")
+    return nodes
+
+
+def api_v1_public_key_fingerprint(public_key: object) -> str | None:
+    """Mirror RelayClient's privacy-safe public-key fingerprint algorithm."""
+    if not isinstance(public_key, str) or not public_key:
+        return None
+    return hashlib.sha256(public_key.encode("utf-8")).hexdigest()[:12]
+
+
+def registered_api_v1_node_fingerprints(
+        nodes: list[dict[str, object]]) -> list[str] | None:
+    """Fingerprint a complete diagnostics node set, failing closed if malformed."""
+    if not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes):
+        return None
+    fingerprints = [
+        api_v1_public_key_fingerprint(node.get("server_public_key")) for node in nodes
+    ]
+    if any(fingerprint is None for fingerprint in fingerprints):
+        return None
+    return [fingerprint for fingerprint in fingerprints if fingerprint is not None]
+
+
+def fresh_bridge_key_fingerprint(log_path: Path, start_boundary: int) -> str | None:
+    """Read a reset marker written after the runner-owned pre-Start byte boundary."""
+    try:
+        with log_path.open("rb") as log_file:
+            log_file.seek(start_boundary)
+            fresh_output = log_file.read(64 * 1024).decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+    matches = re.findall(
+        r"desktop\.compute_node_bridge\.relay_client\.reset\s+"
+        r"[^\r\n]*\boperator_session_id=\S+[^\r\n]*\bkey_fingerprint=([0-9a-f]{12})\b",
+        fresh_output,
+    )
+    return matches[-1] if len(set(matches)) == 1 else None
+
+
+def authoritative_local_registration_observed(
+        relay_url: str, *, timeout_seconds: float, driver_log: Path,
+        start_boundary: int) -> bool:
+    """Require one relay node whose identity is the fresh local bridge identity."""
+    local_fingerprint = fresh_bridge_key_fingerprint(driver_log, start_boundary)
+    if local_fingerprint is None:
+        return False
+    nodes = fetch_api_v1_registered_compute_nodes(
+        relay_url, timeout_seconds=timeout_seconds)
+    fingerprints = registered_api_v1_node_fingerprints(nodes)
+    return fingerprints == [local_fingerprint]
+
+
 def require_clean_relay_registration_baseline(
         relay_url: str, *, timeout_seconds: float, fail_closed,
         record_relay_observation) -> int:
@@ -120,15 +181,15 @@ def require_clean_relay_registration_baseline(
             fail_closed("operator_registration_not_reached")
         record_relay_observation("polled")
         try:
-            registered = fetch_relay_diagnostics_count(
+            nodes = fetch_api_v1_registered_compute_nodes(
                 relay_url, timeout_seconds=max(0.05, min(remaining, 0.5)))
         except Exception:
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
             continue
-        if registered != 0:
+        if nodes:
             record_relay_observation("not_reached")
             fail_closed("operator_registration_not_reached")
-        return registered
+        return 0
 
 
 def wait_for_relay_diagnostics_count(relay_url: str, expected_count: int, timeout_seconds: float) -> float:
@@ -297,7 +358,8 @@ def wait_for_running_stability(
 
 
 def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining,
-        record_progress, fail_closed, relay_url: str, record_relay_observation) -> None:
+        record_progress, fail_closed, relay_url: str, record_relay_observation,
+        driver_log: Path, start_boundary: int) -> None:
     """Require the two ordered post-click operator boundaries fail closed."""
     active_attempt_ready = True
     try:
@@ -332,8 +394,9 @@ def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining
             return False
         record_relay_observation("polled")
         try:
-            registered = fetch_relay_diagnostics_count(
-                relay_url, timeout_seconds=min(remaining, 0.5)) == 1
+            registered = authoritative_local_registration_observed(
+                relay_url, timeout_seconds=min(remaining, 0.5),
+                driver_log=driver_log, start_boundary=start_boundary)
         except Exception:
             return False
         if registered:
@@ -349,8 +412,9 @@ def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining
         if remaining > 0:
             record_relay_observation("polled")
             try:
-                terminal_registered = fetch_relay_diagnostics_count(
-                    relay_url, timeout_seconds=min(remaining, 0.5)) == 1
+                terminal_registered = authoritative_local_registration_observed(
+                    relay_url, timeout_seconds=min(remaining, 0.5),
+                    driver_log=driver_log, start_boundary=start_boundary)
             except Exception:
                 terminal_registered = False
         if not terminal_registered:
@@ -1926,11 +1990,13 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         require_clean_relay_registration_baseline(
             request["relay_url"], timeout_seconds=setup_remaining(),
             fail_closed=fail_closed, record_relay_observation=record_relay_observation)
+        driver_log_boundary = driver_log.stat().st_size
         driver.find_element(By.XPATH, "//button[.='Start operator']").click()
         operator_progress = "operator_started"
         wait_for_post_start_operator_state(
             driver, setup_remaining, record_operator_progress, fail_closed,
-            request["relay_url"], record_relay_observation)
+            request["relay_url"], record_relay_observation, driver_log,
+            driver_log_boundary)
         write_phase("operator_ready")
 
         _validate_operator_tokenizer_handoff(tokenizer_evidence, fail_closed)

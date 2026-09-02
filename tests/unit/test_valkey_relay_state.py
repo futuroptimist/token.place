@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import logging
 import math
 import re
@@ -29,6 +30,7 @@ from valkey_relay_state import (
 )
 from relay_state_store import (
     EncryptedRequestEnvelope,
+    RelayStateCapacityExceeded,
     RelayStateConflict,
     RelayStateCredentialMismatch,
     RelayStateInvalidReservation,
@@ -959,6 +961,181 @@ def test_claimed_request_validates_identity_before_reading_state():
     with pytest.raises(RelayStateStoreError, match="request identity is invalid"):
         store.claimed_request("node-a", "12345")
     foundation.read_manifest.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ([b"owner"], RelayStateCredentialMismatch),
+        ([b"capacity"], RelayStateCapacityExceeded),
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"claimed"], ValkeySchemaIncompatibleError),
+        (
+            [b"claimed", b"0", b"9", b"10", b"client", b"request", b"{}"],
+            ValkeySchemaIncompatibleError,
+        ),
+        (
+            [
+                b"claimed",
+                b"1",
+                b"11",
+                b"10",
+                b"client",
+                b"request",
+                b"{}",
+            ],
+            ValkeySchemaIncompatibleError,
+        ),
+        (
+            [
+                b"claimed",
+                b"1",
+                b"9",
+                b"10",
+                b"",
+                b"request",
+                b"{}",
+            ],
+            ValkeySchemaIncompatibleError,
+        ),
+    ],
+)
+def test_claim_translates_malformed_and_fixed_script_results(result, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(expected):
+        store.claim_queued_request("node-a", "a" * 64, "consumer")
+
+
+def test_claim_empty_and_valid_results_are_decoded():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    foundation.execute.return_value = [b"empty"]
+    assert store.claim_queued_request("node-a", "a" * 64, "consumer").state == "empty"
+
+    envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "ciphertext": "ciphertext",
+        "cipherkey": "cipherkey",
+        "iv": "iv",
+    }
+    foundation.execute.return_value = [
+        b"reclaimed",
+        b"2",
+        b"9",
+        b"10",
+        b"client",
+        b"request",
+        json.dumps(envelope).encode(),
+    ]
+    result = store.claim_queued_request("node-a", "a" * 64, "consumer")
+    assert (result.state, result.generation, result.client_public_key) == (
+        "reclaimed",
+        2,
+        "client",
+    )
+
+
+@pytest.mark.parametrize("raw", ["not-bytes", b"[]", b"{}", b"not-json"])
+def test_claim_envelope_decoder_rejects_malformed_values(raw):
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        ValkeyRegistrationStore._decode_request_envelope(raw)
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_status"),
+    [
+        ([b"missing_or_expired"], "missing_or_expired"),
+        ([b"owner_mismatch"], "owner_mismatch"),
+        ([b"stale_generation", b"2"], "stale_generation"),
+        ([b"continued", b"2", b"9.5"], "continued"),
+    ],
+)
+def test_renew_claim_decodes_each_fixed_result(result, expected_status):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    renewal = store.renew_claim(
+        "node-a", "a" * 64, "consumer", "client", "request", 2
+    )
+    assert renewal.state == expected_status
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        [b"schema"],
+        [b"stale_generation", b"0"],
+        [b"continued", b"0", b"9"],
+        [b"continued", b"1", b"nan"],
+        [b"unknown"],
+    ],
+)
+def test_renew_claim_rejects_malformed_script_results(result):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 1)
+
+
+def test_claim_input_and_acknowledgement_validation_precede_dispatch():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(RelayStateStoreError, match="consumer identity"):
+        store.claim_queued_request("node-a", "a" * 64, "")
+    with pytest.raises(RelayStateStoreError, match="request id is required"):
+        store.claimed_request("node-a", "")
+    with pytest.raises(RelayStateStoreError, match="claim generation"):
+        store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 0)
+    with pytest.raises(RelayStateStoreError, match="control tombstones"):
+        store.renew_claim_or_read_control(
+            "node-a",
+            "a" * 64,
+            "consumer",
+            "client",
+            "request",
+            1,
+            acknowledge=True,
+        )
+    foundation.execute.assert_not_called()
+
+
+def test_renew_or_read_control_delegates_when_not_acknowledging():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = [b"missing_or_expired"]
+    store = registration_store_with_foundation(foundation)
+
+    result = store.renew_claim_or_read_control(
+        "node-a", "a" * 64, "consumer", "client", "request", 1
+    )
+    assert result.state == "missing_or_expired"
+
+
+def test_live_claims_tolerates_a_removed_registration_after_read_gate():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation.server_time.return_value = (1, 0)
+    foundation._call.return_value = [None, None, None]
+    store = registration_store_with_foundation(foundation)
+
+    assert store.active_claims("node-a") == ()
+    foundation.check_read_compatible.assert_called_once_with(
+        foundation.read_manifest.return_value
+    )
 
 
 @pytest.mark.parametrize(

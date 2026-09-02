@@ -2771,6 +2771,135 @@ def test_main_does_not_import_compute_runtime_for_mode_normalization(monkeypatch
     assert compute_node_bridge.main() == 0
 
 
+def _cleanup_packaged_bridge_process(proc):
+    """Terminate and reap a packaged bridge without any unbounded operations."""
+    failures = []
+
+    if proc.poll() is None:
+        if sys.platform == 'win32':
+            try:
+                taskkill_result = subprocess.run(
+                    ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+                if taskkill_result.returncode != 0:
+                    failures.append(f'taskkill exited with {taskkill_result.returncode}')
+                    try:
+                        proc.kill()
+                    except OSError as kill_exc:
+                        failures.append(f'parent kill failed: {kill_exc!r}')
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                failures.append(f'taskkill failed: {exc!r}')
+                try:
+                    proc.kill()
+                except OSError as kill_exc:
+                    failures.append(f'parent kill failed: {kill_exc!r}')
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError as exc:
+                failures.append(f'process-group kill failed: {exc!r}')
+                try:
+                    proc.kill()
+                except OSError as kill_exc:
+                    failures.append(f'parent kill failed: {kill_exc!r}')
+
+    for attempt in range(2):
+        try:
+            proc.communicate(timeout=5)
+            return failures
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            failures.append(f'pipe drain attempt {attempt + 1} failed: {exc!r}')
+            try:
+                proc.kill()
+            except OSError as kill_exc:
+                failures.append(f'parent kill attempt {attempt + 1} failed: {kill_exc!r}')
+
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError as exc:
+                failures.append(f'pipe close failed: {exc!r}')
+
+    try:
+        proc.communicate(timeout=5)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        failures.append(f'final reap failed: {exc!r}')
+    return failures
+
+
+def _communicate_with_packaged_bridge_cleanup(proc):
+    timeout_diagnostic = None
+    stdout = ''
+    stderr = ''
+    try:
+        stdout, stderr = proc.communicate(input='{"type":"cancel"}\n', timeout=10)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ''
+        stderr = exc.stderr or ''
+        timeout_diagnostic = (
+            'packaged bridge did not stop within 10 seconds'
+            f'\nstdout:\n{stdout}\nstderr:\n{stderr}'
+        )
+
+    cleanup_failures = _cleanup_packaged_bridge_process(proc)
+    if timeout_diagnostic is not None:
+        if cleanup_failures:
+            timeout_diagnostic += '\ncleanup failures:\n' + '\n'.join(cleanup_failures)
+        pytest.fail(timeout_diagnostic)
+    if cleanup_failures:
+        pytest.fail('packaged bridge cleanup failed:\n' + '\n'.join(cleanup_failures))
+    return stdout, stderr
+
+
+def test_packaged_bridge_timeout_cleanup_is_bounded_and_preserves_diagnostic(monkeypatch):
+    class _Pipe:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class _Process:
+        pid = 123
+        returncode = None
+        stdin = _Pipe()
+        stdout = _Pipe()
+        stderr = _Pipe()
+
+        def __init__(self):
+            self.communicate_calls = []
+
+        def communicate(self, input=None, timeout=None):
+            self.communicate_calls.append((input, timeout))
+            if input is not None:
+                raise subprocess.TimeoutExpired('bridge', timeout, 'primary stdout', 'primary stderr')
+            raise subprocess.TimeoutExpired('bridge', timeout)
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            return None
+
+    proc = _Process()
+    monkeypatch.setattr(os, 'killpg', lambda *_args: None)
+
+    with pytest.raises(pytest.fail.Exception, match='(?s)primary stdout.*cleanup failures'):
+        _communicate_with_packaged_bridge_cleanup(proc)
+
+    assert proc.communicate_calls == [
+        ('{"type":"cancel"}\n', 10),
+        (None, 5),
+        (None, 5),
+        (None, 5),
+    ]
+    assert all(pipe.closed for pipe in (proc.stdin, proc.stdout, proc.stderr))
+
+
 def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_path):
     python_dir = tmp_path / 'bin' / 'resources' / 'python'
     import_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
@@ -2928,65 +3057,16 @@ class ComputeNodeRuntime:
         cwd=tmp_path,
         **popen_process_group,
     )
-    stdout = ''
-    stderr = ''
-    try:
-        # Drain both pipes while the bridge shuts down.  Waiting before reading
-        # can deadlock on Windows once its smaller pipe buffer fills.
-        stdout, stderr = proc.communicate(input='{"type":"cancel"}\n', timeout=10)
+    # Drain both pipes while the bridge shuts down. Waiting before reading can
+    # deadlock on Windows once its smaller pipe buffer fills.
+    stdout, stderr = _communicate_with_packaged_bridge_cleanup(proc)
 
-        assert proc.returncode == 0, stderr
-        events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
-        started = next(event for event in events if event.get('type') == 'started')
-        assert started.get('context_tier') == '8k-fast'
-        assert any(event.get('type') == 'stopped' for event in events)
-        assert "No module named 'utils'" not in stdout
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ''
-        stderr = exc.stderr or ''
-        pytest.fail(
-            'packaged bridge did not stop within 10 seconds'
-            f'\nstdout:\n{stdout}\nstderr:\n{stderr}',
-        )
-    finally:
-        if proc.poll() is None:
-            try:
-                if sys.platform == 'win32':
-                    taskkill_result = subprocess.run(
-                        ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=5,
-                    )
-                    if taskkill_result.returncode != 0:
-                        proc.kill()
-                else:
-                    os.killpg(proc.pid, signal.SIGKILL)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
-        try:
-            proc.communicate(timeout=5)
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
-                proc.communicate(timeout=5)
-            except (OSError, subprocess.TimeoutExpired, ValueError):
-                # A descendant can keep inherited pipe handles open even after
-                # the bridge is dead. Cleanup is best-effort and must not mask
-                # the test's original assertion or timeout failure.
-                for pipe in (proc.stdin, proc.stdout, proc.stderr):
-                    if pipe is not None:
-                        try:
-                            pipe.close()
-                        except OSError:
-                            pass
+    assert proc.returncode == 0, stderr
+    events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+    started = next(event for event in events if event.get('type') == 'started')
+    assert started.get('context_tier') == '8k-fast'
+    assert any(event.get('type') == 'stopped' for event in events)
+    assert "No module named 'utils'" not in stdout
 
 
 def test_main_subprocess_emits_structured_error_when_context_profiles_missing(tmp_path):

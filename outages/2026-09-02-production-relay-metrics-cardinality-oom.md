@@ -82,7 +82,7 @@ sampled maxima may be lower than instantaneous peaks.
 | 2026-09-02 17:05:00 | 2026-09-03 00:05:00 | Restart counter was 7. |
 | 2026-09-02 17:50:09 | 2026-09-03 00:50:09 | Kubernetes recorded the prior container termination as `OOMKilled`, exit code 137. |
 | During initial triage | During initial triage | The affected pod had reached 15 restarts. Kubernetes events included 251 BackOff events over approximately 73 minutes. A later historical query showed a maximum restart count of 16. |
-| 2026-09-02 18:07:50 | 2026-09-03 01:07:50 | After verifying the exact production target, the operator changed only the ServiceMonitor `release` label from `kube-prometheus-stack` to `incident-paused-tokenplace-oom`, then deleted only the OOM-looping pod. No image rollback or Deployment change occurred. |
+| 2026-09-02 18:07:50 | 2026-09-03 01:07:50 | After verifying the exact production target, the operator changed only the ServiceMonitor discovery label so Prometheus no longer selected the target, then deleted only the OOM-looping pod. No image rollback or Deployment change occurred. |
 | 2026-09-02 18:08:18 | 2026-09-03 01:08:18 | Replacement pod started, became ready, and ended the confirmed impact window with a fresh pod-level `emptyDir`. |
 
 ## Technical root cause
@@ -158,21 +158,18 @@ deployment are attributed as the trigger.
 
 ## Recovery and resolution
 
-At 2026-09-03T01:07:50Z, the operator first verified the Kubernetes context (`sugar-prod`),
-namespace and Deployment (`tokenplace`), exact image, replica count, memory limit, and
-ServiceMonitor configuration. The operator then:
+At 2026-09-03T01:07:50Z, the operator first verified the production Kubernetes context,
+namespace, Deployment, exact image, replica count, memory limit, and ServiceMonitor configuration.
+The operator then:
 
-1. paused Prometheus discovery of only the token.place target by changing the ServiceMonitor's
-   `release` label from `kube-prometheus-stack` to `incident-paused-tokenplace-oom`;
-2. deleted only affected pod `tokenplace-7758c45ffb-dqccb` (UID
-   `e151eed5-6ecf-466e-9cc2-79956ea71903`) so Kubernetes created a new pod and fresh pod-level
+1. paused Prometheus discovery of only the token.place target by changing its ServiceMonitor
+   discovery label;
+2. deleted only the affected pod so Kubernetes created a replacement with a fresh pod-level
    `emptyDir`; and
 3. did not roll back the image or change the Deployment.
 
-The replacement was `tokenplace-7758c45ffb-fr45t` (UID
-`2d1a6ad9-aff9-40d9-a3f3-60ed062c387b`) on node `sugarkube0`. It started at
-`2026-09-03T01:08:18Z`, reported Ready `True`, and had zero restarts during mitigation
-verification.
+The replacement started at `2026-09-03T01:08:18Z`, reported Ready `True`, and had zero restarts
+during mitigation verification.
 
 This emergency action removed the accumulated pod-level metric files and stopped scheduled
 scrapes from rebuilding or serializing the unsafe metric set. It restored application service but

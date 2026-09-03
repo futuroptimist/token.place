@@ -28,6 +28,7 @@ from relay_state_store import (
 from tests.registration_store_contract import assert_registration_contract
 from valkey_relay_state import (
     CLAIM_SCRIPT,
+    RENEW_CLAIM_SCRIPT,
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
     DirectPrimary,
@@ -2922,11 +2923,13 @@ def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_s
         first.close()
         second.close()
 
-def _enqueue_claim_fixture(store, node_id, owner, client, request, deadline):
+def _enqueue_claim_fixture(
+    store, node_id, owner, client, request, deadline, envelope=None
+):
     selection = store.select_and_reserve(
         client, request, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
     )
-    envelope = EncryptedRequestEnvelope(
+    envelope = envelope or EncryptedRequestEnvelope(
         "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
     )
     store.enqueue_encrypted_request(
@@ -3126,6 +3129,379 @@ def _claim_authority_snapshot(store, node_id, client_id, request_id):
         datastore.xrange(cfg.key("queue", node)),
         datastore.zrange(cfg.key("claims:expiry"), 0, -1, withscores=True),
     )
+
+def _claim_namespace_snapshot(store, node_id, identities):
+    cfg = store._foundation.config
+    node = store._node_digest(node_id)
+    keys = [
+        cfg.key("nodes:lease"),
+        cfg.key("cursor"),
+        cfg.key("requests:deadline"),
+        cfg.key("claims:expiry"),
+        cfg.key("node", node),
+        cfg.key("queue", node),
+    ]
+    for client_id, request_id in identities:
+        client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
+        request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
+        keys.extend(
+            (cfg.key("request", client, request), cfg.key("claim", client, request))
+        )
+    client = store._foundation._client
+    return tuple(client.dump(key) for key in keys)
+
+
+def test_claim_namespace_isolation_covers_claim_renewal_and_reads(valkey_server):
+    stores = [
+        _registration_store(valkey_server, uuid.uuid4().hex, claim_ttl_seconds=2)
+        for _ in range(2)
+    ]
+    node_id = "shared-claim-node"
+    identity = ("shared-client-key", "shared-request-id")
+    owners = (_digest("namespace-owner-a"), _digest("namespace-owner-b"))
+    consumers = ("namespace-consumer-a", "namespace-consumer-b")
+    envelopes = (
+        EncryptedRequestEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "ciphertext-a", "cipherkey-a", "iv-a"
+        ),
+        EncryptedRequestEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "ciphertext-b", "cipherkey-b", "iv-b"
+        ),
+    )
+    try:
+        results = []
+        for store, owner, consumer, envelope in zip(
+            stores, owners, consumers, envelopes
+        ):
+            store.register(node_id, _capabilities(), owner)
+            deadline = store._foundation.server_time()[0] + 30
+            selection = store.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+            )
+            store.enqueue_encrypted_request(
+                *identity,
+                selection.reservation_token,
+                node_id,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                envelope,
+                "cancel",
+            )
+            results.append(store.claim_queued_request(node_id, owner, consumer))
+
+        before_other = _claim_namespace_snapshot(stores[1], node_id, (identity,))
+        renewed = stores[0].renew_claim(
+            node_id, owners[0], consumers[0], *identity, results[0].generation
+        )
+        assert renewed.state == "continued"
+        assert (
+            _claim_namespace_snapshot(stores[1], node_id, (identity,)) == before_other
+        )
+
+        for index, store in enumerate(stores):
+            active = store.active_claims(node_id)
+            claimed = store.claimed_request(node_id, identity[1])
+            assert len(active) == 1 and claimed is not None
+            queued, claim = claimed
+            assert claim == active[0]
+            assert claim.control_credential_digest == owners[index]
+            assert claim.consumer_identity_digest == store._consumer_digest(
+                consumers[index]
+            )
+            assert queued.envelope == envelopes[index]
+            assert claim.envelope == envelopes[index]
+            assert store.claimed_request(node_id, "unrelated-request") is None
+    finally:
+        for store in stores:
+            _delete_claim_fixture_state(store, (node_id,), (identity,))
+            store.close()
+
+
+def test_claim_compatibility_gates_fail_closed_before_state_or_scripts(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex, claim_ttl_seconds=2)
+    owner, node_id = _digest("compatibility-owner"), "compatibility-node"
+    identity = ("compatibility-client", "compatibility-request")
+    cfg = store._foundation.config
+    schema_key = cfg.key("schema")
+    original_call = store._foundation._call
+    try:
+        store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(
+            store, node_id, owner, *identity, store._foundation.server_time()[0] + 30
+        )
+        claim = store.claim_queued_request(node_id, owner, "compatibility-consumer")
+        baseline = _claim_namespace_snapshot(store, node_id, (identity,))
+
+        cases = (
+            (
+                _manifest(reader_min=2, reader_max=2),
+                (
+                    lambda: store.active_claims(node_id),
+                    lambda: store.claimed_request(node_id, identity[1]),
+                    lambda: store.claim_queued_request(node_id, owner, "consumer-two"),
+                    lambda: store.renew_claim(
+                        node_id,
+                        owner,
+                        "compatibility-consumer",
+                        *identity,
+                        claim.generation,
+                    ),
+                ),
+            ),
+            (
+                _manifest(writer_min=2, writer_max=2, active_writer_revision=2),
+                (
+                    lambda: store.claim_queued_request(node_id, owner, "consumer-two"),
+                    lambda: store.renew_claim(
+                        node_id,
+                        owner,
+                        "compatibility-consumer",
+                        *identity,
+                        claim.generation,
+                    ),
+                ),
+            ),
+        )
+        for manifest, operations in cases:
+            store._foundation._client.set(schema_key, manifest.encode())
+            for operation in operations:
+                commands = []
+
+                def record_command(command, *args, **kwargs):
+                    commands.append(command.__name__.lower())
+                    return original_call(command, *args, **kwargs)
+
+                store._foundation._call = record_command
+                with pytest.raises(
+                    ValkeySchemaIncompatibleError,
+                    match="^state schema incompatible$",
+                ):
+                    operation()
+                assert not {"zrangebyscore", "hmget", "xrange", "evalsha"}.intersection(
+                    commands
+                )
+                assert (
+                    _claim_namespace_snapshot(store, node_id, (identity,)) == baseline
+                )
+
+            if manifest.writer_min == 2:
+                assert len(store.active_claims(node_id)) == 1
+                assert store.claimed_request(node_id, identity[1]) is not None
+
+        for script, mutation in (
+            (
+                CLAIM_SCRIPT,
+                lambda: store.claim_queued_request(node_id, owner, "consumer-two"),
+            ),
+            (
+                RENEW_CLAIM_SCRIPT,
+                lambda: store.renew_claim(
+                    node_id,
+                    owner,
+                    "compatibility-consumer",
+                    *identity,
+                    claim.generation,
+                ),
+            ),
+        ):
+            digests = dict(SCRIPT_DIGESTS)
+            digests[script.name] = "0" * 64
+            store._foundation._client.set(
+                schema_key, _manifest(script_digests=digests).encode()
+            )
+            commands = []
+
+            def record_command(command, *args, **kwargs):
+                commands.append(command.__name__.lower())
+                return original_call(command, *args, **kwargs)
+
+            store._foundation._call = record_command
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                mutation()
+            assert "evalsha" not in commands
+            assert _claim_namespace_snapshot(store, node_id, (identity,)) == baseline
+    finally:
+        store._foundation._call = original_call
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize("failure", ("connection", "readonly"))
+@pytest.mark.parametrize("operation", ("active", "claimed", "claim", "renew"))
+def test_claim_backend_failures_are_typed_redacted_and_not_replayed(
+    valkey_server, caplog, operation, failure
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex, claim_ttl_seconds=2)
+    raw_owner = "raw-owner-credential-marker"
+    owner, node_id = _digest(raw_owner), "private-node-marker"
+    identities = (
+        ("public-key-marker", "request-id-marker"),
+        ("second-public-key-marker", "second-request-id-marker"),
+    )
+    consumer = "consumer-identity-marker"
+    cfg = store._foundation.config
+    endpoint_marker = "private-backend-endpoint-marker"
+    ciphertext_marker = "ciphertext-sensitive-marker"
+    cipher_key_marker = "sensitive-cipher-key-marker"
+    iv_marker = "sensitive-iv-marker"
+    key_marker = cfg.key("claim", _digest("private-client"), _digest("private-request"))
+    original_evalsha = store._foundation._client.evalsha
+    original_zrange = store._foundation._client.zrangebyscore
+    calls = 0
+    try:
+        store.register(node_id, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 30
+        envelope = EncryptedRequestEnvelope(
+            "tokenplace_api_v1_relay_e2ee",
+            1,
+            ciphertext_marker,
+            cipher_key_marker,
+            iv_marker,
+        )
+        for identity in identities:
+            _enqueue_claim_fixture(
+                store, node_id, owner, *identity, deadline, envelope=envelope
+            )
+        claimed = store.claim_queued_request(node_id, owner, consumer)
+        store._foundation._client.script_load(CLAIM_SCRIPT.source)
+        store._foundation._client.script_load(RENEW_CLAIM_SCRIPT.source)
+        before = _claim_namespace_snapshot(store, node_id, identities)
+
+        def fail(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            message = " ".join(
+                (
+                    endpoint_marker,
+                    raw_owner,
+                    owner,
+                    consumer,
+                    *identities[0],
+                    ciphertext_marker,
+                    cipher_key_marker,
+                    iv_marker,
+                    key_marker,
+                )
+            )
+            if failure == "readonly":
+                raise redis.ResponseError("READONLY " + message)
+            raise redis.ConnectionError(message)
+
+        if operation in {"active", "claimed"}:
+            store._foundation._client.zrangebyscore = fail
+            invoke = (
+                (lambda: store.active_claims(node_id))
+                if operation == "active"
+                else (lambda: store.claimed_request(node_id, identities[0][1]))
+            )
+        else:
+            store._foundation._client.evalsha = fail
+            invoke = (
+                (lambda: store.claim_queued_request(node_id, owner, "other-consumer"))
+                if operation == "claim"
+                else lambda: store.renew_claim(
+                    node_id, owner, consumer, *identities[0], claimed.generation
+                )
+            )
+        expected = (
+            ValkeyReadOnlyError if failure == "readonly" else ValkeyUnavailableError
+        )
+        expected_message = (
+            "^state backend is not writable$"
+            if failure == "readonly"
+            else "^state backend unavailable$"
+        )
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(expected, match=expected_message) as caught:
+                invoke()
+        assert calls == (
+            1 if operation in {"claim", "renew"} or failure == "readonly" else 2
+        )
+        rendered = "".join(
+            (
+                str(caught.value),
+                repr(caught.value),
+                "".join(traceback.format_exception(caught.value)),
+                caplog.text,
+                repr(store),
+                repr(store._foundation),
+                repr(store._foundation.config),
+                repr(store._foundation.config.direct),
+            )
+        )
+        markers = (
+            endpoint_marker,
+            raw_owner,
+            owner,
+            consumer,
+            *identities[0],
+            ciphertext_marker,
+            cipher_key_marker,
+            iv_marker,
+            key_marker,
+        )
+        assert all(marker not in rendered for marker in markers)
+        assert caught.value.__cause__ is None
+        store._foundation._client.evalsha = original_evalsha
+        store._foundation._client.zrangebyscore = original_zrange
+        assert _claim_namespace_snapshot(store, node_id, identities) == before
+    finally:
+        store._foundation._client.evalsha = original_evalsha
+        store._foundation._client.zrangebyscore = original_zrange
+        _delete_claim_fixture_state(store, (node_id,), identities)
+        store.close()
+
+
+def test_claim_unknown_fields_survive_renewal_and_reclaim(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex, claim_ttl_seconds=0.08)
+    owner, node_id = _digest("additive-owner"), "additive-node"
+    identity = ("additive-client", "additive-request")
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    request_key = cfg.key("request", client, request)
+    claim_key = cfg.key("claim", client, request)
+    future_request = b"future-request-value"
+    future_claim = b"future-claim-value"
+    try:
+        store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(
+            store, node_id, owner, *identity, store._foundation.server_time()[0] + 30
+        )
+        claimed = store.claim_queued_request(node_id, owner, "additive-consumer-one")
+        store._foundation._client.hset(request_key, "future_request", future_request)
+        store._foundation._client.hset(claim_key, "future_claim", future_claim)
+
+        renewed = store.renew_claim(
+            node_id,
+            owner,
+            "additive-consumer-one",
+            *identity,
+            claimed.generation,
+        )
+        assert renewed.state == "continued"
+        assert (
+            store._foundation._client.hget(request_key, "future_request")
+            == future_request
+        )
+        assert store._foundation._client.hget(claim_key, "future_claim") == future_claim
+
+        _wait_for_server_epoch(store, renewed.lease_expires_at_epoch)
+        reclaimed = store.claim_queued_request(node_id, owner, "additive-consumer-two")
+        assert reclaimed.state == "reclaimed"
+        assert reclaimed.generation > claimed.generation
+        assert (
+            store._foundation._client.hget(request_key, "future_request")
+            == future_request
+        )
+        assert store._foundation._client.hget(claim_key, "future_claim") == future_claim
+    finally:
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store.close()
+
+
+
 
 def test_renew_claim_authenticates_exact_live_authority(valkey_server):
     namespace = uuid.uuid4().hex

@@ -27,6 +27,7 @@ from relay_state_store import (
 )
 from tests.registration_store_contract import assert_registration_contract
 from valkey_relay_state import (
+    CLAIM_SCRIPT,
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
     DirectPrimary,
@@ -2666,6 +2667,124 @@ def test_expire_lost_reply_does_not_consume_a_hidden_retry_batch(valkey_server):
         store._foundation._client.evalsha = original_evalsha
         store._foundation._client.delete(*_registration_keys(store, *node_ids))
         store.close()
+
+
+def test_ambiguous_claim_result_is_not_replayed_and_reclaims_monotonically(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.08)
+    second = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.08)
+    owner, node_id = _digest("ambiguous-claim-owner"), "ambiguous-claim-node"
+    identity = ("ambiguous-claim-client", "ambiguous-claim-request")
+    consumer = "ambiguous-claim-consumer"
+    cfg = first._foundation.config
+    node = first._node_digest(node_id)
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    request_key = cfg.key("request", client, request)
+    claim_key = cfg.key("claim", client, request)
+    original_evalsha = first._foundation._client.evalsha
+    dispatches = 0
+    try:
+        first.register(node_id, _capabilities(), owner)
+        deadline = first._foundation.server_time()[0] + 30
+        envelope = _enqueue_claim_fixture(first, node_id, owner, *identity, deadline)
+        loaded = first._foundation._client.script_load(CLAIM_SCRIPT.source)
+        loaded = loaded.decode() if isinstance(loaded, bytes) else loaded
+        assert loaded == CLAIM_SCRIPT.eval_sha1
+
+        def lose_claim_result(*args, **kwargs):
+            nonlocal dispatches
+            assert args[0] == CLAIM_SCRIPT.eval_sha1
+            dispatches += 1
+            original_evalsha(*args, **kwargs)
+            raise redis.ConnectionError("ambiguous-claim-private-marker")
+
+        first._foundation._client.evalsha = lose_claim_result
+        try:
+            with pytest.raises(
+                ValkeyUnavailableError, match="^state backend unavailable$"
+            ) as caught:
+                first.claim_queued_request(node_id, owner, consumer)
+        finally:
+            first._foundation._client.evalsha = original_evalsha
+        assert dispatches == 1
+        assert caught.value.__cause__ is None
+        assert "ambiguous-claim-private-marker" not in "".join(
+            traceback.format_exception(caught.value)
+        )
+
+        live = second.active_claims(node_id)
+        claimed = second.claimed_request(node_id, identity[1])
+        assert len(live) == 1 and claimed is not None
+        queued, committed = claimed
+        assert committed == live[0]
+        assert queued.envelope == envelope
+        assert (queued.client_public_key, queued.request_id) == identity
+        assert second._foundation._client.hget(request_key, "state") == b"claimed"
+        assert second._foundation._client.xlen(cfg.key("queue", node)) == 1
+        assert second._foundation._client.zcard(cfg.key("requests:deadline")) == 1
+        assert second._foundation._client.zcard(cfg.key("claims:expiry")) == 1
+        assert (
+            second._foundation._client.zscore(cfg.key("claims:expiry"), member)
+            == committed.lease_expires_at_epoch
+        )
+        assert second._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+        assert second._foundation._client.zcard(cfg.key("terminals:expiry")) == 0
+        assert (
+            second._foundation._client.hget(
+                cfg.key("node", node), "scheduler_claimed_work"
+            )
+            == b"0"
+        )
+        assert (
+            second.claim_queued_request(node_id, owner, "other-consumer").state
+            == "empty"
+        )
+
+        generations = [committed.generation]
+        leases = [committed.lease_expires_at_epoch]
+        for consumer_identity in ("reclaim-consumer-one", "reclaim-consumer-two"):
+            _wait_for_server_epoch(second, leases[-1])
+            assert second.active_claims(node_id) == ()
+            assert second._foundation._client.xlen(cfg.key("queue", node)) == 1
+            assert second._foundation._client.zcard(cfg.key("requests:deadline")) == 1
+            assert second._foundation._client.zcard(cfg.key("terminals:expiry")) == 0
+            assert second._foundation._client.hget(request_key, "state") == b"claimed"
+            reclaimed = second.claim_queued_request(node_id, owner, consumer_identity)
+            assert reclaimed.state == "reclaimed"
+            generations.append(reclaimed.generation)
+            leases.append(reclaimed.lease_expires_at_epoch)
+            assert second._foundation._client.xlen(cfg.key("queue", node)) == 1
+            assert second._foundation._client.zcard(cfg.key("claims:expiry")) == 1
+
+        assert generations == sorted(set(generations))
+        assert all(new > old for old, new in zip(generations, generations[1:]))
+        assert len(second.active_claims(node_id)) == 1
+        assert len(second._foundation._client.hgetall(request_key)) > 0
+        assert len(second._foundation._client.hgetall(claim_key)) > 0
+        for stale_generation, stale_consumer in zip(
+            generations[:-1], (consumer, "reclaim-consumer-one")
+        ):
+            before = _claim_authority_snapshot(second, node_id, *identity)
+            stale = second.renew_claim(
+                node_id,
+                owner,
+                stale_consumer,
+                *identity,
+                stale_generation,
+            )
+            assert stale.state == "stale_generation"
+            assert stale.generation == generations[-1]
+            assert _claim_authority_snapshot(second, node_id, *identity) == before
+    finally:
+        first._foundation._client.evalsha = original_evalsha
+        _delete_claim_fixture_state(first, (node_id,), (identity,))
+        first._foundation._client.delete(cfg.key("terminals:expiry"))
+        first.close()
+        second.close()
 
 
 def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_server):

@@ -408,6 +408,14 @@ resilience work and did not cause this incident.
   data, arbitrary diagnostic payloads, source addresses, private evidence paths, screenshots, and
   raw log archives are intentionally excluded.
 
+## Related incident
+
+Stable process uptime after this incident's mitigation exposed a distinct, pre-existing
+[public-information rate-limit defect on September 3](2026-09-03-production-public-information-rate-limit-exhaustion.md).
+Application-metrics scraping remained paused throughout that incident. The later quota exhaustion
+does not alter this incident's metrics-cardinality root cause; both records instead identify a
+shared release-line parity and production-qualification weakness.
+
 ## Verification commands and public references
 
 Repository commands used to validate this documentation change:

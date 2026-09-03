@@ -108,10 +108,10 @@ memory leak.
    1,679 at 23:30 UTC, 2,719 of 2,741 at 23:40 UTC, and 4,093 of 4,124 at 23:46:30 UTC.
 3. Distinct path values rapidly multiplied the number of application series. Flask series grew
    from 28,964 at 23:30 UTC to 70,529 at 23:46:30 UTC and peaked at 71,056 at 23:48 UTC.
-4. Every 30-second scrape collected and serialized approximately 71,088 samples. The resulting
-   exposition was approximately 7.79 MB and took approximately 6–8 seconds. Historical Prometheus
-   scrape duration rose from 3.102 seconds at 23:30 UTC to 6.150 seconds at 23:40 UTC and reached
-   an observed maximum of 8.238 seconds.
+4. Prometheus scraped 28,996 samples at 23:30 UTC, 47,050 at 23:40 UTC, and 71,088 at the
+   23:48 UTC peak. During the crash loop, exposition responses were approximately 7.79 MB and took
+   approximately 6–8 seconds. Historical Prometheus scrape duration rose from 3.102 seconds at
+   23:30 UTC to 6.150 seconds at 23:40 UTC and reached an observed maximum of 8.238 seconds.
 5. Relay memory approached the container's 268,435,456-byte limit. The largest 30-second working
    set sample was 247,996,416 bytes (approximately 92.4%); the largest RSS sample was 242,376,704
    bytes. The samples need not capture the instantaneous allocation that crossed the hard limit.
@@ -309,7 +309,7 @@ not constitute production resolution: corrected-image deployment and verificatio
 | P0 | Detect | Define per-target budgets and alerts for `scrape_samples_scraped`, `scrape_series_added`, `scrape_duration_seconds`, and distinct bounded route-label counts. | Detects exporter growth before memory exhaustion. | Unassigned | Proposed | Each budget has a documented threshold and tested alert. |
 | P1 | Detect | Add a dashboard combining application cardinality, scrape sample count/size, scrape latency, memory headroom, and restarts. | Correlated signals shorten diagnosis. | Unassigned | Proposed | Dashboard panels populate from a staging cardinality exercise. |
 | P0 | Detect | Add a release/staging gate that rejects linear series growth from unique unknown paths. | Stops reintroduction before production. | Unassigned | Proposed | Gate fails an intentionally unbounded fixture and passes bounded instrumentation. |
-| P0 | Detect | Add a release/artifact provenance gate that verifies the deployed commit descends from required hardening merges. | Prevents a release lineage from omitting fixes already implemented on `main`. | Unassigned | Proposed | Promotion fails for an artifact without `e0e2685` ancestry and records the verified image and source commit identities. |
+| P0 | Detect | Add a release/artifact provenance gate that requires either verified `e0e2685` ancestry or an explicitly reviewed and tested behavior-equivalent backport for the focused release-line hotfix. | Prevents a divergent release lineage from omitting required hardening while retaining the documented manual-hotfix strategy. | Unassigned | Proposed | Promotion verifies `e0e2685` ancestry or an explicitly reviewed equivalent backport, passes the bounded-registry negative/cardinality tests, and records the image and source commit identities and qualification path. |
 | P1 | Detect | Retain privacy-safe aggregate access evidence long enough to classify future triggers without raw credentials, query strings, encrypted payloads, or sensitive paths. | Improves attribution confidence without weakening privacy. | Unassigned | Proposed | Retention and redaction review proves only bounded aggregates are stored. |
 | P0 | Mitigate | Write a metrics-induced OOM-loop runbook: validate context/target, pause only its ServiceMonitor, replace the pod, verify public health, and keep scraping paused until exit criteria pass. | Makes the safe, narrow recovery repeatable. | Unassigned | Proposed | A non-production exercise completes with no unrelated target mutation. |
 | P0 | Mitigate | Add a bounded emergency setting that disables expensive application metrics while retaining liveness, readiness, and minimal operational metrics. | Preserves minimum observability without exercising unsafe exposition. | Unassigned | Proposed | Exercise shows minimal metrics and health remain available with bounded resource use. |

@@ -2824,6 +2824,176 @@ def _enqueue_claim_fixture(store, node_id, owner, client, request, deadline):
     return envelope
 
 
+def _delete_claim_fixture_state(store, node_ids, identities):
+    cfg = store._foundation.config
+    keys = [
+        cfg.key("schema"),
+        cfg.key("nodes:lease"),
+        cfg.key("cursor"),
+        cfg.key("reservations:expiry"),
+        cfg.key("requests:deadline"),
+        cfg.key("claims:expiry"),
+    ]
+    for node_id in node_ids:
+        node = store._node_digest(node_id)
+        keys.extend((cfg.key("node", node), cfg.key("queue", node)))
+    for client_id, request_id in identities:
+        client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
+        request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
+        keys.extend(
+            (cfg.key("request", client, request), cfg.key("claim", client, request))
+        )
+    store._foundation._client.delete(*keys)
+
+
+def test_claim_fifo_skips_live_claim_and_returns_typed_empty(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner, node_id = _digest("fifo-owner"), "fifo-node"
+    identities = (
+        ("fifo-client-a", "fifo-request-a"),
+        ("fifo-client-b", "fifo-request-b"),
+    )
+    deadline = first._foundation.server_time()[0] + 30
+    cfg = first._foundation.config
+    node = first._node_digest(node_id)
+    try:
+        first.register(node_id, _capabilities(concurrency=2), owner)
+        envelopes = tuple(
+            _enqueue_claim_fixture(first, node_id, owner, *identity, deadline)
+            for identity in identities
+        )
+
+        claimed = tuple(
+            store.claim_queued_request(node_id, owner, f"fifo-consumer-{index}")
+            for index, store in enumerate((second, first), 1)
+        )
+        for result, identity, envelope in zip(claimed, identities, envelopes):
+            assert result.state == "claimed"
+            assert (result.client_public_key, result.request_id) == identity
+            assert result.envelope == envelope
+
+        empty = second.claim_queued_request(node_id, owner, "fifo-consumer-empty")
+        assert empty.state == "empty"
+        assert empty.generation is None
+        assert first._foundation._client.xlen(cfg.key("queue", node)) == 2
+        assert first._foundation._client.zcard(cfg.key("claims:expiry")) == 2
+        assert first._foundation._client.zcard(cfg.key("requests:deadline")) == 2
+        assert first._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
+        assert len(first.active_claims(node_id)) == 2
+        assert first._foundation._client.hget(
+            cfg.key("node", node), "scheduler_claimed_work"
+        ) == b"0"
+    finally:
+        _delete_claim_fixture_state(first, (node_id,), identities)
+        first.close()
+        second.close()
+
+
+def test_claim_rejections_are_typed_and_non_mutating(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace, lease_ttl_seconds=0.08)
+    owner, node_id = _digest("rejection-owner"), "rejection-node"
+    identity = ("rejection-client", "rejection-request")
+    cfg = store._foundation.config
+    node = store._node_digest(node_id)
+    try:
+        registration = store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(
+            store, node_id, owner, *identity, store._foundation.server_time()[0] + 30
+        )
+
+        def snapshot():
+            return (
+                store._foundation._client.hgetall(cfg.key("node", node)),
+                store._foundation._client.xrange(cfg.key("queue", node)),
+                store._foundation._client.zrange(
+                    cfg.key("requests:deadline"), 0, -1, withscores=True
+                ),
+                store._foundation._client.hgetall(cfg.key("cursor")),
+                store._foundation._client.zrange(
+                    cfg.key("claims:expiry"), 0, -1, withscores=True
+                ),
+            )
+
+        for attempted_node, attempted_owner in (
+            (node_id, _digest("wrong-owner")),
+            ("unknown-node", owner),
+        ):
+            before = snapshot()
+            with pytest.raises(
+                RelayStateCredentialMismatch, match="claim owner is invalid"
+            ):
+                store.claim_queued_request(
+                    attempted_node, attempted_owner, "rejection-consumer"
+                )
+            assert snapshot() == before
+
+        _wait_for_server_epoch(store, registration.lease_expires_at_epoch)
+        before = snapshot()
+        with pytest.raises(
+            RelayStateCredentialMismatch, match="claim owner is invalid"
+        ):
+            store.claim_queued_request(node_id, owner, "rejection-consumer")
+        assert snapshot() == before
+
+        store.register(node_id, _capabilities(), owner)
+        assert store.unregister(node_id, owner)
+        before = snapshot()
+        with pytest.raises(
+            RelayStateCredentialMismatch, match="claim owner is invalid"
+        ):
+            store.claim_queued_request(node_id, owner, "rejection-consumer")
+        assert snapshot() == before
+        assert store._foundation._client.zcard(cfg.key("claims:expiry")) == 0
+    finally:
+        _delete_claim_fixture_state(store, (node_id, "unknown-node"), (identity,))
+        store.close()
+
+
+def test_claim_lease_is_bounded_by_request_deadline(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server, namespace, claim_ttl_seconds=2, lease_ttl_seconds=5
+    )
+    owner, node_id = _digest("deadline-owner"), "deadline-node"
+    identity = ("deadline-client", "deadline-request")
+    cfg = store._foundation.config
+    node = store._node_digest(node_id)
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    try:
+        store.register(node_id, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 0.32
+        _enqueue_claim_fixture(store, node_id, owner, *identity, deadline)
+
+        result = store.claim_queued_request(node_id, owner, "deadline-consumer")
+        assert result.state == "claimed"
+        assert result.request_deadline_epoch == deadline
+        assert result.lease_expires_at_epoch <= deadline
+        assert store._foundation._client.xlen(cfg.key("queue", node)) == 1
+        assert store._foundation._client.hget(
+            cfg.key("request", client, request), "claim_generation"
+        ) == str(result.generation).encode()
+
+        _wait_for_server_epoch(store, deadline)
+        assert store.active_claims(node_id) == ()
+        empty = store.claim_queued_request(node_id, owner, "deadline-consumer-final")
+        assert empty.state == "empty" and empty.generation is None
+        assert store._foundation._client.zscore(
+            cfg.key("claims:expiry"), f"{client}:{request}"
+        ) == deadline
+        assert store._foundation._client.hget(
+            cfg.key("request", client, request), "claim_generation"
+        ) == str(result.generation).encode()
+        assert store._foundation._client.xlen(cfg.key("queue", node)) == 1
+    finally:
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store.close()
+
+
 def _claim_authority_snapshot(store, node_id, client_id, request_id):
     cfg = store._foundation.config
     client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()

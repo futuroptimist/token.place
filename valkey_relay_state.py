@@ -1196,12 +1196,13 @@ for _, entry in ipairs(entries) do
     if node_live >= max_node then return {'capacity'} end
     local generation=redis.call('HINCRBY',cursor,'_claim_generation',1)
     local expires=math.min(now+ttl,deadline)
+    local expires_value=expires == deadline and rv[8] or tostring(expires)
     if expires <= now then return {'empty'} end
     redis.call('HSET',ck,'client',client,'request',request,'node_digest',node_digest,'node_id',node_id,
       'owner_digest',owner,'consumer_digest',consumer,'deadline',rv[8],'sequence',rv[10],
-      'generation',generation,'lease_expires',expires)
-    redis.call('ZADD',expiries,expires,member); redis.call('HSET',rk,'state','claimed','claim_generation',generation)
-    return {reclaim and 'reclaimed' or 'claimed',tostring(generation),tostring(expires),rv[8],rv[4],rv[5],rv[9]}
+      'generation',generation,'lease_expires',expires_value)
+    redis.call('ZADD',expiries,expires_value,member); redis.call('HSET',rk,'state','claimed','claim_generation',generation)
+    return {reclaim and 'reclaimed' or 'claimed',tostring(generation),expires_value,rv[8],rv[4],rv[5],rv[9]}
     end
   end
 end
@@ -1210,7 +1211,7 @@ return {'empty'}
 CLAIM_SCRIPT = ReviewedScript(
     "claim_queued_request_v1",
     CLAIM_SOURCE,
-    "70a4c142082c9192a39886ee6046a54c34bee48974f2d9cb97392e4836096695",  # pragma: allowlist secret
+    "2b8079831f5a736e3ac257135464a6c355bfe418ab119a4e2d92ccdb05012b68",  # pragma: allowlist secret
     True,
 )
 

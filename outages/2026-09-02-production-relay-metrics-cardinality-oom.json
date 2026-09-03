@@ -1,0 +1,8 @@
+{
+  "date": "2026-09-02",
+  "slug": "production-relay-metrics-cardinality-oom",
+  "summary": "Unbounded HTTP path labels in default Flask request instrumentation caused application metric cardinality and scrape serialization cost to grow until the sole production relay exceeded its 256Mi memory limit, was OOM-killed, and intermittently left Traefik without an available backend.",
+  "impact": "Production was intermittently unavailable during an approximately 87-minute crash loop, and repeated process termination created an unquantified risk of losing active memory-backed API-v1 relay state; no customer data loss was proven or quantified.",
+  "fix": "The operator mitigated the incident by pausing discovery of only the token.place ServiceMonitor and replacing the affected pod to obtain a fresh pod-level emptyDir, without changing the Deployment or image; the permanent bounded-cardinality fix and deliberate restoration of application scraping remain pending.",
+  "lessons": "Application metric labels must be bounded, cardinality and scrape cost need proactive budgets and alerts, Prometheus multiprocess files must be safely cleared on application-container startup, and a single replica amplifies process failures while memory-backed authoritative state limits HA options."
+}

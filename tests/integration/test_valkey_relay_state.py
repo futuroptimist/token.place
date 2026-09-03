@@ -2968,6 +2968,173 @@ def _delete_claim_fixture_state(store, node_ids, identities):
     store._foundation._client.delete(*keys)
 
 
+@pytest.mark.parametrize(
+    "malformed_authority",
+    (
+        "queue_client_digest",
+        "queue_request_digest",
+        "request_deadline_nan",
+        "request_deadline_inf",
+        "request_deadline_zero",
+        "node_lease_nan",
+        "node_lease_inf",
+        "request_sequence_zero",
+        "request_sequence_fractional",
+        "request_sequence_mismatch",
+        "claim_deadline_nan",
+        "claim_sequence_zero",
+        "claim_sequence_fractional",
+        "claim_generation_zero",
+        "claim_generation_fractional",
+        "claim_lease_nan",
+        "oversized_client_public_key",
+        "empty_client_public_key",
+        "oversized_request_id",
+        "empty_request_id",
+        "oversized_envelope",
+        "empty_envelope",
+        "malformed_generation_cursor",
+        "generation_cursor_behind_reclaim",
+    ),
+)
+def test_claim_queued_request_rejects_malformed_addressed_authority_without_mutation(
+    valkey_server, malformed_authority
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex, claim_ttl_seconds=30)
+    cfg = store._foundation.config
+    client = store._foundation._client
+    owner, node_id = _digest("malformed-owner"), "malformed-node"
+    client_id, request_id = "malformed-client", "malformed-request"
+    client_digest = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
+    request_digest = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
+    node_digest = store._node_digest(node_id)
+    request_key = cfg.key("request", client_digest, request_digest)
+    claim_key = cfg.key("claim", client_digest, request_digest)
+    queue_key = cfg.key("queue", node_digest)
+    cursor_key = cfg.key("cursor")
+    claims_expiry_key = cfg.key("claims:expiry")
+    member = f"{client_digest}:{request_digest}"
+    deadline = store._foundation.server_time()[0] + 120
+    node_key = cfg.key("node", node_digest)
+    sorted_set_keys = (
+        cfg.key("nodes:lease"),
+        claims_expiry_key,
+        cfg.key("requests:deadline"),
+        cfg.key("reservations:expiry"),
+    )
+
+    def snapshot():
+        return (
+            client.hgetall(node_key),
+            client.xrange(queue_key),
+            client.hgetall(request_key),
+            client.hgetall(claim_key),
+            client.hgetall(cursor_key),
+            tuple(client.zrange(key, 0, -1, withscores=True) for key in sorted_set_keys),
+        )
+    try:
+        store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(
+            store, node_id, owner, client_id, request_id, deadline
+        )
+
+        reclaim_case = malformed_authority.startswith("claim_") or (
+            malformed_authority == "generation_cursor_behind_reclaim"
+        )
+        if reclaim_case:
+            claimed = store.claim_queued_request(node_id, owner, "first-consumer")
+            expired = store._foundation.server_time()[0] - 1
+            client.hset(claim_key, "lease_expires", expired)
+            client.zadd(claims_expiry_key, {member: expired})
+
+        if malformed_authority == "queue_client_digest":
+            client.xdel(queue_key, "1-0")
+            client.xadd(
+                queue_key,
+                {"client": "g" * 64, "request": request_digest},
+                id="2-0",
+            )
+        elif malformed_authority == "queue_request_digest":
+            client.xdel(queue_key, "1-0")
+            client.xadd(
+                queue_key,
+                {"client": client_digest, "request": "z" * 64},
+                id="2-0",
+            )
+        elif malformed_authority == "request_deadline_nan":
+            client.hset(request_key, "deadline", "nan")
+        elif malformed_authority == "request_deadline_inf":
+            client.hset(request_key, "deadline", "inf")
+        elif malformed_authority == "request_deadline_zero":
+            client.hset(request_key, "deadline", "0")
+        elif malformed_authority == "node_lease_nan":
+            client.hset(node_key, "lease_expires_at_epoch", "nan")
+        elif malformed_authority == "node_lease_inf":
+            client.hset(node_key, "lease_expires_at_epoch", "inf")
+            client.zadd(cfg.key("nodes:lease"), {node_digest: "+inf"})
+        elif malformed_authority == "request_sequence_zero":
+            client.hset(request_key, "sequence", "0")
+        elif malformed_authority == "request_sequence_fractional":
+            client.hset(request_key, "sequence", "1.5")
+        elif malformed_authority == "request_sequence_mismatch":
+            client.hset(request_key, "sequence", "2")
+        elif malformed_authority == "claim_deadline_nan":
+            client.hset(claim_key, "deadline", "nan")
+        elif malformed_authority == "claim_sequence_zero":
+            client.hset(claim_key, "sequence", "0")
+        elif malformed_authority == "claim_sequence_fractional":
+            client.hset(claim_key, "sequence", "1.5")
+        elif malformed_authority == "claim_generation_zero":
+            client.hset(claim_key, "generation", "0")
+            client.hset(request_key, "claim_generation", "0")
+        elif malformed_authority == "claim_generation_fractional":
+            client.hset(claim_key, "generation", "1.5")
+            client.hset(request_key, "claim_generation", "1.5")
+        elif malformed_authority == "claim_lease_nan":
+            client.hset(claim_key, "lease_expires", "nan")
+        elif malformed_authority == "oversized_client_public_key":
+            client.hset(
+                request_key,
+                "client_public_key",
+                b"k" * (store.config.max_identity_bytes + 1),
+            )
+        elif malformed_authority == "empty_client_public_key":
+            client.hset(request_key, "client_public_key", b"")
+        elif malformed_authority == "oversized_request_id":
+            client.hset(
+                request_key,
+                "request_id",
+                b"r" * (store.config.max_identity_bytes + 1),
+            )
+        elif malformed_authority == "empty_request_id":
+            client.hset(request_key, "request_id", b"")
+        elif malformed_authority == "oversized_envelope":
+            client.hset(
+                request_key,
+                "envelope",
+                b"e" * (store.config.max_envelope_bytes + 1),
+            )
+        elif malformed_authority == "empty_envelope":
+            client.hset(request_key, "envelope", b"")
+        elif malformed_authority == "malformed_generation_cursor":
+            client.hset(cursor_key, "_claim_generation", "not-an-integer")
+        elif malformed_authority == "generation_cursor_behind_reclaim":
+            assert claimed.generation > 0
+            client.hset(cursor_key, "_claim_generation", claimed.generation - 1)
+
+        before = snapshot()
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ) as caught:
+            store.claim_queued_request(node_id, owner, "rejected-consumer")
+
+        assert str(caught.value) == "state schema incompatible"
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(store, (node_id,), ((client_id, request_id),))
+        store.close()
+
+
 def test_claim_fifo_skips_live_claim_and_returns_typed_empty(valkey_server):
     namespace = uuid.uuid4().hex
     first = _registration_store(valkey_server, namespace)

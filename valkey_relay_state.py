@@ -1116,6 +1116,7 @@ CLAIM_SOURCE = """\
 local leases, node, queue, expiries, cursor = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
 local prefix, node_digest, node_id, owner, consumer = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
 local ttl, max_global, max_node, queue_bound, cleanup_bound = tonumber(ARGV[6]), tonumber(ARGV[7]), tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10])
+local max_identity, max_envelope = tonumber(ARGV[11]), tonumber(ARGV[12])
 local t = redis.call('TIME'); local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 local function digest(value)
   return value and string.len(value) == 64 and not string.find(value, '[^0-9a-f]')
@@ -1124,24 +1125,36 @@ local function finite(value)
   local number = tonumber(value)
   return number and number == number and math.abs(number) ~= math.huge and number
 end
+local function positive_integer(value)
+  local number = finite(value)
+  return number and number >= 1 and number <= 9007199254740990 and number % 1 == 0 and number
+end
 local indexed_lease = redis.call('ZSCORE', leases, node_digest)
-if not indexed_lease or tonumber(indexed_lease) <= now or redis.call('EXISTS', node) == 0 then return {'owner'} end
+if not indexed_lease or redis.call('EXISTS', node) == 0 then return {'owner'} end
 local nv = redis.call('HMGET', node, 'node_id', 'control_credential_digest', 'scheduler_draining', 'lease_expires_at_epoch')
 for i=1,#nv do if not nv[i] then return {'schema'} end end
-local node_lease = tonumber(nv[4])
-if not node_lease or math.abs(node_lease - tonumber(indexed_lease)) > 0.000001 then return {'schema'} end
+local node_lease, indexed_node_lease = finite(nv[4]), finite(indexed_lease)
+if not node_lease or not indexed_node_lease or node_lease ~= indexed_node_lease then return {'schema'} end
+if node_lease <= now then return {'owner'} end
 if nv[1] ~= node_id or nv[2] ~= owner or (nv[3] ~= '0' and nv[3] ~= '1') then return {'owner'} end
 local entries = redis.call('XRANGE', queue, '-', '+', 'COUNT', queue_bound)
 for _, entry in ipairs(entries) do
   local f = entry[2]; local client, request
   for i=1,#f,2 do if f[i]=='client' then client=f[i+1] elseif f[i]=='request' then request=f[i+1] end end
-  if not client or not request or #f ~= 4 or string.len(client) ~= 64 or string.len(request) ~= 64 then return {'schema'} end
+  if not client or not request or #f ~= 4 or not digest(client) or not digest(request) then return {'schema'} end
   local rk = prefix .. 'request:' .. client .. ':' .. request
   local rv = redis.call('HMGET', rk, 'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','envelope','sequence','queue_entry','claim_generation')
   local present=0 for i=1,#rv do if rv[i] then present=present+1 end end
-  if present == 0 then return {'schema'} elseif present < 11 then return {'schema'} end
-  local deadline = tonumber(rv[8]); local sequence = tonumber(rv[10])
-  if not deadline or not sequence or rv[2]~=client or rv[3]~=request or rv[6]~=node_id or rv[7]~=node_digest or rv[11]~=entry[1] then return {'schema'} end
+  if present == 0 then return {'schema'} end
+  for i=1,11 do if not rv[i] then return {'schema'} end end
+  local deadline = finite(rv[8]); local sequence = positive_integer(rv[10])
+  if not deadline or deadline <= 0 or not sequence or tostring(sequence)~=rv[10] or
+     rv[2]~=client or rv[3]~=request or rv[6]~=node_id or rv[7]~=node_digest or
+     not digest(rv[2]) or not digest(rv[3]) or not digest(rv[7]) or
+     string.len(rv[4]) < 1 or string.len(rv[4]) > max_identity or
+     string.len(rv[5]) < 1 or string.len(rv[5]) > max_identity or
+     string.len(rv[9]) < 1 or string.len(rv[9]) > max_envelope or
+     rv[11]~=entry[1] or rv[11]~=rv[10] .. '-0' then return {'schema'} end
   if deadline > now and (rv[1]=='queued' or rv[1]=='claimed') then
     local member=client .. ':' .. request; local ck=prefix .. 'claim:' .. client .. ':' .. request
     local fields={'client','request','node_digest','node_id','owner_digest','consumer_digest','deadline','sequence','generation','lease_expires'}
@@ -1152,14 +1165,17 @@ for _, entry in ipairs(entries) do
     if old_present == 0 then
       if rv[1] ~= 'queued' or rv[12] then return {'schema'} end
     else
-      local old_deadline=tonumber(old[7]); local old_sequence=tonumber(old[8]); local old_generation=tonumber(old[9]); local old_expiry=tonumber(old[10])
+      local old_deadline=finite(old[7]); local old_sequence=positive_integer(old[8]); local old_generation=positive_integer(old[9]); local old_expiry=finite(old[10])
       local indexed_expiry=redis.call('ZSCORE',expiries,member)
-      if not old_deadline or not old_sequence or not old_generation or old_generation < 1 or not old_expiry or
+      local indexed_expiry_value=indexed_expiry and finite(indexed_expiry)
+      local lifecycle_generation=positive_integer(rv[12])
+      if not old_deadline or not old_sequence or not old_generation or not old_expiry or old_expiry <= 0 or
          old[1]~=client or old[2]~=request or old[3]~=node_digest or old[4]~=node_id or
          not digest(old[3]) or not digest(old[5]) or not digest(old[6]) or
-         old_deadline~=deadline or old_sequence~=sequence or (indexed_expiry and tonumber(indexed_expiry)~=old_expiry) or
+         old_deadline~=deadline or old_sequence~=sequence or not lifecycle_generation or lifecycle_generation~=old_generation or
+         (indexed_expiry and (not indexed_expiry_value or indexed_expiry_value~=old_expiry)) or
          (old_expiry > now and not indexed_expiry) or
-         rv[1]~='claimed' or tonumber(rv[12])~=old_generation then return {'schema'} end
+         rv[1]~='claimed' then return {'schema'} end
       if old_expiry <= now then reclaim = true else reclaim = nil end
     end
     if reclaim ~= nil then
@@ -1190,11 +1206,16 @@ for _, entry in ipairs(entries) do
          finite(lifecycle[7]) ~= live_sequence or finite(lifecycle[8]) ~= live_generation then return {'schema'} end
       if lv[3] == node_digest then node_live = node_live + 1 end
     end
+    local cursor_value=redis.call('HGET',cursor,'_claim_generation')
+    local cursor_generation=cursor_value and finite(cursor_value) or 0
+    if (cursor_value and (not cursor_generation or cursor_generation < 0 or cursor_generation > 9007199254740990 or cursor_generation % 1 ~= 0 or tostring(cursor_generation) ~= cursor_value)) or
+       (reclaim and cursor_generation < positive_integer(old[9])) then return {'schema'} end
     local expired = redis.call('ZRANGEBYSCORE', expiries, '-inf', now, 'LIMIT', 0, cleanup_bound)
     if #expired > 0 then redis.call('ZREM', expiries, unpack(expired)) end
     if #live >= max_global then return {'capacity'} end
     if node_live >= max_node then return {'capacity'} end
     local generation=redis.call('HINCRBY',cursor,'_claim_generation',1)
+    if generation <= cursor_generation or (reclaim and generation <= positive_integer(old[9])) then return {'schema'} end
     local expires=math.min(now+ttl,deadline)
     local expires_value=expires == deadline and rv[8] or tostring(expires)
     if expires <= now then return {'empty'} end
@@ -1211,7 +1232,7 @@ return {'empty'}
 CLAIM_SCRIPT = ReviewedScript(
     "claim_queued_request_v1",
     CLAIM_SOURCE,
-    "2b8079831f5a736e3ac257135464a6c355bfe418ab119a4e2d92ccdb05012b68",  # pragma: allowlist secret
+    "a0c37525aa891260d1f96c7ad98ef5eeca564dd5baa85fb5b5d1a0234b9f3edc",  # pragma: allowlist secret
     True,
 )
 
@@ -2151,6 +2172,8 @@ class ValkeyRegistrationStore:
             str(self.config.max_claims_per_node).encode(),
             str(self.config.max_queue_depth_per_node).encode(),
             str(self.config.node_transition_batch_size).encode(),
+            str(self.config.max_identity_bytes).encode(),
+            str(self.config.max_envelope_bytes).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(

@@ -2843,56 +2843,100 @@ def test_renew_claim_authenticates_exact_live_authority(valkey_server):
     first = _registration_store(valkey_server, namespace, claim_ttl_seconds=2)
     second = _registration_store(valkey_server, namespace, claim_ttl_seconds=2)
     owner = _digest("exact-renew-owner")
+    other_owner = _digest("exact-renew-other-owner")
     node_id = "exact-renew-node"
+    other_node_id = "exact-renew-other-node"
     identity = ("exact-renew-client", "exact-renew-request")
     deadline = first._foundation.server_time()[0] + 60
     cfg = first._foundation.config
     node = first._node_digest(node_id)
+    other_node = first._node_digest(other_node_id)
     client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
     request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
     try:
         first.register(node_id, _capabilities(), owner)
         _enqueue_claim_fixture(first, node_id, owner, *identity, deadline)
         claim = first.claim_queued_request(node_id, owner, "exact-consumer")
+        first.register(other_node_id, _capabilities(), other_owner)
 
         rejected = (
             (
-                node_id,
-                _digest("other-owner"),
-                "exact-consumer",
-                *identity,
-                claim.generation,
-            ),
-            (node_id, owner, "other-consumer", *identity, claim.generation),
-            ("other-node", owner, "exact-consumer", *identity, claim.generation),
-            (
-                node_id,
-                owner,
-                "exact-consumer",
-                "other-client",
-                identity[1],
-                claim.generation,
+                (
+                    node_id,
+                    _digest("other-owner"),
+                    "exact-consumer",
+                    *identity,
+                    claim.generation,
+                ),
+                "owner_mismatch",
             ),
             (
-                node_id,
-                owner,
-                "exact-consumer",
-                identity[0],
-                "other-request",
-                claim.generation,
+                (node_id, owner, "other-consumer", *identity, claim.generation),
+                "owner_mismatch",
             ),
-            (node_id, owner, "exact-consumer", *identity, claim.generation + 1),
+            (
+                (
+                    other_node_id,
+                    other_owner,
+                    "exact-consumer",
+                    *identity,
+                    claim.generation,
+                ),
+                "owner_mismatch",
+            ),
+            (
+                (
+                    node_id,
+                    owner,
+                    "exact-consumer",
+                    "other-client",
+                    identity[1],
+                    claim.generation,
+                ),
+                "missing_or_expired",
+            ),
+            (
+                (
+                    node_id,
+                    owner,
+                    "exact-consumer",
+                    identity[0],
+                    "other-request",
+                    claim.generation,
+                ),
+                "missing_or_expired",
+            ),
+            (
+                (node_id, owner, "exact-consumer", *identity, claim.generation + 1),
+                "stale_generation",
+            ),
         )
-        for arguments in rejected:
+        for arguments, expected_state in rejected:
             before = _claim_authority_snapshot(first, node_id, *identity)
-            assert second.renew_claim(*arguments).state != "continued"
+            result = second.renew_claim(*arguments)
+            assert result.state == expected_state
+            if expected_state == "stale_generation":
+                assert result.generation == claim.generation
             assert _claim_authority_snapshot(first, node_id, *identity) == before
 
+        before = _claim_authority_snapshot(first, node_id, *identity)
+        node_before = first._foundation._client.hgetall(cfg.key("node", node))
         renewed = second.renew_claim(
             node_id, owner, "exact-consumer", *identity, claim.generation
         )
         assert renewed.state == "continued"
         assert renewed.generation == claim.generation
+        after = _claim_authority_snapshot(first, node_id, *identity)
+        assert after[0] == before[0]
+        assert after[1].keys() == before[1].keys()
+        assert {k: v for k, v in after[1].items() if k != b"lease_expires"} == {
+            k: v for k, v in before[1].items() if k != b"lease_expires"
+        }
+        stored_lease = float(after[1][b"lease_expires"])
+        assert stored_lease == pytest.approx(renewed.lease_expires_at_epoch, abs=0.001)
+        assert after[2:4] == before[2:4]
+        assert after[4][0] == (before[4][0][0], stored_lease)
+        assert first._foundation._client.hgetall(cfg.key("node", node)) == node_before
     finally:
         first._foundation._client.delete(
             cfg.key("schema"),
@@ -2902,7 +2946,9 @@ def test_renew_claim_authenticates_exact_live_authority(valkey_server):
             cfg.key("requests:deadline"),
             cfg.key("claims:expiry"),
             cfg.key("node", node),
+            cfg.key("node", other_node),
             cfg.key("queue", node),
+            cfg.key("queue", other_node),
             cfg.key("request", client, request),
             cfg.key("claim", client, request),
         )
@@ -3075,7 +3121,10 @@ def test_concurrent_renewal_and_registration_removal_fences_former_owner(
             removal_future = pool.submit(remove)
         renewal = renewal_future.result()
         removed = removal_future.result()
-        assert renewal.state in {"continued", "owner_mismatch"}
+        if removal == "unregister":
+            assert renewal.state in {"continued", "owner_mismatch"}
+        else:
+            assert renewal.state == "owner_mismatch"
         assert removed
         assert (
             first.renew_claim(

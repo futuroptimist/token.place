@@ -3116,6 +3116,74 @@ def test_claim_lease_is_bounded_by_request_deadline(valkey_server):
         store.close()
 
 
+def test_renew_claim_preserves_exact_deadline_representation(valkey_server):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        claim_ttl_seconds=2,
+        lease_ttl_seconds=5,
+    )
+    owner, node_id = _digest("exact-deadline-owner"), "exact-deadline-node"
+    consumer = "exact-deadline-consumer"
+    identity = ("exact-deadline-client", "exact-deadline-request")
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    request_key = cfg.key("request", client, request)
+    claim_key = cfg.key("claim", client, request)
+    try:
+        store.register(node_id, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 0.45
+        _enqueue_claim_fixture(store, node_id, owner, *identity, deadline)
+        claimed = store.claim_queued_request(node_id, owner, consumer)
+        assert claimed.state == "claimed"
+
+        stored_deadline = store._foundation._client.hget(request_key, "deadline")
+        assert stored_deadline == repr(deadline).encode()
+        request_before = store._foundation._client.hgetall(request_key)
+        claim_before = store._foundation._client.hgetall(claim_key)
+        cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
+        queue_before = store._foundation._client.xrange(
+            cfg.key("queue", store._node_digest(node_id))
+        )
+
+        renewed = store.renew_claim(
+            node_id, owner, consumer, *identity, claimed.generation
+        )
+        assert renewed.state == "continued"
+        assert renewed.lease_expires_at_epoch == deadline
+        assert renewed.lease_expires_at_epoch <= deadline
+        assert store._foundation._client.hget(
+            claim_key, "lease_expires"
+        ) == stored_deadline
+        assert store._foundation._client.zscore(
+            cfg.key("claims:expiry"), member
+        ) == deadline
+
+        claim_after = store._foundation._client.hgetall(claim_key)
+        assert {k: v for k, v in claim_after.items() if k != b"lease_expires"} == {
+            k: v for k, v in claim_before.items() if k != b"lease_expires"
+        }
+        assert store._foundation._client.hgetall(request_key) == request_before
+        assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
+        assert store._foundation._client.xrange(
+            cfg.key("queue", store._node_digest(node_id))
+        ) == queue_before
+
+        _wait_for_server_epoch(store, deadline)
+        before_rejected = _claim_authority_snapshot(store, node_id, *identity)
+        rejected = store.renew_claim(
+            node_id, owner, consumer, *identity, claimed.generation
+        )
+        assert rejected.state == "missing_or_expired"
+        assert _claim_authority_snapshot(store, node_id, *identity) == before_rejected
+    finally:
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store.close()
+
+
 def _claim_authority_snapshot(store, node_id, client_id, request_id):
     cfg = store._foundation.config
     client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()

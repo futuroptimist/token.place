@@ -1251,13 +1251,15 @@ if not request_deadline or not request_sequence or request_sequence<1 or request
 if rv[1]~='claimed' or rv[2]~=client or rv[3]~=request_digest or rv[4]~=node_id or
    rv[5]~=node_digest or request_deadline~=deadline or request_sequence~=sequence or request_generation~=current then return {'schema'} end
 local renewed=math.min(now+ttl,deadline); if renewed<=now then return {'missing_or_expired'} end
-redis.call('HSET',claim,'lease_expires',renewed); redis.call('ZADD',expiries,renewed,client .. ':' .. request_digest)
-return {'continued',tostring(current),tostring(renewed)}
+local renewed_value=tostring(renewed)
+if renewed==deadline then renewed_value=cv[7] end
+redis.call('HSET',claim,'lease_expires',renewed_value); redis.call('ZADD',expiries,renewed_value,client .. ':' .. request_digest)
+return {'continued',tostring(current),renewed_value}
 """
 RENEW_CLAIM_SCRIPT = ReviewedScript(
     "renew_claim_v1",
     RENEW_CLAIM_SOURCE,
-    "5c7299dea0b983823406b69ca4da3c4b9ce51b326825a3d78a7d9a25fefbe811",  # pragma: allowlist secret
+    "00489e639453edb006ec1671858063124a96000aa0201243fa8489f4a739d75f",  # pragma: allowlist secret
     True,
 )
 

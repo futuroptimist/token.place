@@ -1,0 +1,8 @@
+{
+  "date": "2026-09-02",
+  "slug": "production-relay-metrics-cardinality-oom",
+  "summary": "Default Flask request instrumentation retained effectively unbounded HTTP path labels; thousands of unmatched paths expanded the relay's application metrics and scrape-serialization cost until Kubernetes OOM-killed the sole 256Mi production relay.",
+  "impact": "Production was intermittently unavailable during an approximately 87-minute crash loop, with Traefik reporting no available server while the sole relay pod was unavailable; repeated termination also created an unquantified risk of losing active memory-backed relay state, but customer data or work loss was not proven.",
+  "fix": "Operators mitigated the incident by pausing discovery of only the token.place ServiceMonitor target and replacing the affected pod to obtain a fresh emptyDir, without changing or rolling back the Deployment; the permanent bounded-cardinality fix and deliberate restoration of application scraping remain pending.",
+  "lessons": "Application metric labels must be bounded and cardinality budgets detected before memory exhaustion; multiprocess files must be safely cleared on container startup, and a single memory-backed relay replica amplifies each process failure while replicas alone are not yet a safe standalone mitigation."
+}

@@ -3304,11 +3304,16 @@ def test_renew_claim_preserves_exact_deadline_representation(valkey_server):
         seconds, micros = store._foundation.server_time()
         deadline = seconds + micros / 1_000_000 + 0.45
         _enqueue_claim_fixture(store, node_id, owner, *identity, deadline)
+        stored_deadline = store._foundation._client.hget(request_key, "deadline")
+        decoded_deadline = float(stored_deadline)
+        assert math.isfinite(decoded_deadline)
+        assert decoded_deadline == deadline
+
         claimed = store.claim_queued_request(node_id, owner, consumer)
         assert claimed.state == "claimed"
-
-        stored_deadline = store._foundation._client.hget(request_key, "deadline")
-        assert stored_deadline == repr(deadline).encode()
+        assert store._foundation._client.hget(
+            claim_key, "lease_expires"
+        ) == stored_deadline
         request_before = store._foundation._client.hgetall(request_key)
         claim_before = store._foundation._client.hgetall(claim_key)
         cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))

@@ -25,6 +25,12 @@ database, allowing the OOM cycle to repeat. Because production had one relay rep
 temporarily remove the only backend and produce Traefik's browser-visible `no available server`
 response.
 
+The source repository's `main` branch already contained bounded-registry hardening, including a
+dedicated relay registry, disabled default exports, normalization of unmatched routes to `other`,
+and a bounded-scrape regression test. The deployed `e46277d` image did not descend from that
+hardening merge and still initialized default Flask metrics. This confirmed release-line/source-
+provenance mismatch left the runtime mechanism present in production.
+
 At 2026-09-03 01:07:50 UTC, an operator paused Prometheus discovery of only the token.place target
 and deleted only the affected pod. Kubernetes created a healthy replacement with a fresh
 pod-level `emptyDir`; the image and Deployment were not rolled back or changed. Production serves
@@ -82,7 +88,7 @@ sampled maxima may be lower than instantaneous peaks.
 | 2026-09-02 17:05:00 | 2026-09-03 00:05:00 | Restart counter was 7. |
 | 2026-09-02 17:50:09 | 2026-09-03 00:50:09 | Kubernetes recorded the prior container termination as `OOMKilled`, exit code 137. |
 | During initial triage | During initial triage | The affected pod had reached 15 restarts. Kubernetes events included 251 BackOff events over approximately 73 minutes. A later historical query showed a maximum restart count of 16. |
-| 2026-09-02 18:07:50 | 2026-09-03 01:07:50 | After verifying the exact production target, the operator changed only the ServiceMonitor discovery label so Prometheus no longer selected the target, then deleted only the OOM-looping pod. No image rollback or Deployment change occurred. |
+| 2026-09-02 18:07:50 | 2026-09-03 01:07:50 | After verifying the exact production target, the operator changed only the ServiceMonitor `release` label from `kube-prometheus-stack` to `incident-paused-tokenplace-oom`, then deleted only the OOM-looping pod. No image rollback or Deployment change occurred. |
 | 2026-09-02 18:08:18 | 2026-09-03 01:08:18 | Replacement pod started, became ready, and ended the confirmed impact window with a fresh pod-level `emptyDir`. |
 
 ## Technical root cause
@@ -113,6 +119,24 @@ memory leak.
 7. Production had one desired and available replica. Each OOM interval could therefore leave no
    serving backend.
 
+### Source hardening and deployed provenance
+
+Source commit
+[`a86fa1a`](https://github.com/futuroptimist/token.place/commit/a86fa1a47220023b7a236fefcb7f78c0c4487880),
+merged to `main` by
+[`e0e2685`](https://github.com/futuroptimist/token.place/commit/e0e2685062a1f4714dd6a10cda7586dd1534860a),
+introduced `RELAY_METRICS_REGISTRY`, set `metrics_export_defaults=False`, normalized unmatched
+routes through `_normalise_http_route()` to `other`, and added
+`test_metrics_scrape_uses_bounded_relay_registry`.
+
+The deployed commit `e46277d` came from PR #1735's `release/relay-0.1.1` base
+[`dc6ac09`](https://github.com/futuroptimist/token.place/commit/dc6ac09d7963d417ab6054b97c48e314a6494eef).
+Repository ancestry confirms that `e46277d` is not a descendant of hardening merge `e0e2685`, and
+its `api/__init__.py` still calls default `PrometheusMetrics(app)`. Thus the bounded implementation
+existed on `main` but was omitted from the deployed release lineage. This is confirmed repository
+evidence; this record does not speculate about why that release line was selected or imply a
+rollout near incident onset.
+
 ### Trigger attribution
 
 **Supported inference:** the rapid arrival of thousands of distinct unmatched paths is consistent
@@ -141,8 +165,10 @@ deployment are attributed as the trigger.
 ## Contributing factors
 
 - Implicit default per-path Flask instrumentation accepted effectively unbounded caller-controlled
-  label values instead of a small, explicitly registered metric set.
-- Unmatched/404 paths were not collapsed to a fixed label.
+  label values in the deployed release instead of the bounded registry already present on `main`.
+- The deployed release lineage omitted `main`'s normalization of unmatched/404 paths to `other`.
+- Release/artifact provenance checks did not prevent deployment of a lineage missing the source-
+  level metrics hardening.
 - Cardinality, scrape sample count, series additions, scrape duration, memory headroom, and restart
   acceleration were not correlated early enough to prevent the OOM.
 - The 256Mi hard limit left little headroom as metric state and scrape serialization grew. Raising
@@ -158,18 +184,21 @@ deployment are attributed as the trigger.
 
 ## Recovery and resolution
 
-At 2026-09-03T01:07:50Z, the operator first verified the production Kubernetes context,
-namespace, Deployment, exact image, replica count, memory limit, and ServiceMonitor configuration.
-The operator then:
+At 2026-09-03T01:07:50Z, the operator first verified the Kubernetes context (`sugar-prod`),
+namespace and Deployment (`tokenplace`), exact image, replica count, memory limit, and
+ServiceMonitor configuration. The operator then:
 
-1. paused Prometheus discovery of only the token.place target by changing its ServiceMonitor
-   discovery label;
-2. deleted only the affected pod so Kubernetes created a replacement with a fresh pod-level
+1. paused Prometheus discovery of only the token.place target by changing the ServiceMonitor's
+   `release` label from `kube-prometheus-stack` to `incident-paused-tokenplace-oom`;
+2. deleted only affected pod `tokenplace-7758c45ffb-dqccb` (UID
+   `e151eed5-6ecf-466e-9cc2-79956ea71903`) so Kubernetes created a new pod and fresh pod-level
    `emptyDir`; and
 3. did not roll back the image or change the Deployment.
 
-The replacement started at `2026-09-03T01:08:18Z`, reported Ready `True`, and had zero restarts
-during mitigation verification.
+The replacement was `tokenplace-7758c45ffb-fr45t` (UID
+`2d1a6ad9-aff9-40d9-a3f3-60ed062c387b`) on node `sugarkube0`. It started at
+`2026-09-03T01:08:18Z`, reported Ready `True`, and had zero restarts during mitigation
+verification.
 
 This emergency action removed the accumulated pod-level metric files and stopped scheduled
 scrapes from rebuilding or serializing the unsafe metric set. It restored application service but
@@ -214,14 +243,14 @@ Mitigated rather than Resolved.
 
 ## Corrective actions
 
-These actions are proposed and unassigned; this document does not claim that a permanent fix is
-complete.
+Actions remain unassigned unless noted by implementation status. Source-level implementation does
+not constitute production resolution: corrected-image deployment and verification remain pending.
 
 | Priority | Type | Action | Rationale | Owner | Status | Verification or exit criterion |
 | --- | --- | --- | --- | --- | --- | --- |
-| P0 | Prevent | Replace raw-path Flask grouping with bounded route-template or endpoint labels. | Removes caller control of label cardinality. | Unassigned | Proposed | A fixed allowlist of route labels is demonstrated under adversarial traffic. |
-| P0 | Prevent | Collapse every unmatched/404 route to one fixed label; prohibit query strings, request IDs, model names, keys, tokens, and arbitrary path segments from labels. | One unknown route class must remain one series class and must not expose sensitive values. | Unassigned | Proposed | Thousands of distinct unknown URLs yield the same bounded labels and no sensitive strings in exposition. |
-| P0 | Prevent | Prefer a small explicitly registered metric set over implicit default per-path instrumentation. | Makes the exported contract reviewable and bounded. | Unassigned | Proposed | Exported metric names and every label domain have documented finite bounds. |
+| P0 | Prevent | Replace raw-path Flask grouping with bounded route-template or endpoint labels. | Removes caller control of label cardinality. | Unassigned | Implemented on `main`; production deployment and verification pending | The corrected image identity is verified and a fixed allowlist of route labels is demonstrated under adversarial traffic. |
+| P0 | Prevent | Collapse every unmatched/404 route to one fixed label; prohibit query strings, request IDs, model names, keys, tokens, and arbitrary path segments from labels. | One unknown route class must remain one series class and must not expose sensitive values. | Unassigned | Implemented on `main`; production deployment and verification pending | Thousands of distinct unknown URLs yield the same bounded labels and no sensitive strings in exposition. |
+| P0 | Prevent | Prefer a small explicitly registered metric set over implicit default per-path instrumentation. | Makes the exported contract reviewable and bounded. | Unassigned | Implemented on `main`; production deployment and verification pending | The deployed corrected image exports documented finite metric names and label domains. |
 | P0 | Prevent | Add a regression/load test with thousands of unique unmatched paths and fixed budgets for series, samples, response size, scrape duration, and memory. | Reproduces the trigger class and prevents recurrence. | Unassigned | Proposed | The test passes explicit reviewed budgets and fails the prior unbounded behavior. |
 | P0 | Prevent | Move multiprocess metrics to a dedicated directory and clear it safely on every application-container startup before Gunicorn launches. | A container restart must not inherit stale metric files; pod deletion must not be the cleanup mechanism. | Unassigned | Proposed | A container restart test proves the directory starts clean without deleting the pod. |
 | P0 | Prevent | Validate Prometheus multiprocess worker cleanup. | Dead-worker files and series must not accumulate across worker lifecycles. | Unassigned | Proposed | Repeated worker start/exit testing leaves a bounded, correct exposition. |
@@ -232,6 +261,7 @@ complete.
 | P0 | Detect | Define per-target budgets and alerts for `scrape_samples_scraped`, `scrape_series_added`, `scrape_duration_seconds`, and distinct bounded route-label counts. | Detects exporter growth before memory exhaustion. | Unassigned | Proposed | Each budget has a documented threshold and tested alert. |
 | P1 | Detect | Add a dashboard combining application cardinality, scrape sample count/size, scrape latency, memory headroom, and restarts. | Correlated signals shorten diagnosis. | Unassigned | Proposed | Dashboard panels populate from a staging cardinality exercise. |
 | P0 | Detect | Add a release/staging gate that rejects linear series growth from unique unknown paths. | Stops reintroduction before production. | Unassigned | Proposed | Gate fails an intentionally unbounded fixture and passes bounded instrumentation. |
+| P0 | Detect | Add a release/artifact provenance gate that verifies the deployed commit descends from required hardening merges. | Prevents a release lineage from omitting fixes already implemented on `main`. | Unassigned | Proposed | Promotion fails for an artifact without `e0e2685` ancestry and records the verified image and source commit identities. |
 | P1 | Detect | Retain privacy-safe aggregate access evidence long enough to classify future triggers without raw credentials, query strings, encrypted payloads, or sensitive paths. | Improves attribution confidence without weakening privacy. | Unassigned | Proposed | Retention and redaction review proves only bounded aggregates are stored. |
 | P0 | Mitigate | Write a metrics-induced OOM-loop runbook: validate context/target, pause only its ServiceMonitor, replace the pod, verify public health, and keep scraping paused until exit criteria pass. | Makes the safe, narrow recovery repeatable. | Unassigned | Proposed | A non-production exercise completes with no unrelated target mutation. |
 | P0 | Mitigate | Add a bounded emergency setting that disables expensive application metrics while retaining liveness, readiness, and minimal operational metrics. | Preserves minimum observability without exercising unsafe exposition. | Unassigned | Proposed | Exercise shows minimal metrics and health remain available with bounded resource use. |
@@ -263,9 +293,11 @@ The availability impact ended when the replacement pod became healthy at
 - **Telemetry:** token.place application scraping intentionally paused.
 - **Incident:** Mitigated, not Resolved.
 - **Runtime/deployment remediation:** no image rollback or Deployment change was part of emergency
-  recovery.
-- **Permanent closeout condition:** deploy and verify bounded instrumentation and safe
-  multiprocess cleanup, then deliberately restore scraping through the full stability window.
+  recovery; bounded registry hardening is implemented on `main` but absent from the deployed
+  lineage.
+- **Permanent closeout condition:** build and deploy a corrected image, verify its source/artifact
+  identity, pass the adversarial staging soak, implement and verify multiprocess startup cleanup,
+  then deliberately restore scraping through the full stability window.
 
 Disabling scraping, replacing a pod, filtering traffic, raising memory, or adding replicas alone
 must not be recorded as permanent resolution. Issue #1569 concerns separate shared-state/HA
@@ -306,6 +338,9 @@ detect-secrets scan $(git diff --cached --name-only)
 Public references:
 
 - [Deployed commit `e46277d`](https://github.com/futuroptimist/token.place/commit/e46277daaeb76beeb9f2a2e9e265181287239b22)
+- [Bounded-registry source commit `a86fa1a`](https://github.com/futuroptimist/token.place/commit/a86fa1a47220023b7a236fefcb7f78c0c4487880)
+- [`main` hardening merge `e0e2685`](https://github.com/futuroptimist/token.place/commit/e0e2685062a1f4714dd6a10cda7586dd1534860a)
+- [`release/relay-0.1.1` base `dc6ac09`](https://github.com/futuroptimist/token.place/commit/dc6ac09d7963d417ab6054b97c48e314a6494eef)
 - [PR #1735: build-info label correction](https://github.com/futuroptimist/token.place/pull/1735)
 - [PR #1726: unrelated internal Valkey slice](https://github.com/futuroptimist/token.place/pull/1726)
 - [Issue #1569: separate shared-state/HA resilience work](https://github.com/futuroptimist/token.place/issues/1569)

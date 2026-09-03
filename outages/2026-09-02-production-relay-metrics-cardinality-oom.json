@@ -1,0 +1,8 @@
+{
+  "date": "2026-09-02",
+  "slug": "production-relay-metrics-cardinality-oom",
+  "summary": "Unbounded HTTP path labels in the relay's default Flask metrics grew application cardinality from roughly 29,000 to 71,000 series; expensive scrapes drove memory to the 256Mi limit, OOM-killed the sole relay pod, and produced intermittent no-backend responses.",
+  "impact": "Production was intermittently unavailable during an approximately 87-minute crash loop, and repeated termination created an unquantified risk of losing active memory-backed API-v1 relay state; no customer data loss was proven.",
+  "fix": "Operators mitigated the incident by pausing only token.place application-metrics discovery and replacing the OOM-looping pod to obtain fresh pod-level metrics storage; a permanent bounded-cardinality fix and deliberate restoration of scraping remain pending.",
+  "lessons": "Application metric labels must be bounded, cardinality and memory pressure need direct detection, multiprocess metric files must be cleared safely on container startup, and a single replica amplifies each process failure into possible production unavailability."
+}

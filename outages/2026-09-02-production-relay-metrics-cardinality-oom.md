@@ -19,9 +19,9 @@ metric set from approximately 29,000 Flask series to approximately 71,000. Colle
 serialization of that multiprocess metric set increased `/metrics` response size and latency while
 relay memory approached its 256Mi hard limit, after which Kubernetes OOM-killed the process.
 
-The metric files were in `PROMETHEUS_MULTIPROC_DIR=/tmp`, and the chart mounted `/tmp` from a
-pod-level `emptyDir`. An ordinary application-container restart retained the accumulated metric
-database, allowing the OOM cycle to repeat. Because production had one relay replica, a crash could
+Multiprocess metric state used pod-lifetime temporary storage without startup cleanup. An ordinary
+application-container restart could therefore retain the unsafe exposition state and allow the OOM
+cycle to repeat. Because production had one relay replica, a crash could
 temporarily remove the only backend and produce Traefik's browser-visible `no available server`
 response.
 
@@ -88,7 +88,7 @@ sampled maxima may be lower than instantaneous peaks.
 | 2026-09-02 17:05:00 | 2026-09-03 00:05:00 | Restart counter was 7. |
 | 2026-09-02 17:50:09 | 2026-09-03 00:50:09 | Kubernetes recorded the prior container termination as `OOMKilled`, exit code 137. |
 | During initial triage | During initial triage | The affected pod had reached 15 restarts. Kubernetes events included 251 BackOff events over approximately 73 minutes. A later historical query showed a maximum restart count of 16. |
-| 2026-09-02 18:07:50 | 2026-09-03 01:07:50 | After verifying the exact production target, the operator changed only the ServiceMonitor `release` label from `kube-prometheus-stack` to `incident-paused-tokenplace-oom`, then deleted only the OOM-looping pod. No image rollback or Deployment change occurred. |
+| 2026-09-02 18:07:50 | 2026-09-03 01:07:50 | After verifying the exact production target, the operator changed only its discovery selector so it no longer matched, then deleted only the OOM-looping pod. No image rollback or workload change occurred. |
 | 2026-09-02 18:08:18 | 2026-09-03 01:08:18 | Replacement pod started, became ready, and ended the confirmed impact window with a fresh pod-level `emptyDir`. |
 
 ## Technical root cause
@@ -98,26 +98,47 @@ sampled maxima may be lower than instantaneous peaks.
 The confirmed root cause was unbounded application metric label cardinality, not a Prometheus
 memory leak.
 
-1. Default Flask request instrumentation retained raw or effectively unbounded request path values
-   as labels. Almost every observed path value during the buildup was an unmatched route: 1,659 of
+1. Deployed commit `e46277d` called bare `PrometheusMetrics(app)` in `api/__init__.py` and pinned
+   `prometheus_flask_exporter==0.23.2` and `prometheus-client==0.21.0` in
+   `config/requirements_relay.txt`. The exporter defaults (`export_defaults=True`,
+   `group_by="path"`) enabled its Flask request-latency histogram with `(method,path,status)`
+   identity. Each unique tuple exposed 17 series: 15 buckets plus `_count` and `_sum`.
+2. Default Flask request instrumentation therefore retained request-controlled raw paths as labels.
+   Almost every observed path value during the buildup was an unmatched route: 1,659 of
    1,679 at 23:30 UTC, 2,719 of 2,741 at 23:40 UTC, and 4,093 of 4,124 at 23:46:30 UTC.
-2. Distinct path values rapidly multiplied the number of application series. Flask series grew
+3. Distinct path values rapidly multiplied the number of application series. Flask series grew
    from 28,964 at 23:30 UTC to 70,529 at 23:46:30 UTC and peaked at 71,056 at 23:48 UTC.
-3. Every 30-second scrape collected and serialized the large multiprocess set. Successful
-   `/metrics` responses recorded in application access logs were approximately
-   7,788,590–7,788,593 bytes and took approximately 6.45–7.93 seconds. Historical Prometheus
+4. Every 30-second scrape collected and serialized approximately 71,088 samples. The resulting
+   exposition was approximately 7.79 MB and took approximately 6–8 seconds. Historical Prometheus
    scrape duration rose from 3.102 seconds at 23:30 UTC to 6.150 seconds at 23:40 UTC and reached
    an observed maximum of 8.238 seconds.
-4. Relay memory approached the container's 268,435,456-byte limit. The largest 30-second working
+5. Relay memory approached the container's 268,435,456-byte limit. The largest 30-second working
    set sample was 247,996,416 bytes (approximately 92.4%); the largest RSS sample was 242,376,704
    bytes. The samples need not capture the instantaneous allocation that crossed the hard limit.
-5. Kubernetes OOM-killed the process. Its previous-state termination evidence, not the zero-valued
+6. Kubernetes OOM-killed the process. Its previous-state termination evidence, not the zero-valued
    `container_oom_events` query, establishes the OOM.
-6. `PROMETHEUS_MULTIPROC_DIR` pointed to `/tmp`, which was backed by a pod-level `emptyDir`.
-   Application-container restarts within the same pod retained the accumulated metric database,
-   so restarting the container did not remove the condition and the crash loop continued.
-7. Production had one desired and available replica. Each OOM interval could therefore leave no
+7. Multiprocess metric state used pod-lifetime `/tmp` without startup cleanup. Application-container
+   restarts within the same pod could retain the accumulated metric database. The old files were
+   not directly inventoried, and scrape pause and pod replacement occurred together, so their
+   individual effects were not production A/B tested.
+8. Production had one desired and available replica. Each OOM interval could therefore leave no
    serving backend.
+
+### Causal fingerprint
+
+The tuple counts below are separate from the distinct-path figures in the timeline:
+
+| UTC | `(method,path,status)` tuples | `17 × tuples` | Observed Flask series | Residual |
+| --- | ---: | ---: | ---: | ---: |
+| 23:30:00 | 1,703 | 28,951 | 28,964 | 13 |
+| 23:40:00 | 2,765 | 47,005 | 47,018 | 13 |
+| 23:46:30 | 4,148 | 70,516 | 70,529 | 13 |
+| 23:48:00 | 4,179 | 71,043 | 71,056 | 13 |
+
+Every checkpoint satisfies `flask_series = 17 × request_histogram_tuples + 13`. The increase was
+exactly `2,476 × 17 = 42,092` series, equal to `71,056 − 28,964`. This is the causal fingerprint:
+raw-path histogram cardinality accounts for all observed Flask-series growth, rather than a
+generic Prometheus-server memory leak.
 
 ### Source hardening and deployed provenance
 
@@ -129,6 +150,11 @@ introduced `RELAY_METRICS_REGISTRY`, set `metrics_export_defaults=False`, normal
 routes through `_normalise_http_route()` to `other`, and added
 `test_metrics_scrape_uses_bounded_relay_registry`.
 
+PR [#1447](https://github.com/futuroptimist/token.place/pull/1447), merged to `main` as `e0e2685`
+on July 13, implemented a dedicated `CollectorRegistry`, `metrics_export_defaults=False`,
+`metrics_path=None`, a relay-owned bounded `/metrics`, and reviewed finite labels. Its negative
+test proves unmatched paths expose neither raw paths nor default `flask_http_request*` families.
+
 The deployed commit `e46277d` came from PR #1735's `release/relay-0.1.1` base
 [`dc6ac09`](https://github.com/futuroptimist/token.place/commit/dc6ac09d7963d417ab6054b97c48e314a6494eef).
 Repository ancestry confirms that `e46277d` is not a descendant of hardening merge `e0e2685`, and
@@ -137,15 +163,41 @@ existed on `main` but was omitted from the deployed release lineage. This is con
 evidence; this record does not speculate about why that release line was selected or imply a
 rollout near incident onset.
 
-### Trigger attribution
+On the divergent release line, PR [#1729](https://github.com/futuroptimist/token.place/pull/1729)
+narrowly backported four gauges and bearer authentication while leaving the default exporter
+enabled. PR [#1732](https://github.com/futuroptimist/token.place/pull/1732) fixed maintenance-gauge
+PID labels while explicitly preserving the default registry and route. PR
+[#1735](https://github.com/futuroptimist/token.place/pull/1735) changed build-info labels and
+produced deployed `e46277d`. Release validation checked required metric presence and authentication
+but lacked a negative/cardinality regression proving default Flask families and raw unmatched
+paths were absent.
 
-**Supported inference:** the rapid arrival of thousands of distinct unmatched paths is consistent
-with automated scanning or randomized-path traffic.
+### Trigger classification and causal confidence
 
-**Unresolved evidence:** raw historical paths, complete access logs, and exact source addresses are
-not available in the public evidence. No attacker, crawler, customer, or exact traffic source can
-be identified. The unusual traffic exposed the latent defect; regardless of traffic origin, the
-application should not have created unbounded label values.
+Aggregate evidence confirms **automated-style unmatched-path/404 probing** as the trigger class.
+From 23:30 through 23:48 UTC, every one of the 2,476 new tuples was a 404: 2,469 were `GET 404` and
+7 were `POST 404`. Of 2,998 incremental requests, 2,675 (89.23%) were 404s. The 2,476 new tuples
+equaled 92.56% of incremental 404 requests, demonstrating extremely low path reuse. The singleton-
+path ratio rose from 34.43% to 70.81%. Tuple growth accelerated from 106.2 per minute during
+23:30–23:40 to 212.8 per minute during 23:40–23:46:30.
+
+The actor, source network, external-versus-internal origin, and intent remain unknown. This record
+does not characterize the traffic as a malicious attack or attribute it to a party. The traffic
+exposed a latent defect; regardless of origin, request input must not create unbounded labels.
+
+Confidence is separated as follows:
+
+- **Confirmed root defect:** request-controlled raw paths became unbounded metric labels.
+- **Confirmed trigger class:** rapid automated-style unmatched-path/404 probing.
+- **Confirmed outcome:** Kubernetes OOM-killed the relay.
+- **Strongly supported final pressure mechanism:** collection and serialization of approximately
+  71,088 samples into a roughly 7.79 MB, 6–8 second exposition while only approximately 19.49 MiB
+  of sampled cgroup headroom remained. No heap profile captured the exact final allocation.
+- **Persistence factor:** pod-lifetime multiprocess metric state lacked startup cleanup. Old files
+  were not directly inventoried, and scrape pause plus pod replacement occurred together, so the
+  individual effects were not production A/B tested.
+- **Impact amplifier:** one replica.
+- **Systemic cause:** release-line safety parity and negative-test coverage failed.
 
 ### Deployment-change attribution and PR #1726
 
@@ -184,21 +236,17 @@ deployment are attributed as the trigger.
 
 ## Recovery and resolution
 
-At 2026-09-03T01:07:50Z, the operator first verified the Kubernetes context (`sugar-prod`),
-namespace and Deployment (`tokenplace`), exact image, replica count, memory limit, and
-ServiceMonitor configuration. The operator then:
+At 2026-09-03T01:07:50Z, the operator first verified the production context, workload, exact image,
+replica count, memory limit, and scrape-target configuration. The operator then:
 
-1. paused Prometheus discovery of only the token.place target by changing the ServiceMonitor's
-   `release` label from `kube-prometheus-stack` to `incident-paused-tokenplace-oom`;
-2. deleted only affected pod `tokenplace-7758c45ffb-dqccb` (UID
-   `e151eed5-6ecf-466e-9cc2-79956ea71903`) so Kubernetes created a new pod and fresh pod-level
-   `emptyDir`; and
-3. did not roll back the image or change the Deployment.
+1. paused Prometheus discovery of only the application target by changing its selector to a
+   nonmatching value;
+2. deleted only the affected pod so Kubernetes created a replacement with fresh pod-level
+   temporary storage; and
+3. did not roll back the image or change the workload.
 
-The replacement was `tokenplace-7758c45ffb-fr45t` (UID
-`2d1a6ad9-aff9-40d9-a3f3-60ed062c387b`) on node `sugarkube0`. It started at
-`2026-09-03T01:08:18Z`, reported Ready `True`, and had zero restarts during mitigation
-verification.
+The replacement started at `2026-09-03T01:08:18Z`, reported Ready `True`, and had zero restarts
+during mitigation verification.
 
 This emergency action removed the accumulated pod-level metric files and stopped scheduled
 scrapes from rebuilding or serializing the unsafe metric set. It restored application service but
@@ -269,6 +317,43 @@ not constitute production resolution: corrected-image deployment and verificatio
 | P0 | Mitigate | Define a safe procedure to restore the ServiceMonitor label only after the corrected image is verified. | Prevents premature scrape restoration. | Unassigned | Proposed | Procedure includes all restoration gates and a rollback step. |
 | P1 | Mitigate | Continue shared-state/HA work tracked by [#1569](https://github.com/futuroptimist/token.place/issues/1569), without treating replicas as safe standalone mitigation while authoritative state is memory-backed. | HA can reduce single-replica amplification only after correctness constraints are satisfied. | Unassigned | Proposed | Shared-state correctness is proven before multi-replica availability is relied upon. |
 | P0 | Mitigate | After the fix, run a staging soak with scraping enabled and adversarial unique-path traffic before production restoration. | Validates the whole scrape/traffic lifecycle. | Unassigned | Proposed | Sustained soak passes every restoration exit criterion. |
+
+### Prometheus restoration path
+
+The recommended near-term path is a focused hotfix based on the current `release/relay-0.1.1`
+line, unless a newer main-derived release has independently completed every existing staging and
+production-promotion gate. Urgent observability restoration must not be coupled to an otherwise
+unqualified broad `main` rollout. The release hotfix must manually port the bounded behavior from
+#1447 rather than blindly cherry-pick its historical diff. It must:
+
+- disable prometheus-flask-exporter defaults and its automatic `/metrics` route;
+- use a dedicated registry and relay-owned authenticated `/metrics`;
+- preserve the required build, instrumentation, and node gauges;
+- expose only reviewed finite `tokenplace_*` label domains;
+- prove that no default `flask_http_request*` family, raw path, query string, request ID,
+  credential, ciphertext, or arbitrary value appears;
+- use a dedicated exact multiprocess directory and clear/recreate only that directory before
+  Gunicorn starts, or formally remove multiprocess mode if the release is locked to one worker;
+  and
+- add a same-pod application-container restart test proving stale metric files are not inherited.
+
+Before production scraping is restored, an immutable hotfix image must pass staging with the
+production-equivalent one-worker, 256Mi, and 30-second scrape settings. The test must send thousands
+of unique unknown paths while continuously scraping and verify bounded series/sample counts,
+response size, scrape latency, RSS/working-set headroom, zero OOMs/restarts, clean restart behavior,
+exact image identity, public health, and API-v1 compatibility.
+
+Production must keep application scraping paused through corrected-image deployment. Because relay
+authority remains memory-backed and the workload uses a single replica with Recreate semantics,
+the existing controlled quiescence and rollout procedure is required. Operators must verify health
+and build identity before deliberately restoring only the exact target discovery selector, then
+observe a defined stability window with explicit rollback thresholds. If cardinality, scrape cost,
+memory, or restarts regress, pause only that target again. Scraping must never be restored against
+`e46277d`; a memory-limit increase, edge filtering, or extra replicas alone is not resolution.
+
+Incident status remains **Mitigated** until the corrected image is deployed, scraping is restored,
+and the stability window passes. Promotion from `main` remains a separate, fully qualified later
+release path.
 
 ### Required restoration exit criteria
 
@@ -342,9 +427,15 @@ Public references:
 - [`main` hardening merge `e0e2685`](https://github.com/futuroptimist/token.place/commit/e0e2685062a1f4714dd6a10cda7586dd1534860a)
 - [`release/relay-0.1.1` base `dc6ac09`](https://github.com/futuroptimist/token.place/commit/dc6ac09d7963d417ab6054b97c48e314a6494eef)
 - [PR #1735: build-info label correction](https://github.com/futuroptimist/token.place/pull/1735)
+- [PR #1732: maintenance-gauge PID-label correction](https://github.com/futuroptimist/token.place/pull/1732)
+- [PR #1729: release-line metrics backport](https://github.com/futuroptimist/token.place/pull/1729)
+- [PR #1447: bounded relay metrics registry](https://github.com/futuroptimist/token.place/pull/1447)
 - [PR #1726: unrelated internal Valkey slice](https://github.com/futuroptimist/token.place/pull/1726)
 - [Issue #1569: separate shared-state/HA resilience work](https://github.com/futuroptimist/token.place/issues/1569)
-- [Prometheus multiprocess-mode documentation](https://prometheus.github.io/client_python/multiprocess/)
+- [Deployed `api/__init__.py`](https://github.com/futuroptimist/token.place/blob/e46277daaeb76beeb9f2a2e9e265181287239b22/api/__init__.py)
+- [Deployed relay requirement pins](https://github.com/futuroptimist/token.place/blob/e46277daaeb76beeb9f2a2e9e265181287239b22/config/requirements_relay.txt)
+- [prometheus-flask-exporter 0.23.2 source and defaults](https://github.com/rycus86/prometheus_flask_exporter/blob/0.23.2/prometheus_flask_exporter/__init__.py)
+- [prometheus-client 0.21.0 multiprocess requirements](https://github.com/prometheus/client_python/blob/v0.21.0/docs/content/multiprocess/_index.md)
 - [Kubernetes `emptyDir` documentation](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir)
 
 This public record uses sanitized aggregates and durable repository references. It does not publish

@@ -195,7 +195,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "f7fd8a03170b39a32ccd489b8d0ce53e0906909404971af255ec373997c0ccee"  # pragma: allowlist secret
+    expected_digest = "3559da1040624e6ac52d933a3d116c680d0398243ca4c68b308d0e1c4e10ecd8"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -217,6 +217,15 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     assert "'client_public_key','request_id','node_id','consumer_digest','generation','envelope'" in ACCEPT_RESPONSE_SCRIPT.source
     assert "'retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request'" in ACCEPT_RESPONSE_SCRIPT.source
     assert "local lv=redis.call('HMGET',lk,'state','client','request','client_public_key','request_id'" in ACCEPT_RESPONSE_SCRIPT.source
+    response_validator = ACCEPT_RESPONSE_SCRIPT.source.split(
+        "local function validate_response_due(due)", 1
+    )[1].split("local function contains", 1)[0]
+    terminal_validator = ACCEPT_RESPONSE_SCRIPT.source.split(
+        "local function validate_terminal_due(due,response_due)", 1
+    )[1].split("local function reap", 1)[0]
+    for validator in (response_validator, terminal_validator):
+        assert "tv[12]~=lv[12]" in validator
+        assert "tv[14]~=lv[13]" in validator
     assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_terminal_due(terminal_due,response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
     assert "redis.call('EXISTS',response)~=0 or response_indexed or terminal_indexed" in ACCEPT_RESPONSE_SCRIPT.source
     assert "if entries>=limit then return false end" in ACCEPT_RESPONSE_SCRIPT.source

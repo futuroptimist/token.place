@@ -1340,6 +1340,7 @@ local function validate_response_due(due)
        lv[4]~=rv[3] or lv[5]~=rv[4] or lv[6]~=rv[5] or not digest(lv[7]) or
        not deadline or deadline<accepted or not integer(lv[9]) or lv[10]~=rv[7] or
        lv[11]~=lv[9]..'-0' or not digest(lv[12]) or not digest(lv[13]) or
+       tv[12]~=lv[12] or tv[14]~=lv[13] or
        string.len(lv[14] or '')<1 or string.len(lv[14] or '')>max_request_envelope or string.len(lv[4] or '')>max_identity or
        string.len(lv[5] or '')>max_identity or string.len(lv[6] or '')>max_node_id then return false end
   end
@@ -1371,7 +1372,8 @@ local function validate_terminal_due(due,response_due)
        string.len(lv[5] or '')<1 or string.len(lv[5] or '')>max_identity or lv[6]~=tv[4] or
        string.len(lv[6] or '')>max_node_id or not digest(lv[7]) or not deadline or deadline<accepted or
        not integer(lv[9]) or lv[10]~=tv[7] or lv[11]~=lv[9]..'-0' or
-       not digest(lv[12]) or not digest(lv[13]) or string.len(lv[14] or '')<1 or
+       not digest(lv[12]) or not digest(lv[13]) or tv[12]~=lv[12] or tv[14]~=lv[13] or
+       string.len(lv[14] or '')<1 or
        string.len(lv[14] or '')>max_request_envelope then return false end
     local response_exists=redis.call('EXISTS',prefix..'response:'..c..':'..q)
     local response_score=redis.call('ZSCORE',response_expiries,member)
@@ -1515,7 +1517,7 @@ return {'accepted',generation,accepted_value,replay_value}
 ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     "accept_encrypted_response_v1",
     ACCEPT_RESPONSE_SOURCE,
-    "f7fd8a03170b39a32ccd489b8d0ce53e0906909404971af255ec373997c0ccee",  # pragma: allowlist secret
+    "3559da1040624e6ac52d933a3d116c680d0398243ca4c68b308d0e1c4e10ecd8",  # pragma: allowlist secret
     True,
 )
 

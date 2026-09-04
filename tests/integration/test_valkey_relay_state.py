@@ -3434,6 +3434,67 @@ def test_encrypted_response_cleanup_rejects_malformed_authority_without_writes(
         store.close()
 
 
+@pytest.mark.parametrize("cleanup_phase", ("response", "terminal"))
+@pytest.mark.parametrize(
+    "terminal_field", ("retrieval_credential_digest", "cancellation_token_digest")
+)
+def test_encrypted_response_cleanup_rejects_mismatched_lifecycle_digests(
+    valkey_server, cleanup_phase, terminal_field
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, consumer = "digest-node", _digest("digest-owner"), "consumer"
+    identity = ("digest-client", "digest-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    response = cfg.key("response", client, request)
+    terminal = cfg.key("terminal", client, request)
+    lifecycle = cfg.key("request", client, request)
+    response_index = cfg.key("responses:expiry")
+    terminal_index = cfg.key("terminals:expiry")
+    datastore = store._foundation._client
+
+    def snapshot():
+        return (
+            datastore.hgetall(response),
+            datastore.hgetall(terminal),
+            datastore.hgetall(lifecycle),
+            datastore.zrange(response_index, 0, -1, withscores=True),
+            datastore.zrange(terminal_index, 0, -1, withscores=True),
+        )
+
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        accepted = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        due = accepted.accepted_at_epoch
+        datastore.hset(response, "replay_expires_at_epoch", repr(due))
+        datastore.hset(terminal, "replay_expires_at_epoch", repr(due))
+        datastore.zadd(response_index, {member: due})
+        if cleanup_phase == "terminal":
+            store._cleanup_completed_records()
+            datastore.hset(terminal, "expires_at_epoch", repr(due))
+            datastore.zadd(terminal_index, {member: due})
+
+        datastore.hset(terminal, terminal_field, "f" * 64)
+        before = snapshot()
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store._cleanup_completed_records()
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
 def test_encrypted_response_cleanup_validates_batch_before_exact_reaping(valkey_server):
     store = _registration_store(valkey_server, uuid.uuid4().hex)
     node, owner, consumer = "batch-node", _digest("batch-owner"), "consumer"

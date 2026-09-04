@@ -172,8 +172,10 @@ health source, or terminal-state authority.
    SHA-256 of the raw token's lowercase hexadecimal ASCII representation is passed to and persisted
    by `accept_encrypted_response_v1`, together with the canonical epoch; the key, raw token, and
    key-equivalent HMAC state never reach Valkey. That single mutating script calls `TIME` again,
-   rejects a malformed or future preflight epoch, revalidates both inclusive deadlines against its
-   own time, and atomically persists response, acknowledgement digest, and terminal state. There is
+   rejects a non-finite, negative, future, or retention-stale preflight epoch before mutation,
+   revalidates both inclusive deadlines against its own time, and atomically persists response,
+   acknowledgement digest, and terminal state. Bounded retention cleanup validates the complete
+   response/terminal/index/lifecycle batch before making any cleanup write. There is
    no provisional token field, post-acceptance digest write, lazy initialization, or ambiguous
    mutation retry. An operation-level exact retry reads the retained terminal authority and returns
    its original generation, acceptance epoch, and replay epoch without recording a new outcome.

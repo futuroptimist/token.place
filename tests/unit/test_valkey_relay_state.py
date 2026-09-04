@@ -90,12 +90,17 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
         ACCEPT_RESPONSE_SCRIPT.source,
     )
     stale_guard = (
-        "if replay<=now or terminal_expiry<=now then return {'stale_time'} end"
+        "if not replay or not terminal_expiry or replay<=now or terminal_expiry<=now "
+        "then return {'malformed'} end"
     )
     assert stale_guard in ACCEPT_RESPONSE_SCRIPT.source
     assert ACCEPT_RESPONSE_SCRIPT.source.index(stale_guard) < (
         ACCEPT_RESPONSE_SCRIPT.source.index("redis.call('HSET',response")
     )
+    assert "if not accepted or accepted<0 or accepted>now then return {'malformed'} end" in ACCEPT_RESPONSE_SCRIPT.source
+    cleanup_offset = ACCEPT_RESPONSE_SCRIPT.source.index("local function cleanup()")
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_response_due(response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
+    assert "redis.call('EXISTS',response)~=0 or response_indexed or terminal_indexed" in ACCEPT_RESPONSE_SCRIPT.source
 
 
 def config(**changes):
@@ -1250,3 +1255,59 @@ def test_enqueue_translates_fixed_script_results(result, expected):
             envelope,
             "cancel",
         )
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    (
+        ([b"owner"], RelayStateCredentialMismatch),
+        ([b"missing"], RelayStateConflict),
+        ([b"stale", b"2"], RelayStateConflict),
+        ([b"conflict"], RelayStateConflict),
+        ([b"malformed"], RelayStateConflict),
+        ([b"capacity"], RelayStateCapacityExceeded),
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"malformed", b"extra"], ValkeySchemaIncompatibleError),
+        ([b"stale"], ValkeySchemaIncompatibleError),
+        ([b"stale", b"01"], ValkeySchemaIncompatibleError),
+        ([b"accepted", b"1", b"nan", b"2"], ValkeySchemaIncompatibleError),
+        ([b"existing", b"1", b"2", b"1"], ValkeySchemaIncompatibleError),
+    ),
+)
+def test_accept_response_decodes_only_fixed_bounded_results(reply, error):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.server_time.return_value = (1, 0)
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+
+    with pytest.raises(error):
+        store.accept_encrypted_response(
+            "node", "a" * 64, "consumer", "client", "request", 1, envelope
+        )
+
+
+@pytest.mark.parametrize(("status", "new_outcome"), ((b"accepted", True), (b"existing", False)))
+def test_accept_response_decodes_fixed_success_results(status, new_outcome):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.server_time.return_value = (1, 0)
+    foundation.execute.return_value = [status, b"1", b"1.0", b"2.0"]
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+
+    result = store.accept_encrypted_response(
+        "node", "a" * 64, "consumer", "client", "request", 1, envelope
+    )
+
+    assert result.new_outcome is new_outcome
+    assert (result.generation, result.accepted_at_epoch, result.replay_expires_at_epoch) == (
+        1,
+        1.0,
+        2.0,
+    )

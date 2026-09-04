@@ -3024,6 +3024,7 @@ def test_encrypted_response_rejects_stale_preflight_without_mutation(valkey_serv
         namespace,
         response_replay_ttl_seconds=0.001,
         terminal_retention_seconds=0.001,
+        control_tombstone_ttl_seconds=0.001,
     )
     node, owner, consumer = "response-node", _digest("response-owner"), "consumer-a"
     identity = ("response-client", "response-request")
@@ -4790,4 +4791,36 @@ def test_claim_result_budget_accepts_large_bounded_result(valkey_server):
         if selection is not None and selection.reservation_token is not None:
             keys.append(cfg.key("reservation", _digest(selection.reservation_token)))
         store._foundation._client.delete(*keys)
+        store.close()
+
+
+def test_completed_record_reads_hide_expired_backlog_beyond_cleanup_batch(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=0.01,
+        terminal_retention_seconds=0.01,
+        control_tombstone_ttl_seconds=0.001,
+        node_transition_batch_size=1,
+    )
+    node, owner, consumer = "expiry-node", _digest("expiry-owner"), "expiry-consumer"
+    identities = tuple(("expiry-client", f"expiry-request-{index}") for index in range(3))
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    try:
+        store.register(node, _capabilities(), owner)
+        for identity in identities:
+            _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+            claim = store.claim_queued_request(node, owner, consumer)
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, response
+            )
+        time.sleep(0.03)
+
+        assert store.response_records() == ()
+        assert store.terminal_records() == ()
+    finally:
+        _delete_claim_fixture_state(store, (node,), identities)
         store.close()

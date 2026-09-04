@@ -166,8 +166,18 @@ health source, or terminal-state authority.
    the terminal/dedup record with `completed`; and increment the outcome only once. Competing
    response, cancellation, expiry, or unregister receives the existing terminal result. Generate a
    bounded retrieval acknowledgement token deterministically from the canonical identity, accepted
-   epoch, and response digest using a shared injected acknowledgement key; store only the token
-   digest with the response and return the raw token only with authenticated retrieval responses.
+   epoch, and response digest using a shared injected acknowledgement key. Immediately before the
+   single mutating acceptance script, the reviewed non-mutating `server_time_v1` transition supplies
+   the authoritative `(seconds, microseconds)` sample. The relay canonically converts that sample to
+   the in-memory contract's epoch float and locally computes the HMAC-SHA-256 token over the v1 domain,
+   raw client/request digests, network-order IEEE-754 epoch, and raw response digest. It passes only
+   that epoch and SHA-256 of the token's lowercase hexadecimal ASCII to the acceptance script; the
+   acknowledgement key and raw token never enter Valkey. The script calls `TIME` again, rejects a
+   malformed or future preflight timestamp, rechecks inclusive claim/request expiry, and performs all
+   writes atomically. There is no preflight mutation, post-acceptance digest write, provisional token,
+   lazy initialization, or ambiguous mutation retry. An operation-level exact retry reads the retained
+   terminal and returns its original generation and timestamps with `new_outcome=False`; retrieval and
+   acknowledgement remain a later slice.
 7. **Cancel, expire, unregister, or evict.** Win the same lifecycle CAS, remove reservation/queue/
    claim/progress state as applicable, release capacity, and apply a fixed terminal status/reason.
    Unregister/evict processes only a bounded batch and records continuation work; the node becomes

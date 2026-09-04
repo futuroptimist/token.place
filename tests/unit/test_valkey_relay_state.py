@@ -1193,3 +1193,24 @@ def test_enqueue_translates_fixed_script_results(result, expected):
             envelope,
             "cancel",
         )
+
+
+def test_acknowledgement_key_is_required_exact_bytes_copied_and_redacted():
+    foundation = Mock(spec=ValkeyFoundation)
+    cfg = RelayStateStoreConfig(namespace="testing.unit")
+    for invalid in (None, bytearray(b"x" * 32), b"x" * 31):
+        with pytest.raises(RelayStateStoreError, match="acknowledgement configuration"):
+            ValkeyRegistrationStore(foundation, cfg, acknowledgement_key=invalid)
+    key = bytes(bytearray(b"x" * 32))
+    store = ValkeyRegistrationStore(foundation, cfg, acknowledgement_key=key)
+    assert store._acknowledgement_key == key
+    assert store._acknowledgement_key is not key
+    assert key.hex() not in repr(store)
+
+
+def test_accept_response_script_is_reviewed_pinned_and_bounded():
+    script = valkey_relay_state.ACCEPT_RESPONSE_SCRIPT
+    assert script.name == "accept_encrypted_response_v1"
+    assert SCRIPT_DIGESTS[script.name] == script.sha256
+    assert script.sha256 == __import__("hashlib").sha256(script.source.encode()).hexdigest()
+    assert re.search(r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]", script.source) is None

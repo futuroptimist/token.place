@@ -3033,6 +3033,99 @@ def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_s
         second.close()
 
 
+def test_encrypted_response_retries_retained_retrieval_expired_terminal(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=0.1,
+        terminal_retention_seconds=30,
+        control_tombstone_ttl_seconds=30,
+    )
+    second = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=0.1,
+        terminal_retention_seconds=30,
+        control_tombstone_ttl_seconds=30,
+    )
+    node, owner, consumer = "expired-node", _digest("expired-owner"), "consumer"
+    identity = ("expired-client", "expired-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = first._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    node_digest = first._node_digest(node)
+    datastore = first._foundation._client
+    declared_keys = (
+        cfg.key("nodes:lease"),
+        cfg.key("node", node_digest),
+        cfg.key("queue", node_digest),
+        cfg.key("claim", client, request),
+        cfg.key("request", client, request),
+        cfg.key("claims:expiry"),
+        cfg.key("requests:deadline"),
+        cfg.key("response", client, request),
+        cfg.key("responses:expiry"),
+        cfg.key("terminal", client, request),
+        cfg.key("terminals:expiry"),
+        cfg.key("progress", client, request),
+    )
+
+    def snapshot():
+        return tuple(datastore.dump(key) for key in declared_keys)
+
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        claim = first.claim_queued_request(node, owner, consumer)
+        accepted = first.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+
+        for _ in range(200):
+            seconds, micros = first._foundation.server_time()
+            if seconds + micros / 1_000_000 >= accepted.replay_expires_at_epoch:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("authoritative Valkey time did not reach response expiry")
+        first._cleanup_completed_records()
+        assert datastore.exists(cfg.key("response", client, request)) == 0
+        assert datastore.zscore(cfg.key("responses:expiry"), member) is None
+        assert datastore.hget(
+            cfg.key("terminal", client, request), "retrieval_state"
+        ) == b"retrieval_expired"
+
+        datastore.delete(cfg.key("node", node_digest))
+        datastore.zrem(cfg.key("nodes:lease"), node_digest)
+        before = snapshot()
+        retried = second.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        assert retried == dataclasses.replace(accepted, new_outcome=False)
+        assert snapshot() == before
+
+        before = snapshot()
+        with pytest.raises(RelayStateConflict, match="response lifecycle conflict"):
+            second.accept_encrypted_response(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claim.generation,
+                dataclasses.replace(envelope, ciphertext="different-ciphertext"),
+            )
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
 @pytest.mark.parametrize(
     "corruption",
     (

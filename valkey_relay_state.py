@@ -1408,11 +1408,9 @@ if tp>0 then
        response_replay<response_accepted or response_values[12]~='response_ready' or
        response_values[5]~=tv[4] or response_values[6]~=tv[6] or response_values[7]~=tv[7] or
        response_values[9]~=tv[9] or response_values[10]~=tv[8] or response_values[11]~=tv[10] then return {'schema'} end
-    if tv[4]==node_id and tv[5]==owner and tv[6]==consumer and tostring(g)==generation and tv[8]==response_digest then
-      if response_values[8]~=envelope then return {'schema'} end
-      return {'existing',tostring(g),tv[9],tv[10]}
-    end
+    if tv[4]==node_id and tv[5]==owner and tv[6]==consumer and tostring(g)==generation and tv[8]==response_digest and response_values[8]~=envelope then return {'schema'} end
   elseif response_exists~=0 or response_score then return {'schema'} end
+  if tv[4]==node_id and tv[5]==owner and tv[6]==consumer and tostring(g)==generation and tv[8]==response_digest then return {'existing',tostring(g),tv[9],tv[10]} end
   return {'conflict'}
 end
 local response_indexed=redis.call('ZSCORE',response_expiries,client..':'..request_digest)
@@ -1486,7 +1484,7 @@ return {'accepted',generation,accepted_value,replay_value}
 ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     "accept_encrypted_response_v1",
     ACCEPT_RESPONSE_SOURCE,
-    "4e15b6d3aafd367ca338f8a1814e5a1b5375df8f026e61db9e1c07e1b2adf929",  # pragma: allowlist secret
+    "7fce1055792435c73b24b18f221646d3c092d07bbfb9952c8a2fa716116687c8",  # pragma: allowlist secret
     True,
 )
 

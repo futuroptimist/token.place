@@ -457,8 +457,14 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
     return response
 
 
-def init_app(app):
-    """Initialize the API with the Flask app."""
+def init_app(
+    app,
+    *,
+    metrics_registry=None,
+    metrics_export_defaults=True,
+    metrics_path="/metrics",
+):
+    """Initialize the API with optional application-owned metrics settings."""
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {
@@ -485,7 +491,12 @@ def init_app(app):
 
     _install_control_plane_rate_limiter(app, limiter_storage_uri)
 
-    PrometheusMetrics(app)
+    PrometheusMetrics(
+        app,
+        path=metrics_path,
+        export_defaults=metrics_export_defaults,
+        registry=metrics_registry,
+    )
     app.register_blueprint(v1_routes.v1_bp)
     app.register_blueprint(v1_routes.openai_v1_bp)
     app.register_blueprint(v2_routes.v2_bp)

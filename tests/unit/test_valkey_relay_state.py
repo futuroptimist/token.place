@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import json
 import logging
 import math
@@ -30,6 +31,7 @@ from valkey_relay_state import (
 )
 from relay_state_store import (
     EncryptedRequestEnvelope,
+    EncryptedResponseEnvelope,
     RelayStateCapacityExceeded,
     RelayStateConflict,
     RelayStateCredentialMismatch,
@@ -77,7 +79,44 @@ def registration_store_with_foundation(foundation):
     store = object.__new__(ValkeyRegistrationStore)
     store._foundation = foundation
     store._config = RelayStateStoreConfig(namespace="testing.unit")
+    store._acknowledgement_key = b"shared-test-acknowledgement-key-32"
     return store
+
+
+@pytest.mark.parametrize("value", [None, "x" * 32, bytearray(32), b"x" * 31])
+def test_acknowledgement_key_validation_precedes_backend_access(value):
+    with pytest.raises(RelayStateStoreError, match="acknowledgement key"):
+        ValkeyRegistrationStore(None, None, acknowledgement_key=value)
+
+
+def test_acknowledgement_key_is_required_copied_and_redacted():
+    foundation = object.__new__(ValkeyFoundation)
+    key = b"shared-acknowledgement-key-value-32"
+    store = ValkeyRegistrationStore(
+        foundation,
+        RelayStateStoreConfig(namespace="testing.unit"),
+        acknowledgement_key=key,
+    )
+    assert store._acknowledgement_key == key
+    assert store._acknowledgement_key is not key
+    assert key.decode() not in repr(store)
+
+
+def test_response_serialization_is_canonical_sorted_utf8():
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher-雪", "key", "iv"
+    )
+    assert ValkeyRegistrationStore._serialized_response_envelope(envelope) == (
+        b'{"cipherkey":"key","ciphertext":"cipher-\xe9\x9b\xaa","iv":"iv",'
+        b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}'
+    )
+
+
+def test_response_script_is_digest_pinned_and_uses_no_global_operations():
+    script = valkey_relay_state.ACCEPT_ENCRYPTED_RESPONSE_SCRIPT
+    assert script.name == "accept_encrypted_response_v1"
+    assert hashlib.sha256(script.source.encode()).hexdigest() == script.sha256
+    assert re.search(r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]", script.source) is None
 
 
 def test_select_script_contains_no_scan_commands():

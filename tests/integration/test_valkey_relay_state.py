@@ -17,9 +17,11 @@ import redis
 from relay_state_store import (
     ComputeNodeCapabilities,
     EncryptedRequestEnvelope,
+    EncryptedResponseEnvelope,
     InMemoryRelayStateStore,
     RelayStateCapacityExceeded,
     RelayStateCredentialMismatch,
+    RelayStateConflict,
     RelayStateInvalidReservation,
     RelayStateNoCapacity,
     RelayStateStoreConfig,
@@ -253,6 +255,7 @@ def _registration_store(port, namespace, **overrides):
     return ValkeyRegistrationStore(
         foundation,
         RelayStateStoreConfig(namespace="testing.valkey", **overrides),
+        acknowledgement_key=b"shared-test-acknowledgement-key-32",
     )
 
 
@@ -2955,6 +2958,8 @@ def _delete_claim_fixture_state(store, node_ids, identities):
         cfg.key("reservations:expiry"),
         cfg.key("requests:deadline"),
         cfg.key("claims:expiry"),
+        cfg.key("responses:expiry"),
+        cfg.key("terminals:expiry"),
     ]
     for node_id in node_ids:
         node = store._node_digest(node_id)
@@ -2963,9 +2968,55 @@ def _delete_claim_fixture_state(store, node_ids, identities):
         client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
         request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
         keys.extend(
-            (cfg.key("request", client, request), cfg.key("claim", client, request))
+            (
+                cfg.key("request", client, request),
+                cfg.key("claim", client, request),
+                cfg.key("response", client, request),
+                cfg.key("terminal", client, request),
+                cfg.key("progress", client, request),
+            )
         )
     store._foundation._client.delete(*keys)
+
+
+def test_encrypted_response_acceptance_is_once_only_across_stores(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node_id, owner = "node-response", _digest("owner-response")
+    identity = ("client-response", "request-response")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "iv"
+    )
+    try:
+        first.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node_id, owner, *identity, time.time() + 60)
+        claim = first.claim_queued_request(node_id, owner, "consumer-response")
+
+        accepted = second.accept_encrypted_response(
+            node_id, owner, "consumer-response", *identity, claim.generation, envelope
+        )
+        retried = first.accept_encrypted_response(
+            node_id, owner, "consumer-response", *identity, claim.generation, envelope
+        )
+
+        assert accepted.new_outcome is True
+        assert retried == dataclasses.replace(accepted, new_outcome=False)
+        assert len(first.response_records()) == 1
+        assert len(second.terminal_records()) == 1
+        with pytest.raises(RelayStateConflict):
+            first.accept_encrypted_response(
+                node_id,
+                owner,
+                "consumer-response",
+                *identity,
+                claim.generation,
+                dataclasses.replace(envelope, ciphertext="conflict"),
+            )
+    finally:
+        _delete_claim_fixture_state(first, (node_id,), (identity,))
+        first.close()
+        second.close()
 
 
 @pytest.mark.parametrize(
@@ -4215,7 +4266,8 @@ def test_claim_capacity_counts_only_complete_live_claims(valkey_server):
             store.claim_queued_request(nodes[1], owner, "consumer-b")
         _enqueue_claim_fixture(store, nodes[0], owner, *identities[2], deadline)
         per_node_store = ValkeyRegistrationStore(
-            store._foundation, dataclasses.replace(store.config, max_claims=2)
+            store._foundation, dataclasses.replace(store.config, max_claims=2),
+            acknowledgement_key=b"shared-test-acknowledgement-key-32",
         )
         with pytest.raises(RelayStateCapacityExceeded):
             per_node_store.claim_queued_request(nodes[0], owner, "consumer-c")

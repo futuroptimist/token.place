@@ -210,39 +210,49 @@ period proving that those probes no longer consume their quotas.
 
 ## Corrective actions
 
-Actions remain unassigned. Runtime correction and production changes are outside this
-documentation-only record.
+Corrective actions are tracked in the linked issues below. Creating a tracker does not change an
+action's implementation, deployment, or restoration status. Runtime correction and production
+changes are outside this documentation-only record.
 
 ### Prevent
 
-| Priority | Action | Status | Verification or exit criterion |
-| --- | --- | --- | --- |
-| P0 | Manually port PR #1551's behavior to the exact `release/relay-0.1.1` line, or deploy an independently fully qualified newer release with equivalent behavior. | Proposed | The immutable deployed image exempts exact normalized-path `GET`/`HEAD` requests only for `/`, `/api/v1/meta`, and `/api/v1/version`. |
-| P0 | Preserve rate limiting for non-read methods, `/api/v1/models`, ordinary public API routes, authenticated compute control-plane routes, and all mutation routes. | Proposed | A route-and-method matrix proves only the three reviewed read paths are exempt. |
-| P0 | Add regression tests under deliberately low hourly and daily quotas. | Proposed | Repeated safe reads do not consume quota, while unrelated routes and mutation methods reach the existing OpenAI-style 429 response. |
-| P0 | Add a release-line provenance/parity gate for already-merged safety fixes including #1447 and #1551. | Proposed | Promotion records source and image identities and fails when required ancestry or an explicitly reviewed, behavior-equivalent backport is absent. |
-| P0 | Compare configured synthetic request frequency with every applicable endpoint quota in CI or deployment validation. | Proposed | Validation fails when projected requests can exhaust a quota within its window. |
-| P1 | Evaluate shared limiter storage in the existing HA work, without treating it alone as a fix for wrongly charged probes. | Proposed | HA testing proves intended counter consistency and separately verifies the exact public-read exemption. |
-| P0 | Validate trusted-proxy client-identity handling without blindly trusting spoofable forwarding headers. | Proposed | Production-equivalent tests document trusted hops and prove untrusted clients cannot choose limiter identities. |
+| Priority | Action | Status | Tracker | Verification or exit criterion |
+| --- | --- | --- | --- | --- |
+| P0 | Manually port PR #1551's behavior to the exact `release/relay-0.1.1` line, or deploy an independently fully qualified newer release with equivalent behavior. | Proposed | [token.place #1766](https://github.com/futuroptimist/token.place/issues/1766) | The immutable deployed image exempts exact normalized-path `GET`/`HEAD` requests only for `/`, `/api/v1/meta`, and `/api/v1/version`. |
+| P0 | Preserve rate limiting for non-read methods, `/api/v1/models`, ordinary public API routes, authenticated compute control-plane routes, and all mutation routes. | Proposed | [token.place #1766](https://github.com/futuroptimist/token.place/issues/1766) | A route-and-method matrix proves only the three reviewed read paths are exempt. |
+| P0 | Add regression tests under deliberately low hourly and daily quotas. | Proposed | [token.place #1766](https://github.com/futuroptimist/token.place/issues/1766) | Repeated safe reads do not consume quota, while unrelated routes and mutation methods reach the existing OpenAI-style 429 response. |
+| P0 | Add a release-line provenance/parity gate for already-merged safety fixes including #1447 and #1551. | Proposed | [token.place #1770](https://github.com/futuroptimist/token.place/issues/1770) | Promotion records source and image identities and fails when required ancestry or an explicitly reviewed, behavior-equivalent backport is absent. |
+| P0 | Compare configured synthetic request frequency with every applicable endpoint quota in CI or deployment validation. | Proposed | [sugarkube #2778](https://github.com/futuroptimist/sugarkube/issues/2778) | Validation fails when projected requests can exhaust a quota within its window. |
+| P1 | Evaluate shared limiter storage in the existing HA work, without treating it alone as a fix for wrongly charged probes. | Proposed | [Existing non-incident HA work #1569](https://github.com/futuroptimist/token.place/issues/1569) | HA testing proves intended counter consistency and separately verifies the exact public-read exemption. |
+| P0 | Validate trusted-proxy client-identity handling without blindly trusting spoofable forwarding headers. | Proposed | [token.place #1772](https://github.com/futuroptimist/token.place/issues/1772) | Production-equivalent tests document trusted hops and prove untrusted clients cannot choose limiter identities. |
 
 ### Detect
 
-| Priority | Action | Status | Verification or exit criterion |
-| --- | --- | --- | --- |
-| P0 | Add bounded, route-class-based 429 and quota-pressure telemetry without raw paths, source addresses, credentials, or attacker-controlled labels. | Proposed | Staging exhaustion produces bounded diagnostics and no sensitive or unbounded labels. |
-| P0 | Alert before a synthetic monitor consumes a material percentage of a quota. | Proposed | A controlled probe soak crosses warning thresholds before any HTTP 429. |
-| P0 | Keep `/livez` and `/healthz` coverage active whenever higher-level probes are intentionally paused. | In effect during mitigation; permanent procedure proposed | Monitoring review confirms continuous basic-health coverage during a scoped pause. |
-| P0 | Detect promoted artifacts missing reviewed safety fixes. | Proposed | A deliberately incomplete release artifact is rejected before production. |
+| Priority | Action | Status | Tracker | Verification or exit criterion |
+| --- | --- | --- | --- | --- |
+| P0 | Add bounded, route-class-based 429 and quota-pressure telemetry without raw paths, source addresses, credentials, or attacker-controlled labels. | Proposed | [token.place #1771](https://github.com/futuroptimist/token.place/issues/1771)<br>[sugarkube #2782](https://github.com/futuroptimist/sugarkube/issues/2782) | Staging exhaustion produces bounded diagnostics and no sensitive or unbounded labels. |
+| P0 | Alert before a synthetic monitor consumes a material percentage of a quota. | Proposed | [token.place #1771](https://github.com/futuroptimist/token.place/issues/1771) | A controlled probe soak crosses warning thresholds before any HTTP 429. |
+| P0 | Keep `/livez` and `/healthz` coverage active whenever higher-level probes are intentionally paused. | In effect during mitigation; permanent procedure proposed | [sugarkube #2776](https://github.com/futuroptimist/sugarkube/issues/2776) | Monitoring review confirms continuous basic-health coverage during a scoped pause. |
+| P0 | Detect promoted artifacts missing reviewed safety fixes. | Proposed | [token.place #1770](https://github.com/futuroptimist/token.place/issues/1770) | A deliberately incomplete release artifact is rejected before production. |
 
 ### Mitigate
 
-| Priority | Action | Status | Verification or exit criterion |
-| --- | --- | --- | --- |
-| P0 | Document the emergency procedure for pausing only quota-consuming Probe resources and resetting process-local counters. | Proposed | A non-production exercise changes only the intended probes and verifies their discovery state. |
-| P0 | Warn that process replacement can discard memory-backed relay state and requires controlled quiescence, compute re-registration, and end-to-end verification. | Proposed | The runbook includes explicit state-risk acknowledgement and verifies registration, polling, and response submission after replacement. |
-| P0 | Require immutable image identity, route/method matrix tests, a production-equivalent probe soak, and explicit rollback thresholds before restoration. | Proposed | Qualification records the image identity and passes all gates through a defined stability window. |
-| P0 | Restore only the two public-information probes after the corrected image is healthy. | Blocked on corrected deployment | The two probes return 200 throughout the stability window without consuming their quotas; health probes remain active. |
-| P0 | Keep `/metrics` restoration governed by the separate OOM corrective-action track. | In effect | No rate-limit remediation step re-enables application-metrics scraping. |
+| Priority | Action | Status | Tracker | Verification or exit criterion |
+| --- | --- | --- | --- | --- |
+| P0 | Document the emergency procedure for pausing only quota-consuming Probe resources and resetting process-local counters. | Proposed | [sugarkube #2779](https://github.com/futuroptimist/sugarkube/issues/2779) | A non-production exercise changes only the intended probes and verifies their discovery state. |
+| P0 | Warn that process replacement can discard memory-backed relay state and requires controlled quiescence, compute re-registration, and end-to-end verification. | Proposed | [sugarkube #2779](https://github.com/futuroptimist/sugarkube/issues/2779) | The runbook includes explicit state-risk acknowledgement and verifies registration, polling, and response submission after replacement. |
+| P0 | Require immutable image identity, route/method matrix tests, a production-equivalent probe soak, and explicit rollback thresholds before restoration. | Proposed | [sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774)<br>[sugarkube #2775](https://github.com/futuroptimist/sugarkube/issues/2775) | Qualification records the image identity and passes all gates through a defined stability window. |
+| P0 | Restore only the two public-information probes after the corrected image is healthy. | Blocked on corrected deployment | [sugarkube #2776](https://github.com/futuroptimist/sugarkube/issues/2776) | The two probes return 200 throughout the stability window without consuming their quotas; health probes remain active. |
+| P0 | Keep `/metrics` restoration governed by the separate OOM corrective-action track. | In effect | [sugarkube #2777](https://github.com/futuroptimist/sugarkube/issues/2777) | No rate-limit remediation step re-enables application-metrics scraping. |
+
+The recovery sequence is tracked explicitly: [token.place #1766](https://github.com/futuroptimist/token.place/issues/1766) feeds the combined staging qualification
+in [sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774), which gates exact-image production deployment in
+[sugarkube #2775](https://github.com/futuroptimist/sugarkube/issues/2775). Public-information probe restoration and rate-limit closeout remain gated by
+[sugarkube #2776](https://github.com/futuroptimist/sugarkube/issues/2776). Only after both probes are restored and their immediate
+checks pass may [sugarkube #2777](https://github.com/futuroptimist/sugarkube/issues/2777) begin application-metrics restoration; the
+two 24-hour stability windows may then overlap.
+None of these trackers records deployment, restoration, or incident resolution by its creation
+alone.
 
 ## Restoration and resolution criteria
 

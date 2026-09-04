@@ -95,6 +95,15 @@ def test_required_sugarkube_metric_families_and_initialization(relay_client) -> 
         "tokenplace_compute_nodes_registered",
         "tokenplace_compute_nodes_healthy",
         "tokenplace_relay_requests_total",
+        "tokenplace_http_requests_total",
+        "tokenplace_http_request_duration_seconds",
+        "tokenplace_relay_queue_depth",
+        "tokenplace_relay_oldest_queued_request_age_seconds",
+        "tokenplace_compute_node_lease_age_seconds",
+        "tokenplace_compute_node_evictions_total",
+        "tokenplace_relay_in_flight_requests",
+        "tokenplace_relay_oldest_in_flight_age_seconds",
+        "tokenplace_relay_request_outcomes_total",
     ):
         assert metric in body
     assert _metric_value(body, "tokenplace_instrumentation_up") == 1
@@ -102,125 +111,72 @@ def test_required_sugarkube_metric_families_and_initialization(relay_client) -> 
     assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
 
 
-def test_maintenance_gauges_use_single_multiprocess_snapshot(tmp_path) -> None:
-    """Multiprocess exposition must not emit per-worker maintenance gauges."""
+def test_entrypoint_clears_only_dedicated_metrics_directory_on_each_restart(tmp_path) -> None:
+    """Container restarts cannot inherit stale shards from the pod-lifetime directory."""
 
-    multiprocess_dir = tmp_path / "prometheus"
-    multiprocess_dir.mkdir()
-    token = secrets.token_urlsafe(24)
+    metrics_dir = tmp_path / "tokenplace-prometheus-multiproc"
+    sibling = tmp_path / "keep-me"
+    sibling.write_text("outside", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    gunicorn = fake_bin / "gunicorn"
+    gunicorn.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gunicorn.chmod(0o755)
     env = os.environ.copy()
-    env.update(
-        {
-            "PROMETHEUS_MULTIPROC_DIR": str(multiprocess_dir),
-            "TOKENPLACE_IMAGE_TAG": "sha-deadbee",
-            "TOKENPLACE_METRICS_TOKEN": token,
-        }
-    )
-    worker = """
-import os
-import sys
+    env.update({
+        "PATH": f"{fake_bin}:{env['PATH']}",
+        "PROMETHEUS_MULTIPROC_DIR": str(metrics_dir),
+        "RELAY_WORKER_TMP_DIR": str(tmp_path / "worker-tmp"),
+    })
+    entrypoint = Path(__file__).parents[2] / "docker/relay/entrypoint.sh"
 
-from prometheus_client import Gauge
+    for stale_name in ("counter_11.db", "gauge_liveall_22.db"):
+        metrics_dir.mkdir(exist_ok=True)
+        (metrics_dir / stale_name).write_text("stale", encoding="utf-8")
+        subprocess.run([str(entrypoint)], env=env, check=True, capture_output=True, text=True)
+        assert metrics_dir.is_dir()
+        assert list(metrics_dir.iterdir()) == []
+        assert sibling.read_text(encoding="utf-8") == "outside"
 
-import relay
 
-default_mode_control = Gauge(
-    "default_mode_control",
-    "Control gauge using the default multiprocess mode",
-)
-default_mode_control.set(1)
+def test_entrypoint_fails_closed_for_unsafe_metrics_targets(tmp_path) -> None:
+    entrypoint = Path(__file__).parents[2] / "docker/relay/entrypoint.sh"
+    env = os.environ.copy()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    gunicorn = fake_bin / "gunicorn"
+    gunicorn.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    gunicorn.chmod(0o755)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
 
-relay.app.config["TESTING"] = True
-with relay.app.test_client() as client:
-    registered = client.post(
-        "/api/v1/relay/servers/register",
-        json={"server_public_key": "node-a"},
-    )
-    assert registered.status_code == 200
-    assert client.get("/metrics").status_code == 401
-    response = client.get(
-        "/metrics",
-        headers={
-            "Authorization": "Bearer " + os.environ["TOKENPLACE_METRICS_TOKEN"]
-        },
-    )
-    body = response.get_data(as_text=True)
-    assert response.status_code == 200
-    assert os.environ["TOKENPLACE_METRICS_TOKEN"] not in body
-    if sys.argv[1] == "emit":
-        sys.stdout.write("\\n__METRICS__\\n" + body)
-"""
+    for target in ("", "/tmp", "relative/tokenplace-prometheus-multiproc"):
+        env["PROMETHEUS_MULTIPROC_DIR"] = target
+        result = subprocess.run([str(entrypoint)], env=env, capture_output=True, text=True)
+        assert result.returncode == 1
 
-    # Three independent workers each report one node. The final scrape is emitted
-    # by the last worker so its authoritative snapshot remains the most recent.
-    results = []
-    for mode in ("write", "write"):
-        results.append(
-            subprocess.run(
-                [sys.executable, "-c", worker, mode],
-                cwd=Path(__file__).parents[2],
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        )
-    results.append(
-        subprocess.run(
-            [sys.executable, "-c", worker, "emit"],
-            cwd=Path(__file__).parents[2],
-            env=env,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    )
-    assert all(token not in result.stdout for result in results)
-    assert all(token not in result.stderr for result in results)
-    exposed = results[-1].stdout.split("__METRICS__\n", 1)[1]
+    real_target = tmp_path / "real"
+    real_target.mkdir()
+    symlink_target = tmp_path / "tokenplace-prometheus-multiproc"
+    symlink_target.symlink_to(real_target, target_is_directory=True)
+    env["PROMETHEUS_MULTIPROC_DIR"] = str(symlink_target)
+    result = subprocess.run([str(entrypoint)], env=env, capture_output=True, text=True)
+    assert result.returncode == 1
 
-    names = {
-        "tokenplace_build_info",
-        "tokenplace_instrumentation_up",
-        "tokenplace_compute_nodes_registered",
-        "tokenplace_compute_nodes_healthy",
-    }
-    samples = [
-        sample
-        for family in text_string_to_metric_families(exposed)
-        for sample in family.samples
-        if sample.name in names
-    ]
-    by_name = {
-        name: [sample for sample in samples if sample.name == name]
-        for name in names
-    }
-    control_samples = [
-        sample
-        for family in text_string_to_metric_families(exposed)
-        for sample in family.samples
-        if sample.name == "default_mode_control"
-    ]
 
-    assert len(control_samples) == len(results)
-    assert len({sample.labels["pid"] for sample in control_samples}) == len(results)
-    assert all(set(sample.labels) == {"pid"} for sample in control_samples)
-    assert all(len(metric_samples) == 1 for metric_samples in by_name.values())
-    assert all("pid" not in sample.labels for sample in samples)
-    assert by_name["tokenplace_build_info"][0].value == 1
-    assert by_name["tokenplace_instrumentation_up"][0].value == 1
-    assert by_name["tokenplace_compute_nodes_registered"][0].value == 1
-    assert by_name["tokenplace_compute_nodes_healthy"][0].value == 1
-    assert set(by_name["tokenplace_build_info"][0].labels) == {
-        "version",
-        "revision",
-    }
-    assert by_name["tokenplace_build_info"][0].labels == {
-        "version": "sha-deadbee",
-        "revision": "sha-deadbee",
-    }
-    for name in names - {"tokenplace_build_info"}:
-        assert by_name[name][0].labels == {}
+def test_gunicorn_child_exit_marks_worker_dead(monkeypatch) -> None:
+    import importlib.util
+
+    config_path = Path(__file__).parents[2] / "docker/relay/gunicorn.conf.py"
+    spec = importlib.util.spec_from_file_location("relay_gunicorn_config", config_path)
+    assert spec is not None and spec.loader is not None
+    config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config)
+    seen = []
+    monkeypatch.setattr(config.multiprocess, "mark_process_dead", seen.append)
+
+    config.child_exit(None, type("Worker", (), {"pid": 4242})())
+
+    assert seen == [4242]
 
 
 @pytest.mark.parametrize("image_tag", [None, ""])
@@ -342,8 +298,8 @@ def test_repeated_scrapes_are_read_only_for_relay_state(relay_client) -> None:
         key: dict(value) for key, value in known_servers.items()
     }
     request_series = (
-        'tokenplace_relay_requests_total{endpoint="api_v1_relay_servers_register",'
-        'method="POST",status="200"}'
+        'tokenplace_relay_requests_total{endpoint="/api/v1/relay/servers/register",'
+        'method="POST",status="2xx"}'
     )
     before_scrapes = _metric_value(_scrape(relay_client), request_series)
 
@@ -360,3 +316,103 @@ def test_api_v1_model_catalog_remains_llama_31_only(relay_client) -> None:
     assert [model["id"] for model in response.get_json()["data"]] == [
         "llama-3.1-8b-instruct"
     ]
+
+
+BOUNDED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "other"}
+BOUNDED_STATUS_CLASSES = {"1xx", "2xx", "3xx", "4xx", "5xx", "unknown"}
+BOUNDED_PROVIDER_MODES = set(relay.PROVIDER_MODE_ENUM)
+BOUNDED_OUTCOMES = set(relay.OUTCOME_ENUM)
+
+
+def _samples(body: str):
+    return [
+        sample
+        for family in text_string_to_metric_families(body)
+        for sample in family.samples
+    ]
+
+
+def test_thousands_of_unmatched_paths_have_bounded_cardinality_and_exposition(relay_client) -> None:
+    """Attacker-selected 404 paths collapse to one finite route class."""
+
+    raw_values = []
+    for index in range(2_000):
+        marker = f"unmatched-sensitive-{index}"
+        raw_values.append(marker)
+        response = relay_client.get(f"/{marker}?credential=query-{index}")
+        assert response.status_code == 404
+
+    body = _scrape(relay_client)
+    samples = _samples(body)
+    request_samples = [s for s in samples if s.name == "tokenplace_http_requests_total"]
+    unmatched = [s for s in request_samples if s.labels.get("route") == "other"]
+    assert unmatched
+    assert {s.labels["route"] for s in unmatched} == {"other"}
+    assert all(marker not in body for marker in raw_values)
+    assert "credential=query-" not in body
+    assert "flask_http_request" not in body
+    # Explicit deterministic budgets guard against series and payload regressions.
+    assert len(samples) <= 500
+    assert len(body.encode("utf-8")) <= 100_000
+
+
+def test_metric_names_and_label_domains_are_finite(relay_client) -> None:
+    for index in range(20):
+        response = relay_client.open(f"/custom-{index}", method=f"CUSTOM{index}")
+        assert response.status_code == 404
+
+    body = _scrape(relay_client)
+    allowed_routes = {
+        "/api/v1/relay/requests", "/api/v1/relay/requests/cancel",
+        "/api/v1/relay/responses", "/api/v1/relay/responses/retrieve",
+        "/api/v1/relay/servers/register", "/api/v1/relay/servers/unregister",
+        "/api/v1/relay/servers/poll", "/api/v1/relay/servers/next",
+        "/api/v1/*", "/api/v2/*", "/healthz", "/livez",
+        "/relay/diagnostics", "other",
+    }
+    for sample in _samples(body):
+        labels = sample.labels
+        if "method" in labels:
+            assert labels["method"] in BOUNDED_METHODS
+        if "route" in labels:
+            assert labels["route"] in allowed_routes
+        if "endpoint" in labels:
+            assert labels["endpoint"] in allowed_routes
+        if "status_class" in labels:
+            assert labels["status_class"] in BOUNDED_STATUS_CLASSES
+        if "status" in labels:
+            assert labels["status"] in BOUNDED_STATUS_CLASSES
+        if "provider_mode" in labels:
+            assert labels["provider_mode"] in BOUNDED_PROVIDER_MODES
+        if "outcome" in labels:
+            assert labels["outcome"] in BOUNDED_OUTCOMES
+        if "reason" in labels:
+            assert labels["reason"] in set(relay.EVICTION_REASON_ENUM)
+
+
+def test_metrics_scrapes_do_not_instrument_themselves(relay_client) -> None:
+    before = _scrape(relay_client)
+    for _ in range(5):
+        _scrape(relay_client)
+    after = _scrape(relay_client)
+
+    for body in (before, after):
+        assert 'route="/metrics"' not in body
+        assert 'endpoint="/metrics"' not in body
+    assert before == after
+
+
+def test_unauthorized_metrics_does_not_leak_or_instrument_credential(relay_client, monkeypatch) -> None:
+    expected = "expected-metrics-secret"
+    supplied = "attacker-controlled-credential"
+    monkeypatch.setenv("TOKENPLACE_METRICS_TOKEN", expected)
+
+    response = relay_client.get("/metrics", headers={"Authorization": f"Bearer {supplied}"})
+
+    assert response.status_code == 401
+    assert expected not in response.get_data(as_text=True)
+    assert supplied not in response.get_data(as_text=True)
+    body = _scrape(relay_client, headers={"Authorization": f"Bearer {expected}"})
+    assert expected not in body
+    assert supplied not in body
+    assert 'route="/metrics"' not in body

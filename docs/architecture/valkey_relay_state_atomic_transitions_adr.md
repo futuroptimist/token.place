@@ -168,6 +168,17 @@ health source, or terminal-state authority.
    bounded retrieval acknowledgement token deterministically from the canonical identity, accepted
    epoch, and response digest using a shared injected acknowledgement key; store only the token
    digest with the response and return the raw token only with authenticated retrieval responses.
+   Immediately before acceptance, the reviewed non-mutating `server_time_v1` transition obtains the
+   authoritative Valkey `(seconds, microseconds)` sample and the relay canonically converts it to the
+   established floating-point accepted epoch. The relay derives the HMAC token locally from the
+   shared key, raw client/request digests, network-order IEEE-754 accepted epoch, and raw response
+   digest, then sends only the accepted epoch and SHA-256 digest of the token's lowercase hexadecimal
+   ASCII representation to `accept_encrypted_response_v1`. That single mutating script calls `TIME`
+   again, rejects malformed or future samples, revalidates inclusive claim/request deadlines, and
+   atomically persists all response and terminal authority. The shared key, raw token, and
+   key-equivalent HMAC state never enter Valkey; there is no provisional or post-acceptance digest
+   write and no automatic retry of an ambiguous mutation. An operation-level exact retry recovers
+   the original generation and timestamps from the retained terminal with `new_outcome=False`.
 7. **Cancel, expire, unregister, or evict.** Win the same lifecycle CAS, remove reservation/queue/
    claim/progress state as applicable, release capacity, and apply a fixed terminal status/reason.
    Unregister/evict processes only a bounded batch and records continuation work; the node becomes

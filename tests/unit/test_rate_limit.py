@@ -10,6 +10,7 @@ from flask import Flask, request as flask_request
 
 from api import (
     _check_control_plane_limits,
+    _is_public_api_rate_limit_exempt_path,
     _load_relay_server_registration_tokens,
     init_app,
 )
@@ -75,6 +76,19 @@ def test_public_information_reads_are_exempt_without_consuming_user_quota():
 
     assert limited.status_code == 429
     assert limited.get_json()["error"]["code"] == "rate_limit_exceeded"
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_public_information_exemption_normalizes_only_trailing_slashes(method):
+    """Trailing slashes normalize, while malformed internal slashes do not."""
+    app = Flask(__name__)
+
+    for path in ("/api/v1/meta/", "/api/v1/version/"):
+        with app.test_request_context(path, method=method):
+            assert _is_public_api_rate_limit_exempt_path(flask_request.path)
+
+    with app.test_request_context("/api//v1/meta", method=method):
+        assert not _is_public_api_rate_limit_exempt_path(flask_request.path)
 
 
 @pytest.mark.parametrize("path", ["/", "/api/v1/meta", "/api/v1/version"])

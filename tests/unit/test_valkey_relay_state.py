@@ -80,6 +80,55 @@ def test_response_serialization_is_canonical_sorted_utf8():
     )
 
 
+def test_completed_inspector_index_detects_overflow_and_malformed_shapes():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    store = registration_store_with_foundation(foundation)
+    member = b"a" * 64 + b":" + b"b" * 64
+    foundation._call.return_value = [(member, 2.0), (member, 3.0)]
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store._completed_index_members("index", 1.0, 1)
+    assert foundation._call.call_args.kwargs["num"] == 2
+
+    foundation._call.return_value = [(member,)]
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store._completed_index_members("index", 1.0, 1)
+
+
+def test_completed_inspector_rejects_raw_size_before_decode_or_hash():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.return_value = [b"oversized"]
+    store = registration_store_with_foundation(foundation)
+
+    with patch("valkey_relay_state.hashlib.sha256") as sha256:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store._completed_hash("key", (b"digest",), {b"digest": 2})
+    sha256.assert_not_called()
+
+
+def test_completed_inspector_distinguishes_disappearance_from_remaining_authority():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    store = registration_store_with_foundation(foundation)
+    member = b"a" * 64 + b":" + b"b" * 64
+
+    foundation._call.side_effect = [0, None]
+    assert store._completed_member_disappeared("hash", "index", member)
+    foundation._call.side_effect = [1, None]
+    assert not store._completed_member_disappeared("hash", "index", member)
+
+
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     expected_digest = "f7fd8a03170b39a32ccd489b8d0ce53e0906909404971af255ec373997c0ccee"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest

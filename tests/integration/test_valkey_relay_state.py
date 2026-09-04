@@ -5428,3 +5428,71 @@ def test_completed_record_reads_hide_expired_backlog_beyond_cleanup_batch(valkey
     finally:
         _delete_claim_fixture_state(store, (node,), identities)
         store.close()
+
+
+@pytest.mark.parametrize("inspector", ("response_records", "terminal_records"))
+def test_completed_record_inspectors_validate_paired_authority_and_additive_fields(
+    valkey_server, inspector
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=60,
+        terminal_retention_seconds=600,
+    )
+    node, owner, consumer = "inspect-node", _digest("inspect-owner"), "inspect-consumer"
+    identity = ("inspect-client", "inspect-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    client, request = store._identity(*identity)
+    cfg = store._foundation.config
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, response
+        )
+        terminal_key = cfg.key("terminal", client, request)
+        response_key = cfg.key("response", client, request)
+        store._foundation._client.hset(terminal_key, "compatible_extension", "retained")
+        store._foundation._client.hset(response_key, "compatible_extension", "retained")
+
+        records = getattr(store, inspector)()
+        assert len(records) == 1
+        with pytest.raises((dataclasses.FrozenInstanceError, AttributeError)):
+            records[0].generation = 99
+
+        store._foundation._client.hset(
+            cfg.key("request", client, request), "claim_generation", "999"
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError) as caught:
+            getattr(store, inspector)()
+        rendered = repr(caught.value)
+        assert "ciphertext" not in rendered
+        assert client not in rendered and request not in rendered
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+def test_completed_record_inspector_detects_live_index_overflow(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace, max_responses=1)
+    cfg = store._foundation.config
+    first = b"a" * 64 + b":" + b"b" * 64
+    second = b"c" * 64 + b":" + b"d" * 64
+    try:
+        now = store._foundation.server_time()[0]
+        store._foundation._client.zadd(
+            cfg.key("responses:expiry"), {first: now + 100, second: now + 100}
+        )
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store.response_records()
+    finally:
+        store._foundation._client.delete(cfg.key("responses:expiry"))
+        store.close()

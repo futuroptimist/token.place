@@ -88,6 +88,7 @@ def desktop_runner():
         "NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS", "NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS",
         "PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS",
         "PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS",
+        "PRE_START_DIAGNOSTIC_ALLOWLISTS", "PRE_START_DIAGNOSTIC_DEFAULTS",
     }
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
@@ -106,6 +107,7 @@ def desktop_runner():
         "authoritative_registration_matches",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
         "_webdriver_session_elapsed_bucket", "_write_webdriver_diagnostic",
+        "_start_click_exception_category",
         "_read_operator_start_diagnostic", "_read_native_startup_diagnostic",
         "_read_packaged_startup_diagnostic", "_status_value",
         "main"}
@@ -142,7 +144,7 @@ def desktop_runner():
         "InvalidArgumentException": InvalidArgumentException,
         "ReadTimeoutError": ReadTimeoutError, "ConnectTimeoutError": ConnectTimeoutError,
         "NewConnectionError": NewConnectionError, "ProtocolError": ProtocolError,
-        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v7",
+        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v8",
         "WEBDRIVER_COMPATIBILITY_RESULTS": frozenset({"match", "mismatch", "unknown"}),
         "WEBDRIVER_EXCEPTION_FAMILIES": frozenset({"read_timeout", "connection_failure",
             "capability_rejection", "driver_version_mismatch", "application_startup_failure",
@@ -841,7 +843,7 @@ def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
         "C:\\private\\target", "SECRET_READINESS")
     artifact = tmp_path / "packaged-webdriver-diagnostic.json"
     assert json.loads(artifact.read_text()) == {
-        "schema_version": "packaged-webdriver-diagnostic-v7",
+        "schema_version": "packaged-webdriver-diagnostic-v8",
         "browser_driver_compatibility": "unknown",
         "tauri_driver_state": "unknown",
         "webdriver_failure_category": "webdriver_session_creation_failed",
@@ -851,6 +853,7 @@ def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
         "target_category": "unknown",
         "readiness_category": "unknown",
         "operator_progress": "not_started",
+        **desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS,
         "start_handler_state": "not_entered",
         "invocation_state": "not_started",
         "native_event_observation": "none",
@@ -877,7 +880,7 @@ def test_webdriver_diagnostic_clamps_invalid_v3_enums(desktop_runner, tmp_path):
     artifact = json.loads(
         (tmp_path / "packaged-webdriver-diagnostic.json").read_text())
     assert artifact == {
-        "schema_version": "packaged-webdriver-diagnostic-v7",
+        "schema_version": "packaged-webdriver-diagnostic-v8",
         "browser_driver_compatibility": "match",
         "tauri_driver_state": "running",
         "webdriver_failure_category": "none",
@@ -887,6 +890,7 @@ def test_webdriver_diagnostic_clamps_invalid_v3_enums(desktop_runner, tmp_path):
         "target_category": "attachable_target",
         "readiness_category": "ready",
         "operator_progress": "not_started",
+        **desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS,
         "start_handler_state": "not_entered",
         "invocation_state": "not_started",
         "native_event_observation": "none",
@@ -911,6 +915,25 @@ def test_webdriver_diagnostic_clamps_hostile_operator_progress(desktop_runner, t
     assert artifact["operator_progress"] == "not_started"
     assert "private" not in json.dumps(artifact)
     assert "SECRET" not in json.dumps(artifact)
+
+
+def test_webdriver_diagnostic_clamps_hostile_pre_start_fields(desktop_runner, tmp_path):
+    desktop_runner.LOGS_DIR = tmp_path
+    desktop_runner._write_webdriver_diagnostic(
+        "match", "running", "none", pre_start_diagnostic={
+            "baseline_outcome": "C:\\Users\\private\\SECRET",
+            "baseline_poll_attempt_count": True,
+            "baseline_transient_failure_count": -1,
+            "last_authoritative_registered_node_count": "response body SECRET",
+            "start_click_state": "SECRET",
+            "start_click_exception_category": "private exception SECRET",
+        })
+    artifact_text = (tmp_path / "packaged-webdriver-diagnostic.json").read_text()
+    artifact = json.loads(artifact_text)
+    assert {field: artifact[field] for field in desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS} \
+        == desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS
+    assert "private" not in artifact_text
+    assert "SECRET" not in artifact_text
 
 
 def test_operator_start_diagnostic_collects_only_allowlisted_dom_values(desktop_runner):
@@ -1261,11 +1284,32 @@ def test_clean_relay_baseline_rejects_preexisting_unrelated_node(desktop_runner)
     def fail_closed(reason):
         raise RuntimeError(reason) from None
     observations = []
+    diagnostic = desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS.copy()
     with pytest.raises(RuntimeError, match="^operator_registration_not_reached$"):
         desktop_runner.require_clean_relay_registration_baseline(
             "https://relay.example", timeout_seconds=0.5, fail_closed=fail_closed,
-            record_relay_observation=observations.append)
+            record_relay_observation=observations.append,
+            record_pre_start_state=lambda **changes: diagnostic.update(changes))
     assert observations == ["polled", "not_reached"]
+    assert diagnostic == {
+        **desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS,
+        "baseline_outcome": "rejected_nonzero",
+        "baseline_poll_attempt_count": 1,
+        "last_authoritative_registered_node_count": 1,
+    }
+
+
+def test_clean_relay_baseline_accepts_immediate_authoritative_zero(desktop_runner):
+    desktop_runner.fetch_api_v1_registered_node_fingerprints = lambda *_args, **_kwargs: []
+    diagnostic = desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS.copy()
+    assert desktop_runner.require_clean_relay_registration_baseline(
+        "https://relay.example", timeout_seconds=0.5, fail_closed=pytest.fail,
+        record_relay_observation=lambda _observation: None,
+        record_pre_start_state=lambda **changes: diagnostic.update(changes)) == []
+    assert diagnostic["baseline_outcome"] == "accepted_zero"
+    assert diagnostic["baseline_poll_attempt_count"] == 1
+    assert diagnostic["baseline_transient_failure_count"] == 0
+    assert diagnostic["last_authoritative_registered_node_count"] == 0
 
 
 def test_relay_baseline_retries_transient_failure(desktop_runner):
@@ -1277,11 +1321,36 @@ def test_relay_baseline_retries_transient_failure(desktop_runner):
         return result
     desktop_runner.fetch_api_v1_registered_node_fingerprints = fetch
     observations = []
+    diagnostic = desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS.copy()
     baseline = desktop_runner.require_clean_relay_registration_baseline(
         "https://relay.example", timeout_seconds=1, fail_closed=pytest.fail,
-        record_relay_observation=observations.append)
+        record_relay_observation=observations.append,
+        record_pre_start_state=lambda **changes: diagnostic.update(changes))
     assert baseline == []
     assert observations == ["polled", "polled"]
+    assert diagnostic["baseline_outcome"] == "accepted_zero_after_recovery"
+    assert diagnostic["baseline_poll_attempt_count"] == 2
+    assert diagnostic["baseline_transient_failure_count"] == 1
+    assert diagnostic["last_authoritative_registered_node_count"] == 0
+
+
+def test_relay_baseline_records_terminal_probe_exhaustion(desktop_runner, monkeypatch):
+    ticks = iter((0.0, 0.0, 0.05, 0.2, 0.2))
+    monkeypatch.setattr(desktop_runner.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    desktop_runner.fetch_api_v1_registered_node_fingerprints = \
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("PRIVATE"))
+    diagnostic = desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS.copy()
+    with pytest.raises(RuntimeError, match="^operator_registration_not_reached$"):
+        desktop_runner.require_clean_relay_registration_baseline(
+            "https://relay.example", timeout_seconds=0.1,
+            fail_closed=lambda reason: (_ for _ in ()).throw(RuntimeError(reason)),
+            record_relay_observation=lambda _observation: None,
+            record_pre_start_state=lambda **changes: diagnostic.update(changes))
+    assert diagnostic["baseline_outcome"] == "probe_failures_exhausted"
+    assert diagnostic["baseline_poll_attempt_count"] == 1
+    assert diagnostic["baseline_transient_failure_count"] == 1
+    assert diagnostic["last_authoritative_registered_node_count"] is None
 
 
 def test_fresh_bridge_fingerprint_ignores_prior_session_log_content(
@@ -4144,6 +4213,8 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
         "webdriver_transport_failure", "webdriver_ready", "not_started"),
     (None, None, None, None, None, RuntimeError("private readiness exception /secret/path"),
         None, "desktop_ui_not_ready", "desktop_session_started", "not_started"),
+    (None, None, None, None, None, None, RuntimeError("click_failure"),
+        "packaged_runner_failure", "desktop_ready", "operator_enabled"),
     (None, None, None, None, None, None, RuntimeError("packaged_runner_failure"),
         "packaged_runner_failure", "desktop_ready", "operator_started"),
     (None, None, None, None, None, None, RuntimeError("operator_running_not_reached"),
@@ -4180,8 +4251,12 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     checkpoints = []
     process = SimpleNamespace(pid=1234)
     application_process = SimpleNamespace(pid=1235)
+    def click():
+        if str(operator_error) == "click_failure":
+            raise RuntimeError("private click exception /secret/path")
+
     driver = SimpleNamespace(
-        find_element=lambda *_args: SimpleNamespace(click=lambda: None),
+        find_element=lambda *_args: SimpleNamespace(click=click),
         execute_script=lambda *_args: None,
     )
     start_calls = []
@@ -4275,6 +4350,13 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "WEBDRIVER_READINESS_CATEGORIES": frozenset({"ready", "no_window_handle",
             "wrong_handle", "missing_shell", "missing_required_controls",
             "webdriver_failure", "unknown"}),
+        "PRE_START_DIAGNOSTIC_DEFAULTS": {
+            "baseline_outcome": "not_entered", "baseline_poll_attempt_count": 0,
+            "baseline_transient_failure_count": 0,
+            "last_authoritative_registered_node_count": None,
+            "start_click_state": "not_reached", "start_click_exception_category": "none",
+        },
+        "_start_click_exception_category": lambda _exc: "other",
         "_classify_webdriver_session_failure": lambda _exc, _process: (
             "webdriver_session_creation_failed", "running", "unknown"),
             "_write_webdriver_diagnostic": lambda *args: diagnostics.append(args),
@@ -4303,7 +4385,10 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "fill_input_by_label": lambda *_args: None,
         "benchmark_operator_mode": lambda _backend: "cpu",
         "wait_for_start_operator_enabled": lambda *_args, **_kwargs: None,
-        "require_clean_relay_registration_baseline": lambda *_args, **_kwargs: 0,
+        "require_clean_relay_registration_baseline": lambda *_args, **kwargs: (
+            kwargs["record_pre_start_state"](
+                baseline_outcome="accepted_zero", baseline_poll_attempt_count=1,
+                last_authoritative_registered_node_count=0) or []),
         "wait_for_post_start_operator_state": post_start,
         "_validate_operator_tokenizer_handoff": lambda _evidence, fail_closed: (
             fail_closed("rust_python_handoff_failed")
@@ -4362,14 +4447,24 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     assert checkpoints[-1]["last_safe_phase"] == expected_phase
     assert checkpoints[-1]["failure_reason"] == expected_reason
     assert checkpoints[-1]["cleanup_succeeded"] is True
-    assert diagnostics[-1][-4] == expected_progress
-    assert diagnostics[-1][-3]["start_handler_state"] == "entered"
-    assert diagnostics[-1][-2] == {
+    assert diagnostics[-1][-5] == expected_progress
+    assert diagnostics[-1][-4]["start_handler_state"] == "entered"
+    assert diagnostics[-1][-3] == {
         "native_startup_phase": "startup_task_failed",
         "native_startup_outcome": "failed",
         "native_startup_failure_category": "child_spawn_failed",
     }
-    assert diagnostics[-1][-1] == {}
+    assert diagnostics[-1][-2] == {}
+    pre_start = diagnostics[-1][-1]
+    if expected_progress == "operator_enabled":
+        assert pre_start["start_click_state"] == "raised"
+        assert pre_start["start_click_exception_category"] == "other"
+    elif expected_progress == "not_started":
+        assert pre_start["baseline_outcome"] == "not_entered"
+        assert pre_start["start_click_state"] == "not_reached"
+    else:
+        assert pre_start["baseline_outcome"] == "accepted_zero"
+        assert pre_start["start_click_state"] == "returned"
     assert len(start_calls) == (
         0 if command_error or gate_error or launch_error or devtools_error else 1)
     if fake_os.name == "nt" and not command_error and not gate_error and not launch_error:

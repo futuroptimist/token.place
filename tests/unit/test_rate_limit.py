@@ -5,6 +5,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from flask import Flask, request as flask_request
 
 from api import (
@@ -44,6 +45,101 @@ def test_rate_limit_uses_openai_style_error_payload():
     assert payload["error"]["type"] == "rate_limit_error"
     assert payload["error"]["code"] == "rate_limit_exceeded"
     assert "rate limit exceeded" in payload["error"]["message"].lower()
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1/minute", "API_DAILY_QUOTA": "1/day"},
+    clear=True,
+)
+def test_public_information_reads_are_exempt_without_consuming_user_quota():
+    """Public UI and metadata reads should leave both ordinary quotas intact."""
+    app = Flask(__name__)
+    init_app(app)
+
+    for path in ("/", "/api/v1/meta", "/api/v1/version"):
+        app.add_url_rule(
+            path,
+            endpoint=f"public-information-{path}",
+            view_func=lambda: {"status": "ok"},
+            methods=["GET"],
+        )
+
+    with app.test_client() as client:
+        for method in (client.get, client.head):
+            for path in ("/", "/api/v1/meta", "/api/v1/version"):
+                assert [method(path).status_code for _ in range(3)] == [200, 200, 200]
+
+        assert client.get("/api/v1/models").status_code == 200
+        limited = client.get("/api/v1/models")
+
+    assert limited.status_code == 429
+    assert limited.get_json()["error"]["code"] == "rate_limit_exceeded"
+
+
+@pytest.mark.parametrize("path", ["/", "/api/v1/meta", "/api/v1/version"])
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1/minute", "API_DAILY_QUOTA": "1/day"},
+    clear=True,
+)
+def test_public_information_exemption_does_not_cover_mutation_methods(path, method):
+    """Exact public-information paths remain quota-protected for mutations."""
+    app = Flask(__name__)
+    init_app(app)
+    app.add_url_rule(
+        path,
+        endpoint=f"public-information-mutation-{method}-{path}",
+        view_func=lambda: {"status": "ok"},
+        methods=[method],
+    )
+
+    with app.test_client() as client:
+        assert client.open(path, method=method).status_code == 200
+        limited = client.open(path, method=method)
+
+    assert limited.status_code == 429
+    assert limited.get_json()["error"]["code"] == "rate_limit_exceeded"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/models",
+        "/unrelated-public-route",
+        "/api/v1/metadata",
+        "/api/v1/meta-extra",
+        "/prefix/api/v1/meta",
+        "/api/v1/versioned",
+        "/api/v1/version/extra",
+    ],
+)
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1/minute", "API_DAILY_QUOTA": "1/day"},
+    clear=True,
+)
+def test_public_information_exemption_does_not_cover_other_paths(path, method):
+    """Safe reads use an exact normalized-path allowlist, not prefix matching."""
+    app = Flask(__name__)
+    init_app(app)
+    if path != "/api/v1/models":
+        app.add_url_rule(
+            path,
+            endpoint=f"protected-public-read-{method}-{path}",
+            view_func=lambda: {"status": "ok"},
+            methods=["GET"],
+        )
+
+    with app.test_client() as client:
+        assert client.open(path, method=method).status_code == 200
+        limited = client.open(path, method=method)
+
+    assert limited.status_code == 429
+    if method == "GET":
+        assert limited.get_json()["error"]["code"] == "rate_limit_exceeded"
 
 
 @patch.dict(

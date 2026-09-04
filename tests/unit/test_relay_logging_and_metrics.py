@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import io
 import logging
 import os
 import re
@@ -24,10 +25,23 @@ def relay_client():
     """Provide a clean relay Flask test client."""
 
     app.config["TESTING"] = True
-    known_servers.clear()
+    state_stores = (
+        known_servers,
+        relay.client_inference_requests,
+        relay.client_responses,
+        relay.client_pending_request_ids,
+        relay.client_terminal_request_ids,
+        relay.client_terminal_outcomes,
+        relay.streaming_sessions,
+        relay.streaming_sessions_by_client,
+        relay.api_v1_recently_unregistered_servers,
+    )
+    for store in state_stores:
+        store.clear()
     with app.test_client() as client:
         yield client
-    known_servers.clear()
+    for store in state_stores:
+        store.clear()
 
 
 def test_json_formatter_outputs_structured_payload() -> None:
@@ -42,14 +56,14 @@ def test_json_formatter_outputs_structured_payload() -> None:
         args=("chat",),
         exc_info=None,
     )
-    record.request_id = "abc123"
+    record.request_id = "sensitive-request-id"
 
     payload = json.loads(JsonFormatter().format(record))
 
     assert payload["message"] == "processed chat request"
     assert payload["level"] == "INFO"
     assert payload["logger"] == "tokenplace.relay"
-    assert payload["request_id"] == "abc123"
+    assert "request_id" not in payload
     assert payload["timestamp"].endswith("Z")
 
 
@@ -291,32 +305,42 @@ def test_metrics_auth_accepts_correct_credential_without_logging_it(
     assert token not in response.get_data(as_text=True)
 
 
-def test_metrics_uses_multiprocess_collector_when_directory_is_configured(
-    relay_client, monkeypatch
-) -> None:
-    """Gunicorn workers must expose one aggregate view of shard-backed metrics."""
+def test_multiprocess_workers_aggregate_and_gauges_have_no_pid(tmp_path) -> None:
+    """Two real worker PIDs contribute to one dedicated aggregate exposition."""
 
-    registries = []
-    payloads = []
-    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", "/tmp/metrics-test")
-    monkeypatch.setattr(
-        relay.multiprocess,
-        "MultiProcessCollector",
-        lambda registry: registries.append(registry),
+    metrics_dir = tmp_path / "multiprocess"
+    metrics_dir.mkdir()
+    env = os.environ.copy()
+    env["PROMETHEUS_MULTIPROC_DIR"] = str(metrics_dir)
+    worker = """
+import relay
+relay.HTTP_REQUESTS_TOTAL.labels('POST', '/api/v1/relay/requests', '2xx', 'relay', 'completed').inc()
+relay.HTTP_REQUEST_DURATION_SECONDS.labels('POST', '/api/v1/relay/requests', '2xx', 'relay', 'completed').observe(0.25)
+relay.RELAY_QUEUE_DEPTH.labels('relay').set(3)
+"""
+    for _ in range(2):
+        subprocess.run([sys.executable, "-c", worker], env=env, check=True, capture_output=True)
+
+    scrape = """
+import json
+import relay
+from prometheus_client import generate_latest
+print(json.dumps({'body': generate_latest(relay.RELAY_METRICS_REGISTRY).decode()}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", scrape], env=env, check=True, capture_output=True, text=True
     )
-    monkeypatch.setattr(
-        relay,
-        "generate_latest",
-        lambda registry: payloads.append(registry) or b"aggregate\n",
-    )
-
-    response = relay_client.get("/metrics")
-
-    assert response.status_code == 200
-    assert response.data == b"aggregate\n"
-    assert len(registries) == 1
-    assert payloads == registries
-    assert registries[0] is not relay.RELAY_METRICS_REGISTRY
+    body = json.loads(result.stdout.splitlines()[-1])["body"]
+    samples = _samples(body)
+    counter = [sample for sample in samples if sample.name == "tokenplace_http_requests_total"]
+    histogram_count = [
+        sample for sample in samples
+        if sample.name == "tokenplace_http_request_duration_seconds_count"
+    ]
+    queue = [sample for sample in samples if sample.name == "tokenplace_relay_queue_depth"]
+    assert len(counter) == len(histogram_count) == len(queue) == 1
+    assert counter[0].value == histogram_count[0].value == 2
+    assert all("pid" not in sample.labels for sample in samples)
 
 
 def test_relay_gauges_use_bounded_multiprocess_mode() -> None:
@@ -332,6 +356,68 @@ def test_relay_gauges_use_bounded_multiprocess_mode() -> None:
         relay.INSTRUMENTATION_UP,
     ):
         assert gauge._multiprocess_mode == "livemostrecent"
+
+
+def test_queue_dispatch_completion_and_terminal_metrics_update_once(relay_client) -> None:
+    server_key = "metric-node"
+    client_key = "metric-client"
+    _register_api_v1_node(relay_client, server_key)
+    envelope = {
+        "request_id": "metric-complete",
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "client_public_key": client_key,
+        "server_public_key": server_key,
+        "chat_history": "encrypted-request",
+        "cipherkey": "encrypted-key",
+        "iv": "encrypted-iv",
+    }
+    assert relay_client.post("/api/v1/relay/requests", json=envelope).status_code == 200
+    queued = _scrape(relay_client)
+    assert _metric_value(queued, 'tokenplace_relay_queue_depth{provider_mode="relay"}') == 1
+
+    assert relay_client.post(
+        "/api/v1/relay/servers/poll", json={"server_public_key": server_key}
+    ).status_code == 200
+    dispatched = _scrape(relay_client)
+    assert _metric_value(dispatched, 'tokenplace_relay_queue_depth{provider_mode="relay"}') == 0
+    assert _metric_value(dispatched, "tokenplace_relay_in_flight_requests") == 1
+
+    response = dict(envelope)
+    response.pop("server_public_key")
+    response["chat_history"] = "encrypted-response"
+    assert relay_client.post("/api/v1/relay/responses", json=response).status_code == 200
+    complete = _scrape(relay_client)
+    assert _metric_value(complete, "tokenplace_relay_in_flight_requests") == 0
+
+    outcomes = {
+        "cancelled": ("cancel-client", "cancel-request"),
+        "expired": ("expire-client", "expire-request"),
+        "timed_out": ("timeout-client", "timeout-request"),
+        "rate_limited": ("limited-client", "limited-request"),
+    }
+    before = _scrape(relay_client)
+    for outcome, identity in outcomes.items():
+        baseline = _metric_value(
+            before, f'tokenplace_relay_request_outcomes_total{{outcome="{outcome}"}}'
+        )
+        assert relay._record_request_terminal_outcome_once(*identity, outcome)
+        assert not relay._record_request_terminal_outcome_once(*identity, outcome)
+        after = _scrape(relay_client)
+        assert _metric_value(
+            after, f'tokenplace_relay_request_outcomes_total{{outcome="{outcome}"}}'
+        ) == baseline + 1
+
+    eviction_before = _metric_value(
+        _scrape(relay_client),
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    )
+    assert relay._unregister_server(server_key, eviction_reason="stale_lease")
+    assert not relay._unregister_server(server_key, eviction_reason="stale_lease")
+    assert _metric_value(
+        _scrape(relay_client),
+        'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
+    ) == eviction_before + 1
 
 
 def test_repeated_scrapes_are_read_only_for_relay_state(relay_client) -> None:
@@ -365,6 +451,38 @@ BOUNDED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "
 BOUNDED_STATUS_CLASSES = {"1xx", "2xx", "3xx", "4xx", "5xx", "unknown"}
 BOUNDED_PROVIDER_MODES = set(relay.PROVIDER_MODE_ENUM)
 BOUNDED_OUTCOMES = set(relay.OUTCOME_ENUM)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (99, "unknown"), (100, "1xx"), (599, "5xx"), (600, "unknown"),
+        (-200, "unknown"), ("not-a-status", "unknown"),
+    ],
+)
+def test_status_class_is_strictly_bounded(value, expected) -> None:
+    assert relay._normalise_status_class(value) == expected
+
+
+@pytest.mark.parametrize("value", ["TRACE", "BREW", "CUSTOM-ATTACK", None])
+def test_nonstandard_methods_are_bounded(value) -> None:
+    assert relay._normalise_http_method(value) == "other"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(99, "unknown"), (100, "100"), (599, "599"), (600, "unknown"), ("bad", "unknown")],
+)
+def test_legacy_status_is_exact_but_bounded(value, expected) -> None:
+    assert relay._normalise_legacy_status(value) == expected
+
+
+def test_legacy_endpoint_preserves_known_names_and_bounds_unmatched_values() -> None:
+    assert (
+        relay._normalise_legacy_endpoint("api_v1_relay_servers_register")
+        == "api_v1_relay_servers_register"
+    )
+    assert relay._normalise_legacy_endpoint("attacker-selected-endpoint") == "unknown"
 
 
 def _samples(body: str):
@@ -415,7 +533,7 @@ def test_metric_names_and_label_domains_are_finite(relay_client) -> None:
         "/api/v1/*", "/api/v2/*", "/healthz", "/livez",
         "/relay/diagnostics", "other",
     }
-    allowed_endpoints = {rule.endpoint for rule in app.url_map.iter_rules()} | {"unknown"}
+    allowed_endpoints = set(relay.LEGACY_ENDPOINT_ENUM) | {"unknown"}
     for sample in _samples(body):
         labels = sample.labels
         if "method" in labels:
@@ -427,13 +545,89 @@ def test_metric_names_and_label_domains_are_finite(relay_client) -> None:
         if "status_class" in labels:
             assert labels["status_class"] in BOUNDED_STATUS_CLASSES
         if "status" in labels:
-            assert labels["status"].isdigit()
+            assert labels["status"] == "unknown" or (
+                labels["status"].isdigit() and 100 <= int(labels["status"]) <= 599
+            )
         if "provider_mode" in labels:
             assert labels["provider_mode"] in BOUNDED_PROVIDER_MODES
         if "outcome" in labels:
             assert labels["outcome"] in BOUNDED_OUTCOMES
         if "reason" in labels:
             assert labels["reason"] in set(relay.EVICTION_REASON_ENUM)
+
+
+def test_only_explicit_relay_metric_families_are_exposed(relay_client) -> None:
+    allowed = {
+        "tokenplace_build_info",
+        "tokenplace_compute_node_evictions",
+        "tokenplace_compute_node_evictions_created",
+        "tokenplace_compute_node_lease_age_seconds",
+        "tokenplace_compute_nodes_healthy",
+        "tokenplace_compute_nodes_registered",
+        "tokenplace_http_request_duration_seconds",
+        "tokenplace_http_request_duration_seconds_created",
+        "tokenplace_http_requests",
+        "tokenplace_http_requests_created",
+        "tokenplace_instrumentation_up",
+        "tokenplace_relay_in_flight_requests",
+        "tokenplace_relay_oldest_in_flight_age_seconds",
+        "tokenplace_relay_oldest_queued_request_age_seconds",
+        "tokenplace_relay_queue_depth",
+        "tokenplace_relay_request_outcomes",
+        "tokenplace_relay_request_outcomes_created",
+        "tokenplace_relay_requests",
+        "tokenplace_relay_requests_created",
+    }
+    body = _scrape(relay_client)
+    families = {family.name for family in text_string_to_metric_families(body)}
+    assert families == allowed
+    assert "flask_http_request" not in body
+
+
+def test_sensitive_inputs_and_exceptions_never_reach_observability(relay_client) -> None:
+    markers = {
+        "path": "private-path-marker",
+        "query": "private-query-marker",
+        "request": "private-request-id-marker",
+        "agent": "private-user-agent-marker",
+        "key": "private-public-key-marker",
+        "ciphertext": "private-ciphertext-marker",
+        "auth": "private-authorization-marker",
+        "exception": "private-exception-marker",
+    }
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter())
+    relay.LOGGER.addHandler(handler)
+    try:
+        relay_client.get(
+            f"/{markers['path']}?secret={markers['query']}&ciphertext={markers['ciphertext']}",
+            headers={
+                "X-Request-Id": markers["request"],
+                "User-Agent": markers["agent"],
+                "Authorization": markers["auth"],
+            },
+        )
+        unknown = relay_client.post(
+            "/api/v1/relay/responses/retrieve",
+            json={"client_public_key": markers["key"], "request_id": markers["request"]},
+        )
+        try:
+            raise RuntimeError(markers["exception"])
+        except RuntimeError:
+            relay.LOGGER.error(
+                "relay.synthetic_failure",
+                exc_info=True,
+                extra={"request_id": markers["request"], "ciphertext": markers["ciphertext"]},
+            )
+    finally:
+        relay.LOGGER.removeHandler(handler)
+
+    assert unknown.status_code == 404
+    assert unknown.get_json() == {"error": {"message": "Unknown request", "code": 404}}
+    observable = "\n".join((stream.getvalue(), _scrape(relay_client), unknown.get_data(as_text=True)))
+    for marker in markers.values():
+        assert marker not in observable
 
 
 def test_metrics_scrapes_do_not_instrument_themselves(relay_client) -> None:

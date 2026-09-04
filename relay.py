@@ -63,6 +63,20 @@ class JsonFormatter(logging.Formatter):
         "thread",
         "threadName",
     }
+    _SENSITIVE = {
+        "authorization",
+        "ciphertext",
+        "client_fingerprint",
+        "client_public_key",
+        "gpu_host",
+        "host",
+        "request_id",
+        "server_fingerprint",
+        "server_public_key",
+        "source_address",
+        "upstream",
+        "user_agent",
+    }
 
     def format(self, record: logging.LogRecord) -> str:  # noqa: D401 - logging API
         payload: Dict[str, Any] = {
@@ -72,11 +86,8 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
         }
 
-        if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
-
         for key, value in record.__dict__.items():
-            if key in self._RESERVED or key.startswith("_"):
+            if key in self._RESERVED or key in self._SENSITIVE or key.startswith("_"):
                 continue
             payload[key] = value
 
@@ -107,6 +118,10 @@ LOGGER = setup_logging()
 
 
 RELAY_METRICS_REGISTRY = CollectorRegistry()
+_PROMETHEUS_MULTIPROCESS_ACTIVE = bool(os.environ.get("PROMETHEUS_MULTIPROC_DIR"))
+if _PROMETHEUS_MULTIPROCESS_ACTIVE:
+    multiprocess.MultiProcessCollector(RELAY_METRICS_REGISTRY)
+_RELAY_METRIC_REGISTRY = None if _PROMETHEUS_MULTIPROCESS_ACTIVE else RELAY_METRICS_REGISTRY
 _METRICS_INITIALIZED = False
 
 
@@ -384,8 +399,8 @@ def create_app() -> Flask:
         from config import get_config
 
         configured_servers = get_config().get("relay.server_pool", []) or []
-    except (ImportError, AttributeError, KeyError, TypeError) as exc:
-        LOGGER.debug("relay.config.load_failed", exc_info=exc)
+    except (ImportError, AttributeError, KeyError, TypeError):
+        LOGGER.debug("relay.config.load_failed", extra={"reason": "config_load_failed"})
         configured_servers = []
     flask_app.config["relay_configured_servers"] = list(configured_servers)
     public_base_url = _load_public_base_url()
@@ -403,8 +418,8 @@ def create_app() -> Flask:
     LOGGER.info(
         "relay.app.initialized",
         extra={
-            "upstream": flask_app.config.get("upstream_url"),
-            "public_base_url": public_base_url,
+            "has_upstream": bool(flask_app.config.get("upstream_url")),
+            "has_public_base_url": bool(public_base_url),
         },
     )
     return flask_app
@@ -418,7 +433,7 @@ def _get_request_counter() -> Counter:
         "tokenplace_relay_requests_total",
         "Total HTTP requests processed by token.place relay",
         ["method", "endpoint", "status"],
-        registry=RELAY_METRICS_REGISTRY,
+        registry=_RELAY_METRIC_REGISTRY,
     )
 
 
@@ -475,7 +490,7 @@ HTTP_REQUESTS_TOTAL = _collector(
         "tokenplace_http_requests_total",
         "Bounded relay HTTP requests by normalized route, status class, provider mode, and outcome.",
         ["method", "route", "status_class", "provider_mode", "outcome"],
-        registry=RELAY_METRICS_REGISTRY,
+        registry=_RELAY_METRIC_REGISTRY,
     ),
 )
 HTTP_REQUEST_DURATION_SECONDS = _collector(
@@ -485,52 +500,52 @@ HTTP_REQUEST_DURATION_SECONDS = _collector(
         "Bounded relay HTTP request duration in seconds.",
         ["method", "route", "status_class", "provider_mode", "outcome"],
         buckets=HTTP_DURATION_BUCKETS,
-        registry=RELAY_METRICS_REGISTRY,
+        registry=_RELAY_METRIC_REGISTRY,
     ),
 )
 RELAY_QUEUE_DEPTH = _collector(
     "tokenplace_relay_queue_depth",
-    lambda: Gauge("tokenplace_relay_queue_depth", "Current encrypted relay request queue depth.", ["provider_mode"], multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_relay_queue_depth", "Current encrypted relay request queue depth.", ["provider_mode"], multiprocess_mode="livemostrecent", registry=_RELAY_METRIC_REGISTRY),
 )
 RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS = _collector(
     "tokenplace_relay_oldest_queued_request_age_seconds",
-    lambda: Gauge("tokenplace_relay_oldest_queued_request_age_seconds", "Age of the oldest queued encrypted relay request.", ["provider_mode"], multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_relay_oldest_queued_request_age_seconds", "Age of the oldest queued encrypted relay request.", ["provider_mode"], multiprocess_mode="livemostrecent", registry=_RELAY_METRIC_REGISTRY),
 )
 COMPUTE_NODES_REGISTERED = _collector(
     "tokenplace_compute_nodes_registered",
-    lambda: Gauge("tokenplace_compute_nodes_registered", "Registered API v1 compute nodes.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_compute_nodes_registered", "Registered API v1 compute nodes.", multiprocess_mode="livemostrecent", registry=_RELAY_METRIC_REGISTRY),
 )
 COMPUTE_NODES_HEALTHY = _collector(
     "tokenplace_compute_nodes_healthy",
-    lambda: Gauge("tokenplace_compute_nodes_healthy", "Healthy API v1 compute nodes using relay lease semantics.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_compute_nodes_healthy", "Healthy API v1 compute nodes using relay lease semantics.", multiprocess_mode="livemostrecent", registry=_RELAY_METRIC_REGISTRY),
 )
 COMPUTE_NODE_LEASE_AGE_SECONDS = _collector(
     "tokenplace_compute_node_lease_age_seconds",
-    lambda: Gauge("tokenplace_compute_node_lease_age_seconds", "Oldest compute-node lease age without node identity.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_compute_node_lease_age_seconds", "Oldest compute-node lease age without node identity.", multiprocess_mode="livemostrecent", registry=_RELAY_METRIC_REGISTRY),
 )
 COMPUTE_NODE_EVICTIONS_TOTAL = _collector(
     "tokenplace_compute_node_evictions_total",
-    lambda: Counter("tokenplace_compute_node_evictions_total", "Compute node evictions by fixed reason.", ["reason"], registry=RELAY_METRICS_REGISTRY),
+    lambda: Counter("tokenplace_compute_node_evictions_total", "Compute node evictions by fixed reason.", ["reason"], registry=_RELAY_METRIC_REGISTRY),
 )
 RELAY_IN_FLIGHT_REQUESTS = _collector(
     "tokenplace_relay_in_flight_requests",
-    lambda: Gauge("tokenplace_relay_in_flight_requests", "Current encrypted relay requests dispatched to compute nodes.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_relay_in_flight_requests", "Current encrypted relay requests dispatched to compute nodes.", multiprocess_mode="livemostrecent", registry=_RELAY_METRIC_REGISTRY),
 )
 RELAY_OLDEST_IN_FLIGHT_AGE_SECONDS = _collector(
     "tokenplace_relay_oldest_in_flight_age_seconds",
-    lambda: Gauge("tokenplace_relay_oldest_in_flight_age_seconds", "Age of the oldest in-flight encrypted relay request.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_relay_oldest_in_flight_age_seconds", "Age of the oldest in-flight encrypted relay request.", multiprocess_mode="livemostrecent", registry=_RELAY_METRIC_REGISTRY),
 )
 RELAY_REQUEST_OUTCOMES_TOTAL = _collector(
     "tokenplace_relay_request_outcomes_total",
-    lambda: Counter("tokenplace_relay_request_outcomes_total", "Terminal relay request outcomes by fixed enum.", ["outcome"], registry=RELAY_METRICS_REGISTRY),
+    lambda: Counter("tokenplace_relay_request_outcomes_total", "Terminal relay request outcomes by fixed enum.", ["outcome"], registry=_RELAY_METRIC_REGISTRY),
 )
 BUILD_INFO = _collector(
     "tokenplace_build_info",
-    lambda: Gauge("tokenplace_build_info", "token.place build metadata.", ["version", "revision"], multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_build_info", "token.place build metadata.", ["version", "revision"], multiprocess_mode="livemostrecent", registry=_RELAY_METRIC_REGISTRY),
 )
 INSTRUMENTATION_UP = _collector(
     "tokenplace_instrumentation_up",
-    lambda: Gauge("tokenplace_instrumentation_up", "Whether relay metrics instrumentation initialized.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_instrumentation_up", "Whether relay metrics instrumentation initialized.", multiprocess_mode="livemostrecent", registry=_RELAY_METRIC_REGISTRY),
 )
 
 
@@ -571,9 +586,55 @@ def _normalise_http_method(method: str | None) -> str:
 
 def _normalise_status_class(status_code: int | str) -> str:
     try:
-        return f"{int(status_code) // 100}xx"
+        status = int(status_code)
     except (TypeError, ValueError):
         return "unknown"
+    return f"{status // 100}xx" if 100 <= status <= 599 else "unknown"
+
+
+# Freeze the Flask endpoint vocabulary after application construction.  This
+# preserves every release-line endpoint value while preventing subsequently
+# injected or unmatched endpoint names from creating arbitrary series.
+LEGACY_ENDPOINT_ENUM = frozenset(app.view_functions) | frozenset({
+    "api_v1_relay_requests",
+    "api_v1_relay_requests_cancel",
+    "api_v1_relay_responses",
+    "api_v1_relay_responses_retrieve",
+    "api_v1_relay_servers_next",
+    "api_v1_relay_servers_poll",
+    "api_v1_relay_servers_register",
+    "api_v1_relay_servers_unregister",
+    "api_v1_meta",
+    "api_v1_version",
+    "faucet",
+    "healthz",
+    "index",
+    "livez",
+    "metrics",
+    "next_server",
+    "relay_api_v1_chat_completions",
+    "relay_api_v1_source",
+    "relay_diagnostics",
+    "retrieve",
+    "sink",
+    "source",
+    "serve_static",
+    "stream_retrieve",
+    "stream_source",
+    "unregister",
+})
+
+
+def _normalise_legacy_endpoint(endpoint: str | None) -> str:
+    return endpoint if endpoint in LEGACY_ENDPOINT_ENUM else "unknown"
+
+
+def _normalise_legacy_status(status_code: int | str) -> str:
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError):
+        return "unknown"
+    return str(status) if 100 <= status <= 599 else "unknown"
 
 
 def _normalise_http_route() -> str:
@@ -1094,7 +1155,6 @@ def _unregister_server(server_public_key: str, *, eviction_reason: str = "unregi
     LOGGER.info(
         "server.unregistered",
         extra={
-            "server_fingerprint": _safe_key_fingerprint(server_public_key),
             "removed": removed,
             "cancelled_queue_depth": cancelled_queue_depth,
         },
@@ -1191,7 +1251,8 @@ def _record_request_start():
 @app.after_request
 def _log_request(response: Response):
     endpoint = request.endpoint or "unknown"
-    status_code = str(response.status_code)
+    method = _normalise_http_method(request.method)
+    status_code = _normalise_legacy_status(response.status_code)
     route = _normalise_http_route()
     status_class = _normalise_status_class(response.status_code)
     outcome = _outcome_for_response(response)
@@ -1199,10 +1260,9 @@ def _log_request(response: Response):
 
     try:
         if route != "/metrics":
-            method = _normalise_http_method(request.method)
             # Preserve the established relay metric contract for existing
             # dashboards; the new HTTP metric carries normalized labels.
-            REQUEST_COUNTER.labels(method, endpoint, status_code).inc()
+            REQUEST_COUNTER.labels(method, _normalise_legacy_endpoint(endpoint), status_code).inc()
             HTTP_REQUESTS_TOTAL.labels(method, route, status_class, provider_mode, outcome).inc()
     except Exception:  # pragma: no cover - defensive metric increment
         LOGGER.debug(
@@ -1216,7 +1276,7 @@ def _log_request(response: Response):
     try:
         if route != "/metrics":
             HTTP_REQUEST_DURATION_SECONDS.labels(
-                _normalise_http_method(request.method),
+                method,
                 route,
                 status_class,
                 provider_mode,
@@ -1231,10 +1291,10 @@ def _log_request(response: Response):
         LOGGER.info(
             "http.request",
             extra={
-                "http_method": request.method,
+                "http_method": method,
                 "http_route": route,
                 "http_path": route,
-                "http_status": int(status_code),
+                "http_status": int(status_code) if status_code != "unknown" else "unknown",
                 "status_class": status_class,
                 "duration_ms": round((duration or 0) * 1000, 2),
             },
@@ -1252,11 +1312,7 @@ def _log_request(response: Response):
 @app.route("/metrics", methods=["GET"])
 def metrics():
     try:
-        registry = RELAY_METRICS_REGISTRY
-        if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
-            registry = CollectorRegistry()
-            multiprocess.MultiProcessCollector(registry)
-        payload = generate_latest(registry)
+        payload = generate_latest(RELAY_METRICS_REGISTRY)
     except Exception:
         LOGGER.error("metrics.serialize_failed", extra={"reason": "serialize_failed"})
         return Response("metrics unavailable\n", status=503, mimetype="text/plain")
@@ -1299,7 +1355,7 @@ def healthz():
         status.setdefault("details", {})["gpuHostResolution"] = "failed"
         LOGGER.warning(
             "healthz.resolution_failed",
-            extra={"gpu_host": gpu_host, "require_upstream_health": require_upstream_health},
+            extra={"reason": "upstream_resolution_failed"},
         )
         return jsonify(status), 503
 
@@ -1490,7 +1546,6 @@ def _select_next_server_payload(*, api_v1: bool = False):
     LOGGER.info(
         "relay.server_selected",
         extra={
-            "server_fingerprint": _safe_key_fingerprint(server_public_key),
             "selection_policy": "registration_order_round_robin",
             "round_robin_index": selection.get("round_robin_index"),
             "round_robin_position": selection.get("round_robin_position"),
@@ -1673,12 +1728,6 @@ def _queue_client_response(client_public_key, envelope):
         client_responses[client_public_key] = [existing, envelope]
 
 
-def _safe_key_fingerprint(value: Any) -> str:
-    if not isinstance(value, str) or not value:
-        return "unknown"
-    return f"{value[:8]}...{value[-4:]}" if len(value) > 12 else "short-key"
-
-
 _ALLOWED_API_V1_TERMINAL_STATUSES = {"cancelled", "expired"}
 _API_V1_UNREGISTER_TOMBSTONE_TTL_SECONDS = 300.0
 api_v1_recently_unregistered_servers: dict[str, float] = {}
@@ -1808,9 +1857,6 @@ def _remove_request_from_server_queues(client_public_key, request_id):
                     removed_for_server += 1
                     LOGGER.info(
                         "relay.api_v1.request_removed_from_queue",
-                        extra={
-                            "server_fingerprint": _safe_key_fingerprint(server_public_key),
-                        },
                     )
                     continue
                 kept.append(item)
@@ -1901,7 +1947,6 @@ def _cancel_api_v1_request(client_public_key, request_id, *, status="cancelled",
     LOGGER.info(
         "relay.api_v1.request_cancelled",
         extra={
-            "client_fingerprint": _safe_key_fingerprint(client_public_key),
             "status": status,
             "reason": reason or status,
             "removed_from_queue": removed,
@@ -2126,7 +2171,7 @@ def api_v1_relay_servers_register():
             log_event = "server.registered"
         known_servers[public_key]['last_ping_duration'] = lease_seconds
         known_servers[public_key][API_V1_SERVER_MARKER] = True
-    LOGGER.info(log_event, extra={"server_fingerprint": _safe_key_fingerprint(public_key)})
+    LOGGER.info(log_event)
 
     return jsonify({
         'next_ping_in_x_seconds': lease_seconds,
@@ -2189,7 +2234,7 @@ def api_v1_relay_servers_poll():
         server_payload['last_ping'] = datetime.now()
         server_payload['last_ping_duration'] = lease_seconds
         server_payload['polling_until_monotonic'] = time.monotonic() + max(poll_wait_seconds, 0.0)
-    LOGGER.info("server.heartbeat", extra={"server_fingerprint": _safe_key_fingerprint(public_key)})
+    LOGGER.info("server.heartbeat")
 
     def _mark_claimed_request_terminal(claimed_request):
         if not isinstance(claimed_request, dict):
@@ -2269,7 +2314,6 @@ def api_v1_relay_servers_poll():
     LOGGER.info(
         "relay.api_v1.request_dispatched",
         extra={
-            "server_fingerprint": _safe_key_fingerprint(public_key),
             "queue_wait_ms": queue_wait_ms,
         },
     )
@@ -2313,7 +2357,6 @@ def api_v1_relay_requests():
     LOGGER.info(
         "relay.api_v1.request_queued",
         extra={
-            "server_fingerprint": _safe_key_fingerprint(server_public_key),
             "queue_depth": queue_depth,
         },
     )
@@ -2384,9 +2427,6 @@ def api_v1_relay_responses():
             if _has_client_response_for_request(client_public_key, request_id):
                 LOGGER.info(
                     "relay.api_v1.duplicate_response_ignored",
-                    extra={
-                        "client_fingerprint": _safe_key_fingerprint(client_public_key),
-                    },
                 )
                 return jsonify({'message': 'Response already queued for client'}), 200
             _expire_pending_request_if_stale(client_public_key, request_id)
@@ -2419,12 +2459,7 @@ def api_v1_relay_responses():
             _queue_client_response(client_public_key, envelope)
     else:
         _queue_client_response(client_public_key, envelope)
-    LOGGER.info(
-        "relay.api_v1.response_received",
-        extra={
-            "client_fingerprint": _safe_key_fingerprint(client_public_key),
-        },
-    )
+    LOGGER.info("relay.api_v1.response_received")
     return jsonify({'message': 'Response received and queued for client'}), 200
 
 
@@ -2454,7 +2489,6 @@ def api_v1_relay_responses_retrieve():
         if _is_request_pending(client_public_key, request_id):
             LOGGER.debug(
                 "relay.api_v1.response_pending",
-                extra={"client_fingerprint": _safe_key_fingerprint(client_public_key)},
             )
             return jsonify({"status": "pending"}), 202
         terminal = _get_terminal_request(client_public_key, request_id)
@@ -2462,15 +2496,10 @@ def api_v1_relay_responses_retrieve():
             status = terminal.get('status', 'cancelled')
             return jsonify({'error': {'message': f'Request {status}', 'code': status, 'status': status, 'reason': terminal.get('reason', status)}}), 410
         if request_id:
-            return jsonify({'error': {'message': f'Unknown request_id: {request_id}', 'code': 404}}), 404
+            return jsonify({'error': {'message': 'Unknown request', 'code': 404}}), 404
         return jsonify({'error': {'message': 'No response available for the given public key', 'code': 404}}), 404
 
-    LOGGER.info(
-        "relay.api_v1.response_retrieved",
-        extra={
-            "client_fingerprint": _safe_key_fingerprint(client_public_key),
-        },
-    )
+    LOGGER.info("relay.api_v1.response_retrieved")
     return jsonify(response), 200
 
 @app.route('/faucet', methods=['POST'])
@@ -2643,13 +2672,11 @@ def sink():
                     queued_requests.pop(0)
                     LOGGER.warning(
                         "relay.api_v1_plaintext_payload_dropped",
-                        extra={"server_fingerprint": _safe_key_fingerprint(public_key)},
                     )
                     continue
                 if request_payload.get('e2ee_v1'):
                     LOGGER.warning(
                         "relay.api_v1_ciphertext_payload_skipped",
-                        extra={"server_fingerprint": _safe_key_fingerprint(public_key)},
                     )
                     break
                 request_payload = queued_requests.pop(0)
@@ -2800,7 +2827,7 @@ def serve(host: str, port: int) -> None:
             try:
                 server.shutdown()
             except Exception:  # pragma: no cover - defensive logging path
-                LOGGER.exception("relay.shutdown.error")
+                LOGGER.error("relay.shutdown.error", extra={"reason": "shutdown_failed"})
 
         shutdown_thread = threading.Thread(
             target=_shutdown_server,
@@ -2823,9 +2850,8 @@ def serve(host: str, port: int) -> None:
     LOGGER.info(
         "relay.startup",
         extra={
-            "host": host,
             "port": port,
-            "upstream": app.config.get("upstream_url"),
+            "has_upstream": bool(app.config.get("upstream_url")),
         },
     )
 
@@ -2848,7 +2874,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         port = int(port_value)
     except ValueError:
-        LOGGER.warning("relay.invalid_port", extra={"port": port_value})
+        LOGGER.warning("relay.invalid_port", extra={"reason": "invalid_port"})
         port = args.port
 
     _configure_mock_mode(args.use_mock_llm)

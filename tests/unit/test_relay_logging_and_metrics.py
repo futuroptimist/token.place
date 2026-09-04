@@ -342,8 +342,8 @@ def test_repeated_scrapes_are_read_only_for_relay_state(relay_client) -> None:
         key: dict(value) for key, value in known_servers.items()
     }
     request_series = (
-        'tokenplace_relay_requests_total{endpoint="api_v1_relay_servers_register",'
-        'method="POST",status="200"}'
+        'tokenplace_relay_requests_total{endpoint="/api/v1/relay/servers/register",'
+        'method="POST",status="2xx"}'
     )
     before_scrapes = _metric_value(_scrape(relay_client), request_series)
 
@@ -360,3 +360,140 @@ def test_api_v1_model_catalog_remains_llama_31_only(relay_client) -> None:
     assert [model["id"] for model in response.get_json()["data"]] == [
         "llama-3.1-8b-instruct"
     ]
+
+
+BOUNDED_METRIC_NAMES = {
+    "tokenplace_build_info",
+    "tokenplace_compute_nodes_healthy",
+    "tokenplace_compute_nodes_registered",
+    "tokenplace_http_request_duration_seconds",
+    "tokenplace_http_requests_total",
+    "tokenplace_http_requests",
+    "tokenplace_http_requests_created",
+    "tokenplace_instrumentation_up",
+    "tokenplace_relay_in_flight_requests",
+    "tokenplace_relay_queue_depth",
+    "tokenplace_relay_request_outcomes_total",
+    "tokenplace_relay_request_outcomes",
+    "tokenplace_relay_request_outcomes_created",
+    "tokenplace_relay_requests_total",
+    "tokenplace_relay_requests",
+    "tokenplace_relay_requests_created",
+    "tokenplace_http_request_duration_seconds_created",
+}
+
+
+def test_thousands_of_unmatched_paths_have_a_deterministic_budget(relay_client, monkeypatch) -> None:
+    """Attacker-controlled 404s collapse to one route and bounded exposition."""
+
+    monkeypatch.setattr(relay.LOGGER, "info", lambda *_args, **_kwargs: None)
+    for index in range(2_000):
+        response = relay_client.get(
+            f"/private-raw-path-{index}?credential=query-secret-{index}",
+            headers={"User-Agent": f"raw-agent-{index}", "X-Request-Id": f"raw-id-{index}"},
+        )
+        assert response.status_code == 404
+
+    body = _scrape(relay_client)
+    families = list(text_string_to_metric_families(body))
+    names = {family.name for family in families}
+    samples = [sample for family in families for sample in family.samples]
+
+    assert "flask_http_request" not in body
+    assert names <= BOUNDED_METRIC_NAMES
+    assert len(samples) <= 500
+    assert len(body.encode()) <= 65_536
+    assert 'route="unmatched"' in body
+    assert 'endpoint="unmatched"' in body
+    for index in (0, 1, 999, 1_999):
+        assert f"private-raw-path-{index}" not in body
+        assert f"query-secret-{index}" not in body
+        assert f"raw-id-{index}" not in body
+        assert f"raw-agent-{index}" not in body
+
+
+def test_metrics_scrapes_do_not_instrument_themselves(relay_client) -> None:
+    before = _scrape(relay_client)
+    for _ in range(5):
+        _scrape(relay_client)
+    after = _scrape(relay_client)
+    assert before == after
+    assert 'route="/metrics"' not in after
+    assert 'endpoint="/metrics"' not in after
+
+
+def test_metric_label_domains_are_reviewed_and_finite(relay_client) -> None:
+    relay_client.open("/unmatched", method="ATTACKER-METHOD")
+    body = _scrape(relay_client)
+    samples = [
+        sample
+        for family in text_string_to_metric_families(body)
+        for sample in family.samples
+    ]
+    domains = {"method": set(), "route": set(), "endpoint": set(), "status_class": set(), "provider_mode": set(), "outcome": set()}
+    for sample in samples:
+        for label in domains:
+            if label in sample.labels:
+                domains[label].add(sample.labels[label])
+    assert domains["method"] <= relay.METHODS | {"other"}
+    assert domains["route"] <= relay.KNOWN_ROUTES | {"unmatched"}
+    assert domains["endpoint"] <= relay.KNOWN_ROUTES | {"unmatched"}
+    assert domains["status_class"] <= {"1xx", "2xx", "3xx", "4xx", "5xx", "unknown"}
+    assert domains["provider_mode"] <= {"relay"}
+    assert domains["outcome"] <= relay.OUTCOMES
+
+
+def test_entrypoint_restart_cleanup_is_exact_and_rejects_unsafe_targets(tmp_path) -> None:
+    entrypoint = Path(__file__).parents[2] / "docker/relay/entrypoint.sh"
+    metrics_dir = tmp_path / "metrics"
+    sibling = tmp_path / "keep"
+    metrics_dir.mkdir()
+    (metrics_dir / "stale.db").write_text("stale")
+    sibling.write_text("keep")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_gunicorn = bin_dir / "gunicorn"
+    fake_gunicorn.write_text("#!/bin/sh\ntest ! -e \"$PROMETHEUS_MULTIPROC_DIR/stale.db\"\ntouch \"$PROMETHEUS_MULTIPROC_DIR/fresh.db\"\n")
+    fake_gunicorn.chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "PROMETHEUS_MULTIPROC_DIR": str(metrics_dir)}
+
+    subprocess.run([str(entrypoint)], env=env, check=True)
+
+    assert (metrics_dir / "fresh.db").is_file()
+    assert sibling.read_text() == "keep"
+    unsafe = subprocess.run(
+        [str(entrypoint)],
+        env={**env, "PROMETHEUS_MULTIPROC_DIR": "/tmp"},
+        capture_output=True,
+        text=True,
+    )
+    assert unsafe.returncode != 0
+    assert "must be dedicated" in unsafe.stderr
+
+
+def test_entrypoint_rejects_metrics_directory_symlink(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    sentinel = target / "sentinel"
+    sentinel.write_text("keep")
+    link = tmp_path / "metrics-link"
+    link.symlink_to(target, target_is_directory=True)
+    entrypoint = Path(__file__).parents[2] / "docker/relay/entrypoint.sh"
+    result = subprocess.run(
+        [str(entrypoint)],
+        env={**os.environ, "PROMETHEUS_MULTIPROC_DIR": str(link)},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert sentinel.read_text() == "keep"
+
+
+def test_gunicorn_child_exit_marks_worker_dead(monkeypatch) -> None:
+    import gunicorn_metrics
+
+    seen = []
+    monkeypatch.setattr(gunicorn_metrics.multiprocess, "mark_process_dead", seen.append)
+    worker = type("Worker", (), {"pid": 4242})()
+    gunicorn_metrics.child_exit(None, worker)
+    assert seen == [4242]

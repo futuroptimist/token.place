@@ -1,0 +1,8 @@
+{
+  "date": "2026-09-03",
+  "slug": "production-public-information-rate-limit-exhaustion",
+  "summary": "Scheduled 60-second public-information probes consumed the deployed release's default 1000/day quotas for the root and metadata endpoints, making quota exhaustion visible to traffic sharing an exhausted application-visible identity.",
+  "impact": "The public landing page and metadata endpoint returned HTTP 429 to affected traffic, while the relay remained healthy and health, version, and compute polling requests continued succeeding in retained evidence.",
+  "fix": "The operator paused only the two quota-consuming probes and replaced the process to reset in-memory counters. Status remains Mitigated until an identity-verified image with exact read-only public-information exemptions is qualified, deployed, and passes a restored-probe stability period.",
+  "lessons": "Release parity must preserve reviewed safety fixes; synthetic request frequency must be validated against endpoint quotas, quota pressure needs privacy-safe early warning, and process replacement is a risky reset rather than a permanent correction."
+}

@@ -77,6 +77,7 @@ def registration_store_with_foundation(foundation):
     store = object.__new__(ValkeyRegistrationStore)
     store._foundation = foundation
     store._config = RelayStateStoreConfig(namespace="testing.unit")
+    store._acknowledgement_key = b"shared-test-acknowledgement-key-32"
     return store
 
 

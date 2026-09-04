@@ -3126,6 +3126,132 @@ def test_encrypted_response_retries_retained_retrieval_expired_terminal(valkey_s
         second.close()
 
 
+@pytest.mark.parametrize("terminal_fields", ({"additive": "value"}, {"outcome": "completed"}))
+def test_encrypted_response_rejects_preexisting_terminal_authority_without_mutation(
+    valkey_server, terminal_fields
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "orphan-node", _digest("orphan-owner"), "consumer"
+    identity = ("orphan-client", "orphan-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    terminal = cfg.key("terminal", client, request)
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store._foundation._client.hset(terminal, mapping=terminal_fields)
+        before = store._foundation._client.dump(terminal)
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, envelope
+            )
+        assert store._foundation._client.dump(terminal) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+def test_encrypted_response_complete_terminal_preserves_additive_fields(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "additive-node", _digest("additive-owner"), "consumer"
+    identity = ("additive-client", "additive-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    terminal = cfg.key("terminal", client, request)
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        accepted = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        store._foundation._client.hset(terminal, "additive", "preserved")
+        before = store._foundation._client.dump(terminal)
+
+        retried = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        assert retried == dataclasses.replace(accepted, new_outcome=False)
+        assert store._foundation._client.dump(terminal) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize("retrieval_state", ("response_ready", "retrieval_expired"))
+@pytest.mark.parametrize("corruption", ("empty_node", "oversized_node", "negative_accepted", "future_accepted"))
+def test_encrypted_response_rejects_invalid_retained_terminal_bounds_without_mutation(
+    valkey_server, retrieval_state, corruption
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=0.05 if retrieval_state == "retrieval_expired" else 300,
+        terminal_retention_seconds=600,
+    )
+    node, owner, consumer = "bounded-node", _digest("bounded-owner"), "consumer"
+    identity = ("bounded-client", "bounded-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    terminal = cfg.key("terminal", client, request)
+    response = cfg.key("response", client, request)
+    datastore = store._foundation._client
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        accepted = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        if retrieval_state == "retrieval_expired":
+            for _ in range(200):
+                seconds, micros = store._foundation.server_time()
+                if seconds + micros / 1_000_000 >= accepted.replay_expires_at_epoch:
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("authoritative Valkey time did not reach response expiry")
+            store._cleanup_completed_records()
+
+        field = "node_id" if corruption.endswith("node") else "accepted_at_epoch"
+        value = {
+            "empty_node": "",
+            "oversized_node": "x" * (store.config.max_node_id_bytes + 1),
+            "negative_accepted": "-1",
+            "future_accepted": repr(time.time() + 60),
+        }[corruption]
+        datastore.hset(terminal, field, value)
+        if retrieval_state == "response_ready":
+            datastore.hset(response, field, value)
+        before = (datastore.hgetall(terminal), datastore.hgetall(response))
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, envelope
+            )
+        assert (datastore.hgetall(terminal), datastore.hgetall(response)) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
 @pytest.mark.parametrize(
     "corruption",
     (

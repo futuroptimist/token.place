@@ -81,7 +81,7 @@ def test_response_serialization_is_canonical_sorted_utf8():
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "7fce1055792435c73b24b18f221646d3c092d07bbfb9952c8a2fa716116687c8"  # pragma: allowlist secret
+    expected_digest = "b0336b46934f17548504a56ffab7e4ea3d1cdb5e489109c8a03eb3b9af6a318b"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -106,6 +106,8 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
         ACCEPT_RESPONSE_SCRIPT.source.index("if entries>=limit then return false end")
     )
     assert "local response_values=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "local terminal_exists=redis.call('EXISTS',terminal)" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "a<0 or a>now" in ACCEPT_RESPONSE_SCRIPT.source
     assert ACCEPT_RESPONSE_SCRIPT.source.index("elseif response_exists~=0 or response_score") < ACCEPT_RESPONSE_SCRIPT.source.index("return {'existing',tostring(g),tv[9],tv[10]}")
 
 
@@ -1277,6 +1279,7 @@ def test_enqueue_translates_fixed_script_results(result, expected):
         ([b"stale"], ValkeySchemaIncompatibleError),
         ([b"stale", b"01"], ValkeySchemaIncompatibleError),
         ([b"accepted", b"1", b"nan", b"2"], ValkeySchemaIncompatibleError),
+        ([b"existing", b"1", b"-1", b"2"], ValkeySchemaIncompatibleError),
         ([b"existing", b"1", b"2", b"1"], ValkeySchemaIncompatibleError),
     ),
 )

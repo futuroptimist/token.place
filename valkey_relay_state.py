@@ -1385,10 +1385,12 @@ if not replay or not terminal_expiry or replay<=now or terminal_expiry<=now then
 if not cleanup() then return {'schema'} end
 local tv=redis.call('HMGET',terminal,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
 local tp=0 for i=1,#tv do if tv[i] then tp=tp+1 end end
-if tp>0 then
-  if tp~=#tv then return {'schema'} end
+local terminal_exists=redis.call('EXISTS',terminal)
+if terminal_exists~=0 or tp>0 then
+  if terminal_exists~=1 or tp~=#tv then return {'schema'} end
   local g=integer(tv[7]); local a=finite(tv[9]); local replay=finite(tv[10]); local expires=finite(tv[11])
   if tv[1]~='completed' or tv[2]~='response_completed' or (tv[3]~='response_ready' and tv[3]~='retrieval_expired') or not g or not a or not replay or not expires or replay<a or expires<a or not digest(tv[5]) or not digest(tv[6]) or not digest(tv[8]) or not digest(tv[12]) or not digest(tv[13]) or not digest(tv[14]) or tv[15]~=client or tv[16]~=request_digest then return {'schema'} end
+  if string.len(tv[4] or '')<1 or string.len(tv[4] or '')>max_node_id or a<0 or a>now then return {'schema'} end
   local member=client..':'..request_digest
   local terminal_score=finite(redis.call('ZSCORE',terminal_expiries,member))
   local response_score=finite(redis.call('ZSCORE',response_expiries,member))
@@ -1484,7 +1486,7 @@ return {'accepted',generation,accepted_value,replay_value}
 ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     "accept_encrypted_response_v1",
     ACCEPT_RESPONSE_SOURCE,
-    "7fce1055792435c73b24b18f221646d3c092d07bbfb9952c8a2fa716116687c8",  # pragma: allowlist secret
+    "b0336b46934f17548504a56ffab7e4ea3d1cdb5e489109c8a03eb3b9af6a318b",  # pragma: allowlist secret
     True,
 )
 
@@ -2665,6 +2667,7 @@ class ValkeyRegistrationStore:
                 or str(result_generation) != self._decode_text(values[0])
                 or not math.isfinite(result_accepted)
                 or not math.isfinite(replay)
+                or result_accepted < 0
                 or replay < result_accepted
             ):
                 raise ValueError

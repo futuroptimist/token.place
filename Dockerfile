@@ -22,6 +22,7 @@ COPY --chown=relay:relay config /app/config
 COPY --chown=relay:relay utils /app/utils
 COPY --chown=relay:relay static /app/static
 COPY --chown=relay:relay relay.py config.py encrypt.py release_metadata.py /app/
+COPY --chown=relay:relay docker/relay /app/docker/relay
 COPY --chown=relay:relay docker/relay/entrypoint.sh /usr/local/bin/relay-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/relay-entrypoint.sh
@@ -30,7 +31,7 @@ USER relay
 
 ENV RELAY_HOST=0.0.0.0 \
     RELAY_PORT=5010 \
-    PROMETHEUS_MULTIPROC_DIR=/tmp
+    PROMETHEUS_MULTIPROC_DIR=/tmp/tokenplace-prometheus-multiproc
 
 EXPOSE 5010
 

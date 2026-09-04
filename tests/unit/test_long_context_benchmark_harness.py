@@ -4158,6 +4158,15 @@ def test_packaged_prompt_rejects_inexact_vue_population(desktop_runner):
     assert failures == ["message_input_not_populated"]
 
 
+def _runner_ast_definitions(tree, function_names):
+    return [node for node in tree.body
+        if (isinstance(node, ast.FunctionDef) and node.name in function_names)
+        or (isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                and target.id == "PRE_START_DIAGNOSTIC_DEFAULTS"
+                for target in node.targets))]
+
+
 def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_path):
     """Exercise the real runner's pre-launch failure and final checkpoint path."""
     source = RUNNER_SOURCE.read_text(encoding="utf-8")
@@ -4166,8 +4175,7 @@ def test_packaged_runner_setup_timeout_records_sanitized_cleanup_checkpoint(tmp_
         "_write_benchmark_phase", "_remove_owned_path",
         "tauri_driver_environment", "tokenizer_stage_path", "_write_tokenizer_stage",
         "run_long_context_packaged_mode"}
-    functions = [node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    functions = _runner_ast_definitions(tree, wanted)
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
@@ -4246,8 +4254,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     wanted = {"tauri_driver_environment", "tokenizer_stage_path",
         "_write_tokenizer_stage", "_webdriver_session_elapsed_bucket",
         "_webdriver_process_posture", "run_long_context_packaged_mode"}
-    functions = [node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    functions = _runner_ast_definitions(tree, wanted)
     checkpoints = []
     process = SimpleNamespace(pid=1234)
     application_process = SimpleNamespace(pid=1235)
@@ -4495,8 +4502,7 @@ def test_packaged_runner_primary_failure_survives_cleanup_failure(tmp_path):
         "_write_benchmark_phase", "_remove_owned_path",
         "tauri_driver_environment", "tokenizer_stage_path", "_write_tokenizer_stage",
         "run_long_context_packaged_mode"}
-    functions = [node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    functions = _runner_ast_definitions(tree, wanted)
     namespace = {
         "Path": Path, "json": json, "time": time, "tempfile": __import__("tempfile"),
         "os": os, "shutil": __import__("shutil"), "contextlib": __import__("contextlib"),
@@ -4536,8 +4542,7 @@ def test_packaged_runner_provisional_checkpoint_retry_preserves_cleanup_allowanc
         "_write_benchmark_phase",
         "_remove_owned_path", "tauri_driver_environment", "tokenizer_stage_path",
         "_write_tokenizer_stage", "run_long_context_packaged_mode"}
-    functions = [node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    functions = _runner_ast_definitions(tree, wanted)
     now = [0.0]
     fake_time = SimpleNamespace(monotonic=lambda: now[0], sleep=lambda delay: None)
     namespace = {
@@ -4599,8 +4604,7 @@ def test_packaged_runner_log_close_failure_preserves_primary_and_finishes_cleanu
     tree = ast.parse(source)
     wanted = {"tauri_driver_environment", "tokenizer_stage_path",
         "_write_tokenizer_stage", "run_long_context_packaged_mode"}
-    functions = [node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    functions = _runner_ast_definitions(tree, wanted)
     events = []
     checkpoints = []
     removed = []

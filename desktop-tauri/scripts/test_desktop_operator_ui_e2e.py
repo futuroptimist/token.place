@@ -2015,16 +2015,9 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     webdriver_readiness_category = "unknown"
     operator_progress = "not_started"
     relay_observation = "not_started"
-    # Keep these defaults local so even failures during the earliest packaged bootstrap
+    # Keep a mutable local copy so even failures during the earliest packaged bootstrap
     # can serialize a complete diagnostic without requiring any UI state.
-    pre_start_diagnostic: dict[str, object] = {
-        "baseline_outcome": "not_entered",
-        "baseline_poll_attempt_count": 0,
-        "baseline_transient_failure_count": 0,
-        "last_authoritative_registered_node_count": None,
-        "start_click_state": "not_reached",
-        "start_click_exception_category": "none",
-    }
+    pre_start_diagnostic: dict[str, object] = PRE_START_DIAGNOSTIC_DEFAULTS.copy()
     def record_operator_progress(progress: str) -> None:
         nonlocal operator_progress
         operator_progress = progress

@@ -5,10 +5,12 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from flask import Flask, request as flask_request
 
 from api import (
     _check_control_plane_limits,
+    _is_public_api_rate_limit_exempt_path,
     _load_relay_server_registration_tokens,
     init_app,
 )
@@ -44,6 +46,91 @@ def test_rate_limit_uses_openai_style_error_payload():
     assert payload["error"]["type"] == "rate_limit_error"
     assert payload["error"]["code"] == "rate_limit_exceeded"
     assert "rate limit exceeded" in payload["error"]["message"].lower()
+
+
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1/minute", "API_DAILY_QUOTA": "1/day"},
+    clear=True,
+)
+def test_public_information_reads_are_exempt_without_consuming_user_quota():
+    """Public UI and metadata reads should leave the ordinary API quota intact."""
+    app = Flask(__name__)
+    init_app(app)
+
+    for index, path in enumerate(("/", "/api/v1/meta", "/api/v1/version")):
+        app.add_url_rule(
+            path,
+            endpoint=f"public-information-{index}",
+            view_func=lambda: {"status": "ok"},
+            methods=["GET"],
+        )
+
+    with app.test_client() as client:
+        for method in (client.get, client.head):
+            for path in ("/", "/api/v1/meta", "/api/v1/version"):
+                assert [method(path).status_code for _ in range(3)] == [200, 200, 200]
+
+        # Safe reads consumed neither the hourly nor daily ordinary-public bucket.
+        assert client.get("/api/v1/models").status_code == 200
+        limited = client.get("/api/v1/models")
+
+    assert limited.status_code == 429
+    assert limited.get_json()["error"]["code"] == "rate_limit_exceeded"
+
+
+@pytest.mark.parametrize("path", ["/", "/api/v1/meta", "/api/v1/version"])
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+@patch.dict(
+    os.environ,
+    {"API_RATE_LIMIT": "1/minute", "API_DAILY_QUOTA": "1/day"},
+    clear=True,
+)
+def test_public_information_exemption_does_not_cover_mutation_methods(path, method):
+    """Exact public-information paths remain protected for mutation methods."""
+    app = Flask(__name__)
+    init_app(app)
+    app.add_url_rule(
+        path,
+        endpoint=f"public-information-mutation-{method}-{path}",
+        view_func=lambda: {"status": "ok"},
+        methods=[method],
+    )
+
+    with app.test_client() as client:
+        assert client.open(path, method=method).status_code == 200
+        limited = client.open(path, method=method)
+
+    assert limited.status_code == 429
+    assert limited.get_json()["error"]["code"] == "rate_limit_exceeded"
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/models",
+        "/api/v1/meta/details",
+        "/api/v1/metadata",
+        "/prefix/api/v1/meta",
+        "/api//v1/meta",
+        "/api/v1/versioned",
+    ],
+)
+def test_public_information_exemption_does_not_cover_other_read_paths(path, method):
+    """Read exemptions are exact after the existing trailing-slash normalization."""
+    app = Flask(__name__)
+    with app.test_request_context(path, method=method):
+        assert not _is_public_api_rate_limit_exempt_path(flask_request.path)
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize("path", ["/", "/api/v1/meta/", "/api/v1/version/"])
+def test_public_information_exemption_uses_normalized_exact_paths(path, method):
+    """The established trailing-slash normalization applies before matching."""
+    app = Flask(__name__)
+    with app.test_request_context(path, method=method):
+        assert _is_public_api_rate_limit_exempt_path(flask_request.path)
 
 
 @patch.dict(

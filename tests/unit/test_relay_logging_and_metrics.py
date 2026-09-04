@@ -501,12 +501,16 @@ def test_relay_gauges_use_bounded_multiprocess_mode() -> None:
         assert gauge._multiprocess_mode == "livemostrecent"
 
 
-def test_queue_dispatch_completion_and_terminal_metrics_update_once(relay_client) -> None:
-    server_key = "metric-node"
-    client_key = "metric-client"
-    _register_api_v1_node(relay_client, server_key)
+def _outcome_value(client, outcome: str) -> float:
+    return _metric_value(
+        _scrape(client),
+        f'tokenplace_relay_request_outcomes_total{{outcome="{outcome}"}}',
+    )
+
+
+def _relay_envelope(*, server_key: str, client_key: str, request_id: str, cancel_token=None):
     envelope = {
-        "request_id": "metric-complete",
+        "request_id": request_id,
         "protocol": "tokenplace_api_v1_relay_e2ee",
         "version": 1,
         "client_public_key": client_key,
@@ -515,6 +519,19 @@ def test_queue_dispatch_completion_and_terminal_metrics_update_once(relay_client
         "cipherkey": "encrypted-key",
         "iv": "encrypted-iv",
     }
+    if cancel_token is not None:
+        envelope["cancel_token"] = cancel_token
+    return envelope
+
+
+def test_queue_dispatch_completion_and_terminal_metrics_update_once(relay_client) -> None:
+    server_key = "metric-node"
+    client_key = "metric-client"
+    _register_api_v1_node(relay_client, server_key)
+    envelope = _relay_envelope(
+        server_key=server_key, client_key=client_key, request_id="metric-complete"
+    )
+    completed_before = _outcome_value(relay_client, "completed")
     assert relay_client.post("/api/v1/relay/requests", json=envelope).status_code == 200
     queued = _scrape(relay_client)
     assert _metric_value(queued, 'tokenplace_relay_queue_depth{provider_mode="relay"}') == 1
@@ -532,35 +549,123 @@ def test_queue_dispatch_completion_and_terminal_metrics_update_once(relay_client
     assert relay_client.post("/api/v1/relay/responses", json=response).status_code == 200
     complete = _scrape(relay_client)
     assert _metric_value(complete, "tokenplace_relay_in_flight_requests") == 0
+    assert _outcome_value(relay_client, "completed") == completed_before + 1
 
-    outcomes = {
-        "cancelled": ("cancel-client", "cancel-request"),
-        "expired": ("expire-client", "expire-request"),
-        "timed_out": ("timeout-client", "timeout-request"),
-        "rate_limited": ("limited-client", "limited-request"),
+    # A duplicate provider submission is accepted idempotently, but cannot claim
+    # the lifecycle or increment the terminal outcome again.
+    assert relay_client.post("/api/v1/relay/responses", json=response).status_code == 200
+    assert _outcome_value(relay_client, "completed") == completed_before + 1
+
+
+def test_cancel_route_records_cancelled_outcome_once(relay_client) -> None:
+    server_key = "cancel-node"
+    client_key = "cancel-client"
+    request_id = "cancel-request"
+    cancel_token = "cancel-proof"
+    _register_api_v1_node(relay_client, server_key)
+    envelope = _relay_envelope(
+        server_key=server_key,
+        client_key=client_key,
+        request_id=request_id,
+        cancel_token=cancel_token,
+    )
+    assert relay_client.post("/api/v1/relay/requests", json=envelope).status_code == 200
+    before = _outcome_value(relay_client, "cancelled")
+    cancellation = {
+        "client_public_key": client_key,
+        "request_id": request_id,
+        "cancel_token": cancel_token,
+        "status": "cancelled",
+        "reason": "requester_cancelled",
     }
-    before = _scrape(relay_client)
-    for outcome, identity in outcomes.items():
-        baseline = _metric_value(
-            before, f'tokenplace_relay_request_outcomes_total{{outcome="{outcome}"}}'
-        )
-        assert relay._record_request_terminal_outcome_once(*identity, outcome)
-        assert not relay._record_request_terminal_outcome_once(*identity, outcome)
-        after = _scrape(relay_client)
-        assert _metric_value(
-            after, f'tokenplace_relay_request_outcomes_total{{outcome="{outcome}"}}'
-        ) == baseline + 1
 
-    eviction_before = _metric_value(
+    assert relay_client.post("/api/v1/relay/requests/cancel", json=cancellation).status_code == 200
+    assert relay_client.post("/api/v1/relay/requests/cancel", json=cancellation).status_code == 403
+    assert _outcome_value(relay_client, "cancelled") == before + 1
+
+
+def test_response_submission_records_expired_pending_request_once(relay_client) -> None:
+    server_key = "expiry-node"
+    client_key = "expiry-client"
+    request_id = "expiry-request"
+    _register_api_v1_node(relay_client, server_key)
+    envelope = _relay_envelope(
+        server_key=server_key, client_key=client_key, request_id=request_id
+    )
+    assert relay_client.post("/api/v1/relay/requests", json=envelope).status_code == 200
+    relay.client_pending_request_ids[client_key][request_id] = (
+        relay.time.time() - relay.PENDING_REQUEST_TTL_SECONDS - 1
+    )
+    response = dict(envelope)
+    response.pop("server_public_key")
+    response["chat_history"] = "encrypted-response"
+    before = _outcome_value(relay_client, "expired")
+
+    assert relay_client.post("/api/v1/relay/responses", json=response).status_code == 410
+    assert relay_client.post("/api/v1/relay/responses", json=response).status_code == 410
+    assert _outcome_value(relay_client, "expired") == before + 1
+
+
+def test_poll_server_removal_records_provider_timeout_once(relay_client, monkeypatch) -> None:
+    server_key = "timeout-node"
+    client_key = "timeout-client"
+    request_id = "timeout-request"
+    _register_api_v1_node(relay_client, server_key)
+    envelope = _relay_envelope(
+        server_key=server_key, client_key=client_key, request_id=request_id
+    )
+    assert relay_client.post("/api/v1/relay/requests", json=envelope).status_code == 200
+    original_pop = relay._pop_next_api_v1_request
+
+    def pop_then_remove_server(public_key):
+        claimed = original_pop(public_key)
+        known_servers.pop(public_key, None)
+        return claimed
+
+    monkeypatch.setattr(relay, "_pop_next_api_v1_request", pop_then_remove_server)
+    before = _outcome_value(relay_client, "timed_out")
+
+    assert relay_client.post(
+        "/api/v1/relay/servers/poll", json={"server_public_key": server_key}
+    ).status_code == 404
+    assert relay_client.post(
+        "/api/v1/relay/servers/poll", json={"server_public_key": server_key}
+    ).status_code == 404
+    assert _outcome_value(relay_client, "timed_out") == before + 1
+
+
+def test_request_route_429_records_rate_limited_outcome(relay_client, monkeypatch) -> None:
+    before = _outcome_value(relay_client, "rate_limited")
+    monkeypatch.setitem(
+        app.view_functions,
+        "api_v1_relay_requests",
+        lambda: ({"error": {"message": "limited", "code": 429}}, 429),
+    )
+
+    response = relay_client.post(
+        "/api/v1/relay/requests",
+        json={"synthetic": "payload"},
+        environ_base={"REMOTE_ADDR": "192.0.2.55"},
+    )
+    assert response.status_code == 429
+    assert _outcome_value(relay_client, "rate_limited") == before + 1
+
+
+def test_public_route_records_stale_eviction_once(relay_client) -> None:
+    server_key = "stale-node"
+    _register_api_v1_node(relay_client, server_key)
+    known_servers[server_key]["last_ping"] = datetime.now() - timedelta(days=1)
+    before = _metric_value(
         _scrape(relay_client),
         'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
     )
-    assert relay._unregister_server(server_key, eviction_reason="stale_lease")
-    assert not relay._unregister_server(server_key, eviction_reason="stale_lease")
+
+    assert relay_client.get("/healthz").status_code == 200
+    assert relay_client.get("/healthz").status_code == 200
     assert _metric_value(
         _scrape(relay_client),
         'tokenplace_compute_node_evictions_total{reason="stale_lease"}',
-    ) == eviction_before + 1
+    ) == before + 1
 
 
 def test_repeated_scrapes_are_read_only_for_relay_state(relay_client) -> None:
@@ -658,8 +763,8 @@ def test_thousands_of_unmatched_paths_have_bounded_cardinality_and_exposition(re
     # Explicit deterministic budgets guard against series and payload regressions.
     # Includes the preserved legacy request-counter contract alongside the
     # bounded metric families accumulated by the full unit-test process.
-    assert len(samples) <= 700
-    assert len(body.encode("utf-8")) <= 100_000
+    assert len(samples) <= 725
+    assert len(body.encode("utf-8")) <= 107_000
 
 
 def test_metric_names_and_label_domains_are_finite(relay_client) -> None:

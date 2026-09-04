@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+from prometheus_client import REGISTRY
 from prometheus_client.parser import text_string_to_metric_families
 
 import relay
@@ -102,125 +103,52 @@ def test_required_sugarkube_metric_families_and_initialization(relay_client) -> 
     assert _metric_value(body, "tokenplace_compute_nodes_healthy") == 0
 
 
-def test_maintenance_gauges_use_single_multiprocess_snapshot(tmp_path) -> None:
-    """Multiprocess exposition must not emit per-worker maintenance gauges."""
+def test_metrics_registry_is_dedicated_and_not_multiprocess() -> None:
+    """The one-worker release registry must not inherit process-global metrics."""
 
-    multiprocess_dir = tmp_path / "prometheus"
-    multiprocess_dir.mkdir()
-    token = secrets.token_urlsafe(24)
+    assert relay.RELAY_METRICS_REGISTRY is not REGISTRY
+    names = set(relay.RELAY_METRICS_REGISTRY._names_to_collectors)
+    assert "tokenplace_http_requests" in names
+    assert all(not name.startswith("flask_http_request") for name in names)
+
+
+def test_single_process_startup_clears_only_dedicated_stale_metrics(tmp_path) -> None:
+    """Container restart cleanup removes stale files without touching siblings."""
+
+    metrics_dir = Path("/tmp/tokenplace-prometheus-multiproc")
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    stale = metrics_dir / "gauge_livemostrecent_123.db"
+    stale.write_text("stale", encoding="utf-8")
+    sibling = tmp_path / "must-survive"
+    sibling.write_text("safe", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_gunicorn = fake_bin / "gunicorn"
+    fake_gunicorn.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_gunicorn.chmod(0o755)
     env = os.environ.copy()
-    env.update(
-        {
-            "PROMETHEUS_MULTIPROC_DIR": str(multiprocess_dir),
-            "TOKENPLACE_IMAGE_TAG": "sha-deadbee",
-            "TOKENPLACE_METRICS_TOKEN": token,
-        }
+    env.update({"PATH": f"{fake_bin}:{env['PATH']}", "PROMETHEUS_MULTIPROC_DIR": str(metrics_dir)})
+
+    subprocess.run(
+        ["sh", "docker/relay/entrypoint.sh"],
+        cwd=Path(__file__).parents[2], env=env, check=True, capture_output=True, text=True,
     )
-    worker = """
-import os
-import sys
 
-from prometheus_client import Gauge
+    assert not stale.exists()
+    assert sibling.read_text(encoding="utf-8") == "safe"
 
-import relay
 
-default_mode_control = Gauge(
-    "default_mode_control",
-    "Control gauge using the default multiprocess mode",
-)
-default_mode_control.set(1)
+def test_single_process_startup_rejects_multiple_workers(tmp_path) -> None:
+    """Multiprocess mode fails closed for the memory-backed maintenance release."""
 
-relay.app.config["TESTING"] = True
-with relay.app.test_client() as client:
-    registered = client.post(
-        "/api/v1/relay/servers/register",
-        json={"server_public_key": "node-a"},
+    env = os.environ.copy()
+    env["RELAY_WORKERS"] = "2"
+    result = subprocess.run(
+        ["sh", "docker/relay/entrypoint.sh"],
+        cwd=Path(__file__).parents[2], env=env, capture_output=True, text=True,
     )
-    assert registered.status_code == 200
-    assert client.get("/metrics").status_code == 401
-    response = client.get(
-        "/metrics",
-        headers={
-            "Authorization": "Bearer " + os.environ["TOKENPLACE_METRICS_TOKEN"]
-        },
-    )
-    body = response.get_data(as_text=True)
-    assert response.status_code == 200
-    assert os.environ["TOKENPLACE_METRICS_TOKEN"] not in body
-    if sys.argv[1] == "emit":
-        sys.stdout.write("\\n__METRICS__\\n" + body)
-"""
-
-    # Three independent workers each report one node. The final scrape is emitted
-    # by the last worker so its authoritative snapshot remains the most recent.
-    results = []
-    for mode in ("write", "write"):
-        results.append(
-            subprocess.run(
-                [sys.executable, "-c", worker, mode],
-                cwd=Path(__file__).parents[2],
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        )
-    results.append(
-        subprocess.run(
-            [sys.executable, "-c", worker, "emit"],
-            cwd=Path(__file__).parents[2],
-            env=env,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    )
-    assert all(token not in result.stdout for result in results)
-    assert all(token not in result.stderr for result in results)
-    exposed = results[-1].stdout.split("__METRICS__\n", 1)[1]
-
-    names = {
-        "tokenplace_build_info",
-        "tokenplace_instrumentation_up",
-        "tokenplace_compute_nodes_registered",
-        "tokenplace_compute_nodes_healthy",
-    }
-    samples = [
-        sample
-        for family in text_string_to_metric_families(exposed)
-        for sample in family.samples
-        if sample.name in names
-    ]
-    by_name = {
-        name: [sample for sample in samples if sample.name == name]
-        for name in names
-    }
-    control_samples = [
-        sample
-        for family in text_string_to_metric_families(exposed)
-        for sample in family.samples
-        if sample.name == "default_mode_control"
-    ]
-
-    assert len(control_samples) == len(results)
-    assert len({sample.labels["pid"] for sample in control_samples}) == len(results)
-    assert all(set(sample.labels) == {"pid"} for sample in control_samples)
-    assert all(len(metric_samples) == 1 for metric_samples in by_name.values())
-    assert all("pid" not in sample.labels for sample in samples)
-    assert by_name["tokenplace_build_info"][0].value == 1
-    assert by_name["tokenplace_instrumentation_up"][0].value == 1
-    assert by_name["tokenplace_compute_nodes_registered"][0].value == 1
-    assert by_name["tokenplace_compute_nodes_healthy"][0].value == 1
-    assert set(by_name["tokenplace_build_info"][0].labels) == {
-        "version",
-        "revision",
-    }
-    assert by_name["tokenplace_build_info"][0].labels == {
-        "version": "sha-deadbee",
-        "revision": "sha-deadbee",
-    }
-    for name in names - {"tokenplace_build_info"}:
-        assert by_name[name][0].labels == {}
+    assert result.returncode != 0
+    assert "requires RELAY_WORKERS=1" in result.stderr
 
 
 @pytest.mark.parametrize("image_tag", [None, ""])
@@ -342,8 +270,8 @@ def test_repeated_scrapes_are_read_only_for_relay_state(relay_client) -> None:
         key: dict(value) for key, value in known_servers.items()
     }
     request_series = (
-        'tokenplace_relay_requests_total{endpoint="api_v1_relay_servers_register",'
-        'method="POST",status="200"}'
+        'tokenplace_relay_requests_total{endpoint="/api/v1/relay/servers/register",'
+        'method="POST",status="2xx"}'
     )
     before_scrapes = _metric_value(_scrape(relay_client), request_series)
 
@@ -360,3 +288,75 @@ def test_api_v1_model_catalog_remains_llama_31_only(relay_client) -> None:
     assert [model["id"] for model in response.get_json()["data"]] == [
         "llama-3.1-8b-instruct"
     ]
+
+
+def test_unmatched_paths_have_fixed_cardinality_and_bounded_exposition(
+    relay_client, caplog
+) -> None:
+    """Thousands of attacker-selected paths collapse to one deterministic series set."""
+
+    marker = "raw-sensitive-unmatched"
+    caplog.set_level(logging.ERROR, logger="tokenplace.relay")
+    before = _scrape(relay_client)
+    for index in range(2_000):
+        response = relay_client.get(f"/{marker}-{index}?credential=secret-{index}")
+        assert response.status_code in {404, 429}
+
+    body = _scrape(relay_client)
+    families = list(text_string_to_metric_families(body))
+    samples = [sample for family in families for sample in family.samples]
+    route_samples = [
+        sample for sample in samples if sample.name == "tokenplace_http_requests_total"
+    ]
+
+    assert "flask_http_request" not in body
+    assert marker not in body
+    assert "credential" not in body
+    before_labels = {
+        tuple(sorted(sample.labels.items()))
+        for family in text_string_to_metric_families(before)
+        for sample in family.samples
+        if sample.name == "tokenplace_http_requests_total"
+    }
+    unmatched_samples = [
+        sample for sample in route_samples if sample.labels["route"] == "other"
+    ]
+    assert unmatched_samples
+    new_labels = {tuple(sorted(sample.labels.items())) for sample in route_samples}
+    assert len(new_labels - before_labels) <= 2
+    assert {sample.labels["method"] for sample in route_samples} <= set(
+        relay.CANONICAL_HTTP_METHOD_ENUM
+    ) | {"other"}
+    assert {sample.labels["status_class"] for sample in route_samples} <= {
+        "1xx", "2xx", "3xx", "4xx", "5xx", "unknown"
+    }
+    assert {sample.labels["provider_mode"] for sample in route_samples} <= set(
+        relay.PROVIDER_MODE_ENUM
+    )
+    assert {sample.labels["outcome"] for sample in route_samples} <= set(
+        relay.OUTCOME_ENUM
+    )
+    # These budgets include every series accumulated by earlier module tests;
+    # the 2,000 unmatched requests may add only the fixed labels asserted above.
+    assert len(samples) <= 700
+    assert len(body.encode("utf-8")) <= 100_000
+
+
+def test_metrics_requests_do_not_instrument_themselves(relay_client) -> None:
+    """Authorized scrapes must not recursively increase HTTP metric series."""
+
+    before = _scrape(relay_client)
+    for _ in range(5):
+        _scrape(relay_client)
+    after = _scrape(relay_client)
+
+    def request_total(body: str) -> float:
+        return sum(
+            sample.value
+            for family in text_string_to_metric_families(body)
+            for sample in family.samples
+            if sample.name == "tokenplace_http_requests_total"
+        )
+
+    assert request_total(after) == request_total(before)
+    assert 'route="/metrics"' not in after

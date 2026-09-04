@@ -342,8 +342,8 @@ def test_repeated_scrapes_are_read_only_for_relay_state(relay_client) -> None:
         key: dict(value) for key, value in known_servers.items()
     }
     request_series = (
-        'tokenplace_relay_requests_total{endpoint="api_v1_relay_servers_register",'
-        'method="POST",status="200"}'
+        'tokenplace_relay_requests_total{endpoint="/api/v1/relay/servers/register",'
+        'method="POST",status="2xx"}'
     )
     before_scrapes = _metric_value(_scrape(relay_client), request_series)
 
@@ -360,3 +360,167 @@ def test_api_v1_model_catalog_remains_llama_31_only(relay_client) -> None:
     assert [model["id"] for model in response.get_json()["data"]] == [
         "llama-3.1-8b-instruct"
     ]
+
+
+BOUNDED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "other"}
+BOUNDED_ROUTES = {
+    "/api/v1/relay/requests",
+    "/api/v1/relay/requests/cancel",
+    "/api/v1/relay/responses",
+    "/api/v1/relay/responses/retrieve",
+    "/api/v1/relay/servers/register",
+    "/api/v1/relay/servers/unregister",
+    "/api/v1/relay/servers/poll",
+    "/api/v1/relay/servers/next",
+    "/healthz",
+    "/livez",
+    "/relay/diagnostics",
+    "/api/v1/*",
+    "/api/v2/*",
+    "other",
+}
+
+
+def _samples(body: str):
+    return [
+        sample
+        for family in text_string_to_metric_families(body)
+        for sample in family.samples
+    ]
+
+
+def test_unmatched_paths_have_deterministically_bounded_exposition(relay_client) -> None:
+    before = _scrape(relay_client)
+    before_samples = len(_samples(before))
+    secrets_seen = []
+    for index in range(2_000):
+        raw = f"unmatched-attacker-path-{index}"
+        secrets_seen.append(raw)
+        response = relay_client.get(f"/{raw}?credential=query-{index}")
+        assert response.status_code == 404
+
+    body = _scrape(relay_client)
+    samples = _samples(body)
+    assert len(samples) <= before_samples + 20
+    assert len(body.encode()) <= len(before.encode()) + 10_000
+    assert all(raw not in body for raw in secrets_seen)
+    assert "query-1999" not in body
+    assert "flask_http_request" not in body
+
+    http_samples = [sample for sample in samples if sample.name == "tokenplace_http_requests_total"]
+    unmatched = [
+        sample
+        for sample in http_samples
+        if sample.labels
+        == {
+            "method": "GET",
+            "route": "other",
+            "status_class": "4xx",
+            "provider_mode": "relay",
+            "outcome": "failed",
+        }
+    ]
+    assert len(unmatched) == 1
+    assert unmatched[0].value >= 2_000
+    assert {sample.labels["method"] for sample in http_samples} <= BOUNDED_METHODS
+    assert {sample.labels["route"] for sample in http_samples} <= BOUNDED_ROUTES
+    assert {sample.labels["status_class"] for sample in http_samples} <= {
+        "1xx", "2xx", "3xx", "4xx", "5xx", "unknown"
+    }
+    assert {sample.labels["provider_mode"] for sample in http_samples} <= set(relay.PROVIDER_MODE_ENUM)
+    assert {sample.labels["outcome"] for sample in http_samples} <= set(relay.OUTCOME_ENUM)
+
+
+def test_metrics_scrapes_do_not_instrument_themselves(relay_client) -> None:
+    before = _scrape(relay_client)
+    for _ in range(5):
+        _scrape(relay_client)
+    after = _scrape(relay_client)
+    for metric_name in (
+        "tokenplace_http_requests_total",
+        "tokenplace_http_request_duration_seconds_count",
+        "tokenplace_relay_requests_total",
+    ):
+        assert sum(s.value for s in _samples(after) if s.name == metric_name) == sum(
+            s.value for s in _samples(before) if s.name == metric_name
+        )
+    assert 'route="/metrics"' not in after
+    assert 'endpoint="/metrics"' not in after
+
+
+def _run_relay_entrypoint(tmp_path: Path, metrics_dir: Path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    fake_gunicorn = bin_dir / "gunicorn"
+    fake_gunicorn.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$PROMETHEUS_MULTIPROC_DIR\"\n",
+        encoding="utf-8",
+    )
+    fake_gunicorn.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "PROMETHEUS_MULTIPROC_DIR": str(metrics_dir),
+        }
+    )
+    return subprocess.run(
+        ["sh", "docker/relay/entrypoint.sh"],
+        cwd=Path(__file__).parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_container_restart_clears_only_dedicated_metrics_directory(tmp_path) -> None:
+    metrics_dir = tmp_path / "prometheus"
+    metrics_dir.mkdir()
+    stale_file = metrics_dir / "counter_123.db"
+    stale_file.write_text("stale", encoding="utf-8")
+    sibling = tmp_path / "must-survive.txt"
+    sibling.write_text("safe", encoding="utf-8")
+
+    first = _run_relay_entrypoint(tmp_path, metrics_dir)
+    assert first.returncode == 0, first.stderr
+    assert first.stdout.strip() == str(metrics_dir)
+    assert list(metrics_dir.iterdir()) == []
+    assert sibling.read_text(encoding="utf-8") == "safe"
+
+    stale_file.write_text("stale-after-container-restart", encoding="utf-8")
+    second = _run_relay_entrypoint(tmp_path, metrics_dir)
+    assert second.returncode == 0, second.stderr
+    assert list(metrics_dir.iterdir()) == []
+    assert sibling.read_text(encoding="utf-8") == "safe"
+
+
+def test_metrics_startup_fails_closed_for_symlink_target(tmp_path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    sentinel = target / "sentinel"
+    sentinel.write_text("safe", encoding="utf-8")
+    metrics_link = tmp_path / "prometheus-link"
+    metrics_link.symlink_to(target, target_is_directory=True)
+
+    result = _run_relay_entrypoint(tmp_path, metrics_link)
+
+    assert result.returncode != 0
+    assert "must not be a symlink" in result.stderr
+    assert sentinel.read_text(encoding="utf-8") == "safe"
+
+
+def test_gunicorn_child_exit_marks_worker_dead(monkeypatch) -> None:
+    import importlib.util
+
+    config_path = Path(__file__).parents[2] / "docker/relay/gunicorn.conf.py"
+    spec = importlib.util.spec_from_file_location("relay_gunicorn_config", config_path)
+    assert spec is not None and spec.loader is not None
+    config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config)
+    seen = []
+    monkeypatch.setattr(config.multiprocess, "mark_process_dead", seen.append)
+
+    config.child_exit(None, type("Worker", (), {"pid": 4242})())
+
+    assert seen == [4242]

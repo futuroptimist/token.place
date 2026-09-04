@@ -81,7 +81,7 @@ def test_response_serialization_is_canonical_sorted_utf8():
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "b0336b46934f17548504a56ffab7e4ea3d1cdb5e489109c8a03eb3b9af6a318b"  # pragma: allowlist secret
+    expected_digest = "f7fd8a03170b39a32ccd489b8d0ce53e0906909404971af255ec373997c0ccee"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -100,6 +100,10 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     assert "if not accepted or accepted<0 or accepted>now then return {'malformed'} end" in ACCEPT_RESPONSE_SCRIPT.source
     cleanup_offset = ACCEPT_RESPONSE_SCRIPT.source.index("local function cleanup()")
     assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_response_due(response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
+    assert "'client_public_key','request_id','node_id','consumer_digest','generation','envelope'" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "'retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request'" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "local lv=redis.call('HMGET',lk,'state','client','request','client_public_key','request_id'" in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_terminal_due(terminal_due,response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
     assert "redis.call('EXISTS',response)~=0 or response_indexed or terminal_indexed" in ACCEPT_RESPONSE_SCRIPT.source
     assert "if entries>=limit then return false end" in ACCEPT_RESPONSE_SCRIPT.source
     assert ACCEPT_RESPONSE_SCRIPT.source.index("for i=1,#members,2 do") < (

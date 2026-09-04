@@ -1294,7 +1294,7 @@ local leases,node,queue,claim,request,claim_expiries,deadlines,response,response
 local prefix,node_digest,node_id,owner,consumer,client,request_digest,generation,envelope,response_digest,accepted_value,ack_digest=unpack(ARGV)
 local replay_ttl,terminal_ttl,max_responses,max_client_responses,max_terminals,max_client_terminals,cleanup_bound,max_envelope=tonumber(ARGV[13]),tonumber(ARGV[14]),tonumber(ARGV[15]),tonumber(ARGV[16]),tonumber(ARGV[17]),tonumber(ARGV[18]),tonumber(ARGV[19]),tonumber(ARGV[20])
 local client_public_key,request_id=ARGV[21],ARGV[22]
-local max_node_id,max_identity=tonumber(ARGV[24]),tonumber(ARGV[25])
+local max_node_id,max_identity,max_request_envelope=tonumber(ARGV[24]),tonumber(ARGV[25]),tonumber(ARGV[26])
 local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
 local function finite(value) local n=tonumber(value); return n and n==n and math.abs(n)~=math.huge and n end
 local function digest(value) return value and string.len(value)==64 and not string.find(value,'[^0-9a-f]') end
@@ -1316,15 +1316,32 @@ local function validate_response_due(due)
     local rk=prefix..'response:'..c..':'..q
     local tk=prefix..'terminal:'..c..':'..q
     local lk=prefix..'request:'..c..':'..q
-    local rv=redis.call('HMGET',rk,'client','request','response_digest','accepted_at_epoch','replay_expires_at_epoch','status')
-    local tv=redis.call('HMGET',tk,'client','request','outcome','reason','retrieval_state','response_digest','accepted_at_epoch','replay_expires_at_epoch')
+    local rv=redis.call('HMGET',rk,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')
+    local tv=redis.call('HMGET',tk,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
+    local lv=redis.call('HMGET',lk,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest','envelope')
     local score=finite(redis.call('ZSCORE',response_expiries,member))
-    local expiry=finite(rv[5]); local accepted=finite(rv[4])
-    if not score or not expiry or not accepted or score~=expiry or expiry>now or expiry<accepted or
-       rv[1]~=c or rv[2]~=q or not digest(rv[3]) or rv[6]~='response_ready' or
-       tv[1]~=c or tv[2]~=q or tv[3]~='completed' or tv[4]~='response_completed' or
-       tv[5]~='response_ready' or tv[6]~=rv[3] or finite(tv[7])~=accepted or finite(tv[8])~=expiry or
-       redis.call('HGET',lk,'state')~='response_ready' then return false end
+    local terminal_score=finite(redis.call('ZSCORE',terminal_expiries,member))
+    local accepted=finite(rv[9]); local expiry=finite(rv[11]); local terminal_expiry=finite(tv[11])
+    if not score or not expiry or not accepted or accepted<0 or accepted>now or score~=expiry or expiry>now or expiry<accepted or
+       redis.call('EXISTS',rk)~=1 or rv[1]~=c or rv[2]~=q or
+       string.len(rv[3] or '')<1 or string.len(rv[3] or '')>max_identity or
+       string.len(rv[4] or '')<1 or string.len(rv[4] or '')>max_identity or
+       string.len(rv[5] or '')<1 or string.len(rv[5] or '')>max_node_id or not digest(rv[6]) or
+       not integer(rv[7]) or string.len(rv[8] or '')<1 or string.len(rv[8] or '')>max_envelope or
+       not digest(rv[10]) or rv[12]~='response_ready' then return false end
+    if redis.call('EXISTS',tk)~=1 or tv[1]~='completed' or tv[2]~='response_completed' or
+       tv[3]~='response_ready' or tv[4]~=rv[5] or string.len(tv[4] or '')<1 or string.len(tv[4] or '')>max_node_id or
+       not digest(tv[5]) or tv[6]~=rv[6] or tv[7]~=rv[7] or tv[8]~=rv[10] or
+       finite(tv[9])~=accepted or finite(tv[10])~=expiry or not terminal_expiry or
+       terminal_expiry<expiry or not terminal_score or terminal_score~=terminal_expiry or
+       not digest(tv[12]) or not digest(tv[13]) or not digest(tv[14]) or tv[15]~=c or tv[16]~=q then return false end
+    local deadline=finite(lv[8])
+    if redis.call('EXISTS',lk)~=1 or lv[1]~='response_ready' or lv[2]~=c or lv[3]~=q or
+       lv[4]~=rv[3] or lv[5]~=rv[4] or lv[6]~=rv[5] or not digest(lv[7]) or
+       not deadline or deadline<accepted or not integer(lv[9]) or lv[10]~=rv[7] or
+       lv[11]~=lv[9]..'-0' or not digest(lv[12]) or not digest(lv[13]) or
+       string.len(lv[14] or '')<1 or string.len(lv[14] or '')>max_request_envelope or string.len(lv[4] or '')>max_identity or
+       string.len(lv[5] or '')>max_identity or string.len(lv[6] or '')>max_node_id then return false end
   end
   return true
 end
@@ -1338,16 +1355,28 @@ local function validate_terminal_due(due,response_due)
     local c,q=string.sub(member,1,sep-1),string.sub(member,sep+1)
     local tk=prefix..'terminal:'..c..':'..q
     local lk=prefix..'request:'..c..':'..q
-    local tv=redis.call('HMGET',tk,'client','request','outcome','reason','retrieval_state','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch')
+    local tv=redis.call('HMGET',tk,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
+    local lv=redis.call('HMGET',lk,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest','envelope')
     local score=finite(redis.call('ZSCORE',terminal_expiries,member))
-    local accepted=finite(tv[7]); local replay=finite(tv[8]); local expiry=finite(tv[9])
+    local accepted=finite(tv[9]); local replay=finite(tv[10]); local expiry=finite(tv[11])
     if not score or not accepted or not replay or not expiry or score~=expiry or expiry>now or
-       replay<accepted or expiry<replay or tv[1]~=c or tv[2]~=q or tv[3]~='completed' or
-       tv[4]~='response_completed' or (tv[5]~='response_ready' and tv[5]~='retrieval_expired') or
-       not digest(tv[6]) or redis.call('HGET',lk,'state')~='response_ready' then return false end
+       accepted<0 or accepted>now or replay<accepted or expiry<replay or redis.call('EXISTS',tk)~=1 or
+       tv[1]~='completed' or tv[2]~='response_completed' or (tv[3]~='response_ready' and tv[3]~='retrieval_expired') or
+       string.len(tv[4] or '')<1 or string.len(tv[4] or '')>max_node_id or not digest(tv[5]) or
+       not digest(tv[6]) or not integer(tv[7]) or not digest(tv[8]) or not digest(tv[12]) or
+       not digest(tv[13]) or not digest(tv[14]) or tv[15]~=c or tv[16]~=q then return false end
+    local deadline=finite(lv[8])
+    if redis.call('EXISTS',lk)~=1 or lv[1]~='response_ready' or lv[2]~=c or lv[3]~=q or
+       string.len(lv[4] or '')<1 or string.len(lv[4] or '')>max_identity or
+       string.len(lv[5] or '')<1 or string.len(lv[5] or '')>max_identity or lv[6]~=tv[4] or
+       string.len(lv[6] or '')>max_node_id or not digest(lv[7]) or not deadline or deadline<accepted or
+       not integer(lv[9]) or lv[10]~=tv[7] or lv[11]~=lv[9]..'-0' or
+       not digest(lv[12]) or not digest(lv[13]) or string.len(lv[14] or '')<1 or
+       string.len(lv[14] or '')>max_request_envelope then return false end
     local response_exists=redis.call('EXISTS',prefix..'response:'..c..':'..q)
-    if tv[5]=='retrieval_expired' and response_exists~=0 then return false end
-    if tv[5]=='response_ready' and (response_exists==0 or not contains(response_due,member)) then return false end
+    local response_score=redis.call('ZSCORE',response_expiries,member)
+    if tv[3]=='retrieval_expired' and (response_exists~=0 or response_score) then return false end
+    if tv[3]=='response_ready' and (response_exists~=1 or not response_score or not contains(response_due,member)) then return false end
   end
   return true
 end
@@ -1486,7 +1515,7 @@ return {'accepted',generation,accepted_value,replay_value}
 ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     "accept_encrypted_response_v1",
     ACCEPT_RESPONSE_SOURCE,
-    "b0336b46934f17548504a56ffab7e4ea3d1cdb5e489109c8a03eb3b9af6a318b",  # pragma: allowlist secret
+    "f7fd8a03170b39a32ccd489b8d0ce53e0906909404971af255ec373997c0ccee",  # pragma: allowlist secret
     True,
 )
 
@@ -2628,6 +2657,7 @@ class ValkeyRegistrationStore:
             b"accept",
             str(self.config.max_node_id_bytes).encode(),
             str(self.config.max_identity_bytes).encode(),
+            str(self.config.max_envelope_bytes).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(
@@ -2719,6 +2749,7 @@ class ValkeyRegistrationStore:
             b"cleanup",
             str(self.config.max_node_id_bytes).encode(),
             str(self.config.max_identity_bytes).encode(),
+            str(self.config.max_envelope_bytes).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(ACCEPT_RESPONSE_SCRIPT.name, keys, args)

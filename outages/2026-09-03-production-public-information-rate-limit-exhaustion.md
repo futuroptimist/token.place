@@ -33,6 +33,10 @@ no permanent correction has been deployed. The incident is therefore **Mitigated
 
 ## Impact
 
+`Major` reflects user-visible HTTP 429 degradation of public-information routes while `/livez`,
+`/healthz`, and the compute path remained operational, with no evidence of data loss or security
+impact.
+
 - Public landing-page and metadata reads returned HTTP 429 to traffic sharing the exhausted
   application-visible identity.
 - The relay was not totally unavailable. Retained evidence shows health and version checks and
@@ -224,7 +228,7 @@ changes are outside this documentation-only record.
 | P0 | Add a release-line provenance/parity gate for already-merged safety fixes including #1447 and #1551. | Proposed | [token.place #1770](https://github.com/futuroptimist/token.place/issues/1770) | Promotion records source and image identities and fails when required ancestry or an explicitly reviewed, behavior-equivalent backport is absent. |
 | P0 | Compare configured synthetic request frequency with every applicable endpoint quota in CI or deployment validation. | Proposed | [sugarkube #2778](https://github.com/futuroptimist/sugarkube/issues/2778) | Validation fails when projected requests can exhaust a quota within its window. |
 | P1 | Evaluate shared limiter storage in the existing HA work, without treating it alone as a fix for wrongly charged probes. | Proposed | [Existing non-incident HA work #1569](https://github.com/futuroptimist/token.place/issues/1569) | HA testing proves intended counter consistency and separately verifies the exact public-read exemption. |
-| P0 | Validate trusted-proxy client-identity handling without blindly trusting spoofable forwarding headers. | Proposed | [token.place #1772](https://github.com/futuroptimist/token.place/issues/1772) | Production-equivalent tests document trusted hops and prove untrusted clients cannot choose limiter identities. |
+| P1 | Validate trusted-proxy client-identity handling without blindly trusting spoofable forwarding headers. | Proposed | [token.place #1772](https://github.com/futuroptimist/token.place/issues/1772) | Production-equivalent tests document trusted hops and prove untrusted clients cannot choose limiter identities. |
 
 ### Detect
 
@@ -254,6 +258,11 @@ two 24-hour stability windows may then overlap.
 None of these trackers records deployment, restoration, or incident resolution by its creation
 alone.
 
+Trusted-proxy/client-identity validation remains a P1 defense-in-depth follow-up tracked by
+[token.place #1772](https://github.com/futuroptimist/token.place/issues/1772). It is not a
+prerequisite for [sugarkube #2776](https://github.com/futuroptimist/sugarkube/issues/2776) or for
+restoring the two public-information probes.
+
 ## Restoration and resolution criteria
 
 Before the two paused public-information probes are restored, an immutable corrected image must:
@@ -264,7 +273,7 @@ Before the two paused public-information probes are restored, an immutable corre
 3. pass a production-equivalent probe soak demonstrating that the configured cadence does not
    consume the public-information quotas;
 4. record source and image identities and prove release-line safety parity;
-5. pass trusted-proxy identity validation and explicit rollback thresholds; and
+5. pass explicit rollback thresholds; and
 6. deploy through the controlled process-state procedure with health, compute re-registration,
    polling, and response-submission verification.
 

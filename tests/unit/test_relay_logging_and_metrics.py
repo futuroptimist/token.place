@@ -226,6 +226,77 @@ def test_gunicorn_child_exit_marks_worker_dead(monkeypatch) -> None:
     assert seen == [4242]
 
 
+def test_gunicorn_error_log_filter_bounds_request_records() -> None:
+    """Gunicorn request errors must reach handlers without request-controlled data."""
+
+    import importlib.util
+
+    config_path = Path(__file__).parents[2] / "docker/relay/gunicorn.conf.py"
+    spec = importlib.util.spec_from_file_location("relay_gunicorn_privacy_config", config_path)
+    assert spec is not None and spec.loader is not None
+    config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config)
+
+    error_log = logging.Logger("gunicorn.error.test")
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    error_log.addHandler(handler)
+    server = type("Server", (), {"error_log": error_log})()
+
+    config.on_starting(server)
+    config.on_starting(server)
+    assert len(error_log.filters) == 1
+
+    error_log.warning(
+        "Invalid request from ip=%s: %s",
+        "private-source-address-marker",
+        "private-parser-exception-marker",
+    )
+    error_log.info("Worker lifecycle event %s", "preserved")
+    try:
+        raise RuntimeError("private-traceback-marker")
+    except RuntimeError:
+        error_log.exception(
+            "Error handling request %s",
+            "/private-uri-marker?secret=private-query-marker",
+        )
+
+    formatted = output.getvalue()
+    assert "gunicorn.invalid_request" in formatted
+    assert "gunicorn.request_error" in formatted
+    assert "Worker lifecycle event preserved" in formatted
+    for marker in (
+        "private-source-address-marker",
+        "private-parser-exception-marker",
+        "private-uri-marker",
+        "private-query-marker",
+        "private-traceback-marker",
+        "Traceback",
+    ):
+        assert marker not in formatted
+
+
+def test_gunicorn_error_log_filter_is_installed_after_fork() -> None:
+    """The privacy filter must also be present on a worker-created logger."""
+
+    import importlib.util
+
+    config_path = Path(__file__).parents[2] / "docker/relay/gunicorn.conf.py"
+    spec = importlib.util.spec_from_file_location("relay_gunicorn_worker_config", config_path)
+    assert spec is not None and spec.loader is not None
+    config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config)
+    master_log = logging.Logger("gunicorn.error.master")
+    worker_log = logging.Logger("gunicorn.error.worker")
+    server = type("Server", (), {"error_log": master_log})()
+    worker = type("Worker", (), {"error_log": worker_log})()
+
+    config.post_fork(server, worker)
+
+    assert len(master_log.filters) == 1
+    assert len(worker_log.filters) == 1
+
+
 @pytest.mark.parametrize("image_tag", [None, ""])
 def test_build_info_labels_fall_back_to_release_metadata(
     monkeypatch, image_tag

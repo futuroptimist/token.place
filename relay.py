@@ -79,12 +79,16 @@ class JsonFormatter(logging.Formatter):
     }
 
     def format(self, record: logging.LogRecord) -> str:  # noqa: D401 - logging API
+        exception_record = record.exc_info is not None or record.exc_text is not None
         payload: Dict[str, Any] = {
             "timestamp": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": "relay.exception" if exception_record else record.getMessage(),
         }
+
+        if exception_record:
+            payload["reason"] = "exception"
 
         for key, value in record.__dict__.items():
             if key in self._RESERVED or key in self._SENSITIVE or key.startswith("_"):

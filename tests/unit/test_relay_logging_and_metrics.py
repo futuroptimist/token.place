@@ -67,6 +67,32 @@ def test_json_formatter_outputs_structured_payload() -> None:
     assert payload["timestamp"].endswith("Z")
 
 
+def test_json_formatter_bounds_exception_records() -> None:
+    """Exception records must not interpolate messages or serialize tracebacks."""
+
+    try:
+        raise RuntimeError("private-exception-marker")
+    except RuntimeError:
+        record = logging.LogRecord(
+            name="flask.app",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=42,
+            msg="Exception on %s",
+            args=("/private-path-marker?secret=private-query-marker",),
+            exc_info=sys.exc_info(),
+        )
+
+    formatted = JsonFormatter().format(record)
+    payload = json.loads(formatted)
+
+    assert payload["message"] == "relay.exception"
+    assert payload["reason"] == "exception"
+    assert "private-path-marker" not in formatted
+    assert "private-query-marker" not in formatted
+    assert "private-exception-marker" not in formatted
+
+
 @pytest.mark.integration
 def test_metrics_endpoint_exposes_prometheus_text(relay_client) -> None:
     """/metrics should expose Prometheus plaintext suitable for scraping."""
@@ -134,7 +160,10 @@ def test_entrypoint_clears_only_dedicated_metrics_directory_on_each_restart(tmp_
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     gunicorn = fake_bin / "gunicorn"
-    gunicorn.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    invocation = tmp_path / "gunicorn-arguments"
+    gunicorn.write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$@" > "{invocation}"\n', encoding="utf-8"
+    )
     gunicorn.chmod(0o755)
     env = os.environ.copy()
     env.update({
@@ -151,6 +180,10 @@ def test_entrypoint_clears_only_dedicated_metrics_directory_on_each_restart(tmp_
         assert metrics_dir.is_dir()
         assert list(metrics_dir.iterdir()) == []
         assert sibling.read_text(encoding="utf-8") == "outside"
+
+    arguments = invocation.read_text(encoding="utf-8").splitlines()
+    assert "--access-logfile" not in arguments
+    assert arguments[arguments.index("--error-logfile") + 1] == "-"
 
 
 def test_entrypoint_fails_closed_for_unsafe_metrics_targets(tmp_path) -> None:

@@ -921,12 +921,12 @@ def test_webdriver_diagnostic_clamps_hostile_pre_start_fields(desktop_runner, tm
     desktop_runner.LOGS_DIR = tmp_path
     desktop_runner._write_webdriver_diagnostic(
         "match", "running", "none", pre_start_diagnostic={
-            "baseline_outcome": "C:\\Users\\private\\SECRET",
+            "baseline_outcome": ["C:\\Users\\private\\SECRET"],
             "baseline_poll_attempt_count": True,
             "baseline_transient_failure_count": -1,
             "last_authoritative_registered_node_count": "response body SECRET",
-            "start_click_state": "SECRET",
-            "start_click_exception_category": "private exception SECRET",
+            "start_click_state": {"private": "SECRET"},
+            "start_click_exception_category": {"private exception SECRET"},
         })
     artifact_text = (tmp_path / "packaged-webdriver-diagnostic.json").read_text()
     artifact = json.loads(artifact_text)
@@ -4258,7 +4258,9 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     checkpoints = []
     process = SimpleNamespace(pid=1234)
     application_process = SimpleNamespace(pid=1235)
+    diagnostics = []
     def click():
+        assert diagnostics[-1][-1]["start_click_state"] == "about_to_attempt"
         if str(operator_error) == "click_failure":
             raise RuntimeError("private click exception /secret/path")
 
@@ -4302,6 +4304,7 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
 
     def post_start(_driver, _remaining, record_progress, fail_closed, _relay_url,
             record_relay_observation, *_identity_args):
+        assert diagnostics[-1][-1]["start_click_state"] == "returned"
         if operator_error:
             if str(operator_error) in {
                     "handoff_failure", "submit_failure", "final_stage_failure"}:
@@ -4317,7 +4320,6 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
 
     fake_os = SimpleNamespace(**vars(os))
     fake_os.name = "posix" if str(ready_error) == "posix readiness failure" else "nt"
-    diagnostics = []
     class MemorySampler:
         def __init__(self, pid):
             memory_roots.append(pid)
@@ -4366,7 +4368,8 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
         "_start_click_exception_category": lambda _exc: "other",
         "_classify_webdriver_session_failure": lambda _exc, _process: (
             "webdriver_session_creation_failed", "running", "unknown"),
-            "_write_webdriver_diagnostic": lambda *args: diagnostics.append(args),
+            "_write_webdriver_diagnostic": lambda *args: diagnostics.append(
+                (*args[:-1], dict(args[-1]))),
             "_read_native_startup_diagnostic": lambda _driver: {
                 "native_startup_phase": "startup_task_failed",
                 "native_startup_outcome": "failed",
@@ -4466,12 +4469,17 @@ def test_packaged_runner_distinguishes_desktop_session_and_ui_failures(
     if expected_progress == "operator_enabled":
         assert pre_start["start_click_state"] == "raised"
         assert pre_start["start_click_exception_category"] == "other"
+        assert [item[-1]["start_click_state"] for item in diagnostics[-2:]] == [
+            "raised", "raised"]
     elif expected_progress == "not_started":
         assert pre_start["baseline_outcome"] == "not_entered"
         assert pre_start["start_click_state"] == "not_reached"
     else:
         assert pre_start["baseline_outcome"] == "accepted_zero"
         assert pre_start["start_click_state"] == "returned"
+        assert any(item[-1]["start_click_state"] == "returned"
+            for item in diagnostics[:-1])
+        assert diagnostics[-1][-4]["invocation_state"] == "resolved"
     assert len(start_calls) == (
         0 if command_error or gate_error or launch_error or devtools_error else 1)
     if fake_os.name == "nt" and not command_error and not gate_error and not launch_error:

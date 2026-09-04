@@ -1487,7 +1487,8 @@ def _write_webdriver_diagnostic(
     }
     supplied_pre_start = pre_start_diagnostic or {}
     safe_pre_start = {
-        field: (value if (value := supplied_pre_start.get(field)) in allowed
+        field: (value if isinstance(value := supplied_pre_start.get(field), str)
+                and value in allowed
                 else PRE_START_DIAGNOSTIC_DEFAULTS[field])
         for field, allowed in PRE_START_DIAGNOSTIC_ALLOWLISTS.items()
     }
@@ -2026,6 +2027,13 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         relay_observation = observation
     def record_pre_start_state(**changes: object) -> None:
         pre_start_diagnostic.update(changes)
+    def write_pre_start_snapshot() -> None:
+        _write_webdriver_diagnostic(
+            os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
+            tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
+            webdriver_process_posture, webdriver_session_elapsed_bucket,
+            webdriver_target_category, webdriver_readiness_category, operator_progress,
+            {}, {}, {}, pre_start_diagnostic)
     try:
         setup_remaining()
         try:
@@ -2138,14 +2146,17 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         driver_log_handle.flush()
         bridge_log_start_offset = driver_log.stat().st_size
         pre_start_diagnostic["start_click_state"] = "about_to_attempt"
+        write_pre_start_snapshot()
         try:
             driver.find_element(By.XPATH, "//button[.='Start operator']").click()
         except Exception as exc:
             pre_start_diagnostic["start_click_state"] = "raised"
             pre_start_diagnostic["start_click_exception_category"] = \
                 _start_click_exception_category(exc)
+            write_pre_start_snapshot()
             fail_closed("packaged_runner_failure")
         pre_start_diagnostic["start_click_state"] = "returned"
+        write_pre_start_snapshot()
         operator_progress = "operator_started"
         wait_for_post_start_operator_state(
             driver, setup_remaining, record_operator_progress, fail_closed,

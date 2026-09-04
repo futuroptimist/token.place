@@ -193,23 +193,41 @@ def authoritative_registration_matches(relay_url: str, *, timeout_seconds: float
 
 def require_clean_relay_registration_baseline(
         relay_url: str, *, timeout_seconds: float, fail_closed,
-        record_relay_observation) -> list[str]:
+        record_relay_observation, record_pre_start_state=lambda **_changes: None) -> list[str]:
     """Require an authoritative empty relay before starting this attempt."""
+    attempts = 0
+    transient_failures = 0
+    record_pre_start_state(baseline_outcome="polling",
+        baseline_poll_attempt_count=attempts,
+        baseline_transient_failure_count=transient_failures)
     deadline = time.monotonic() + timeout_seconds
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            record_pre_start_state(
+                baseline_outcome=("probe_failures_exhausted"
+                    if transient_failures else "deadline_exhausted"))
             fail_closed("operator_registration_not_reached")
+        attempts += 1
+        record_pre_start_state(baseline_poll_attempt_count=attempts)
         record_relay_observation("polled")
         try:
             registered = fetch_api_v1_registered_node_fingerprints(
                 relay_url, timeout_seconds=max(0.05, min(remaining, 0.5)))
         except Exception:
+            transient_failures += 1
+            record_pre_start_state(
+                baseline_transient_failure_count=transient_failures)
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
             continue
+        count = len(registered)
+        record_pre_start_state(last_authoritative_registered_node_count=count)
         if registered:
+            record_pre_start_state(baseline_outcome="rejected_nonzero")
             record_relay_observation("not_reached")
             fail_closed("operator_registration_not_reached")
+        record_pre_start_state(baseline_outcome=("accepted_zero_after_recovery"
+            if transient_failures else "accepted_zero"))
         return registered
 
 
@@ -1051,7 +1069,7 @@ def tauri_driver_command() -> list[str]:
     )
 
 
-WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v7"
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v8"
 WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
 WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
     "read_timeout", "connection_failure", "capability_rejection",
@@ -1112,6 +1130,39 @@ NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS = {
     "native_startup_outcome": "not_started",
     "native_startup_failure_category": "none",
 }
+
+PRE_START_DIAGNOSTIC_ALLOWLISTS = {
+    "baseline_outcome": frozenset({
+        "not_entered", "polling", "accepted_zero", "accepted_zero_after_recovery",
+        "rejected_nonzero", "probe_failures_exhausted", "deadline_exhausted",
+    }),
+    "start_click_state": frozenset({
+        "not_reached", "about_to_attempt", "returned", "raised",
+    }),
+    "start_click_exception_category": frozenset({
+        "none", "no_such_element", "stale_element", "timeout", "webdriver", "other",
+    }),
+}
+PRE_START_DIAGNOSTIC_DEFAULTS = {
+    "baseline_outcome": "not_entered",
+    "baseline_poll_attempt_count": 0,
+    "baseline_transient_failure_count": 0,
+    "last_authoritative_registered_node_count": None,
+    "start_click_state": "not_reached",
+    "start_click_exception_category": "none",
+}
+
+
+def _start_click_exception_category(exc: Exception) -> str:
+    if isinstance(exc, NoSuchElementException):
+        return "no_such_element"
+    if isinstance(exc, StaleElementReferenceException):
+        return "stale_element"
+    if isinstance(exc, TimeoutException):
+        return "timeout"
+    if isinstance(exc, WebDriverException):
+        return "webdriver"
+    return "other"
 
 PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS = {
     "startup_boundary": frozenset({
@@ -1393,7 +1444,8 @@ def _write_webdriver_diagnostic(
         readiness_category: str = "unknown", operator_progress: str = "not_started",
         operator_start_diagnostic: dict[str, str] | None = None,
         native_startup_diagnostic: dict[str, str] | None = None,
-        packaged_startup_diagnostic: dict[str, str] | None = None) -> None:
+        packaged_startup_diagnostic: dict[str, str] | None = None,
+        pre_start_diagnostic: dict[str, object] | None = None) -> None:
     """Atomically retain the bounded session diagnostic while raw logs are discarded."""
     if compatibility not in WEBDRIVER_COMPATIBILITY_RESULTS:
         compatibility = "unknown"
@@ -1433,6 +1485,21 @@ def _write_webdriver_diagnostic(
                 else PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS[field])
         for field, allowed in PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS.items()
     }
+    supplied_pre_start = pre_start_diagnostic or {}
+    safe_pre_start = {
+        field: (value if isinstance(value := supplied_pre_start.get(field), str)
+                and value in allowed
+                else PRE_START_DIAGNOSTIC_DEFAULTS[field])
+        for field, allowed in PRE_START_DIAGNOSTIC_ALLOWLISTS.items()
+    }
+    for field in ("baseline_poll_attempt_count", "baseline_transient_failure_count"):
+        value = supplied_pre_start.get(field)
+        safe_pre_start[field] = (value if isinstance(value, int)
+            and not isinstance(value, bool) and value >= 0 else 0)
+    value = supplied_pre_start.get("last_authoritative_registered_node_count")
+    safe_pre_start["last_authoritative_registered_node_count"] = (
+        value if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        else None)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
     fd, temporary_name = tempfile.mkstemp(
@@ -1451,6 +1518,7 @@ def _write_webdriver_diagnostic(
                 "target_category": target_category,
                 "readiness_category": readiness_category,
                 "operator_progress": operator_progress,
+                **safe_pre_start,
                 **safe_start_diagnostic,
                 **safe_native_diagnostic,
                 **safe_packaged_diagnostic,
@@ -1948,12 +2016,24 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
     webdriver_readiness_category = "unknown"
     operator_progress = "not_started"
     relay_observation = "not_started"
+    # Keep a mutable local copy so even failures during the earliest packaged bootstrap
+    # can serialize a complete diagnostic without requiring any UI state.
+    pre_start_diagnostic: dict[str, object] = PRE_START_DIAGNOSTIC_DEFAULTS.copy()
     def record_operator_progress(progress: str) -> None:
         nonlocal operator_progress
         operator_progress = progress
     def record_relay_observation(observation: str) -> None:
         nonlocal relay_observation
         relay_observation = observation
+    def record_pre_start_state(**changes: object) -> None:
+        pre_start_diagnostic.update(changes)
+    def write_pre_start_snapshot() -> None:
+        _write_webdriver_diagnostic(
+            os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
+            tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
+            webdriver_process_posture, webdriver_session_elapsed_bucket,
+            webdriver_target_category, webdriver_readiness_category, operator_progress,
+            {}, {}, {}, pre_start_diagnostic)
     try:
         setup_remaining()
         try:
@@ -2061,10 +2141,22 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
         setup_remaining()
         require_clean_relay_registration_baseline(
             request["relay_url"], timeout_seconds=setup_remaining(),
-            fail_closed=fail_closed, record_relay_observation=record_relay_observation)
+            fail_closed=fail_closed, record_relay_observation=record_relay_observation,
+            record_pre_start_state=record_pre_start_state)
         driver_log_handle.flush()
         bridge_log_start_offset = driver_log.stat().st_size
-        driver.find_element(By.XPATH, "//button[.='Start operator']").click()
+        pre_start_diagnostic["start_click_state"] = "about_to_attempt"
+        write_pre_start_snapshot()
+        try:
+            driver.find_element(By.XPATH, "//button[.='Start operator']").click()
+        except Exception as exc:
+            pre_start_diagnostic["start_click_state"] = "raised"
+            pre_start_diagnostic["start_click_exception_category"] = \
+                _start_click_exception_category(exc)
+            write_pre_start_snapshot()
+            fail_closed("packaged_runner_failure")
+        pre_start_diagnostic["start_click_state"] = "returned"
+        write_pre_start_snapshot()
         operator_progress = "operator_started"
         wait_for_post_start_operator_state(
             driver, setup_remaining, record_operator_progress, fail_closed,
@@ -2275,7 +2367,7 @@ def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
             webdriver_process_posture, webdriver_session_elapsed_bucket,
             webdriver_target_category, webdriver_readiness_category, operator_progress,
             operator_start_diagnostic, native_startup_diagnostic,
-            packaged_startup_diagnostic)
+            packaged_startup_diagnostic, pre_start_diagnostic)
         cleanup_deadline = time.monotonic() + cleanup_timeout
         def cleanup_remaining() -> float:
             return max(0.0, cleanup_deadline - time.monotonic())

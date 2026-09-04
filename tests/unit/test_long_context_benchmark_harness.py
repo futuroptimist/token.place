@@ -738,6 +738,22 @@ def test_real_urllib3_read_timeout_without_msg_is_classified(desktop_runner):
             "webdriver_transport_failure", "running", "read_timeout")
 
 
+@pytest.mark.parametrize(("exception_name", "expected_category"), [
+    ("NoSuchElementException", "no_such_element"),
+    ("StaleElementReferenceException", "stale_element"),
+    ("TimeoutException", "timeout"),
+    ("WebDriverException", "webdriver"),
+    (None, "other"),
+])
+def test_start_click_exception_categories_are_bounded(
+        desktop_runner, exception_name, expected_category):
+    exception_type = (getattr(desktop_runner, exception_name)
+        if exception_name else RuntimeError)
+    exception = exception_type("private click failure C:\\Users\\SECRET")
+
+    assert desktop_runner._start_click_exception_category(exception) == expected_category
+
+
 def test_webdriver_process_posture_and_elapsed_are_bounded(
         desktop_runner, monkeypatch, tmp_path):
     application_path = (tmp_path / "private application.exe").resolve()

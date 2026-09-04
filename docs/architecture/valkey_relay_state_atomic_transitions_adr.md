@@ -163,11 +163,19 @@ health source, or terminal-state authority.
    tombstone exists, return its fixed control state instead of renewing; acknowledgement is atomic.
 6. **Accept response and finalize.** Authenticate owner and generation; win a CAS from active to
    `response_ready`; store one bounded encrypted response; remove claim/queue/progress state; create
-   the terminal/dedup record with `completed`; and increment the outcome only once. Competing
-   response, cancellation, expiry, or unregister receives the existing terminal result. Generate a
-   bounded retrieval acknowledgement token deterministically from the canonical identity, accepted
-   epoch, and response digest using a shared injected acknowledgement key; store only the token
-   digest with the response and return the raw token only with authenticated retrieval responses.
+   the terminal/dedup record with `completed`; and increment the outcome only once. Immediately
+   before acceptance, the reviewed non-mutating `server_time_v1` transition samples Valkey
+   `(seconds, microseconds)`, which the relay canonically converts to the in-memory contract's epoch
+   float. The relay derives the HMAC-SHA-256 acknowledgement token locally from the shared injected
+   key, domain separator, raw client/request digests, network-order IEEE-754 epoch double, and raw
+   response digest, then supplies only the epoch and SHA-256 of the token's lowercase hexadecimal
+   ASCII to one mutating acceptance script. That script calls `TIME` again, rejects malformed or
+   future samples, revalidates inclusive claim/request deadlines, and atomically persists the digest
+   and all protocol state. The key, raw token, and key-equivalent state never reach Valkey; there is
+   no post-acceptance write, provisional token field, lazy initialization, or ambiguous mutation
+   retry. An exact operation-level retry reads terminal authority first and returns its original
+   generation and timestamps without requiring a live registration or creating a new outcome.
+   Competing response, cancellation, expiry, or unregister receives the existing terminal result.
 7. **Cancel, expire, unregister, or evict.** Win the same lifecycle CAS, remove reservation/queue/
    claim/progress state as applicable, release capacity, and apply a fixed terminal status/reason.
    Unregister/evict processes only a bounded batch and records continuation work; the node becomes

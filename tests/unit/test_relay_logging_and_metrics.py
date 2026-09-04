@@ -192,7 +192,8 @@ def test_entrypoint_fails_closed_for_unsafe_metrics_targets(tmp_path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     gunicorn = fake_bin / "gunicorn"
-    gunicorn.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    invocation = tmp_path / "gunicorn-invoked"
+    gunicorn.write_text(f'#!/bin/sh\ntouch "{invocation}"\nexit 99\n', encoding="utf-8")
     gunicorn.chmod(0o755)
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
 
@@ -208,6 +209,44 @@ def test_entrypoint_fails_closed_for_unsafe_metrics_targets(tmp_path) -> None:
     env["PROMETHEUS_MULTIPROC_DIR"] = str(symlink_target)
     result = subprocess.run([str(entrypoint)], env=env, capture_output=True, text=True)
     assert result.returncode == 1
+
+    traversal_parent = tmp_path / "traversal"
+    traversal_parent.mkdir()
+    (traversal_parent / "child").mkdir()
+    traversal_target = traversal_parent / "tokenplace-prometheus-multiproc"
+    traversal_target.mkdir()
+    traversal_sentinel = traversal_target / "keep"
+    traversal_sentinel.write_text("untouched", encoding="utf-8")
+    env["PROMETHEUS_MULTIPROC_DIR"] = str(
+        traversal_parent / "child" / ".." / "tokenplace-prometheus-multiproc"
+    )
+    result = subprocess.run([str(entrypoint)], env=env, capture_output=True, text=True)
+    assert result.returncode == 1
+    assert traversal_sentinel.read_text(encoding="utf-8") == "untouched"
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    ancestor_target = real_parent / "tokenplace-prometheus-multiproc"
+    ancestor_target.mkdir()
+    ancestor_sentinel = ancestor_target / "keep"
+    ancestor_sentinel.write_text("untouched", encoding="utf-8")
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    env["PROMETHEUS_MULTIPROC_DIR"] = str(
+        linked_parent / "tokenplace-prometheus-multiproc"
+    )
+    result = subprocess.run([str(entrypoint)], env=env, capture_output=True, text=True)
+    assert result.returncode == 1
+    assert ancestor_sentinel.read_text(encoding="utf-8") == "untouched"
+
+    file_target = tmp_path / "file-parent" / "tokenplace-prometheus-multiproc"
+    file_target.parent.mkdir()
+    file_target.write_text("untouched", encoding="utf-8")
+    env["PROMETHEUS_MULTIPROC_DIR"] = str(file_target)
+    result = subprocess.run([str(entrypoint)], env=env, capture_output=True, text=True)
+    assert result.returncode == 1
+    assert file_target.read_text(encoding="utf-8") == "untouched"
+    assert not invocation.exists()
 
 
 def test_gunicorn_child_exit_marks_worker_dead(monkeypatch) -> None:

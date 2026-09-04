@@ -1427,7 +1427,6 @@ local function bounded(index,kind,limit,per_limit)
   local members=redis.call('ZRANGE',index,0,limit,'WITHSCORES')
   if #members%2~=0 then return nil end
   local entries=#members/2
-  if entries>limit then return false end
   local count=0
   for i=1,#members,2 do
     local m,score_value=members[i],finite(members[i+1])
@@ -1454,6 +1453,7 @@ local function bounded(index,kind,limit,per_limit)
     end
     if c==client then count=count+1 end
   end
+  if entries>=limit then return false end
   if count>=per_limit then return false end
   return true
 end
@@ -1473,7 +1473,7 @@ return {'accepted',generation,accepted_value,replay_value}
 ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     "accept_encrypted_response_v1",
     ACCEPT_RESPONSE_SOURCE,
-    "067cd68d0d6be45d618f9807bf7fc576e045818c6a85a12e93571a0007aa07c3",  # pragma: allowlist secret
+    "23ad81f810994e5853d6abc32d2685f29b6e5c4ca7eb71916652d13967bc8b9c",  # pragma: allowlist secret
     True,
 )
 

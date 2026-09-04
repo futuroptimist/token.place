@@ -81,10 +81,10 @@ def test_response_serialization_is_canonical_sorted_utf8():
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
+    expected_digest = "23ad81f810994e5853d6abc32d2685f29b6e5c4ca7eb71916652d13967bc8b9c"  # pragma: allowlist secret
+    assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
-    assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == (
-        ACCEPT_RESPONSE_SCRIPT.sha256
-    )
+    assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
     assert not re.search(
         r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
         ACCEPT_RESPONSE_SCRIPT.source,
@@ -101,6 +101,10 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     cleanup_offset = ACCEPT_RESPONSE_SCRIPT.source.index("local function cleanup()")
     assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_response_due(response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
     assert "redis.call('EXISTS',response)~=0 or response_indexed or terminal_indexed" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "if entries>=limit then return false end" in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("for i=1,#members,2 do") < (
+        ACCEPT_RESPONSE_SCRIPT.source.index("if entries>=limit then return false end")
+    )
 
 
 def config(**changes):

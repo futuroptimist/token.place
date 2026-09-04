@@ -3053,6 +3053,99 @@ def test_encrypted_response_rejects_stale_preflight_without_mutation(valkey_serv
 
 
 @pytest.mark.parametrize(
+    ("bound", "same_client", "limits"),
+    (
+        ("global-response", False, {"max_responses": 1}),
+        ("per-client-response", True, {"max_responses_per_client": 1}),
+        ("global-terminal", False, {"max_terminal_records": 1}),
+        ("per-client-terminal", True, {"max_terminal_records_per_client": 1}),
+    ),
+)
+def test_encrypted_response_capacity_bounds_reject_without_mutation(
+    valkey_server, bound, same_client, limits
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=300,
+        terminal_retention_seconds=600,
+        **limits,
+    )
+    second = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=300,
+        terminal_retention_seconds=600,
+        **limits,
+    )
+    node, owner, consumer = "capacity-node", _digest("capacity-owner"), "consumer"
+    first_client = f"{bound}-client"
+    second_client = first_client if same_client else f"{bound}-other-client"
+    identities = ((first_client, f"{bound}-first"), (second_client, f"{bound}-second"))
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = first._foundation.config
+    node_digest = first._node_digest(node)
+
+    def declared_snapshot():
+        zset_keys = [
+            cfg.key("nodes:lease"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("responses:expiry"),
+            cfg.key("terminals:expiry"),
+        ]
+        hash_keys = [cfg.key("node", node_digest)]
+        for client_id, request_id in identities:
+            client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
+            request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
+            hash_keys.extend(
+                (
+                    cfg.key("request", client, request),
+                    cfg.key("claim", client, request),
+                    cfg.key("response", client, request),
+                    cfg.key("terminal", client, request),
+                    cfg.key("progress", client, request),
+                )
+            )
+        datastore = first._foundation._client
+        return (
+            {key: datastore.hgetall(key) for key in hash_keys},
+            {key: datastore.zrange(key, 0, -1, withscores=True) for key in zset_keys},
+            datastore.xrange(cfg.key("queue", node_digest)),
+        )
+
+    try:
+        first.register(node, _capabilities(), owner)
+        generations = []
+        for identity in identities:
+            _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+            generations.append(
+                first.claim_queued_request(node, owner, consumer).generation
+            )
+            if identity == identities[0]:
+                first.accept_encrypted_response(
+                    node, owner, consumer, *identity, generations[-1], response
+                )
+
+        before = declared_snapshot()
+        with pytest.raises(
+            RelayStateCapacityExceeded,
+            match="^response lifecycle capacity reached$",
+        ):
+            second.accept_encrypted_response(
+                node, owner, consumer, *identities[1], generations[1], response
+            )
+        assert declared_snapshot() == before
+    finally:
+        _delete_claim_fixture_state(first, (node,), identities)
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
     "malformed_authority",
     (
         "queue_client_digest",

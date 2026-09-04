@@ -231,7 +231,7 @@ changes are outside this documentation-only record.
 | Priority | Action | Status | Tracker | Verification or exit criterion |
 | --- | --- | --- | --- | --- |
 | P0 | Add bounded, route-class-based 429 and quota-pressure telemetry without raw paths, source addresses, credentials, or attacker-controlled labels. | Proposed | [token.place #1771](https://github.com/futuroptimist/token.place/issues/1771)<br>[sugarkube #2782](https://github.com/futuroptimist/sugarkube/issues/2782) | Staging exhaustion produces bounded diagnostics and no sensitive or unbounded labels. |
-| P0 | Alert before a synthetic monitor consumes a material percentage of a quota. | Proposed | [token.place #1771](https://github.com/futuroptimist/token.place/issues/1771) | A controlled probe soak crosses warning thresholds before any HTTP 429. |
+| P0 | Alert before a synthetic monitor consumes a material percentage of a quota. | Proposed | [Bounded telemetry: token.place #1771](https://github.com/futuroptimist/token.place/issues/1771)<br>[Alert implementation: sugarkube #2405](https://github.com/futuroptimist/sugarkube/issues/2405) | A controlled probe soak crosses warning thresholds before any HTTP 429. |
 | P0 | Keep `/livez` and `/healthz` coverage active whenever higher-level probes are intentionally paused. | In effect during mitigation; permanent procedure proposed | [sugarkube #2776](https://github.com/futuroptimist/sugarkube/issues/2776) | Monitoring review confirms continuous basic-health coverage during a scoped pause. |
 | P0 | Detect promoted artifacts missing reviewed safety fixes. | Proposed | [token.place #1770](https://github.com/futuroptimist/token.place/issues/1770) | A deliberately incomplete release artifact is rejected before production. |
 

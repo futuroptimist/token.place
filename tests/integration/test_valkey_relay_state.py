@@ -20,6 +20,7 @@ from relay_state_store import (
     EncryptedResponseEnvelope,
     InMemoryRelayStateStore,
     RelayStateCapacityExceeded,
+    RelayStateConflict,
     RelayStateCredentialMismatch,
     RelayStateInvalidReservation,
     RelayStateNoCapacity,
@@ -3014,6 +3015,40 @@ def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_s
         _delete_claim_fixture_state(first, (node,), (identity,))
         first.close()
         second.close()
+
+
+def test_encrypted_response_rejects_stale_preflight_without_mutation(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=0.001,
+        terminal_retention_seconds=0.001,
+    )
+    node, owner, consumer = "response-node", _digest("response-owner"), "consumer-a"
+    identity = ("response-client", "response-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    deadline = time.time() + 60
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, deadline)
+        claim = store.claim_queued_request(node, owner, consumer)
+        current_seconds, current_micros = store._foundation.server_time()
+        store._foundation.server_time = lambda: (current_seconds - 1, current_micros)
+
+        with pytest.raises(RelayStateConflict, match="response lifecycle conflict"):
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, response
+            )
+
+        assert len(store.active_claims(node)) == 1
+        assert store.response_records() == ()
+        assert store.terminal_records() == ()
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
 
 
 @pytest.mark.parametrize(

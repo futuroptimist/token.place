@@ -46,7 +46,9 @@ from relay_state_store import (
 @pytest.mark.parametrize("key", [None, "x" * 32, bytearray(32), b"x" * 31])
 def test_acknowledgement_key_is_required_exact_bytes_and_redacted(key):
     foundation = object.__new__(ValkeyFoundation)
-    with pytest.raises(RelayStateStoreError, match="acknowledgement key is invalid") as caught:
+    with pytest.raises(
+        RelayStateStoreError, match="acknowledgement key is invalid"
+    ) as caught:
         ValkeyRegistrationStore(
             foundation,
             RelayStateStoreConfig(namespace="testing.unit"),
@@ -86,6 +88,13 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     assert not re.search(
         r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
         ACCEPT_RESPONSE_SCRIPT.source,
+    )
+    stale_guard = (
+        "if replay<=now or terminal_expiry<=now then return {'stale_time'} end"
+    )
+    assert stale_guard in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index(stale_guard) < (
+        ACCEPT_RESPONSE_SCRIPT.source.index("redis.call('HSET',response")
     )
 
 
@@ -1112,9 +1121,7 @@ def test_renew_claim_decodes_each_fixed_result(result, expected_status):
     foundation.execute.return_value = result
     store = registration_store_with_foundation(foundation)
 
-    renewal = store.renew_claim(
-        "node-a", "a" * 64, "consumer", "client", "request", 2
-    )
+    renewal = store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 2)
     assert renewal.state == expected_status
 
 

@@ -5,7 +5,7 @@ import logging
 import math
 import re
 import traceback
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import redis
@@ -123,10 +123,16 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
     store = registration_store_with_foundation(foundation)
     member = b"a" * 64 + b":" + b"b" * 64
 
-    foundation._call.side_effect = [0, None]
-    assert store._completed_member_disappeared("hash", "index", member)
-    foundation._call.side_effect = [1, None]
-    assert not store._completed_member_disappeared("hash", "index", member)
+    pipeline = MagicMock()
+    foundation._client.pipeline.return_value = pipeline
+    pipeline.__enter__.return_value = pipeline
+    foundation._call.return_value = [0, None]
+    assert store._completed_primary_authority("hash", "index", member) == (0, None)
+    pipeline.exists.assert_called_once_with("hash")
+    pipeline.zscore.assert_called_once_with("index", member)
+
+    foundation._call.return_value = [1, 2.0]
+    assert store._completed_primary_authority("hash", "index", member) == (1, 2.0)
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():

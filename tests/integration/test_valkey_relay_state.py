@@ -5431,8 +5431,17 @@ def test_completed_record_reads_hide_expired_backlog_beyond_cleanup_batch(valkey
 
 
 @pytest.mark.parametrize("inspector", ("response_records", "terminal_records"))
+@pytest.mark.parametrize(
+    ("authority", "field", "replacement"),
+    (
+        ("request", "claim_generation", "999"),
+        ("request", "node_digest", "0" * 64),
+        ("terminal", "retrieval_credential_digest", "0" * 64),
+        ("terminal", "cancellation_token_digest", "0" * 64),
+    ),
+)
 def test_completed_record_inspectors_validate_paired_authority_and_additive_fields(
-    valkey_server, inspector
+    valkey_server, inspector, authority, field, replacement
 ):
     namespace = uuid.uuid4().hex
     store = _registration_store(
@@ -5466,7 +5475,7 @@ def test_completed_record_inspectors_validate_paired_authority_and_additive_fiel
             records[0].generation = 99
 
         store._foundation._client.hset(
-            cfg.key("request", client, request), "claim_generation", "999"
+            cfg.key(authority, client, request), field, replacement
         )
         with pytest.raises(ValkeySchemaIncompatibleError) as caught:
             getattr(store, inspector)()
@@ -5478,21 +5487,30 @@ def test_completed_record_inspectors_validate_paired_authority_and_additive_fiel
         store.close()
 
 
-def test_completed_record_inspector_detects_live_index_overflow(valkey_server):
+@pytest.mark.parametrize(
+    ("inspector", "index_name", "limit_name"),
+    (
+        ("response_records", "responses:expiry", "max_responses"),
+        ("terminal_records", "terminals:expiry", "max_terminal_records"),
+    ),
+)
+def test_completed_record_inspector_detects_live_index_overflow(
+    valkey_server, inspector, index_name, limit_name
+):
     namespace = uuid.uuid4().hex
-    store = _registration_store(valkey_server, namespace, max_responses=1)
+    store = _registration_store(valkey_server, namespace, **{limit_name: 1})
     cfg = store._foundation.config
     first = b"a" * 64 + b":" + b"b" * 64
     second = b"c" * 64 + b":" + b"d" * 64
     try:
         now = store._foundation.server_time()[0]
         store._foundation._client.zadd(
-            cfg.key("responses:expiry"), {first: now + 100, second: now + 100}
+            cfg.key(index_name), {first: now + 100, second: now + 100}
         )
         with pytest.raises(
             ValkeySchemaIncompatibleError, match="state schema incompatible"
         ):
-            store.response_records()
+            getattr(store, inspector)()
     finally:
-        store._foundation._client.delete(cfg.key("responses:expiry"))
+        store._foundation._client.delete(cfg.key(index_name))
         store.close()

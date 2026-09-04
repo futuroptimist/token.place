@@ -17,6 +17,7 @@ import redis
 from relay_state_store import (
     ComputeNodeCapabilities,
     EncryptedRequestEnvelope,
+    EncryptedResponseEnvelope,
     InMemoryRelayStateStore,
     RelayStateCapacityExceeded,
     RelayStateCredentialMismatch,
@@ -253,6 +254,7 @@ def _registration_store(port, namespace, **overrides):
     return ValkeyRegistrationStore(
         foundation,
         RelayStateStoreConfig(namespace="testing.valkey", **overrides),
+        acknowledgement_key=b"shared-valkey-test-acknowledgement-key-v1",
     )
 
 
@@ -4215,7 +4217,9 @@ def test_claim_capacity_counts_only_complete_live_claims(valkey_server):
             store.claim_queued_request(nodes[1], owner, "consumer-b")
         _enqueue_claim_fixture(store, nodes[0], owner, *identities[2], deadline)
         per_node_store = ValkeyRegistrationStore(
-            store._foundation, dataclasses.replace(store.config, max_claims=2)
+            store._foundation,
+            dataclasses.replace(store.config, max_claims=2),
+            acknowledgement_key=b"shared-valkey-test-acknowledgement-key-v1",
         )
         with pytest.raises(RelayStateCapacityExceeded):
             per_node_store.claim_queued_request(nodes[0], owner, "consumer-c")
@@ -4706,3 +4710,50 @@ def test_claim_result_budget_accepts_large_bounded_result(valkey_server):
             keys.append(cfg.key("reservation", _digest(selection.reservation_token)))
         store._foundation._client.delete(*keys)
         store.close()
+
+
+def test_atomic_encrypted_response_acceptance_and_terminal_retry(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner, node_id = _digest("response-owner"), "response-node"
+    client_id, request_id, consumer = "response-client", "response-request", "consumer"
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "response-iv"
+    )
+    try:
+        first.register(node_id, _capabilities(), owner)
+        deadline = first._foundation.server_time()[0] + 120
+        _enqueue_claim_fixture(first, node_id, owner, client_id, request_id, deadline)
+        claim = first.claim_queued_request(node_id, owner, consumer)
+        assert claim.generation is not None
+        created = second.accept_encrypted_response(
+            node_id, owner, consumer, client_id, request_id, claim.generation, response
+        )
+        retried = first.accept_encrypted_response(
+            node_id, owner, consumer, client_id, request_id, claim.generation, response
+        )
+        assert created.new_outcome is True
+        assert retried.new_outcome is False
+        assert (retried.generation, retried.accepted_at_epoch, retried.replay_expires_at_epoch) == (
+            created.generation, created.accepted_at_epoch, created.replay_expires_at_epoch
+        )
+        records, terminals = first.response_records(), second.terminal_records()
+        assert len(records) == len(terminals) == 1
+        assert records[0].response_digest == terminals[0].response_digest
+        assert first._foundation._client.xlen(
+            first._foundation.config.key("queue", first._node_digest(node_id))
+        ) == 0
+    finally:
+        cfg = first._foundation.config
+        c, r = first._identity(client_id, request_id)
+        first._foundation._client.delete(
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("requests:deadline"), cfg.key("claims:expiry"),
+            cfg.key("responses:expiry"), cfg.key("terminals:expiry"),
+            cfg.key("node", first._node_digest(node_id)),
+            cfg.key("queue", first._node_digest(node_id)), cfg.key("request", c, r),
+            cfg.key("claim", c, r), cfg.key("response", c, r), cfg.key("terminal", c, r),
+            cfg.key("progress", c, r),
+        )
+        first.close(); second.close()

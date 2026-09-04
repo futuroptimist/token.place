@@ -80,6 +80,65 @@ def test_response_serialization_is_canonical_sorted_utf8():
     )
 
 
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b"[]",
+        b'{"protocol":"tokenplace_api_v1_relay_e2ee"}',
+        (
+            b'{"protocol":"tokenplace_api_v1_relay_e2ee", "version":1,'
+            b'"ciphertext":"cipher","cipherkey":"key","iv":"iv"}'
+        ),
+    ),
+)
+def test_response_envelope_decoder_rejects_malformed_or_noncanonical_bytes(raw):
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        ValkeyRegistrationStore._decode_response_envelope(raw)
+
+
+@pytest.mark.parametrize(
+    ("generation", "envelope", "maximum", "message"),
+    (
+        (
+            0,
+            EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"
+            ),
+            1024,
+            "generation",
+        ),
+        (1, object(), 1024, "response envelope"),
+        (
+            1,
+            EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"
+            ),
+            1,
+            "byte bound",
+        ),
+    ),
+)
+def test_accept_response_rejects_invalid_inputs_before_backend_access(
+    generation, envelope, maximum, message
+):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(
+        store.config, max_response_envelope_bytes=maximum
+    )
+
+    with pytest.raises(RelayStateStoreError, match=message):
+        store.accept_encrypted_response(
+            "node", "a" * 64, "consumer", "client", "request", generation, envelope
+        )
+
+    foundation.server_time.assert_not_called()
+    foundation.execute.assert_not_called()
+
+
 def test_completed_inspector_index_detects_overflow_and_malformed_shapes():
     foundation = Mock(spec=ValkeyFoundation)
     foundation.config = config()

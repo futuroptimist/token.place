@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import json
 import logging
 import math
@@ -12,6 +13,7 @@ from redis.sentinel import MasterNotFoundError
 import valkey_relay_state
 
 from valkey_relay_state import (
+    ACCEPT_RESPONSE_SCRIPT,
     DirectPrimary,
     ReviewedScript,
     SchemaManifest,
@@ -30,6 +32,7 @@ from valkey_relay_state import (
 )
 from relay_state_store import (
     EncryptedRequestEnvelope,
+    EncryptedResponseEnvelope,
     RelayStateCapacityExceeded,
     RelayStateConflict,
     RelayStateCredentialMismatch,
@@ -38,6 +41,52 @@ from relay_state_store import (
     RelayStateStoreError,
     SchedulerNodeState,
 )
+
+
+@pytest.mark.parametrize("key", [None, "x" * 32, bytearray(32), b"x" * 31])
+def test_acknowledgement_key_is_required_exact_bytes_and_redacted(key):
+    foundation = object.__new__(ValkeyFoundation)
+    with pytest.raises(RelayStateStoreError, match="acknowledgement key is invalid") as caught:
+        ValkeyRegistrationStore(
+            foundation,
+            RelayStateStoreConfig(namespace="testing.unit"),
+            acknowledgement_key=key,
+        )
+    assert repr(key) not in repr(caught.value)
+
+
+def test_acknowledgement_key_is_copied_and_never_represented():
+    foundation = object.__new__(ValkeyFoundation)
+    key = b"shared-test-acknowledgement-key-32"
+    store = ValkeyRegistrationStore(
+        foundation,
+        RelayStateStoreConfig(namespace="testing.unit"),
+        acknowledgement_key=key,
+    )
+    assert store._acknowledgement_key == key
+    assert store._acknowledgement_key is not key
+    assert key.decode() not in repr(store)
+
+
+def test_response_serialization_is_canonical_sorted_utf8():
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher-☃", "key", "iv"
+    )
+    assert ValkeyRegistrationStore._serialized_response_envelope(envelope) == (
+        b'{"cipherkey":"key","ciphertext":"cipher-\xe2\x98\x83","iv":"iv",'
+        b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}'
+    )
+
+
+def test_accept_response_script_is_registered_digest_pinned_and_bounded():
+    assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
+    assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == (
+        ACCEPT_RESPONSE_SCRIPT.sha256
+    )
+    assert not re.search(
+        r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
+        ACCEPT_RESPONSE_SCRIPT.source,
+    )
 
 
 def config(**changes):
@@ -77,6 +126,7 @@ def registration_store_with_foundation(foundation):
     store = object.__new__(ValkeyRegistrationStore)
     store._foundation = foundation
     store._config = RelayStateStoreConfig(namespace="testing.unit")
+    store._acknowledgement_key = b"shared-test-acknowledgement-key-32"
     return store
 
 

@@ -1,16 +1,17 @@
-"""Internal Valkey connection, schema, key, and reviewed-script primitives.
+"""Internal Valkey relay-state transitions and reviewed-script primitives.
 
-This foundation intentionally implements no relay lifecycle operation and is not
-imported by :mod:`relay`.
+This incomplete backend is intentionally not imported by :mod:`relay`.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import re
 import secrets
+import struct
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -25,6 +26,7 @@ from relay_state_store import (
     ComputeNodeCapabilities,
     ComputeNodeRegistration,
     EncryptedRequestEnvelope,
+    EncryptedResponseEnvelope,
     EnqueueResult,
     ClaimRecord,
     ClaimResult,
@@ -37,9 +39,12 @@ from relay_state_store import (
     RelayStateNoCapacity,
     RelayStateStoreConfig,
     RelayStateStoreError,
+    ResponseAcceptanceResult,
+    ResponseRecord,
     ReservationRecord,
     SchedulerNodeState,
     SelectionResult,
+    TerminalOutcomeRecord,
 )
 
 _NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
@@ -1284,6 +1289,90 @@ RENEW_CLAIM_SCRIPT = ReviewedScript(
     True,
 )
 
+ACCEPT_RESPONSE_SOURCE = """\
+local leases,node,queue,claim,request,claim_expiries,deadlines,response,response_expiries,terminal,terminal_expiries,progress=unpack(KEYS)
+local prefix,node_digest,node_id,owner,consumer,client,request_digest,generation,envelope,response_digest,accepted_value,ack_digest=unpack(ARGV)
+local replay_ttl,terminal_ttl,max_responses,max_client_responses,max_terminals,max_client_terminals,cleanup_bound,max_envelope=tonumber(ARGV[13]),tonumber(ARGV[14]),tonumber(ARGV[15]),tonumber(ARGV[16]),tonumber(ARGV[17]),tonumber(ARGV[18]),tonumber(ARGV[19]),tonumber(ARGV[20])
+local client_public_key,request_id=ARGV[21],ARGV[22]
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local function finite(value) local n=tonumber(value); return n and n==n and math.abs(n)~=math.huge and n end
+local function digest(value) return value and string.len(value)==64 and not string.find(value,'[^0-9a-f]') end
+local function integer(value) local n=finite(value); return n and n>=1 and n<=9007199254740990 and n%1==0 and n end
+local function reap(index,kind)
+  local due=redis.call('ZRANGEBYSCORE',index,'-inf',now,'LIMIT',0,cleanup_bound)
+  for _,member in ipairs(due) do
+    local sep=string.find(member,':',1,true); if not sep then return false end
+    local c,q=string.sub(member,1,sep-1),string.sub(member,sep+1)
+    if not digest(c) or not digest(q) then return false end
+    local key=prefix..kind..':'..c..':'..q
+    local score=finite(redis.call('ZSCORE',index,member)); local expiry=finite(redis.call('HGET',key,kind=='response' and 'replay_expires_at_epoch' or 'expires_at_epoch'))
+    if not score or not expiry or score~=expiry then return false end
+    if kind=='response' then
+      local tk=prefix..'terminal:'..c..':'..q
+      if redis.call('EXISTS',tk)==0 then return false end
+      redis.call('DEL',key); redis.call('ZREM',index,member)
+      redis.call('HSET',tk,'retrieval_state','retrieval_expired')
+    else
+      redis.call('DEL',key); redis.call('ZREM',index,member)
+      local rk=prefix..'request:'..c..':'..q
+      if redis.call('HGET',rk,'state')=='response_ready' then redis.call('DEL',rk) end
+    end
+  end
+  return true
+end
+if not reap(response_expiries,'response') or not reap(terminal_expiries,'terminal') then return {'schema'} end
+if ARGV[23]=='cleanup' then return {'cleaned'} end
+if not digest(node_digest) or not digest(owner) or not digest(consumer) or not digest(client) or not digest(request_digest) or not digest(response_digest) or not digest(ack_digest) or not integer(generation) or string.len(envelope)>max_envelope then return {'schema'} end
+local accepted=finite(accepted_value); if not accepted or accepted>now then return {'schema'} end
+local tv=redis.call('HMGET',terminal,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
+local tp=0 for i=1,#tv do if tv[i] then tp=tp+1 end end
+if tp>0 then
+  if tp~=#tv then return {'schema'} end
+  local g=integer(tv[7]); local a=finite(tv[9]); local replay=finite(tv[10]); local expires=finite(tv[11])
+  if tv[1]~='completed' or tv[2]~='response_completed' or (tv[3]~='response_ready' and tv[3]~='retrieval_expired') or not g or not a or not replay or not expires or replay<a or expires<a or not digest(tv[5]) or not digest(tv[6]) or not digest(tv[8]) or not digest(tv[12]) or not digest(tv[13]) or not digest(tv[14]) or tv[15]~=client or tv[16]~=request_digest then return {'schema'} end
+  if tv[4]==node_id and tv[5]==owner and tv[6]==consumer and tostring(g)==generation and tv[8]==response_digest then return {'existing',tostring(g),tv[9],tv[10]} end
+  return {'conflict'}
+end
+local indexed_lease=finite(redis.call('ZSCORE',leases,node_digest)); local nv=redis.call('HMGET',node,'node_id','control_credential_digest','lease_expires_at_epoch')
+if not indexed_lease or not nv[1] then return {'owner'} end
+if not nv[2] or not nv[3] or finite(nv[3])~=indexed_lease then return {'schema'} end
+if indexed_lease<=now or nv[1]~=node_id or nv[2]~=owner then return {'owner'} end
+local cv=redis.call('HMGET',claim,'client','request','node_digest','node_id','owner_digest','consumer_digest','deadline','sequence','generation','lease_expires')
+for i=1,#cv do if not cv[i] then return {'missing'} end end
+local deadline=finite(cv[7]); local sequence=integer(cv[8]); local current=integer(cv[9]); local claim_expiry=finite(cv[10]); local member=client..':'..request_digest
+if not deadline or not sequence or not current or not claim_expiry or finite(redis.call('ZSCORE',claim_expiries,member))~=claim_expiry then return {'schema'} end
+if tostring(current)~=generation then return {'stale',tostring(current)} end
+if cv[1]~=client or cv[2]~=request_digest or cv[3]~=node_digest or cv[4]~=node_id or cv[5]~=owner or cv[6]~=consumer then return {'owner'} end
+if claim_expiry<=now or deadline<=now then return {'missing'} end
+local rv=redis.call('HMGET',request,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest')
+for i=1,#rv do if not rv[i] then return {'schema'} end end
+if rv[1]~='claimed' or rv[2]~=client or rv[3]~=request_digest or rv[4]~=client_public_key or rv[5]~=request_id or rv[6]~=node_id or rv[7]~=node_digest or finite(rv[8])~=deadline or integer(rv[9])~=sequence or integer(rv[10])~=current or rv[11]~=tostring(sequence)..'-0' or not digest(rv[12]) or not digest(rv[13]) or finite(redis.call('ZSCORE',deadlines,member))~=deadline then return {'schema'} end
+local stream=redis.call('XRANGE',queue,rv[11],rv[11],'COUNT',1)
+if #stream~=1 or stream[1][1]~=rv[11] or #stream[1][2]~=4 or stream[1][2][1]~='client' or stream[1][2][2]~=client or stream[1][2][3]~='request' or stream[1][2][4]~=request_digest then return {'schema'} end
+local function bounded(index,limit,per_limit)
+  local members=redis.call('ZRANGE',index,0,limit)
+  if #members>=limit then return false end
+  local count=0 for _,m in ipairs(members) do if string.sub(m,1,65)==client..':' then count=count+1 end end
+  return count<per_limit
+end
+if not bounded(response_expiries,max_responses,max_client_responses) or not bounded(terminal_expiries,max_terminals,max_client_terminals) then return {'capacity'} end
+local replay=accepted+replay_ttl; local terminal_expiry=accepted+terminal_ttl
+local replay_value=string.format('%.17g',replay); local terminal_value=string.format('%.17g',terminal_expiry)
+redis.call('HSET',response,'client',client,'request',request_digest,'client_public_key',client_public_key,'request_id',request_id,'node_id',node_id,'consumer_digest',consumer,'generation',generation,'envelope',envelope,'accepted_at_epoch',accepted_value,'response_digest',response_digest,'replay_expires_at_epoch',replay_value,'status','response_ready')
+redis.call('ZADD',response_expiries,replay_value,member)
+redis.call('HSET',terminal,'client',client,'request',request_digest,'outcome','completed','reason','response_completed','retrieval_state','response_ready','node_id',node_id,'owner_digest',owner,'consumer_digest',consumer,'generation',generation,'response_digest',response_digest,'accepted_at_epoch',accepted_value,'replay_expires_at_epoch',replay_value,'expires_at_epoch',terminal_value,'retrieval_credential_digest',rv[12],'acknowledgement_digest',ack_digest,'cancellation_token_digest',rv[13])
+redis.call('ZADD',terminal_expiries,terminal_value,member)
+redis.call('XDEL',queue,rv[11]); redis.call('DEL',claim); redis.call('ZREM',claim_expiries,member); redis.call('ZREM',deadlines,member); redis.call('DEL',progress)
+redis.call('HSET',request,'state','response_ready')
+return {'accepted',generation,accepted_value,replay_value}
+"""
+ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
+    "accept_encrypted_response_v1",
+    ACCEPT_RESPONSE_SOURCE,
+    "f5e80386f5ba65f3270fb303a4345eb47437be18869e550b32b36794ac293f49",  # pragma: allowlist secret
+    True,
+)
+
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
     {
         SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT,
@@ -1293,6 +1382,7 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         ENQUEUE_SCRIPT.name: ENQUEUE_SCRIPT,
         CLAIM_SCRIPT.name: CLAIM_SCRIPT,
         RENEW_CLAIM_SCRIPT.name: RENEW_CLAIM_SCRIPT,
+        ACCEPT_RESPONSE_SCRIPT.name: ACCEPT_RESPONSE_SCRIPT,
     }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
@@ -1544,21 +1634,28 @@ class ValkeyFoundation:
 
 
 class ValkeyRegistrationStore:
-    """Internal Valkey implementation through reservation and encrypted enqueue.
+    """Internal Valkey implementation through encrypted-response acceptance.
 
     This deliberately does not implement or advertise ``RelayStateStore``: the
     remaining coordination transitions must exist before runtime selection is safe.
     """
 
     def __init__(
-        self, foundation: ValkeyFoundation, config: RelayStateStoreConfig
+        self,
+        foundation: ValkeyFoundation,
+        config: RelayStateStoreConfig,
+        *,
+        acknowledgement_key: bytes,
     ) -> None:
+        if type(acknowledgement_key) is not bytes or len(acknowledgement_key) < 32:
+            raise RelayStateStoreError("acknowledgement key is invalid")
         if not isinstance(foundation, ValkeyFoundation) or not isinstance(
             config, RelayStateStoreConfig
         ):
             raise RelayStateStoreError("invalid Valkey registration configuration")
         self._foundation = foundation
         self._config = config
+        self._acknowledgement_key = memoryview(acknowledgement_key).tobytes()
 
     def __repr__(self) -> str:
         return "ValkeyRegistrationStore(<redacted>)"
@@ -2316,6 +2413,247 @@ class ValkeyRegistrationStore:
             request_id,
             generation,
         )
+
+    @staticmethod
+    def _serialized_response_envelope(envelope: EncryptedResponseEnvelope) -> bytes:
+        return json.dumps(
+            {
+                "protocol": envelope.protocol,
+                "version": envelope.version,
+                "ciphertext": envelope.ciphertext,
+                "cipherkey": envelope.cipherkey,
+                "iv": envelope.iv,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+
+    def accept_encrypted_response(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        envelope: EncryptedResponseEnvelope,
+    ) -> ResponseAcceptanceResult:
+        """Atomically retain one response and its completed terminal authority."""
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        consumer = self._consumer_digest(consumer_identity)
+        client, request = self._identity(client_public_key, request_id)
+        if type(generation) is not int or generation < 1:
+            raise RelayStateStoreError("claim generation is invalid")
+        if not isinstance(envelope, EncryptedResponseEnvelope):
+            raise RelayStateStoreError(
+                "response envelope must be EncryptedResponseEnvelope"
+            )
+        encoded = self._serialized_response_envelope(envelope)
+        if len(encoded) > self.config.max_response_envelope_bytes:
+            raise RelayStateStoreError(
+                "encrypted response exceeds its configured byte bound"
+            )
+        response_digest = hashlib.sha256(encoded).hexdigest()
+        seconds, micros = self._foundation.server_time()
+        accepted = seconds + micros / 1_000_000
+        message = (
+            b"token.place/relay-response-ack/v1\0"
+            + bytes.fromhex(client)
+            + bytes.fromhex(request)
+            + struct.pack("!d", accepted)
+            + bytes.fromhex(response_digest)
+        )
+        raw_token = hmac.new(
+            self._acknowledgement_key, message, hashlib.sha256
+        ).hexdigest()
+        acknowledgement_digest = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
+        node_digest = self._node_digest(node_id)
+        cfg = self._foundation.config
+        member = f"{client}:{request}"
+        keys = (
+            cfg.key("nodes:lease"),
+            cfg.key("node", node_digest),
+            cfg.key("queue", node_digest),
+            cfg.key("claim", client, request),
+            cfg.key("request", client, request),
+            cfg.key("claims:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("response", client, request),
+            cfg.key("responses:expiry"),
+            cfg.key("terminal", client, request),
+            cfg.key("terminals:expiry"),
+            cfg.key("progress", client, request),
+        )
+        args = (
+            cfg.key_prefix.encode(), node_digest.encode(), node_id.encode(),
+            control_credential_digest.encode(), consumer.encode(), client.encode(),
+            request.encode(), str(generation).encode(), encoded,
+            response_digest.encode(), repr(accepted).encode(),
+            acknowledgement_digest.encode(),
+            repr(float(self.config.response_replay_ttl_seconds)).encode(),
+            repr(float(self.config.terminal_retention_seconds)).encode(),
+            str(self.config.max_responses).encode(),
+            str(self.config.max_responses_per_client).encode(),
+            str(self.config.max_terminal_records).encode(),
+            str(self.config.max_terminal_records_per_client).encode(),
+            str(self.config.node_transition_batch_size).encode(),
+            str(self.config.max_response_envelope_bytes).encode(),
+            client_public_key.encode(), request_id.encode(), b"accept",
+        )
+        status, values = self._ascii_status(
+            self._foundation.execute(
+                ACCEPT_RESPONSE_SCRIPT.name,
+                keys,
+                args,
+                max_result_bytes=_CLAIM_RESULT_METADATA_BYTES,
+            )
+        )
+        if status == "owner" and not values:
+            raise RelayStateCredentialMismatch("response owner is invalid")
+        if status in {"missing", "stale", "conflict"}:
+            raise RelayStateConflict("response lifecycle conflict")
+        if status == "capacity" and not values:
+            raise RelayStateCapacityExceeded("response lifecycle capacity reached")
+        if status == "schema" and not values:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if status not in {"accepted", "existing"} or len(values) != 3:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            result_generation = int(self._decode_text(values[0]))
+            result_accepted = float(self._decode_text(values[1]))
+            replay = float(self._decode_text(values[2]))
+            if (
+                result_generation < 1
+                or not math.isfinite(result_accepted)
+                or not math.isfinite(replay)
+                or replay < result_accepted
+            ):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        return ResponseAcceptanceResult(
+            "response_ready", result_generation, result_accepted, replay,
+            status == "accepted",
+        )
+
+    def _cleanup_completed_records(self) -> None:
+        cfg = self._foundation.config
+        zero = "0" * 64
+        keys = (
+            cfg.key("nodes:lease"), cfg.key("node", zero), cfg.key("queue", zero),
+            cfg.key("claim", zero, zero), cfg.key("request", zero, zero),
+            cfg.key("claims:expiry"), cfg.key("requests:deadline"),
+            cfg.key("response", zero, zero), cfg.key("responses:expiry"),
+            cfg.key("terminal", zero, zero), cfg.key("terminals:expiry"),
+            cfg.key("progress", zero, zero),
+        )
+        args = (
+            cfg.key_prefix.encode(), *(zero.encode(),) * 6, b"1", b"", zero.encode(),
+            b"0", zero.encode(),
+            repr(float(self.config.response_replay_ttl_seconds)).encode(),
+            repr(float(self.config.terminal_retention_seconds)).encode(),
+            str(self.config.max_responses).encode(),
+            str(self.config.max_responses_per_client).encode(),
+            str(self.config.max_terminal_records).encode(),
+            str(self.config.max_terminal_records_per_client).encode(),
+            str(self.config.node_transition_batch_size).encode(),
+            str(self.config.max_response_envelope_bytes).encode(), b"", b"", b"cleanup",
+        )
+        status, values = self._ascii_status(
+            self._foundation.execute(ACCEPT_RESPONSE_SCRIPT.name, keys, args)
+        )
+        if status != "cleaned" or values:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+
+    @staticmethod
+    def _decode_response_envelope(raw: bytes) -> EncryptedResponseEnvelope:
+        try:
+            value = json.loads(raw)
+            if not isinstance(value, dict) or set(value) != {
+                "protocol", "version", "ciphertext", "cipherkey", "iv"
+            }:
+                raise ValueError
+            envelope = EncryptedResponseEnvelope(**value)
+            if ValkeyRegistrationStore._serialized_response_envelope(envelope) != raw:
+                raise ValueError
+            return envelope
+        except (TypeError, ValueError, json.JSONDecodeError, RelayStateStoreError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+
+    def response_records(self) -> tuple[ResponseRecord, ...]:
+        self._cleanup_completed_records()
+        cfg = self._foundation.config
+        members = self._foundation._call(
+            self._foundation._client.zrange,
+            cfg.key("responses:expiry"), 0, self.config.max_responses,
+            withscores=True,
+        )
+        if len(members) > self.config.max_responses:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        fields = (b"client", b"request", b"client_public_key", b"request_id", b"node_id",
+                  b"consumer_digest", b"generation", b"envelope", b"accepted_at_epoch",
+                  b"response_digest", b"replay_expires_at_epoch", b"status")
+        records = []
+        for raw_member, raw_score in members:
+            try:
+                member = self._decode_text(raw_member); client, request = member.split(":")
+                values = self._foundation._call(self._foundation._client.hmget,
+                    cfg.key("response", client, request), fields)
+                if isinstance(values, list) and all(value is None for value in values):
+                    continue
+                if len(values) != len(fields) or any(type(value) is not bytes for value in values):
+                    raise ValueError
+                v = dict(zip(fields, values)); generation = int(v[b"generation"])
+                accepted = float(v[b"accepted_at_epoch"]); replay = float(v[b"replay_expires_at_epoch"])
+                score = float(raw_score); envelope = self._decode_response_envelope(v[b"envelope"])
+                if (not _SHA256_RE.fullmatch(client) or not _SHA256_RE.fullmatch(request)
+                    or v[b"client"] != client.encode() or v[b"request"] != request.encode()
+                    or hashlib.sha256(b"client\0" + v[b"client_public_key"]).hexdigest() != client
+                    or hashlib.sha256(b"request\0" + v[b"request_id"]).hexdigest() != request
+                    or not _SHA256_RE.fullmatch(self._decode_text(v[b"consumer_digest"]))
+                    or not _SHA256_RE.fullmatch(self._decode_text(v[b"response_digest"]))
+                    or hashlib.sha256(v[b"envelope"]).hexdigest() != self._decode_text(v[b"response_digest"])
+                    or generation < 1 or not all(map(math.isfinite, (accepted, replay, score)))
+                    or replay != score or v[b"status"] != b"response_ready"):
+                    raise ValueError
+                records.append(ResponseRecord(client, request, self._decode_text(v[b"client_public_key"]),
+                    self._decode_text(v[b"request_id"]), self._decode_text(v[b"node_id"]),
+                    self._decode_text(v[b"consumer_digest"]), generation, envelope, accepted,
+                    self._decode_text(v[b"response_digest"]), replay))
+            except (TypeError, ValueError, OverflowError, UnicodeDecodeError):
+                raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        return tuple(records)
+
+    def terminal_records(self) -> tuple[TerminalOutcomeRecord, ...]:
+        self._cleanup_completed_records()
+        cfg = self._foundation.config
+        members = self._foundation._call(self._foundation._client.zrange,
+            cfg.key("terminals:expiry"), 0, self.config.max_terminal_records, withscores=True)
+        if len(members) > self.config.max_terminal_records:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        fields = (b"client",b"request",b"node_id",b"owner_digest",b"consumer_digest",b"generation",
+            b"response_digest",b"accepted_at_epoch",b"replay_expires_at_epoch",b"expires_at_epoch",
+            b"outcome",b"retrieval_state",b"retrieval_credential_digest",b"acknowledgement_digest",
+            b"reason",b"cancellation_token_digest")
+        result=[]
+        for raw_member, raw_score in members:
+            try:
+                member=self._decode_text(raw_member); client,request=member.split(":")
+                values=self._foundation._call(self._foundation._client.hmget,cfg.key("terminal",client,request),fields)
+                if isinstance(values,list) and all(value is None for value in values): continue
+                if len(values)!=len(fields) or any(type(v) is not bytes for v in values): raise ValueError
+                v=dict(zip(fields,values)); generation=int(v[b"generation"]); accepted=float(v[b"accepted_at_epoch"]); replay=float(v[b"replay_expires_at_epoch"]); expires=float(v[b"expires_at_epoch"])
+                digests=(client,request,*[self._decode_text(v[f]) for f in (b"owner_digest",b"consumer_digest",b"response_digest",b"retrieval_credential_digest",b"acknowledgement_digest",b"cancellation_token_digest")])
+                if (any(not _SHA256_RE.fullmatch(d) for d in digests) or v[b"client"]!=client.encode() or v[b"request"]!=request.encode() or generation<1
+                    or not all(map(math.isfinite,(accepted,replay,expires,float(raw_score)))) or expires!=float(raw_score)
+                    or v[b"outcome"]!=b"completed" or v[b"reason"]!=b"response_completed"
+                    or v[b"retrieval_state"] not in {b"response_ready",b"retrieval_expired"}): raise ValueError
+                result.append(TerminalOutcomeRecord(client,request,self._decode_text(v[b"node_id"]),self._decode_text(v[b"owner_digest"]),self._decode_text(v[b"consumer_digest"]),generation,self._decode_text(v[b"response_digest"]),accepted,replay,expires,retrieval_state=self._decode_text(v[b"retrieval_state"]),retrieval_credential_digest=self._decode_text(v[b"retrieval_credential_digest"]),acknowledgement_digest=self._decode_text(v[b"acknowledgement_digest"]),cancellation_token_digest=self._decode_text(v[b"cancellation_token_digest"])))
+            except (TypeError,ValueError,OverflowError,UnicodeDecodeError):
+                raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        return tuple(result)
 
     def _live_claims(
         self, node_id: str

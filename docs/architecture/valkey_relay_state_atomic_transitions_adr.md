@@ -164,10 +164,19 @@ health source, or terminal-state authority.
 6. **Accept response and finalize.** Authenticate owner and generation; win a CAS from active to
    `response_ready`; store one bounded encrypted response; remove claim/queue/progress state; create
    the terminal/dedup record with `completed`; and increment the outcome only once. Competing
-   response, cancellation, expiry, or unregister receives the existing terminal result. Generate a
-   bounded retrieval acknowledgement token deterministically from the canonical identity, accepted
-   epoch, and response digest using a shared injected acknowledgement key; store only the token
-   digest with the response and return the raw token only with authenticated retrieval responses.
+   response, cancellation, expiry, or unregister receives the existing terminal result. Immediately
+   before acceptance, the reviewed non-mutating `server_time_v1` transition samples Valkey's exact
+   `(seconds, microseconds)` time. The relay canonically converts it to the in-memory contract's epoch
+   float and locally derives the HMAC-SHA-256 acknowledgement token from the shared injected key,
+   canonical raw identity digests, network-order IEEE-754 epoch double, and response digest. Only
+   SHA-256 of the raw token's lowercase hexadecimal ASCII representation is passed to and persisted
+   by `accept_encrypted_response_v1`, together with the canonical epoch; the key, raw token, and
+   key-equivalent HMAC state never reach Valkey. That single mutating script calls `TIME` again,
+   rejects a malformed or future preflight epoch, revalidates both inclusive deadlines against its
+   own time, and atomically persists response, acknowledgement digest, and terminal state. There is
+   no provisional token field, post-acceptance digest write, lazy initialization, or ambiguous
+   mutation retry. An operation-level exact retry reads the retained terminal authority and returns
+   its original generation, acceptance epoch, and replay epoch without recording a new outcome.
 7. **Cancel, expire, unregister, or evict.** Win the same lifecycle CAS, remove reservation/queue/
    claim/progress state as applicable, release capacity, and apply a fixed terminal status/reason.
    Unregister/evict processes only a bounded batch and records continuation work; the node becomes

@@ -24,6 +24,7 @@ from prometheus_client import (
     Gauge,
     Histogram,
     generate_latest,
+    multiprocess,
 )
 from werkzeug.serving import make_server
 
@@ -489,23 +490,23 @@ HTTP_REQUEST_DURATION_SECONDS = _collector(
 )
 RELAY_QUEUE_DEPTH = _collector(
     "tokenplace_relay_queue_depth",
-    lambda: Gauge("tokenplace_relay_queue_depth", "Current encrypted relay request queue depth.", ["provider_mode"], registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_relay_queue_depth", "Current encrypted relay request queue depth.", ["provider_mode"], multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
 )
 RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS = _collector(
     "tokenplace_relay_oldest_queued_request_age_seconds",
-    lambda: Gauge("tokenplace_relay_oldest_queued_request_age_seconds", "Age of the oldest queued encrypted relay request.", ["provider_mode"], registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_relay_oldest_queued_request_age_seconds", "Age of the oldest queued encrypted relay request.", ["provider_mode"], multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
 )
 COMPUTE_NODES_REGISTERED = _collector(
     "tokenplace_compute_nodes_registered",
-    lambda: Gauge("tokenplace_compute_nodes_registered", "Registered API v1 compute nodes.", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_compute_nodes_registered", "Registered API v1 compute nodes.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
 )
 COMPUTE_NODES_HEALTHY = _collector(
     "tokenplace_compute_nodes_healthy",
-    lambda: Gauge("tokenplace_compute_nodes_healthy", "Healthy API v1 compute nodes using relay lease semantics.", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_compute_nodes_healthy", "Healthy API v1 compute nodes using relay lease semantics.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
 )
 COMPUTE_NODE_LEASE_AGE_SECONDS = _collector(
     "tokenplace_compute_node_lease_age_seconds",
-    lambda: Gauge("tokenplace_compute_node_lease_age_seconds", "Oldest compute-node lease age without node identity.", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_compute_node_lease_age_seconds", "Oldest compute-node lease age without node identity.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
 )
 COMPUTE_NODE_EVICTIONS_TOTAL = _collector(
     "tokenplace_compute_node_evictions_total",
@@ -513,11 +514,11 @@ COMPUTE_NODE_EVICTIONS_TOTAL = _collector(
 )
 RELAY_IN_FLIGHT_REQUESTS = _collector(
     "tokenplace_relay_in_flight_requests",
-    lambda: Gauge("tokenplace_relay_in_flight_requests", "Current encrypted relay requests dispatched to compute nodes.", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_relay_in_flight_requests", "Current encrypted relay requests dispatched to compute nodes.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
 )
 RELAY_OLDEST_IN_FLIGHT_AGE_SECONDS = _collector(
     "tokenplace_relay_oldest_in_flight_age_seconds",
-    lambda: Gauge("tokenplace_relay_oldest_in_flight_age_seconds", "Age of the oldest in-flight encrypted relay request.", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_relay_oldest_in_flight_age_seconds", "Age of the oldest in-flight encrypted relay request.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
 )
 RELAY_REQUEST_OUTCOMES_TOTAL = _collector(
     "tokenplace_relay_request_outcomes_total",
@@ -525,11 +526,11 @@ RELAY_REQUEST_OUTCOMES_TOTAL = _collector(
 )
 BUILD_INFO = _collector(
     "tokenplace_build_info",
-    lambda: Gauge("tokenplace_build_info", "token.place build metadata.", ["version", "revision"], registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_build_info", "token.place build metadata.", ["version", "revision"], multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
 )
 INSTRUMENTATION_UP = _collector(
     "tokenplace_instrumentation_up",
-    lambda: Gauge("tokenplace_instrumentation_up", "Whether relay metrics instrumentation initialized.", registry=RELAY_METRICS_REGISTRY),
+    lambda: Gauge("tokenplace_instrumentation_up", "Whether relay metrics instrumentation initialized.", multiprocess_mode="livemostrecent", registry=RELAY_METRICS_REGISTRY),
 )
 
 
@@ -655,17 +656,6 @@ def _terminal_outcome_from_status_reason(status: str, reason: str | None) -> str
     if status == "cancelled":
         return "cancelled"
     return "failed"
-
-
-def _metrics_token_is_valid() -> bool:
-    token = os.environ.get("TOKENPLACE_METRICS_TOKEN", "")
-    if not token:
-        return True
-    header = request.headers.get("Authorization", "")
-    prefix = "Bearer "
-    if not header.startswith(prefix):
-        return False
-    return secrets.compare_digest(header[len(prefix):], token)
 
 
 def _update_runtime_gauges() -> None:
@@ -1210,7 +1200,9 @@ def _log_request(response: Response):
     try:
         if route != "/metrics":
             method = _normalise_http_method(request.method)
-            REQUEST_COUNTER.labels(method, route, status_class).inc()
+            # Preserve the established relay metric contract for existing
+            # dashboards; the new HTTP metric carries normalized labels.
+            REQUEST_COUNTER.labels(method, endpoint, status_code).inc()
             HTTP_REQUESTS_TOTAL.labels(method, route, status_class, provider_mode, outcome).inc()
     except Exception:  # pragma: no cover - defensive metric increment
         LOGGER.debug(
@@ -1260,7 +1252,11 @@ def _log_request(response: Response):
 @app.route("/metrics", methods=["GET"])
 def metrics():
     try:
-        payload = generate_latest(RELAY_METRICS_REGISTRY)
+        registry = RELAY_METRICS_REGISTRY
+        if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+            registry = CollectorRegistry()
+            multiprocess.MultiProcessCollector(registry)
+        payload = generate_latest(registry)
     except Exception:
         LOGGER.error("metrics.serialize_failed", extra={"reason": "serialize_failed"})
         return Response("metrics unavailable\n", status=503, mimetype="text/plain")

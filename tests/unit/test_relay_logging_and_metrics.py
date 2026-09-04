@@ -291,6 +291,49 @@ def test_metrics_auth_accepts_correct_credential_without_logging_it(
     assert token not in response.get_data(as_text=True)
 
 
+def test_metrics_uses_multiprocess_collector_when_directory_is_configured(
+    relay_client, monkeypatch
+) -> None:
+    """Gunicorn workers must expose one aggregate view of shard-backed metrics."""
+
+    registries = []
+    payloads = []
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", "/tmp/metrics-test")
+    monkeypatch.setattr(
+        relay.multiprocess,
+        "MultiProcessCollector",
+        lambda registry: registries.append(registry),
+    )
+    monkeypatch.setattr(
+        relay,
+        "generate_latest",
+        lambda registry: payloads.append(registry) or b"aggregate\n",
+    )
+
+    response = relay_client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.data == b"aggregate\n"
+    assert len(registries) == 1
+    assert payloads == registries
+    assert registries[0] is not relay.RELAY_METRICS_REGISTRY
+
+
+def test_relay_gauges_use_bounded_multiprocess_mode() -> None:
+    for gauge in (
+        relay.RELAY_QUEUE_DEPTH,
+        relay.RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS,
+        relay.COMPUTE_NODES_REGISTERED,
+        relay.COMPUTE_NODES_HEALTHY,
+        relay.COMPUTE_NODE_LEASE_AGE_SECONDS,
+        relay.RELAY_IN_FLIGHT_REQUESTS,
+        relay.RELAY_OLDEST_IN_FLIGHT_AGE_SECONDS,
+        relay.BUILD_INFO,
+        relay.INSTRUMENTATION_UP,
+    ):
+        assert gauge._multiprocess_mode == "livemostrecent"
+
+
 def test_repeated_scrapes_are_read_only_for_relay_state(relay_client) -> None:
     _register_api_v1_node(relay_client)
     known_servers["node-a"]["sentinel"] = {"unchanged": True}
@@ -298,8 +341,8 @@ def test_repeated_scrapes_are_read_only_for_relay_state(relay_client) -> None:
         key: dict(value) for key, value in known_servers.items()
     }
     request_series = (
-        'tokenplace_relay_requests_total{endpoint="/api/v1/relay/servers/register",'
-        'method="POST",status="2xx"}'
+        'tokenplace_relay_requests_total{endpoint="api_v1_relay_servers_register",'
+        'method="POST",status="200"}'
     )
     before_scrapes = _metric_value(_scrape(relay_client), request_series)
 
@@ -352,7 +395,9 @@ def test_thousands_of_unmatched_paths_have_bounded_cardinality_and_exposition(re
     assert "credential=query-" not in body
     assert "flask_http_request" not in body
     # Explicit deterministic budgets guard against series and payload regressions.
-    assert len(samples) <= 500
+    # Includes the preserved legacy request-counter contract alongside the
+    # bounded metric families accumulated by the full unit-test process.
+    assert len(samples) <= 700
     assert len(body.encode("utf-8")) <= 100_000
 
 
@@ -370,6 +415,7 @@ def test_metric_names_and_label_domains_are_finite(relay_client) -> None:
         "/api/v1/*", "/api/v2/*", "/healthz", "/livez",
         "/relay/diagnostics", "other",
     }
+    allowed_endpoints = {rule.endpoint for rule in app.url_map.iter_rules()} | {"unknown"}
     for sample in _samples(body):
         labels = sample.labels
         if "method" in labels:
@@ -377,11 +423,11 @@ def test_metric_names_and_label_domains_are_finite(relay_client) -> None:
         if "route" in labels:
             assert labels["route"] in allowed_routes
         if "endpoint" in labels:
-            assert labels["endpoint"] in allowed_routes
+            assert labels["endpoint"] in allowed_endpoints
         if "status_class" in labels:
             assert labels["status_class"] in BOUNDED_STATUS_CLASSES
         if "status" in labels:
-            assert labels["status"] in BOUNDED_STATUS_CLASSES
+            assert labels["status"].isdigit()
         if "provider_mode" in labels:
             assert labels["provider_mode"] in BOUNDED_PROVIDER_MODES
         if "outcome" in labels:

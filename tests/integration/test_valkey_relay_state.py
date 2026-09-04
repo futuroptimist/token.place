@@ -3000,11 +3000,27 @@ def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_s
         accepted = second.accept_encrypted_response(
             node, owner, consumer, *identity, claim.generation, response
         )
+        node_digest = first._node_digest(node)
+        first._foundation._client.delete(
+            first._foundation.config.key("node", node_digest)
+        )
+        first._foundation._client.zrem(
+            first._foundation.config.key("nodes:lease"), node_digest
+        )
         replay = first.accept_encrypted_response(
             node, owner, consumer, *identity, claim.generation, response
         )
         assert accepted.new_outcome is True
         assert dataclasses.replace(accepted, new_outcome=False) == replay
+        with pytest.raises(RelayStateConflict, match="response lifecycle conflict"):
+            first.accept_encrypted_response(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claim.generation,
+                dataclasses.replace(response, ciphertext="different-ciphertext"),
+            )
         assert len(first.response_records()) == len(first.terminal_records()) == 1
         assert first.response_records()[0].envelope == response
         assert first.terminal_records()[0].acknowledgement_digest == (
@@ -3015,6 +3031,115 @@ def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_s
         _delete_claim_fixture_state(first, (node,), (identity,))
         first.close()
         second.close()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "client",
+        "request",
+        "client_public_key",
+        "request_id",
+        "node_id",
+        "consumer_digest",
+        "generation",
+        "envelope",
+        "accepted_at_epoch",
+        "response_digest",
+        "replay_expires_at_epoch",
+        "status",
+        "response_expiry_score",
+        "response_expiry_member",
+        "oversized_client_public_key",
+        "oversized_node_id",
+        "oversized_envelope",
+    ),
+)
+def test_encrypted_response_retained_retry_validates_complete_paired_authority(
+    valkey_server, corruption
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=300,
+        terminal_retention_seconds=600,
+    )
+    node, owner, consumer = "retained-node", _digest("retained-owner"), "consumer"
+    identity = ("retained-client", "retained-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    response_key = cfg.key("response", client, request)
+    response_expiries = cfg.key("responses:expiry")
+    datastore = store._foundation._client
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+
+        if corruption == "response_expiry_score":
+            datastore.zincrby(response_expiries, 1, member)
+        elif corruption == "response_expiry_member":
+            score = datastore.zscore(response_expiries, member)
+            datastore.zrem(response_expiries, member)
+            datastore.zadd(response_expiries, {f"{client}:{'0' * 64}": score})
+        else:
+            field = corruption.removeprefix("oversized_")
+            replacements = {
+                "client": "0" * 64,
+                "request": "0" * 64,
+                "client_public_key": "different-client",
+                "request_id": "different-request",
+                "node_id": "different-node",
+                "consumer_digest": "0" * 64,
+                "generation": str(claim.generation + 1),
+                "envelope": b"different-envelope",
+                "accepted_at_epoch": "1",
+                "response_digest": "0" * 64,
+                "replay_expires_at_epoch": "1",
+                "status": "different-status",
+            }
+            replacement = replacements.get(field)
+            if corruption.startswith("oversized_"):
+                bound = (
+                    store.config.max_response_envelope_bytes
+                    if field == "envelope"
+                    else store.config.max_node_id_bytes
+                    if field == "node_id"
+                    else store.config.max_identity_bytes
+                )
+                replacement = b"x" * (bound + 1)
+            datastore.hset(response_key, field, replacement)
+
+        snapshot = (
+            datastore.hgetall(response_key),
+            datastore.hgetall(cfg.key("terminal", client, request)),
+            datastore.hgetall(cfg.key("request", client, request)),
+            datastore.zrange(response_expiries, 0, -1, withscores=True),
+            datastore.zrange(cfg.key("terminals:expiry"), 0, -1, withscores=True),
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, envelope
+            )
+        assert snapshot == (
+            datastore.hgetall(response_key),
+            datastore.hgetall(cfg.key("terminal", client, request)),
+            datastore.hgetall(cfg.key("request", client, request)),
+            datastore.zrange(response_expiries, 0, -1, withscores=True),
+            datastore.zrange(cfg.key("terminals:expiry"), 0, -1, withscores=True),
+        )
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
 
 
 def test_encrypted_response_rejects_stale_preflight_without_mutation(valkey_server):

@@ -81,7 +81,7 @@ def test_response_serialization_is_canonical_sorted_utf8():
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "23ad81f810994e5853d6abc32d2685f29b6e5c4ca7eb71916652d13967bc8b9c"  # pragma: allowlist secret
+    expected_digest = "4e15b6d3aafd367ca338f8a1814e5a1b5375df8f026e61db9e1c07e1b2adf929"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -105,6 +105,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     assert ACCEPT_RESPONSE_SCRIPT.source.index("for i=1,#members,2 do") < (
         ACCEPT_RESPONSE_SCRIPT.source.index("if entries>=limit then return false end")
     )
+    assert "local response_values=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')" in ACCEPT_RESPONSE_SCRIPT.source
 
 
 def config(**changes):

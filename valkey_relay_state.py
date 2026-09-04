@@ -1395,11 +1395,24 @@ if tp>0 then
   local response_exists=redis.call('EXISTS',response)
   if not terminal_score or terminal_score~=expires or expires<replay or terminal_score<=now then return {'schema'} end
   if tv[3]=='response_ready' then
-    local response_replay=finite(redis.call('HGET',response,'replay_expires_at_epoch'))
-    local stored_digest=redis.call('HGET',response,'response_digest')
-    if response_exists~=1 or not response_score or response_score~=replay or response_replay~=replay or stored_digest~=tv[8] then return {'schema'} end
+    local response_values=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')
+    local response_generation=integer(response_values[7]); local response_accepted=finite(response_values[9]); local response_replay=finite(response_values[11])
+    if response_exists~=1 or not response_score or response_score~=replay or
+       response_values[1]~=client or response_values[2]~=request_digest or
+       response_values[3]~=client_public_key or response_values[4]~=request_id or
+       string.len(response_values[3] or '')<1 or string.len(response_values[3] or '')>max_identity or
+       string.len(response_values[4] or '')<1 or string.len(response_values[4] or '')>max_identity or
+       string.len(response_values[5] or '')<1 or string.len(response_values[5] or '')>max_node_id or
+       not digest(response_values[6]) or not response_generation or
+       string.len(response_values[8] or '')<1 or string.len(response_values[8] or '')>max_envelope or not response_accepted or not response_replay or
+       response_replay<response_accepted or response_values[12]~='response_ready' or
+       response_values[5]~=tv[4] or response_values[6]~=tv[6] or response_values[7]~=tv[7] or
+       response_values[9]~=tv[9] or response_values[10]~=tv[8] or response_values[11]~=tv[10] then return {'schema'} end
+    if tv[4]==node_id and tv[5]==owner and tv[6]==consumer and tostring(g)==generation and tv[8]==response_digest then
+      if response_values[8]~=envelope then return {'schema'} end
+      return {'existing',tostring(g),tv[9],tv[10]}
+    end
   elseif response_exists~=0 or response_score then return {'schema'} end
-  if tv[4]==node_id and tv[5]==owner and tv[6]==consumer and tostring(g)==generation and tv[8]==response_digest then return {'existing',tostring(g),tv[9],tv[10]} end
   return {'conflict'}
 end
 local response_indexed=redis.call('ZSCORE',response_expiries,client..':'..request_digest)
@@ -1473,7 +1486,7 @@ return {'accepted',generation,accepted_value,replay_value}
 ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     "accept_encrypted_response_v1",
     ACCEPT_RESPONSE_SOURCE,
-    "23ad81f810994e5853d6abc32d2685f29b6e5c4ca7eb71916652d13967bc8b9c",  # pragma: allowlist secret
+    "4e15b6d3aafd367ca338f8a1814e5a1b5375df8f026e61db9e1c07e1b2adf929",  # pragma: allowlist secret
     True,
 )
 

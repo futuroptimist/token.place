@@ -2984,6 +2984,15 @@ class ValkeyRegistrationStore:
                     value = self._completed_hash(key, fields, limits)
                     if value is None:
                         raise ValueError
+                    primary_exists, primary_score = self._completed_primary_authority(
+                        key, index, raw_member
+                    )
+                    if (
+                        primary_exists != 1
+                        or primary_score is None
+                        or float(primary_score) != float(raw_score)
+                    ):
+                        raise ValueError
                     generation = int(value[b"generation"])
                     accepted = float(value[b"accepted_at_epoch"])
                     replay = float(value[b"replay_expires_at_epoch"])
@@ -3190,6 +3199,15 @@ class ValkeyRegistrationStore:
                     value = self._validated_terminal(
                         cfg, client, request, now, require_live=True
                     )
+                    primary_exists, primary_score = self._completed_primary_authority(
+                        key, index, raw_member
+                    )
+                    if (
+                        primary_exists != 1
+                        or primary_score is None
+                        or float(primary_score) != float(raw_score)
+                    ):
+                        raise ValueError
                     if float(raw_score) != float(value[b"expires_at_epoch"]):
                         raise ValueError
                     lifecycle = self._completed_lifecycle(cfg, client, request)

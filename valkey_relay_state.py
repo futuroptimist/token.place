@@ -1,16 +1,17 @@
-"""Internal Valkey connection, schema, key, and reviewed-script primitives.
+"""Internal Valkey relay-state transitions and reviewed-script primitives.
 
-This foundation intentionally implements no relay lifecycle operation and is not
-imported by :mod:`relay`.
+This incomplete backend is intentionally not imported by :mod:`relay`.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import re
 import secrets
+import struct
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -25,6 +26,7 @@ from relay_state_store import (
     ComputeNodeCapabilities,
     ComputeNodeRegistration,
     EncryptedRequestEnvelope,
+    EncryptedResponseEnvelope,
     EnqueueResult,
     ClaimRecord,
     ClaimResult,
@@ -37,9 +39,12 @@ from relay_state_store import (
     RelayStateNoCapacity,
     RelayStateStoreConfig,
     RelayStateStoreError,
+    ResponseAcceptanceResult,
+    ResponseRecord,
     ReservationRecord,
     SchedulerNodeState,
     SelectionResult,
+    TerminalOutcomeRecord,
 )
 
 _NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
@@ -1284,6 +1289,238 @@ RENEW_CLAIM_SCRIPT = ReviewedScript(
     True,
 )
 
+ACCEPT_RESPONSE_SOURCE = """\
+local leases,node,queue,claim,request,claim_expiries,deadlines,response,response_expiries,terminal,terminal_expiries,progress=unpack(KEYS)
+local prefix,node_digest,node_id,owner,consumer,client,request_digest,generation,envelope,response_digest,accepted_value,ack_digest=unpack(ARGV)
+local replay_ttl,terminal_ttl,max_responses,max_client_responses,max_terminals,max_client_terminals,cleanup_bound,max_envelope=tonumber(ARGV[13]),tonumber(ARGV[14]),tonumber(ARGV[15]),tonumber(ARGV[16]),tonumber(ARGV[17]),tonumber(ARGV[18]),tonumber(ARGV[19]),tonumber(ARGV[20])
+local client_public_key,request_id=ARGV[21],ARGV[22]
+local max_node_id,max_identity,max_request_envelope=tonumber(ARGV[24]),tonumber(ARGV[25]),tonumber(ARGV[26])
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local function finite(value) local n=tonumber(value); return n and n==n and math.abs(n)~=math.huge and n end
+local function digest(value) return value and string.len(value)==64 and not string.find(value,'[^0-9a-f]') end
+local function integer(value) local n=finite(value); return n and n>=1 and n<=9007199254740990 and n%1==0 and tostring(n)==value and n end
+local function due_members(index)
+  local due=redis.call('ZRANGEBYSCORE',index,'-inf',now,'LIMIT',0,cleanup_bound)
+  for _,member in ipairs(due) do
+    local sep=string.find(member,':',1,true)
+    local c=sep and string.sub(member,1,sep-1)
+    local q=sep and string.sub(member,sep+1)
+    if not digest(c) or not digest(q) then return nil end
+  end
+  return due
+end
+local function validate_response_due(due)
+  for _,member in ipairs(due) do
+    local sep=string.find(member,':',1,true)
+    local c,q=string.sub(member,1,sep-1),string.sub(member,sep+1)
+    local rk=prefix..'response:'..c..':'..q
+    local tk=prefix..'terminal:'..c..':'..q
+    local lk=prefix..'request:'..c..':'..q
+    local rv=redis.call('HMGET',rk,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')
+    local tv=redis.call('HMGET',tk,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
+    local lv=redis.call('HMGET',lk,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest','envelope')
+    local score=finite(redis.call('ZSCORE',response_expiries,member))
+    local terminal_score=finite(redis.call('ZSCORE',terminal_expiries,member))
+    local accepted=finite(rv[9]); local expiry=finite(rv[11]); local terminal_expiry=finite(tv[11])
+    if not score or not expiry or not accepted or accepted<0 or accepted>now or score~=expiry or expiry>now or expiry<accepted or
+       redis.call('EXISTS',rk)~=1 or rv[1]~=c or rv[2]~=q or
+       string.len(rv[3] or '')<1 or string.len(rv[3] or '')>max_identity or
+       string.len(rv[4] or '')<1 or string.len(rv[4] or '')>max_identity or
+       string.len(rv[5] or '')<1 or string.len(rv[5] or '')>max_node_id or not digest(rv[6]) or
+       not integer(rv[7]) or string.len(rv[8] or '')<1 or string.len(rv[8] or '')>max_envelope or
+       not digest(rv[10]) or rv[12]~='response_ready' then return false end
+    if redis.call('EXISTS',tk)~=1 or tv[1]~='completed' or tv[2]~='response_completed' or
+       tv[3]~='response_ready' or tv[4]~=rv[5] or string.len(tv[4] or '')<1 or string.len(tv[4] or '')>max_node_id or
+       not digest(tv[5]) or tv[6]~=rv[6] or tv[7]~=rv[7] or tv[8]~=rv[10] or
+       finite(tv[9])~=accepted or finite(tv[10])~=expiry or not terminal_expiry or
+       terminal_expiry<expiry or not terminal_score or terminal_score~=terminal_expiry or
+       not digest(tv[12]) or not digest(tv[13]) or not digest(tv[14]) or tv[15]~=c or tv[16]~=q then return false end
+    local deadline=finite(lv[8])
+    if redis.call('EXISTS',lk)~=1 or lv[1]~='response_ready' or lv[2]~=c or lv[3]~=q or
+       lv[4]~=rv[3] or lv[5]~=rv[4] or lv[6]~=rv[5] or not digest(lv[7]) or
+       not deadline or deadline<accepted or not integer(lv[9]) or lv[10]~=rv[7] or
+       lv[11]~=lv[9]..'-0' or not digest(lv[12]) or not digest(lv[13]) or
+       tv[12]~=lv[12] or tv[14]~=lv[13] or
+       string.len(lv[14] or '')<1 or string.len(lv[14] or '')>max_request_envelope or string.len(lv[4] or '')>max_identity or
+       string.len(lv[5] or '')>max_identity or string.len(lv[6] or '')>max_node_id then return false end
+  end
+  return true
+end
+local function contains(values,target)
+  for _,value in ipairs(values) do if value==target then return true end end
+  return false
+end
+local function validate_terminal_due(due,response_due)
+  for _,member in ipairs(due) do
+    local sep=string.find(member,':',1,true)
+    local c,q=string.sub(member,1,sep-1),string.sub(member,sep+1)
+    local tk=prefix..'terminal:'..c..':'..q
+    local lk=prefix..'request:'..c..':'..q
+    local tv=redis.call('HMGET',tk,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
+    local lv=redis.call('HMGET',lk,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest','envelope')
+    local score=finite(redis.call('ZSCORE',terminal_expiries,member))
+    local accepted=finite(tv[9]); local replay=finite(tv[10]); local expiry=finite(tv[11])
+    if not score or not accepted or not replay or not expiry or score~=expiry or expiry>now or
+       accepted<0 or accepted>now or replay<accepted or expiry<replay or redis.call('EXISTS',tk)~=1 or
+       tv[1]~='completed' or tv[2]~='response_completed' or (tv[3]~='response_ready' and tv[3]~='retrieval_expired') or
+       string.len(tv[4] or '')<1 or string.len(tv[4] or '')>max_node_id or not digest(tv[5]) or
+       not digest(tv[6]) or not integer(tv[7]) or not digest(tv[8]) or not digest(tv[12]) or
+       not digest(tv[13]) or not digest(tv[14]) or tv[15]~=c or tv[16]~=q then return false end
+    local deadline=finite(lv[8])
+    if redis.call('EXISTS',lk)~=1 or lv[1]~='response_ready' or lv[2]~=c or lv[3]~=q or
+       string.len(lv[4] or '')<1 or string.len(lv[4] or '')>max_identity or
+       string.len(lv[5] or '')<1 or string.len(lv[5] or '')>max_identity or lv[6]~=tv[4] or
+       string.len(lv[6] or '')>max_node_id or not digest(lv[7]) or not deadline or deadline<accepted or
+       not integer(lv[9]) or lv[10]~=tv[7] or lv[11]~=lv[9]..'-0' or
+       not digest(lv[12]) or not digest(lv[13]) or tv[12]~=lv[12] or tv[14]~=lv[13] or
+       string.len(lv[14] or '')<1 or
+       string.len(lv[14] or '')>max_request_envelope then return false end
+    local response_exists=redis.call('EXISTS',prefix..'response:'..c..':'..q)
+    local response_score=redis.call('ZSCORE',response_expiries,member)
+    if tv[3]=='retrieval_expired' and (response_exists~=0 or response_score) then return false end
+    if tv[3]=='response_ready' and (response_exists~=1 or not response_score or not contains(response_due,member)) then return false end
+  end
+  return true
+end
+local function reap(response_due,terminal_due)
+  for _,member in ipairs(response_due) do
+    local sep=string.find(member,':',1,true)
+    local c,q=string.sub(member,1,sep-1),string.sub(member,sep+1)
+    redis.call('DEL',prefix..'response:'..c..':'..q)
+    redis.call('ZREM',response_expiries,member)
+    redis.call('HSET',prefix..'terminal:'..c..':'..q,'retrieval_state','retrieval_expired')
+  end
+  for _,member in ipairs(terminal_due) do
+    local sep=string.find(member,':',1,true)
+    local c,q=string.sub(member,1,sep-1),string.sub(member,sep+1)
+    redis.call('DEL',prefix..'terminal:'..c..':'..q)
+    redis.call('ZREM',terminal_expiries,member)
+    redis.call('DEL',prefix..'request:'..c..':'..q)
+  end
+end
+local function cleanup()
+  local response_due=due_members(response_expiries); local terminal_due=due_members(terminal_expiries)
+  if not response_due or not terminal_due or not validate_response_due(response_due) or not validate_terminal_due(terminal_due,response_due) then return false end
+  reap(response_due,terminal_due)
+  return true
+end
+if ARGV[23]=='cleanup' then
+  if not cleanup() then return {'schema'} end
+  return {'cleaned'}
+end
+if not digest(node_digest) or not digest(owner) or not digest(consumer) or not digest(client) or not digest(request_digest) or not digest(response_digest) or not digest(ack_digest) or not integer(generation) or string.len(envelope)>max_envelope then return {'schema'} end
+local accepted=finite(accepted_value)
+if not accepted or accepted<0 or accepted>now then return {'malformed'} end
+local replay=finite(accepted+replay_ttl); local terminal_expiry=finite(accepted+terminal_ttl)
+if not replay or not terminal_expiry or replay<=now or terminal_expiry<=now then return {'malformed'} end
+if not cleanup() then return {'schema'} end
+local tv=redis.call('HMGET',terminal,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
+local tp=0 for i=1,#tv do if tv[i] then tp=tp+1 end end
+local terminal_exists=redis.call('EXISTS',terminal)
+if terminal_exists~=0 or tp>0 then
+  if terminal_exists~=1 or tp~=#tv then return {'schema'} end
+  local g=integer(tv[7]); local a=finite(tv[9]); local replay=finite(tv[10]); local expires=finite(tv[11])
+  if tv[1]~='completed' or tv[2]~='response_completed' or (tv[3]~='response_ready' and tv[3]~='retrieval_expired') or not g or not a or not replay or not expires or replay<a or expires<a or not digest(tv[5]) or not digest(tv[6]) or not digest(tv[8]) or not digest(tv[12]) or not digest(tv[13]) or not digest(tv[14]) or tv[15]~=client or tv[16]~=request_digest then return {'schema'} end
+  if string.len(tv[4] or '')<1 or string.len(tv[4] or '')>max_node_id or a<0 or a>now then return {'schema'} end
+  local member=client..':'..request_digest
+  local terminal_score=finite(redis.call('ZSCORE',terminal_expiries,member))
+  local response_score=finite(redis.call('ZSCORE',response_expiries,member))
+  local response_exists=redis.call('EXISTS',response)
+  if not terminal_score or terminal_score~=expires or expires<replay or terminal_score<=now then return {'schema'} end
+  if tv[3]=='response_ready' then
+    local response_values=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')
+    local response_generation=integer(response_values[7]); local response_accepted=finite(response_values[9]); local response_replay=finite(response_values[11])
+    if response_exists~=1 or not response_score or response_score~=replay or
+       response_values[1]~=client or response_values[2]~=request_digest or
+       response_values[3]~=client_public_key or response_values[4]~=request_id or
+       string.len(response_values[3] or '')<1 or string.len(response_values[3] or '')>max_identity or
+       string.len(response_values[4] or '')<1 or string.len(response_values[4] or '')>max_identity or
+       string.len(response_values[5] or '')<1 or string.len(response_values[5] or '')>max_node_id or
+       not digest(response_values[6]) or not response_generation or
+       string.len(response_values[8] or '')<1 or string.len(response_values[8] or '')>max_envelope or not response_accepted or not response_replay or
+       response_replay<response_accepted or response_values[12]~='response_ready' or
+       response_values[5]~=tv[4] or response_values[6]~=tv[6] or response_values[7]~=tv[7] or
+       response_values[9]~=tv[9] or response_values[10]~=tv[8] or response_values[11]~=tv[10] then return {'schema'} end
+    if tv[4]==node_id and tv[5]==owner and tv[6]==consumer and tostring(g)==generation and tv[8]==response_digest and response_values[8]~=envelope then return {'schema'} end
+  elseif response_exists~=0 or response_score then return {'schema'} end
+  if tv[4]==node_id and tv[5]==owner and tv[6]==consumer and tostring(g)==generation and tv[8]==response_digest then return {'existing',tostring(g),tv[9],tv[10]} end
+  return {'conflict'}
+end
+local response_indexed=redis.call('ZSCORE',response_expiries,client..':'..request_digest)
+local terminal_indexed=redis.call('ZSCORE',terminal_expiries,client..':'..request_digest)
+if redis.call('EXISTS',response)~=0 or response_indexed or terminal_indexed then return {'schema'} end
+local indexed_lease=finite(redis.call('ZSCORE',leases,node_digest)); local nv=redis.call('HMGET',node,'node_id','control_credential_digest','lease_expires_at_epoch')
+if not indexed_lease or not nv[1] then return {'owner'} end
+if not nv[2] or not nv[3] or finite(nv[3])~=indexed_lease then return {'schema'} end
+if indexed_lease<=now or nv[1]~=node_id or nv[2]~=owner then return {'owner'} end
+local cv=redis.call('HMGET',claim,'client','request','node_digest','node_id','owner_digest','consumer_digest','deadline','sequence','generation','lease_expires')
+for i=1,#cv do if not cv[i] then return {'missing'} end end
+local deadline=finite(cv[7]); local sequence=integer(cv[8]); local current=integer(cv[9]); local claim_expiry=finite(cv[10]); local member=client..':'..request_digest
+if not deadline or not sequence or not current or not claim_expiry or finite(redis.call('ZSCORE',claim_expiries,member))~=claim_expiry then return {'schema'} end
+if tostring(current)~=generation then return {'stale',tostring(current)} end
+if cv[1]~=client or cv[2]~=request_digest or cv[3]~=node_digest or cv[4]~=node_id or cv[5]~=owner or cv[6]~=consumer then return {'owner'} end
+if claim_expiry<=now or deadline<=now then return {'missing'} end
+local rv=redis.call('HMGET',request,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest','envelope')
+for i=1,#rv do if not rv[i] then return {'schema'} end end
+if rv[1]~='claimed' or rv[2]~=client or rv[3]~=request_digest or rv[4]~=client_public_key or rv[5]~=request_id or rv[6]~=node_id or rv[7]~=node_digest or finite(rv[8])~=deadline or integer(rv[9])~=sequence or integer(rv[10])~=current or rv[11]~=tostring(sequence)..'-0' or not digest(rv[12]) or not digest(rv[13]) or string.len(rv[4])<1 or string.len(rv[4])>max_identity or
+   string.len(rv[5])<1 or string.len(rv[5])>max_identity or string.len(rv[6])<1 or string.len(rv[6])>max_node_id or
+   string.len(rv[14])<1 or finite(redis.call('ZSCORE',deadlines,member))~=deadline or claim_expiry>deadline then return {'schema'} end
+local stream=redis.call('XRANGE',queue,rv[11],rv[11],'COUNT',1)
+if #stream~=1 or stream[1][1]~=rv[11] or #stream[1][2]~=4 or stream[1][2][1]~='client' or stream[1][2][2]~=client or stream[1][2][3]~='request' or stream[1][2][4]~=request_digest then return {'schema'} end
+local function bounded(index,kind,limit,per_limit)
+  local members=redis.call('ZRANGE',index,0,limit,'WITHSCORES')
+  if #members%2~=0 then return nil end
+  local entries=#members/2
+  local count=0
+  for i=1,#members,2 do
+    local m,score_value=members[i],finite(members[i+1])
+    local sep=string.find(m,':',1,true)
+    local c=sep and string.sub(m,1,sep-1); local q=sep and string.sub(m,sep+1)
+    if not digest(c) or not digest(q) or not score_value then return nil end
+    local key=prefix..kind..':'..c..':'..q
+    if kind=='response' then
+      local values=redis.call('HMGET',key,'client','request','response_digest','accepted_at_epoch','replay_expires_at_epoch','status')
+      local accepted_at=finite(values[4]); local stored=finite(values[5])
+      local terminal_values=redis.call('HMGET',prefix..'terminal:'..c..':'..q,'outcome','retrieval_state','response_digest','replay_expires_at_epoch')
+      if values[1]~=c or values[2]~=q or not digest(values[3]) or not accepted_at or not stored or
+         stored<accepted_at or stored~=score_value or values[6]~='response_ready' or
+         terminal_values[1]~='completed' or terminal_values[2]~='response_ready' or
+         terminal_values[3]~=values[3] or finite(terminal_values[4])~=stored then return nil end
+    else
+      local values=redis.call('HMGET',key,'client','request','outcome','reason','retrieval_state','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch')
+      local accepted_at=finite(values[7]); local replay_at=finite(values[8]); local stored=finite(values[9])
+      if values[1]~=c or values[2]~=q or values[3]~='completed' or values[4]~='response_completed' or
+         (values[5]~='response_ready' and values[5]~='retrieval_expired') or not digest(values[6]) or
+         not accepted_at or not replay_at or not stored or replay_at<accepted_at or stored<replay_at or stored~=score_value then return nil end
+      local response_exists=redis.call('EXISTS',prefix..'response:'..c..':'..q)
+      if (values[5]=='response_ready' and response_exists~=1) or (values[5]=='retrieval_expired' and response_exists~=0) then return nil end
+    end
+    if c==client then count=count+1 end
+  end
+  if entries>=limit then return false end
+  if count>=per_limit then return false end
+  return true
+end
+local response_capacity=bounded(response_expiries,'response',max_responses,max_client_responses)
+local terminal_capacity=bounded(terminal_expiries,'terminal',max_terminals,max_client_terminals)
+if response_capacity==nil or terminal_capacity==nil then return {'schema'} end
+if not response_capacity or not terminal_capacity then return {'capacity'} end
+local replay_value=string.format('%.17g',replay); local terminal_value=string.format('%.17g',terminal_expiry)
+redis.call('HSET',response,'client',client,'request',request_digest,'client_public_key',client_public_key,'request_id',request_id,'node_id',node_id,'consumer_digest',consumer,'generation',generation,'envelope',envelope,'accepted_at_epoch',accepted_value,'response_digest',response_digest,'replay_expires_at_epoch',replay_value,'status','response_ready')
+redis.call('ZADD',response_expiries,replay_value,member)
+redis.call('HSET',terminal,'client',client,'request',request_digest,'outcome','completed','reason','response_completed','retrieval_state','response_ready','node_id',node_id,'owner_digest',owner,'consumer_digest',consumer,'generation',generation,'response_digest',response_digest,'accepted_at_epoch',accepted_value,'replay_expires_at_epoch',replay_value,'expires_at_epoch',terminal_value,'retrieval_credential_digest',rv[12],'acknowledgement_digest',ack_digest,'cancellation_token_digest',rv[13])
+redis.call('ZADD',terminal_expiries,terminal_value,member)
+redis.call('XDEL',queue,rv[11]); redis.call('DEL',claim); redis.call('ZREM',claim_expiries,member); redis.call('ZREM',deadlines,member); redis.call('DEL',progress)
+redis.call('HSET',request,'state','response_ready')
+return {'accepted',generation,accepted_value,replay_value}
+"""
+ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
+    "accept_encrypted_response_v1",
+    ACCEPT_RESPONSE_SOURCE,
+    "3559da1040624e6ac52d933a3d116c680d0398243ca4c68b308d0e1c4e10ecd8",  # pragma: allowlist secret
+    True,
+)
+
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
     {
         SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT,
@@ -1293,6 +1530,7 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         ENQUEUE_SCRIPT.name: ENQUEUE_SCRIPT,
         CLAIM_SCRIPT.name: CLAIM_SCRIPT,
         RENEW_CLAIM_SCRIPT.name: RENEW_CLAIM_SCRIPT,
+        ACCEPT_RESPONSE_SCRIPT.name: ACCEPT_RESPONSE_SCRIPT,
     }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
@@ -1544,21 +1782,28 @@ class ValkeyFoundation:
 
 
 class ValkeyRegistrationStore:
-    """Internal Valkey implementation through reservation and encrypted enqueue.
+    """Internal Valkey implementation through encrypted-response acceptance.
 
     This deliberately does not implement or advertise ``RelayStateStore``: the
     remaining coordination transitions must exist before runtime selection is safe.
     """
 
     def __init__(
-        self, foundation: ValkeyFoundation, config: RelayStateStoreConfig
+        self,
+        foundation: ValkeyFoundation,
+        config: RelayStateStoreConfig,
+        *,
+        acknowledgement_key: bytes,
     ) -> None:
+        if type(acknowledgement_key) is not bytes or len(acknowledgement_key) < 32:
+            raise RelayStateStoreError("acknowledgement key is invalid")
         if not isinstance(foundation, ValkeyFoundation) or not isinstance(
             config, RelayStateStoreConfig
         ):
             raise RelayStateStoreError("invalid Valkey registration configuration")
         self._foundation = foundation
         self._config = config
+        self._acknowledgement_key = memoryview(acknowledgement_key).tobytes()
 
     def __repr__(self) -> str:
         return "ValkeyRegistrationStore(<redacted>)"
@@ -2317,6 +2562,820 @@ class ValkeyRegistrationStore:
             generation,
         )
 
+    @staticmethod
+    def _serialized_response_envelope(envelope: EncryptedResponseEnvelope) -> bytes:
+        return json.dumps(
+            {
+                "protocol": envelope.protocol,
+                "version": envelope.version,
+                "ciphertext": envelope.ciphertext,
+                "cipherkey": envelope.cipherkey,
+                "iv": envelope.iv,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+
+    def accept_encrypted_response(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        envelope: EncryptedResponseEnvelope,
+    ) -> ResponseAcceptanceResult:
+        """Atomically retain one response and its completed terminal authority."""
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        consumer = self._consumer_digest(consumer_identity)
+        client, request = self._identity(client_public_key, request_id)
+        if type(generation) is not int or generation < 1:
+            raise RelayStateStoreError("claim generation is invalid")
+        if type(envelope) is not EncryptedResponseEnvelope:
+            raise RelayStateStoreError(
+                "response envelope must be EncryptedResponseEnvelope"
+            )
+        encoded = self._serialized_response_envelope(envelope)
+        if len(encoded) > self.config.max_response_envelope_bytes:
+            raise RelayStateStoreError(
+                "encrypted response exceeds its configured byte bound"
+            )
+        response_digest = hashlib.sha256(encoded).hexdigest()
+        seconds, micros = self._foundation.server_time()
+        accepted = seconds + micros / 1_000_000
+        message = (
+            b"token.place/relay-response-ack/v1\0"
+            + bytes.fromhex(client)
+            + bytes.fromhex(request)
+            + struct.pack("!d", accepted)
+            + bytes.fromhex(response_digest)
+        )
+        raw_token = hmac.new(
+            self._acknowledgement_key, message, hashlib.sha256
+        ).hexdigest()
+        acknowledgement_digest = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
+        node_digest = self._node_digest(node_id)
+        cfg = self._foundation.config
+        keys = (
+            cfg.key("nodes:lease"),
+            cfg.key("node", node_digest),
+            cfg.key("queue", node_digest),
+            cfg.key("claim", client, request),
+            cfg.key("request", client, request),
+            cfg.key("claims:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("response", client, request),
+            cfg.key("responses:expiry"),
+            cfg.key("terminal", client, request),
+            cfg.key("terminals:expiry"),
+            cfg.key("progress", client, request),
+        )
+        args = (
+            cfg.key_prefix.encode(),
+            node_digest.encode(),
+            node_id.encode(),
+            control_credential_digest.encode(),
+            consumer.encode(),
+            client.encode(),
+            request.encode(),
+            str(generation).encode(),
+            encoded,
+            response_digest.encode(),
+            repr(accepted).encode(),
+            acknowledgement_digest.encode(),
+            repr(float(self.config.response_replay_ttl_seconds)).encode(),
+            repr(float(self.config.terminal_retention_seconds)).encode(),
+            str(self.config.max_responses).encode(),
+            str(self.config.max_responses_per_client).encode(),
+            str(self.config.max_terminal_records).encode(),
+            str(self.config.max_terminal_records_per_client).encode(),
+            str(self.config.node_transition_batch_size).encode(),
+            str(self.config.max_response_envelope_bytes).encode(),
+            client_public_key.encode(),
+            request_id.encode(),
+            b"accept",
+            str(self.config.max_node_id_bytes).encode(),
+            str(self.config.max_identity_bytes).encode(),
+            str(self.config.max_envelope_bytes).encode(),
+        )
+        status, values = self._ascii_status(
+            self._foundation.execute(
+                ACCEPT_RESPONSE_SCRIPT.name,
+                keys,
+                args,
+                max_result_bytes=_CLAIM_RESULT_METADATA_BYTES,
+            )
+        )
+        if status == "owner" and not values:
+            raise RelayStateCredentialMismatch("response owner is invalid")
+        if status in {"missing", "conflict", "malformed"} and not values:
+            raise RelayStateConflict("response lifecycle conflict")
+        if status == "stale" and len(values) == 1:
+            try:
+                current_generation_raw = self._decode_text(values[0])
+                current_generation = int(current_generation_raw)
+                if (
+                    current_generation < 1
+                    or str(current_generation) != current_generation_raw
+                ):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
+            raise RelayStateConflict("response lifecycle conflict")
+        if status == "capacity" and not values:
+            raise RelayStateCapacityExceeded("response lifecycle capacity reached")
+        if status == "schema" and not values:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if status not in {"accepted", "existing"} or len(values) != 3:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            result_generation = int(self._decode_text(values[0]))
+            result_accepted = float(self._decode_text(values[1]))
+            replay = float(self._decode_text(values[2]))
+            if (
+                result_generation < 1
+                or str(result_generation) != self._decode_text(values[0])
+                or not math.isfinite(result_accepted)
+                or not math.isfinite(replay)
+                or result_accepted < 0
+                or replay < result_accepted
+            ):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        return ResponseAcceptanceResult(
+            "response_ready",
+            result_generation,
+            result_accepted,
+            replay,
+            status == "accepted",
+        )
+
+    def _cleanup_completed_records(self) -> None:
+        cfg = self._foundation.config
+        zero = "0" * 64
+        keys = (
+            cfg.key("nodes:lease"),
+            cfg.key("node", zero),
+            cfg.key("queue", zero),
+            cfg.key("claim", zero, zero),
+            cfg.key("request", zero, zero),
+            cfg.key("claims:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("response", zero, zero),
+            cfg.key("responses:expiry"),
+            cfg.key("terminal", zero, zero),
+            cfg.key("terminals:expiry"),
+            cfg.key("progress", zero, zero),
+        )
+        args = (
+            cfg.key_prefix.encode(),
+            *(zero.encode(),) * 6,
+            b"1",
+            b"",
+            zero.encode(),
+            b"0",
+            zero.encode(),
+            repr(float(self.config.response_replay_ttl_seconds)).encode(),
+            repr(float(self.config.terminal_retention_seconds)).encode(),
+            str(self.config.max_responses).encode(),
+            str(self.config.max_responses_per_client).encode(),
+            str(self.config.max_terminal_records).encode(),
+            str(self.config.max_terminal_records_per_client).encode(),
+            str(self.config.node_transition_batch_size).encode(),
+            str(self.config.max_response_envelope_bytes).encode(),
+            b"",
+            b"",
+            b"cleanup",
+            str(self.config.max_node_id_bytes).encode(),
+            str(self.config.max_identity_bytes).encode(),
+            str(self.config.max_envelope_bytes).encode(),
+        )
+        status, values = self._ascii_status(
+            self._foundation.execute(ACCEPT_RESPONSE_SCRIPT.name, keys, args)
+        )
+        if status != "cleaned" or values:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+
+    @staticmethod
+    def _decode_response_envelope(raw: bytes) -> EncryptedResponseEnvelope:
+        try:
+            value = json.loads(raw)
+            if not isinstance(value, dict) or set(value) != {
+                "protocol",
+                "version",
+                "ciphertext",
+                "cipherkey",
+                "iv",
+            }:
+                raise ValueError
+            envelope = EncryptedResponseEnvelope(**value)
+            if ValkeyRegistrationStore._serialized_response_envelope(envelope) != raw:
+                raise ValueError
+            return envelope
+        except (TypeError, ValueError, json.JSONDecodeError, RelayStateStoreError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+
+    def _completed_index_members(self, index: str, now: float, maximum: int) -> list:
+        members = self._foundation._call(
+            self._foundation._client.zrangebyscore,
+            index,
+            f"({now}",
+            "+inf",
+            start=0,
+            num=maximum + 1,
+            withscores=True,
+        )
+        if type(members) is not list or len(members) > maximum:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        for indexed in members:
+            if type(indexed) not in {tuple, list} or len(indexed) != 2:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            member, score = indexed
+            if (
+                type(member) is not bytes
+                or len(member) != 129
+                or member[64:65] != b":"
+                or not re.fullmatch(b"[0-9a-f]{64}:[0-9a-f]{64}", member)
+                or type(score) not in {int, float}
+                or isinstance(score, bool)
+            ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return members
+
+    def _completed_hash(
+        self, key: str, fields: tuple[bytes, ...], limits: dict[bytes, int]
+    ) -> dict[bytes, bytes] | None:
+        values = self._foundation._call(self._foundation._client.hmget, key, fields)
+        if type(values) is not list or len(values) != len(fields):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if all(value is None for value in values):
+            return None
+        if any(type(value) is not bytes for value in values):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if any(
+            len(value) > limits.get(field, _MAX_RESULT_BYTES)
+            for field, value in zip(fields, values)
+        ):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if sum(map(len, values)) > sum(
+            limits.get(field, _MAX_RESULT_BYTES) for field in fields
+        ):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return dict(zip(fields, values))
+
+    def _completed_primary_authority(
+        self, key: str, index: str, member: bytes
+    ) -> tuple[int, float | None]:
+        with self._foundation._client.pipeline(transaction=True) as pipeline:
+            pipeline.exists(key)
+            pipeline.zscore(index, member)
+            result = self._foundation._call(pipeline.execute)
+        if type(result) is not list or len(result) != 2:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        exists, score = result
+        if type(exists) is not int or isinstance(exists, bool) or exists not in {0, 1}:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if score is not None and (
+            type(score) not in {int, float}
+            or isinstance(score, bool)
+            or not math.isfinite(float(score))
+        ):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return exists, score
+
+    @staticmethod
+    def _completed_digest(value: bytes) -> bool:
+        return type(value) is bytes and re.fullmatch(b"[0-9a-f]{64}", value) is not None
+
+    def _completed_lifecycle(
+        self, cfg, client: bytes, request: bytes
+    ) -> dict[bytes, bytes]:
+        fields = (
+            b"state",
+            b"client",
+            b"request",
+            b"client_public_key",
+            b"request_id",
+            b"node_id",
+            b"node_digest",
+            b"deadline",
+            b"sequence",
+            b"claim_generation",
+            b"queue_entry",
+            b"token_digest",
+            b"cancellation_digest",
+            b"envelope",
+        )
+        limits = {field: _MAX_RESULT_BYTES for field in fields}
+        limits.update(
+            {
+                b"client": 64,
+                b"request": 64,
+                b"client_public_key": self.config.max_identity_bytes,
+                b"request_id": self.config.max_identity_bytes,
+                b"node_id": self.config.max_node_id_bytes,
+                b"node_digest": 64,
+                b"deadline": 32,
+                b"sequence": 16,
+                b"claim_generation": 16,
+                b"queue_entry": 32,
+                b"token_digest": 64,
+                b"cancellation_digest": 64,
+                b"envelope": self.config.max_envelope_bytes,
+            }
+        )
+        value = self._completed_hash(
+            cfg.key("request", client.decode(), request.decode()), fields, limits
+        )
+        if value is None:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            deadline = float(value[b"deadline"])
+            sequence = int(value[b"sequence"])
+            generation = int(value[b"claim_generation"])
+            if (
+                value[b"state"] != b"response_ready"
+                or value[b"client"] != client
+                or value[b"request"] != request
+                or not 0
+                < len(value[b"client_public_key"])
+                <= self.config.max_identity_bytes
+                or not 0 < len(value[b"request_id"]) <= self.config.max_identity_bytes
+                or hashlib.sha256(b"client\0" + value[b"client_public_key"])
+                .hexdigest()
+                .encode()
+                != client
+                or hashlib.sha256(b"request\0" + value[b"request_id"])
+                .hexdigest()
+                .encode()
+                != request
+                or not 0 < len(value[b"node_id"]) <= self.config.max_node_id_bytes
+                or not self._completed_digest(value[b"node_digest"])
+                or self._node_digest(value[b"node_id"].decode()).encode()
+                != value[b"node_digest"]
+                or not math.isfinite(deadline)
+                or sequence < 1
+                or str(sequence).encode() != value[b"sequence"]
+                or generation < 1
+                or str(generation).encode() != value[b"claim_generation"]
+                or value[b"queue_entry"] != value[b"sequence"] + b"-0"
+                or not self._completed_digest(value[b"token_digest"])
+                or not self._completed_digest(value[b"cancellation_digest"])
+                or not 0 < len(value[b"envelope"]) <= self.config.max_envelope_bytes
+            ):
+                raise ValueError
+            self._decode_request_envelope(value[b"envelope"])
+        except (TypeError, ValueError, OverflowError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        return value
+
+    def response_records(self) -> tuple[ResponseRecord, ...]:
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        self._foundation.check_write_compatible(manifest)
+        self._cleanup_completed_records()
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        seconds, micros = self._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        cfg = self._foundation.config
+        index = cfg.key("responses:expiry")
+        members = self._completed_index_members(index, now, self.config.max_responses)
+        fields = (
+            b"client",
+            b"request",
+            b"client_public_key",
+            b"request_id",
+            b"node_id",
+            b"consumer_digest",
+            b"generation",
+            b"envelope",
+            b"accepted_at_epoch",
+            b"response_digest",
+            b"replay_expires_at_epoch",
+            b"status",
+        )
+        limits = {
+            b"client": 64,
+            b"request": 64,
+            b"client_public_key": self.config.max_identity_bytes,
+            b"request_id": self.config.max_identity_bytes,
+            b"node_id": self.config.max_node_id_bytes,
+            b"consumer_digest": 64,
+            b"generation": 16,
+            b"envelope": self.config.max_response_envelope_bytes,
+            b"accepted_at_epoch": 32,
+            b"response_digest": 64,
+            b"replay_expires_at_epoch": 32,
+            b"status": 32,
+        }
+        records = []
+        for raw_member, raw_score in members:
+            client, request = raw_member.split(b":")
+            key = cfg.key("response", client.decode(), request.decode())
+            for attempt in range(2):
+                try:
+                    value = self._completed_hash(key, fields, limits)
+                    if value is None:
+                        raise ValueError
+                    primary_exists, primary_score = self._completed_primary_authority(
+                        key, index, raw_member
+                    )
+                    if (
+                        primary_exists != 1
+                        or primary_score is None
+                        or float(primary_score) != float(raw_score)
+                    ):
+                        raise ValueError
+                    generation = int(value[b"generation"])
+                    accepted = float(value[b"accepted_at_epoch"])
+                    replay = float(value[b"replay_expires_at_epoch"])
+                    score = float(raw_score)
+                    envelope = self._decode_response_envelope(value[b"envelope"])
+                    digest = hashlib.sha256(value[b"envelope"]).hexdigest().encode()
+                    if (
+                        value[b"client"] != client
+                        or value[b"request"] != request
+                        or hashlib.sha256(b"client\0" + value[b"client_public_key"])
+                        .hexdigest()
+                        .encode()
+                        != client
+                        or hashlib.sha256(b"request\0" + value[b"request_id"])
+                        .hexdigest()
+                        .encode()
+                        != request
+                        or not 0
+                        < len(value[b"node_id"])
+                        <= self.config.max_node_id_bytes
+                        or not self._completed_digest(value[b"consumer_digest"])
+                        or not self._completed_digest(value[b"response_digest"])
+                        or digest != value[b"response_digest"]
+                        or generation < 1
+                        or str(generation).encode() != value[b"generation"]
+                        or not all(map(math.isfinite, (accepted, replay, score)))
+                        or accepted < 0
+                        or repr(accepted).encode() != value[b"accepted_at_epoch"]
+                        or format(replay, ".17g").encode()
+                        != value[b"replay_expires_at_epoch"]
+                        or replay < accepted
+                        or replay <= now
+                        or replay != score
+                        or value[b"status"] != b"response_ready"
+                    ):
+                        raise ValueError
+                    terminal = self._validated_terminal(
+                        cfg, client, request, now, require_live=True
+                    )
+                    lifecycle = self._completed_lifecycle(cfg, client, request)
+                    if (
+                        terminal[b"retrieval_state"] != b"response_ready"
+                        or terminal[b"node_id"] != value[b"node_id"]
+                        or terminal[b"consumer_digest"] != value[b"consumer_digest"]
+                        or terminal[b"generation"] != value[b"generation"]
+                        or terminal[b"response_digest"] != value[b"response_digest"]
+                        or terminal[b"accepted_at_epoch"] != value[b"accepted_at_epoch"]
+                        or terminal[b"replay_expires_at_epoch"]
+                        != value[b"replay_expires_at_epoch"]
+                        or terminal[b"retrieval_credential_digest"]
+                        != lifecycle[b"token_digest"]
+                        or terminal[b"cancellation_token_digest"]
+                        != lifecycle[b"cancellation_digest"]
+                        or lifecycle[b"client_public_key"]
+                        != value[b"client_public_key"]
+                        or lifecycle[b"request_id"] != value[b"request_id"]
+                        or lifecycle[b"node_id"] != value[b"node_id"]
+                        or lifecycle[b"claim_generation"] != value[b"generation"]
+                        or float(lifecycle[b"deadline"]) < accepted
+                    ):
+                        raise ValueError
+                    records.append(
+                        ResponseRecord(
+                            client.decode(),
+                            request.decode(),
+                            value[b"client_public_key"].decode(),
+                            value[b"request_id"].decode(),
+                            value[b"node_id"].decode(),
+                            value[b"consumer_digest"].decode(),
+                            generation,
+                            envelope,
+                            accepted,
+                            value[b"response_digest"].decode(),
+                            replay,
+                        )
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                    OverflowError,
+                    UnicodeDecodeError,
+                    ValkeySchemaIncompatibleError,
+                ):
+                    exists, indexed_score = self._completed_primary_authority(
+                        key, index, raw_member
+                    )
+                    if exists == 0 and indexed_score is None:
+                        break
+                    if attempt == 0:
+                        continue
+                    raise ValkeySchemaIncompatibleError(
+                        "state schema incompatible"
+                    ) from None
+                else:
+                    break
+        return tuple(records)
+
+    def _validated_terminal(
+        self, cfg, client: bytes, request: bytes, now: float, *, require_live: bool
+    ) -> dict[bytes, bytes]:
+        fields = (
+            b"client",
+            b"request",
+            b"node_id",
+            b"owner_digest",
+            b"consumer_digest",
+            b"generation",
+            b"response_digest",
+            b"accepted_at_epoch",
+            b"replay_expires_at_epoch",
+            b"expires_at_epoch",
+            b"outcome",
+            b"retrieval_state",
+            b"retrieval_credential_digest",
+            b"acknowledgement_digest",
+            b"reason",
+            b"cancellation_token_digest",
+        )
+        limits = {field: 64 for field in fields}
+        limits.update(
+            {
+                b"node_id": self.config.max_node_id_bytes,
+                b"generation": 16,
+                b"accepted_at_epoch": 32,
+                b"replay_expires_at_epoch": 32,
+                b"expires_at_epoch": 32,
+                b"retrieval_state": 32,
+                b"reason": 32,
+            }
+        )
+        value = self._completed_hash(
+            cfg.key("terminal", client.decode(), request.decode()), fields, limits
+        )
+        if value is None:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            generation = int(value[b"generation"])
+            accepted = float(value[b"accepted_at_epoch"])
+            replay = float(value[b"replay_expires_at_epoch"])
+            expires = float(value[b"expires_at_epoch"])
+            terminal_score = self._foundation._call(
+                self._foundation._client.zscore,
+                cfg.key("terminals:expiry"),
+                client + b":" + request,
+            )
+            digests = (
+                b"owner_digest",
+                b"consumer_digest",
+                b"response_digest",
+                b"retrieval_credential_digest",
+                b"acknowledgement_digest",
+                b"cancellation_token_digest",
+            )
+            if (
+                value[b"client"] != client
+                or value[b"request"] != request
+                or not 0 < len(value[b"node_id"]) <= self.config.max_node_id_bytes
+                or any(not self._completed_digest(value[field]) for field in digests)
+                or generation < 1
+                or str(generation).encode() != value[b"generation"]
+                or not all(map(math.isfinite, (accepted, replay, expires)))
+                or accepted < 0
+                or accepted > now
+                or repr(accepted).encode() != value[b"accepted_at_epoch"]
+                or format(replay, ".17g").encode() != value[b"replay_expires_at_epoch"]
+                or format(expires, ".17g").encode() != value[b"expires_at_epoch"]
+                or replay < accepted
+                or expires < replay
+                or (require_live and expires <= now)
+                or type(terminal_score) not in {int, float}
+                or isinstance(terminal_score, bool)
+                or not math.isfinite(float(terminal_score))
+                or float(terminal_score) != expires
+                or value[b"outcome"] != b"completed"
+                or value[b"reason"] != b"response_completed"
+                or value[b"retrieval_state"]
+                not in {b"response_ready", b"retrieval_expired"}
+            ):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        return value
+
+    def terminal_records(self) -> tuple[TerminalOutcomeRecord, ...]:
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        self._foundation.check_write_compatible(manifest)
+        self._cleanup_completed_records()
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        seconds, micros = self._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        cfg = self._foundation.config
+        index = cfg.key("terminals:expiry")
+        members = self._completed_index_members(
+            index, now, self.config.max_terminal_records
+        )
+        result = []
+        for raw_member, raw_score in members:
+            client, request = raw_member.split(b":")
+            key = cfg.key("terminal", client.decode(), request.decode())
+            for attempt in range(2):
+                try:
+                    value = self._validated_terminal(
+                        cfg, client, request, now, require_live=True
+                    )
+                    primary_exists, primary_score = self._completed_primary_authority(
+                        key, index, raw_member
+                    )
+                    if (
+                        primary_exists != 1
+                        or primary_score is None
+                        or float(primary_score) != float(raw_score)
+                    ):
+                        raise ValueError
+                    if float(raw_score) != float(value[b"expires_at_epoch"]):
+                        raise ValueError
+                    lifecycle = self._completed_lifecycle(cfg, client, request)
+                    if (
+                        value[b"retrieval_credential_digest"]
+                        != lifecycle[b"token_digest"]
+                        or value[b"cancellation_token_digest"]
+                        != lifecycle[b"cancellation_digest"]
+                        or lifecycle[b"node_id"] != value[b"node_id"]
+                        or lifecycle[b"claim_generation"] != value[b"generation"]
+                        or float(lifecycle[b"deadline"])
+                        < float(value[b"accepted_at_epoch"])
+                    ):
+                        raise ValueError
+                    response_index = cfg.key("responses:expiry")
+                    response_key = cfg.key(
+                        "response", client.decode(), request.decode()
+                    )
+                    response_score = self._foundation._call(
+                        self._foundation._client.zscore, response_index, raw_member
+                    )
+                    retrieval_state = value[b"retrieval_state"]
+                    if value[b"retrieval_state"] == b"retrieval_expired":
+                        response_exists = self._foundation._call(
+                            self._foundation._client.exists, response_key
+                        )
+                        if (
+                            type(response_exists) is not int
+                            or response_exists != 0
+                            or response_score is not None
+                        ):
+                            raise ValueError
+                    else:
+                        response_fields = (
+                            b"client",
+                            b"request",
+                            b"client_public_key",
+                            b"request_id",
+                            b"node_id",
+                            b"consumer_digest",
+                            b"generation",
+                            b"envelope",
+                            b"accepted_at_epoch",
+                            b"response_digest",
+                            b"replay_expires_at_epoch",
+                            b"status",
+                        )
+                        response_limits = {
+                            field: _MAX_RESULT_BYTES for field in response_fields
+                        }
+                        response_limits.update(
+                            {
+                                b"client": 64,
+                                b"request": 64,
+                                b"client_public_key": self.config.max_identity_bytes,
+                                b"request_id": self.config.max_identity_bytes,
+                                b"node_id": self.config.max_node_id_bytes,
+                                b"consumer_digest": 64,
+                                b"generation": 16,
+                                b"envelope": self.config.max_response_envelope_bytes,
+                                b"accepted_at_epoch": 32,
+                                b"response_digest": 64,
+                                b"replay_expires_at_epoch": 32,
+                                b"status": 32,
+                            }
+                        )
+                        response = self._completed_hash(
+                            response_key, response_fields, response_limits
+                        )
+                        if response is None:
+                            raise ValueError
+                        self._decode_response_envelope(response[b"envelope"])
+                        response_generation = int(response[b"generation"])
+                        response_accepted = float(response[b"accepted_at_epoch"])
+                        response_replay = float(response[b"replay_expires_at_epoch"])
+                        if (
+                            response[b"client"] != client
+                            or response[b"request"] != request
+                            or response[b"client_public_key"]
+                            != lifecycle[b"client_public_key"]
+                            or response[b"request_id"] != lifecycle[b"request_id"]
+                            or hashlib.sha256(
+                                b"client\0" + response[b"client_public_key"]
+                            )
+                            .hexdigest()
+                            .encode()
+                            != client
+                            or hashlib.sha256(b"request\0" + response[b"request_id"])
+                            .hexdigest()
+                            .encode()
+                            != request
+                            or response[b"node_id"] != value[b"node_id"]
+                            or response[b"consumer_digest"] != value[b"consumer_digest"]
+                            or response[b"generation"] != value[b"generation"]
+                            or response_generation < 1
+                            or str(response_generation).encode()
+                            != response[b"generation"]
+                            or response[b"response_digest"] != value[b"response_digest"]
+                            or hashlib.sha256(response[b"envelope"])
+                            .hexdigest()
+                            .encode()
+                            != response[b"response_digest"]
+                            or response[b"accepted_at_epoch"]
+                            != value[b"accepted_at_epoch"]
+                            or response[b"replay_expires_at_epoch"]
+                            != value[b"replay_expires_at_epoch"]
+                            or not all(
+                                map(math.isfinite, (response_accepted, response_replay))
+                            )
+                            or response_accepted < 0
+                            or repr(response_accepted).encode()
+                            != response[b"accepted_at_epoch"]
+                            or format(response_replay, ".17g").encode()
+                            != response[b"replay_expires_at_epoch"]
+                            or response_replay < response_accepted
+                            or response[b"status"] != b"response_ready"
+                            or type(response_score) not in {int, float}
+                            or isinstance(response_score, bool)
+                            or float(response_score) != response_replay
+                        ):
+                            raise ValueError
+                        if response_replay <= now:
+                            retrieval_state = b"retrieval_expired"
+                    result.append(
+                        TerminalOutcomeRecord(
+                            client.decode(),
+                            request.decode(),
+                            value[b"node_id"].decode(),
+                            value[b"owner_digest"].decode(),
+                            value[b"consumer_digest"].decode(),
+                            int(value[b"generation"]),
+                            value[b"response_digest"].decode(),
+                            float(value[b"accepted_at_epoch"]),
+                            float(value[b"replay_expires_at_epoch"]),
+                            float(value[b"expires_at_epoch"]),
+                            retrieval_state=retrieval_state.decode(),
+                            retrieval_credential_digest=value[
+                                b"retrieval_credential_digest"
+                            ].decode(),
+                            acknowledgement_digest=value[
+                                b"acknowledgement_digest"
+                            ].decode(),
+                            cancellation_token_digest=value[
+                                b"cancellation_token_digest"
+                            ].decode(),
+                        )
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                    OverflowError,
+                    UnicodeDecodeError,
+                    ValkeySchemaIncompatibleError,
+                ):
+                    exists, indexed_score = self._completed_primary_authority(
+                        key, index, raw_member
+                    )
+                    if exists == 0 and indexed_score is None:
+                        break
+                    if attempt == 0:
+                        continue
+                    raise ValkeySchemaIncompatibleError(
+                        "state schema incompatible"
+                    ) from None
+                else:
+                    break
+        return tuple(result)
+
     def _live_claims(
         self, node_id: str
     ) -> tuple[tuple[QueuedRequest, ClaimRecord], ...]:
@@ -2485,9 +3544,7 @@ class ValkeyRegistrationStore:
                     or r[b"node_id"] != c[b"node_id"]
                     or not 0 < len(r[b"node_id"]) <= self.config.max_node_id_bytes
                     or self._decode_text(r[b"node_digest"]) != claim_node_digest
-                    or not _SHA256_RE.fullmatch(
-                        self._decode_text(r[b"node_digest"])
-                    )
+                    or not _SHA256_RE.fullmatch(self._decode_text(r[b"node_digest"]))
                     or request_deadline != deadline
                     or request_sequence != seq
                     or request_generation != gen

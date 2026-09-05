@@ -1,10 +1,11 @@
 import dataclasses
+import hashlib
 import json
 import logging
 import math
 import re
 import traceback
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import redis
@@ -12,6 +13,7 @@ from redis.sentinel import MasterNotFoundError
 import valkey_relay_state
 
 from valkey_relay_state import (
+    ACCEPT_RESPONSE_SCRIPT,
     DirectPrimary,
     ReviewedScript,
     SchemaManifest,
@@ -30,6 +32,7 @@ from valkey_relay_state import (
 )
 from relay_state_store import (
     EncryptedRequestEnvelope,
+    EncryptedResponseEnvelope,
     RelayStateCapacityExceeded,
     RelayStateConflict,
     RelayStateCredentialMismatch,
@@ -38,6 +41,201 @@ from relay_state_store import (
     RelayStateStoreError,
     SchedulerNodeState,
 )
+
+
+@pytest.mark.parametrize("key", [None, "x" * 32, bytearray(32), b"x" * 31])
+def test_acknowledgement_key_is_required_exact_bytes_and_redacted(key):
+    foundation = object.__new__(ValkeyFoundation)
+    with pytest.raises(
+        RelayStateStoreError, match="acknowledgement key is invalid"
+    ) as caught:
+        ValkeyRegistrationStore(
+            foundation,
+            RelayStateStoreConfig(namespace="testing.unit"),
+            acknowledgement_key=key,
+        )
+    assert repr(key) not in repr(caught.value)
+
+
+def test_acknowledgement_key_is_copied_and_never_represented():
+    foundation = object.__new__(ValkeyFoundation)
+    key = b"shared-test-acknowledgement-key-32"
+    store = ValkeyRegistrationStore(
+        foundation,
+        RelayStateStoreConfig(namespace="testing.unit"),
+        acknowledgement_key=key,
+    )
+    assert store._acknowledgement_key == key
+    assert store._acknowledgement_key is not key
+    assert key.decode() not in repr(store)
+
+
+def test_response_serialization_is_canonical_sorted_utf8():
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher-☃", "key", "iv"
+    )
+    assert ValkeyRegistrationStore._serialized_response_envelope(envelope) == (
+        b'{"cipherkey":"key","ciphertext":"cipher-\xe2\x98\x83","iv":"iv",'
+        b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}'
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b"[]",
+        b'{"protocol":"tokenplace_api_v1_relay_e2ee"}',
+        (
+            b'{"protocol":"tokenplace_api_v1_relay_e2ee", "version":1,'
+            b'"ciphertext":"cipher","cipherkey":"key","iv":"iv"}'
+        ),
+    ),
+)
+def test_response_envelope_decoder_rejects_malformed_or_noncanonical_bytes(raw):
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        ValkeyRegistrationStore._decode_response_envelope(raw)
+
+
+@pytest.mark.parametrize(
+    ("generation", "envelope", "maximum", "message"),
+    (
+        (
+            0,
+            EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"
+            ),
+            1024,
+            "generation",
+        ),
+        (1, object(), 1024, "response envelope"),
+        (
+            1,
+            EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"
+            ),
+            1,
+            "byte bound",
+        ),
+    ),
+)
+def test_accept_response_rejects_invalid_inputs_before_backend_access(
+    generation, envelope, maximum, message
+):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(
+        store.config, max_response_envelope_bytes=maximum
+    )
+
+    with pytest.raises(RelayStateStoreError, match=message):
+        store.accept_encrypted_response(
+            "node", "a" * 64, "consumer", "client", "request", generation, envelope
+        )
+
+    foundation.server_time.assert_not_called()
+    foundation.execute.assert_not_called()
+
+
+def test_completed_inspector_index_detects_overflow_and_malformed_shapes():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    store = registration_store_with_foundation(foundation)
+    member = b"a" * 64 + b":" + b"b" * 64
+    foundation._call.return_value = [(member, 2.0), (member, 3.0)]
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store._completed_index_members("index", 1.0, 1)
+    assert foundation._call.call_args.kwargs["num"] == 2
+
+    foundation._call.return_value = [(member,)]
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store._completed_index_members("index", 1.0, 1)
+
+
+def test_completed_inspector_rejects_raw_size_before_decode_or_hash():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.return_value = [b"oversized"]
+    store = registration_store_with_foundation(foundation)
+
+    with patch("valkey_relay_state.hashlib.sha256") as sha256:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store._completed_hash("key", (b"digest",), {b"digest": 2})
+    sha256.assert_not_called()
+
+
+def test_completed_inspector_distinguishes_disappearance_from_remaining_authority():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    store = registration_store_with_foundation(foundation)
+    member = b"a" * 64 + b":" + b"b" * 64
+
+    pipeline = MagicMock()
+    foundation._client.pipeline.return_value = pipeline
+    pipeline.__enter__.return_value = pipeline
+    foundation._call.return_value = [0, None]
+    assert store._completed_primary_authority("hash", "index", member) == (0, None)
+    pipeline.exists.assert_called_once_with("hash")
+    pipeline.zscore.assert_called_once_with("index", member)
+
+    foundation._call.return_value = [1, 2.0]
+    assert store._completed_primary_authority("hash", "index", member) == (1, 2.0)
+
+
+def test_accept_response_script_is_registered_digest_pinned_and_bounded():
+    expected_digest = "3559da1040624e6ac52d933a3d116c680d0398243ca4c68b308d0e1c4e10ecd8"  # pragma: allowlist secret
+    assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
+    assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
+    assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
+    assert not re.search(
+        r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
+        ACCEPT_RESPONSE_SCRIPT.source,
+    )
+    stale_guard = (
+        "if not replay or not terminal_expiry or replay<=now or terminal_expiry<=now "
+        "then return {'malformed'} end"
+    )
+    assert stale_guard in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index(stale_guard) < (
+        ACCEPT_RESPONSE_SCRIPT.source.index("redis.call('HSET',response")
+    )
+    assert "if not accepted or accepted<0 or accepted>now then return {'malformed'} end" in ACCEPT_RESPONSE_SCRIPT.source
+    cleanup_offset = ACCEPT_RESPONSE_SCRIPT.source.index("local function cleanup()")
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_response_due(response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
+    assert "'client_public_key','request_id','node_id','consumer_digest','generation','envelope'" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "'retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request'" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "local lv=redis.call('HMGET',lk,'state','client','request','client_public_key','request_id'" in ACCEPT_RESPONSE_SCRIPT.source
+    response_validator = ACCEPT_RESPONSE_SCRIPT.source.split(
+        "local function validate_response_due(due)", 1
+    )[1].split("local function contains", 1)[0]
+    terminal_validator = ACCEPT_RESPONSE_SCRIPT.source.split(
+        "local function validate_terminal_due(due,response_due)", 1
+    )[1].split("local function reap", 1)[0]
+    for validator in (response_validator, terminal_validator):
+        assert "tv[12]~=lv[12]" in validator
+        assert "tv[14]~=lv[13]" in validator
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_terminal_due(terminal_due,response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
+    assert "redis.call('EXISTS',response)~=0 or response_indexed or terminal_indexed" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "if entries>=limit then return false end" in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("for i=1,#members,2 do") < (
+        ACCEPT_RESPONSE_SCRIPT.source.index("if entries>=limit then return false end")
+    )
+    assert "local response_values=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "local terminal_exists=redis.call('EXISTS',terminal)" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "a<0 or a>now" in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("elseif response_exists~=0 or response_score") < ACCEPT_RESPONSE_SCRIPT.source.index("return {'existing',tostring(g),tv[9],tv[10]}")
 
 
 def config(**changes):
@@ -77,6 +275,7 @@ def registration_store_with_foundation(foundation):
     store = object.__new__(ValkeyRegistrationStore)
     store._foundation = foundation
     store._config = RelayStateStoreConfig(namespace="testing.unit")
+    store._acknowledgement_key = b"shared-test-acknowledgement-key-32"
     return store
 
 
@@ -1062,9 +1261,7 @@ def test_renew_claim_decodes_each_fixed_result(result, expected_status):
     foundation.execute.return_value = result
     store = registration_store_with_foundation(foundation)
 
-    renewal = store.renew_claim(
-        "node-a", "a" * 64, "consumer", "client", "request", 2
-    )
+    renewal = store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 2)
     assert renewal.state == expected_status
 
 
@@ -1193,3 +1390,60 @@ def test_enqueue_translates_fixed_script_results(result, expected):
             envelope,
             "cancel",
         )
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    (
+        ([b"owner"], RelayStateCredentialMismatch),
+        ([b"missing"], RelayStateConflict),
+        ([b"stale", b"2"], RelayStateConflict),
+        ([b"conflict"], RelayStateConflict),
+        ([b"malformed"], RelayStateConflict),
+        ([b"capacity"], RelayStateCapacityExceeded),
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"malformed", b"extra"], ValkeySchemaIncompatibleError),
+        ([b"stale"], ValkeySchemaIncompatibleError),
+        ([b"stale", b"01"], ValkeySchemaIncompatibleError),
+        ([b"accepted", b"1", b"nan", b"2"], ValkeySchemaIncompatibleError),
+        ([b"existing", b"1", b"-1", b"2"], ValkeySchemaIncompatibleError),
+        ([b"existing", b"1", b"2", b"1"], ValkeySchemaIncompatibleError),
+    ),
+)
+def test_accept_response_decodes_only_fixed_bounded_results(reply, error):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.server_time.return_value = (1, 0)
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+
+    with pytest.raises(error):
+        store.accept_encrypted_response(
+            "node", "a" * 64, "consumer", "client", "request", 1, envelope
+        )
+
+
+@pytest.mark.parametrize(("status", "new_outcome"), ((b"accepted", True), (b"existing", False)))
+def test_accept_response_decodes_fixed_success_results(status, new_outcome):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.server_time.return_value = (1, 0)
+    foundation.execute.return_value = [status, b"1", b"1.0", b"2.0"]
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+
+    result = store.accept_encrypted_response(
+        "node", "a" * 64, "consumer", "client", "request", 1, envelope
+    )
+
+    assert result.new_outcome is new_outcome
+    assert (result.generation, result.accepted_at_epoch, result.replay_expires_at_epoch) == (
+        1,
+        1.0,
+        2.0,
+    )

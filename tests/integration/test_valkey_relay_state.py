@@ -5464,8 +5464,8 @@ def test_completed_record_reads_hide_expired_backlog_beyond_cleanup_batch(valkey
     store = _registration_store(
         valkey_server,
         namespace,
-        response_replay_ttl_seconds=0.01,
-        terminal_retention_seconds=0.01,
+        response_replay_ttl_seconds=0.05,
+        terminal_retention_seconds=60,
         control_tombstone_ttl_seconds=0.001,
         node_transition_batch_size=1,
     )
@@ -5474,6 +5474,7 @@ def test_completed_record_reads_hide_expired_backlog_beyond_cleanup_batch(valkey
     response = EncryptedResponseEnvelope(
         "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
     )
+    cfg = store._foundation.config
     try:
         store.register(node, _capabilities(), owner)
         for identity in identities:
@@ -5482,10 +5483,38 @@ def test_completed_record_reads_hide_expired_backlog_beyond_cleanup_batch(valkey
             store.accept_encrypted_response(
                 node, owner, consumer, *identity, claim.generation, response
             )
-        time.sleep(0.03)
+        response_keys = tuple(
+            cfg.key("response", *store._identity(*identity)) for identity in identities
+        )
+        terminal_keys = tuple(
+            cfg.key("terminal", *store._identity(*identity)) for identity in identities
+        )
+        response_index = cfg.key("responses:expiry")
+        terminal_index = cfg.key("terminals:expiry")
+        for _ in range(200):
+            seconds, micros = store._foundation.server_time()
+            if all(
+                store._foundation._client.zscore(
+                    response_index, ":".join(store._identity(*identity))
+                )
+                <= seconds + micros / 1_000_000
+                for identity in identities
+            ):
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("authoritative Valkey time did not reach response expiry")
 
-        assert store.response_records() == ()
-        assert store.terminal_records() == ()
+        records = store.terminal_records()
+        assert len(records) == 3
+        assert {record.retrieval_state for record in records} == {"retrieval_expired"}
+        assert sum(store._foundation._client.exists(key) for key in response_keys) == 2
+        assert store._foundation._client.zcard(response_index) == 2
+        assert store._foundation._client.zcard(terminal_index) == 3
+        assert sorted(
+            store._foundation._client.hget(key, "retrieval_state")
+            for key in terminal_keys
+        ) == [b"response_ready", b"response_ready", b"retrieval_expired"]
     finally:
         _delete_claim_fixture_state(store, (node,), identities)
         store.close()

@@ -3211,6 +3211,7 @@ class ValkeyRegistrationStore:
                     response_score = self._foundation._call(
                         self._foundation._client.zscore, response_index, raw_member
                     )
+                    retrieval_state = value[b"retrieval_state"]
                     if value[b"retrieval_state"] == b"retrieval_expired":
                         response_exists = self._foundation._call(
                             self._foundation._client.exists, response_key
@@ -3310,6 +3311,8 @@ class ValkeyRegistrationStore:
                             or float(response_score) != response_replay
                         ):
                             raise ValueError
+                        if response_replay <= now:
+                            retrieval_state = b"retrieval_expired"
                     result.append(
                         TerminalOutcomeRecord(
                             client.decode(),
@@ -3322,7 +3325,7 @@ class ValkeyRegistrationStore:
                             float(value[b"accepted_at_epoch"]),
                             float(value[b"replay_expires_at_epoch"]),
                             float(value[b"expires_at_epoch"]),
-                            retrieval_state=value[b"retrieval_state"].decode(),
+                            retrieval_state=retrieval_state.decode(),
                             retrieval_credential_digest=value[
                                 b"retrieval_credential_digest"
                             ].decode(),

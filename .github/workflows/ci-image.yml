@@ -185,6 +185,32 @@ jobs:
           curl -fsS http://127.0.0.1:5011/metrics >/dev/null
           docker exec tokenplace-relay-smoke-readonly sh -c "tr '\\0' ' ' < /proc/1/cmdline" | grep -F -- '--workers 1'
 
+      - name: Gate candidate on mandatory release-safety behavior
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_REF: ${{ github.ref }}
+        run: ./scripts/run_relay_release_safety_gate.sh tokenplace-relay:smoke relay-release-safety-evidence.json
+
+      - name: Retain release-safety evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-release-safety-${{ steps.tags.outputs.short_sha }}
+          path: relay-release-safety-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summarize release-safety evidence
+        run: |
+          {
+            echo "## Mandatory relay release-safety contract"
+            echo ""
+            echo "Source commit: \`$(jq -r .source_commit relay-release-safety-evidence.json)\`"
+            echo "Release ref/base: \`$(jq -r .release_ref relay-release-safety-evidence.json)\`"
+            echo "Candidate image: \`$(jq -r .candidate_image relay-release-safety-evidence.json)\`"
+            echo "Candidate immutable ID: \`$(jq -r .candidate_digest relay-release-safety-evidence.json)\`"
+            jq -r '.results[] | "- " + (if .passed then "PASS" else "FAIL" end) + ": `" + .id + "`"' relay-release-safety-evidence.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish validation summary
         run: |
           {
@@ -230,6 +256,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push multi-arch relay image
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -260,6 +287,7 @@ jobs:
               echo "Sugarkube deploy tag: \`${{ needs.build-and-smoke.outputs.semver_tag }}\`"
             fi
             echo "SHA tag: \`${{ needs.build-and-smoke.outputs.sha_tag }}\`"
+            echo "OCI index digest: \`${{ steps.push.outputs.digest }}\`"
             echo ""
             echo "Pushed: true"
           } >> "$GITHUB_STEP_SUMMARY"

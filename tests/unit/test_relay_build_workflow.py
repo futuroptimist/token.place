@@ -34,3 +34,14 @@ def test_relay_image_workflow_targets_multi_arch_and_ghcr_metadata() -> None:
         line.strip().startswith("org.opencontainers.image.licenses=")
         for line in labels_block.splitlines()
     ), "OCI metadata should declare the image license"
+
+
+def test_every_relay_publish_is_gated_on_built_candidate() -> None:
+    workflow_text = WORKFLOW_PATH.read_text(encoding="utf-8")
+    gate = "./scripts/run_relay_release_safety_gate.sh tokenplace-relay:smoke"
+    assert gate in workflow_text
+    assert workflow_text.index("Build relay image locally") < workflow_text.index(gate)
+    assert workflow_text.index(gate) < workflow_text.index("publish:\n")
+    assert "needs: build-and-smoke" in workflow_text
+    assert "if-no-files-found: error" in workflow_text
+    assert "steps.push.outputs.digest" in workflow_text

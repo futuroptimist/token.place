@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {"id": "metrics.no_flask_defaults", "description": "Default Flask request metric families are absent"},
+    {"id": "metrics.no_raw_paths", "description": "Request metrics never contain unmatched request paths"},
+    {"id": "metrics.bounded_unmatched_paths", "description": "Distinct unmatched paths have bounded series growth"},
+    {"id": "quota.public_information_exempt", "description": "Public information reads do not consume ordinary quota"},
+    {"id": "quota.protected_routes_limited", "description": "Ordinary API routes remain rate limited"}
+  ],
+  "unmatched_path_count": 40,
+  "maximum_series_growth": 12
+}

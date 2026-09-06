@@ -4227,6 +4227,188 @@ def test_encrypted_response_inclusive_expiry_boundaries_are_non_mutating(
         second.close()
 
 
+def test_encrypted_response_first_transition_removes_exact_authority_once(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, max_claims=8)
+    second = _registration_store(valkey_server, namespace, max_claims=8)
+    node, owner, consumer = "transition-node", _digest("transition-owner"), "consumer"
+    identities = (("transition-client-a", "request-a"), ("transition-client-b", "request-b"))
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    datastore = first._foundation._client
+    keys, member = _response_acceptance_authority(first, node, identities[0])
+    neighbor_keys, neighbor_member = _response_acceptance_authority(
+        first, node, identities[1]
+    )
+    node_key = keys[1]
+    try:
+        first.register(node, _capabilities(concurrency=2), owner)
+        claims = []
+        for identity in identities:
+            _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+            claims.append(first.claim_queued_request(node, owner, consumer))
+        datastore.hset(keys[11], mapping={"stage": "generating"})
+        datastore.hset(neighbor_keys[11], mapping={"stage": "neighbor"})
+
+        queue_before = datastore.xrange(keys[2])
+        addressed_entry = datastore.hget(keys[4], "queue_entry")
+        neighbor_hashes_before = tuple(
+            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
+        )
+        neighbor_scores_before = (
+            datastore.zscore(neighbor_keys[5], neighbor_member),
+            datastore.zscore(neighbor_keys[6], neighbor_member),
+        )
+        scheduler_before = datastore.hget(node_key, "scheduler_claimed_work")
+        assert scheduler_before == b"0"
+        assert len(queue_before) == 2
+
+        accepted = first.accept_encrypted_response(
+            node, owner, consumer, *identities[0], claims[0].generation, envelope
+        )
+        assert accepted.new_outcome
+        assert datastore.xrange(keys[2]) == [
+            entry for entry in queue_before if entry[0] != addressed_entry
+        ]
+        assert datastore.exists(keys[3]) == 0
+        assert datastore.zscore(keys[5], member) is None
+        assert datastore.zscore(keys[6], member) is None
+        assert datastore.exists(keys[11]) == 0
+        assert datastore.hget(keys[4], "state") == b"response_ready"
+        assert datastore.hget(node_key, "scheduler_claimed_work") == scheduler_before
+        assert tuple(
+            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
+        ) == neighbor_hashes_before
+        assert (
+            datastore.zscore(keys[5], neighbor_member),
+            datastore.zscore(keys[6], neighbor_member),
+        ) == neighbor_scores_before
+
+        after = _exact_key_snapshot(first, keys)
+        retried = second.accept_encrypted_response(
+            node, owner, consumer, *identities[0], claims[0].generation, envelope
+        )
+        assert not retried.new_outcome
+        assert retried == dataclasses.replace(accepted, new_outcome=False)
+        assert _exact_key_snapshot(first, keys) == after
+        assert tuple(
+            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
+        ) == neighbor_hashes_before
+        assert (
+            datastore.zscore(keys[5], neighbor_member),
+            datastore.zscore(keys[6], neighbor_member),
+        ) == neighbor_scores_before
+    finally:
+        _delete_claim_fixture_state(first, (node,), identities)
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
+    ("capacity", "limits", "same_client"),
+    (
+        ("global_active", {"max_queued_requests": 1}, False),
+        ("node_active", {"max_queue_depth_per_node": 1}, False),
+        ("client_active", {"max_queued_requests_per_client": 1}, True),
+        ("global_claim", {"max_claims": 1}, False),
+        ("node_claim", {"max_claims_per_node": 1}, False),
+    ),
+)
+def test_encrypted_response_releases_capacity_immediately(
+    valkey_server, capacity, limits, same_client
+):
+    defaults = {
+        "max_queued_requests": 8,
+        "max_queue_depth_per_node": 8,
+        "max_queued_requests_per_client": 8,
+        "max_claims": 8,
+        "max_claims_per_node": 8,
+    }
+    defaults.update(limits)
+    store = _registration_store(valkey_server, uuid.uuid4().hex, **defaults)
+    node, owner, consumer = "release-node", _digest("release-owner"), "consumer"
+    first_identity = ("release-client", "first")
+    second_identity = (
+        "release-client" if same_client else "release-other-client",
+        "second",
+    )
+    identities = (first_identity, second_identity)
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    request_envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    deadline = time.time() + 60
+    second_selection = None
+    try:
+        store.register(node, _capabilities(concurrency=4), owner)
+        _enqueue_claim_fixture(store, node, owner, *first_identity, deadline)
+        first_claim = store.claim_queued_request(node, owner, consumer)
+
+        if capacity.endswith("claim"):
+            _enqueue_claim_fixture(store, node, owner, *second_identity, deadline)
+            with pytest.raises(RelayStateCapacityExceeded):
+                store.claim_queued_request(node, owner, "second-consumer")
+        elif capacity == "node_active":
+            with pytest.raises(RelayStateNoCapacity):
+                store.select_and_reserve(
+                    *second_identity, "qwen3-8b-instruct", "8k-fast", deadline
+                )
+        else:
+            second_selection = store.select_and_reserve(
+                *second_identity, "qwen3-8b-instruct", "8k-fast", deadline
+            )
+            with pytest.raises(RelayStateNoCapacity):
+                store.enqueue_encrypted_request(
+                    *second_identity,
+                    second_selection.reservation_token,
+                    node,
+                    "qwen3-8b-instruct",
+                    "8k-fast",
+                    deadline,
+                    request_envelope,
+                    "cancel",
+                )
+
+        store.accept_encrypted_response(
+            node, owner, consumer, *first_identity, first_claim.generation, response
+        )
+
+        if capacity.endswith("claim"):
+            released = store.claim_queued_request(node, owner, "second-consumer")
+            assert released.state == "claimed"
+        else:
+            if capacity == "node_active":
+                second_selection = store.select_and_reserve(
+                    *second_identity, "qwen3-8b-instruct", "8k-fast", deadline
+                )
+            released = store.enqueue_encrypted_request(
+                *second_identity,
+                second_selection.reservation_token,
+                node,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                request_envelope,
+                "cancel",
+            )
+            assert released.created
+    finally:
+        if second_selection is not None and second_selection.reservation_token:
+            token = hashlib.sha256(
+                second_selection.reservation_token.encode("ascii")
+            ).hexdigest()
+            store._foundation._client.delete(
+                store._foundation.config.key("reservation", token)
+            )
+        _delete_claim_fixture_state(store, (node,), identities)
+        store.close()
+
+
 @pytest.mark.parametrize(
     ("bound", "same_client", "limits"),
     (

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "contract_id": "relay-release-safety-v1",
+  "required_checks": [
+    "metrics.default_families_absent",
+    "metrics.request_path_labels_bounded",
+    "metrics.unmatched_path_series_bounded",
+    "quota.public_information_reads_exempt",
+    "quota.protected_route_enforced"
+  ],
+  "unmatched_path_probe_count": 40,
+  "maximum_unmatched_path_series_growth": 4,
+  "default_metric_prefixes": ["flask_http_request"],
+  "public_information_paths": ["/", "/api/v1/meta", "/api/v1/version"],
+  "protected_path": "/api/v1/models"
+}

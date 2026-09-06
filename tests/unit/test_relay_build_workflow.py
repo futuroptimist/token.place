@@ -34,3 +34,15 @@ def test_relay_image_workflow_targets_multi_arch_and_ghcr_metadata() -> None:
         line.strip().startswith("org.opencontainers.image.licenses=")
         for line in labels_block.splitlines()
     ), "OCI metadata should declare the image license"
+
+
+def test_release_safety_gate_precedes_every_relay_image_publish() -> None:
+    workflow_text = WORKFLOW_PATH.read_text(encoding="utf-8")
+    gate_index = workflow_text.index("scripts/relay_release_safety_gate.py")
+    publish_job_index = workflow_text.index("\n  publish:")
+    push_index = workflow_text.index("push: true")
+
+    assert gate_index < publish_job_index < push_index
+    assert "needs: build-and-smoke" in workflow_text
+    assert "relay-release-safety-evidence" in workflow_text
+    assert "steps.publish-image.outputs.digest" in workflow_text

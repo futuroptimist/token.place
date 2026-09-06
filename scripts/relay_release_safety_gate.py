@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +36,8 @@ class GateFailure(RuntimeError):
 class Sample:
     name: str
     labels: tuple[tuple[str, str], ...]
+    # Values change as counters advance and therefore are not series identity.
+    value: str = field(default="", compare=False, hash=False)
 
 
 def load_contract(path: Path = CONTRACT_PATH) -> list[dict[str, str]]:
@@ -76,32 +78,34 @@ def parse_metrics(text: str) -> set[Sample]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        match = re.fullmatch(r"([^\s]+)\s+([^\s]+)(?:\s+(\d+))?", line)
-        if not match or not NUMBER.fullmatch(match.group(2)):
+        match = re.fullmatch(
+            rf"({METRIC_NAME.pattern})(\{{(?:[^\"\\}}]|\\.|\"(?:\\.|[^\"\\])*\")*\}})?"
+            rf"\s+({NUMBER.pattern})(?:\s+\d+)?",
+            line,
+        )
+        if not match:
             raise GateFailure("metrics_malformed")
-        identity = match.group(1)
-        if "{" in identity:
-            name, labels_text = identity.split("{", 1)
-            if not labels_text.endswith("}"):
-                raise GateFailure("metrics_malformed")
-            labels_text = labels_text[:-1]
-        else:
-            name, labels_text = identity, ""
-        if not METRIC_NAME.fullmatch(name):
-            raise GateFailure("metrics_malformed")
+        name, labels_block, numeric_value = match.groups()
+        labels_text = labels_block[1:-1] if labels_block else ""
         labels: list[tuple[str, str]] = []
         pos = 0
         while pos < len(labels_text):
-            item = re.match(r'(?:,)?([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"', labels_text[pos:])
+            if labels and labels_text[pos] != ",":
+                raise GateFailure("metrics_malformed")
+            if labels:
+                pos += 1
+            item = re.match(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:\\.|[^"\\])*)"\s*', labels_text[pos:])
             if not item or not LABEL_NAME.fullmatch(item.group(1)):
                 raise GateFailure("metrics_malformed")
             try:
-                value = json.loads('"' + item.group(2) + '"')
+                label_value = json.loads('"' + item.group(2) + '"')
             except json.JSONDecodeError as exc:
                 raise GateFailure("metrics_malformed") from exc
-            labels.append((item.group(1), value))
+            labels.append((item.group(1), label_value))
             pos += item.end()
-        samples.add(Sample(name, tuple(sorted(labels))))
+        if len({key for key, _ in labels}) != len(labels):
+            raise GateFailure("metrics_malformed")
+        samples.add(Sample(name, tuple(sorted(labels)), numeric_value))
     if not samples:
         raise GateFailure("metrics_empty")
     return samples
@@ -115,28 +119,46 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
     try:
         parse_metrics(warm)  # warm lazy collectors before the baseline
         status, before_text = request(base_url, "/metrics")
-        before = parse_metrics(before_text) if status == 200 else set()
+        if status != 200:
+            return results
+        before = parse_metrics(before_text)
         first = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(24)]
         if any(request(base_url, path)[0] != 404 for path in first):
             return results
         status, middle_text = request(base_url, "/metrics")
-        middle = parse_metrics(middle_text) if status == 200 else set()
+        if status != 200:
+            return results
+        middle = parse_metrics(middle_text)
         second = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(24)]
         if any(request(base_url, path)[0] != 404 for path in second):
             return results
         status, after_text = request(base_url, "/metrics")
-        after = parse_metrics(after_text) if status == 200 else set()
+        if status != 200:
+            return results
+        after = parse_metrics(after_text)
     except GateFailure:
         return results
     names = {sample.name for sample in after}
     expected = {"tokenplace_http_requests_total", "tokenplace_instrumentation_up"}
-    results["metrics.valid_instrumentation"] = {"passed": status == 200 and expected <= names}
+    instrumentation = [sample for sample in after if sample.name == "tokenplace_instrumentation_up"]
+    results["metrics.valid_instrumentation"] = {
+        "passed": expected <= names and bool(instrumentation)
+        and all(float(sample.value) == 1 for sample in instrumentation)
+    }
     results["metrics.no_flask_defaults"] = {"passed": not any(n.startswith("flask_http_") for n in names)}
     all_paths = first + second
     unsafe = False
+    added_by_probes = (middle - before) | (after - middle)
     for sample in after:
         for key, value in sample.labels:
-            if key in {"path", "endpoint", "url"} or value in all_paths or "release-safety-unmatched-" in value:
+            # Flask endpoint names and normalized route templates are bounded; the
+            # presence of an ``endpoint`` label alone is therefore not unsafe.
+            raw_path = value.startswith("/") and (
+                "release-safety-unmatched-" in value
+                or bool(re.search(r"/(?:[0-9a-f]{16,}|\d{6,})(?:/|$)", value, re.IGNORECASE))
+            )
+            transformed_per_path = sample in added_by_probes and key in {"path", "route", "endpoint", "url"}
+            if raw_path or transformed_per_path or value in all_paths or "release-safety-unmatched-" in value:
                 unsafe = True
     results["metrics.no_raw_paths"] = {"passed": not unsafe}
     growth1, growth2 = len(middle - before), len(after - middle)

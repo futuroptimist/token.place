@@ -1663,10 +1663,16 @@ def test_relay_diagnostics_response_read_preserves_identifiable_transport_catego
     assert raised.value.relay_failure_category == category
 
 
-def test_relay_diagnostics_http_error_response_is_closed(desktop_runner):
+@pytest.mark.parametrize("close_failure", [None, OSError("PRIVATE cleanup failure")])
+def test_relay_diagnostics_http_error_response_is_closed(
+        desktop_runner, close_failure):
     closed = []
     error = HTTPError("https://private.example", 403, "PRIVATE", {}, None)
-    error.close = lambda: closed.append(True)
+    def close():
+        closed.append(True)
+        if close_failure is not None:
+            raise close_failure
+    error.close = close
     desktop_runner.urlopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(error)
     with pytest.raises(ValueError) as raised:
         desktop_runner.fetch_relay_diagnostics_count(
@@ -1674,6 +1680,8 @@ def test_relay_diagnostics_http_error_response_is_closed(desktop_runner):
     assert closed == [True]
     assert raised.value.relay_failure_category == "http_status"
     assert raised.value.relay_http_status == 403
+    assert "PRIVATE cleanup failure" not in str(raised.value)
+    assert "https://private.example" not in str(raised.value)
 
 
 def test_relay_diagnostics_http_error_close_cancellation_propagates(desktop_runner):

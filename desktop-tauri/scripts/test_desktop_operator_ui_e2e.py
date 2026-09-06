@@ -12,12 +12,14 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import psutil
 from urllib3.exceptions import (
@@ -34,6 +36,12 @@ WEBDRIVER_URL = "http://127.0.0.1:4444"
 NATIVE_WEBDRIVER_URL = "http://127.0.0.1:4445"
 LOGS_DIR = REPO_ROOT / ".desktop-e2e-logs"
 BOOTSTRAP_LOG = LOGS_DIR / "bootstrap.log"
+RELAY_DIAGNOSTICS_USER_AGENT = "token.place-relay-baseline-diagnostic/1.0"
+RELAY_PROBE_FAILURE_CATEGORIES = frozenset({
+    "dns", "connection", "tls", "timeout", "response_read", "utf8_json",
+    "schema_validation", "count_validation", "http_status", "unknown",
+})
+_MAX_DIAGNOSTIC_COUNTER = 1_000_000
 
 # Ensure diagnostics artifact directory exists before fragile bootstrap/import steps.
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -104,35 +112,96 @@ def wait_for_http_200(url: str, timeout_seconds: float = 30.0) -> None:
 
 
 
+def _relay_probe_error(category: str, http_status: object = None,
+        message: str = "relay diagnostics probe failed") -> ValueError:
+    """Create a bounded probe error without retaining response or exception details."""
+    error = ValueError(message)
+    error.relay_probe_category = (category
+        if category in RELAY_PROBE_FAILURE_CATEGORIES else "unknown")
+    error.relay_http_status = (http_status
+        if isinstance(http_status, int) and not isinstance(http_status, bool)
+        and 100 <= http_status <= 599 else None)
+    return error
+
+
+def _fetch_relay_diagnostics_payload(relay_url: str, *, timeout_seconds: float):
+    request = Request(f"{relay_url}/relay/diagnostics", method="GET", headers={
+        "User-Agent": RELAY_DIAGNOSTICS_USER_AGENT,
+    })
+    try:
+        response_context = urlopen(request, timeout=timeout_seconds)  # nosec B310
+    except HTTPError as exc:
+        raise _relay_probe_error("http_status", exc.code) from None
+    except (TimeoutError, socket.timeout):
+        raise _relay_probe_error("timeout") from None
+    except ssl.SSLError:
+        raise _relay_probe_error("tls") from None
+    except socket.gaierror:
+        raise _relay_probe_error("dns") from None
+    except (ConnectionError, URLError) as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, socket.gaierror):
+            category = "dns"
+        elif isinstance(reason, ssl.SSLError):
+            category = "tls"
+        elif isinstance(reason, (TimeoutError, socket.timeout)):
+            category = "timeout"
+        else:
+            category = "connection"
+        raise _relay_probe_error(category) from None
+    except OSError:
+        raise _relay_probe_error("unknown") from None
+    try:
+        with response_context as response:
+            body = response.read()
+    except (TimeoutError, socket.timeout):
+        raise _relay_probe_error("timeout") from None
+    except Exception:
+        raise _relay_probe_error("response_read") from None
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise _relay_probe_error("utf8_json") from None
+
+
 def fetch_relay_diagnostics_count(relay_url: str, *, timeout_seconds: float) -> int:
-    with urlopen(f"{relay_url}/relay/diagnostics", timeout=timeout_seconds) as response:  # nosec B310
-        payload = json.loads(response.read().decode("utf-8"))
-    return int(payload["total_api_v1_registered_compute_nodes"])
+    payload = _fetch_relay_diagnostics_payload(
+        relay_url, timeout_seconds=timeout_seconds)
+    if not isinstance(payload, dict):
+        raise _relay_probe_error("schema_validation", message="malformed relay diagnostics")
+    count = payload.get("total_api_v1_registered_compute_nodes")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise _relay_probe_error("count_validation", message="malformed relay diagnostics count")
+    return count
 
 
 def fetch_api_v1_registered_node_fingerprints(
         relay_url: str, *, timeout_seconds: float) -> list[str]:
     """Return validated API-v1 node fingerprints without retaining public keys."""
-    with urlopen(f"{relay_url}/relay/diagnostics", timeout=timeout_seconds) as response:  # nosec B310
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = _fetch_relay_diagnostics_payload(
+        relay_url, timeout_seconds=timeout_seconds)
     if not isinstance(payload, dict):
-        raise ValueError("malformed relay diagnostics")
+        raise _relay_probe_error("schema_validation", message="malformed relay diagnostics")
     nodes = payload.get("api_v1_registered_compute_nodes")
     if not isinstance(nodes, list):
-        raise ValueError("malformed API-v1 registered node diagnostics")
+        raise _relay_probe_error("schema_validation",
+            message="malformed API-v1 registered node diagnostics")
     declared_count = payload.get("total_api_v1_registered_compute_nodes")
     if (isinstance(declared_count, bool)
             or not isinstance(declared_count, int)
             or declared_count < 0
             or declared_count != len(nodes)):
-        raise ValueError("malformed API-v1 registered node count")
+        raise _relay_probe_error("count_validation",
+            message="malformed API-v1 registered node count")
     fingerprints = []
     for node in nodes:
         if not isinstance(node, dict):
-            raise ValueError("malformed API-v1 registered node")
+            raise _relay_probe_error("schema_validation",
+                message="malformed API-v1 registered node")
         public_key = node.get("server_public_key")
         if not isinstance(public_key, str) or not public_key:
-            raise ValueError("malformed API-v1 registered node public key")
+            raise _relay_probe_error("schema_validation",
+                message="malformed API-v1 registered node public key")
         fingerprints.append(hashlib.sha256(
             public_key.encode("utf-8", errors="ignore")).hexdigest()[:12])
     return fingerprints
@@ -197,9 +266,12 @@ def require_clean_relay_registration_baseline(
     """Require an authoritative empty relay before starting this attempt."""
     attempts = 0
     transient_failures = 0
+    failure_counts = {category: 0 for category in RELAY_PROBE_FAILURE_CATEGORIES}
     record_pre_start_state(baseline_outcome="polling",
         baseline_poll_attempt_count=attempts,
-        baseline_transient_failure_count=transient_failures)
+        baseline_transient_failure_count=transient_failures,
+        baseline_failure_category_counts=failure_counts,
+        baseline_last_failure_category="none", baseline_last_http_status=None)
     deadline = time.monotonic() + timeout_seconds
     while True:
         remaining = deadline - time.monotonic()
@@ -214,10 +286,18 @@ def require_clean_relay_registration_baseline(
         try:
             registered = fetch_api_v1_registered_node_fingerprints(
                 relay_url, timeout_seconds=max(0.05, min(remaining, 0.5)))
-        except Exception:
+        except Exception as exc:
             transient_failures += 1
+            category = getattr(exc, "relay_probe_category", "unknown")
+            if category not in RELAY_PROBE_FAILURE_CATEGORIES:
+                category = "unknown"
+            failure_counts[category] = min(
+                _MAX_DIAGNOSTIC_COUNTER, failure_counts[category] + 1)
             record_pre_start_state(
-                baseline_transient_failure_count=transient_failures)
+                baseline_transient_failure_count=transient_failures,
+                baseline_failure_category_counts=failure_counts,
+                baseline_last_failure_category=category,
+                baseline_last_http_status=getattr(exc, "relay_http_status", None))
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
             continue
         count = len(registered)
@@ -1069,7 +1149,7 @@ def tauri_driver_command() -> list[str]:
     )
 
 
-WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v8"
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v9"
 WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
 WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
     "read_timeout", "connection_failure", "capability_rejection",
@@ -1142,11 +1222,22 @@ PRE_START_DIAGNOSTIC_ALLOWLISTS = {
     "start_click_exception_category": frozenset({
         "none", "no_such_element", "stale_element", "timeout", "webdriver", "other",
     }),
+    "baseline_last_failure_category": frozenset({
+        "none", "dns", "connection", "tls", "timeout", "response_read",
+        "utf8_json", "schema_validation", "count_validation", "http_status", "unknown",
+    }),
 }
 PRE_START_DIAGNOSTIC_DEFAULTS = {
     "baseline_outcome": "not_entered",
     "baseline_poll_attempt_count": 0,
     "baseline_transient_failure_count": 0,
+    "baseline_failure_category_counts": {
+        "dns": 0, "connection": 0, "tls": 0, "timeout": 0,
+        "response_read": 0, "utf8_json": 0, "schema_validation": 0,
+        "count_validation": 0, "http_status": 0, "unknown": 0,
+    },
+    "baseline_last_failure_category": "none",
+    "baseline_last_http_status": None,
     "last_authoritative_registered_node_count": None,
     "start_click_state": "not_reached",
     "start_click_exception_category": "none",
@@ -1469,19 +1560,22 @@ def _write_webdriver_diagnostic(
         operator_progress = "not_started"
     supplied_start_diagnostic = operator_start_diagnostic or {}
     safe_start_diagnostic = {
-        field: (value if (value := supplied_start_diagnostic.get(field)) in allowed
+        field: (value if isinstance(value := supplied_start_diagnostic.get(field), str)
+                and value in allowed
                 else OPERATOR_START_DIAGNOSTIC_DEFAULTS[field])
         for field, allowed in OPERATOR_START_DIAGNOSTIC_ALLOWLISTS.items()
     }
     supplied_native_diagnostic = native_startup_diagnostic or {}
     safe_native_diagnostic = {
-        field: (value if (value := supplied_native_diagnostic.get(field)) in allowed
+        field: (value if isinstance(value := supplied_native_diagnostic.get(field), str)
+                and value in allowed
                 else NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS[field])
         for field, allowed in NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS.items()
     }
     supplied_packaged_diagnostic = packaged_startup_diagnostic or {}
     safe_packaged_diagnostic = {
-        field: (value if (value := supplied_packaged_diagnostic.get(field)) in allowed
+        field: (value if isinstance(value := supplied_packaged_diagnostic.get(field), str)
+                and value in allowed
                 else PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS[field])
         for field, allowed in PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS.items()
     }
@@ -1494,8 +1588,21 @@ def _write_webdriver_diagnostic(
     }
     for field in ("baseline_poll_attempt_count", "baseline_transient_failure_count"):
         value = supplied_pre_start.get(field)
-        safe_pre_start[field] = (value if isinstance(value, int)
+        safe_pre_start[field] = (min(value, _MAX_DIAGNOSTIC_COUNTER)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0)
+    supplied_counts = supplied_pre_start.get("baseline_failure_category_counts")
+    if not isinstance(supplied_counts, dict):
+        supplied_counts = {}
+    safe_pre_start["baseline_failure_category_counts"] = {
+        category: (min(value, _MAX_DIAGNOSTIC_COUNTER)
+            if isinstance(value := supplied_counts.get(category), int)
             and not isinstance(value, bool) and value >= 0 else 0)
+        for category in RELAY_PROBE_FAILURE_CATEGORIES
+    }
+    value = supplied_pre_start.get("baseline_last_http_status")
+    safe_pre_start["baseline_last_http_status"] = (value
+        if isinstance(value, int) and not isinstance(value, bool)
+        and 100 <= value <= 599 else None)
     value = supplied_pre_start.get("last_authoritative_registered_node_count")
     safe_pre_start["last_authoritative_registered_node_count"] = (
         value if isinstance(value, int) and not isinstance(value, bool) and value >= 0

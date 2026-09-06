@@ -79,6 +79,8 @@ def desktop_runner():
     tree = ast.parse(RUNNER_SOURCE.read_text(encoding="utf-8"))
     assignments = {
         "NATIVE_WEBDRIVER_URL", "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION",
+        "RELAY_DIAGNOSTICS_USER_AGENT", "RELAY_PROBE_FAILURE_CATEGORIES",
+        "_MAX_DIAGNOSTIC_COUNTER",
         "_BRIDGE_RESET_PATTERN", "_MAX_FRESH_BRIDGE_LOG_BYTES",
         "WEBDRIVER_COMPATIBILITY_RESULTS", "WEBDRIVER_EXCEPTION_FAMILIES",
         "WEBDRIVER_PROCESS_POSTURES", "WEBDRIVER_SESSION_ELAPSED_BUCKETS",
@@ -102,7 +104,9 @@ def desktop_runner():
         "tauri_driver_environment", "tauri_driver_command", "wait_for_webdriver_ready",
         "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
         "wait_for_post_start_operator_state", "require_clean_relay_registration_baseline",
-        "fetch_api_v1_registered_node_fingerprints", "_bridge_reset_observations",
+        "fetch_api_v1_registered_node_fingerprints", "fetch_relay_diagnostics_count",
+        "_fetch_relay_diagnostics_payload", "_relay_probe_error",
+        "_bridge_reset_observations",
         "fresh_bridge_key_fingerprint",
         "authoritative_registration_matches",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
@@ -137,14 +141,17 @@ def desktop_runner():
         "WebDriverException": _WebDriverException,
         "WebDriverWait": object, "WEBDRIVER_URL": "http://127.0.0.1:4444",
         "NATIVE_WEBDRIVER_URL": "http://127.0.0.1:4445",
-        "urlopen": None,
+        "urlopen": None, "Request": __import__("urllib.request", fromlist=["Request"]).Request,
+        "HTTPError": __import__("urllib.error", fromlist=["HTTPError"]).HTTPError,
+        "URLError": __import__("urllib.error", fromlist=["URLError"]).URLError,
+        "socket": __import__("socket"), "ssl": __import__("ssl"),
         "PACKAGED_FAILURE_REASONS": h.PACKAGED_FAILURE_REASONS,
         "PACKAGED_PHASES": h.PACKAGED_PHASES,
         "SessionNotCreatedException": SessionNotCreatedException,
         "InvalidArgumentException": InvalidArgumentException,
         "ReadTimeoutError": ReadTimeoutError, "ConnectTimeoutError": ConnectTimeoutError,
         "NewConnectionError": NewConnectionError, "ProtocolError": ProtocolError,
-        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v8",
+        "WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION": "packaged-webdriver-diagnostic-v9",
         "WEBDRIVER_COMPATIBILITY_RESULTS": frozenset({"match", "mismatch", "unknown"}),
         "WEBDRIVER_EXCEPTION_FAMILIES": frozenset({"read_timeout", "connection_failure",
             "capability_rejection", "driver_version_mismatch", "application_startup_failure",
@@ -859,7 +866,7 @@ def test_webdriver_session_diagnostic_artifact_is_fixed_schema_and_sanitized(
         "C:\\private\\target", "SECRET_READINESS")
     artifact = tmp_path / "packaged-webdriver-diagnostic.json"
     assert json.loads(artifact.read_text()) == {
-        "schema_version": "packaged-webdriver-diagnostic-v8",
+        "schema_version": "packaged-webdriver-diagnostic-v9",
         "browser_driver_compatibility": "unknown",
         "tauri_driver_state": "unknown",
         "webdriver_failure_category": "webdriver_session_creation_failed",
@@ -896,7 +903,7 @@ def test_webdriver_diagnostic_clamps_invalid_v3_enums(desktop_runner, tmp_path):
     artifact = json.loads(
         (tmp_path / "packaged-webdriver-diagnostic.json").read_text())
     assert artifact == {
-        "schema_version": "packaged-webdriver-diagnostic-v8",
+        "schema_version": "packaged-webdriver-diagnostic-v9",
         "browser_driver_compatibility": "match",
         "tauri_driver_state": "running",
         "webdriver_failure_category": "none",
@@ -940,14 +947,23 @@ def test_webdriver_diagnostic_clamps_hostile_pre_start_fields(desktop_runner, tm
             "baseline_outcome": ["C:\\Users\\private\\SECRET"],
             "baseline_poll_attempt_count": True,
             "baseline_transient_failure_count": -1,
+            "baseline_failure_category_counts": {
+                "http_status": 10**20, "timeout": True,
+                "C:\\private\\SECRET": 12},
+            "baseline_last_failure_category": ["C:\\private\\SECRET"],
+            "baseline_last_http_status": True,
             "last_authoritative_registered_node_count": "response body SECRET",
             "start_click_state": {"private": "SECRET"},
             "start_click_exception_category": {"private exception SECRET"},
         })
     artifact_text = (tmp_path / "packaged-webdriver-diagnostic.json").read_text()
     artifact = json.loads(artifact_text)
-    assert {field: artifact[field] for field in desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS} \
-        == desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS
+    expected = desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS.copy()
+    expected["baseline_failure_category_counts"] = {
+        **expected["baseline_failure_category_counts"],
+        "http_status": desktop_runner._MAX_DIAGNOSTIC_COUNTER,
+    }
+    assert {field: artifact[field] for field in expected} == expected
     assert "private" not in artifact_text
     assert "SECRET" not in artifact_text
 
@@ -1440,6 +1456,98 @@ def test_authoritative_registration_requires_one_matching_local_node(
     assert desktop_runner.authoritative_registration_matches(
         "https://relay.example", timeout_seconds=0.5,
         bridge_log=Path("runner.log"), bridge_log_start_offset=42) is expected
+
+
+@pytest.mark.parametrize("helper, payload, expected", [
+    ("fetch_relay_diagnostics_count",
+        {"total_api_v1_registered_compute_nodes": 0}, 0),
+    ("fetch_api_v1_registered_node_fingerprints",
+        {"total_api_v1_registered_compute_nodes": 0,
+         "api_v1_registered_compute_nodes": []}, []),
+])
+def test_relay_diagnostics_transport_uses_explicit_honest_user_agent(
+        desktop_runner, helper, payload, expected):
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self):
+            return json.dumps(payload).encode("utf-8")
+
+    def transport(request, *, timeout):
+        calls.append((request, timeout))
+        # Deterministically model the observed default-header rejection.
+        if request.get_header("User-agent") != desktop_runner.RELAY_DIAGNOSTICS_USER_AGENT:
+            raise desktop_runner.HTTPError(request.full_url, 403, "rejected", {}, None)
+        return Response()
+
+    desktop_runner.urlopen = transport
+    assert getattr(desktop_runner, helper)(
+        "https://relay.example", timeout_seconds=0.5) == expected
+    request, timeout = calls[0]
+    assert request.full_url == "https://relay.example/relay/diagnostics"
+    assert request.get_method() == "GET"
+    assert request.get_header("User-agent") == \
+        "token.place-relay-baseline-diagnostic/1.0"
+    assert timeout == 0.5
+
+
+@pytest.mark.parametrize("failure, category, status", [
+    (lambda runner: runner.HTTPError("https://relay.example", 403, "private", {}, None),
+        "http_status", 403),
+    (lambda runner: runner.URLError(runner.socket.gaierror("private")), "dns", None),
+    (lambda runner: runner.URLError(ConnectionRefusedError("private")), "connection", None),
+    (lambda runner: runner.URLError(runner.ssl.SSLError("private")), "tls", None),
+    (lambda runner: TimeoutError("private"), "timeout", None),
+])
+def test_relay_diagnostics_transport_failures_are_bounded(
+        desktop_runner, failure, category, status):
+    desktop_runner.urlopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        failure(desktop_runner))
+    with pytest.raises(ValueError, match="^relay diagnostics probe failed$") as raised:
+        desktop_runner.fetch_relay_diagnostics_count(
+            "https://relay.example/private", timeout_seconds=0.5)
+    assert raised.value.relay_probe_category == category
+    assert raised.value.relay_http_status == status
+    assert "private" not in str(raised.value)
+
+
+def test_relay_baseline_does_not_swallow_cancellation(desktop_runner):
+    desktop_runner.fetch_api_v1_registered_node_fingerprints = \
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        desktop_runner.require_clean_relay_registration_baseline(
+            "https://relay.example", timeout_seconds=0.5,
+            fail_closed=pytest.fail, record_relay_observation=lambda _value: None)
+
+
+def test_relay_baseline_records_repeated_http_status_without_private_data(
+        desktop_runner, monkeypatch):
+    clock = [0.0]
+    def monotonic():
+        clock[0] += 0.03
+        return clock[0]
+    monkeypatch.setattr(desktop_runner.time, "monotonic", monotonic)
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    private = "C:\\Users\\private\\prompt-secret"
+    desktop_runner.fetch_api_v1_registered_node_fingerprints = \
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            desktop_runner._relay_probe_error("http_status", 403, private))
+    diagnostic = desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS.copy()
+    with pytest.raises(RuntimeError, match="^operator_registration_not_reached$"):
+        desktop_runner.require_clean_relay_registration_baseline(
+            "https://relay.example", timeout_seconds=0.1,
+            fail_closed=lambda reason: (_ for _ in ()).throw(RuntimeError(reason)),
+            record_relay_observation=lambda _value: None,
+            record_pre_start_state=lambda **changes: diagnostic.update(changes))
+    assert diagnostic["baseline_transient_failure_count"] == 2
+    assert diagnostic["baseline_failure_category_counts"]["http_status"] == 2
+    assert diagnostic["baseline_last_failure_category"] == "http_status"
+    assert diagnostic["baseline_last_http_status"] == 403
+    assert private not in json.dumps(diagnostic)
 
 
 @pytest.mark.parametrize("nodes", [None, {}, [None], [{"server_public_key": ""}]])

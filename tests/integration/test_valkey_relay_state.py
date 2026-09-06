@@ -3143,6 +3143,113 @@ def test_encrypted_response_compatibility_gates_fail_closed_before_state_or_acce
         store.close()
 
 
+def test_encrypted_response_namespace_isolation(valkey_server):
+    stores = [
+        _registration_store(valkey_server, uuid.uuid4().hex) for _ in range(2)
+    ]
+    node, owner, consumer = (
+        "namespace-response-node",
+        _digest("namespace-response-owner"),
+        "namespace-response-consumer",
+    )
+    identity = ("namespace-response-client", "namespace-response-request")
+    envelopes = (
+        EncryptedResponseEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "ciphertext-a", "key-a", "iv-a"
+        ),
+        EncryptedResponseEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "ciphertext-b", "key-b", "iv-b"
+        ),
+    )
+    authorities = [
+        _response_acceptance_authority(store, node, identity) for store in stores
+    ]
+    try:
+        assert set(authorities[0][0]).isdisjoint(authorities[1][0])
+        for store, (keys, _) in zip(stores, authorities):
+            assert all(
+                key.startswith(store._foundation.config.key_prefix) for key in keys
+            )
+
+        claims = []
+        for store in stores:
+            store.register(node, _capabilities(), owner)
+            deadline = store._foundation.server_time()[0] + 60
+            _enqueue_claim_fixture(store, node, owner, *identity, deadline)
+            claims.append(store.claim_queued_request(node, owner, consumer))
+
+        before = [
+            _exact_key_snapshot(store, authority[0])
+            for store, authority in zip(stores, authorities)
+        ]
+        accepted = stores[0].accept_encrypted_response(
+            node, owner, consumer, *identity, claims[0].generation, envelopes[0]
+        )
+        assert accepted.new_outcome is True
+        assert _exact_key_snapshot(stores[1], authorities[1][0]) == before[1]
+        assert stores[1]._foundation._client.exists(
+            authorities[1][0][7], authorities[1][0][9]
+        ) == 0
+        assert stores[1]._foundation._client.zscore(
+            authorities[1][0][8], authorities[1][1]
+        ) is None
+        assert stores[1]._foundation._client.zscore(
+            authorities[1][0][10], authorities[1][1]
+        ) is None
+
+        namespace_a = _exact_key_snapshot(stores[0], authorities[0][0])
+        accepted_other = stores[1].accept_encrypted_response(
+            node, owner, consumer, *identity, claims[1].generation, envelopes[1]
+        )
+        assert accepted_other.new_outcome is True
+        assert _exact_key_snapshot(stores[0], authorities[0][0]) == namespace_a
+
+        namespace_b = _exact_key_snapshot(stores[1], authorities[1][0])
+        response_records = stores[0].response_records()
+        terminal_records = stores[0].terminal_records()
+        assert _exact_key_snapshot(stores[1], authorities[1][0]) == namespace_b
+        assert len(response_records) == len(terminal_records) == 1
+        assert response_records[0].envelope == envelopes[0]
+        assert (
+            terminal_records[0].response_digest == response_records[0].response_digest
+        )
+
+        namespace_a = _exact_key_snapshot(stores[0], authorities[0][0])
+        response_records = stores[1].response_records()
+        terminal_records = stores[1].terminal_records()
+        assert _exact_key_snapshot(stores[0], authorities[0][0]) == namespace_a
+        assert len(response_records) == len(terminal_records) == 1
+        assert response_records[0].envelope == envelopes[1]
+        assert (
+            terminal_records[0].response_digest == response_records[0].response_digest
+        )
+
+        completed = [
+            _exact_key_snapshot(store, authority[0])
+            for store, authority in zip(stores, authorities)
+        ]
+        for index, store in enumerate(stores):
+            replay = store.accept_encrypted_response(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claims[index].generation,
+                envelopes[index],
+            )
+            assert replay == dataclasses.replace(
+                (accepted, accepted_other)[index], new_outcome=False
+            )
+        assert [
+            _exact_key_snapshot(store, authority[0])
+            for store, authority in zip(stores, authorities)
+        ] == completed
+    finally:
+        for store in stores:
+            _delete_claim_fixture_state(store, (node,), (identity,))
+            store.close()
+
+
 def test_encrypted_response_committed_lost_reply_is_recovered_without_replay(
     valkey_server, caplog
 ):

@@ -3071,6 +3071,83 @@ def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_s
         second.close()
 
 
+def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "retrieve-node", _digest("retrieve-owner"), "consumer"
+    identity = ("retrieve-client", "retrieve-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "response-iv"
+    )
+    deadline = time.time() + 60
+    try:
+        first.register(node, _capabilities(), owner)
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        first.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request-ciphertext", "request-key", "request-iv"
+            ),
+            "cancel",
+        )
+        claim = first.claim_queued_request(node, owner, consumer)
+        accepted = first.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, response
+        )
+
+        initial = first.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        replay = second.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert initial == replay
+        assert initial.state == "response_ready"
+        assert initial.envelope == response
+        assert initial.request_deadline_epoch == deadline
+        assert initial.replay_expires_at_epoch == accepted.replay_expires_at_epoch
+        assert initial.acknowledgement_token is not None
+        assert first.retrieve_encrypted_response(
+            *identity, "0" * 64
+        ).state == "invalid_retrieval_credential"
+        assert first.retrieve_encrypted_response(
+            *identity, selection.reservation_token, "f" * 64
+        ).state == "invalid_acknowledgement"
+        assert first.response_records()[0].envelope == response
+
+        acknowledged = second.retrieve_encrypted_response(
+            *identity,
+            selection.reservation_token,
+            initial.acknowledgement_token,
+        )
+        duplicate = first.retrieve_encrypted_response(
+            *identity,
+            selection.reservation_token,
+            initial.acknowledgement_token,
+        )
+        assert acknowledged.state == duplicate.state == "acknowledged"
+        assert first.response_records() == ()
+        terminal = first.terminal_records()[0]
+        assert terminal.outcome == "completed"
+        assert terminal.retrieval_state == "acknowledged"
+        keys, member = _response_acceptance_authority(first, node, identity)
+        assert first._foundation._client.zscore(keys[8], member) is None
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
 @pytest.mark.parametrize(
     ("manifest", "expected_dispatches"),
     (

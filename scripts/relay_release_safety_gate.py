@@ -23,7 +23,11 @@ EXPECTED_IDS = {
     "quota.public_information_exempt",
     "quota.protected_route_limited",
 }
-SERIES_RE = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*(?:\{.*\})?\s+[-+0-9.NaInf]+(?:\s+\d+)?$")
+PROMETHEUS_NUMBER = r"[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|NaN|Inf)"
+SERIES_RE = re.compile(
+    rf"^[a-zA-Z_:][a-zA-Z0-9_:]*(?:\{{.*\}})?\s+{PROMETHEUS_NUMBER}(?:\s+\d+)?$"
+)
+GIT_REVISION_RE = re.compile(r"[0-9a-fA-F]{7,40}")
 
 
 class GateFailure(RuntimeError):
@@ -47,7 +51,8 @@ def load_contract(path: Path = CONTRACT_PATH) -> list[dict[str, str]]:
 def request(base_url: str, path: str, method: str = "GET") -> tuple[int, str]:
     req = urllib.request.Request(f"{base_url}{path}", method=method)
     try:
-        with urllib.request.urlopen(req, timeout=5) as response:
+        # base_url is constructed internally from a fixed loopback HTTP origin.
+        with urllib.request.urlopen(req, timeout=5) as response:  # nosec B310
             return response.status, response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8", "replace")
@@ -61,6 +66,21 @@ def series_count(metrics: str) -> int:
 
 def execute_checks(base_url: str) -> dict[str, dict[str, object]]:
     results: dict[str, dict[str, object]] = {}
+
+    # Exercise quota behavior before unmatched-path traffic so the deliberately
+    # tiny shared quota starts from a known state. Public routes must remain
+    # available even after the protected route consumes that quota.
+    first_protected = request(base_url, "/api/v1/models")[0]
+    second_protected = request(base_url, "/api/v1/models")[0]
+    public_statuses = []
+    for method in ("GET", "HEAD"):
+        for path in ("/", "/api/v1/meta", "/api/v1/version"):
+            public_statuses.extend(request(base_url, path, method)[0] for _ in range(3))
+    results["quota.public_information_exempt"] = {
+        "passed": first_protected != 429 and 429 not in public_statuses
+    }
+    results["quota.protected_route_limited"] = {"passed": second_protected == 429}
+
     _, before = request(base_url, "/metrics")
     probes = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(40)]
     for path in probes:
@@ -77,16 +97,6 @@ def execute_checks(base_url: str) -> dict[str, dict[str, object]]:
     growth = series_count(after) - series_count(before)
     results["metrics.bounded_unmatched_paths"] = {"passed": growth < len(probes), "series_growth": growth}
 
-    public_statuses = []
-    for method in ("GET", "HEAD"):
-        for path in ("/", "/api/v1/meta", "/api/v1/version"):
-            public_statuses.extend(request(base_url, path, method)[0] for _ in range(3))
-    first_protected = request(base_url, "/api/v1/models")[0]
-    second_protected = request(base_url, "/api/v1/models")[0]
-    results["quota.public_information_exempt"] = {
-        "passed": 429 not in public_statuses and first_protected != 429
-    }
-    results["quota.protected_route_limited"] = {"passed": second_protected == 429}
     return results
 
 
@@ -105,7 +115,11 @@ def docker_output(*args: str) -> str:
 
 
 def validate_candidate_identity(source: str, revision: str, digest: str | None, repo_digests: str = "") -> None:
-    if not revision or not (source.startswith(revision) or revision.startswith(source)):
+    if (
+        not GIT_REVISION_RE.fullmatch(source)
+        or not GIT_REVISION_RE.fullmatch(revision)
+        or not (source.startswith(revision) or revision.startswith(source))
+    ):
         raise GateFailure("candidate image revision label does not match the requested source commit")
     if digest:
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
@@ -154,11 +168,16 @@ def main() -> int:
             raise GateFailure("candidate relay did not become ready")
         evidence["results"] = qualify(base_url)
         evidence["passed"] = True
-    except (GateFailure, subprocess.CalledProcessError) as exc:
+    except (GateFailure, subprocess.CalledProcessError, OSError) as exc:
         evidence["passed"] = False
         evidence["error"] = str(exc)
     finally:
-        subprocess.run(["docker", "rm", "-f", container], check=False, capture_output=True)
+        try:
+            subprocess.run(["docker", "rm", "-f", container], check=False, capture_output=True)
+        except OSError:
+            # Preserve the original failure and still emit fail-closed evidence
+            # when Docker is missing or cannot be executed during cleanup.
+            pass
         args.evidence.parent.mkdir(parents=True, exist_ok=True)
         args.evidence.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(evidence, indent=2, sort_keys=True))

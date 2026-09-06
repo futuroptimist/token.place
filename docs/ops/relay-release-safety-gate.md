@@ -23,8 +23,9 @@ python scripts/relay_release_safety_gate.py \
 
 A passing report contains `passed: true`, the source/ref and immutable image identity, plus a result
 for every contract requirement. For publication, CI first pushes a uniquely named non-release
-candidate index, pulls it by digest, qualifies that exact artifact, and only then attaches the
-production-eligible tags. CI uploads the non-secret report and records the OCI index digest in the
+candidate index, pulls each advertised platform by digest, qualifies every platform artifact, and
+only then attaches the production-eligible tags to the index. CI uploads one non-secret report per
+platform and records the OCI index digest in the
 workflow summary. Missing, duplicate, skipped, malformed, mismatched, or false results fail
 closed. The report intentionally excludes request bodies, credentials, client identities, logs, and
 the randomized unmatched paths used by the probe.

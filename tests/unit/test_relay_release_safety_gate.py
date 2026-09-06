@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -112,3 +114,46 @@ def test_registry_digest_mismatch_fails_closed():
     expected = "sha256:" + "a" * 64
     with pytest.raises(gate.GateFailure, match="digest"):
         gate.validate_candidate_identity("abc1234", "abc1234", expected, '["repo@sha256:' + "b" * 64 + '"]')
+
+
+@pytest.mark.parametrize(("source", "revision"), [("a", "a"), ("abc1234", "xyz9876"), ("g" * 7, "g" * 7)])
+def test_revision_requires_matching_git_hashes(source, revision):
+    with pytest.raises(gate.GateFailure, match="revision"):
+        gate.validate_candidate_identity(source, revision, None)
+
+
+def test_revision_allows_valid_abbreviated_prefix():
+    gate.validate_candidate_identity("abcdef0123456789", "abcdef0", None)
+
+
+def test_series_count_accepts_prometheus_float_formats():
+    metrics = "\n".join([
+        "counter 1e+06",
+        'gauge{label="value"} -2.5E-3 1234567890',
+        "positive_inf +Inf",
+        "not_a_sample help text",
+    ])
+    assert gate.series_count(metrics) == 3
+
+
+def test_missing_docker_still_writes_failure_evidence(tmp_path, monkeypatch):
+    evidence = tmp_path / "evidence.json"
+    monkeypatch.setattr(sys, "argv", [
+        str(SCRIPT),
+        "--image", "missing:image",
+        "--source-commit", "abcdef0",
+        "--release-ref", "main",
+        "--release-base", "main",
+        "--evidence", str(evidence),
+    ])
+
+    def missing_docker(*_args, **_kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(gate, "docker_output", missing_docker)
+    monkeypatch.setattr(gate.subprocess, "run", missing_docker)
+
+    assert gate.main() == 1
+    report = json.loads(evidence.read_text(encoding="utf-8"))
+    assert report["passed"] is False
+    assert "docker" in report["error"]

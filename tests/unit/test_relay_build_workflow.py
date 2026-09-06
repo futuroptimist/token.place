@@ -41,11 +41,15 @@ def test_every_relay_image_publish_is_blocked_on_artifact_safety_gate() -> None:
     gate = workflow_text.index("python scripts/relay_release_safety_gate.py")
     publish_job = workflow_text.index("\n  publish:")
     push = workflow_text.index("push: true", publish_job)
-    exact_gate = workflow_text.index("Pull and qualify the exact candidate index", push)
+    exact_gate = workflow_text.index("Pull and qualify every candidate platform", push)
     promotion = workflow_text.index("Promote qualified candidate to release tags", exact_gate)
 
     assert gate < publish_job < push < exact_gate < promotion
     assert "needs: build-and-smoke" in workflow_text[publish_job:push]
     assert "if-no-files-found: error" in workflow_text
     assert "steps.push.outputs.digest" in workflow_text
+    qualification = workflow_text[exact_gate:promotion]
+    assert "for platform in linux/amd64 linux/arm64" in qualification
+    assert 'docker pull --platform "${platform}" "${candidate}"' in qualification
+    assert "relay-release-safety-publish-${platform_tag}-evidence.json" in qualification
     assert "docker buildx imagetools create" in workflow_text[promotion:]

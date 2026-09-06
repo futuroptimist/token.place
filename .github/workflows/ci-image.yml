@@ -264,26 +264,30 @@ jobs:
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
 
-      - name: Pull and qualify the exact candidate index
+      - name: Pull and qualify every candidate platform
         run: |
           set -euo pipefail
           candidate="${{ needs.build-and-smoke.outputs.repository }}@${{ steps.push.outputs.digest }}"
-          docker pull "${candidate}"
-          docker tag "${candidate}" tokenplace-relay:publish-candidate
-          python scripts/relay_release_safety_gate.py \
-            --image tokenplace-relay:publish-candidate \
-            --source-commit "$(git rev-parse HEAD)" \
-            --release-ref "${GITHUB_REF}" \
-            --release-base "${{ github.base_ref || 'main' }}" \
-            --candidate-digest "${{ steps.push.outputs.digest }}" \
-            --evidence relay-release-safety-publish-evidence.json
+          for platform in linux/amd64 linux/arm64; do
+            platform_tag="${platform//\//-}"
+            image="tokenplace-relay:publish-candidate-${platform_tag}"
+            docker pull --platform "${platform}" "${candidate}"
+            docker tag "${candidate}" "${image}"
+            python scripts/relay_release_safety_gate.py \
+              --image "${image}" \
+              --source-commit "$(git rev-parse HEAD)" \
+              --release-ref "${GITHUB_REF}" \
+              --release-base "${{ github.base_ref || 'main' }}" \
+              --candidate-digest "${{ steps.push.outputs.digest }}" \
+              --evidence "relay-release-safety-publish-${platform_tag}-evidence.json"
+          done
 
       - name: Upload publication safety evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: relay-release-safety-publish-${{ needs.build-and-smoke.outputs.short_sha }}
-          path: relay-release-safety-publish-evidence.json
+          path: relay-release-safety-publish-*-evidence.json
           if-no-files-found: error
 
       - name: Promote qualified candidate to release tags

@@ -14,6 +14,7 @@ import valkey_relay_state
 
 from valkey_relay_state import (
     ACCEPT_RESPONSE_SCRIPT,
+    RETRIEVE_RESPONSE_SCRIPT,
     DirectPrimary,
     ReviewedScript,
     SchemaManifest,
@@ -195,7 +196,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "3559da1040624e6ac52d933a3d116c680d0398243ca4c68b308d0e1c4e10ecd8"  # pragma: allowlist secret
+    expected_digest = "fcbec2f8126ea96834b8196a907aced2fe5e82d41edfbe7f966f2820a89774d8"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -245,6 +246,38 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     assert expiry_guard_offset < ACCEPT_RESPONSE_SCRIPT.source.index(
         "redis.call('XDEL',queue"
     )
+
+
+def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
+    expected_digest = "53458e8528e0c2d02c10472c45279a03be0884435461d36c6b2b37843cfb8bb7"  # pragma: allowlist secret
+    assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
+    assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
+    assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
+    assert not re.search(
+        r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
+        RETRIEVE_RESPONSE_SCRIPT.source,
+    )
+    assert "local t=redis.call('TIME')" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "if replay<=now then" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert RETRIEVE_RESPONSE_SCRIPT.source.index("if replay<=now then") < (
+        RETRIEVE_RESPONSE_SCRIPT.source.index("if mode=='read' then")
+    )
+    assert "expected_envelope~=rv[8]" in RETRIEVE_RESPONSE_SCRIPT.source
+
+
+@pytest.mark.parametrize(
+    ("client", "request_id"),
+    ((None, "request"), ("client", None), ("", "request"), ("client", "")),
+)
+def test_retrieve_response_rejects_invalid_identity_before_backend(client, request_id):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(RelayStateStoreError, match="request identity is invalid"):
+        store.retrieve_encrypted_response(client, request_id, "a" * 64)
+
+    foundation.execute.assert_not_called()
 
 
 def config(**changes):

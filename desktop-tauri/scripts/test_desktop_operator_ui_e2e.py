@@ -12,12 +12,14 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import psutil
 from urllib3.exceptions import (
@@ -104,35 +106,104 @@ def wait_for_http_200(url: str, timeout_seconds: float = 30.0) -> None:
 
 
 
+RELAY_DIAGNOSTICS_USER_AGENT = "token.place-relay-baseline-diagnostic/1.0"
+RELAY_BASELINE_FAILURE_CATEGORIES = frozenset({
+    "none", "http_status", "dns", "connection", "tls", "timeout",
+    "response_read", "response_utf8", "response_json", "response_schema",
+    "response_count", "unknown",
+})
+_MAX_DIAGNOSTIC_COUNTER = 1_000_000
+
+
+def _relay_probe_error(category: str, *, http_status: object = None) -> ValueError:
+    """Create a bounded relay-probe error without retaining private details."""
+    error = ValueError("relay diagnostics probe failed")
+    error.relay_failure_category = (category
+        if category in RELAY_BASELINE_FAILURE_CATEGORIES else "unknown")
+    error.relay_http_status = (http_status
+        if isinstance(http_status, int) and not isinstance(http_status, bool)
+        and 100 <= http_status <= 599 else None)
+    return error
+
+
+def _relay_diagnostics_payload(relay_url: str, *, timeout_seconds: float) -> object:
+    request = Request(f"{relay_url}/relay/diagnostics", method="GET", headers={
+        "User-Agent": RELAY_DIAGNOSTICS_USER_AGENT,
+    })
+    try:
+        response_context = urlopen(request, timeout=timeout_seconds)  # nosec B310
+    except HTTPError as exc:
+        raise _relay_probe_error("http_status", http_status=exc.code) from None
+    except URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, socket.gaierror):
+            category = "dns"
+        elif isinstance(reason, ssl.SSLError):
+            category = "tls"
+        elif isinstance(reason, (TimeoutError, socket.timeout)):
+            category = "timeout"
+        elif isinstance(reason, (ConnectionError, OSError)):
+            category = "connection"
+        else:
+            category = "unknown"
+        raise _relay_probe_error(category) from None
+    except (TimeoutError, socket.timeout):
+        raise _relay_probe_error("timeout") from None
+    except ssl.SSLError:
+        raise _relay_probe_error("tls") from None
+    except (ConnectionError, OSError):
+        raise _relay_probe_error("connection") from None
+    except Exception:
+        raise _relay_probe_error("unknown") from None
+    try:
+        with response_context as response:
+            body = response.read()
+    except (TimeoutError, socket.timeout):
+        raise _relay_probe_error("timeout") from None
+    except Exception:
+        raise _relay_probe_error("response_read") from None
+    try:
+        text = body.decode("utf-8")
+    except (UnicodeDecodeError, AttributeError):
+        raise _relay_probe_error("response_utf8") from None
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        raise _relay_probe_error("response_json") from None
+
+
 def fetch_relay_diagnostics_count(relay_url: str, *, timeout_seconds: float) -> int:
-    with urlopen(f"{relay_url}/relay/diagnostics", timeout=timeout_seconds) as response:  # nosec B310
-        payload = json.loads(response.read().decode("utf-8"))
-    return int(payload["total_api_v1_registered_compute_nodes"])
+    payload = _relay_diagnostics_payload(relay_url, timeout_seconds=timeout_seconds)
+    if not isinstance(payload, dict):
+        raise _relay_probe_error("response_schema")
+    count = payload.get("total_api_v1_registered_compute_nodes")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise _relay_probe_error("response_count")
+    return count
 
 
 def fetch_api_v1_registered_node_fingerprints(
         relay_url: str, *, timeout_seconds: float) -> list[str]:
     """Return validated API-v1 node fingerprints without retaining public keys."""
-    with urlopen(f"{relay_url}/relay/diagnostics", timeout=timeout_seconds) as response:  # nosec B310
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = _relay_diagnostics_payload(relay_url, timeout_seconds=timeout_seconds)
     if not isinstance(payload, dict):
-        raise ValueError("malformed relay diagnostics")
+        raise _relay_probe_error("response_schema")
     nodes = payload.get("api_v1_registered_compute_nodes")
     if not isinstance(nodes, list):
-        raise ValueError("malformed API-v1 registered node diagnostics")
+        raise _relay_probe_error("response_schema")
     declared_count = payload.get("total_api_v1_registered_compute_nodes")
     if (isinstance(declared_count, bool)
             or not isinstance(declared_count, int)
             or declared_count < 0
             or declared_count != len(nodes)):
-        raise ValueError("malformed API-v1 registered node count")
+        raise _relay_probe_error("response_count")
     fingerprints = []
     for node in nodes:
         if not isinstance(node, dict):
-            raise ValueError("malformed API-v1 registered node")
+            raise _relay_probe_error("response_schema")
         public_key = node.get("server_public_key")
         if not isinstance(public_key, str) or not public_key:
-            raise ValueError("malformed API-v1 registered node public key")
+            raise _relay_probe_error("response_schema")
         fingerprints.append(hashlib.sha256(
             public_key.encode("utf-8", errors="ignore")).hexdigest()[:12])
     return fingerprints
@@ -197,9 +268,12 @@ def require_clean_relay_registration_baseline(
     """Require an authoritative empty relay before starting this attempt."""
     attempts = 0
     transient_failures = 0
+    failure_counts = {category: 0 for category in RELAY_BASELINE_FAILURE_CATEGORIES
+        if category != "none"}
     record_pre_start_state(baseline_outcome="polling",
         baseline_poll_attempt_count=attempts,
-        baseline_transient_failure_count=transient_failures)
+        baseline_transient_failure_count=transient_failures,
+        baseline_failure_counts=failure_counts)
     deadline = time.monotonic() + timeout_seconds
     while True:
         remaining = deadline - time.monotonic()
@@ -214,10 +288,18 @@ def require_clean_relay_registration_baseline(
         try:
             registered = fetch_api_v1_registered_node_fingerprints(
                 relay_url, timeout_seconds=max(0.05, min(remaining, 0.5)))
-        except Exception:
+        except Exception as exc:
             transient_failures += 1
+            category = getattr(exc, "relay_failure_category", "unknown")
+            if category not in failure_counts:
+                category = "unknown"
+            failure_counts[category] = min(
+                _MAX_DIAGNOSTIC_COUNTER, failure_counts[category] + 1)
             record_pre_start_state(
-                baseline_transient_failure_count=transient_failures)
+                baseline_transient_failure_count=transient_failures,
+                baseline_last_failure_category=category,
+                baseline_last_http_status=getattr(exc, "relay_http_status", None),
+                baseline_failure_counts=failure_counts.copy())
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
             continue
         count = len(registered)
@@ -1069,7 +1151,7 @@ def tauri_driver_command() -> list[str]:
     )
 
 
-WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v8"
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v9"
 WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
 WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
     "read_timeout", "connection_failure", "capability_rejection",
@@ -1142,12 +1224,20 @@ PRE_START_DIAGNOSTIC_ALLOWLISTS = {
     "start_click_exception_category": frozenset({
         "none", "no_such_element", "stale_element", "timeout", "webdriver", "other",
     }),
+    "baseline_last_failure_category": RELAY_BASELINE_FAILURE_CATEGORIES,
 }
 PRE_START_DIAGNOSTIC_DEFAULTS = {
     "baseline_outcome": "not_entered",
     "baseline_poll_attempt_count": 0,
     "baseline_transient_failure_count": 0,
     "last_authoritative_registered_node_count": None,
+    "baseline_last_failure_category": "none",
+    "baseline_last_http_status": None,
+    "baseline_failure_counts": {
+        "http_status": 0, "dns": 0, "connection": 0, "tls": 0, "timeout": 0,
+        "response_read": 0, "response_utf8": 0, "response_json": 0,
+        "response_schema": 0, "response_count": 0, "unknown": 0,
+    },
     "start_click_state": "not_reached",
     "start_click_exception_category": "none",
 }
@@ -1494,12 +1584,25 @@ def _write_webdriver_diagnostic(
     }
     for field in ("baseline_poll_attempt_count", "baseline_transient_failure_count"):
         value = supplied_pre_start.get(field)
-        safe_pre_start[field] = (value if isinstance(value, int)
-            and not isinstance(value, bool) and value >= 0 else 0)
+        safe_pre_start[field] = (min(value, _MAX_DIAGNOSTIC_COUNTER)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0)
     value = supplied_pre_start.get("last_authoritative_registered_node_count")
     safe_pre_start["last_authoritative_registered_node_count"] = (
         value if isinstance(value, int) and not isinstance(value, bool) and value >= 0
         else None)
+    value = supplied_pre_start.get("baseline_last_http_status")
+    safe_pre_start["baseline_last_http_status"] = (value
+        if isinstance(value, int) and not isinstance(value, bool)
+        and 100 <= value <= 599 else None)
+    supplied_counts = supplied_pre_start.get("baseline_failure_counts")
+    if not isinstance(supplied_counts, dict):
+        supplied_counts = {}
+    safe_pre_start["baseline_failure_counts"] = {
+        category: (min(value, _MAX_DIAGNOSTIC_COUNTER)
+            if isinstance(value := supplied_counts.get(category), int)
+            and not isinstance(value, bool) and value >= 0 else 0)
+        for category in RELAY_BASELINE_FAILURE_CATEGORIES if category != "none"
+    }
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
     fd, temporary_name = tempfile.mkstemp(

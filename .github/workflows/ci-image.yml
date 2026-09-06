@@ -185,6 +185,40 @@ jobs:
           curl -fsS http://127.0.0.1:5011/metrics >/dev/null
           docker exec tokenplace-relay-smoke-readonly sh -c "tr '\\0' ' ' < /proc/1/cmdline" | grep -F -- '--workers 1'
 
+      - name: Gate candidate on mandatory relay release-safety behavior
+        run: |
+          set -euo pipefail
+          image_id="$(docker image inspect --format '{{.Id}}' tokenplace-relay:smoke)"
+          python scripts/relay_release_safety_gate.py \
+            --image tokenplace-relay:smoke \
+            --expected-image-id "${image_id}" \
+            --source-commit "$(git rev-parse HEAD)" \
+            --release-ref "${GITHUB_REF}" \
+            --evidence relay-release-safety-evidence.json
+
+      - name: Upload release-safety evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-release-safety-evidence-${{ steps.tags.outputs.short_sha }}
+          path: relay-release-safety-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summarize release-safety evidence
+        run: |
+          set -euo pipefail
+          {
+            echo "## Mandatory relay release-safety contract"
+            echo ""
+            echo "Source commit: \`$(jq -r .source_commit relay-release-safety-evidence.json)\`"
+            echo "Release ref/base: \`$(jq -r .release_ref relay-release-safety-evidence.json)\`"
+            echo "Candidate image: \`$(jq -r .candidate_image relay-release-safety-evidence.json)\`"
+            echo "Candidate immutable image ID: \`$(jq -r .candidate_image_id relay-release-safety-evidence.json)\`"
+            echo ""
+            jq -r '.results | to_entries[] | "- `\(.key)`: \(if .value.passed then "PASS" else "FAIL" end)"' \
+              relay-release-safety-evidence.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish validation summary
         run: |
           {
@@ -192,6 +226,8 @@ jobs:
             echo ""
             echo "Repository: `${{ steps.tags.outputs.repository }}`"
             echo "Commit: `${{ steps.tags.outputs.short_sha }}`"
+            echo "Candidate: `tokenplace-relay:smoke`"
+            echo "Safety contract: `relay-release-safety-v1` (all mandatory checks passed)"
             if [[ "${{ steps.tags.outputs.publish }}" == "true" ]]; then
               echo "Publishing will be handled by the publish job."
               echo "Immutable Sugarkube tag after publish: `${{ steps.tags.outputs.deploy_tag }}`"
@@ -230,6 +266,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push multi-arch relay image
+        id: publish-image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -260,6 +297,10 @@ jobs:
               echo "Sugarkube deploy tag: \`${{ needs.build-and-smoke.outputs.semver_tag }}\`"
             fi
             echo "SHA tag: \`${{ needs.build-and-smoke.outputs.sha_tag }}\`"
+            echo "OCI index digest: \`${{ steps.publish-image.outputs.digest }}\`"
+            echo "Source commit: \`${{ github.sha }}\`"
+            echo "Release ref/base: \`${{ github.ref }}\`"
+            echo "Safety evidence: \`relay-release-safety-evidence-${{ needs.build-and-smoke.outputs.short_sha }}\`"
             echo ""
             echo "Pushed: true"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -40,8 +40,9 @@ described below. The bounded-cardinality backport has since been deployed and au
 scraping restored. The operator classified the incident as **Resolved operationally** at `2026-09-05T19:53:19Z`:
 service and observability were restored on the corrected deployment. That operational boundary
 does not assert that every original qualification or issue-closeout requirement passed. The
-adversarial staging, restart-cleanup, and 24-hour stability requirements remain visible and
-pending, and preventive work remains tracked in open action items.
+operator reported the combined recovery image's staging qualification complete before deployment;
+this public summary does not reproduce the complete staging evidence, and independent evidence
+review, the 24-hour stability requirements, and preventive issue closeout remain open.
 
 ## Impact
 
@@ -327,15 +328,15 @@ ready with zero restarts, and HTTP 429 and 5xx counts both remained zero. At
 `2026-09-05T19:53:19Z`, the bounded exporter was deployed, authenticated application scraping was
 restored, and **no intentionally disabled monitoring functionality remained**. This is the
 operator-supplied operational-resolution boundary, but it is only bounded production observation:
-20 canaries and six minutes do not
-satisfy the required thousands-path regression, same-pod restart-cleanup verification,
-production-equivalent adversarial soak, or 24-hour stability windows below.
+20 canaries and six minutes do not independently document the required thousands-path regression,
+same-pod restart-cleanup verification, operator-reported staging soak, or 24-hour stability windows
+below.
 
 PR [#1782](https://github.com/futuroptimist/token.place/pull/1782) provides repository regression
 coverage for bounded metrics and restart cleanup. That automated evidence is distinct from the
-still-pending production-equivalent staging qualification and from the bounded production
-observations above; the 20 production canaries are not represented as a thousands-path staging
-test.
+operator-reported completed production-equivalent staging qualification and from the bounded
+production observations above; this public summary does not reproduce the complete staging
+evidence, and the 20 production canaries are not represented as a thousands-path staging test.
 
 ## What went well
 
@@ -374,7 +375,7 @@ close these trackers or satisfy their remaining exit criteria.
 | P0 | Prevent | Replace raw-path Flask grouping with bounded route-template or endpoint labels. | Removes caller control of label cardinality. | Unassigned | Deployed; full exit criterion pending | [token.place #1765](https://github.com/futuroptimist/token.place/issues/1765)<br>[sugarkube #2775](https://github.com/futuroptimist/sugarkube/issues/2775) | The corrected image identity is verified and a fixed allowlist of route labels is demonstrated under adversarial traffic. |
 | P0 | Prevent | Collapse every unmatched/404 route to one fixed label; prohibit query strings, request IDs, model names, keys, tokens, and arbitrary path segments from labels. | One unknown route class must remain one series class and must not expose sensitive values. | Unassigned | Deployed; full exit criterion pending | [token.place #1765](https://github.com/futuroptimist/token.place/issues/1765) | Thousands of distinct unknown URLs yield the same bounded labels and no sensitive strings in exposition. |
 | P0 | Prevent | Prefer a small explicitly registered metric set over implicit default per-path instrumentation. | Makes the exported contract reviewable and bounded. | Unassigned | Deployed; full exit criterion pending | [token.place #1765](https://github.com/futuroptimist/token.place/issues/1765) | The deployed corrected image exports documented finite metric names and label domains. |
-| P0 | Prevent | Add a regression/load test with thousands of unique unmatched paths and fixed budgets for series, samples, response size, scrape duration, and memory. | Reproduces the trigger class and prevents recurrence. | Unassigned | Repository regression covered by #1782; staging criterion pending | [token.place #1765](https://github.com/futuroptimist/token.place/issues/1765)<br>[sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774) | The test passes explicit reviewed budgets and fails the prior unbounded behavior. |
+| P0 | Prevent | Add a regression/load test with thousands of unique unmatched paths and fixed budgets for series, samples, response size, scrape duration, and memory. | Reproduces the trigger class and prevents recurrence. | Unassigned | Repository regression covered by #1782; staging qualification operator-reported complete, evidence review and tracker acceptance pending | [token.place #1765](https://github.com/futuroptimist/token.place/issues/1765)<br>[sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774) | The test passes explicit reviewed budgets and fails the prior unbounded behavior. |
 | P0 | Prevent | Move multiprocess metrics to a dedicated directory and clear it safely on every application-container startup before Gunicorn launches. | A container restart must not inherit stale metric files; pod deletion must not be the cleanup mechanism. | Unassigned | Implemented and regression-covered by #1782; tracker closeout pending | [token.place #1765](https://github.com/futuroptimist/token.place/issues/1765) | A container restart test proves the directory starts clean without deleting the pod. |
 | P0 | Prevent | Validate Prometheus multiprocess worker cleanup. | Dead-worker files and series must not accumulate across worker lifecycles. | Unassigned | Repository regression covered by #1782; broader qualification pending | [token.place #1765](https://github.com/futuroptimist/token.place/issues/1765) | Repeated worker start/exit testing leaves a bounded, correct exposition. |
 | P1 | Prevent | Consider a bounded edge rate limit or scanner control for unmatched paths. | Reduces abusive load as defense in depth but cannot replace bounded labels. | Unassigned | Proposed | [sugarkube #2780](https://github.com/futuroptimist/sugarkube/issues/2780) | Legitimate routes remain usable and randomized-path traffic is bounded; exporter tests still pass without this control. |
@@ -391,7 +392,7 @@ close these trackers or satisfy their remaining exit criteria.
 | P0 | Mitigate | Document that container restart does not necessarily clear a pod `emptyDir`; this incident required pod replacement. | Prevents ineffective restart loops. | Unassigned | Proposed | [sugarkube #2779](https://github.com/futuroptimist/sugarkube/issues/2779) | Runbook review and a pod-lifecycle test demonstrate the distinction. |
 | P0 | Mitigate | Define a safe procedure to restore the ServiceMonitor label only after the corrected image is verified. | Prevents premature scrape restoration. | Unassigned | Proposed | [sugarkube #2777](https://github.com/futuroptimist/sugarkube/issues/2777) | Procedure includes all restoration gates and a rollback step. |
 | P1 | Mitigate | Continue shared-state/HA work tracked by [#1569](https://github.com/futuroptimist/token.place/issues/1569), without treating replicas as safe standalone mitigation while authoritative state is memory-backed. | HA can reduce single-replica amplification only after correctness constraints are satisfied. | Unassigned | Proposed | [Existing non-incident HA work #1569](https://github.com/futuroptimist/token.place/issues/1569) | Shared-state correctness is proven before multi-replica availability is relied upon. |
-| P0 | Mitigate | After the fix, run a staging soak with scraping enabled and adversarial unique-path traffic before production restoration. | Validates the whole scrape/traffic lifecycle. | Unassigned | Proposed | [sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774) | Sustained soak passes every restoration exit criterion. |
+| P0 | Mitigate | After the fix, run a staging soak with scraping enabled and adversarial unique-path traffic before production restoration. | Validates the whole scrape/traffic lifecycle. | Unassigned | Operator-reported complete before deployment; evidence review and tracker acceptance pending | [sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774) | Sustained soak passes every restoration exit criterion. |
 
 The recovery sequence is tracked explicitly: the bounded backport in
 [token.place #1765](https://github.com/futuroptimist/token.place/issues/1765), staging qualification
@@ -400,10 +401,12 @@ deployment in [sugarkube #2775](https://github.com/futuroptimist/sugarkube/issue
 application-metrics restoration tracked by
 [sugarkube #2777](https://github.com/futuroptimist/sugarkube/issues/2777), after
 [sugarkube #2776](https://github.com/futuroptimist/sugarkube/issues/2776) restored both
-public-information probes. Service and observability restoration support the operational
-classification, while the remaining adversarial staging and 24-hour stability criteria keep
-qualification and issue closeout open. Repository restart-cleanup coverage in #1782 is not a claim
-that every production or staging acceptance criterion passed.
+public-information probes. The operator reported qualification of the combined recovery image in
+staging complete before its production deployment. Service and observability restoration support
+the operational classification, while this public summary does not reproduce the complete staging
+qualification evidence; independent evidence review, remaining tracker acceptance criteria, and
+the 24-hour stability criteria keep issue closeout open. Repository restart-cleanup coverage in
+#1782 is not a claim that every production or staging acceptance criterion passed.
 
 The fifteen canonical action trackers are token.place #1765, #1766, and #1770–#1773, plus
 sugarkube #2774–#2782. All fifteen remain open. Links to token.place
@@ -431,7 +434,9 @@ unqualified broad `main` rollout. The release hotfix must manually port the boun
 - add a same-pod application-container restart test proving stale metric files are not inherited.
 
 Before production scraping is restored, an immutable hotfix image must pass staging with the
-production-equivalent one-worker, 256Mi, and 30-second scrape settings. The test must send thousands
+production-equivalent one-worker, 256Mi, and 30-second scrape settings. The operator reported this
+qualification complete for the combined recovery image before deployment, although this public
+summary does not reproduce its complete evidence. The test must send thousands
 of unique unknown paths while continuously scraping and verify bounded series/sample counts,
 response size, scrape latency, RSS/working-set headroom, zero OOMs/restarts, clean restart behavior,
 exact image identity, public health, and API-v1 compatibility.
@@ -446,8 +451,9 @@ memory, or restarts regress, pause only that target again. Scraping must never b
 
 These retained requirements continue to govern full qualification and issue closeout. The
 identity-verified recovery deployment and bounded restoration soak ending at
-`2026-09-05T19:53:19Z` support the operator's **Resolved operationally** classification, while the
-uncompleted criteria below remain pending.
+`2026-09-05T19:53:19Z` support the operator's **Resolved operationally** classification. The staging
+qualification is operator-reported complete, while independent review of its evidence and the
+other unverified criteria below remain pending.
 
 ### Required restoration exit criteria
 

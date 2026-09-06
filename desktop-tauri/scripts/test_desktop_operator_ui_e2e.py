@@ -1588,7 +1588,8 @@ def _write_webdriver_diagnostic(
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0)
     value = supplied_pre_start.get("last_authoritative_registered_node_count")
     safe_pre_start["last_authoritative_registered_node_count"] = (
-        value if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        min(value, _MAX_DIAGNOSTIC_COUNTER)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
         else None)
     value = supplied_pre_start.get("baseline_last_http_status")
     safe_pre_start["baseline_last_http_status"] = (value

@@ -949,7 +949,7 @@ def test_webdriver_diagnostic_clamps_hostile_pre_start_fields(desktop_runner, tm
             "baseline_outcome": ["C:\\Users\\private\\SECRET"],
             "baseline_poll_attempt_count": True,
             "baseline_transient_failure_count": -1,
-            "last_authoritative_registered_node_count": "response body SECRET",
+            "last_authoritative_registered_node_count": 10**100,
             "baseline_last_failure_category": ["SECRET"],
             "baseline_last_http_status": True,
             "baseline_failure_counts": {"http_status": 10**100,
@@ -961,6 +961,8 @@ def test_webdriver_diagnostic_clamps_hostile_pre_start_fields(desktop_runner, tm
     artifact = json.loads(artifact_text)
     assert {field: artifact[field] for field in desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS} \
         == {**desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS,
+            "last_authoritative_registered_node_count":
+                desktop_runner._MAX_DIAGNOSTIC_COUNTER,
             "baseline_failure_counts": {
                 **desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS["baseline_failure_counts"],
                 "http_status": desktop_runner._MAX_DIAGNOSTIC_COUNTER}}

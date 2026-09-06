@@ -4,7 +4,8 @@
 
 - **Date:** 2026-09-02
 - **Severity:** Critical
-- **Status:** Mitigated
+- **Status:** Resolved (operationally)
+- **Resolved at:** 2026-09-05T19:53:19Z
 - **Component:** production token.place relay and its application metrics endpoint
 - **Incident ID:** `2026-09-02-production-relay-metrics-cardinality-oom`
 - **Primary incident window:** approximately 2026-09-02 16:41 PDT / 23:41 UTC through
@@ -33,10 +34,11 @@ provenance mismatch left the runtime mechanism present in production.
 
 At 2026-09-03 01:07:50 UTC, an operator paused Prometheus discovery of only the token.place target
 and deleted only the affected pod. Kubernetes created a healthy replacement with a fresh
-pod-level `emptyDir`; the image and Deployment were not rolled back or changed. Production serves
-traffic again, but application scraping remains intentionally paused. The incident is therefore
-**Mitigated**, not resolved: a bounded-cardinality fix must be deployed and pass the restoration
-criteria below before scraping is restored.
+pod-level `emptyDir`; the image and Deployment were not rolled back or changed. Production served
+traffic again, but application scraping remained intentionally paused at that stage. The incident was
+**Mitigated** pending a corrected deployment. The bounded-cardinality backport was subsequently
+deployed, application scraping was restored, and the incident became **Resolved (operationally)**
+at `2026-09-05T19:53:19Z`. Preventive action-item completion remains a separate state.
 
 ## Impact
 
@@ -250,10 +252,59 @@ during mitigation verification.
 
 This emergency action removed the accumulated pod-level metric files and stopped scheduled
 scrapes from rebuilding or serializing the unsafe metric set. It restored application service but
-is not the permanent fix. The telemetry state remains intentionally degraded, so the incident is
-Mitigated rather than Resolved.
+was not the permanent fix. The final corrected deployment and observability restoration are
+recorded below.
 
-## Post-recovery verification
+### Final corrected deployment and observability restoration
+
+An observed production Helm upgrade to revision 7 occurred at
+`2026-09-05T19:10:05.335904906Z`. It deployed
+`ghcr.io/futuroptimist/tokenplace-relay:sha-6c39adc`, OCI index digest
+`sha256:543fde33aff45253630090b52d16163e3586da12c973f5c4a658ddc8927d0a68`, from source
+commit `6c39adc64e7bed4f85d07164aa2860e637919ca9`; the public immutable build ref was
+`sha-6c39adc` and the public semantic version was `0.1.1`. The new pod was created at
+`2026-09-05T19:10:09Z`, started at `2026-09-05T19:10:13Z`, and ran as one ready replica with zero
+restarts and no termination reason. This record does not infer who performed the upgrade.
+
+Cutover verification began at `2026-09-05T19:32:18Z`. The exact image digest and immutable ref
+matched; one compute registration and continuing successful polling were observed, along with two
+accepted requests, two accepted responses, and two successful retrievals. All public health and
+identity endpoints remained HTTP 200, no HTTP 5xx occurred, and a bounded two-minute soak passed.
+Relay memory stayed between 63,971,328 and 64,786,432 bytes against a 268,435,456-byte limit.
+
+Public-information probe restoration began at `2026-09-05T19:38:04Z`. The root and
+`/api/v1/meta` blackbox probes were restored to `release=kube-prometheus-stack`; `/livez` and
+`/healthz` remained active. Prometheus uniquely discovered both restored targets with no last
+error. Successful scrapes were recorded for root at `2026-09-05T19:41:51.950530221Z` and metadata
+at `2026-09-05T19:42:08.689609225Z`; each had three samples in the final three-minute window and
+`min_over_time(probe_success)=1`. No HTTP 429 or 5xx occurred, compute polling continued, the pod
+remained ready with zero restarts, and memory remained approximately 64–65 MiB.
+
+Application-metrics restoration began at `2026-09-05T19:47:21Z`. Before periodic scraping was
+enabled, an authenticated manual scrape returned HTTP 200, 35,733 bytes, and 227 samples. Twenty
+deterministic unmatched-path canaries all returned HTTP 404; the following authenticated scrape
+was 35,749 bytes and 227 samples, with no canary path and no `pid` label. Each maintenance metric—
+`tokenplace_build_info`, `tokenplace_compute_nodes_healthy`,
+`tokenplace_compute_nodes_registered`, and `tokenplace_instrumentation_up`—had exactly one series.
+
+The token.place ServiceMonitor was then restored to `release=kube-prometheus-stack`. Prometheus
+discovered exactly one healthy application target, in scrape pool
+`serviceMonitor/tokenplace/tokenplace/0`, with no last error. Its final recorded successful scrape
+was `2026-09-05T19:53:19.538689743Z`. The final three-minute window contained six successful `up`
+samples with `min_over_time(up)=1`; `scrape_samples_scraped=227`,
+`scrape_duration_seconds=0.011584181`, `tokenplace_instrumentation_up=1`, and raw canary series
+equaled zero. The final authenticated payload was 35,751 bytes and 227 samples with zero canary
+occurrences and zero `pid`-label occurrences.
+
+During the bounded six-minute metrics soak, relay memory remained between 65,101,824 and
+65,425,408 bytes against the 268,435,456-byte limit, compute polls increased from 222 to 260, the
+pod remained ready, and restart, HTTP 429, and HTTP 5xx counts remained zero. At the evidence-backed
+boundary `2026-09-05T19:53:19Z`, the bounded-metrics correction was live and authenticated
+production scraping was restored and stable. The OOM incident is therefore **Resolved
+(operationally)**. Every monitoring function intentionally disabled during the causal chain has
+been restored; no intentionally disabled monitoring functionality remains.
+
+## Initial post-mitigation verification
 
 - The replacement pod was Ready `True` with zero restarts during verification.
 - Public `/livez`, `/healthz`, and `/` requests returned HTTP 200.
@@ -361,9 +412,9 @@ observe a defined stability window with explicit rollback thresholds. If cardina
 memory, or restarts regress, pause only that target again. Scraping must never be restored against
 `e46277d`; a memory-limit increase, edge filtering, or extra replicas alone is not resolution.
 
-Incident status remains **Mitigated** until the corrected image is deployed, scraping is restored,
-and the stability window passes. Promotion from `main` remains a separate, fully qualified later
-release path.
+These criteria were satisfied by the corrected deployment and restoration evidence above at
+`2026-09-05T19:53:19Z`. Promotion from `main` remains a separate, fully qualified later release
+path.
 
 ### Required restoration exit criteria
 
@@ -385,14 +436,14 @@ The availability impact ended when the replacement pod became healthy at
 2026-09-03T01:08:18Z. Closeout state is:
 
 - **Application:** healthy after mitigation.
-- **Telemetry:** token.place application scraping intentionally paused.
-- **Incident:** Mitigated, not Resolved.
-- **Runtime/deployment remediation:** no image rollback or Deployment change was part of emergency
-  recovery; bounded registry hardening is implemented on `main` but absent from the deployed
-  lineage.
-- **Permanent closeout condition:** build and deploy a corrected image, verify its source/artifact
-  identity, pass the adversarial staging soak, implement and verify multiprocess startup cleanup,
-  then deliberately restore scraping through the full stability window.
+- **Telemetry:** all four public blackbox probes and authenticated application scraping are active;
+  no intentionally disabled monitoring functionality remains.
+- **Incident:** Resolved (operationally) at `2026-09-05T19:53:19Z`.
+- **Runtime/deployment remediation:** the identity-verified bounded-metrics recovery image is live
+  and stable under restored scraping.
+- **Preventive work:** all fifteen canonical corrective-action trackers remain open until
+  their individual implementation and verification criteria are independently completed. Operational resolution
+  does not close or complete them.
 
 Disabling scraping, replacing a pod, filtering traffic, raising memory, or adding replicas alone
 must not be recorded as permanent resolution. Issue #1569 concerns separate shared-state/HA

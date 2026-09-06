@@ -4,7 +4,8 @@
 
 - **Date:** 2026-09-03
 - **Severity:** Major
-- **Status:** Mitigated
+- **Status:** Resolved (operationally)
+- **Resolved at:** 2026-09-05T19:53:19Z
 - **Component:** production token.place relay public landing page and metadata endpoint
 - **Incident ID:** `2026-09-03-production-public-information-rate-limit-exhaustion`
 - **Observed incident window:** earliest retained HTTP 429 at `2026-09-03T17:11:52.030Z` through
@@ -28,8 +29,11 @@ endpoint.
 
 The operator paused discovery of only the root and metadata blackbox probes and replaced the exact
 running process to reset its process-local, in-memory limiter counters. The image, release, and
-quotas were unchanged. Serving and compute paths recovered, but the two probes remain paused and
-no permanent correction has been deployed. The incident is therefore **Mitigated**, not Resolved.
+quotas were unchanged. Serving and compute paths recovered, but the two probes remained paused and
+no permanent correction had yet been deployed. The public-information exemption backport was
+subsequently deployed, all probes were restored without HTTP 429 recurrence, and the incident
+became **Resolved (operationally)** at `2026-09-05T19:53:19Z`. Preventive action-item completion
+remains separate.
 
 ## Impact
 
@@ -177,7 +181,7 @@ At `2026-09-03T22:51:22Z`, all checked public, health, metadata, model-listing, 
 returned 200. One compute registration, eleven polls, and one response submission succeeded. The
 replacement remained at zero restarts with no OOM termination.
 
-Current status is **Mitigated**:
+That mitigation state was **Mitigated**:
 
 - the application and compute path are healthy;
 - root and metadata blackbox probes remain intentionally paused;
@@ -188,6 +192,45 @@ Current status is **Mitigated**:
 Resolution requires a qualified immutable image containing the exact PR #1551 behavior, successful
 production rollout, restoration of only the two paused public-information probes, and a stability
 period proving that those probes no longer consume their quotas.
+
+### Final corrected deployment and monitoring restoration
+
+An observed production Helm upgrade to revision 7 occurred at
+`2026-09-05T19:10:05.335904906Z`. It deployed
+`ghcr.io/futuroptimist/tokenplace-relay:sha-6c39adc`, OCI index digest
+`sha256:543fde33aff45253630090b52d16163e3586da12c973f5c4a658ddc8927d0a68`, from source
+commit `6c39adc64e7bed4f85d07164aa2860e637919ca9`; the public immutable build ref was
+`sha-6c39adc` and the public semantic version was `0.1.1`. The new pod was created at
+`2026-09-05T19:10:09Z`, started at `2026-09-05T19:10:13Z`, and ran as one ready replica with zero
+restarts and no termination reason. This record does not infer who performed the upgrade.
+
+Cutover verification began at `2026-09-05T19:32:18Z`. Exact artifact identity matched, one compute
+registration and continuing successful polling were observed, and two complete request, response,
+and retrieval lifecycles succeeded. All public health and identity endpoints remained HTTP 200,
+no HTTP 5xx occurred, and a bounded two-minute soak passed. Relay memory stayed between 63,971,328
+and 64,786,432 bytes against a 268,435,456-byte limit.
+
+Public-information restoration began at `2026-09-05T19:38:04Z`. The root and `/api/v1/meta`
+blackbox probes were restored to `release=kube-prometheus-stack`, while `/livez` and `/healthz`
+remained active. Prometheus uniquely discovered both restored targets and reported each healthy
+with no last error. Root's successful scrape was recorded at
+`2026-09-05T19:41:51.950530221Z` and metadata's at `2026-09-05T19:42:08.689609225Z`; each produced
+three samples in the final three-minute window with `min_over_time(probe_success)=1`. No HTTP 429
+or 5xx occurred, compute polling continued, the pod remained ready with zero restarts, and memory
+remained approximately 64–65 MiB.
+
+Authenticated application scraping was restored next, beginning at `2026-09-05T19:47:21Z`, after
+a bounded-cardinality canary. Prometheus discovered exactly one healthy application target, and
+its final successful scrape was recorded at `2026-09-05T19:53:19.538689743Z`. Across the bounded
+six-minute soak, memory stayed between 65,101,824 and 65,425,408 bytes against 268,435,456, compute
+polls increased from 222 to 260, the pod stayed ready with zero restarts, and HTTP 429 and HTTP 5xx
+counts remained zero.
+
+At the evidence-backed boundary `2026-09-05T19:53:19Z`, the public-information exemption was live,
+all four public probes and authenticated application scraping were active, and monitoring had
+remained healthy without quota-exhaustion recurrence. The rate-limit incident is therefore
+**Resolved (operationally)**. Every monitoring function intentionally disabled during the causal
+chain has been restored; no intentionally disabled monitoring functionality remains.
 
 ## What went well
 
@@ -281,6 +324,11 @@ After rollout, only the root and metadata probes should be restored. A defined s
 must prove they remain healthy without consuming quota. If the route/method matrix, quota pressure,
 identity behavior, or serving health regresses, pause only those probes and roll back according to
 the qualified plan. `/metrics` restoration remains wholly separate.
+
+The qualified rollout and restoration sequence above satisfied these operational resolution
+criteria at `2026-09-05T19:53:19Z`. All fifteen canonical corrective-action trackers remain open
+until their individual implementation and verification criteria are independently completed;
+operational resolution does not close or complete them.
 
 ## Evidence limitations
 

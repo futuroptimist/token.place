@@ -4154,6 +4154,80 @@ def test_encrypted_response_rejects_stale_preflight_without_mutation(valkey_serv
 
 
 @pytest.mark.parametrize(
+    ("boundary", "claim_ttl", "deadline_offset"),
+    (
+        ("claim_lease_boundary", 0.08, 5.0),
+        ("request_deadline_boundary", 2.0, 0.15),
+    ),
+)
+def test_encrypted_response_inclusive_expiry_boundaries_are_non_mutating(
+    valkey_server, boundary, claim_ttl, deadline_offset
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server, namespace, claim_ttl_seconds=claim_ttl
+    )
+    second = _registration_store(
+        valkey_server, namespace, claim_ttl_seconds=claim_ttl
+    )
+    node, owner, consumer = "boundary-node", _digest("boundary-owner"), "consumer"
+    identity = (f"{boundary}-client", f"{boundary}-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    keys, member = _response_acceptance_authority(first, node, identity)
+    datastore = first._foundation._client
+    try:
+        first.register(node, _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + deadline_offset
+        _enqueue_claim_fixture(first, node, owner, *identity, deadline)
+        claim = first.claim_queued_request(node, owner, consumer)
+        if boundary == "request_deadline_boundary":
+            assert claim.lease_expires_at_epoch == claim.request_deadline_epoch
+        else:
+            assert claim.lease_expires_at_epoch < claim.request_deadline_epoch
+
+        datastore.hset(keys[11], mapping={"stage": "generating"})
+        before = _exact_key_snapshot(first, keys)
+        claim_before = datastore.hgetall(keys[3])
+        lifecycle_before = datastore.hgetall(keys[4])
+        queue_before = datastore.xrange(keys[2])
+        claim_score = datastore.zscore(keys[5], member)
+        deadline_score = datastore.zscore(keys[6], member)
+        progress_before = datastore.hgetall(keys[11])
+        due = (
+            claim.lease_expires_at_epoch
+            if boundary == "claim_lease_boundary"
+            else claim.request_deadline_epoch
+        )
+        _wait_for_server_epoch(first, due)
+
+        with pytest.raises(
+            RelayStateConflict, match="^response lifecycle conflict$"
+        ):
+            second.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, response
+            )
+
+        assert _exact_key_snapshot(first, keys) == before
+        assert datastore.hgetall(keys[3]) == claim_before
+        assert datastore.hgetall(keys[4]) == lifecycle_before
+        assert datastore.hget(keys[4], "state") == b"claimed"
+        assert datastore.xrange(keys[2]) == queue_before
+        assert datastore.zscore(keys[5], member) == claim_score
+        assert datastore.zscore(keys[6], member) == deadline_score
+        assert datastore.hgetall(keys[11]) == progress_before
+        assert datastore.exists(keys[7]) == datastore.exists(keys[9]) == 0
+        assert datastore.zscore(keys[8], member) is None
+        assert datastore.zscore(keys[10], member) is None
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
     ("bound", "same_client", "limits"),
     (
         ("global-response", False, {"max_responses": 1}),

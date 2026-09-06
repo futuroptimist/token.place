@@ -236,6 +236,15 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     assert "local terminal_exists=redis.call('EXISTS',terminal)" in ACCEPT_RESPONSE_SCRIPT.source
     assert "a<0 or a>now" in ACCEPT_RESPONSE_SCRIPT.source
     assert ACCEPT_RESPONSE_SCRIPT.source.index("elseif response_exists~=0 or response_score") < ACCEPT_RESPONSE_SCRIPT.source.index("return {'existing',tostring(g),tv[9],tv[10]}")
+    expiry_guard = "if claim_expiry<=now or deadline<=now then return {'missing'} end"
+    assert expiry_guard in ACCEPT_RESPONSE_SCRIPT.source
+    expiry_guard_offset = ACCEPT_RESPONSE_SCRIPT.source.index(expiry_guard)
+    assert expiry_guard_offset < ACCEPT_RESPONSE_SCRIPT.source.index(
+        "redis.call('HSET',response"
+    )
+    assert expiry_guard_offset < ACCEPT_RESPONSE_SCRIPT.source.index(
+        "redis.call('XDEL',queue"
+    )
 
 
 def config(**changes):

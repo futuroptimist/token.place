@@ -3250,6 +3250,121 @@ def test_encrypted_response_namespace_isolation(valkey_server):
             store.close()
 
 
+@pytest.mark.parametrize(
+    ("backend_error", "expected_error", "expected_message"),
+    (
+        (
+            redis.ConnectionError,
+            ValkeyUnavailableError,
+            "state backend unavailable",
+        ),
+        (
+            lambda message: redis.ResponseError(f"READONLY {message}"),
+            ValkeyReadOnlyError,
+            "state backend is not writable",
+        ),
+        (
+            redis.ResponseError,
+            ValkeyUnavailableError,
+            "state backend command failed",
+        ),
+    ),
+    ids=("connection", "readonly", "command"),
+)
+def test_encrypted_response_backend_failures_are_typed_redacted_and_not_replayed(
+    valkey_server, caplog, backend_error, expected_error, expected_message
+):
+    namespace = f"acceptance-failure-{uuid.uuid4().hex}"
+    store = _registration_store(valkey_server, namespace)
+    node = "acceptance-failure-node-marker"
+    owner = _digest("acceptance-failure-owner-marker")
+    consumer = "acceptance-failure-consumer-marker"
+    identity = (
+        "acceptance-failure-client-marker",
+        "acceptance-failure-request-marker",
+    )
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee",
+        1,
+        "acceptance-failure-ciphertext-marker",
+        "acceptance-failure-cipher-key-marker",
+        "acceptance-failure-iv-marker",
+    )
+    keys, member = _response_acceptance_authority(store, node, identity)
+    original_evalsha = store._foundation._client.evalsha
+    dispatches = []
+    endpoint_marker = "acceptance-failure-private-endpoint-marker"
+    acknowledgement_marker = _ACKNOWLEDGEMENT_KEY.decode()
+    markers = (
+        endpoint_marker,
+        namespace,
+        *keys,
+        node,
+        owner,
+        consumer,
+        *identity,
+        envelope.ciphertext,
+        envelope.cipherkey,
+        envelope.iv,
+        acknowledgement_marker,
+    )
+    try:
+        store.register(node, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 60
+        _enqueue_claim_fixture(store, node, owner, *identity, deadline)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store._foundation._client.script_load(ACCEPT_RESPONSE_SCRIPT.source)
+        before = _exact_key_snapshot(store, keys)
+
+        def fail_acceptance(*args, **kwargs):
+            if args[0] != ACCEPT_RESPONSE_SCRIPT.eval_sha1:
+                return original_evalsha(*args, **kwargs)
+            dispatches.append((args, kwargs))
+            raise backend_error(" ".join(markers))
+
+        store._foundation._client.evalsha = fail_acceptance
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(
+                expected_error, match=f"^{expected_message}$"
+            ) as caught:
+                store.accept_encrypted_response(
+                    node, owner, consumer, *identity, claim.generation, envelope
+                )
+
+        assert len(dispatches) == 1
+        assert caught.value.__cause__ is None
+        rendered = "".join(
+            (
+                str(caught.value),
+                repr(caught.value),
+                "".join(traceback.format_exception(caught.value)),
+                caplog.text,
+                repr(store),
+                repr(store._foundation),
+                repr(store._foundation.config),
+                repr(store._foundation.config.direct),
+            )
+        )
+        assert all(marker not in rendered for marker in markers)
+        dispatched_args, dispatched_kwargs = dispatches[0]
+        assert dispatched_kwargs == {}
+        assert all(
+            _ACKNOWLEDGEMENT_KEY not in (
+                value if isinstance(value, bytes) else str(value).encode()
+            )
+            for value in dispatched_args[2:]
+        )
+        assert _exact_key_snapshot(store, keys) == before
+        assert store._foundation._client.exists(keys[7], keys[9]) == 0
+        assert store._foundation._client.zscore(keys[8], member) is None
+        assert store._foundation._client.zscore(keys[10], member) is None
+    finally:
+        store._foundation._client.evalsha = original_evalsha
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
 def test_encrypted_response_committed_lost_reply_is_recovered_without_replay(
     valkey_server, caplog
 ):

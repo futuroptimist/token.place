@@ -1,5 +1,6 @@
 import ast
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -94,7 +95,7 @@ def desktop_runner():
         "PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS",
         "PRE_START_DIAGNOSTIC_ALLOWLISTS", "PRE_START_DIAGNOSTIC_DEFAULTS",
         "RELAY_DIAGNOSTICS_USER_AGENT", "RELAY_BASELINE_FAILURE_CATEGORIES",
-        "_MAX_DIAGNOSTIC_COUNTER",
+        "_MAX_DIAGNOSTIC_COUNTER", "_RELAY_CONNECTION_ERRNOS",
     }
     names = {"_wait_for_packaged_setup_condition", "_prepare_packaged_landing_page",
         "_validate_packaged_failure_reason", "_enter_packaged_prompt",
@@ -109,7 +110,8 @@ def desktop_runner():
         "start_driver", "wait_for_webview2_devtools", "wait_for_ui_ready",
         "wait_for_post_start_operator_state", "require_clean_relay_registration_baseline",
         "fetch_relay_diagnostics_count", "fetch_api_v1_registered_node_fingerprints",
-        "_relay_probe_error", "_relay_diagnostics_payload", "_bridge_reset_observations",
+        "_relay_probe_error", "_relay_transport_failure_category",
+        "_relay_diagnostics_payload", "_bridge_reset_observations",
         "fresh_bridge_key_fingerprint",
         "authoritative_registration_matches",
         "_classify_webdriver_session_failure", "_webdriver_process_posture",
@@ -131,7 +133,7 @@ def desktop_runner():
         ChromeOptions=object), "ActionChains": object,
         "time": time, "By": SimpleNamespace(CSS_SELECTOR="css", XPATH="xpath"),
         "os": os, "json": json, "hashlib": hashlib, "re": re,
-        "socket": socket, "ssl": ssl, "Request": Request,
+        "socket": socket, "ssl": ssl, "errno": errno, "Request": Request,
         "HTTPError": HTTPError, "URLError": URLError,
         "tempfile": __import__("tempfile"),
         "argparse": __import__("argparse"),
@@ -949,7 +951,7 @@ def test_webdriver_diagnostic_clamps_hostile_pre_start_fields(desktop_runner, tm
             "baseline_outcome": ["C:\\Users\\private\\SECRET"],
             "baseline_poll_attempt_count": True,
             "baseline_transient_failure_count": -1,
-            "last_authoritative_registered_node_count": 10**100,
+            "last_authoritative_registered_node_count": 10**5000,
             "baseline_last_failure_category": ["SECRET"],
             "baseline_last_http_status": True,
             "baseline_failure_counts": {"http_status": 10**100,
@@ -1422,6 +1424,27 @@ def test_relay_baseline_does_not_swallow_cancellation(desktop_runner):
             record_relay_observation=lambda _observation: None)
 
 
+@pytest.mark.parametrize("category", [[], {}, True, "none", "unsupported"])
+def test_relay_baseline_normalizes_malformed_exception_category(
+        desktop_runner, monkeypatch, category):
+    ticks = iter((0.0, 0.0, 0.05, 0.2, 0.2))
+    monkeypatch.setattr(desktop_runner.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(desktop_runner.time, "sleep", lambda _seconds: None)
+    failure = RuntimeError("PRIVATE")
+    failure.relay_failure_category = category
+    desktop_runner.fetch_api_v1_registered_node_fingerprints = \
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure)
+    diagnostic = desktop_runner.PRE_START_DIAGNOSTIC_DEFAULTS.copy()
+    with pytest.raises(RuntimeError, match="^operator_registration_not_reached$"):
+        desktop_runner.require_clean_relay_registration_baseline(
+            "https://relay.example", timeout_seconds=0.1,
+            fail_closed=lambda reason: (_ for _ in ()).throw(RuntimeError(reason)),
+            record_relay_observation=lambda _observation: None,
+            record_pre_start_state=lambda **changes: diagnostic.update(changes))
+    assert diagnostic["baseline_last_failure_category"] == "unknown"
+    assert diagnostic["baseline_failure_counts"]["unknown"] == 1
+
+
 def test_fresh_bridge_fingerprint_ignores_prior_session_log_content(
         desktop_runner, tmp_path):
     log = tmp_path / "runner.log"
@@ -1538,6 +1561,10 @@ def test_relay_diagnostics_helpers_use_accepted_explicit_request_contract(deskto
         "http_status", 403),
     (URLError(socket.gaierror("PRIVATE")), "dns", None),
     (URLError(ConnectionRefusedError("PRIVATE")), "connection", None),
+    (socket.gaierror("PRIVATE"), "dns", None),
+    (OSError("PRIVATE"), "unknown", None),
+    (URLError(OSError("PRIVATE")), "unknown", None),
+    (OSError(errno.ECONNREFUSED, "PRIVATE"), "connection", None),
     (URLError(ssl.SSLError("PRIVATE")), "tls", None),
     (TimeoutError("PRIVATE"), "timeout", None),
     (RuntimeError("PRIVATE"), "unknown", None),
@@ -1590,6 +1617,59 @@ def test_relay_diagnostics_response_read_failure_is_categorized(desktop_runner):
             "https://relay.example", timeout_seconds=0.5)
     assert raised.value.relay_failure_category == "response_read"
     assert "PRIVATE" not in str(raised.value)
+
+
+@pytest.mark.parametrize(("failure", "category"), [
+    (socket.gaierror("PRIVATE"), "dns"),
+    (ssl.SSLError("PRIVATE"), "tls"),
+    (TimeoutError("PRIVATE"), "timeout"),
+    (ConnectionResetError("PRIVATE"), "connection"),
+    (OSError("PRIVATE"), "response_read"),
+])
+def test_relay_diagnostics_response_read_preserves_identifiable_transport_category(
+        desktop_runner, failure, category):
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self):
+            raise failure
+    desktop_runner.urlopen = lambda *_args, **_kwargs: Response()
+    with pytest.raises(ValueError) as raised:
+        desktop_runner.fetch_relay_diagnostics_count(
+            "https://relay.example", timeout_seconds=0.5)
+    assert raised.value.relay_failure_category == category
+
+
+def test_relay_diagnostics_http_error_response_is_closed(desktop_runner):
+    closed = []
+    error = HTTPError("https://private.example", 403, "PRIVATE", {}, None)
+    error.close = lambda: closed.append(True)
+    desktop_runner.urlopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(error)
+    with pytest.raises(ValueError) as raised:
+        desktop_runner.fetch_relay_diagnostics_count(
+            "https://relay.example", timeout_seconds=0.5)
+    assert closed == [True]
+    assert raised.value.relay_failure_category == "http_status"
+    assert raised.value.relay_http_status == 403
+
+
+def test_relay_diagnostics_http_error_close_cancellation_propagates(desktop_runner):
+    class Cancelled(BaseException):
+        pass
+    error = HTTPError("https://private.example", 403, "PRIVATE", {}, None)
+    error.close = lambda: (_ for _ in ()).throw(Cancelled())
+    desktop_runner.urlopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(error)
+    with pytest.raises(Cancelled):
+        desktop_runner.fetch_relay_diagnostics_count(
+            "https://relay.example", timeout_seconds=0.5)
+
+
+@pytest.mark.parametrize("category", [[], {}, True, "none", "unsupported"])
+def test_relay_probe_error_normalizes_malformed_categories(desktop_runner, category):
+    assert desktop_runner._relay_probe_error(
+        category).relay_failure_category == "unknown"
 
 
 @pytest.mark.parametrize("nodes", [None, {}, [None], [{"server_public_key": ""}]])

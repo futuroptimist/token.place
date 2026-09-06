@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -113,17 +114,37 @@ RELAY_BASELINE_FAILURE_CATEGORIES = frozenset({
     "response_count", "unknown",
 })
 _MAX_DIAGNOSTIC_COUNTER = 1_000_000
+_RELAY_CONNECTION_ERRNOS = frozenset({
+    errno.ECONNABORTED, errno.ECONNREFUSED, errno.ECONNRESET,
+    errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EPIPE,
+})
 
 
-def _relay_probe_error(category: str, *, http_status: object = None) -> ValueError:
+def _relay_probe_error(category: object, *, http_status: object = None) -> ValueError:
     """Create a bounded relay-probe error without retaining private details."""
     error = ValueError("relay diagnostics probe failed")
     error.relay_failure_category = (category
-        if category in RELAY_BASELINE_FAILURE_CATEGORIES else "unknown")
+        if isinstance(category, str) and category != "none"
+        and category in RELAY_BASELINE_FAILURE_CATEGORIES else "unknown")
     error.relay_http_status = (http_status
         if isinstance(http_status, int) and not isinstance(http_status, bool)
         and 100 <= http_status <= 599 else None)
     return error
+
+
+def _relay_transport_failure_category(exc: BaseException) -> str:
+    """Classify transport failures using types and explicit errno values only."""
+    if isinstance(exc, socket.gaierror):
+        return "dns"
+    if isinstance(exc, ssl.SSLError):
+        return "tls"
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(exc, ConnectionError):
+        return "connection"
+    if isinstance(exc, OSError) and exc.errno in _RELAY_CONNECTION_ERRNOS:
+        return "connection"
+    return "unknown"
 
 
 def _relay_diagnostics_payload(relay_url: str, *, timeout_seconds: float) -> object:
@@ -133,35 +154,24 @@ def _relay_diagnostics_payload(relay_url: str, *, timeout_seconds: float) -> obj
     try:
         response_context = urlopen(request, timeout=timeout_seconds)  # nosec B310
     except HTTPError as exc:
+        try:
+            exc.close()
+        except Exception:
+            pass
         raise _relay_probe_error("http_status", http_status=exc.code) from None
     except URLError as exc:
-        reason = exc.reason
-        if isinstance(reason, socket.gaierror):
-            category = "dns"
-        elif isinstance(reason, ssl.SSLError):
-            category = "tls"
-        elif isinstance(reason, (TimeoutError, socket.timeout)):
-            category = "timeout"
-        elif isinstance(reason, (ConnectionError, OSError)):
-            category = "connection"
-        else:
-            category = "unknown"
-        raise _relay_probe_error(category) from None
-    except (TimeoutError, socket.timeout):
-        raise _relay_probe_error("timeout") from None
-    except ssl.SSLError:
-        raise _relay_probe_error("tls") from None
-    except (ConnectionError, OSError):
-        raise _relay_probe_error("connection") from None
+        raise _relay_probe_error(_relay_transport_failure_category(exc.reason)) from None
+    except (OSError, TimeoutError) as exc:
+        raise _relay_probe_error(_relay_transport_failure_category(exc)) from None
     except Exception:
         raise _relay_probe_error("unknown") from None
     try:
         with response_context as response:
             body = response.read()
-    except (TimeoutError, socket.timeout):
-        raise _relay_probe_error("timeout") from None
-    except Exception:
-        raise _relay_probe_error("response_read") from None
+    except Exception as exc:
+        category = _relay_transport_failure_category(exc)
+        raise _relay_probe_error(
+            category if category != "unknown" else "response_read") from None
     try:
         text = body.decode("utf-8")
     except (UnicodeDecodeError, AttributeError):
@@ -291,7 +301,7 @@ def require_clean_relay_registration_baseline(
         except Exception as exc:
             transient_failures += 1
             category = getattr(exc, "relay_failure_category", "unknown")
-            if category not in failure_counts:
+            if not isinstance(category, str) or category not in failure_counts:
                 category = "unknown"
             failure_counts[category] = min(
                 _MAX_DIAGNOSTIC_COUNTER, failure_counts[category] + 1)

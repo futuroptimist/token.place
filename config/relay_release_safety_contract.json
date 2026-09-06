@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "bounded_metrics.no_flask_defaults",
+      "description": "Default prometheus-flask-exporter request metric families are absent."
+    },
+    {
+      "id": "bounded_metrics.no_raw_paths",
+      "description": "Request metrics never expose caller-controlled unmatched paths."
+    },
+    {
+      "id": "bounded_metrics.series_growth",
+      "description": "Distinct unmatched paths do not produce linear exported-series growth."
+    },
+    {
+      "id": "quota.public_information_exempt",
+      "description": "GET /, /api/v1/meta, and /api/v1/version do not consume ordinary API quota."
+    },
+    {
+      "id": "quota.protected_route_limited",
+      "description": "An ordinary protected API route remains rate-limited."
+    }
+  ]
+}

@@ -24,6 +24,7 @@ jobs:
       contents: read
     outputs:
       short_sha: ${{ steps.tags.outputs.short_sha }}
+      full_sha: ${{ steps.tags.outputs.full_sha }}
       created: ${{ steps.tags.outputs.created }}
       repository: ${{ steps.tags.outputs.repository }}
       publish_tags: ${{ steps.tags.outputs.publish_tags }}
@@ -52,6 +53,7 @@ jobs:
           deploy_tag=""
 
           short_sha="$(git rev-parse --short=7 HEAD)"
+          full_sha="$(git rev-parse HEAD)"
           created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           repository="ghcr.io/futuroptimist/tokenplace-relay"
           sha_tag="${repository}:sha-${short_sha}"
@@ -83,6 +85,7 @@ jobs:
           fi
 
           echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "full_sha=${full_sha}" >> "$GITHUB_OUTPUT"
           echo "created=${created}" >> "$GITHUB_OUTPUT"
           echo "repository=${repository}" >> "$GITHUB_OUTPUT"
           echo "sha_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
@@ -109,7 +112,7 @@ jobs:
           tags: tokenplace-relay:smoke
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ steps.tags.outputs.short_sha }}
+            org.opencontainers.image.revision=${{ steps.tags.outputs.full_sha }}
             org.opencontainers.image.created=${{ steps.tags.outputs.created }}
             org.opencontainers.image.licenses=MIT
           cache-from: type=gha,scope=relay-image
@@ -185,13 +188,32 @@ jobs:
           curl -fsS http://127.0.0.1:5011/metrics >/dev/null
           docker exec tokenplace-relay-smoke-readonly sh -c "tr '\\0' ' ' < /proc/1/cmdline" | grep -F -- '--workers 1'
 
+      - name: Gate built candidate on mandatory release-safety behavior
+        run: |
+          python scripts/relay_release_safety_gate.py \
+            --image tokenplace-relay:smoke \
+            --source-commit '${{ steps.tags.outputs.full_sha }}' \
+            --release-ref '${{ github.ref }}' \
+            --release-base '${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}' \
+            --evidence relay-release-safety-evidence.json
+
+      - name: Upload validation safety evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-release-safety-${{ steps.tags.outputs.short_sha }}
+          path: relay-release-safety-evidence.json
+          if-no-files-found: error
+
       - name: Publish validation summary
         run: |
           {
             echo "## Relay image validation"
             echo ""
             echo "Repository: `${{ steps.tags.outputs.repository }}`"
-            echo "Commit: `${{ steps.tags.outputs.short_sha }}`"
+            echo "Commit: `${{ steps.tags.outputs.full_sha }}`"
+            echo "Release ref/base: `${{ github.ref }}` / `${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}`"
+            echo "Candidate: `tokenplace-relay:smoke` (`$(jq -r .candidate_digest relay-release-safety-evidence.json)`)"
+            jq -r '.results | to_entries[] | "- `\(.key)`: **\(if .value.passed then "PASS" else "FAIL" end)**"' relay-release-safety-evidence.json
             if [[ "${{ steps.tags.outputs.publish }}" == "true" ]]; then
               echo "Publishing will be handled by the publish job."
               echo "Immutable Sugarkube tag after publish: `${{ steps.tags.outputs.deploy_tag }}`"
@@ -229,7 +251,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push multi-arch relay image
+      - name: Build and push quarantined multi-arch relay candidate
+        id: candidate
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -237,14 +260,49 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
-          tags: ${{ needs.build-and-smoke.outputs.publish_tags }}
+          tags: ${{ needs.build-and-smoke.outputs.repository }}:candidate-${{ github.run_id }}-${{ github.run_attempt }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ needs.build-and-smoke.outputs.short_sha }}
+            org.opencontainers.image.revision=${{ needs.build-and-smoke.outputs.full_sha }}
             org.opencontainers.image.created=${{ needs.build-and-smoke.outputs.created }}
             org.opencontainers.image.licenses=MIT
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
+
+      - name: Gate pushed candidate before release-tag publication
+        env:
+          CANDIDATE_IMAGE: ${{ needs.build-and-smoke.outputs.repository }}:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "${CANDIDATE_IMAGE}"
+          python scripts/relay_release_safety_gate.py \
+            --image "${CANDIDATE_IMAGE}" \
+            --source-commit '${{ needs.build-and-smoke.outputs.full_sha }}' \
+            --release-ref '${{ github.ref }}' \
+            --release-base '${{ github.event.repository.default_branch }}' \
+            --evidence relay-release-safety-evidence.json
+          index_digest='${{ steps.candidate.outputs.digest }}'
+          [[ "${index_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "missing immutable candidate digest" >&2; exit 1; }
+          jq --arg digest "${index_digest}" '.candidate_digest = $digest' relay-release-safety-evidence.json > evidence.tmp
+          mv evidence.tmp relay-release-safety-evidence.json
+
+      - name: Publish qualified candidate under release tags
+        env:
+          CANDIDATE_IMAGE: ${{ needs.build-and-smoke.outputs.repository }}:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          PUBLISH_TAGS: ${{ needs.build-and-smoke.outputs.publish_tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || { echo "empty publication tag" >&2; exit 1; }
+            docker buildx imagetools create --tag "${tag}" "${CANDIDATE_IMAGE}"
+          done <<< "${PUBLISH_TAGS}"
+
+      - name: Upload publication safety evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-release-safety-published-${{ needs.build-and-smoke.outputs.short_sha }}
+          path: relay-release-safety-evidence.json
+          if-no-files-found: error
 
       - name: Publish workflow summary
         run: |
@@ -260,6 +318,10 @@ jobs:
               echo "Sugarkube deploy tag: \`${{ needs.build-and-smoke.outputs.semver_tag }}\`"
             fi
             echo "SHA tag: \`${{ needs.build-and-smoke.outputs.sha_tag }}\`"
+            echo "Source commit: \`${{ needs.build-and-smoke.outputs.full_sha }}\`"
+            echo "Release ref/base: \`${{ github.ref }}\` / \`${{ github.event.repository.default_branch }}\`"
+            echo "Qualified candidate: \`${{ needs.build-and-smoke.outputs.repository }}:candidate-${{ github.run_id }}-${{ github.run_attempt }}@$(jq -r .candidate_digest relay-release-safety-evidence.json)\`"
+            jq -r '.results | to_entries[] | "- `\(.key)`: **\(if .value.passed then "PASS" else "FAIL" end)**"' relay-release-safety-evidence.json
             echo ""
             echo "Pushed: true"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -27,6 +27,7 @@ from valkey_relay_state import (
     ValkeyScriptError,
     ValkeyUnavailableError,
     REGISTRATION_TRANSITION_SCRIPT,
+    RETRIEVE_RESPONSE_SCRIPT,
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
 )
@@ -78,6 +79,19 @@ def test_response_serialization_is_canonical_sorted_utf8():
         b'{"cipherkey":"key","ciphertext":"cipher-\xe2\x98\x83","iv":"iv",'
         b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}'
     )
+
+
+def test_retrieve_response_script_is_registered_digest_pinned_and_secret_free():
+    expected = (
+        "d638bc7fdb07a606c0189c425d0025575f60e6c42a4bd634efc03621374d519b"  # pragma: allowlist secret
+    )
+    assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected
+    assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected
+    source = RETRIEVE_RESPONSE_SCRIPT.source.lower()
+    assert "time" in source
+    assert "flush" not in source
+    assert "scan" not in source
+    assert "acknowledgement_key" not in source
 
 
 @pytest.mark.parametrize(
@@ -195,7 +209,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "3559da1040624e6ac52d933a3d116c680d0398243ca4c68b308d0e1c4e10ecd8"  # pragma: allowlist secret
+    expected_digest = "c4687ca94f6d9c70c78b1c877e32d8b773eb155e829ae3f997be3f4223924168"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest

@@ -17,8 +17,10 @@ import redis
 from relay_state_store import (
     ComputeNodeCapabilities,
     EncryptedRequestEnvelope,
+    EncryptedResponseEnvelope,
     InMemoryRelayStateStore,
     RelayStateCapacityExceeded,
+    RelayStateConflict,
     RelayStateCredentialMismatch,
     RelayStateInvalidReservation,
     RelayStateNoCapacity,
@@ -27,6 +29,7 @@ from relay_state_store import (
 )
 from tests.registration_store_contract import assert_registration_contract
 from valkey_relay_state import (
+    ACCEPT_RESPONSE_SCRIPT,
     CLAIM_SCRIPT,
     RENEW_CLAIM_SCRIPT,
     SCRIPT_DIGESTS,
@@ -40,6 +43,8 @@ from valkey_relay_state import (
     ValkeySchemaIncompatibleError,
     ValkeyUnavailableError,
 )
+
+_ACKNOWLEDGEMENT_KEY = b"shared-test-acknowledgement-key-32"
 
 
 def _free_port():
@@ -253,6 +258,7 @@ def _registration_store(port, namespace, **overrides):
     return ValkeyRegistrationStore(
         foundation,
         RelayStateStoreConfig(namespace="testing.valkey", **overrides),
+        acknowledgement_key=_ACKNOWLEDGEMENT_KEY,
     )
 
 
@@ -2955,6 +2961,8 @@ def _delete_claim_fixture_state(store, node_ids, identities):
         cfg.key("reservations:expiry"),
         cfg.key("requests:deadline"),
         cfg.key("claims:expiry"),
+        cfg.key("responses:expiry"),
+        cfg.key("terminals:expiry"),
     ]
     for node_id in node_ids:
         node = store._node_digest(node_id)
@@ -2963,9 +2971,1829 @@ def _delete_claim_fixture_state(store, node_ids, identities):
         client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
         request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
         keys.extend(
-            (cfg.key("request", client, request), cfg.key("claim", client, request))
+            (
+                cfg.key("request", client, request),
+                cfg.key("claim", client, request),
+                cfg.key("response", client, request),
+                cfg.key("terminal", client, request),
+                cfg.key("progress", client, request),
+            )
         )
     store._foundation._client.delete(*keys)
+
+
+def _response_acceptance_authority(store, node_id, identity):
+    """Return the exact declared keys and identity member for one acceptance."""
+    cfg = store._foundation.config
+    client_id, request_id = identity
+    client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
+    node = store._node_digest(node_id)
+    return (
+        (
+            cfg.key("nodes:lease"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("claim", client, request),
+            cfg.key("request", client, request),
+            cfg.key("claims:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("response", client, request),
+            cfg.key("responses:expiry"),
+            cfg.key("terminal", client, request),
+            cfg.key("terminals:expiry"),
+            cfg.key("progress", client, request),
+        ),
+        f"{client}:{request}",
+    )
+
+
+def _exact_key_snapshot(store, keys):
+    datastore = store._foundation._client
+    return (
+        tuple(
+            datastore.zrange(keys[index], 0, -1, withscores=True)
+            for index in (0, 5, 6, 8, 10)
+        ),
+        tuple(datastore.hgetall(keys[index]) for index in (1, 3, 4, 7, 9, 11)),
+        datastore.xrange(keys[2]),
+    )
+
+
+def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "response-node", _digest("response-owner"), "consumer-a"
+    identity = ("response-client", "response-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "response-iv"
+    )
+    deadline = time.time() + 60
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, deadline)
+        claim = first.claim_queued_request(node, owner, consumer)
+
+        accepted = second.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, response
+        )
+        node_digest = first._node_digest(node)
+        first._foundation._client.delete(
+            first._foundation.config.key("node", node_digest)
+        )
+        first._foundation._client.zrem(
+            first._foundation.config.key("nodes:lease"), node_digest
+        )
+        replay = first.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, response
+        )
+        assert accepted.new_outcome is True
+        assert dataclasses.replace(accepted, new_outcome=False) == replay
+        with pytest.raises(RelayStateConflict, match="response lifecycle conflict"):
+            first.accept_encrypted_response(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claim.generation,
+                dataclasses.replace(response, ciphertext="different-ciphertext"),
+            )
+        assert len(first.response_records()) == len(first.terminal_records()) == 1
+        assert first.response_records()[0].envelope == response
+        assert first.terminal_records()[0].acknowledgement_digest == (
+            second.terminal_records()[0].acknowledgement_digest
+        )
+        assert first.active_claims(node) == ()
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected_dispatches"),
+    (
+        (_manifest(reader_min=2, reader_max=2), ()),
+        (
+            _manifest(writer_min=2, writer_max=2, active_writer_revision=2),
+            (SERVER_TIME_SCRIPT.eval_sha1,),
+        ),
+        (
+            _manifest(
+                script_digests={
+                    **SCRIPT_DIGESTS,
+                    ACCEPT_RESPONSE_SCRIPT.name: "0" * 64,
+                }
+            ),
+            (),
+        ),
+    ),
+    ids=("reader", "writer", "acceptance-script-digest"),
+)
+def test_encrypted_response_compatibility_gates_fail_closed_before_state_or_acceptance_script(
+    valkey_server, manifest, expected_dispatches
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, consumer = (
+        "acceptance-compatibility-node",
+        _digest("acceptance-compatibility-owner"),
+        "acceptance-compatibility-consumer",
+    )
+    identity = ("acceptance-compatibility-client", "acceptance-compatibility-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    schema_key = cfg.key("schema")
+    original_evalsha = store._foundation._client.evalsha
+    keys, member = _response_acceptance_authority(store, node, identity)
+    try:
+        store.register(node, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 60
+        _enqueue_claim_fixture(store, node, owner, *identity, deadline)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store._foundation.server_time()
+        baseline = _exact_key_snapshot(store, keys)
+        dispatches = []
+
+        def record_dispatch(*args, **kwargs):
+            dispatches.append(args[0])
+            return original_evalsha(*args, **kwargs)
+
+        store._foundation._client.set(schema_key, manifest.encode())
+        store._foundation._client.evalsha = record_dispatch
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, response
+            )
+
+        assert tuple(dispatches) == expected_dispatches
+        assert ACCEPT_RESPONSE_SCRIPT.eval_sha1 not in dispatches
+        assert _exact_key_snapshot(store, keys) == baseline
+        assert store._foundation._client.exists(keys[7], keys[9]) == 0
+        assert store._foundation._client.zscore(keys[8], member) is None
+        assert store._foundation._client.zscore(keys[10], member) is None
+    finally:
+        store._foundation._client.evalsha = original_evalsha
+        store._foundation._client.set(schema_key, _manifest().encode())
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+def test_encrypted_response_namespace_isolation(valkey_server):
+    stores = [
+        _registration_store(valkey_server, uuid.uuid4().hex) for _ in range(2)
+    ]
+    node, owner, consumer = (
+        "namespace-response-node",
+        _digest("namespace-response-owner"),
+        "namespace-response-consumer",
+    )
+    identity = ("namespace-response-client", "namespace-response-request")
+    envelopes = (
+        EncryptedResponseEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "ciphertext-a", "key-a", "iv-a"
+        ),
+        EncryptedResponseEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "ciphertext-b", "key-b", "iv-b"
+        ),
+    )
+    authorities = [
+        _response_acceptance_authority(store, node, identity) for store in stores
+    ]
+    try:
+        assert set(authorities[0][0]).isdisjoint(authorities[1][0])
+        for store, (keys, _) in zip(stores, authorities):
+            assert all(
+                key.startswith(store._foundation.config.key_prefix) for key in keys
+            )
+
+        claims = []
+        for store in stores:
+            store.register(node, _capabilities(), owner)
+            deadline = store._foundation.server_time()[0] + 60
+            _enqueue_claim_fixture(store, node, owner, *identity, deadline)
+            claims.append(store.claim_queued_request(node, owner, consumer))
+
+        before = [
+            _exact_key_snapshot(store, authority[0])
+            for store, authority in zip(stores, authorities)
+        ]
+        accepted = stores[0].accept_encrypted_response(
+            node, owner, consumer, *identity, claims[0].generation, envelopes[0]
+        )
+        assert accepted.new_outcome is True
+        assert _exact_key_snapshot(stores[1], authorities[1][0]) == before[1]
+        assert stores[1]._foundation._client.exists(
+            authorities[1][0][7], authorities[1][0][9]
+        ) == 0
+        assert stores[1]._foundation._client.zscore(
+            authorities[1][0][8], authorities[1][1]
+        ) is None
+        assert stores[1]._foundation._client.zscore(
+            authorities[1][0][10], authorities[1][1]
+        ) is None
+
+        namespace_a = _exact_key_snapshot(stores[0], authorities[0][0])
+        accepted_other = stores[1].accept_encrypted_response(
+            node, owner, consumer, *identity, claims[1].generation, envelopes[1]
+        )
+        assert accepted_other.new_outcome is True
+        assert _exact_key_snapshot(stores[0], authorities[0][0]) == namespace_a
+
+        namespace_b = _exact_key_snapshot(stores[1], authorities[1][0])
+        response_records = stores[0].response_records()
+        terminal_records = stores[0].terminal_records()
+        assert _exact_key_snapshot(stores[1], authorities[1][0]) == namespace_b
+        assert len(response_records) == len(terminal_records) == 1
+        assert response_records[0].envelope == envelopes[0]
+        assert (
+            terminal_records[0].response_digest == response_records[0].response_digest
+        )
+
+        namespace_a = _exact_key_snapshot(stores[0], authorities[0][0])
+        response_records = stores[1].response_records()
+        terminal_records = stores[1].terminal_records()
+        assert _exact_key_snapshot(stores[0], authorities[0][0]) == namespace_a
+        assert len(response_records) == len(terminal_records) == 1
+        assert response_records[0].envelope == envelopes[1]
+        assert (
+            terminal_records[0].response_digest == response_records[0].response_digest
+        )
+
+        completed = [
+            _exact_key_snapshot(store, authority[0])
+            for store, authority in zip(stores, authorities)
+        ]
+        for index, store in enumerate(stores):
+            replay = store.accept_encrypted_response(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claims[index].generation,
+                envelopes[index],
+            )
+            assert replay == dataclasses.replace(
+                (accepted, accepted_other)[index], new_outcome=False
+            )
+        assert [
+            _exact_key_snapshot(store, authority[0])
+            for store, authority in zip(stores, authorities)
+        ] == completed
+    finally:
+        for store in stores:
+            _delete_claim_fixture_state(store, (node,), (identity,))
+            store.close()
+
+
+@pytest.mark.parametrize(
+    ("backend_error", "expected_error", "expected_message"),
+    (
+        (
+            redis.ConnectionError,
+            ValkeyUnavailableError,
+            "state backend unavailable",
+        ),
+        (
+            lambda message: redis.ResponseError(f"READONLY {message}"),
+            ValkeyReadOnlyError,
+            "state backend is not writable",
+        ),
+        (
+            redis.ResponseError,
+            ValkeyUnavailableError,
+            "state backend command failed",
+        ),
+    ),
+    ids=("connection", "readonly", "command"),
+)
+def test_encrypted_response_backend_failures_are_typed_redacted_and_not_replayed(
+    valkey_server, caplog, backend_error, expected_error, expected_message
+):
+    namespace = f"acceptance-failure-{uuid.uuid4().hex}"
+    store = _registration_store(valkey_server, namespace)
+    node = "acceptance-failure-node-marker"
+    owner = _digest("acceptance-failure-owner-marker")
+    consumer = "acceptance-failure-consumer-marker"
+    identity = (
+        "acceptance-failure-client-marker",
+        "acceptance-failure-request-marker",
+    )
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee",
+        1,
+        "acceptance-failure-ciphertext-marker",
+        "acceptance-failure-cipher-key-marker",
+        "acceptance-failure-iv-marker",
+    )
+    keys, member = _response_acceptance_authority(store, node, identity)
+    original_evalsha = store._foundation._client.evalsha
+    dispatches = []
+    endpoint_marker = "acceptance-failure-private-endpoint-marker"
+    acknowledgement_marker = _ACKNOWLEDGEMENT_KEY.decode()
+    markers = (
+        endpoint_marker,
+        namespace,
+        *keys,
+        node,
+        owner,
+        consumer,
+        *identity,
+        envelope.ciphertext,
+        envelope.cipherkey,
+        envelope.iv,
+        acknowledgement_marker,
+    )
+    try:
+        store.register(node, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 60
+        _enqueue_claim_fixture(store, node, owner, *identity, deadline)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store._foundation._client.script_load(ACCEPT_RESPONSE_SCRIPT.source)
+        before = _exact_key_snapshot(store, keys)
+
+        def fail_acceptance(*args, **kwargs):
+            if args[0] != ACCEPT_RESPONSE_SCRIPT.eval_sha1:
+                return original_evalsha(*args, **kwargs)
+            dispatches.append((args, kwargs))
+            raise backend_error(" ".join(markers))
+
+        store._foundation._client.evalsha = fail_acceptance
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(
+                expected_error, match=f"^{expected_message}$"
+            ) as caught:
+                store.accept_encrypted_response(
+                    node, owner, consumer, *identity, claim.generation, envelope
+                )
+
+        assert len(dispatches) == 1
+        assert caught.value.__cause__ is None
+        rendered = "".join(
+            (
+                str(caught.value),
+                repr(caught.value),
+                "".join(traceback.format_exception(caught.value)),
+                caplog.text,
+                repr(store),
+                repr(store._foundation),
+                repr(store._foundation.config),
+                repr(store._foundation.config.direct),
+            )
+        )
+        assert all(marker not in rendered for marker in markers)
+        dispatched_args, dispatched_kwargs = dispatches[0]
+        assert dispatched_kwargs == {}
+        assert all(
+            _ACKNOWLEDGEMENT_KEY not in (
+                value if isinstance(value, bytes) else str(value).encode()
+            )
+            for value in dispatched_args[2:]
+        )
+        assert _exact_key_snapshot(store, keys) == before
+        assert store._foundation._client.exists(keys[7], keys[9]) == 0
+        assert store._foundation._client.zscore(keys[8], member) is None
+        assert store._foundation._client.zscore(keys[10], member) is None
+    finally:
+        store._foundation._client.evalsha = original_evalsha
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+def test_encrypted_response_committed_lost_reply_is_recovered_without_replay(
+    valkey_server, caplog
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "lost-reply-node", _digest("lost-reply-owner"), "consumer"
+    identity = ("lost-reply-client", "lost-reply-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee",
+        1,
+        "lost-reply-ciphertext-marker",
+        "lost-reply-key-marker",
+        "lost-reply-iv-marker",
+    )
+    keys, member = _response_acceptance_authority(first, node, identity)
+    cfg = first._foundation.config
+    response_key, terminal_key = keys[7], keys[9]
+    original_evalsha = first._foundation._client.evalsha
+    dispatches = 0
+    markers = (
+        "private-endpoint-marker",
+        response_key,
+        terminal_key,
+        node,
+        owner,
+        consumer,
+        *identity,
+        envelope.ciphertext,
+        envelope.cipherkey,
+        envelope.iv,
+    )
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        claim = first.claim_queued_request(node, owner, consumer)
+        first._foundation._client.script_load(ACCEPT_RESPONSE_SCRIPT.source)
+
+        def lose_acceptance_reply(*args):
+            nonlocal dispatches
+            result = original_evalsha(*args)
+            if args[0] == ACCEPT_RESPONSE_SCRIPT.eval_sha1:
+                dispatches += 1
+                raise redis.ConnectionError(" ".join(markers))
+            return result
+
+        first._foundation._client.evalsha = lose_acceptance_reply
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(
+                ValkeyUnavailableError, match="^state backend unavailable$"
+            ) as caught:
+                first.accept_encrypted_response(
+                    node, owner, consumer, *identity, claim.generation, envelope
+                )
+        assert dispatches == 1
+        assert caught.value.__cause__ is None
+        rendered = "".join(
+            (
+                str(caught.value),
+                repr(caught.value),
+                "".join(traceback.format_exception(caught.value)),
+                caplog.text,
+            )
+        )
+        assert all(marker not in rendered for marker in markers)
+
+        first._foundation._client.evalsha = original_evalsha
+        committed = _exact_key_snapshot(first, keys)
+        terminal = first._foundation._client.hgetall(terminal_key)
+        recovered = second.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        assert recovered.new_outcome is False
+        assert recovered.generation == claim.generation
+        assert recovered.accepted_at_epoch == float(terminal[b"accepted_at_epoch"])
+        assert recovered.replay_expires_at_epoch == float(
+            terminal[b"replay_expires_at_epoch"]
+        )
+        assert _exact_key_snapshot(first, keys) == committed
+        assert first._foundation._client.zscore(cfg.key("responses:expiry"), member)
+        assert first._foundation._client.zscore(cfg.key("terminals:expiry"), member)
+    finally:
+        first._foundation._client.evalsha = original_evalsha
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
+def test_encrypted_response_concurrent_identical_acceptance_has_one_outcome(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    stores = (
+        _registration_store(valkey_server, namespace),
+        _registration_store(valkey_server, namespace),
+    )
+    first, second = stores
+    node, owner, consumer = "identical-node", _digest("identical-owner"), "consumer"
+    identity = ("identical-client", "identical-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "same-ciphertext", "same-key", "same-iv"
+    )
+    barrier = Barrier(2, timeout=2)
+    originals = [store._foundation._client.evalsha for store in stores]
+    dispatches = [0, 0]
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        claim = first.claim_queued_request(node, owner, consumer)
+        for store in stores:
+            store._foundation._client.script_load(ACCEPT_RESPONSE_SCRIPT.source)
+
+        for index, store in enumerate(stores):
+            original = originals[index]
+
+            def synchronized(*args, index=index, original=original):
+                if args[0] == ACCEPT_RESPONSE_SCRIPT.eval_sha1:
+                    dispatches[index] += 1
+                    barrier.wait()
+                return original(*args)
+
+            store._foundation._client.evalsha = synchronized
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(
+                    store.accept_encrypted_response,
+                    node,
+                    owner,
+                    consumer,
+                    *identity,
+                    claim.generation,
+                    envelope,
+                )
+                for store in stores
+            ]
+            results = [future.result(timeout=3) for future in futures]
+
+        assert dispatches == [1, 1]
+        assert sorted(result.new_outcome for result in results) == [False, True]
+        assert dataclasses.replace(results[0], new_outcome=False) == dataclasses.replace(
+            results[1], new_outcome=False
+        )
+        keys, member = _response_acceptance_authority(first, node, identity)
+        assert len(first._foundation._client.hgetall(keys[7])) == 12
+        assert len(first._foundation._client.hgetall(keys[9])) == 16
+        assert first._foundation._client.zscore(keys[8], member) is not None
+        assert first._foundation._client.zscore(keys[10], member) is not None
+    finally:
+        for store, original in zip(stores, originals):
+            store._foundation._client.evalsha = original
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
+def test_encrypted_response_concurrent_conflicts_preserve_one_winner(valkey_server):
+    namespace = uuid.uuid4().hex
+    stores = (
+        _registration_store(valkey_server, namespace),
+        _registration_store(valkey_server, namespace),
+    )
+    first, second = stores
+    node, owner, consumer = "conflict-node", _digest("conflict-owner"), "consumer"
+    identity = ("conflict-client", "conflict-request")
+    envelopes = (
+        EncryptedResponseEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "ciphertext-a", "key-a", "iv-a"
+        ),
+        EncryptedResponseEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "ciphertext-b", "key-b", "iv-b"
+        ),
+    )
+    barrier = Barrier(2, timeout=2)
+    originals = [store._foundation._client.evalsha for store in stores]
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        claim = first.claim_queued_request(node, owner, consumer)
+        for store in stores:
+            store._foundation._client.script_load(ACCEPT_RESPONSE_SCRIPT.source)
+        for store, original in zip(stores, originals):
+
+            def synchronized(*args, original=original):
+                if args[0] == ACCEPT_RESPONSE_SCRIPT.eval_sha1:
+                    barrier.wait()
+                return original(*args)
+
+            store._foundation._client.evalsha = synchronized
+
+        def accept(index):
+            try:
+                return stores[index].accept_encrypted_response(
+                    node,
+                    owner,
+                    consumer,
+                    *identity,
+                    claim.generation,
+                    envelopes[index],
+                )
+            except RelayStateConflict as exc:
+                return exc
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(accept, index) for index in range(2)]
+            outcomes = [future.result(timeout=3) for future in futures]
+        winner_index = next(
+            index
+            for index, outcome in enumerate(outcomes)
+            if not isinstance(outcome, Exception)
+        )
+        loser_index = 1 - winner_index
+        assert outcomes[winner_index].new_outcome is True
+        assert str(outcomes[loser_index]) == "response lifecycle conflict"
+
+        for store, original in zip(stores, originals):
+            store._foundation._client.evalsha = original
+        keys, member = _response_acceptance_authority(first, node, identity)
+        authority = _exact_key_snapshot(first, keys)
+        response = first._foundation._client.hgetall(keys[7])
+        terminal = first._foundation._client.hgetall(keys[9])
+        encoded_winner = first._serialized_response_envelope(envelopes[winner_index])
+        assert response[b"envelope"] == encoded_winner
+        assert response[b"response_digest"] == (
+            hashlib.sha256(encoded_winner).hexdigest().encode()
+        )
+        assert terminal[b"response_digest"] == response[b"response_digest"]
+        assert first._foundation._client.zscore(keys[8], member) == float(
+            response[b"replay_expires_at_epoch"]
+        )
+        assert first._foundation._client.zscore(keys[10], member) == float(
+            terminal[b"expires_at_epoch"]
+        )
+
+        replay = stores[winner_index].accept_encrypted_response(
+            node,
+            owner,
+            consumer,
+            *identity,
+            claim.generation,
+            envelopes[winner_index],
+        )
+        assert replay == dataclasses.replace(outcomes[winner_index], new_outcome=False)
+        assert _exact_key_snapshot(first, keys) == authority
+        with pytest.raises(RelayStateConflict, match="^response lifecycle conflict$"):
+            stores[loser_index].accept_encrypted_response(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claim.generation,
+                envelopes[loser_index],
+            )
+        assert _exact_key_snapshot(first, keys) == authority
+    finally:
+        for store, original in zip(stores, originals):
+            store._foundation._client.evalsha = original
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
+def _assert_redacted_acceptance_failure(caught, caplog, markers):
+    rendered = "".join(
+        (
+            str(caught.value),
+            repr(caught.value),
+            "".join(traceback.format_exception(caught.value)),
+            caplog.text,
+        )
+    )
+    leaked = [str(marker) for marker in markers if str(marker) in rendered]
+    assert leaked == []
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "error", "message"),
+    (
+        ("node", RelayStateCredentialMismatch, "response owner is invalid"),
+        ("owner", RelayStateCredentialMismatch, "response owner is invalid"),
+        ("consumer", RelayStateCredentialMismatch, "response owner is invalid"),
+        ("client", RelayStateConflict, "response lifecycle conflict"),
+        ("request", RelayStateConflict, "response lifecycle conflict"),
+        ("generation", RelayStateConflict, "response lifecycle conflict"),
+    ),
+)
+def test_encrypted_response_wrong_authority_is_redacted_and_non_mutating(
+    valkey_server, caplog, mismatch, error, message
+):
+    namespace = uuid.uuid4().hex
+    stores = (
+        _registration_store(valkey_server, namespace),
+        _registration_store(valkey_server, namespace),
+    )
+    first, second = stores
+    node, owner, consumer = "authority-node", _digest("authority-owner"), "consumer"
+    identity = ("authority-client", "authority-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee",
+        1,
+        "authority-ciphertext",
+        "authority-key",
+        "authority-iv",
+    )
+    attempted = {
+        "node": "supplied-wrong-node",
+        "owner": _digest("supplied-wrong-owner"),
+        "consumer": "supplied-wrong-consumer",
+        "client": "supplied-wrong-client",
+        "request": "supplied-wrong-request",
+        "generation": 919191,
+    }
+    arguments = [node, owner, consumer, *identity, None, envelope]
+    positions = {
+        "node": 0,
+        "owner": 1,
+        "consumer": 2,
+        "client": 3,
+        "request": 4,
+        "generation": 5,
+    }
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        claim = first.claim_queued_request(node, owner, consumer)
+        arguments[5] = claim.generation
+        arguments[positions[mismatch]] = attempted[mismatch]
+        attempted_node = arguments[0]
+        attempted_identity = (arguments[3], arguments[4])
+        valid_keys, valid_member = _response_acceptance_authority(first, node, identity)
+        attempted_keys, attempted_member = _response_acceptance_authority(
+            first, attempted_node, attempted_identity
+        )
+        before = (
+            _exact_key_snapshot(first, valid_keys),
+            _exact_key_snapshot(first, attempted_keys),
+        )
+        markers = (
+            namespace,
+            *arguments[:5],
+            (
+                attempted["generation"]
+                if mismatch == "generation"
+                else "supplied-generation-marker"
+            ),
+            envelope.ciphertext,
+            envelope.cipherkey,
+            envelope.iv,
+            *valid_keys,
+            *attempted_keys,
+        )
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(error, match=f"^{message}$") as caught:
+                second.accept_encrypted_response(*arguments)
+        _assert_redacted_acceptance_failure(caught, caplog, markers)
+        assert (
+            _exact_key_snapshot(first, valid_keys),
+            _exact_key_snapshot(first, attempted_keys),
+        ) == before
+        datastore = first._foundation._client
+        for keys, member in (
+            (valid_keys, valid_member),
+            (attempted_keys, attempted_member),
+        ):
+            assert datastore.exists(keys[7], keys[9]) == 0
+            assert datastore.zscore(keys[8], member) is None
+            assert datastore.zscore(keys[10], member) is None
+    finally:
+        _delete_claim_fixture_state(
+            first,
+            (node, attempted["node"]),
+            (
+                identity,
+                (attempted["client"], identity[1]),
+                (identity[0], attempted["request"]),
+            ),
+        )
+        for store in stores:
+            store.close()
+
+
+def test_encrypted_response_stale_generation_is_fenced_after_reclaim(valkey_server):
+    namespace = uuid.uuid4().hex
+    stores = tuple(
+        _registration_store(valkey_server, namespace, claim_ttl_seconds=0.05)
+        for _ in range(2)
+    )
+    first, second = stores
+    node, owner, identity = (
+        "reclaim-response-node",
+        _digest("reclaim-response-owner"),
+        ("reclaim-client", "reclaim-request"),
+    )
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee",
+        1,
+        "reclaim-ciphertext",
+        "reclaim-key",
+        "reclaim-iv",
+    )
+    keys, _ = _response_acceptance_authority(first, node, identity)
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        old = first.claim_queued_request(node, owner, "old-consumer")
+        _wait_for_server_epoch(first, old.lease_expires_at_epoch)
+        current = second.claim_queued_request(node, owner, "current-consumer")
+        assert current.state == "reclaimed" and current.generation > old.generation
+
+        before = _exact_key_snapshot(first, keys)
+        with pytest.raises(RelayStateConflict, match="^response lifecycle conflict$"):
+            first.accept_encrypted_response(
+                node, owner, "old-consumer", *identity, old.generation, envelope
+            )
+        assert _exact_key_snapshot(first, keys) == before
+        accepted = second.accept_encrypted_response(
+            node, owner, "current-consumer", *identity, current.generation, envelope
+        )
+        assert (
+            accepted.new_outcome is True and accepted.generation == current.generation
+        )
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        for store in stores:
+            store.close()
+
+
+@pytest.mark.parametrize("removal", ("unregister", "expiry"))
+def test_encrypted_response_node_id_reuse_fences_old_claim(valkey_server, removal):
+    namespace = uuid.uuid4().hex
+    stores = tuple(
+        _registration_store(valkey_server, namespace, lease_ttl_seconds=0.05)
+        for _ in range(2)
+    )
+    first, second = stores
+    node = "acceptance-reused-node"
+    old_owner, new_owner = _digest("acceptance-old-owner"), _digest(
+        "acceptance-new-owner"
+    )
+    identities = (("reuse-client", "old-request"), ("reuse-client", "fresh-request"))
+    old_envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "old-ciphertext", "old-key", "old-iv"
+    )
+    fresh_envelope = dataclasses.replace(old_envelope, ciphertext="fresh-ciphertext")
+    old_keys, _ = _response_acceptance_authority(first, node, identities[0])
+    try:
+        registration = first.register(node, _capabilities(), old_owner)
+        _enqueue_claim_fixture(first, node, old_owner, *identities[0], time.time() + 60)
+        old = second.claim_queued_request(node, old_owner, "old-consumer")
+        if removal == "unregister":
+            assert first.unregister(node, old_owner)
+        else:
+            _wait_for_server_epoch(first, registration.lease_expires_at_epoch)
+        second.register(node, _capabilities(), new_owner)
+
+        for attempted_owner in (old_owner, new_owner):
+            before = _exact_key_snapshot(first, old_keys)
+            with pytest.raises(
+                RelayStateCredentialMismatch, match="^response owner is invalid$"
+            ):
+                second.accept_encrypted_response(
+                    node,
+                    attempted_owner,
+                    "old-consumer",
+                    *identities[0],
+                    old.generation,
+                    old_envelope,
+                )
+            assert _exact_key_snapshot(first, old_keys) == before
+
+        _enqueue_claim_fixture(
+            second, node, new_owner, *identities[1], time.time() + 60
+        )
+        fresh = first.claim_queued_request(node, new_owner, "fresh-consumer")
+        accepted = second.accept_encrypted_response(
+            node,
+            new_owner,
+            "fresh-consumer",
+            *identities[1],
+            fresh.generation,
+            fresh_envelope,
+        )
+        assert accepted.new_outcome is True
+        assert second.response_records()[0].envelope == fresh_envelope
+    finally:
+        _delete_claim_fixture_state(first, (node,), identities)
+        for store in stores:
+            store.close()
+
+
+def test_encrypted_response_retries_retained_retrieval_expired_terminal(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=0.1,
+        terminal_retention_seconds=30,
+        control_tombstone_ttl_seconds=30,
+    )
+    second = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=0.1,
+        terminal_retention_seconds=30,
+        control_tombstone_ttl_seconds=30,
+    )
+    node, owner, consumer = "expired-node", _digest("expired-owner"), "consumer"
+    identity = ("expired-client", "expired-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = first._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    node_digest = first._node_digest(node)
+    datastore = first._foundation._client
+    declared_keys = (
+        cfg.key("nodes:lease"),
+        cfg.key("node", node_digest),
+        cfg.key("queue", node_digest),
+        cfg.key("claim", client, request),
+        cfg.key("request", client, request),
+        cfg.key("claims:expiry"),
+        cfg.key("requests:deadline"),
+        cfg.key("response", client, request),
+        cfg.key("responses:expiry"),
+        cfg.key("terminal", client, request),
+        cfg.key("terminals:expiry"),
+        cfg.key("progress", client, request),
+    )
+
+    def snapshot():
+        return tuple(datastore.dump(key) for key in declared_keys)
+
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        claim = first.claim_queued_request(node, owner, consumer)
+        accepted = first.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+
+        for _ in range(200):
+            seconds, micros = first._foundation.server_time()
+            if seconds + micros / 1_000_000 >= accepted.replay_expires_at_epoch:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("authoritative Valkey time did not reach response expiry")
+        first._cleanup_completed_records()
+        assert datastore.exists(cfg.key("response", client, request)) == 0
+        assert datastore.zscore(cfg.key("responses:expiry"), member) is None
+        assert datastore.hget(
+            cfg.key("terminal", client, request), "retrieval_state"
+        ) == b"retrieval_expired"
+
+        datastore.delete(cfg.key("node", node_digest))
+        datastore.zrem(cfg.key("nodes:lease"), node_digest)
+        before = snapshot()
+        retried = second.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        assert retried == dataclasses.replace(accepted, new_outcome=False)
+        assert snapshot() == before
+
+        before = snapshot()
+        with pytest.raises(RelayStateConflict, match="response lifecycle conflict"):
+            second.accept_encrypted_response(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claim.generation,
+                dataclasses.replace(envelope, ciphertext="different-ciphertext"),
+            )
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize("terminal_fields", ({"additive": "value"}, {"outcome": "completed"}))
+def test_encrypted_response_rejects_preexisting_terminal_authority_without_mutation(
+    valkey_server, terminal_fields
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "orphan-node", _digest("orphan-owner"), "consumer"
+    identity = ("orphan-client", "orphan-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    terminal = cfg.key("terminal", client, request)
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store._foundation._client.hset(terminal, mapping=terminal_fields)
+        before = store._foundation._client.dump(terminal)
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, envelope
+            )
+        assert store._foundation._client.dump(terminal) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+def test_encrypted_response_complete_terminal_preserves_additive_fields(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "additive-node", _digest("additive-owner"), "consumer"
+    identity = ("additive-client", "additive-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    terminal = cfg.key("terminal", client, request)
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        accepted = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        store._foundation._client.hset(terminal, "additive", "preserved")
+        before = store._foundation._client.dump(terminal)
+
+        retried = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        assert retried == dataclasses.replace(accepted, new_outcome=False)
+        assert store._foundation._client.dump(terminal) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize("retrieval_state", ("response_ready", "retrieval_expired"))
+@pytest.mark.parametrize("corruption", ("empty_node", "oversized_node", "negative_accepted", "future_accepted"))
+def test_encrypted_response_rejects_invalid_retained_terminal_bounds_without_mutation(
+    valkey_server, retrieval_state, corruption
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=0.05 if retrieval_state == "retrieval_expired" else 300,
+        terminal_retention_seconds=600,
+    )
+    node, owner, consumer = "bounded-node", _digest("bounded-owner"), "consumer"
+    identity = ("bounded-client", "bounded-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    terminal = cfg.key("terminal", client, request)
+    response = cfg.key("response", client, request)
+    datastore = store._foundation._client
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        accepted = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        if retrieval_state == "retrieval_expired":
+            for _ in range(200):
+                seconds, micros = store._foundation.server_time()
+                if seconds + micros / 1_000_000 >= accepted.replay_expires_at_epoch:
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("authoritative Valkey time did not reach response expiry")
+            store._cleanup_completed_records()
+
+        field = "node_id" if corruption.endswith("node") else "accepted_at_epoch"
+        value = {
+            "empty_node": "",
+            "oversized_node": "x" * (store.config.max_node_id_bytes + 1),
+            "negative_accepted": "-1",
+            "future_accepted": repr(time.time() + 60),
+        }[corruption]
+        datastore.hset(terminal, field, value)
+        if retrieval_state == "response_ready":
+            datastore.hset(response, field, value)
+        before = (datastore.hgetall(terminal), datastore.hgetall(response))
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, envelope
+            )
+        assert (datastore.hgetall(terminal), datastore.hgetall(response)) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "client",
+        "request",
+        "client_public_key",
+        "request_id",
+        "node_id",
+        "consumer_digest",
+        "generation",
+        "envelope",
+        "accepted_at_epoch",
+        "response_digest",
+        "replay_expires_at_epoch",
+        "status",
+        "response_expiry_score",
+        "response_expiry_member",
+        "oversized_client_public_key",
+        "oversized_node_id",
+        "oversized_envelope",
+    ),
+)
+def test_encrypted_response_retained_retry_validates_complete_paired_authority(
+    valkey_server, corruption
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=300,
+        terminal_retention_seconds=600,
+    )
+    node, owner, consumer = "retained-node", _digest("retained-owner"), "consumer"
+    identity = ("retained-client", "retained-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    response_key = cfg.key("response", client, request)
+    response_expiries = cfg.key("responses:expiry")
+    datastore = store._foundation._client
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+
+        if corruption == "response_expiry_score":
+            datastore.zincrby(response_expiries, 1, member)
+        elif corruption == "response_expiry_member":
+            score = datastore.zscore(response_expiries, member)
+            datastore.zrem(response_expiries, member)
+            datastore.zadd(response_expiries, {f"{client}:{'0' * 64}": score})
+        else:
+            field = corruption.removeprefix("oversized_")
+            replacements = {
+                "client": "0" * 64,
+                "request": "0" * 64,
+                "client_public_key": "different-client",
+                "request_id": "different-request",
+                "node_id": "different-node",
+                "consumer_digest": "0" * 64,
+                "generation": str(claim.generation + 1),
+                "envelope": b"different-envelope",
+                "accepted_at_epoch": "1",
+                "response_digest": "0" * 64,
+                "replay_expires_at_epoch": "1",
+                "status": "different-status",
+            }
+            replacement = replacements.get(field)
+            if corruption.startswith("oversized_"):
+                bound = (
+                    store.config.max_response_envelope_bytes
+                    if field == "envelope"
+                    else store.config.max_node_id_bytes
+                    if field == "node_id"
+                    else store.config.max_identity_bytes
+                )
+                replacement = b"x" * (bound + 1)
+            datastore.hset(response_key, field, replacement)
+
+        snapshot = (
+            datastore.hgetall(response_key),
+            datastore.hgetall(cfg.key("terminal", client, request)),
+            datastore.hgetall(cfg.key("request", client, request)),
+            datastore.zrange(response_expiries, 0, -1, withscores=True),
+            datastore.zrange(cfg.key("terminals:expiry"), 0, -1, withscores=True),
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, envelope
+            )
+        assert snapshot == (
+            datastore.hgetall(response_key),
+            datastore.hgetall(cfg.key("terminal", client, request)),
+            datastore.hgetall(cfg.key("request", client, request)),
+            datastore.zrange(response_expiries, 0, -1, withscores=True),
+            datastore.zrange(cfg.key("terminals:expiry"), 0, -1, withscores=True),
+        )
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "partial_response",
+        "partial_terminal",
+        "terminal_index_mismatch",
+        "malformed_lifecycle",
+        "orphan_response_expiry",
+    ),
+)
+def test_encrypted_response_cleanup_rejects_malformed_authority_without_writes(
+    valkey_server, corruption
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, consumer = "cleanup-node", _digest("cleanup-owner"), "consumer"
+    identity = ("cleanup-client", "cleanup-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    response = cfg.key("response", client, request)
+    terminal = cfg.key("terminal", client, request)
+    lifecycle = cfg.key("request", client, request)
+    response_index = cfg.key("responses:expiry")
+    terminal_index = cfg.key("terminals:expiry")
+    datastore = store._foundation._client
+    def snapshot():
+        return (
+            tuple(datastore.hgetall(key) for key in (response, terminal, lifecycle)),
+            tuple(
+                datastore.zrange(key, 0, -1, withscores=True)
+                for key in (response_index, terminal_index)
+            ),
+        )
+
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        accepted = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        due = accepted.accepted_at_epoch
+        datastore.hset(response, "replay_expires_at_epoch", repr(due))
+        datastore.hset(terminal, "replay_expires_at_epoch", repr(due))
+        datastore.zadd(response_index, {member: due})
+
+        if corruption == "partial_response":
+            datastore.delete(response)
+            datastore.hset(response, "additive", "value")
+        elif corruption == "partial_terminal":
+            datastore.delete(terminal)
+            datastore.hset(terminal, "additive", "value")
+        elif corruption == "terminal_index_mismatch":
+            datastore.zincrby(terminal_index, 1, member)
+        elif corruption == "malformed_lifecycle":
+            datastore.hdel(lifecycle, "client_public_key")
+        else:
+            datastore.delete(response)
+            datastore.hset(terminal, "retrieval_state", "retrieval_expired")
+
+        before = snapshot()
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store._cleanup_completed_records()
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize("cleanup_phase", ("response", "terminal"))
+@pytest.mark.parametrize(
+    "terminal_field", ("retrieval_credential_digest", "cancellation_token_digest")
+)
+def test_encrypted_response_cleanup_rejects_mismatched_lifecycle_digests(
+    valkey_server, cleanup_phase, terminal_field
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, consumer = "digest-node", _digest("digest-owner"), "consumer"
+    identity = ("digest-client", "digest-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    response = cfg.key("response", client, request)
+    terminal = cfg.key("terminal", client, request)
+    lifecycle = cfg.key("request", client, request)
+    response_index = cfg.key("responses:expiry")
+    terminal_index = cfg.key("terminals:expiry")
+    datastore = store._foundation._client
+
+    def snapshot():
+        return (
+            datastore.hgetall(response),
+            datastore.hgetall(terminal),
+            datastore.hgetall(lifecycle),
+            datastore.zrange(response_index, 0, -1, withscores=True),
+            datastore.zrange(terminal_index, 0, -1, withscores=True),
+        )
+
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        accepted = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        due = accepted.accepted_at_epoch
+        datastore.hset(response, "replay_expires_at_epoch", repr(due))
+        datastore.hset(terminal, "replay_expires_at_epoch", repr(due))
+        datastore.zadd(response_index, {member: due})
+        if cleanup_phase == "terminal":
+            store._cleanup_completed_records()
+            datastore.hset(terminal, "expires_at_epoch", repr(due))
+            datastore.zadd(terminal_index, {member: due})
+
+        datastore.hset(terminal, terminal_field, "f" * 64)
+        before = snapshot()
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store._cleanup_completed_records()
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+def test_encrypted_response_cleanup_validates_batch_before_exact_reaping(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, consumer = "batch-node", _digest("batch-owner"), "consumer"
+    identities = (("batch-client-a", "request-a"), ("batch-client-b", "request-b"))
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    datastore = store._foundation._client
+    records = []
+    try:
+        store.register(node, _capabilities(concurrency=2), owner)
+        for identity in identities:
+            _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+            claim = store.claim_queued_request(node, owner, consumer)
+            accepted = store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, envelope
+            )
+            client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+            request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+            member = f"{client}:{request}"
+            response = cfg.key("response", client, request)
+            terminal = cfg.key("terminal", client, request)
+            lifecycle = cfg.key("request", client, request)
+            datastore.hset(response, "replay_expires_at_epoch", repr(accepted.accepted_at_epoch))
+            datastore.hset(terminal, "replay_expires_at_epoch", repr(accepted.accepted_at_epoch))
+            datastore.zadd(cfg.key("responses:expiry"), {member: accepted.accepted_at_epoch})
+            records.append((member, response, terminal, lifecycle, accepted.accepted_at_epoch))
+
+        datastore.hdel(records[1][3], "request_id")
+        hash_keys = tuple(key for record in records for key in record[1:4])
+        index_keys = (cfg.key("responses:expiry"), cfg.key("terminals:expiry"))
+
+        def snapshot():
+            return (
+                tuple(datastore.hgetall(key) for key in hash_keys),
+                tuple(datastore.zrange(key, 0, -1, withscores=True) for key in index_keys),
+            )
+
+        before = snapshot()
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store._cleanup_completed_records()
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), identities)
+        store.close()
+
+
+def test_encrypted_response_cleanup_reaps_exact_response_then_terminal(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, consumer = "reap-node", _digest("reap-owner"), "consumer"
+    identity = ("reap-client", "reap-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+    request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+    member = f"{client}:{request}"
+    response = cfg.key("response", client, request)
+    terminal = cfg.key("terminal", client, request)
+    lifecycle = cfg.key("request", client, request)
+    datastore = store._foundation._client
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        accepted = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        due = accepted.accepted_at_epoch
+        datastore.hset(response, "replay_expires_at_epoch", repr(due))
+        datastore.hset(terminal, mapping={"replay_expires_at_epoch": repr(due), "additive": "preserved"})
+        datastore.hset(lifecycle, "additive", "preserved")
+        datastore.zadd(cfg.key("responses:expiry"), {member: due})
+        lifecycle_before = datastore.dump(lifecycle)
+
+        store._cleanup_completed_records()
+        assert datastore.exists(response) == 0
+        assert datastore.zscore(cfg.key("responses:expiry"), member) is None
+        assert datastore.hget(terminal, "retrieval_state") == b"retrieval_expired"
+        assert datastore.hget(terminal, "additive") == b"preserved"
+        assert datastore.dump(lifecycle) == lifecycle_before
+
+        datastore.hset(terminal, "expires_at_epoch", repr(due))
+        datastore.zadd(cfg.key("terminals:expiry"), {member: due})
+        store._cleanup_completed_records()
+        assert datastore.exists(terminal) == datastore.exists(lifecycle) == 0
+        assert datastore.zscore(cfg.key("terminals:expiry"), member) is None
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+def test_encrypted_response_rejects_stale_preflight_without_mutation(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=0.001,
+        terminal_retention_seconds=0.001,
+        control_tombstone_ttl_seconds=0.001,
+    )
+    node, owner, consumer = "response-node", _digest("response-owner"), "consumer-a"
+    identity = ("response-client", "response-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    deadline = time.time() + 60
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, deadline)
+        claim = store.claim_queued_request(node, owner, consumer)
+        current_seconds, current_micros = store._foundation.server_time()
+        store._foundation.server_time = lambda: (current_seconds - 1, current_micros)
+
+        with pytest.raises(RelayStateConflict, match="response lifecycle conflict"):
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, response
+            )
+
+        assert len(store.active_claims(node)) == 1
+        assert store.response_records() == ()
+        assert store.terminal_records() == ()
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("boundary", "claim_ttl", "deadline_offset"),
+    (
+        ("claim_lease_boundary", 0.08, 5.0),
+        ("request_deadline_boundary", 2.0, 0.15),
+    ),
+)
+def test_encrypted_response_inclusive_expiry_boundaries_are_non_mutating(
+    valkey_server, boundary, claim_ttl, deadline_offset
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server, namespace, claim_ttl_seconds=claim_ttl
+    )
+    second = _registration_store(
+        valkey_server, namespace, claim_ttl_seconds=claim_ttl
+    )
+    node, owner, consumer = "boundary-node", _digest("boundary-owner"), "consumer"
+    identity = (f"{boundary}-client", f"{boundary}-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    keys, member = _response_acceptance_authority(first, node, identity)
+    datastore = first._foundation._client
+    try:
+        first.register(node, _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + deadline_offset
+        _enqueue_claim_fixture(first, node, owner, *identity, deadline)
+        claim = first.claim_queued_request(node, owner, consumer)
+        if boundary == "request_deadline_boundary":
+            assert claim.lease_expires_at_epoch == claim.request_deadline_epoch
+        else:
+            assert claim.lease_expires_at_epoch < claim.request_deadline_epoch
+
+        datastore.hset(keys[11], mapping={"stage": "generating"})
+        before = _exact_key_snapshot(first, keys)
+        claim_before = datastore.hgetall(keys[3])
+        lifecycle_before = datastore.hgetall(keys[4])
+        queue_before = datastore.xrange(keys[2])
+        claim_score = datastore.zscore(keys[5], member)
+        deadline_score = datastore.zscore(keys[6], member)
+        progress_before = datastore.hgetall(keys[11])
+        due = (
+            claim.lease_expires_at_epoch
+            if boundary == "claim_lease_boundary"
+            else claim.request_deadline_epoch
+        )
+        _wait_for_server_epoch(first, due)
+
+        with pytest.raises(
+            RelayStateConflict, match="^response lifecycle conflict$"
+        ):
+            second.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, response
+            )
+
+        assert _exact_key_snapshot(first, keys) == before
+        assert datastore.hgetall(keys[3]) == claim_before
+        assert datastore.hgetall(keys[4]) == lifecycle_before
+        assert datastore.hget(keys[4], "state") == b"claimed"
+        assert datastore.xrange(keys[2]) == queue_before
+        assert datastore.zscore(keys[5], member) == claim_score
+        assert datastore.zscore(keys[6], member) == deadline_score
+        assert datastore.hgetall(keys[11]) == progress_before
+        assert datastore.exists(keys[7]) == datastore.exists(keys[9]) == 0
+        assert datastore.zscore(keys[8], member) is None
+        assert datastore.zscore(keys[10], member) is None
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
+def test_encrypted_response_first_transition_removes_exact_authority_once(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, max_claims=8)
+    second = _registration_store(valkey_server, namespace, max_claims=8)
+    node, owner, consumer = "transition-node", _digest("transition-owner"), "consumer"
+    identities = (("transition-client-a", "request-a"), ("transition-client-b", "request-b"))
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    datastore = first._foundation._client
+    keys, member = _response_acceptance_authority(first, node, identities[0])
+    neighbor_keys, neighbor_member = _response_acceptance_authority(
+        first, node, identities[1]
+    )
+    node_key = keys[1]
+    try:
+        first.register(node, _capabilities(concurrency=2), owner)
+        claims = []
+        for identity in identities:
+            _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+            claims.append(first.claim_queued_request(node, owner, consumer))
+        datastore.hset(keys[11], mapping={"stage": "generating"})
+        datastore.hset(neighbor_keys[11], mapping={"stage": "neighbor"})
+
+        queue_before = datastore.xrange(keys[2])
+        addressed_entry = datastore.hget(keys[4], "queue_entry")
+        neighbor_hashes_before = tuple(
+            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
+        )
+        neighbor_scores_before = (
+            datastore.zscore(neighbor_keys[5], neighbor_member),
+            datastore.zscore(neighbor_keys[6], neighbor_member),
+        )
+        scheduler_before = datastore.hget(node_key, "scheduler_claimed_work")
+        assert scheduler_before == b"0"
+        assert len(queue_before) == 2
+
+        accepted = first.accept_encrypted_response(
+            node, owner, consumer, *identities[0], claims[0].generation, envelope
+        )
+        assert accepted.new_outcome
+        assert datastore.xrange(keys[2]) == [
+            entry for entry in queue_before if entry[0] != addressed_entry
+        ]
+        assert datastore.exists(keys[3]) == 0
+        assert datastore.zscore(keys[5], member) is None
+        assert datastore.zscore(keys[6], member) is None
+        assert datastore.exists(keys[11]) == 0
+        assert datastore.hget(keys[4], "state") == b"response_ready"
+        assert datastore.hget(node_key, "scheduler_claimed_work") == scheduler_before
+        assert tuple(
+            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
+        ) == neighbor_hashes_before
+        assert (
+            datastore.zscore(keys[5], neighbor_member),
+            datastore.zscore(keys[6], neighbor_member),
+        ) == neighbor_scores_before
+
+        after = _exact_key_snapshot(first, keys)
+        retried = second.accept_encrypted_response(
+            node, owner, consumer, *identities[0], claims[0].generation, envelope
+        )
+        assert not retried.new_outcome
+        assert retried == dataclasses.replace(accepted, new_outcome=False)
+        assert _exact_key_snapshot(first, keys) == after
+        assert tuple(
+            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
+        ) == neighbor_hashes_before
+        assert (
+            datastore.zscore(keys[5], neighbor_member),
+            datastore.zscore(keys[6], neighbor_member),
+        ) == neighbor_scores_before
+    finally:
+        _delete_claim_fixture_state(first, (node,), identities)
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
+    ("capacity", "limits", "same_client"),
+    (
+        ("global_active", {"max_queued_requests": 1}, False),
+        ("node_active", {"max_queue_depth_per_node": 1}, False),
+        ("client_active", {"max_queued_requests_per_client": 1}, True),
+        ("global_claim", {"max_claims": 1}, False),
+        ("node_claim", {"max_claims_per_node": 1}, False),
+    ),
+)
+def test_encrypted_response_releases_capacity_immediately(
+    valkey_server, capacity, limits, same_client
+):
+    defaults = {
+        "max_queued_requests": 8,
+        "max_queue_depth_per_node": 8,
+        "max_queued_requests_per_client": 8,
+        "max_claims": 8,
+        "max_claims_per_node": 8,
+    }
+    defaults.update(limits)
+    store = _registration_store(valkey_server, uuid.uuid4().hex, **defaults)
+    node, owner, consumer = "release-node", _digest("release-owner"), "consumer"
+    first_identity = ("release-client", "first")
+    second_identity = (
+        "release-client" if same_client else "release-other-client",
+        "second",
+    )
+    identities = (first_identity, second_identity)
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    request_envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    deadline = time.time() + 60
+    second_selection = None
+    try:
+        store.register(node, _capabilities(concurrency=4), owner)
+        _enqueue_claim_fixture(store, node, owner, *first_identity, deadline)
+        first_claim = store.claim_queued_request(node, owner, consumer)
+
+        if capacity.endswith("claim"):
+            _enqueue_claim_fixture(store, node, owner, *second_identity, deadline)
+            with pytest.raises(RelayStateCapacityExceeded):
+                store.claim_queued_request(node, owner, "second-consumer")
+        elif capacity == "node_active":
+            with pytest.raises(RelayStateNoCapacity):
+                store.select_and_reserve(
+                    *second_identity, "qwen3-8b-instruct", "8k-fast", deadline
+                )
+        else:
+            second_selection = store.select_and_reserve(
+                *second_identity, "qwen3-8b-instruct", "8k-fast", deadline
+            )
+            with pytest.raises(RelayStateNoCapacity):
+                store.enqueue_encrypted_request(
+                    *second_identity,
+                    second_selection.reservation_token,
+                    node,
+                    "qwen3-8b-instruct",
+                    "8k-fast",
+                    deadline,
+                    request_envelope,
+                    "cancel",
+                )
+
+        store.accept_encrypted_response(
+            node, owner, consumer, *first_identity, first_claim.generation, response
+        )
+
+        if capacity.endswith("claim"):
+            released = store.claim_queued_request(node, owner, "second-consumer")
+            assert released.state == "claimed"
+        else:
+            if capacity == "node_active":
+                second_selection = store.select_and_reserve(
+                    *second_identity, "qwen3-8b-instruct", "8k-fast", deadline
+                )
+            released = store.enqueue_encrypted_request(
+                *second_identity,
+                second_selection.reservation_token,
+                node,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                request_envelope,
+                "cancel",
+            )
+            assert released.created
+    finally:
+        if second_selection is not None and second_selection.reservation_token:
+            token = hashlib.sha256(
+                second_selection.reservation_token.encode("ascii")
+            ).hexdigest()
+            store._foundation._client.delete(
+                store._foundation.config.key("reservation", token)
+            )
+        _delete_claim_fixture_state(store, (node,), identities)
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("bound", "same_client", "limits"),
+    (
+        ("global-response", False, {"max_responses": 1}),
+        ("per-client-response", True, {"max_responses_per_client": 1}),
+        ("global-terminal", False, {"max_terminal_records": 1}),
+        ("per-client-terminal", True, {"max_terminal_records_per_client": 1}),
+    ),
+)
+def test_encrypted_response_capacity_bounds_reject_without_mutation(
+    valkey_server, bound, same_client, limits
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=300,
+        terminal_retention_seconds=600,
+        **limits,
+    )
+    second = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=300,
+        terminal_retention_seconds=600,
+        **limits,
+    )
+    node, owner, consumer = "capacity-node", _digest("capacity-owner"), "consumer"
+    first_client = f"{bound}-client"
+    second_client = first_client if same_client else f"{bound}-other-client"
+    identities = ((first_client, f"{bound}-first"), (second_client, f"{bound}-second"))
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = first._foundation.config
+    node_digest = first._node_digest(node)
+
+    def declared_snapshot():
+        zset_keys = [
+            cfg.key("nodes:lease"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("responses:expiry"),
+            cfg.key("terminals:expiry"),
+        ]
+        hash_keys = [cfg.key("node", node_digest)]
+        for client_id, request_id in identities:
+            client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
+            request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
+            hash_keys.extend(
+                (
+                    cfg.key("request", client, request),
+                    cfg.key("claim", client, request),
+                    cfg.key("response", client, request),
+                    cfg.key("terminal", client, request),
+                    cfg.key("progress", client, request),
+                )
+            )
+        datastore = first._foundation._client
+        return (
+            {key: datastore.hgetall(key) for key in hash_keys},
+            {key: datastore.zrange(key, 0, -1, withscores=True) for key in zset_keys},
+            datastore.xrange(cfg.key("queue", node_digest)),
+        )
+
+    try:
+        first.register(node, _capabilities(), owner)
+        generations = []
+        for identity in identities:
+            _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+            generations.append(
+                first.claim_queued_request(node, owner, consumer).generation
+            )
+            if identity == identities[0]:
+                first.accept_encrypted_response(
+                    node, owner, consumer, *identity, generations[-1], response
+                )
+
+        before = declared_snapshot()
+        with pytest.raises(
+            RelayStateCapacityExceeded,
+            match="^response lifecycle capacity reached$",
+        ):
+            second.accept_encrypted_response(
+                node, owner, consumer, *identities[1], generations[1], response
+            )
+        assert declared_snapshot() == before
+    finally:
+        _delete_claim_fixture_state(first, (node,), identities)
+        first.close()
+        second.close()
 
 
 @pytest.mark.parametrize(
@@ -4215,7 +6043,9 @@ def test_claim_capacity_counts_only_complete_live_claims(valkey_server):
             store.claim_queued_request(nodes[1], owner, "consumer-b")
         _enqueue_claim_fixture(store, nodes[0], owner, *identities[2], deadline)
         per_node_store = ValkeyRegistrationStore(
-            store._foundation, dataclasses.replace(store.config, max_claims=2)
+            store._foundation,
+            dataclasses.replace(store.config, max_claims=2),
+            acknowledgement_key=_ACKNOWLEDGEMENT_KEY,
         )
         with pytest.raises(RelayStateCapacityExceeded):
             per_node_store.claim_queued_request(nodes[0], owner, "consumer-c")
@@ -4705,4 +6535,337 @@ def test_claim_result_budget_accepts_large_bounded_result(valkey_server):
         if selection is not None and selection.reservation_token is not None:
             keys.append(cfg.key("reservation", _digest(selection.reservation_token)))
         store._foundation._client.delete(*keys)
+        store.close()
+
+
+def test_completed_record_reads_hide_expired_backlog_beyond_cleanup_batch(valkey_server):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=0.05,
+        terminal_retention_seconds=60,
+        control_tombstone_ttl_seconds=0.001,
+        node_transition_batch_size=1,
+    )
+    node, owner, consumer = "expiry-node", _digest("expiry-owner"), "expiry-consumer"
+    identities = tuple(("expiry-client", f"expiry-request-{index}") for index in range(3))
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    try:
+        store.register(node, _capabilities(), owner)
+        for identity in identities:
+            _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+            claim = store.claim_queued_request(node, owner, consumer)
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, response
+            )
+        response_keys = tuple(
+            cfg.key("response", *store._identity(*identity)) for identity in identities
+        )
+        terminal_keys = tuple(
+            cfg.key("terminal", *store._identity(*identity)) for identity in identities
+        )
+        response_index = cfg.key("responses:expiry")
+        terminal_index = cfg.key("terminals:expiry")
+        for _ in range(200):
+            seconds, micros = store._foundation.server_time()
+            if all(
+                store._foundation._client.zscore(
+                    response_index, ":".join(store._identity(*identity))
+                )
+                <= seconds + micros / 1_000_000
+                for identity in identities
+            ):
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("authoritative Valkey time did not reach response expiry")
+
+        records = store.terminal_records()
+        assert len(records) == 3
+        assert {record.retrieval_state for record in records} == {"retrieval_expired"}
+        assert sum(store._foundation._client.exists(key) for key in response_keys) == 2
+        assert store._foundation._client.zcard(response_index) == 2
+        assert store._foundation._client.zcard(terminal_index) == 3
+        assert sorted(
+            store._foundation._client.hget(key, "retrieval_state")
+            for key in terminal_keys
+        ) == [b"response_ready", b"response_ready", b"retrieval_expired"]
+    finally:
+        _delete_claim_fixture_state(store, (node,), identities)
+        store.close()
+
+
+@pytest.mark.parametrize("inspector", ("response_records", "terminal_records"))
+@pytest.mark.parametrize(
+    ("authority", "field", "replacement"),
+    (
+        ("request", "claim_generation", "999"),
+        ("request", "node_digest", "0" * 64),
+        ("terminal", "retrieval_credential_digest", "0" * 64),
+        ("terminal", "cancellation_token_digest", "0" * 64),
+    ),
+)
+def test_completed_record_inspectors_validate_paired_authority_and_additive_fields(
+    valkey_server, inspector, authority, field, replacement
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(
+        valkey_server,
+        namespace,
+        response_replay_ttl_seconds=60,
+        terminal_retention_seconds=600,
+    )
+    node, owner, consumer = "inspect-node", _digest("inspect-owner"), "inspect-consumer"
+    identity = ("inspect-client", "inspect-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    client, request = store._identity(*identity)
+    cfg = store._foundation.config
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, response
+        )
+        terminal_key = cfg.key("terminal", client, request)
+        response_key = cfg.key("response", client, request)
+        store._foundation._client.hset(terminal_key, "compatible_extension", "retained")
+        store._foundation._client.hset(response_key, "compatible_extension", "retained")
+
+        records = getattr(store, inspector)()
+        assert len(records) == 1
+        with pytest.raises((dataclasses.FrozenInstanceError, AttributeError)):
+            records[0].generation = 99
+
+        store._foundation._client.hset(
+            cfg.key(authority, client, request), field, replacement
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError) as caught:
+            getattr(store, inspector)()
+        rendered = repr(caught.value)
+        assert "ciphertext" not in rendered
+        assert client not in rendered and request not in rendered
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("inspector", "index_name", "limit_name"),
+    (
+        ("response_records", "responses:expiry", "max_responses"),
+        ("terminal_records", "terminals:expiry", "max_terminal_records"),
+    ),
+)
+def test_completed_record_inspector_detects_live_index_overflow(
+    valkey_server, inspector, index_name, limit_name
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace, **{limit_name: 1})
+    cfg = store._foundation.config
+    first = b"a" * 64 + b":" + b"b" * 64
+    second = b"c" * 64 + b":" + b"d" * 64
+    try:
+        now = store._foundation.server_time()[0]
+        store._foundation._client.zadd(
+            cfg.key(index_name), {first: now + 100, second: now + 100}
+        )
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            getattr(store, inspector)()
+    finally:
+        store._foundation._client.delete(cfg.key(index_name))
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("inspector", "primary_name", "index_name"),
+    (
+        ("response_records", "response", "responses:expiry"),
+        ("terminal_records", "terminal", "terminals:expiry"),
+    ),
+)
+@pytest.mark.parametrize("mutation", ("disappear", "hash_only", "index_only"))
+def test_completed_record_inspector_primary_authority_race(
+    valkey_server, monkeypatch, inspector, primary_name, index_name, mutation
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "race-node", _digest("race-owner"), "race-consumer"
+    identity = ("race-client", "race-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    client, request = store._identity(*identity)
+    cfg = store._foundation.config
+    primary_key = cfg.key(primary_name, client, request)
+    index_key = cfg.key(index_name)
+    member = f"{client}:{request}"
+    original = store._completed_hash
+    hook_calls = 0
+    primary_reads = 0
+    after_mutation = None
+
+    def snapshot():
+        hash_keys = (
+            cfg.key("request", client, request),
+            cfg.key("response", client, request),
+            cfg.key("terminal", client, request),
+        )
+        index_keys = (
+            cfg.key("responses:expiry"),
+            cfg.key("terminals:expiry"),
+        )
+        return (
+            tuple(
+                sorted(store._foundation._client.hgetall(key).items())
+                for key in hash_keys
+            ),
+            tuple(
+                store._foundation._client.zrange(key, 0, -1, withscores=True)
+                for key in index_keys
+            ),
+        )
+
+    def mutate_before_primary_read(key, fields, limits):
+        nonlocal hook_calls, primary_reads, after_mutation
+        if key == primary_key:
+            primary_reads += 1
+            assert primary_reads <= 2
+            if hook_calls == 0:
+                hook_calls += 1
+                if mutation != "hash_only":
+                    store._foundation._client.delete(primary_key)
+                if mutation != "index_only":
+                    store._foundation._client.zrem(index_key, member)
+                after_mutation = snapshot()
+        return original(key, fields, limits)
+
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, response
+        )
+        monkeypatch.setattr(store, "_completed_hash", mutate_before_primary_read)
+
+        if mutation == "disappear":
+            assert getattr(store, inspector)() == ()
+        else:
+            with pytest.raises(
+                ValkeySchemaIncompatibleError, match="state schema incompatible"
+            ) as caught:
+                getattr(store, inspector)()
+            assert "ciphertext" not in repr(caught.value)
+        assert hook_calls == 1
+        assert snapshot() == after_mutation
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+def test_completed_record_terminal_inspector_retries_cleanup_race(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "transition-node", _digest("transition-owner"), "consumer"
+    identity = ("transition-client", "transition-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    client, request = store._identity(*identity)
+    cfg = store._foundation.config
+    response_key = cfg.key("response", client, request)
+    terminal_key = cfg.key("terminal", client, request)
+    response_index = cfg.key("responses:expiry")
+    member = f"{client}:{request}"
+    original = store._completed_hash
+    hook_calls = 0
+
+    def transition_before_response_read(key, fields, limits):
+        nonlocal hook_calls
+        if key == response_key:
+            hook_calls += 1
+            assert hook_calls == 1
+            store._foundation._client.delete(response_key)
+            store._foundation._client.zrem(response_index, member)
+            store._foundation._client.hset(
+                terminal_key, "retrieval_state", "retrieval_expired"
+            )
+        return original(key, fields, limits)
+
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, response
+        )
+        monkeypatch.setattr(store, "_completed_hash", transition_before_response_read)
+
+        records = store.terminal_records()
+        assert len(records) == 1
+        assert records[0].retrieval_state == "retrieval_expired"
+        assert hook_calls == 1
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+def test_completed_record_terminal_inspector_rejects_unknown_response_authority(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "unknown-node", _digest("unknown-owner"), "consumer"
+    identity = ("unknown-client", "unknown-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    client, request = store._identity(*identity)
+    cfg = store._foundation.config
+    response_key = cfg.key("response", client, request)
+    terminal_key = cfg.key("terminal", client, request)
+    response_index = cfg.key("responses:expiry")
+    member = f"{client}:{request}"
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, response
+        )
+        store._foundation._client.delete(response_key)
+        store._foundation._client.zrem(response_index, member)
+        store._foundation._client.hset(
+            terminal_key, "retrieval_state", "retrieval_expired"
+        )
+        store._foundation._client.hset(response_key, "compatible_extension", "retained")
+        before = (
+            store._foundation._client.dump(response_key),
+            store._foundation._client.dump(terminal_key),
+            store._foundation._client.dump(response_index),
+        )
+
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ) as caught:
+            store.terminal_records()
+        assert "ciphertext" not in repr(caught.value)
+        assert before == (
+            store._foundation._client.dump(response_key),
+            store._foundation._client.dump(terminal_key),
+            store._foundation._client.dump(response_index),
+        )
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
         store.close()

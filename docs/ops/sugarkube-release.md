@@ -10,6 +10,7 @@ chart version.
 
 - Relay image: `ghcr.io/futuroptimist/tokenplace-relay`
 - Relay image workflow: `.github/workflows/ci-image.yml`
+- Mandatory image qualification: [relay release-safety gate](relay-release-safety-gate.md)
 - Helm chart source: `charts/tokenplace`
 - Helm chart workflow: `.github/workflows/ci-helm.yml`
 - OCI chart ref: `oci://ghcr.io/futuroptimist/charts/tokenplace`

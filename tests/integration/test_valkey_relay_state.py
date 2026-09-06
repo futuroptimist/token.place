@@ -3071,6 +3071,78 @@ def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_s
         second.close()
 
 
+@pytest.mark.parametrize(
+    ("manifest", "expected_dispatches"),
+    (
+        (_manifest(reader_min=2, reader_max=2), ()),
+        (
+            _manifest(writer_min=2, writer_max=2, active_writer_revision=2),
+            (SERVER_TIME_SCRIPT.eval_sha1,),
+        ),
+        (
+            _manifest(
+                script_digests={
+                    **SCRIPT_DIGESTS,
+                    ACCEPT_RESPONSE_SCRIPT.name: "0" * 64,
+                }
+            ),
+            (),
+        ),
+    ),
+    ids=("reader", "writer", "acceptance-script-digest"),
+)
+def test_encrypted_response_compatibility_gates_fail_closed_before_state_or_acceptance_script(
+    valkey_server, manifest, expected_dispatches
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, consumer = (
+        "acceptance-compatibility-node",
+        _digest("acceptance-compatibility-owner"),
+        "acceptance-compatibility-consumer",
+    )
+    identity = ("acceptance-compatibility-client", "acceptance-compatibility-request")
+    response = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    cfg = store._foundation.config
+    schema_key = cfg.key("schema")
+    original_evalsha = store._foundation._client.evalsha
+    keys, member = _response_acceptance_authority(store, node, identity)
+    try:
+        store.register(node, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 60
+        _enqueue_claim_fixture(store, node, owner, *identity, deadline)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store._foundation.server_time()
+        baseline = _exact_key_snapshot(store, keys)
+        dispatches = []
+
+        def record_dispatch(*args, **kwargs):
+            dispatches.append(args[0])
+            return original_evalsha(*args, **kwargs)
+
+        store._foundation._client.set(schema_key, manifest.encode())
+        store._foundation._client.evalsha = record_dispatch
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, response
+            )
+
+        assert tuple(dispatches) == expected_dispatches
+        assert ACCEPT_RESPONSE_SCRIPT.eval_sha1 not in dispatches
+        assert _exact_key_snapshot(store, keys) == baseline
+        assert store._foundation._client.exists(keys[7], keys[9]) == 0
+        assert store._foundation._client.zscore(keys[8], member) is None
+        assert store._foundation._client.zscore(keys[10], member) is None
+    finally:
+        store._foundation._client.evalsha = original_evalsha
+        store._foundation._client.set(schema_key, _manifest().encode())
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
 def test_encrypted_response_committed_lost_reply_is_recovered_without_replay(
     valkey_server, caplog
 ):

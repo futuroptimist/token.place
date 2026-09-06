@@ -4,7 +4,8 @@
 
 - **Date:** 2026-09-02
 - **Severity:** Critical
-- **Status:** Mitigated
+- **Status:** Resolved (operationally)
+- **Resolved:** 2026-09-05T19:53:19Z
 - **Component:** production token.place relay and its application metrics endpoint
 - **Incident ID:** `2026-09-02-production-relay-metrics-cardinality-oom`
 - **Primary incident window:** approximately 2026-09-02 16:41 PDT / 23:41 UTC through
@@ -34,9 +35,10 @@ provenance mismatch left the runtime mechanism present in production.
 At 2026-09-03 01:07:50 UTC, an operator paused Prometheus discovery of only the token.place target
 and deleted only the affected pod. Kubernetes created a healthy replacement with a fresh
 pod-level `emptyDir`; the image and Deployment were not rolled back or changed. Production serves
-traffic again, but application scraping remains intentionally paused. The incident is therefore
-**Mitigated**, not resolved: a bounded-cardinality fix must be deployed and pass the restoration
-criteria below before scraping is restored.
+traffic again, while application scraping remained intentionally paused until the bounded fix
+could be deployed and verified. The incident was mitigated at that point and was operationally
+resolved at `2026-09-05T19:53:19Z` after the corrected artifact was deployed, authenticated
+application scraping was restored, and the final bounded monitoring soak passed.
 
 ## Impact
 
@@ -250,8 +252,64 @@ during mitigation verification.
 
 This emergency action removed the accumulated pod-level metric files and stopped scheduled
 scrapes from rebuilding or serializing the unsafe metric set. It restored application service but
-is not the permanent fix. The telemetry state remains intentionally degraded, so the incident is
-Mitigated rather than Resolved.
+was not the permanent fix. The telemetry state remained intentionally degraded until the final
+recovery sequence described below.
+
+### Final production recovery and observability restoration
+
+Production Helm revision 7 was upgraded at `2026-09-05T19:10:05.335904906Z` to
+`ghcr.io/futuroptimist/tokenplace-relay:sha-6c39adc`, OCI index digest
+`sha256:543fde33aff45253630090b52d16163e3586da12c973f5c4a658ddc8927d0a68`. The artifact
+identifies source commit `6c39adc64e7bed4f85d07164aa2860e637919ca9`, immutable build ref
+`sha-6c39adc`, and public semantic version `0.1.1`. The replacement pod was created at
+`2026-09-05T19:10:09Z`, started at `2026-09-05T19:10:13Z`, and ran as one ready replica with zero
+restarts and no termination reason. This records an observed Helm upgrade; the evidence does not
+establish a deployment actor.
+
+Cutover verification began at `2026-09-05T19:32:18Z`. The image digest and immutable ref matched;
+one compute registration and continuing successful polling were observed, along with two accepted
+requests, two accepted responses, and two successful retrievals. All public health and identity
+endpoints returned HTTP 200, no HTTP 5xx occurred, and a bounded two-minute soak held relay memory
+between 63,971,328 and 64,786,432 bytes against the 268,435,456-byte limit.
+
+Public-information probe restoration began at `2026-09-05T19:38:04Z`. The root and
+`/api/v1/meta` probes were restored to `release=kube-prometheus-stack`; `/livez` and `/healthz`
+remained active. Prometheus uniquely discovered both restored targets with no last error. Root and
+metadata recorded successful scrapes at `2026-09-05T19:41:51.950530221Z` and
+`2026-09-05T19:42:08.689609225Z`, respectively. Each produced three samples in the final
+three-minute window with `min_over_time(probe_success)=1`. No HTTP 429 or 5xx occurred, compute
+polling continued, the pod remained ready with zero restarts, and memory remained approximately
+64–65 MiB.
+
+Application-metrics restoration began at `2026-09-05T19:47:21Z`. Before periodic scraping, an
+authenticated manual scrape returned HTTP 200, 35,733 bytes, and 227 samples. Twenty deterministic
+unmatched-path canary requests all returned HTTP 404; the next authenticated scrape was 35,749
+bytes and 227 samples, with no canary path and no `pid` label. Each maintenance metric
+(`tokenplace_build_info`, `tokenplace_compute_nodes_healthy`,
+`tokenplace_compute_nodes_registered`, and `tokenplace_instrumentation_up`) had exactly one
+series.
+
+The token.place ServiceMonitor was then restored to `release=kube-prometheus-stack`. Prometheus
+discovered exactly one healthy application target, in scrape pool
+`serviceMonitor/tokenplace/tokenplace/0`, with no last error. Its final successful scrape was
+recorded at `2026-09-05T19:53:19.538689743Z`: the final three-minute window contained six
+successful `up` samples with `min_over_time(up)=1`, `scrape_samples_scraped=227`,
+`scrape_duration_seconds=0.011584181`, `tokenplace_instrumentation_up=1`, and zero raw canary
+series. The final authenticated payload was 35,751 bytes and 227 samples, with zero canary and
+zero `pid`-label occurrences.
+
+During the bounded six-minute application-metrics soak, relay memory remained between 65,101,824
+and 65,425,408 bytes against the 268,435,456-byte limit, compute polls increased from 222 to 260,
+the pod remained ready with zero restarts, and HTTP 429 and 5xx counts remained zero. At the
+evidence-backed operational resolution boundary, `2026-09-05T19:53:19Z`, user-facing and compute
+lifecycles were healthy, cardinality remained bounded, and authenticated application scraping was
+stable without OOM recurrence. Every temporarily disabled monitoring function had been restored;
+no intentionally disabled monitoring functionality remained.
+
+Operational resolution is distinct from preventive-work completion. The fifteen canonical
+corrective-action issues linked below remain open pending independent implementation and
+verification. The two September incidents form one multi-day causal chain for archival purposes,
+but this incident's root cause remains the distinct unbounded-metrics failure mode.
 
 ## Post-recovery verification
 
@@ -319,12 +377,12 @@ constitute production resolution: corrected-image deployment and verification re
 | P1 | Mitigate | Continue shared-state/HA work tracked by [#1569](https://github.com/futuroptimist/token.place/issues/1569), without treating replicas as safe standalone mitigation while authoritative state is memory-backed. | HA can reduce single-replica amplification only after correctness constraints are satisfied. | Unassigned | Proposed | [Existing non-incident HA work #1569](https://github.com/futuroptimist/token.place/issues/1569) | Shared-state correctness is proven before multi-replica availability is relied upon. |
 | P0 | Mitigate | After the fix, run a staging soak with scraping enabled and adversarial unique-path traffic before production restoration. | Validates the whole scrape/traffic lifecycle. | Unassigned | Proposed | [sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774) | Sustained soak passes every restoration exit criterion. |
 
-The recovery sequence is tracked explicitly: [token.place #1765](https://github.com/futuroptimist/token.place/issues/1765) feeds the combined staging qualification
-in [sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774), which gates exact-image production deployment in
-[sugarkube #2775](https://github.com/futuroptimist/sugarkube/issues/2775). Application-metrics restoration and OOM closeout remain gated by
-[sugarkube #2777](https://github.com/futuroptimist/sugarkube/issues/2777), which may begin only after
-[sugarkube #2776](https://github.com/futuroptimist/sugarkube/issues/2776) has restored both public-information probes and their
-immediate checks pass. The two 24-hour stability windows may then overlap.
+The recovery sequence is tracked explicitly: [token.place #1765](https://github.com/futuroptimist/token.place/issues/1765) fed the combined staging qualification
+in [sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774), which gated exact-image production deployment in
+[sugarkube #2775](https://github.com/futuroptimist/sugarkube/issues/2775). Public-information restoration under
+[sugarkube #2776](https://github.com/futuroptimist/sugarkube/issues/2776) preceded application-metrics restoration under
+[sugarkube #2777](https://github.com/futuroptimist/sugarkube/issues/2777). Those operational steps are complete, but their issue
+records and all other canonical corrective-action trackers remain open for independent review.
 None of these trackers records deployment, restoration, or incident resolution by its creation
 alone.
 
@@ -361,9 +419,9 @@ observe a defined stability window with explicit rollback thresholds. If cardina
 memory, or restarts regress, pause only that target again. Scraping must never be restored against
 `e46277d`; a memory-limit increase, edge filtering, or extra replicas alone is not resolution.
 
-Incident status remains **Mitigated** until the corrected image is deployed, scraping is restored,
-and the stability window passes. Promotion from `main` remains a separate, fully qualified later
-release path.
+These criteria were satisfied by the qualified recovery artifact and the production restoration
+sequence ending at `2026-09-05T19:53:19Z`. Promotion from `main` remains a separate, fully
+qualified later release path.
 
 ### Required restoration exit criteria
 
@@ -385,14 +443,12 @@ The availability impact ended when the replacement pod became healthy at
 2026-09-03T01:08:18Z. Closeout state is:
 
 - **Application:** healthy after mitigation.
-- **Telemetry:** token.place application scraping intentionally paused.
-- **Incident:** Mitigated, not Resolved.
-- **Runtime/deployment remediation:** no image rollback or Deployment change was part of emergency
-  recovery; bounded registry hardening is implemented on `main` but absent from the deployed
-  lineage.
-- **Permanent closeout condition:** build and deploy a corrected image, verify its source/artifact
-  identity, pass the adversarial staging soak, implement and verify multiprocess startup cleanup,
-  then deliberately restore scraping through the full stability window.
+- **Telemetry:** all four public blackbox probes and authenticated application scraping restored.
+- **Incident:** Resolved operationally at `2026-09-05T19:53:19Z`.
+- **Runtime/deployment remediation:** the qualified bounded-metrics backport is deployed as Helm
+  revision 7 and the production artifact identity is verified.
+- **Preventive work:** the linked canonical action items remain open until independently
+  implemented and verified; operational resolution does not complete them.
 
 Disabling scraping, replacing a pod, filtering traffic, raising memory, or adding replicas alone
 must not be recorded as permanent resolution. Issue #1569 concerns separate shared-state/HA

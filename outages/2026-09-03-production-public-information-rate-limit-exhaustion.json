@@ -3,6 +3,103 @@
   "slug": "production-public-information-rate-limit-exhaustion",
   "summary": "Scheduled 60-second public-information probes consumed the deployed release's default 1000/day quotas for the root and metadata endpoints, making quota exhaustion visible to traffic sharing an exhausted application-visible identity.",
   "impact": "The public landing page and metadata endpoint returned HTTP 429 to affected traffic, while the relay remained healthy and health, version, and compute polling requests continued succeeding in retained evidence.",
-  "fix": "The operator paused only the two quota-consuming probes and replaced the process to reset in-memory counters. Status remains Mitigated until an identity-verified image with exact read-only public-information exemptions is qualified, deployed, and passes a restored-probe stability period.",
-  "lessons": "Release parity must preserve reviewed safety fixes; synthetic request frequency must be validated against endpoint quotas, quota pressure needs privacy-safe early warning, and process replacement is a risky reset rather than a permanent correction."
+  "fix": "The public-information exemption backport is deployed in production Helm revision 7 as the identity-verified sha-6c39adc artifact. Root and metadata probes were restored alongside the continuously active health probes, with healthy samples and no HTTP 429 recurrence. Operationally resolved at 2026-09-05T19:53:19Z; the canonical preventive action items remain open.",
+  "lessons": "Release parity must preserve reviewed safety fixes; synthetic request frequency must be validated against endpoint quotas, quota pressure needs privacy-safe early warning, and process replacement is a risky reset rather than a permanent correction.",
+  "status": "resolved_operationally",
+  "resolvedAt": "2026-09-05T19:53:19Z",
+  "resolutionEvidence": {
+    "deployment": {
+      "helmRevision": 7,
+      "image": "ghcr.io/futuroptimist/tokenplace-relay:sha-6c39adc",
+      "ociIndexDigest": "sha256:543fde33aff45253630090b52d16163e3586da12c973f5c4a658ddc8927d0a68",
+      "sourceCommit": "6c39adc64e7bed4f85d07164aa2860e637919ca9",
+      "immutableBuildRef": "sha-6c39adc",
+      "semanticVersion": "0.1.1",
+      "helmUpgradeAt": "2026-09-05T19:10:05.335904906Z",
+      "podCreatedAt": "2026-09-05T19:10:09Z",
+      "podStartedAt": "2026-09-05T19:10:13Z",
+      "readyReplicas": 1,
+      "restarts": 0,
+      "terminationReason": null
+    },
+    "cutoverVerification": {
+      "startedAt": "2026-09-05T19:32:18Z",
+      "computeRegistrations": 1,
+      "acceptedRequests": 2,
+      "acceptedResponses": 2,
+      "successfulRetrievals": 2,
+      "http5xx": 0,
+      "soakSeconds": 120,
+      "memoryBytesMin": 63971328,
+      "memoryBytesMax": 64786432,
+      "memoryLimitBytes": 268435456,
+      "publicHealthAndIdentityHttpStatus": 200,
+      "computePollingContinued": true
+    },
+    "publicProbeRestoration": {
+      "startedAt": "2026-09-05T19:38:04Z",
+      "restoredTargets": [
+        "/",
+        "/api/v1/meta"
+      ],
+      "continuouslyActiveTargets": [
+        "/livez",
+        "/healthz"
+      ],
+      "rootSuccessfulScrapeAt": "2026-09-05T19:41:51.950530221Z",
+      "metadataSuccessfulScrapeAt": "2026-09-05T19:42:08.689609225Z",
+      "samplesPerRestoredTarget": 3,
+      "windowSeconds": 180,
+      "minProbeSuccess": 1,
+      "http429": 0,
+      "http5xx": 0,
+      "ready": true,
+      "restarts": 0
+    },
+    "applicationMetricsRestoration": {
+      "startedAt": "2026-09-05T19:47:21Z",
+      "manualScrapeHttpStatus": 200,
+      "manualScrapeBytes": 35733,
+      "manualScrapeSamples": 227,
+      "canaryRequests": 20,
+      "canaryHttpStatus": 404,
+      "postCanaryBytes": 35749,
+      "postCanarySamples": 227,
+      "rawCanarySeries": 0,
+      "pidLabelOccurrences": 0,
+      "maintenanceMetricSeriesEach": 1,
+      "prometheusTargets": 1,
+      "scrapePool": "serviceMonitor/tokenplace/tokenplace/0",
+      "finalSuccessfulScrapeAt": "2026-09-05T19:53:19.538689743Z",
+      "successfulUpSamples": 6,
+      "windowSeconds": 180,
+      "minUp": 1,
+      "scrapeSamplesScraped": 227,
+      "scrapeDurationSeconds": 0.011584181,
+      "instrumentationUp": 1,
+      "finalPayloadBytes": 35751,
+      "finalPayloadSamples": 227,
+      "finalCanaryOccurrences": 0,
+      "finalPidLabelOccurrences": 0,
+      "soakSeconds": 360,
+      "memoryBytesMin": 65101824,
+      "memoryBytesMax": 65425408,
+      "memoryLimitBytes": 268435456,
+      "computePollsStart": 222,
+      "computePollsEnd": 260,
+      "ready": true,
+      "restarts": 0,
+      "http429": 0,
+      "http5xx": 0
+    },
+    "monitoring": {
+      "allTemporarilyDisabledFunctionsRestored": true,
+      "intentionallyDisabledFunctionsRemaining": 0
+    },
+    "canonicalActionItems": {
+      "count": 15,
+      "state": "open",
+      "completionSeparateFromOperationalResolution": true
+    }
+  }
 }

@@ -4,7 +4,8 @@
 
 - **Date:** 2026-09-03
 - **Severity:** Major
-- **Status:** Mitigated
+- **Status:** Resolved operationally
+- **Resolved:** 2026-09-05T19:53:19Z
 - **Component:** production token.place relay public landing page and metadata endpoint
 - **Incident ID:** `2026-09-03-production-public-information-rate-limit-exhaustion`
 - **Observed incident window:** earliest retained HTTP 429 at `2026-09-03T17:11:52.030Z` through
@@ -30,8 +31,10 @@ The operator paused discovery of only the root and metadata blackbox probes and 
 running process to reset its process-local, in-memory limiter counters. The image, release, and
 quotas were unchanged. Serving and compute paths recovered, but the two probes remained paused and
 no permanent correction had yet been deployed. A corrected image and restored probes now provide
-initial recovery evidence, but the incident remains **Mitigated** pending the required full
-24-hour stability window or direct quota-counter evidence.
+initial recovery evidence. The operator classified the incident as **Resolved operationally** at
+`2026-09-05T19:53:19Z` because service and observability were restored. That boundary does not
+claim a full daily quota window passed; the 24-hour qualification or direct quota-counter evidence
+and issue closeout remain pending.
 
 ## Impact
 
@@ -84,7 +87,7 @@ All times are UTC. Observed events are distinguished from inferred onset.
 | `2026-09-05T19:10:05Z` | Observed Helm revision 7 upgrade deployed the identity-verified combined recovery image. |
 | `2026-09-05T19:32:18Z` | Production cutover verification began; request and compute lifecycles succeeded through a bounded two-minute soak. |
 | `2026-09-05T19:38:04Z` | Root and metadata blackbox probe restoration began; both targets were uniquely discovered and healthy without HTTP 429 recurrence. |
-| `2026-09-05T19:47:21Z` | Authenticated application-metrics restoration began after bounded canary checks. |
+| `2026-09-05T19:47:21Z` | The application-metrics restoration procedure began. The authenticated baseline and bounded canary checks then preceded enabling periodic scraping. |
 | `2026-09-05T19:53:19Z` | The initial six-minute monitoring soak completed with all temporarily disabled monitoring restored; the required 24-hour stability window remained open. |
 
 ## Technical root cause
@@ -147,7 +150,8 @@ rate-limited. The behavior was absent from the deployed release lineage.
 ## Relationship to the September 2 OOM incident
 
 This was not another OOM and was not caused by `/metrics` scraping. Application-metrics scraping
-remained paused throughout this incident. The prior
+remained paused throughout the September 3 failure and initial mitigation period; it was
+subsequently restored before operational resolution. The prior
 [metrics-cardinality OOM incident](2026-09-02-production-relay-metrics-cardinality-oom.md) had
 repeatedly reset process-local limiter counters. Once its mitigation produced stable process
 uptime, the process survived long enough for the pre-existing daily-quota defect to become
@@ -243,9 +247,9 @@ At the evidence-backed boundary `2026-09-05T19:53:19Z`, all four public blackbox
 active, application scraping was restored, and **no intentionally disabled monitoring
 functionality remained**. The public-information exemption was live and no 429 recurrence was
 observed. However, three samples over three minutes and the six-minute aggregate soak do not prove
-that probes at the 60-second cadence remain exempt across the 1,000/day quota window. Without
-direct quota-counter evidence, the required 24-hour stability window must complete before this
-distinct rate-limit incident is resolved. The incidents form one multi-day archival causal chain,
+that probes at the 60-second cadence remain exempt across the 1,000/day quota window. Minutes without 429s do not demonstrate a full daily quota window. Without direct quota-counter
+evidence, the required 24-hour stability window remains pending as a qualification and
+issue-closeout requirement despite the operator-supplied operational resolution. The incidents form one multi-day archival causal chain,
 but their failure modes and root causes remain separate; all corrective-action items remain open.
 
 ## What went well
@@ -283,7 +287,7 @@ does not close the trackers or satisfy the remaining stability-window exit crite
 | --- | --- | --- | --- | --- |
 | P0 | Manually port PR #1551's behavior to the exact `release/relay-0.1.1` line, or deploy an independently fully qualified newer release with equivalent behavior. | Deployed; full exit criterion pending | [token.place #1766](https://github.com/futuroptimist/token.place/issues/1766) | The immutable deployed image exempts exact normalized-path `GET`/`HEAD` requests only for `/`, `/api/v1/meta`, and `/api/v1/version`. |
 | P0 | Preserve rate limiting for non-read methods, `/api/v1/models`, ordinary public API routes, authenticated compute control-plane routes, and all mutation routes. | Deployed; full exit criterion pending | [token.place #1766](https://github.com/futuroptimist/token.place/issues/1766) | A route-and-method matrix proves only the three reviewed read paths are exempt. |
-| P0 | Add regression tests under deliberately low hourly and daily quotas. | Deployed; full exit criterion pending | [token.place #1766](https://github.com/futuroptimist/token.place/issues/1766) | Repeated safe reads do not consume quota, while unrelated routes and mutation methods reach the existing OpenAI-style 429 response. |
+| P0 | Add regression tests under deliberately low hourly and daily quotas. | Repository regression covered by #1789; production-window criterion pending | [token.place #1766](https://github.com/futuroptimist/token.place/issues/1766) | Repeated safe reads do not consume quota, while unrelated routes and mutation methods reach the existing OpenAI-style 429 response. |
 | P0 | Add a release-line provenance/parity gate for already-merged safety fixes including #1447 and #1551. | Proposed | [token.place #1770](https://github.com/futuroptimist/token.place/issues/1770) | Promotion records source and image identities and fails when required ancestry or an explicitly reviewed, behavior-equivalent backport is absent. |
 | P0 | Compare configured synthetic request frequency with every applicable endpoint quota in CI or deployment validation. | Proposed | [sugarkube #2778](https://github.com/futuroptimist/sugarkube/issues/2778) | Validation fails when projected requests can exhaust a quota within its window. |
 | P1 | Evaluate shared limiter storage in the existing HA work, without treating it alone as a fix for wrongly charged probes. | Proposed | [Existing non-incident HA work #1569](https://github.com/futuroptimist/token.place/issues/1569) | HA testing proves intended counter consistency and separately verifies the exact public-read exemption. |
@@ -308,12 +312,23 @@ does not close the trackers or satisfy the remaining stability-window exit crite
 | P0 | Restore only the two public-information probes after the corrected image is healthy. | Restored; 24-hour exit criterion pending | [sugarkube #2776](https://github.com/futuroptimist/sugarkube/issues/2776) | The two probes return 200 throughout the stability window without consuming their quotas; health probes remain active. |
 | P0 | Keep `/metrics` restoration governed by the separate OOM corrective-action track. | In effect | [sugarkube #2777](https://github.com/futuroptimist/sugarkube/issues/2777) | No rate-limit remediation step re-enables application-metrics scraping. |
 
-The recovery sequence is tracked explicitly: [token.place #1766](https://github.com/futuroptimist/token.place/issues/1766) fed the combined staging qualification
-in [sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774), which gated exact-image production deployment in
+The recovery sequence is tracked explicitly: [token.place #1766](https://github.com/futuroptimist/token.place/issues/1766) supplied the release backport, while the retained combined staging qualification remains tracked
+in [sugarkube #2774](https://github.com/futuroptimist/sugarkube/issues/2774). The exact-image production deployment is tracked in
 [sugarkube #2775](https://github.com/futuroptimist/sugarkube/issues/2775). Public-information probe restoration proceeded through
 [sugarkube #2776](https://github.com/futuroptimist/sugarkube/issues/2776), followed by application-metrics restoration through
 [sugarkube #2777](https://github.com/futuroptimist/sugarkube/issues/2777). Those operational milestones are evidenced above;
 none of the trackers is closed by this documentation change.
+
+PR [#1789](https://github.com/futuroptimist/token.place/pull/1789) supplies repository low-quota
+route-and-method regression coverage. That automated evidence is distinct from staging
+qualification and the brief production observation above; it is not a claim that a full daily
+quota window elapsed.
+
+The fifteen canonical action trackers are token.place #1765, #1766, and #1770–#1773, plus
+sugarkube #2774–#2782. All fifteen remain open. Links to token.place
+[#1569](https://github.com/futuroptimist/token.place/issues/1569) and sugarkube
+[#2405](https://github.com/futuroptimist/sugarkube/issues/2405) are contextual trackers outside
+that canonical fifteen-item set; every tracker link and owner in the tables remains unchanged.
 
 Trusted-proxy/client-identity validation remains a P1 defense-in-depth follow-up tracked by
 [token.place #1772](https://github.com/futuroptimist/token.place/issues/1772). It is not a
@@ -322,7 +337,9 @@ restoring the two public-information probes.
 
 ## Restoration and resolution criteria
 
-Before the two paused public-information probes were restored, an immutable corrected image had to:
+The original qualification plan required the following before restoration. The operator-restored
+service is classified as resolved operationally, but the retained items not demonstrated by the
+supplied evidence remain pending for full qualification and issue closeout:
 
 1. contain the exact normalized-path, method-limited PR #1551 behavior;
 2. pass low-quota route-and-method regression tests, including the existing OpenAI-style 429
@@ -347,8 +364,10 @@ step governed by the related OOM incident.
   configuration and identity topology still require validation.
 - No evidence of a same-day quota configuration change was identified.
 - No customer payloads or credentials are required to establish the cause, and none are included.
-- This public record excludes Kubernetes context and namespace names, selector-label values, pod
-  names and UIDs, node names, source addresses, private evidence locations, raw logs, credentials,
+- This public record includes only the prompt-approved restoration coordinates
+  `release=kube-prometheus-stack` and scrape pool `serviceMonitor/tokenplace/tokenplace/0`; it
+  excludes other Kubernetes context and namespace names, private selector-label values, pod names
+  and UIDs, node names, source addresses, private evidence locations, raw logs, credentials,
   tokens, headers, and request payloads.
 
 ## Verification commands and public references

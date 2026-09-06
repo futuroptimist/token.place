@@ -115,6 +115,23 @@ jobs:
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
 
+      - name: Enforce relay release safety contract
+        run: |
+          python scripts/relay_release_safety_gate.py \
+            --image tokenplace-relay:smoke \
+            --source-commit "$(git rev-parse HEAD)" \
+            --release-ref "${GITHUB_REF}" \
+            --release-base "${{ github.base_ref || 'main' }}" \
+            --evidence relay-release-safety-evidence.json
+
+      - name: Upload relay release safety evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-release-safety-${{ steps.tags.outputs.short_sha }}
+          path: relay-release-safety-evidence.json
+          if-no-files-found: error
+
       - name: Smoke test relay container
         run: |
           set -euo pipefail
@@ -229,7 +246,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push multi-arch relay image
+      - name: Build immutable multi-arch candidate
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -237,7 +255,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
-          tags: ${{ needs.build-and-smoke.outputs.publish_tags }}
+          tags: ${{ needs.build-and-smoke.outputs.repository }}:candidate-${{ needs.build-and-smoke.outputs.short_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.build-and-smoke.outputs.short_sha }}
@@ -245,6 +263,42 @@ jobs:
             org.opencontainers.image.licenses=MIT
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
+
+      - name: Pull and qualify the exact candidate index
+        run: |
+          set -euo pipefail
+          candidate="${{ needs.build-and-smoke.outputs.repository }}@${{ steps.push.outputs.digest }}"
+          docker pull "${candidate}"
+          docker tag "${candidate}" tokenplace-relay:publish-candidate
+          python scripts/relay_release_safety_gate.py \
+            --image tokenplace-relay:publish-candidate \
+            --source-commit "$(git rev-parse HEAD)" \
+            --release-ref "${GITHUB_REF}" \
+            --release-base "${{ github.base_ref || 'main' }}" \
+            --candidate-digest "${{ steps.push.outputs.digest }}" \
+            --evidence relay-release-safety-publish-evidence.json
+
+      - name: Upload publication safety evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-release-safety-publish-${{ needs.build-and-smoke.outputs.short_sha }}
+          path: relay-release-safety-publish-evidence.json
+          if-no-files-found: error
+
+      - name: Promote qualified candidate to release tags
+        env:
+          PUBLISH_TAGS: ${{ needs.build-and-smoke.outputs.publish_tags }}
+          CANDIDATE: ${{ needs.build-and-smoke.outputs.repository }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          while IFS= read -r tag; do
+            test -n "${tag}"
+            tag_args+=(--tag "${tag}")
+          done <<< "${PUBLISH_TAGS}"
+          test "${#tag_args[@]}" -gt 0
+          docker buildx imagetools create "${tag_args[@]}" "${CANDIDATE}"
 
       - name: Publish workflow summary
         run: |
@@ -260,6 +314,8 @@ jobs:
               echo "Sugarkube deploy tag: \`${{ needs.build-and-smoke.outputs.semver_tag }}\`"
             fi
             echo "SHA tag: \`${{ needs.build-and-smoke.outputs.sha_tag }}\`"
+            echo "Immutable OCI index digest: \`${{ steps.push.outputs.digest }}\`"
+            echo "Safety contract: passed against the built candidate before publication."
             echo ""
             echo "Pushed: true"
           } >> "$GITHUB_STEP_SUMMARY"

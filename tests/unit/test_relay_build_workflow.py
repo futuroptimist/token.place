@@ -34,3 +34,18 @@ def test_relay_image_workflow_targets_multi_arch_and_ghcr_metadata() -> None:
         line.strip().startswith("org.opencontainers.image.licenses=")
         for line in labels_block.splitlines()
     ), "OCI metadata should declare the image license"
+
+
+def test_every_relay_image_publish_is_blocked_on_artifact_safety_gate() -> None:
+    workflow_text = WORKFLOW_PATH.read_text(encoding="utf-8")
+    gate = workflow_text.index("python scripts/relay_release_safety_gate.py")
+    publish_job = workflow_text.index("\n  publish:")
+    push = workflow_text.index("push: true", publish_job)
+    exact_gate = workflow_text.index("Pull and qualify the exact candidate index", push)
+    promotion = workflow_text.index("Promote qualified candidate to release tags", exact_gate)
+
+    assert gate < publish_job < push < exact_gate < promotion
+    assert "needs: build-and-smoke" in workflow_text[publish_job:push]
+    assert "if-no-files-found: error" in workflow_text
+    assert "steps.push.outputs.digest" in workflow_text
+    assert "docker buildx imagetools create" in workflow_text[promotion:]

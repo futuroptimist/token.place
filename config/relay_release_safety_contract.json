@@ -1,10 +1,12 @@
 {
   "schema_version": 1,
   "requirements": [
+    {"id": "metrics.valid_instrumentation", "description": "Metrics are valid, nonempty Prometheus exposition with required relay instrumentation"},
     {"id": "metrics.no_flask_defaults", "description": "Default Flask exporter metric families are absent"},
     {"id": "metrics.no_raw_paths", "description": "Request metrics contain no raw request-path labels"},
     {"id": "metrics.bounded_unmatched_paths", "description": "Distinct unmatched paths do not grow exported series linearly"},
     {"id": "quota.public_information_exempt", "description": "GET and HEAD on public information routes do not consume the ordinary API quota"},
-    {"id": "quota.protected_route_limited", "description": "An ordinary protected API route remains rate limited"}
+    {"id": "quota.protected_rate_limited", "description": "An ordinary protected API route enforces the configured rate limit"},
+    {"id": "quota.protected_daily_limited", "description": "An ordinary protected API route independently enforces the configured daily limit"}
   ]
 }

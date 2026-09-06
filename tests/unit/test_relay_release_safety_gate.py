@@ -2,158 +2,129 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-
 
 SCRIPT = Path("scripts/relay_release_safety_gate.py")
 SPEC = importlib.util.spec_from_file_location("relay_release_safety_gate", SCRIPT)
 assert SPEC and SPEC.loader
 gate = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = gate
 SPEC.loader.exec_module(gate)
 
-
-class CandidateHandler(BaseHTTPRequestHandler):
-    bounded_metrics = True
-    public_exempt = True
-    quota_used = 0
-    paths: set[str] = set()
-
-    def log_message(self, *_args):
-        pass
-
-    def _reply(self, status: int, body: str = "ok") -> None:
-        self.send_response(status)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body.encode())
-
-    def do_HEAD(self):
-        self.do_GET()
-
-    def do_GET(self):
-        public = self.path in {"/", "/api/v1/meta", "/api/v1/version"}
-        if self.path == "/metrics":
-            lines = ["# TYPE tokenplace_relay_requests_total counter", 'tokenplace_relay_requests_total{route="other"} 1']
-            if not self.bounded_metrics:
-                lines.append('flask_http_request_total{path="/raw-path"} 1')
-                lines.extend(f'tokenplace_request_total{{path="{path}"}} 1' for path in sorted(self.paths))
-            self._reply(200, "\n".join(lines) + "\n")
-            return
-        if self.path.startswith("/release-safety-unmatched-"):
-            self.paths.add(self.path)
-            self._reply(404)
-            return
-        if public and self.public_exempt:
-            self._reply(200)
-            return
-        if type(self).quota_used:
-            self._reply(429)
-            return
-        type(self).quota_used += 1
-        self._reply(200)
+VALID = """# HELP tokenplace_http_requests_total requests
+# TYPE tokenplace_http_requests_total counter
+tokenplace_http_requests_total{method="GET",route="other",status_class="4xx"} 1e+06
+tokenplace_instrumentation_up 1
+"""
 
 
-@pytest.fixture()
-def candidate_server():
-    servers = []
-
-    def start(*, bounded_metrics=True, public_exempt=True):
-        handler = type("ConfiguredCandidate", (CandidateHandler,), {
-            "bounded_metrics": bounded_metrics, "public_exempt": public_exempt,
-            "quota_used": 0, "paths": set(),
-        })
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        servers.append(server)
-        return f"http://127.0.0.1:{server.server_port}"
-
-    yield start
-    for server in servers:
-        server.shutdown()
+def test_parser_accepts_scientific_notation_and_decodes_identity():
+    samples = gate.parse_metrics(VALID + 'escaped{route="template/{id}"} -2.5E-3 123\n')
+    assert gate.Sample("escaped", (("route", "template/{id}"),)) in samples
+    assert len(samples) == 3
 
 
-def test_behavior_equivalent_recovery_passes_without_ancestry(candidate_server):
-    results = gate.qualify(candidate_server())
-    assert all(result["passed"] is True for result in results.values())
+@pytest.mark.parametrize("text", ["", "# comments only\n", "metric help text\n", 'metric{bad="unterminated} 1\n'])
+def test_parser_rejects_empty_or_malformed_exposition(text):
+    with pytest.raises(gate.GateFailure):
+        gate.parse_metrics(text)
 
 
-def test_historical_vulnerable_behavior_fails(candidate_server):
-    with pytest.raises(gate.GateFailure, match="metrics.*quota.public_information_exempt"):
-        gate.qualify(candidate_server(bounded_metrics=False, public_exempt=False))
+def test_metrics_fail_closed_for_http_errors_transport_and_unmatched_redirect(monkeypatch):
+    for status in (500, 0, 302):
+        monkeypatch.setattr(gate, "request", lambda *_args, s=status, **_kwargs: (s, ""))
+        assert not any(v["passed"] for v in gate.execute_metrics_checks("http://loopback").values())
 
 
-def test_disabling_bounded_metrics_fails_independently(candidate_server):
-    with pytest.raises(gate.GateFailure, match="metrics"):
-        gate.qualify(candidate_server(bounded_metrics=False))
+def test_hashed_raw_route_series_grows_even_with_scientific_values(monkeypatch):
+    calls = 0
+    paths: list[str] = []
+    def fake_request(_base, path, method="GET"):
+        nonlocal calls
+        if path == "/metrics":
+            calls += 1
+            extra = "".join(f'hits{{route="{p}"}} 1e+06\n' for p in paths)
+            return 200, VALID + extra
+        paths.append(path)
+        return 404, ""
+    monkeypatch.setattr(gate, "request", fake_request)
+    results = gate.execute_metrics_checks("http://loopback")
+    assert results["metrics.no_raw_paths"]["passed"] is False
+    assert results["metrics.bounded_unmatched_paths"]["passed"] is False
 
 
-def test_disabling_public_quota_exemptions_fails_independently(candidate_server):
-    with pytest.raises(gate.GateFailure, match="quota.public_information_exempt"):
-        gate.qualify(candidate_server(public_exempt=False))
+def test_bounded_template_metrics_pass_after_collector_warmup(monkeypatch):
+    monkeypatch.setattr(gate, "request", lambda _base, path, method="GET":
+                        (200, VALID) if path == "/metrics" else (404, ""))
+    assert all(v["passed"] for v in gate.execute_metrics_checks("http://loopback").values())
 
 
-def test_protected_route_must_still_be_limited(candidate_server, monkeypatch):
-    monkeypatch.setattr(gate, "request", lambda base, path, method="GET": (200, "tokenplace_metric 1\n"))
-    with pytest.raises(gate.GateFailure, match="quota.protected_route_limited"):
-        gate.qualify(candidate_server())
+@pytest.mark.parametrize("statuses,expected", [
+    ([200] * 12 + [200, 429], True), ([500] + [200] * 11 + [200, 429], False),
+    ([200] * 12 + [500, 429], False), ([200] * 12 + [0, 429], False),
+])
+def test_quota_requires_all_public_and_initial_protected_success(monkeypatch, statuses, expected):
+    iterator = iter(statuses)
+    monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: (next(iterator), ""))
+    results = gate.execute_quota_checks("http://loopback", "quota.protected_rate_limited")
+    assert all(v["passed"] for v in results.values()) is expected
 
 
-def test_missing_contract_check_fails_closed(candidate_server, tmp_path):
-    contract = tmp_path / "contract.json"
-    contract.write_text('{"schema_version": 1, "requirements": []}')
-    with pytest.raises(gate.GateFailure, match="empty"):
-        gate.qualify(candidate_server(), contract_path=contract)
+def test_exact_revision_and_verified_historical_abbreviation():
+    full = "a" * 40
+    gate.validate_candidate_identity(full, full)
+    gate.validate_candidate_identity(full, "a" * 7, full)
+    with pytest.raises(gate.GateFailure):
+        gate.validate_candidate_identity(full, "a" * 7)
+    with pytest.raises(gate.GateFailure):
+        gate.validate_candidate_identity(full, "b" * 40)
 
 
-def test_registry_digest_mismatch_fails_closed():
-    expected = "sha256:" + "a" * 64
-    with pytest.raises(gate.GateFailure, match="digest"):
-        gate.validate_candidate_identity("abc1234", "abc1234", expected, '["repo@sha256:' + "b" * 64 + '"]')
-
-
-@pytest.mark.parametrize(("source", "revision"), [("a", "a"), ("abc1234", "xyz9876"), ("g" * 7, "g" * 7)])
-def test_revision_requires_matching_git_hashes(source, revision):
-    with pytest.raises(gate.GateFailure, match="revision"):
-        gate.validate_candidate_identity(source, revision, None)
-
-
-def test_revision_allows_valid_abbreviated_prefix():
-    gate.validate_candidate_identity("abcdef0123456789", "abcdef0", None)
-
-
-def test_series_count_accepts_prometheus_float_formats():
-    metrics = "\n".join([
-        "counter 1e+06",
-        'gauge{label="value"} -2.5E-3 1234567890',
-        "positive_inf +Inf",
-        "not_a_sample help text",
-    ])
-    assert gate.series_count(metrics) == 3
-
-
-def test_missing_docker_still_writes_failure_evidence(tmp_path, monkeypatch):
+def _run_main(tmp_path, monkeypatch, docker_output, cleanup=None):
     evidence = tmp_path / "evidence.json"
-    monkeypatch.setattr(sys, "argv", [
-        str(SCRIPT),
-        "--image", "missing:image",
-        "--source-commit", "abcdef0",
-        "--release-ref", "main",
-        "--release-base", "main",
-        "--evidence", str(evidence),
-    ])
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--image", "candidate", "--platform", "linux/amd64",
+        "--source-commit", "a" * 40, "--release-ref", "refs/heads/work", "--release-base", "main",
+        "--evidence", str(evidence)])
+    monkeypatch.setattr(gate, "docker_output", docker_output)
+    if cleanup:
+        monkeypatch.setattr(gate.subprocess, "run", cleanup)
+    result = gate.main()
+    return result, json.loads(evidence.read_text())
 
-    def missing_docker(*_args, **_kwargs):
-        raise FileNotFoundError("docker")
 
-    monkeypatch.setattr(gate, "docker_output", missing_docker)
-    monkeypatch.setattr(gate.subprocess, "run", missing_docker)
+def test_missing_runtime_emits_sanitized_not_run_evidence(tmp_path, monkeypatch):
+    result, report = _run_main(tmp_path, monkeypatch, lambda *_a: (_ for _ in ()).throw(FileNotFoundError("secret")),
+                               lambda *_a, **_k: None)
+    assert result == 1 and report["error_category"] == "runtime_missing"
+    assert all(v["state"] == "not_run" for v in report["results"].values())
+    assert "secret" not in json.dumps(report)
 
-    assert gate.main() == 1
-    report = json.loads(evidence.read_text(encoding="utf-8"))
-    assert report["passed"] is False
-    assert "docker" in report["error"]
+
+def test_inspect_timeout_preserves_evidence(tmp_path, monkeypatch):
+    result, report = _run_main(tmp_path, monkeypatch,
+        lambda *_a: (_ for _ in ()).throw(subprocess.TimeoutExpired("private", 1)), lambda *_a, **_k: None)
+    assert result == 1 and report["error_category"] == "runtime_timeout"
+
+
+def test_cleanup_failure_does_not_mask_original(tmp_path, monkeypatch):
+    values = iter(["a" * 40, "amd64", "sha256:" + "b" * 64, "container-id"])
+    times = iter([100, 146])
+    monkeypatch.setattr(gate.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (0, ""))
+    result, report = _run_main(tmp_path, monkeypatch,
+        lambda *_a: next(values),
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("cleanup details")))
+    assert result == 1
+    assert report["error_category"] == "startup_timeout"
+    assert report["cleanup"] == "failed"
+    assert "details" not in json.dumps(report)
+
+
+def test_platform_identity_mismatch_fails_before_checks(tmp_path, monkeypatch):
+    values = iter(["a" * 40, "arm64"])
+    result, report = _run_main(tmp_path, monkeypatch, lambda *_a: next(values), lambda *_a, **_k: None)
+    assert result == 1 and report["error_category"] == "platform_identity_mismatch"

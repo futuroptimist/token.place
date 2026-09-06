@@ -15,11 +15,19 @@ commit=$(git rev-parse HEAD)
 docker build --label "org.opencontainers.image.revision=$commit" -t tokenplace-relay:safety .
 python scripts/relay_release_safety_gate.py \
   --image tokenplace-relay:safety \
+  --platform linux/amd64 \
   --source-commit "$commit" \
   --release-ref "$(git symbolic-ref -q --short HEAD || git rev-parse HEAD)" \
   --release-base main \
   --evidence relay-release-safety-evidence.json
 ```
+
+For a multi-platform index, resolve each descriptor with `docker buildx imagetools inspect --raw`,
+pull the descriptor by its `sha256:` digest and pass both `--index-digest` and
+`--platform-digest`. Run once with `--platform linux/amd64` and once with
+`--platform linux/arm64`; QEMU/binfmt must be installed when the host cannot execute the selected
+platform. A platform absent from the index, a platform mismatch reported by Docker, or either gate
+failure blocks the index as a whole.
 
 A passing report contains `passed: true`, the source/ref and immutable image identity, plus a result
 for every contract requirement. For publication, CI first pushes a uniquely named non-release
@@ -30,12 +38,29 @@ workflow summary. Missing, duplicate, skipped, malformed, mismatched, or false r
 closed. The report intentionally excludes request bodies, credentials, client identities, logs, and
 the randomized unmatched paths used by the probe.
 
+The evidence distinguishes `failed` from `not_run` checks and uses sanitized error categories.
+`startup_timeout` means the bounded readiness deadline expired (transient connection resets are
+retried only during that startup window); `runtime_missing`, `runtime_timeout`, and
+`runtime_command_failed` identify local Docker failures. A cleanup failure is recorded separately
+and makes the result fail without replacing the original category. HTTP errors, redirects, and
+transport failures after readiness are check failures rather than responses that satisfy a probe.
+
+## Publication entrypoints
+
+`.github/workflows/ci-image.yml` is the sole relay-image publication entrypoint. Pull requests and
+manual dispatches validate only; pushes to `main` and immutable semantic-version tags build a
+unique candidate index. The workflow qualifies the two descriptors from that exact digest before
+`imagetools create` attaches release tags. Manual runs record the requested `ref` and reviewed
+`base`, rather than substituting the workflow file's ref. Extending the advertised platform list
+requires adding the platform to the build, exact manifest-membership assertion, qualification loop,
+workflow regression tests, and operator documentation in the same change.
+
 ## Maintain the contract
 
 To add a mandatory requirement:
 
 1. Add a stable ID and description to `config/relay_release_safety_contract.json`.
-2. Add the same ID to `EXPECTED_IDS` and an executable artifact-level check to `execute_checks()`.
+2. Add the same ID to `EXPECTED_IDS` and the appropriate executable metrics or quota check.
 3. Add passing and failing fixtures in `tests/unit/test_relay_release_safety_gate.py`.
 4. Run the unit tests and the local image command above.
 
@@ -45,7 +70,10 @@ Keep probes deterministic in their assertions, bounded in traffic, and free of s
 ## Behavior-equivalent backports
 
 The contract approves observed behavior rather than requiring particular commits to be ancestors.
-A maintenance backport is therefore eligible when reviewers confirm its scope and the built image
-passes every current contract result with matching revision metadata. Reviewers should link the CI
-evidence artifact and immutable published digest in the pull request or release record. An ancestry
-claim is neither needed nor accepted as a substitute for the behavioral gate.
+A maintenance backport is therefore eligible when reviewers explicitly approve its equivalence and
+the built image passes every current contract result with matching revision metadata. New artifacts
+must carry the complete source SHA. A historical 7--39 character label is accepted only when the
+caller supplies the independently resolved full revision and it exactly equals the pinned source;
+arbitrary prefix matching is forbidden. Reviewers should link that approval, both platform evidence
+artifacts, and the immutable index and descriptor digests in the pull request or release record. An
+ancestry claim is neither needed nor accepted as a substitute for the behavioral gate.

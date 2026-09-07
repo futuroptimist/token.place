@@ -6339,7 +6339,7 @@ def test_api_v1_heartbeat_stops_when_response_posting_raises():
     assert client._api_v1_heartbeat_thread is None
 
 
-def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
+def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling(monkeypatch):
     manager = _ApiV1RuntimeManager()
     client = _api_v1_validation_client(manager)
     client.stop_polling = False
@@ -6356,20 +6356,64 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
         "iv": "encrypted_iv",
     }
     client._post_api_v1_response = MagicMock(return_value=_PostApiV1Outcome(submitted=True))
+    control_polled = [threading.Event(), threading.Event()]
+    inference_calls = 0
+    original_completion = manager.runtime.create_chat_completion.return_value
 
-    first_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+    def wait_for_control_poll(**_kwargs):
+        nonlocal inference_calls
+        call_index = inference_calls
+        inference_calls += 1
+        if not control_polled[call_index].wait(timeout=2):
+            raise RuntimeError("control poll did not run before inference completed")
+        return original_completion
 
-    assert first_result.submitted is True
-    assert client._api_v1_heartbeat_thread is None
-    assert client.stop_polling is False
-    assert client._polling_stopped_by_request is False
+    manager.runtime.create_chat_completion.side_effect = wait_for_control_poll
+    network_post = MagicMock(side_effect=RuntimeError("unit test attempted real HTTP"))
+    monkeypatch.setattr(relay_client_module.requests, "post", network_post)
+    control_calls = []
 
-    second_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+    def active_control(**kwargs):
+        control_calls.append(kwargs)
+        request_index = {
+            "req-heartbeat-1": 0,
+            "req-heartbeat-2": 1,
+        }[kwargs["request_id"]]
+        control_polled[request_index].set()
+        return {"status": "active", "next_poll_seconds": 1}
 
-    assert second_result.submitted is True
-    assert client.stop_polling is False
-    assert client._polling_stopped_by_request is False
-    assert client._post_api_v1_response.call_count == 2
+    client._post_api_v1_request_control = active_control
+
+    try:
+        first_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+        assert first_result.submitted is True
+        assert client._api_v1_heartbeat_thread is None
+        assert client.stop_polling is False
+        assert client._polling_stopped_by_request is False
+
+        second_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
+
+        assert second_result.submitted is True
+        assert client.stop_polling is False
+        assert client._polling_stopped_by_request is False
+        assert client._post_api_v1_response.call_count == 2
+    finally:
+        for poll_observed in control_polled:
+            poll_observed.set()
+
+    assert all(poll_observed.is_set() for poll_observed in control_polled)
+    assert {call["request_id"] for call in control_calls} == {
+        "req-heartbeat-1",
+        "req-heartbeat-2",
+    }
+    assert all(call["acknowledge"] is False for call in control_calls)
+    assert network_post.call_count == 0
+    assert not any(
+        thread.is_alive()
+        and thread.name.startswith(("api_v1_control", "api_v1_inference"))
+        for thread in threading.enumerate()
+    )
 
 
 def test_api_v1_heartbeat_logs_sanitized_relay_targets():

@@ -459,6 +459,14 @@ _METRICS_CONSTRUCTION_FAILED = False
 REQUEST_COUNTER = None
 
 PROVIDER_MODE_ENUM = ("relay", "direct", "unknown")
+PUBLIC_QUOTA_ROUTE_CLASS_ENUM = (
+    "root", "public_metadata", "public_version", "public_api",
+    "client_relay_read", "compute_control_plane", "operational", "unknown_route",
+)
+PUBLIC_QUOTA_OUTCOME_ENUM = ("accepted", "exempt", "rejected")
+PUBLIC_QUOTA_REJECTION_REASON_ENUM = (
+    "none", "hourly_limit", "daily_limit", "other_limit",
+)
 OUTCOME_ENUM = (
     "completed",
     "cancelled",
@@ -519,6 +527,15 @@ HTTP_REQUEST_DURATION_SECONDS = _collector(
         "Bounded relay HTTP request duration in seconds.",
         ["method", "route", "status_class", "provider_mode", "outcome"],
         buckets=HTTP_DURATION_BUCKETS,
+        registry=RELAY_METRICS_REGISTRY,
+    ),
+)
+PUBLIC_HTTP_QUOTA_OUTCOMES_TOTAL = _collector(
+    "tokenplace_public_http_quota_outcomes_total",
+    lambda: Counter(
+        "tokenplace_public_http_quota_outcomes_total",
+        "Public HTTP quota outcomes using fixed route, method, outcome, and reason enums.",
+        ["route_class", "method", "outcome", "reason"],
         registry=RELAY_METRICS_REGISTRY,
     ),
 )
@@ -630,6 +647,52 @@ def _normalise_status_class(status_code: int | str) -> str:
         return f"{int(status_code) // 100}xx"
     except (TypeError, ValueError):
         return "unknown"
+
+
+def _public_quota_route_class() -> str:
+    """Classify quota traffic using exact paths and Flask-owned endpoints only."""
+
+    from api import (
+        CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS, RATE_LIMIT_EXEMPT_PATHS,
+        RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS, _normalized_path,
+    )
+    path = _normalized_path(request.path)
+    exact_public = {
+        "/": "root", "/api/v1/meta": "public_metadata",
+        "/api/v1/version": "public_version",
+    }
+    if path in exact_public:
+        return exact_public[path]
+    if path in RATE_LIMIT_EXEMPT_PATHS:
+        return "operational"
+    if path in CLIENT_RELAY_READ_RATE_LIMIT_EXEMPT_PATHS:
+        return "client_relay_read"
+    if path in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS:
+        return "compute_control_plane"
+    endpoint = request.endpoint or ""
+    if endpoint.startswith(("v1.", "openai_v1.", "v2.", "openai_v2.")):
+        return "public_api"
+    return "unknown_route"
+
+
+def _record_public_quota_outcome(response: Response) -> Response:
+    """Record one bounded quota outcome independently of inference outcomes."""
+
+    from api import _is_public_api_rate_limit_exempt_path
+    outcome = getattr(g, "tokenplace_public_quota_outcome", None)
+    if outcome != "rejected":
+        outcome = "exempt" if _is_public_api_rate_limit_exempt_path(request.path) else "accepted"
+    reason = getattr(g, "tokenplace_public_quota_rejection_reason", "none")
+    if outcome != "rejected" or reason not in PUBLIC_QUOTA_REJECTION_REASON_ENUM:
+        reason = "none" if outcome != "rejected" else "other_limit"
+    try:
+        PUBLIC_HTTP_QUOTA_OUTCOMES_TOTAL.labels(
+            _public_quota_route_class(), _normalise_http_method(request.method),
+            outcome, reason,
+        ).inc()
+    except Exception:
+        LOGGER.debug("metrics.public_quota_increment_failed")
+    return response
 
 
 def _normalise_http_route() -> str:
@@ -1780,8 +1843,10 @@ def _log_request(response: Response):
     outcome = _outcome_for_response(response)
     provider_mode = "relay"
 
+    _record_public_quota_outcome(response)
+
     try:
-        REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
+        REQUEST_COUNTER.labels(_normalise_http_method(request.method), endpoint, status_code).inc()
         HTTP_REQUESTS_TOTAL.labels(_normalise_http_method(request.method), route, status_class, provider_mode, outcome).inc()
     except Exception:  # pragma: no cover - defensive metric increment
         LOGGER.debug(

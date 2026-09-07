@@ -261,7 +261,16 @@ def main() -> int:
                 base, f"quota.protected_{phase}_limited")
             for key, result in checked.items():
                 result["state"] = "passed" if result["passed"] else "failed"
-                evidence["results"][key] = result
+                if key == "quota.public_information_exempt":
+                    aggregate = evidence["results"][key]
+                    aggregate.setdefault("phases", {})[phase] = result
+                    phase_results = aggregate["phases"]
+                    aggregate["passed"] = set(phase_results) == {"rate", "daily"} and all(
+                        item["passed"] for item in phase_results.values()
+                    )
+                    aggregate["state"] = "passed" if aggregate["passed"] else "failed"
+                else:
+                    evidence["results"][key] = result
         evidence["passed"] = all(v.get("state") == "passed" for v in evidence["results"].values())
         if not evidence["passed"]:
             evidence["error_category"] = "mandatory_check_failed"
@@ -271,12 +280,17 @@ def main() -> int:
         cleanup_failed = False
         for container in containers:
             try:
-                subprocess.run(["docker", "rm", "-f", container], check=False, capture_output=True, timeout=15)
+                completed = subprocess.run(
+                    ["docker", "rm", "-f", container], check=False, capture_output=True, timeout=15
+                )
+                if completed.returncode != 0:
+                    cleanup_failed = True
             except (OSError, subprocess.SubprocessError):
                 cleanup_failed = True
         if cleanup_failed:
             evidence["cleanup"] = "failed"
             evidence["passed"] = False
+            evidence.setdefault("error_category", "cleanup_failed")
         args.evidence.parent.mkdir(parents=True, exist_ok=True)
         args.evidence.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(evidence, indent=2, sort_keys=True))

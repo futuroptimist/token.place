@@ -210,3 +210,67 @@ def test_platform_identity_mismatch_fails_before_checks(tmp_path, monkeypatch):
     values = iter(["a" * 40, "arm64"])
     result, report = _run_main(tmp_path, monkeypatch, lambda *_a: next(values), lambda *_a, **_k: None)
     assert result == 1 and report["error_category"] == "platform_identity_mismatch"
+
+
+def _run_qualified_main(tmp_path, monkeypatch, exemptions=(True, True), missing=None, cleanup_code=0,
+                        protected=(True, True)):
+    values = iter(["a" * 40, "amd64", "sha256:" + "b" * 64, "metrics", "rate", "daily"])
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
+        key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
+    })
+    quota_calls = 0
+
+    def quota_results(_base, limit_id):
+        nonlocal quota_calls
+        phase = "rate" if quota_calls == 0 else "daily"
+        result = {limit_id: {"passed": protected[quota_calls]}}
+        if missing != phase:
+            result["quota.public_information_exempt"] = {"passed": exemptions[quota_calls]}
+        quota_calls += 1
+        return result
+
+    monkeypatch.setattr(gate, "execute_quota_checks", quota_results)
+
+    def cleanup(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], cleanup_code)
+
+    return _run_main(tmp_path, monkeypatch, lambda *_a: next(values), cleanup)
+
+
+@pytest.mark.parametrize("exemptions", [(False, True), (True, False)])
+def test_public_exemption_failure_is_retained_across_phases(tmp_path, monkeypatch, exemptions):
+    result, report = _run_qualified_main(tmp_path, monkeypatch, exemptions=exemptions)
+    public = report["results"]["quota.public_information_exempt"]
+    assert result == 1 and report["error_category"] == "mandatory_check_failed"
+    assert public["state"] == "failed"
+    assert {phase: item["passed"] for phase, item in public["phases"].items()} == {
+        "rate": exemptions[0], "daily": exemptions[1]
+    }
+
+
+@pytest.mark.parametrize("missing", ["rate", "daily"])
+def test_missing_public_exemption_phase_fails_closed(tmp_path, monkeypatch, missing):
+    result, report = _run_qualified_main(tmp_path, monkeypatch, missing=missing)
+    public = report["results"]["quota.public_information_exempt"]
+    assert result == 1 and public["passed"] is False and public["state"] == "failed"
+    assert set(public["phases"]) == ({"daily"} if missing == "rate" else {"rate"})
+
+
+def test_both_public_exemption_phases_pass(tmp_path, monkeypatch):
+    result, report = _run_qualified_main(tmp_path, monkeypatch)
+    public = report["results"]["quota.public_information_exempt"]
+    assert result == 0 and report["passed"] is True
+    assert public["state"] == "passed" and set(public["phases"]) == {"rate", "daily"}
+
+
+def test_nonzero_cleanup_fails_successful_qualification(tmp_path, monkeypatch):
+    result, report = _run_qualified_main(tmp_path, monkeypatch, cleanup_code=1)
+    assert result == 1 and report["passed"] is False
+    assert report["cleanup"] == "failed" and report["error_category"] == "cleanup_failed"
+
+
+def test_nonzero_cleanup_preserves_qualification_failure_category(tmp_path, monkeypatch):
+    result, report = _run_qualified_main(tmp_path, monkeypatch, cleanup_code=1, protected=(False, True))
+    assert result == 1 and report["cleanup"] == "failed"
+    assert report["error_category"] == "mandatory_check_failed"

@@ -2965,6 +2965,8 @@ class ValkeyRegistrationStore:
         if status == "acknowledged" and len(values) == 3 and all(
             isinstance(value, bytes) for value in values
         ):
+            if values != [accepted_raw, digest_raw, ack_raw]:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
             return ResponseRetrievalResult(status)
         if status == "retrieval_expired" and not values:
             return ResponseRetrievalResult(status)

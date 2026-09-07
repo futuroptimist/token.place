@@ -3071,26 +3071,37 @@ def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_s
         second.close()
 
 
+@pytest.mark.parametrize(
+    ("request_limit", "response_limit", "request_ciphertext", "response_ciphertext"),
+    (
+        (256, 2048, "request-ciphertext", "r" * 512),
+        (2048, 256, "q" * 512, "response-ciphertext"),
+    ),
+)
 def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once(
     valkey_server,
+    request_limit,
+    response_limit,
+    request_ciphertext,
+    response_ciphertext,
 ):
     namespace = uuid.uuid4().hex
     first = _registration_store(
         valkey_server,
         namespace,
-        max_envelope_bytes=256,
-        max_response_envelope_bytes=2048,
+        max_envelope_bytes=request_limit,
+        max_response_envelope_bytes=response_limit,
     )
     second = _registration_store(
         valkey_server,
         namespace,
-        max_envelope_bytes=256,
-        max_response_envelope_bytes=2048,
+        max_envelope_bytes=request_limit,
+        max_response_envelope_bytes=response_limit,
     )
     node, owner, consumer = "retrieve-node", _digest("retrieve-owner"), "consumer"
     identity = ("retrieve-client", "retrieve-request")
     response = EncryptedResponseEnvelope(
-        "tokenplace_api_v1_relay_e2ee", 1, "r" * 512, "response-key", "response-iv"
+        "tokenplace_api_v1_relay_e2ee", 1, response_ciphertext, "response-key", "response-iv"
     )
     deadline = time.time() + 60
     try:
@@ -3106,7 +3117,7 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
             "8k-fast",
             deadline,
             EncryptedRequestEnvelope(
-                "tokenplace_api_v1_relay_e2ee", 1, "request-ciphertext", "request-key", "request-iv"
+                "tokenplace_api_v1_relay_e2ee", 1, request_ciphertext, "request-key", "request-iv"
             ),
             "cancel",
         )
@@ -3157,8 +3168,8 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
             _foundation(valkey_server, namespace),
             RelayStateStoreConfig(
                 namespace="testing.valkey",
-                max_envelope_bytes=256,
-                max_response_envelope_bytes=2048,
+                max_envelope_bytes=request_limit,
+                max_response_envelope_bytes=response_limit,
             ),
             acknowledgement_key=b"rotated-test-acknowledgement-key!",
         )

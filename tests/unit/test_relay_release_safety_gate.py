@@ -166,11 +166,11 @@ def test_exact_revision_and_verified_historical_abbreviation():
         gate.validate_candidate_identity(full, "b" * 40)
 
 
-def _run_main(tmp_path, monkeypatch, docker_output, cleanup=None):
+def _run_main(tmp_path, monkeypatch, docker_output, cleanup=None, registry_args=()):
     evidence = tmp_path / "evidence.json"
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--image", "candidate", "--platform", "linux/amd64",
         "--source-commit", "a" * 40, "--release-ref", "refs/heads/work", "--release-base", "main",
-        "--evidence", str(evidence)])
+        "--evidence", str(evidence), *registry_args])
     monkeypatch.setattr(gate, "docker_output", docker_output)
     if cleanup:
         monkeypatch.setattr(gate.subprocess, "run", cleanup)
@@ -210,6 +210,97 @@ def test_platform_identity_mismatch_fails_before_checks(tmp_path, monkeypatch):
     values = iter(["a" * 40, "arm64"])
     result, report = _run_main(tmp_path, monkeypatch, lambda *_a: next(values), lambda *_a, **_k: None)
     assert result == 1 and report["error_category"] == "platform_identity_mismatch"
+
+
+PLATFORM_DIGEST = "sha256:" + "c" * 64
+INDEX_DIGEST = "sha256:" + "d" * 64
+COORDINATE = f"ghcr.io/example/relay@{PLATFORM_DIGEST}"
+
+
+def _manifest(digest=PLATFORM_DIGEST, platform="linux/amd64"):
+    os_name, architecture = platform.split("/")
+    return json.dumps({"manifests": [{
+        "digest": digest, "platform": {"os": os_name, "architecture": architecture},
+    }]})
+
+
+def test_registry_identity_binds_local_image_and_index(monkeypatch):
+    values = iter([json.dumps([COORDINATE]), _manifest()])
+    monkeypatch.setattr(gate, "docker_output", lambda *_args: next(values))
+    gate.validate_registry_identity("candidate", "linux/amd64", COORDINATE, INDEX_DIGEST, PLATFORM_DIGEST)
+
+
+@pytest.mark.parametrize("coordinate,index_digest,platform_digest", [
+    (COORDINATE, "malformed", PLATFORM_DIGEST),
+    ("ghcr.io/example/relay@sha256:" + "e" * 64, INDEX_DIGEST, PLATFORM_DIGEST),
+    ("repo@wrong", INDEX_DIGEST, PLATFORM_DIGEST),
+])
+def test_malformed_or_contradictory_registry_identity_fails_without_docker(
+    monkeypatch, coordinate, index_digest, platform_digest,
+):
+    monkeypatch.setattr(gate, "docker_output", lambda *_args: pytest.fail("docker identity lookup ran"))
+    with pytest.raises(gate.GateFailure):
+        gate.validate_registry_identity("candidate", "linux/amd64", coordinate, index_digest, platform_digest)
+
+
+def test_registry_identity_rejects_local_image_mismatch(monkeypatch):
+    monkeypatch.setattr(gate, "docker_output", lambda *_args: json.dumps([]))
+    with pytest.raises(gate.GateFailure, match="local_image_identity_mismatch"):
+        gate.validate_registry_identity("candidate", "linux/amd64", COORDINATE, INDEX_DIGEST, PLATFORM_DIGEST)
+
+
+@pytest.mark.parametrize("manifest", [_manifest(digest="sha256:" + "e" * 64), _manifest(platform="linux/arm64")])
+def test_registry_identity_rejects_missing_or_wrong_platform_index_member(monkeypatch, manifest):
+    values = iter([json.dumps([COORDINATE]), manifest])
+    monkeypatch.setattr(gate, "docker_output", lambda *_args: next(values))
+    with pytest.raises(gate.GateFailure, match="index_platform_mismatch"):
+        gate.validate_registry_identity("candidate", "linux/amd64", COORDINATE, INDEX_DIGEST, PLATFORM_DIGEST)
+
+
+@pytest.mark.parametrize("values,registry_args,category", [
+    (["a" * 40, "amd64"], ("--registry-coordinate", "repo@wrong", "--index-digest", INDEX_DIGEST,
+      "--platform-digest", PLATFORM_DIGEST), "registry_identity_mismatch"),
+    (["a" * 40, "amd64", "[]"], ("--registry-coordinate", COORDINATE, "--index-digest", INDEX_DIGEST,
+      "--platform-digest", PLATFORM_DIGEST), "local_image_identity_mismatch"),
+    (["a" * 40, "amd64", json.dumps([COORDINATE]), _manifest(platform="linux/arm64")],
+     ("--registry-coordinate", COORDINATE, "--index-digest", INDEX_DIGEST,
+      "--platform-digest", PLATFORM_DIGEST), "index_platform_mismatch"),
+])
+def test_registry_mismatch_persists_not_run_evidence_before_probes(
+    tmp_path, monkeypatch, values, registry_args, category,
+):
+    monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: pytest.fail("probe ran"))
+    result, report = _run_main(
+        tmp_path, monkeypatch, lambda *_args: values.pop(0),
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0), registry_args,
+    )
+    assert result == 1 and report["error_category"] == category
+    assert report["passed"] is False
+    assert all(item["state"] == "not_run" for item in report["results"].values())
+
+
+def test_main_runs_inspected_image_id_not_mutable_alias(tmp_path, monkeypatch):
+    image_id = "sha256:" + "b" * 64
+    calls = []
+    values = iter(["a" * 40, "amd64", image_id, "metrics", "rate", "daily"])
+    monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
+        key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
+    })
+    monkeypatch.setattr(gate, "execute_quota_checks", lambda _base, limit_id: {
+        "quota.public_information_exempt": {"passed": True}, limit_id: {"passed": True},
+    })
+
+    def output(*args):
+        calls.append(args)
+        return next(values)
+
+    result, report = _run_main(
+        tmp_path, monkeypatch, output,
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0),
+    )
+    assert result == 0 and report["image_id"] == image_id
+    assert [call[-1] for call in calls if call[0] == "run"] == [image_id] * 3
 
 
 def _run_qualified_main(tmp_path, monkeypatch, exemptions=(True, True), missing=None, cleanup_code=0,

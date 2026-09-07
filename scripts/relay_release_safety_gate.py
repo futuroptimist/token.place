@@ -23,6 +23,7 @@ EXPECTED_IDS = {
     "quota.protected_rate_limited", "quota.protected_daily_limited",
 }
 GIT_SHA = re.compile(r"[0-9a-f]{40}")
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 METRIC_NAME = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
 NUMBER = re.compile(r"[-+]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|NaN|Inf)")
 LABEL_NAME = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
@@ -194,6 +195,43 @@ def validate_candidate_identity(source: str, revision: str, resolved_revision: s
         raise GateFailure("source_identity_mismatch")
 
 
+def validate_registry_identity(
+    image: str, platform: str, coordinate: str | None, index_digest: str | None,
+    platform_digest: str | None,
+) -> None:
+    """Bind publication metadata to the locally resolved platform manifest."""
+    supplied = (coordinate, index_digest, platform_digest)
+    if not any(supplied):
+        return
+    if not all(supplied) or not DIGEST.fullmatch(index_digest or "") or not DIGEST.fullmatch(platform_digest or ""):
+        raise GateFailure("registry_identity_invalid")
+    if not coordinate or coordinate.count("@") != 1:
+        raise GateFailure("registry_identity_invalid")
+    repository, coordinate_digest = coordinate.rsplit("@", 1)
+    if not repository or re.search(r"\s", repository) or coordinate_digest != platform_digest:
+        raise GateFailure("registry_identity_mismatch")
+
+    try:
+        repo_digests = json.loads(docker_output("image", "inspect", image, "--format", "{{json .RepoDigests}}"))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise GateFailure("registry_identity_invalid") from exc
+    if not isinstance(repo_digests, list) or coordinate not in repo_digests:
+        raise GateFailure("local_image_identity_mismatch")
+    try:
+        index = json.loads(docker_output("buildx", "imagetools", "inspect", "--raw", f"{repository}@{index_digest}"))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise GateFailure("registry_identity_invalid") from exc
+    os_name, architecture = platform.split("/", 1)
+    members = [
+        item for item in index.get("manifests", [])
+        if isinstance(item, dict) and item.get("digest") == platform_digest
+        and item.get("platform", {}).get("os") == os_name
+        and item.get("platform", {}).get("architecture") == architecture
+    ] if isinstance(index, dict) else []
+    if len(members) != 1:
+        raise GateFailure("index_platform_mismatch")
+
+
 def docker_output(*args: str) -> str:
     return subprocess.run(["docker", *args], check=True, capture_output=True, text=True, timeout=30).stdout.strip()
 
@@ -240,7 +278,12 @@ def main() -> int:
         if architecture != args.platform.split("/")[1]:
             raise GateFailure("platform_identity_mismatch")
         validate_candidate_identity(args.source_commit, revision, args.resolved_revision)
-        evidence["image_id"] = docker_output("image", "inspect", args.image, "--format", "{{.Id}}")
+        validate_registry_identity(args.image, args.platform, args.registry_coordinate, args.index_digest,
+                                   args.platform_digest)
+        image_id = docker_output("image", "inspect", args.image, "--format", "{{.Id}}")
+        if not DIGEST.fullmatch(image_id):
+            raise GateFailure("local_image_identity_invalid")
+        evidence["image_id"] = image_id
 
         phases = [("metrics", "1000/minute", "1000/day"), ("rate", "1/minute", "1000/day"), ("daily", "1000/minute", "1/day")]
         for offset, (phase, rate, daily) in enumerate(phases):
@@ -248,7 +291,7 @@ def main() -> int:
             containers.append(container)
             docker_output("run", "-d", "--rm", "--name", container, "-p", f"127.0.0.1:{args.port + offset}:5010",
                           "-e", "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0", "-e", f"API_RATE_LIMIT={rate}",
-                          "-e", f"API_DAILY_QUOTA={daily}", args.image)
+                          "-e", f"API_DAILY_QUOTA={daily}", image_id)
             base = f"http://127.0.0.1:{args.port + offset}"
             deadline = time.monotonic() + 45
             while time.monotonic() < deadline:

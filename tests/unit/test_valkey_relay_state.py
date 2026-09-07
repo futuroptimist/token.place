@@ -249,7 +249,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "87b5ee352f5e7888710adaf64a6bd45a72ac79350a4daf61f2f87edda03fcb95"  # pragma: allowlist secret
+    expected_digest = "da3a32d9cb0ea33d1671e13a98ea67e50b90c845018428e03226650318ae66f0"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest

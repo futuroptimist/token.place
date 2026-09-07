@@ -3824,6 +3824,144 @@ def test_coherent_due_response_retrieval_reaps_only_addressed_authority(valkey_s
 
 
 @pytest.mark.parametrize(
+    ("field", "representation"),
+    (
+        ("accepted_at_epoch", "leading_zero"),
+        ("replay_expires_at_epoch", "whitespace"),
+        ("expires_at_epoch", "alternate"),
+        ("deadline", "overlong"),
+    ),
+)
+def test_response_retrieval_rejects_coordinated_noncanonical_timestamp_authority(
+    valkey_server, field, representation
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    fixture = _accepted_retrieval_fixture(
+        (store,), f"canonical-authority-{field}-{representation}"
+    )
+    node, identity, credential, _, _, keys, member = fixture
+    datastore = store._foundation._client
+    unrelated_member = f"{'9' * 64}:{'8' * 64}"
+    try:
+        source_key = keys[4] if field == "deadline" else keys[9]
+        raw = datastore.hget(source_key, field).decode()
+        if representation == "leading_zero":
+            corrupted = f"0{raw}"
+        elif representation == "whitespace":
+            corrupted = f" {raw}"
+        elif representation == "alternate":
+            corrupted = f"{float(raw):.16e}"
+        else:
+            if "e" in raw:
+                mantissa, exponent = raw.split("e", 1)
+                corrupted = f"{mantissa}{'0' * 40}e{exponent}"
+            else:
+                corrupted = f"{raw}{'0' * 40}"
+
+        if field in {"accepted_at_epoch", "replay_expires_at_epoch"}:
+            datastore.hset(keys[7], field, corrupted)
+            datastore.hset(keys[9], field, corrupted)
+        else:
+            datastore.hset(source_key, field, corrupted)
+        datastore.zadd(keys[8], {unrelated_member: float(raw) + 100})
+        datastore.zadd(keys[10], {unrelated_member: float(raw) + 200})
+        before = _exact_key_snapshot(store, keys)
+
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store.retrieve_encrypted_response(*identity, credential)
+
+        assert _exact_key_snapshot(store, keys) == before
+        assert datastore.zscore(keys[8], unrelated_member) == pytest.approx(
+            float(raw) + 100
+        )
+        assert datastore.zscore(keys[10], unrelated_member) == pytest.approx(
+            float(raw) + 200
+        )
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        datastore.zrem(keys[8], unrelated_member)
+        datastore.zrem(keys[10], unrelated_member)
+        store.close()
+
+
+def test_response_acknowledgement_revalidates_canonical_authority_after_read(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    fixture = _accepted_retrieval_fixture((store,), "canonical-ack-dispatch")
+    node, identity, credential, envelope, _, keys, member = fixture
+    datastore = store._foundation._client
+    ready = store.retrieve_encrypted_response(*identity, credential)
+    original_evalsha = datastore.evalsha
+    dispatches = 0
+    corrupted_snapshot = None
+    unrelated_member = f"{'7' * 64}:{'6' * 64}"
+    datastore.zadd(keys[8], {unrelated_member: time.time() + 100})
+    datastore.zadd(keys[10], {unrelated_member: time.time() + 200})
+    try:
+        def corrupt_before_ack(*args, **kwargs):
+            nonlocal dispatches, corrupted_snapshot
+            if args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1:
+                dispatches += 1
+                if dispatches == 2:
+                    raw = datastore.hget(keys[9], "replay_expires_at_epoch").decode()
+                    corrupted = f" {raw}"
+                    datastore.hset(keys[7], "replay_expires_at_epoch", corrupted)
+                    datastore.hset(keys[9], "replay_expires_at_epoch", corrupted)
+                    corrupted_snapshot = _exact_key_snapshot(store, keys)
+            return original_evalsha(*args, **kwargs)
+
+        datastore.evalsha = corrupt_before_ack
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store.retrieve_encrypted_response(
+                *identity, credential, ready.acknowledgement_token
+            )
+
+        assert dispatches == 2
+        assert corrupted_snapshot is not None
+        assert _exact_key_snapshot(store, keys) == corrupted_snapshot
+        assert datastore.exists(keys[7]) == 1
+        assert datastore.zscore(keys[8], member) is not None
+        datastore.evalsha = original_evalsha
+        datastore.hset(
+            keys[7],
+            "replay_expires_at_epoch",
+            datastore.hget(keys[9], "replay_expires_at_epoch").strip(),
+        )
+        datastore.hset(
+            keys[9],
+            "replay_expires_at_epoch",
+            datastore.hget(keys[9], "replay_expires_at_epoch").strip(),
+        )
+        assert store.retrieve_encrypted_response(*identity, credential).envelope == envelope
+    finally:
+        datastore.evalsha = original_evalsha
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        datastore.zrem(keys[8], unrelated_member)
+        datastore.zrem(keys[10], unrelated_member)
+        store.close()
+
+
+def test_response_retrieval_canonical_timestamp_authority_acknowledges(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    fixture = _accepted_retrieval_fixture((store,), "canonical-control")
+    node, identity, credential, envelope, _, _, _ = fixture
+    try:
+        ready = store.retrieve_encrypted_response(*identity, credential)
+        assert ready.envelope == envelope
+        assert store.retrieve_encrypted_response(
+            *identity, credential, ready.acknowledgement_token
+        ).state == "acknowledged"
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
     ("manifest", "expected_dispatches"),
     (
         (_manifest(reader_min=2, reader_max=2), ()),

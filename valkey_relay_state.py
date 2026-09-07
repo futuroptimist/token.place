@@ -1532,6 +1532,27 @@ local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
 local function finite(value) local n=tonumber(value); return n and n==n and math.abs(n)~=math.huge and n end
 local function digest(value) return value and string.len(value)==64 and not string.find(value,'[^0-9a-f]') end
 local function integer(value) local n=finite(value); return n and n>=1 and n<=9007199254740990 and n%1==0 and tostring(n)==value and n end
+local function python_float(value)
+  if not value or string.len(value)>32 then return false end
+  local whole,fraction=string.match(value,'^([0-9]+)%.([0-9]+)$')
+  local canonical_whole=whole and (whole=='0' or string.match(whole,'^[1-9][0-9]*$'))
+  return canonical_whole and (fraction=='0' or string.sub(fraction,-1)~='0')
+end
+local function lua_float(value)
+  local n=finite(value)
+  if not value or string.len(value)>32 or not n then return false end
+  if n%1==0 then return value=='0' or string.match(value,'^[1-9][0-9]*$') end
+  return python_float(value)
+end
+local function lua_number(value)
+  local n=finite(value)
+  if not value or string.len(value)>32 or not n then return false end
+  if n%1==0 then return string.match(value,'^[1-9][0-9]*$') end
+  if python_float(value) then return true end
+  local whole,fraction,exponent=string.match(value,'^([1-9])%.([0-9]+)e%+([0-9]+)$')
+  local canonical_exponent=exponent and (exponent=='0' or string.match(exponent,'^[1-9][0-9]*$'))
+  return whole and canonical_exponent and string.sub(fraction,-1)~='0'
+end
 if not digest(client) or not digest(request_digest) or not digest(retrieval_digest) or
    (supplied_ack~='' and not digest(supplied_ack)) or
    string.len(client_public_key)<1 or string.len(client_public_key)>max_identity or
@@ -1549,8 +1570,9 @@ if tv[1]~='completed' or tv[2]~='response_completed' or
    (tv[3]~='response_ready' and tv[3]~='acknowledged' and tv[3]~='retrieval_expired') or
    string.len(tv[4] or '')<1 or string.len(tv[4] or '')>max_node_id or
    not digest(tv[5]) or not digest(tv[6]) or not generation or not digest(tv[8]) or
-   not accepted or accepted<0 or accepted>now or not replay or replay<accepted or
-   not terminal_expiry or terminal_expiry<replay or not terminal_score or terminal_score~=terminal_expiry or
+   not accepted or not python_float(tv[9]) or accepted<0 or accepted>now or
+   not replay or not lua_float(tv[10]) or replay<accepted or
+   not terminal_expiry or not lua_float(tv[11]) or terminal_expiry<replay or not terminal_score or terminal_score~=terminal_expiry or
    not digest(tv[13]) or not digest(tv[14]) or tv[15]~=client or tv[16]~=request_digest then return {'schema'} end
 local lv=redis.call('HMGET',request,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest','envelope')
 for i=1,#lv do if not lv[i] then return {'schema'} end end
@@ -1558,7 +1580,7 @@ local deadline=finite(lv[8]); local sequence=integer(lv[9]); local lifecycle_gen
 if lv[1]~='response_ready' or lv[2]~=client or lv[3]~=request_digest or
    lv[4]~=client_public_key or lv[5]~=request_id or lv[6]~=tv[4] or
    string.len(lv[6])<1 or string.len(lv[6])>max_node_id or not digest(lv[7]) or
-   not deadline or deadline<accepted or not sequence or lifecycle_generation~=generation or lv[10]~=tv[7] or
+   not deadline or not lua_number(lv[8]) or deadline<accepted or not sequence or lifecycle_generation~=generation or lv[10]~=tv[7] or
    lv[11]~=lv[9]..'-0' or lv[12]~=tv[12] or lv[13]~=tv[14] or
    string.len(lv[14])<1 or string.len(lv[14])>max_request_envelope then return {'schema'} end
 local response_exists=redis.call('EXISTS',response)
@@ -1589,7 +1611,8 @@ if response_exists~=1 or not response_score or response_score~=replay or rv[1]~=
    rv[2]~=request_digest or rv[3]~=client_public_key or rv[4]~=request_id or rv[5]~=tv[4] or
    string.len(rv[5])<1 or string.len(rv[5])>max_node_id or rv[6]~=tv[6] or
    response_generation~=generation or rv[7]~=tv[7] or string.len(rv[8])<1 or string.len(rv[8])>max_response_envelope or
-   response_accepted~=accepted or rv[9]~=tv[9] or rv[10]~=tv[8] or response_replay~=replay or rv[11]~=tv[10] or rv[12]~='response_ready' then return {'schema'} end
+   response_accepted~=accepted or not python_float(rv[9]) or rv[9]~=tv[9] or rv[10]~=tv[8] or
+   response_replay~=replay or not lua_float(rv[11]) or rv[11]~=tv[10] or rv[12]~='response_ready' then return {'schema'} end
 if terminal_expiry<=now then
   redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
   redis.call('DEL',terminal); redis.call('ZREM',terminal_expiries,member); redis.call('DEL',request)
@@ -1610,7 +1633,7 @@ return {'acknowledged',tv[9],tv[8],tv[13]}
 RETRIEVE_RESPONSE_SCRIPT = ReviewedScript(
     "retrieve_or_ack_response_v1",
     RETRIEVE_RESPONSE_SOURCE,
-    "87b5ee352f5e7888710adaf64a6bd45a72ac79350a4daf61f2f87edda03fcb95",  # pragma: allowlist secret
+    "da3a32d9cb0ea33d1671e13a98ea67e50b90c845018428e03226650318ae66f0",  # pragma: allowlist secret
     True,
 )
 

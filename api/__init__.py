@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Any
 
-from flask import Response, jsonify, request
+from flask import Response, g, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
@@ -653,6 +653,20 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
     return response
 
 
+def _public_quota_rejection_reason(exc: RateLimitExceeded) -> str:
+    """Classify a default-limit rejection without exporting limiter details."""
+
+    try:
+        expiry = int(exc.limit.limit.get_expiry())
+    except (AttributeError, TypeError, ValueError):
+        return "other_limit"
+    if expiry == 60 * 60:
+        return "hourly_limit"
+    if expiry == 24 * 60 * 60:
+        return "daily_limit"
+    return "other_limit"
+
+
 def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metrics_path="/metrics"):
     """Initialize the API with the Flask app.
 
@@ -663,6 +677,14 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
 
     _install_public_api_v1_cors(app)
 
+    @app.before_request
+    def _classify_public_quota_request():
+        # Store only a boolean derived from the application-owned exemption
+        # policy. Relay telemetry never receives the limiter key or identity.
+        g.tokenplace_public_quota_exempt = _is_public_api_rate_limit_exempt_path(
+            request.path
+        )
+
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {
         "default_limits": [
@@ -670,7 +692,7 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
             os.environ.get("API_DAILY_QUOTA", "1000/day"),
         ],
         "default_limits_exempt_when": (
-            lambda: _is_public_api_rate_limit_exempt_path(request.path)
+            lambda: bool(getattr(g, "tokenplace_public_quota_exempt", False))
         ),
     }
     if limiter_storage_uri:
@@ -684,6 +706,9 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
 
     @app.errorhandler(RateLimitExceeded)
     def _handle_rate_limit(exc: RateLimitExceeded):
+        g.tokenplace_public_quota_rejection_reason = _public_quota_rejection_reason(
+            exc
+        )
         return _build_rate_limit_response(exc)
 
     _install_control_plane_rate_limiter(app, limiter_storage_uri)

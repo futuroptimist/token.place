@@ -469,6 +469,14 @@ OUTCOME_ENUM = (
     "failed",
 )
 EVICTION_REASON_ENUM = ("stale_lease", "unregistered", "capacity_loss")
+PUBLIC_QUOTA_ROUTE_CLASS_ENUM = (
+    "root", "public_metadata", "public_version", "public_api_v1",
+    "public_api_compat", "operational", "other_known", "unknown_route",
+)
+PUBLIC_QUOTA_OUTCOME_ENUM = ("accepted", "exempt", "rejected")
+PUBLIC_QUOTA_REJECTION_REASON_ENUM = (
+    "none", "hourly_limit", "daily_limit", "other_limit",
+)
 HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
 BUILD_METADATA = get_release_metadata(None)
 
@@ -519,6 +527,15 @@ HTTP_REQUEST_DURATION_SECONDS = _collector(
         "Bounded relay HTTP request duration in seconds.",
         ["method", "route", "status_class", "provider_mode", "outcome"],
         buckets=HTTP_DURATION_BUCKETS,
+        registry=RELAY_METRICS_REGISTRY,
+    ),
+)
+PUBLIC_HTTP_QUOTA_OUTCOMES_TOTAL = _collector(
+    "tokenplace_public_http_quota_outcomes_total",
+    lambda: Counter(
+        "tokenplace_public_http_quota_outcomes_total",
+        "Public HTTP quota decisions by fixed application-owned classes.",
+        ["route_class", "method", "outcome", "rejection_reason"],
         registry=RELAY_METRICS_REGISTRY,
     ),
 )
@@ -591,6 +608,17 @@ def _initialise_metric_labels() -> None:
         return
     for outcome in OUTCOME_ENUM:
         RELAY_REQUEST_OUTCOMES_TOTAL.labels(outcome)
+    for route_class in PUBLIC_QUOTA_ROUTE_CLASS_ENUM:
+        for method in (*CANONICAL_HTTP_METHOD_ENUM, "other"):
+            for outcome in PUBLIC_QUOTA_OUTCOME_ENUM:
+                reasons = (
+                    PUBLIC_QUOTA_REJECTION_REASON_ENUM[1:]
+                    if outcome == "rejected" else ("none",)
+                )
+                for reason in reasons:
+                    PUBLIC_HTTP_QUOTA_OUTCOMES_TOTAL.labels(
+                        route_class, method, outcome, reason
+                    )
     for reason in EVICTION_REASON_ENUM:
         COMPUTE_NODE_EVICTIONS_TOTAL.labels(reason)
     for state in ("active", "cancelled", "expired", "acknowledged", "completed_unavailable"):
@@ -623,6 +651,40 @@ CANONICAL_HTTP_METHOD_ENUM = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"
 def _normalise_http_method(method: str | None) -> str:
     method = method.upper() if isinstance(method, str) else ""
     return method if method in CANONICAL_HTTP_METHOD_ENUM else "other"
+
+
+def _public_quota_route_class() -> str:
+    """Classify the matched application route without using raw request data."""
+
+    endpoint = request.endpoint
+    if endpoint is None:
+        return "unknown_route"
+    if endpoint == "index":
+        return "root"
+    if endpoint == "api_v1_meta":
+        return "public_metadata"
+    if endpoint == "api_v1_version":
+        return "public_version"
+    if endpoint in {"healthz", "livez", "metrics", "relay_diagnostics"}:
+        return "operational"
+    if endpoint.startswith("v1.") or endpoint.startswith("openai_v1."):
+        return "public_api_v1"
+    if endpoint.startswith("v2.") or endpoint.startswith("openai_v2."):
+        return "public_api_compat"
+    return "other_known"
+
+
+def _public_quota_labels(response: Response) -> tuple[str, str]:
+    """Return closed quota outcome/reason labels for the completed request."""
+
+    if bool(getattr(g, "tokenplace_public_quota_exempt", False)):
+        return "exempt", "none"
+    reason = getattr(g, "tokenplace_public_quota_rejection_reason", None)
+    if response.status_code == 429 and reason is not None:
+        if reason not in PUBLIC_QUOTA_REJECTION_REASON_ENUM or reason == "none":
+            reason = "other_limit"
+        return "rejected", reason
+    return "accepted", "none"
 
 
 def _normalise_status_class(status_code: int | str) -> str:
@@ -1779,10 +1841,15 @@ def _log_request(response: Response):
     status_class = _normalise_status_class(response.status_code)
     outcome = _outcome_for_response(response)
     provider_mode = "relay"
+    quota_outcome, quota_rejection_reason = _public_quota_labels(response)
 
     try:
         REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
         HTTP_REQUESTS_TOTAL.labels(_normalise_http_method(request.method), route, status_class, provider_mode, outcome).inc()
+        PUBLIC_HTTP_QUOTA_OUTCOMES_TOTAL.labels(
+            _public_quota_route_class(), _normalise_http_method(request.method),
+            quota_outcome, quota_rejection_reason,
+        ).inc()
     except Exception:  # pragma: no cover - defensive metric increment
         LOGGER.debug(
             "metrics.increment_failed",

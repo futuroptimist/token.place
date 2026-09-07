@@ -70,6 +70,33 @@ def test_bounded_template_metrics_pass_after_collector_warmup(monkeypatch):
     assert all(v["passed"] for v in gate.execute_metrics_checks("http://loopback").values())
 
 
+def test_lazy_bounded_unmatched_collectors_are_not_per_path_growth(monkeypatch):
+    scrapes = 0
+
+    def fake_request(_base, path, method="GET"):
+        nonlocal scrapes
+        if path != "/metrics":
+            return 404, ""
+        scrapes += 1
+        if scrapes <= 2:
+            return 200, VALID
+        count = 24 if scrapes == 3 else 48
+        lazy = f'''tokenplace_http_requests_total{{method="GET",endpoint="unknown",route="other",status_class="4xx"}} {count}
+tokenplace_http_request_duration_seconds_count{{method="GET",endpoint="unknown",route="other",status_class="4xx"}} {count}
+tokenplace_http_request_duration_seconds_sum{{method="GET",endpoint="unknown",route="other",status_class="4xx"}} {count / 1000}
+'''
+        return 200, VALID + lazy
+
+    monkeypatch.setattr(gate, "request", fake_request)
+    results = gate.execute_metrics_checks("http://loopback")
+    assert all(result["passed"] for result in results.values())
+    assert results["metrics.bounded_unmatched_paths"] == {
+        "passed": True,
+        "first_batch_growth": 3,
+        "second_batch_growth": 0,
+    }
+
+
 @pytest.mark.parametrize("exposition", [VALID, BACKPORT_VALID])
 def test_current_and_backport_bounded_endpoint_metrics_pass(monkeypatch, exposition):
     monkeypatch.setattr(gate, "request", lambda _base, path, method="GET":

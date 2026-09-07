@@ -148,7 +148,10 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
     results["metrics.no_flask_defaults"] = {"passed": not any(n.startswith("flask_http_") for n in names)}
     all_paths = first + second
     unsafe = False
-    added_by_probes = (middle - before) | (after - middle)
+    # Bounded collectors may create their fixed ``unknown``/``other`` series
+    # lazily during the first unmatched batch. Only continued identity growth
+    # in the successive batch demonstrates transformed per-path labels.
+    continued_growth = after - middle
     for sample in after:
         for key, value in sample.labels:
             # Flask endpoint names and normalized route templates are bounded; the
@@ -157,7 +160,7 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
                 "release-safety-unmatched-" in value
                 or bool(re.search(r"/(?:[0-9a-f]{16,}|\d{6,})(?:/|$)", value, re.IGNORECASE))
             )
-            transformed_per_path = sample in added_by_probes and key in {"path", "route", "endpoint", "url"}
+            transformed_per_path = sample in continued_growth and key in {"path", "route", "endpoint", "url"}
             if raw_path or transformed_per_path or value in all_paths or "release-safety-unmatched-" in value:
                 unsafe = True
     results["metrics.no_raw_paths"] = {"passed": not unsafe}

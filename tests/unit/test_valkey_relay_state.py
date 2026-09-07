@@ -249,7 +249,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "da3a32d9cb0ea33d1671e13a98ea67e50b90c845018428e03226650318ae66f0"  # pragma: allowlist secret
+    expected_digest = "b0257c0bab7d472aecb27a98ce4660c0b4119506d2b02b9a2b3f4e01b9d82193"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -272,6 +272,8 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     assert "rv[9]~=tv[9]" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "rv[11]~=tv[10]" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "return {'acknowledged',tv[9],tv[8],tv[13]}" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "local canonical=string.format('%.6f',n)" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "string.format('%.17g',n)==value" in RETRIEVE_RESPONSE_SCRIPT.source
 
 
 @pytest.mark.parametrize(

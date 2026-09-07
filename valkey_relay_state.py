@@ -1533,25 +1533,19 @@ local function finite(value) local n=tonumber(value); return n and n==n and math
 local function digest(value) return value and string.len(value)==64 and not string.find(value,'[^0-9a-f]') end
 local function integer(value) local n=finite(value); return n and n>=1 and n<=9007199254740990 and n%1==0 and tostring(n)==value and n end
 local function python_float(value)
-  if not value or string.len(value)>32 then return false end
-  local whole,fraction=string.match(value,'^([0-9]+)%.([0-9]+)$')
-  local canonical_whole=whole and (whole=='0' or string.match(whole,'^[1-9][0-9]*$'))
-  return canonical_whole and (fraction=='0' or string.sub(fraction,-1)~='0')
+  local n=finite(value)
+  if not value or string.len(value)>32 or not n then return false end
+  local canonical=string.format('%.6f',n)
+  canonical=string.gsub(canonical,'0+$',''); canonical=string.gsub(canonical,'%.$','')
+  if not string.find(canonical,'.',1,true) then canonical=canonical..'.0' end
+  return canonical==value
 end
 local function lua_float(value)
   local n=finite(value)
-  if not value or string.len(value)>32 or not n then return false end
-  if n%1==0 then return value=='0' or string.match(value,'^[1-9][0-9]*$') end
-  return python_float(value)
+  return value and string.len(value)<=32 and n and string.format('%.17g',n)==value
 end
 local function lua_number(value)
-  local n=finite(value)
-  if not value or string.len(value)>32 or not n then return false end
-  if n%1==0 then return string.match(value,'^[1-9][0-9]*$') end
-  if python_float(value) then return true end
-  local whole,fraction,exponent=string.match(value,'^([1-9])%.([0-9]+)e%+([0-9]+)$')
-  local canonical_exponent=exponent and (exponent=='0' or string.match(exponent,'^[1-9][0-9]*$'))
-  return whole and canonical_exponent and string.sub(fraction,-1)~='0'
+  return python_float(value)
 end
 if not digest(client) or not digest(request_digest) or not digest(retrieval_digest) or
    (supplied_ack~='' and not digest(supplied_ack)) or
@@ -1633,7 +1627,7 @@ return {'acknowledged',tv[9],tv[8],tv[13]}
 RETRIEVE_RESPONSE_SCRIPT = ReviewedScript(
     "retrieve_or_ack_response_v1",
     RETRIEVE_RESPONSE_SOURCE,
-    "da3a32d9cb0ea33d1671e13a98ea67e50b90c845018428e03226650318ae66f0",  # pragma: allowlist secret
+    "b0257c0bab7d472aecb27a98ce4660c0b4119506d2b02b9a2b3f4e01b9d82193",  # pragma: allowlist secret
     True,
 )
 
@@ -2267,7 +2261,7 @@ class ValkeyRegistrationStore:
             or not math.isfinite(float(deadline))
         ):
             raise RelayStateStoreError("request deadline must be finite")
-        return normalized_model, normalized_tier, float(deadline)
+        return normalized_model, normalized_tier, float(f"{float(deadline):.6f}")
 
     def _cancellation_digest(self, token: object, *, optional: bool = False) -> str:
         if optional and token is None:
@@ -2724,7 +2718,7 @@ class ValkeyRegistrationStore:
             )
         response_digest = hashlib.sha256(encoded).hexdigest()
         seconds, micros = self._foundation.server_time()
-        accepted = seconds + micros / 1_000_000
+        accepted = float(f"{seconds}.{micros:06d}")
         message = (
             b"token.place/relay-response-ack/v1\0"
             + bytes.fromhex(client)

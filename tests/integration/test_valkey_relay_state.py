@@ -3606,7 +3606,7 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
         assert initial == replay
         assert initial.state == "response_ready"
         assert initial.envelope == response
-        assert initial.request_deadline_epoch == deadline
+        assert initial.request_deadline_epoch == float(f"{deadline:.6f}")
         assert initial.replay_expires_at_epoch == accepted.replay_expires_at_epoch
         assert initial.acknowledgement_token is not None
         assert first.retrieve_encrypted_response(
@@ -3661,12 +3661,13 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
             "request", client_digest, request_digest
         )
         expired_at = time.time() - 1
+        expired_accepted = float(f"{expired_at - 2:.6f}")
         first._foundation._client.hset(
             terminal_key,
             mapping={
-                "accepted_at_epoch": repr(expired_at - 2),
-                "replay_expires_at_epoch": repr(expired_at - 1),
-                "expires_at_epoch": repr(expired_at),
+                "accepted_at_epoch": repr(expired_accepted),
+                "replay_expires_at_epoch": format(expired_at - 1, ".17g"),
+                "expires_at_epoch": format(expired_at, ".17g"),
             },
         )
         first._foundation._client.zadd(
@@ -3801,9 +3802,8 @@ def test_coherent_due_response_retrieval_reaps_only_addressed_authority(valkey_s
         datastore.hset(keys[4], "token_digest", retrieval_digest)
         datastore.hset(keys[9], "retrieval_credential_digest", retrieval_digest)
         now = sum(value / divisor for value, divisor in zip(store._foundation.server_time(), (1, 1_000_000)))
-        accepted_raw, replay_raw, expiry_raw = (
-            format(now - offset, ".17g") for offset in (3, 2, 1)
-        )
+        accepted_raw = repr(float(f"{now - 3:.6f}"))
+        replay_raw, expiry_raw = (format(now - offset, ".17g") for offset in (2, 1))
         datastore.hset(keys[7], mapping={"accepted_at_epoch": accepted_raw, "replay_expires_at_epoch": replay_raw})
         datastore.hset(keys[9], mapping={"accepted_at_epoch": accepted_raw, "replay_expires_at_epoch": replay_raw, "expires_at_epoch": expiry_raw})
         datastore.zadd(keys[8], {member: float(replay_raw), unrelated_member: now + 98})
@@ -3823,21 +3823,36 @@ def test_coherent_due_response_retrieval_reaps_only_addressed_authority(valkey_s
         store.close()
 
 
+def _overprecise_equivalent_float(raw: str) -> str:
+    """Return a distinct decimal spelling with the same binary64 value."""
+    mantissa, separator, exponent = raw.partition("e")
+    if "." not in mantissa:
+        mantissa += ".0"
+    for width in range(1, 17):
+        for digit in "123456789":
+            candidate = f"{mantissa}{'0' * (width - 1)}{digit}"
+            if separator:
+                candidate = f"{candidate}{separator}{exponent}"
+            if candidate != raw and float(candidate) == float(raw):
+                return candidate
+    raise AssertionError("could not construct overprecise equivalent timestamp")
+
+
 @pytest.mark.parametrize(
-    ("field", "representation"),
+    "field",
     (
-        ("accepted_at_epoch", "leading_zero"),
-        ("replay_expires_at_epoch", "whitespace"),
-        ("expires_at_epoch", "alternate"),
-        ("deadline", "overlong"),
+        "accepted_at_epoch",
+        "replay_expires_at_epoch",
+        "expires_at_epoch",
+        "deadline",
     ),
 )
 def test_response_retrieval_rejects_coordinated_noncanonical_timestamp_authority(
-    valkey_server, field, representation
+    valkey_server, field
 ):
     store = _registration_store(valkey_server, uuid.uuid4().hex)
     fixture = _accepted_retrieval_fixture(
-        (store,), f"canonical-authority-{field}-{representation}"
+        (store,), f"canonical-authority-{field}"
     )
     node, identity, credential, _, _, keys, member = fixture
     datastore = store._foundation._client
@@ -3845,18 +3860,7 @@ def test_response_retrieval_rejects_coordinated_noncanonical_timestamp_authority
     try:
         source_key = keys[4] if field == "deadline" else keys[9]
         raw = datastore.hget(source_key, field).decode()
-        if representation == "leading_zero":
-            corrupted = f"0{raw}"
-        elif representation == "whitespace":
-            corrupted = f" {raw}"
-        elif representation == "alternate":
-            corrupted = f"{float(raw):.16e}"
-        else:
-            if "e" in raw:
-                mantissa, exponent = raw.split("e", 1)
-                corrupted = f"{mantissa}{'0' * 40}e{exponent}"
-            else:
-                corrupted = f"{raw}{'0' * 40}"
+        corrupted = _overprecise_equivalent_float(raw)
 
         if field in {"accepted_at_epoch", "replay_expires_at_epoch"}:
             datastore.hset(keys[7], field, corrupted)
@@ -3897,6 +3901,7 @@ def test_response_acknowledgement_revalidates_canonical_authority_after_read(
     original_evalsha = datastore.evalsha
     dispatches = 0
     corrupted_snapshot = None
+    canonical_replay = datastore.hget(keys[9], "replay_expires_at_epoch")
     unrelated_member = f"{'7' * 64}:{'6' * 64}"
     datastore.zadd(keys[8], {unrelated_member: time.time() + 100})
     datastore.zadd(keys[10], {unrelated_member: time.time() + 200})
@@ -3907,7 +3912,7 @@ def test_response_acknowledgement_revalidates_canonical_authority_after_read(
                 dispatches += 1
                 if dispatches == 2:
                     raw = datastore.hget(keys[9], "replay_expires_at_epoch").decode()
-                    corrupted = f" {raw}"
+                    corrupted = _overprecise_equivalent_float(raw)
                     datastore.hset(keys[7], "replay_expires_at_epoch", corrupted)
                     datastore.hset(keys[9], "replay_expires_at_epoch", corrupted)
                     corrupted_snapshot = _exact_key_snapshot(store, keys)
@@ -3930,12 +3935,12 @@ def test_response_acknowledgement_revalidates_canonical_authority_after_read(
         datastore.hset(
             keys[7],
             "replay_expires_at_epoch",
-            datastore.hget(keys[9], "replay_expires_at_epoch").strip(),
+            canonical_replay,
         )
         datastore.hset(
             keys[9],
             "replay_expires_at_epoch",
-            datastore.hget(keys[9], "replay_expires_at_epoch").strip(),
+            canonical_replay,
         )
         assert store.retrieve_encrypted_response(*identity, credential).envelope == envelope
     finally:
@@ -5978,7 +5983,7 @@ def test_claim_lease_is_bounded_by_request_deadline(valkey_server):
 
         result = store.claim_queued_request(node_id, owner, "deadline-consumer")
         assert result.state == "claimed"
-        assert result.request_deadline_epoch == deadline
+        assert result.request_deadline_epoch == float(f"{deadline:.6f}")
         assert result.lease_expires_at_epoch <= deadline
         assert store._foundation._client.xlen(cfg.key("queue", node)) == 1
         assert store._foundation._client.hget(
@@ -6025,7 +6030,7 @@ def test_renew_claim_preserves_exact_deadline_representation(valkey_server):
         stored_deadline = store._foundation._client.hget(request_key, "deadline")
         decoded_deadline = float(stored_deadline)
         assert math.isfinite(decoded_deadline)
-        assert decoded_deadline == deadline
+        assert decoded_deadline == float(f"{deadline:.6f}")
 
         claimed = store.claim_queued_request(node_id, owner, consumer)
         assert claimed.state == "claimed"
@@ -6043,14 +6048,14 @@ def test_renew_claim_preserves_exact_deadline_representation(valkey_server):
             node_id, owner, consumer, *identity, claimed.generation
         )
         assert renewed.state == "continued"
-        assert renewed.lease_expires_at_epoch == deadline
-        assert renewed.lease_expires_at_epoch <= deadline
+        assert renewed.lease_expires_at_epoch == decoded_deadline
+        assert renewed.lease_expires_at_epoch <= decoded_deadline
         assert store._foundation._client.hget(
             claim_key, "lease_expires"
         ) == stored_deadline
         assert store._foundation._client.zscore(
             cfg.key("claims:expiry"), member
-        ) == deadline
+        ) == decoded_deadline
 
         claim_after = store._foundation._client.hgetall(claim_key)
         assert {k: v for k, v in claim_after.items() if k != b"lease_expires"} == {

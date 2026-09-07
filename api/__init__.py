@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Any
 
-from flask import Response, jsonify, request
+from flask import Response, g, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
@@ -278,6 +278,22 @@ def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
         and normalized_path in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS
         and _relay_server_token_is_valid()
     )
+
+
+def _public_rate_limit_exempt_when() -> bool:
+    """Record the bounded exemption decision for relay-owned telemetry."""
+
+    exempt = _is_public_api_rate_limit_exempt_path(request.path)
+    if exempt:
+        g.tokenplace_public_quota_outcome = "exempt"
+    return exempt
+
+
+def _rate_limit_rejection_reason(exc: RateLimitExceeded) -> str:
+    """Map Flask-Limiter windows to a closed, privacy-safe vocabulary."""
+
+    granularity = getattr(getattr(exc.limit.limit, "GRANULARITY", None), "name", "")
+    return {"hour": "hourly", "day": "daily"}.get(granularity, "other")
 
 
 def _resolve_rate_limit_storage_uri() -> str | None:
@@ -669,9 +685,7 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
             os.environ.get("API_RATE_LIMIT", "60/hour"),
             os.environ.get("API_DAILY_QUOTA", "1000/day"),
         ],
-        "default_limits_exempt_when": (
-            lambda: _is_public_api_rate_limit_exempt_path(request.path)
-        ),
+        "default_limits_exempt_when": _public_rate_limit_exempt_when,
     }
     if limiter_storage_uri:
         limiter_kwargs["storage_uri"] = limiter_storage_uri
@@ -684,6 +698,8 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
 
     @app.errorhandler(RateLimitExceeded)
     def _handle_rate_limit(exc: RateLimitExceeded):
+        g.tokenplace_public_quota_outcome = "rejected"
+        g.tokenplace_public_quota_rejection_reason = _rate_limit_rejection_reason(exc)
         return _build_rate_limit_response(exc)
 
     _install_control_plane_rate_limiter(app, limiter_storage_uri)

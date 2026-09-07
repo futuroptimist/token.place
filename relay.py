@@ -469,6 +469,21 @@ OUTCOME_ENUM = (
     "failed",
 )
 EVICTION_REASON_ENUM = ("stale_lease", "unregistered", "capacity_loss")
+PUBLIC_QUOTA_ROUTE_CLASS_ENUM = (
+    "root",
+    "public_metadata",
+    "public_version",
+    "api_v1_inference",
+    "api_v1_other",
+    "api_v2",
+    "relay_control",
+    "health",
+    "metrics",
+    "static",
+    "unknown",
+)
+PUBLIC_QUOTA_OUTCOME_ENUM = ("accepted", "exempt", "rejected")
+PUBLIC_QUOTA_REJECTION_REASON_ENUM = ("none", "hourly", "daily", "other")
 HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
 BUILD_METADATA = get_release_metadata(None)
 
@@ -519,6 +534,15 @@ HTTP_REQUEST_DURATION_SECONDS = _collector(
         "Bounded relay HTTP request duration in seconds.",
         ["method", "route", "status_class", "provider_mode", "outcome"],
         buckets=HTTP_DURATION_BUCKETS,
+        registry=RELAY_METRICS_REGISTRY,
+    ),
+)
+PUBLIC_RATE_LIMIT_REQUESTS_TOTAL = _collector(
+    "tokenplace_public_rate_limit_requests_total",
+    lambda: Counter(
+        "tokenplace_public_rate_limit_requests_total",
+        "Public HTTP quota decisions by fixed application-owned classes.",
+        ["route_class", "method", "outcome", "rejection_reason"],
         registry=RELAY_METRICS_REGISTRY,
     ),
 )
@@ -623,6 +647,49 @@ CANONICAL_HTTP_METHOD_ENUM = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"
 def _normalise_http_method(method: str | None) -> str:
     method = method.upper() if isinstance(method, str) else ""
     return method if method in CANONICAL_HTTP_METHOD_ENUM else "other"
+
+
+def _public_quota_route_class() -> str:
+    """Classify requests from trusted Flask routing state, never raw labels."""
+
+    endpoint = request.endpoint or ""
+    exact_endpoints = {
+        "index": "root",
+        "api_v1_meta": "public_metadata",
+        "api_v1_version": "public_version",
+        "healthz": "health",
+        "livez": "health",
+        "metrics": "metrics",
+        "serve_static": "static",
+    }
+    if endpoint in exact_endpoints:
+        return exact_endpoints[endpoint]
+    if endpoint == "api_v1_relay_requests":
+        return "api_v1_inference"
+    if endpoint.startswith("api_v1_relay_servers_") or endpoint in {
+        "api_v1_relay_progress",
+        "api_v1_relay_responses",
+    }:
+        return "relay_control"
+    if endpoint.startswith("v1.") or endpoint.startswith("openai_v1."):
+        return "api_v1_other"
+    if endpoint.startswith("v2.") or endpoint.startswith("openai_v2."):
+        return "api_v2"
+    return "unknown"
+
+
+def _public_quota_decision(response: Response) -> tuple[str, str]:
+    """Return only reviewed quota outcome and rejection-reason values."""
+
+    if response.status_code == 429:
+        reason = getattr(g, "tokenplace_public_quota_rejection_reason", "other")
+        if reason not in PUBLIC_QUOTA_REJECTION_REASON_ENUM or reason == "none":
+            reason = "other"
+        return "rejected", reason
+    outcome = getattr(g, "tokenplace_public_quota_outcome", "accepted")
+    if outcome != "exempt":
+        outcome = "accepted"
+    return outcome, "none"
 
 
 def _normalise_status_class(status_code: int | str) -> str:
@@ -1779,10 +1846,17 @@ def _log_request(response: Response):
     status_class = _normalise_status_class(response.status_code)
     outcome = _outcome_for_response(response)
     provider_mode = "relay"
+    quota_outcome, quota_rejection_reason = _public_quota_decision(response)
 
     try:
-        REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
+        REQUEST_COUNTER.labels(_normalise_http_method(request.method), endpoint, status_code).inc()
         HTTP_REQUESTS_TOTAL.labels(_normalise_http_method(request.method), route, status_class, provider_mode, outcome).inc()
+        PUBLIC_RATE_LIMIT_REQUESTS_TOTAL.labels(
+            _public_quota_route_class(),
+            _normalise_http_method(request.method),
+            quota_outcome,
+            quota_rejection_reason,
+        ).inc()
     except Exception:  # pragma: no cover - defensive metric increment
         LOGGER.debug(
             "metrics.increment_failed",

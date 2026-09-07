@@ -249,7 +249,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "0a903dd87505b22475818ab6fd520cf90a7036955dc4965115555bcc4a51cb65"  # pragma: allowlist secret
+    expected_digest = "87b5ee352f5e7888710adaf64a6bd45a72ac79350a4daf61f2f87edda03fcb95"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -266,6 +266,11 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     assert "string.len(lv[14])>max_request_envelope" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "string.len(rv[8])>max_response_envelope" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "if terminal_expiry<=now then" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert RETRIEVE_RESPONSE_SCRIPT.source.index("local response_exists=") < (
+        RETRIEVE_RESPONSE_SCRIPT.source.index("if terminal_expiry<=now then")
+    )
+    assert "rv[9]~=tv[9]" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "rv[11]~=tv[10]" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "return {'acknowledged',tv[9],tv[8],tv[13]}" in RETRIEVE_RESPONSE_SCRIPT.source
 
 

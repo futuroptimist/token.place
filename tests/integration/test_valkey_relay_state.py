@@ -3213,6 +3213,146 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
 
 
 @pytest.mark.parametrize(
+    ("retrieval_state", "corruption"),
+    (
+        ("response_ready", "partial_response"),
+        ("response_ready", "numeric_text_mismatch"),
+        ("acknowledged", "unexpected_response"),
+        ("retrieval_expired", "unexpected_expiry_member"),
+    ),
+)
+def test_due_response_retrieval_validates_all_authority_before_cleanup(
+    valkey_server, retrieval_state, corruption
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "due-retrieval-node", _digest("due-owner"), "consumer"
+    identity = ("due-client", f"due-{retrieval_state}-{corruption}")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+    keys, member = _response_acceptance_authority(store, node, identity)
+    datastore = store._foundation._client
+    unrelated_member = f"{'f' * 64}:{'e' * 64}"
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        accepted = store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        credential = "a" * 64
+        retrieval_digest = hashlib.sha256(credential.encode()).hexdigest()
+        datastore.hset(keys[4], "token_digest", retrieval_digest)
+        datastore.hset(keys[9], "retrieval_credential_digest", retrieval_digest)
+        ready = store.retrieve_encrypted_response(*identity, credential)
+
+        if retrieval_state == "acknowledged":
+            store.retrieve_encrypted_response(
+                *identity, credential, ready.acknowledgement_token
+            )
+        elif retrieval_state == "retrieval_expired":
+            datastore.hset(keys[9], "retrieval_state", "retrieval_expired")
+            datastore.delete(keys[7])
+            datastore.zrem(keys[8], member)
+
+        now = sum(value / divisor for value, divisor in zip(store._foundation.server_time(), (1, 1_000_000)))
+        accepted_raw = format(now - 3, ".17g")
+        replay_raw = format(now - 2, ".17g")
+        expiry_raw = format(now - 1, ".17g")
+        datastore.hset(
+            keys[9],
+            mapping={
+                "accepted_at_epoch": accepted_raw,
+                "replay_expires_at_epoch": replay_raw,
+                "expires_at_epoch": expiry_raw,
+            },
+        )
+        datastore.zadd(keys[10], {member: float(expiry_raw), unrelated_member: now + 99})
+        if retrieval_state == "response_ready":
+            datastore.hset(
+                keys[7],
+                mapping={
+                    "accepted_at_epoch": accepted_raw,
+                    "replay_expires_at_epoch": replay_raw,
+                },
+            )
+            datastore.zadd(keys[8], {member: float(replay_raw), unrelated_member: now + 98})
+        else:
+            datastore.zadd(keys[8], {unrelated_member: now + 98})
+
+        if corruption == "partial_response":
+            datastore.hdel(keys[7], "response_digest")
+        elif corruption == "numeric_text_mismatch":
+            datastore.hset(keys[7], "accepted_at_epoch", f"{float(accepted_raw):.16e}")
+        elif corruption == "unexpected_response":
+            datastore.hset(keys[7], mapping={"unexpected": "present"})
+        elif corruption == "unexpected_expiry_member":
+            datastore.zadd(keys[8], {member: float(replay_raw)})
+
+        before = _exact_key_snapshot(store, keys)
+        with pytest.raises(ValkeySchemaIncompatibleError, match="state schema incompatible"):
+            store.retrieve_encrypted_response(*identity, credential)
+        assert _exact_key_snapshot(store, keys) == before
+        assert datastore.zscore(keys[8], unrelated_member) == pytest.approx(now + 98)
+        assert datastore.zscore(keys[10], unrelated_member) == pytest.approx(now + 99)
+        assert accepted.replay_expires_at_epoch > accepted.accepted_at_epoch
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        datastore.zrem(keys[8], unrelated_member)
+        datastore.zrem(keys[10], unrelated_member)
+        store.close()
+
+
+def test_coherent_due_response_retrieval_reaps_only_addressed_authority(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, consumer = "due-cleanup-node", _digest("due-cleanup-owner"), "consumer"
+    identity = ("due-cleanup-client", "due-cleanup-request")
+    keys, member = _response_acceptance_authority(store, node, identity)
+    datastore = store._foundation._client
+    unrelated_member = f"{'d' * 64}:{'c' * 64}"
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        store.accept_encrypted_response(
+            node,
+            owner,
+            consumer,
+            *identity,
+            claim.generation,
+            EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+            ),
+        )
+        credential = "b" * 64
+        retrieval_digest = hashlib.sha256(credential.encode()).hexdigest()
+        datastore.hset(keys[4], "token_digest", retrieval_digest)
+        datastore.hset(keys[9], "retrieval_credential_digest", retrieval_digest)
+        now = sum(value / divisor for value, divisor in zip(store._foundation.server_time(), (1, 1_000_000)))
+        accepted_raw, replay_raw, expiry_raw = (
+            format(now - offset, ".17g") for offset in (3, 2, 1)
+        )
+        datastore.hset(keys[7], mapping={"accepted_at_epoch": accepted_raw, "replay_expires_at_epoch": replay_raw})
+        datastore.hset(keys[9], mapping={"accepted_at_epoch": accepted_raw, "replay_expires_at_epoch": replay_raw, "expires_at_epoch": expiry_raw})
+        datastore.zadd(keys[8], {member: float(replay_raw), unrelated_member: now + 98})
+        datastore.zadd(keys[10], {member: float(expiry_raw), unrelated_member: now + 99})
+
+        result = store.retrieve_encrypted_response(*identity, credential)
+        assert result.state == "invalid_retrieval_credential"
+        assert datastore.exists(keys[4], keys[7], keys[9]) == 0
+        assert datastore.zscore(keys[8], member) is None
+        assert datastore.zscore(keys[10], member) is None
+        assert datastore.zscore(keys[8], unrelated_member) == pytest.approx(now + 98)
+        assert datastore.zscore(keys[10], unrelated_member) == pytest.approx(now + 99)
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        datastore.zrem(keys[8], unrelated_member)
+        datastore.zrem(keys[10], unrelated_member)
+        store.close()
+
+
+@pytest.mark.parametrize(
     ("manifest", "expected_dispatches"),
     (
         (_manifest(reader_min=2, reader_max=2), ()),

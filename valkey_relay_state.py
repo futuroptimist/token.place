@@ -1558,23 +1558,28 @@ local deadline=finite(lv[8]); local sequence=integer(lv[9]); local lifecycle_gen
 if lv[1]~='response_ready' or lv[2]~=client or lv[3]~=request_digest or
    lv[4]~=client_public_key or lv[5]~=request_id or lv[6]~=tv[4] or
    string.len(lv[6])<1 or string.len(lv[6])>max_node_id or not digest(lv[7]) or
-   not deadline or deadline<accepted or not sequence or lifecycle_generation~=generation or
+   not deadline or deadline<accepted or not sequence or lifecycle_generation~=generation or lv[10]~=tv[7] or
    lv[11]~=lv[9]..'-0' or lv[12]~=tv[12] or lv[13]~=tv[14] or
    string.len(lv[14])<1 or string.len(lv[14])>max_request_envelope then return {'schema'} end
-if terminal_expiry<=now then
-  redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
-  redis.call('DEL',terminal); redis.call('ZREM',terminal_expiries,member); redis.call('DEL',request)
-  return {'invalid_credential'}
-end
 local response_exists=redis.call('EXISTS',response)
 local response_score=finite(redis.call('ZSCORE',response_expiries,member))
 if tv[3]=='acknowledged' then
   if response_exists~=0 or response_score then return {'schema'} end
+  if terminal_expiry<=now then
+    redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
+    redis.call('DEL',terminal); redis.call('ZREM',terminal_expiries,member); redis.call('DEL',request)
+    return {'invalid_credential'}
+  end
   if supplied_ack~='' and supplied_ack~=tv[13] then return {'invalid_ack'} end
   return {'acknowledged',tv[9],tv[8],tv[13]}
 end
 if tv[3]=='retrieval_expired' then
   if response_exists~=0 or response_score then return {'schema'} end
+  if terminal_expiry<=now then
+    redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
+    redis.call('DEL',terminal); redis.call('ZREM',terminal_expiries,member); redis.call('DEL',request)
+    return {'invalid_credential'}
+  end
   return {'retrieval_expired'}
 end
 local rv=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')
@@ -1583,8 +1588,13 @@ local response_accepted,response_replay=finite(rv[9]),finite(rv[11]); local resp
 if response_exists~=1 or not response_score or response_score~=replay or rv[1]~=client or
    rv[2]~=request_digest or rv[3]~=client_public_key or rv[4]~=request_id or rv[5]~=tv[4] or
    string.len(rv[5])<1 or string.len(rv[5])>max_node_id or rv[6]~=tv[6] or
-   response_generation~=generation or string.len(rv[8])<1 or string.len(rv[8])>max_response_envelope or
-   response_accepted~=accepted or rv[10]~=tv[8] or response_replay~=replay or rv[12]~='response_ready' then return {'schema'} end
+   response_generation~=generation or rv[7]~=tv[7] or string.len(rv[8])<1 or string.len(rv[8])>max_response_envelope or
+   response_accepted~=accepted or rv[9]~=tv[9] or rv[10]~=tv[8] or response_replay~=replay or rv[11]~=tv[10] or rv[12]~='response_ready' then return {'schema'} end
+if terminal_expiry<=now then
+  redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
+  redis.call('DEL',terminal); redis.call('ZREM',terminal_expiries,member); redis.call('DEL',request)
+  return {'invalid_credential'}
+end
 if replay<=now then
   redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
   redis.call('HSET',terminal,'retrieval_state','retrieval_expired')
@@ -1600,7 +1610,7 @@ return {'acknowledged',tv[9],tv[8],tv[13]}
 RETRIEVE_RESPONSE_SCRIPT = ReviewedScript(
     "retrieve_or_ack_response_v1",
     RETRIEVE_RESPONSE_SOURCE,
-    "0a903dd87505b22475818ab6fd520cf90a7036955dc4965115555bcc4a51cb65",  # pragma: allowlist secret
+    "87b5ee352f5e7888710adaf64a6bd45a72ac79350a4daf61f2f87edda03fcb95",  # pragma: allowlist secret
     True,
 )
 

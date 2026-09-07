@@ -10,13 +10,14 @@ import sys
 import time
 from typing import Any
 
-from flask import Response, jsonify, request
+from flask import Response, g, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
 from limits.storage import storage_from_string
 from limits.strategies import FixedWindowRateLimiter
 from limits.util import parse
+from prometheus_client import Counter
 from prometheus_flask_exporter import PrometheusMetrics
 
 from api.v1 import routes as v1_routes
@@ -25,6 +26,18 @@ from config import get_config
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
 LOGGER = logging.getLogger("tokenplace.api")
+
+PUBLIC_QUOTA_ROUTE_CLASSES = (
+    "root", "public_metadata", "public_version", "api_v1", "api_v2",
+    "operational", "static", "control_plane", "other_known", "unmatched",
+)
+PUBLIC_QUOTA_METHODS = (
+    "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "other",
+)
+PUBLIC_QUOTA_OUTCOMES = ("accepted", "exempt", "rejected")
+PUBLIC_QUOTA_REASONS = (
+    "none", "hourly_limit", "daily_limit", "other_limit", "other_rejection",
+)
 
 CONTROL_PLANE_ROUTE_CLASS = "compute_node_control_plane"
 CONTROL_PLANE_DEFAULT_LIMIT_ENV = "API_RELAY_CONTROL_PLANE_RATE_LIMIT"
@@ -624,6 +637,7 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
                 "retry_after": retry_after,
             },
         )
+        g.tokenplace_public_quota_reason = "other_limit"
         return _build_control_plane_rate_limit_response(limit_item, retry_after)
 
 
@@ -653,6 +667,90 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
     return response
 
 
+def _public_quota_method(method: str | None) -> str:
+    normalized = method.upper() if isinstance(method, str) else ""
+    return normalized if normalized in PUBLIC_QUOTA_METHODS[:-1] else "other"
+
+
+def _public_quota_route_class() -> str:
+    """Classify the matched Flask rule without exporting request path data."""
+
+    if request.url_rule is None:
+        return "unmatched"
+    endpoint = request.endpoint or ""
+    exact_endpoints = {
+        "index": "root",
+        "api_v1_meta": "public_metadata",
+        "api_v1_version": "public_version",
+        "healthz": "operational",
+        "livez": "operational",
+        "metrics": "operational",
+        "relay_diagnostics": "operational",
+        "serve_static": "static",
+    }
+    if endpoint in exact_endpoints:
+        return exact_endpoints[endpoint]
+    rule = request.url_rule.rule
+    if _normalized_path(rule) in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS:
+        return "control_plane"
+    if endpoint.startswith(("v1.", "openai_v1.")) or rule.startswith(("/api/v1/", "/v1/")):
+        return "api_v1"
+    if endpoint.startswith(("v2.", "openai_v2.")) or rule.startswith(("/api/v2/", "/v2/")):
+        return "api_v2"
+    return "other_known"
+
+
+def _public_quota_limit_reason(exc: RateLimitExceeded) -> str:
+    """Map Flask-Limiter metadata to a reviewed reason without exporting it."""
+
+    granularity = getattr(getattr(exc.limit.limit, "GRANULARITY", None), "name", "")
+    normalized = str(granularity).lower()
+    if normalized == "day":
+        return "daily_limit"
+    if normalized == "hour":
+        return "hourly_limit"
+    return "other_limit"
+
+
+def _install_public_quota_metrics(app, registry) -> None:
+    """Install the bounded public HTTP quota-outcome counter when configured."""
+
+    if registry is None:
+        return
+    counter = Counter(
+        "tokenplace_public_http_quota_outcomes_total",
+        "Public HTTP quota decisions using only fixed application-owned classes.",
+        ("route_class", "method", "outcome", "reason"),
+        registry=registry,
+    )
+    app.extensions["tokenplace_public_quota_counter"] = counter
+
+    @app.after_request
+    def _record_public_quota_outcome(response):
+        # The relay owns this endpoint and serializes the registry before
+        # after-request callbacks run.  Do not let observing quota telemetry
+        # change the counter exposed by the following scrape.
+        if request.endpoint == "metrics":
+            return response
+        reason = getattr(g, "tokenplace_public_quota_reason", None)
+        if response.status_code == 429:
+            outcome = "rejected"
+            rejection_reasons = {
+                "hourly_limit", "daily_limit", "other_limit", "other_rejection",
+            }
+            reason = reason if reason in rejection_reasons else "other_rejection"
+        elif _is_public_api_rate_limit_exempt_path(request.path):
+            outcome = "exempt"
+            reason = "none"
+        else:
+            outcome = "accepted"
+            reason = "none"
+        counter.labels(
+            _public_quota_route_class(), _public_quota_method(request.method), outcome, reason,
+        ).inc()
+        return response
+
+
 def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metrics_path="/metrics"):
     """Initialize the API with the Flask app.
 
@@ -662,6 +760,7 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     """
 
     _install_public_api_v1_cors(app)
+    _install_public_quota_metrics(app, metrics_registry)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {
@@ -684,6 +783,7 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
 
     @app.errorhandler(RateLimitExceeded)
     def _handle_rate_limit(exc: RateLimitExceeded):
+        g.tokenplace_public_quota_reason = _public_quota_limit_reason(exc)
         return _build_rate_limit_response(exc)
 
     _install_control_plane_rate_limiter(app, limiter_storage_uri)

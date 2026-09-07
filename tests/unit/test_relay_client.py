@@ -6339,7 +6339,7 @@ def test_api_v1_heartbeat_stops_when_response_posting_raises():
     assert client._api_v1_heartbeat_thread is None
 
 
-def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
+def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling(monkeypatch):
     manager = _ApiV1RuntimeManager()
     client = _api_v1_validation_client(manager)
     client.stop_polling = False
@@ -6357,6 +6357,30 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
     }
     client._post_api_v1_response = MagicMock(return_value=_PostApiV1Outcome(submitted=True))
 
+    control_polled = {
+        request_id: threading.Event()
+        for request_id in ("req-heartbeat-1", "req-heartbeat-2")
+    }
+    generated_request_ids = iter(control_polled)
+
+    def generate_after_control_poll(*_args, **_kwargs):
+        request_id = next(generated_request_ids)
+        assert control_polled[request_id].wait(timeout=1.0)
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    manager.runtime.create_chat_completion.side_effect = generate_after_control_poll
+    control_request_ids = []
+
+    def poll_nonterminal_control(**kwargs):
+        request_id = kwargs["request_id"]
+        control_request_ids.append(request_id)
+        control_polled[request_id].set()
+        return {"status": "active", "next_poll_seconds": 10}
+
+    client._post_api_v1_request_control = poll_nonterminal_control
+    real_http_attempts = MagicMock(side_effect=AssertionError("unexpected real HTTP request"))
+    monkeypatch.setattr(relay_client_module.requests, "post", real_http_attempts)
+
     first_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
 
     assert first_result.submitted is True
@@ -6370,6 +6394,13 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
     assert client.stop_polling is False
     assert client._polling_stopped_by_request is False
     assert client._post_api_v1_response.call_count == 2
+    assert set(control_request_ids) == set(control_polled)
+    assert all(event.is_set() for event in control_polled.values())
+    assert not any(
+        thread.name.startswith(("api_v1_inference", "api_v1_control"))
+        for thread in threading.enumerate()
+    )
+    assert real_http_attempts.call_count == 0
 
 
 def test_api_v1_heartbeat_logs_sanitized_relay_targets():

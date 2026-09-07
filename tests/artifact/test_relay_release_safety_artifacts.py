@@ -116,8 +116,17 @@ def test_reenabled_flask_defaults_fails_only_metrics_incident(tmp_path: Path) ->
     report = _build_and_qualify(tmp_path, RECOVERY, "flask-defaults")
     _assert_executed(report)
     assert report["returncode"] != 0
-    assert report["results"]["metrics.no_flask_defaults"]["passed"] is False
-    assert all(report["results"][key]["passed"] for key in (METRICS_IDS - {"metrics.no_flask_defaults"}) | QUOTA_IDS)
+    assert report["passed"] is False
+    # Flask defaults expose raw paths and keep adding path-specific series, so
+    # this single mutation intentionally violates all three related contracts.
+    for key in (
+        "metrics.no_flask_defaults",
+        "metrics.no_raw_paths",
+        "metrics.bounded_unmatched_paths",
+    ):
+        assert report["results"][key]["passed"] is False
+    assert report["results"]["metrics.valid_instrumentation"]["passed"] is True
+    assert all(report["results"][key]["passed"] for key in QUOTA_IDS)
 
 
 def test_removed_public_exemptions_fails_only_quota_incident(tmp_path: Path) -> None:

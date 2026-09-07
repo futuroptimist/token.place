@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Any
 
-from flask import Response, jsonify, request
+from flask import Response, g, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
@@ -653,6 +653,21 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
     return response
 
 
+def _public_quota_rejection_reason(exc: RateLimitExceeded) -> str:
+    """Classify a limiter exception without exporting its text or bucket key."""
+
+    limit = getattr(getattr(exc, "limit", None), "limit", None)
+    try:
+        expiry = int(limit.get_expiry())
+    except (AttributeError, TypeError, ValueError):
+        return "other_limit"
+    if expiry == 60 * 60:
+        return "hourly_limit"
+    if expiry == 24 * 60 * 60:
+        return "daily_limit"
+    return "other_limit"
+
+
 def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metrics_path="/metrics"):
     """Initialize the API with the Flask app.
 
@@ -684,6 +699,10 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
 
     @app.errorhandler(RateLimitExceeded)
     def _handle_rate_limit(exc: RateLimitExceeded):
+        # Fixed values consumed by relay.py after-request telemetry. Never
+        # propagate a limiter description, key, or caller identity.
+        g.tokenplace_public_quota_outcome = "rejected"
+        g.tokenplace_public_quota_rejection_reason = _public_quota_rejection_reason(exc)
         return _build_rate_limit_response(exc)
 
     _install_control_plane_rate_limiter(app, limiter_storage_uri)

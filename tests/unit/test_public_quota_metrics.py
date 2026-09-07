@@ -7,8 +7,9 @@ import subprocess
 import sys
 from unittest.mock import patch
 
-from flask import Flask, Response
-from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
+import pytest
+from flask import Flask, Response, g
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Counter, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
 from api import (
@@ -49,6 +50,14 @@ def _samples(registry: CollectorRegistry) -> list[dict[str, str]]:
         for sample in family.samples
         if sample.name == "tokenplace_public_http_quota_outcomes_total"
     ]
+
+
+def _family_exposition(registry: CollectorRegistry, family_name: str) -> str:
+    return "\n".join(
+        line
+        for line in generate_latest(registry).decode().splitlines()
+        if family_name in line
+    )
 
 
 @patch.dict(
@@ -169,6 +178,77 @@ def test_metrics_scrapes_do_not_mutate_public_quota_counter() -> None:
     assert all(label["route_class"] != "operational" for label in _samples(registry))
 
 
+@pytest.mark.parametrize(
+    ("path", "route_class"),
+    (
+        ("/", "root"),
+        ("/api/v1/meta", "public_metadata"),
+        ("/api/v1/version", "public_version"),
+    ),
+)
+@patch.dict(
+    "os.environ", {"API_RATE_LIMIT": "1/hour", "API_DAILY_QUOTA": "100/day"}, clear=True
+)
+def test_real_limiter_rejections_keep_public_route_classes(
+    path: str, route_class: str,
+) -> None:
+    with patch("api._is_public_api_rate_limit_exempt_path", return_value=False):
+        app, registry = _app()
+        with app.test_client() as client:
+            assert client.get(path).status_code == 200
+            assert client.get(path).status_code == 429
+
+    assert any(
+        label == {
+            "route_class": route_class,
+            "method": "GET",
+            "outcome": "rejected",
+            "reason": "hourly_limit",
+        }
+        for label in _samples(registry)
+    )
+
+
+@pytest.mark.parametrize("unsafe_reason", ("none", "not-a-reviewed-reason"))
+def test_rejected_events_collapse_invalid_reasons(unsafe_reason: str) -> None:
+    app, registry = _app()
+
+    @app.get("/rejected", endpoint="application_rejection")
+    def rejected():
+        g.tokenplace_public_quota_reason = unsafe_reason
+        return {"error": "bounded"}, 429
+
+    with app.test_client() as client:
+        assert client.get("/rejected").status_code == 429
+
+    assert any(
+        label["outcome"] == "rejected" and label["reason"] == "other_rejection"
+        for label in _samples(registry)
+    )
+
+
+@patch.dict(
+    "os.environ", {"API_RATE_LIMIT": "1/hour", "API_DAILY_QUOTA": "100/day"}, clear=True
+)
+def test_public_http_traffic_does_not_change_inference_outcomes() -> None:
+    app, registry = _app()
+    Counter(
+        "tokenplace_relay_request_outcomes_total",
+        "Terminal relay request outcomes by fixed enum.",
+        ("outcome",),
+        registry=registry,
+    ).labels("completed").inc()
+    before = _family_exposition(registry, "tokenplace_relay_request_outcomes")
+
+    with app.test_client() as client:
+        assert client.get("/api/v1/models").status_code == 200  # accepted
+        assert client.get("/").status_code == 200  # exempt
+        assert client.get("/unknown-public-route").status_code == 404  # unmatched
+        assert client.get("/api/v1/models").status_code == 429  # non-inference rejection
+
+    assert _family_exposition(registry, "tokenplace_relay_request_outcomes") == before
+
+
 @patch.dict(
     "os.environ",
     {"API_RATE_LIMIT": "10000/hour", "API_DAILY_QUOTA": "10000/day"},
@@ -248,13 +328,28 @@ def test_label_vocabularies_and_cardinality_bound_are_closed() -> None:
         "other_limit",
         "other_rejection",
     )
-    assert (
+    logical_label_sets = (
         len(PUBLIC_QUOTA_ROUTE_CLASSES)
         * len(PUBLIC_QUOTA_METHODS)
         * len(PUBLIC_QUOTA_OUTCOMES)
         * len(PUBLIC_QUOTA_REASONS)
-        == 1200
     )
+    assert logical_label_sets == 1200
+
+    app, registry = _app()
+    with app.test_client() as client:
+        assert client.get("/api/v1/models").status_code == 200
+    public_quota_samples = [
+        sample
+        for family in registry.collect()
+        for sample in family.samples
+        if sample.name.startswith("tokenplace_public_http_quota_outcomes_")
+    ]
+    assert {sample.name.rsplit("_", 1)[-1] for sample in public_quota_samples} == {
+        "total",
+        "created",
+    }
+    assert len(public_quota_samples) <= logical_label_sets * 2 == 2400
 
 
 def test_counter_serializes_in_canonical_single_worker_multiprocess_environment(

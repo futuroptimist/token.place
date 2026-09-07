@@ -735,7 +735,10 @@ def _install_public_quota_metrics(app, registry) -> None:
         reason = getattr(g, "tokenplace_public_quota_reason", None)
         if response.status_code == 429:
             outcome = "rejected"
-            reason = reason if reason in PUBLIC_QUOTA_REASONS else "other_rejection"
+            rejection_reasons = {
+                "hourly_limit", "daily_limit", "other_limit", "other_rejection",
+            }
+            reason = reason if reason in rejection_reasons else "other_rejection"
         elif _is_public_api_rate_limit_exempt_path(request.path):
             outcome = "exempt"
             reason = "none"

@@ -25,8 +25,9 @@ identified as a limiter breach becomes `other_rejection`. `reason="none"` is use
 exempt decisions.
 
 The Cartesian upper bound is 10 route classes × 8 methods × 3 outcomes × 5 reasons = **1,200
-counter label sets per target**. When the Prometheus client emits its companion `_created` gauge,
-the conservative exposition bound is 2,400 samples; invalid combinations are not pre-created and
+logical label combinations per target**. Each logical counter combination can produce both a
+`_total` sample and a companion `_created` sample, so the conservative Prometheus exposition bound
+is **2,400 series**; invalid combinations are not pre-created and
 therefore the observed count is substantially smaller. Unique paths, client/source addresses, forwarded headers, limiter
 keys, request IDs, tokens, credentials, and exception text cannot add label values. None of those
 values, nor raw Prompts or encrypted model payloads, may appear in metric names, help text, or
@@ -46,7 +47,8 @@ Prometheus registry and served by the relay-owned `/metrics` endpoint; the defau
 prometheus-flask-exporter request families remain disabled. Counter values accumulate across
 threads in that worker and reset whenever the worker/container restarts. Prometheus queries must
 use `sum`, `rate`, or `increase` and tolerate counter resets. Each authenticated scrape is a
-point-in-time serialization; scraping does not mutate quota counters or this metric.
+point-in-time serialization. The relay-owned endpoint whose trusted Flask endpoint name is
+`metrics` is excluded from this counter, so repeated scrapes do not mutate it.
 
 `PROMETHEUS_MULTIPROC_DIR` may be present in the canonical image for the Prometheus client, but the
 supported runtime remains exactly one worker. Do not sum both the dedicated registry and a second

@@ -3230,6 +3230,171 @@ def test_response_concurrent_acknowledgements_have_coherent_terminal(
             store.close()
 
 
+def test_response_concurrent_conflicting_acknowledgement_has_one_valid_winner(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    stores = tuple(_registration_store(valkey_server, namespace) for _ in range(2))
+    target = _accepted_retrieval_fixture(stores, "conflicting-ack-target")
+    unrelated = _accepted_retrieval_fixture(stores, "conflicting-ack-unrelated")
+    target_ready = stores[0].retrieve_encrypted_response(*target[1], target[2])
+    unrelated_ready = stores[1].retrieve_encrypted_response(
+        *unrelated[1], unrelated[2]
+    )
+    datastore = stores[0]._foundation._client
+    unrelated_before = (
+        datastore.hgetall(unrelated[5][7]),
+        datastore.hgetall(unrelated[5][9]),
+        datastore.zscore(unrelated[5][8], unrelated[6]),
+    )
+    response_expiry_before = datastore.zrange(target[5][8], 0, -1, withscores=True)
+    barrier = Barrier(2, timeout=2)
+    originals = [store._foundation._client.evalsha for store in stores]
+    try:
+        for index, store in enumerate(stores):
+            original = originals[index]
+
+            def synchronized(*args, original=original):
+                if (
+                    args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1
+                    and b"read" in args
+                ):
+                    barrier.wait()
+                return original(*args)
+
+            store._foundation._client.evalsha = synchronized
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            valid = pool.submit(
+                stores[0].retrieve_encrypted_response,
+                *target[1],
+                target[2],
+                target_ready.acknowledgement_token,
+            )
+            conflicting = pool.submit(
+                stores[1].retrieve_encrypted_response,
+                *target[1],
+                target[2],
+                unrelated_ready.acknowledgement_token,
+            )
+            assert valid.result(timeout=3).state == "acknowledged"
+            assert conflicting.result(timeout=3).state == "invalid_acknowledgement"
+
+        assert datastore.exists(target[5][7]) == 0
+        assert datastore.zscore(target[5][8], target[6]) is None
+        assert datastore.zrange(target[5][8], 0, -1, withscores=True) == [
+            entry for entry in response_expiry_before if entry[0] != target[6].encode()
+        ]
+        terminal = datastore.hgetall(target[5][9])
+        assert terminal[b"outcome"] == b"completed"
+        assert terminal[b"retrieval_state"] == b"acknowledged"
+        assert (
+            datastore.hgetall(unrelated[5][7]),
+            datastore.hgetall(unrelated[5][9]),
+            datastore.zscore(unrelated[5][8], unrelated[6]),
+        ) == unrelated_before
+        stores[1]._foundation._client.evalsha = originals[1]
+        assert stores[1].retrieve_encrypted_response(
+            *unrelated[1], unrelated[2]
+        ).envelope == unrelated[3]
+    finally:
+        for store, original in zip(stores, originals):
+            store._foundation._client.evalsha = original
+        _delete_claim_fixture_state(
+            stores[0],
+            (target[0], unrelated[0]),
+            (target[1], unrelated[1]),
+        )
+        for store in stores:
+            store.close()
+
+
+def test_response_acknowledgement_versus_expiry_has_coherent_expiry_winner(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    stores = tuple(_registration_store(valkey_server, namespace) for _ in range(2))
+    target = _accepted_retrieval_fixture(stores, "ack-expiry-target")
+    unrelated = _accepted_retrieval_fixture(stores, "ack-expiry-unrelated")
+    target_ready = stores[0].retrieve_encrypted_response(*target[1], target[2])
+    datastore = stores[0]._foundation._client
+    seconds, micros = stores[0]._foundation.server_time()
+    boundary_raw = format(seconds + micros / 1_000_000, ".17g")
+    datastore.hset(target[5][7], "replay_expires_at_epoch", boundary_raw)
+    datastore.hset(target[5][9], "replay_expires_at_epoch", boundary_raw)
+    datastore.zadd(target[5][8], {target[6]: float(boundary_raw)})
+    completed_authority = {
+        field: datastore.hget(target[5][9], field)
+        for field in (
+            "outcome",
+            "generation",
+            "accepted_at_epoch",
+            "response_digest",
+            "replay_expires_at_epoch",
+        )
+    }
+    unrelated_before = (
+        datastore.hgetall(unrelated[5][7]),
+        datastore.hgetall(unrelated[5][9]),
+        datastore.zscore(unrelated[5][8], unrelated[6]),
+    )
+    response_expiry_before = datastore.zrange(target[5][8], 0, -1, withscores=True)
+    barrier = Barrier(2, timeout=2)
+    originals = [store._foundation._client.evalsha for store in stores]
+    try:
+        for index, store in enumerate(stores):
+            original = originals[index]
+
+            def synchronized(*args, original=original):
+                if (
+                    args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1
+                    and b"read" in args
+                ):
+                    barrier.wait()
+                return original(*args)
+
+            store._foundation._client.evalsha = synchronized
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            read = pool.submit(
+                stores[0].retrieve_encrypted_response, *target[1], target[2]
+            )
+            acknowledge = pool.submit(
+                stores[1].retrieve_encrypted_response,
+                *target[1],
+                target[2],
+                target_ready.acknowledgement_token,
+            )
+            assert [
+                read.result(timeout=3).state,
+                acknowledge.result(timeout=3).state,
+            ] == ["retrieval_expired", "retrieval_expired"]
+
+        assert datastore.exists(target[5][7]) == 0
+        assert datastore.zscore(target[5][8], target[6]) is None
+        assert datastore.zrange(target[5][8], 0, -1, withscores=True) == [
+            entry for entry in response_expiry_before if entry[0] != target[6].encode()
+        ]
+        terminal = datastore.hgetall(target[5][9])
+        assert terminal[b"retrieval_state"] == b"retrieval_expired"
+        assert {
+            field: terminal[field.encode()] for field in completed_authority
+        } == completed_authority
+        assert (
+            datastore.hgetall(unrelated[5][7]),
+            datastore.hgetall(unrelated[5][9]),
+            datastore.zscore(unrelated[5][8], unrelated[6]),
+        ) == unrelated_before
+    finally:
+        for store, original in zip(stores, originals):
+            store._foundation._client.evalsha = original
+        _delete_claim_fixture_state(
+            stores[0],
+            (target[0], unrelated[0]),
+            (target[1], unrelated[1]),
+        )
+        for store in stores:
+            store.close()
+
+
 def test_response_retrieval_cross_identity_credentials_and_tokens_are_fixed_and_non_mutating(
     valkey_server,
 ):

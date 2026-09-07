@@ -117,6 +117,7 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | API_RELAY_CONTROL_PLANE_PROGRESS_RATE_LIMIT | 7200/hour | Per-server-public-key budget for authenticated encrypted progress sideband submissions |
 | API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT | 10000/hour | Aggregate per-IP abuse budget shared by compute-node control-plane routes |
 | TOKENPLACE_RATE_LIMIT_STORAGE_URI | (in-memory) | Optional shared Flask-Limiter/limits backend URI (for example Redis or Memcached) used by public and control-plane budgets |
+| TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES | (empty) | Comma-separated canonical immediate-proxy networks allowed to supply the single `CF-Connecting-IP` rate-limit identity; invalid or dangerously broad values fail startup. See [the trust-boundary contract](docs/ops/trusted-proxy-rate-limit-identity.md) |
 | API_STREAM_RATE_LIMIT | 30/minute   | Per-IP rate limit applied only to streaming chat completions          |
 | SERVICE_NAME    | token.place  | Service identifier returned by health endpoints (whitespace-only overrides
 |                 |              | fall back to `token.place`)                                             |

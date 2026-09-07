@@ -13,7 +13,6 @@ from typing import Any
 from flask import Response, g, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
-from flask_limiter.util import get_remote_address
 from limits.storage import storage_from_string
 from limits.strategies import FixedWindowRateLimiter
 from limits.util import parse
@@ -22,6 +21,7 @@ from prometheus_flask_exporter import PrometheusMetrics
 
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
+from api.client_identity import ClientIdentityPolicy
 from config import get_config
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
@@ -426,18 +426,22 @@ def _control_server_owner_identity(data: Any) -> tuple[str, str] | None:
             return "server_public_key", server_key
     return None
 
-def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]:
+def _control_plane_identity_for_request(
+    path: str, data: Any, client_identity: str | None = None
+) -> tuple[str, str]:
+    if client_identity is None:
+        client_identity = request.remote_addr or "unknown-peer"
     if path == "/api/v1/relay/responses":
         identity = _response_envelope_identity_for_rate_limit(data)
         if identity is not None:
             return identity
-        return "client_ip", get_remote_address()
+        return "client_ip", client_identity
 
     if path in {"/api/v1/relay/servers/control", "/api/v1/relay/servers/unregister", "/api/v1/relay/progress"}:
         identity = _control_server_owner_identity(data)
         if identity is not None:
             return identity
-        return "client_ip", get_remote_address()
+        return "client_ip", client_identity
 
     if isinstance(data, dict) and path in {
         "/api/v1/relay/servers/register",
@@ -447,7 +451,7 @@ def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]
         server_public_key = data.get("server_public_key")
         if isinstance(server_public_key, str) and server_public_key.strip():
             return "server_public_key", server_public_key.strip()
-    return "client_ip", get_remote_address()
+    return "client_ip", client_identity
 
 
 def _control_plane_bucket_identifier(
@@ -564,7 +568,9 @@ def _build_control_plane_rate_limit_response(limit_item: Any, retry_after: int):
     return response
 
 
-def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
+def _install_control_plane_rate_limiter(
+    app, storage_uri: str | None, client_identity
+) -> None:
     route_limits = _control_plane_limits_from_env()
     control_plane_storage_uri = storage_uri or "memory://"
     control_plane_storage = storage_from_string(control_plane_storage_uri)
@@ -593,7 +599,7 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
                 return jsonify({"error": {"message": "Progress envelope too large", "code": 413}}), 413
             request._cached_data = raw_body
 
-        remote_address = get_remote_address()
+        remote_address = client_identity()
         checks: list[tuple[str, str, Any]] = [
             ("client_ip", remote_address, route_limit["ip"])
         ]
@@ -603,7 +609,9 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         # anonymous requests stay keyed to client IP so callers cannot spoof a
         # victim server/client bucket before relay.py validates the request.
         data = request.get_json(silent=True)
-        identity_kind, identity_value = _control_plane_identity_for_request(route, data)
+        identity_kind, identity_value = _control_plane_identity_for_request(
+            route, data, remote_address
+        )
         allow_identity_bucket = _relay_server_token_boundary_has_configured_token()
         if (
             route in {"/api/v1/relay/servers/control", "/api/v1/relay/progress"}
@@ -759,9 +767,16 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     contract. Defaults preserve the historical API behavior for other callers.
     """
 
+    logging.getLogger("flask-limiter").setLevel(logging.WARNING)
     _install_public_api_v1_cors(app)
     _install_public_quota_metrics(app, metrics_registry)
 
+    client_identity_policy = ClientIdentityPolicy.from_environment()
+
+    def client_identity() -> str:
+        return client_identity_policy.key_for_request(request)
+
+    app.extensions["tokenplace_client_identity_policy"] = client_identity_policy
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {
         "default_limits": [
@@ -776,7 +791,7 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
         limiter_kwargs["storage_uri"] = limiter_storage_uri
 
     limiter = Limiter(
-        get_remote_address,
+        client_identity,
         app=app,
         **limiter_kwargs,
     )
@@ -786,7 +801,7 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
         g.tokenplace_public_quota_reason = _public_quota_limit_reason(exc)
         return _build_rate_limit_response(exc)
 
-    _install_control_plane_rate_limiter(app, limiter_storage_uri)
+    _install_control_plane_rate_limiter(app, limiter_storage_uri, client_identity)
 
     PrometheusMetrics(
         app,

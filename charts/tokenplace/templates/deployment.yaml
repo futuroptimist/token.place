@@ -84,6 +84,7 @@ spec:
                 "TOKENPLACE_DEPLOY_ENV" (dict "name" "TOKENPLACE_DEPLOY_ENV" "value" $deployEnv)
                 "TOKENPLACE_IMAGE_TAG" (dict "name" "TOKENPLACE_IMAGE_TAG" "value" $imageRef)
                 "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" (dict "name" "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH" "value" "0")
+                "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" (dict "name" "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" "value" .Values.rateLimit.trustedProxies)
                 "XDG_CONFIG_HOME" (dict "name" "XDG_CONFIG_HOME" "value" "/tmp/.config")
                 "XDG_DATA_HOME" (dict "name" "XDG_DATA_HOME" "value" "/tmp/.local/share")
                 "XDG_CACHE_HOME" (dict "name" "XDG_CACHE_HOME" "value" "/tmp/.cache")

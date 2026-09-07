@@ -57,6 +57,11 @@ service:
   type: ClusterIP
   port: 80
 
+# Empty by default: forwarding headers are ignored. Operators must supply only
+# verified immediate Traefik peer CIDRs; never place Cloudflare client ranges here.
+trustedProxy:
+  networks: ""
+
 metrics:
   enabled: false
   path: /metrics

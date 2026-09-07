@@ -4,6 +4,8 @@ import importlib.util
 import json
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,85 @@ BACKPORT_VALID = """tokenplace_http_requests_total{method="GET", endpoint="metri
 tokenplace_http_requests_total{method="GET",endpoint="unknown",route="/{unmatched}",status_class="4xx"} 3
 tokenplace_instrumentation_up 1
 """
+
+
+def _contract(requirements=None, schema_version=1):
+    return {
+        "schema_version": schema_version,
+        "requirements": requirements if requirements is not None else [
+            {"id": requirement, "description": f"Require {requirement}"}
+            for requirement in sorted(gate.EXPECTED_IDS)
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "contents,category",
+    [
+        (None, "contract_invalid"),
+        ("{malformed", "contract_invalid"),
+        (json.dumps(_contract(schema_version=2)), "contract_invalid"),
+        (json.dumps(_contract([{"id": "duplicate", "description": "first"},
+                               {"id": "duplicate", "description": "second"}])), "contract_invalid"),
+        (json.dumps(_contract([{"id": "metrics.valid_instrumentation", "description": "only one"}])),
+         "contract_mismatch"),
+    ],
+)
+def test_load_contract_rejects_invalid_or_incomplete_contracts(tmp_path, contents, category):
+    contract = tmp_path / "contract.json"
+    if contents is not None:
+        contract.write_text(contents, encoding="utf-8")
+    with pytest.raises(gate.GateFailure, match=category):
+        gate.load_contract(contract)
+
+
+def test_load_contract_accepts_complete_contract(tmp_path):
+    contract = tmp_path / "contract.json"
+    document = _contract()
+    contract.write_text(json.dumps(document), encoding="utf-8")
+    assert gate.load_contract(contract) == document["requirements"]
+
+
+def test_request_preserves_http_semantics_and_refuses_redirects():
+    hits = {"success": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/success")
+                self.end_headers()
+                return
+            if self.path == "/error":
+                self.send_response(503)
+                self.end_headers()
+                self.wfile.write(b"unavailable")
+                return
+            hits["success"] += 1
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ready")
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        assert gate.request(base_url, "/success") == (200, "ready")
+        assert gate.request(base_url, "/error") == (503, "unavailable")
+        hits["success"] = 0
+        assert gate.request(base_url, "/redirect") == (302, "")
+        assert hits["success"] == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    # The stopped loopback server provides a deterministic transport failure.
+    assert gate.request(base_url, "/success") == (0, "")
 
 
 def test_parser_accepts_scientific_notation_and_decodes_identity():

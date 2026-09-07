@@ -6339,7 +6339,7 @@ def test_api_v1_heartbeat_stops_when_response_posting_raises():
     assert client._api_v1_heartbeat_thread is None
 
 
-def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
+def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling(monkeypatch):
     manager = _ApiV1RuntimeManager()
     client = _api_v1_validation_client(manager)
     client.stop_polling = False
@@ -6356,6 +6356,36 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
         "iv": "encrypted_iv",
     }
     client._post_api_v1_response = MagicMock(return_value=_PostApiV1Outcome(submitted=True))
+    control_polled = threading.Condition()
+    control_request_ids = []
+    generation_count = 0
+
+    def wait_for_request_control(*args, **kwargs):
+        nonlocal generation_count
+        with control_polled:
+            generation_count += 1
+            assert control_polled.wait_for(
+                lambda: len(control_request_ids) >= generation_count,
+                timeout=1,
+            ), "request control was not polled before inference completed"
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    manager.runtime.create_chat_completion.side_effect = wait_for_request_control
+
+    def serve_active_request_control(*, request_id, **_kwargs):
+        with control_polled:
+            control_request_ids.append(request_id)
+            control_polled.notify_all()
+        return {"status": "active", "next_poll_seconds": 30}
+
+    client._post_api_v1_request_control = serve_active_request_control
+    attempted_network_calls = []
+
+    def reject_network_call(*args, **kwargs):
+        attempted_network_calls.append((args, kwargs))
+        raise AssertionError("unit test attempted real HTTP")
+
+    monkeypatch.setattr(relay_client_module.requests, "post", reject_network_call)
 
     first_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
 
@@ -6370,6 +6400,12 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
     assert client.stop_polling is False
     assert client._polling_stopped_by_request is False
     assert client._post_api_v1_response.call_count == 2
+    assert set(control_request_ids) == {"req-heartbeat-1", "req-heartbeat-2"}
+    assert not any(
+        thread.name.startswith(("api_v1_inference", "api_v1_control"))
+        for thread in threading.enumerate()
+    )
+    assert len(attempted_network_calls) == 0
 
 
 def test_api_v1_heartbeat_logs_sanitized_relay_targets():

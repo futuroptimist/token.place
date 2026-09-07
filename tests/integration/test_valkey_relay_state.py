@@ -1,10 +1,12 @@
 import concurrent.futures
 import dataclasses
 import hashlib
+import hmac
 import logging
 import math
 import shutil
 import socket
+import struct
 import subprocess
 import time
 import traceback
@@ -32,6 +34,7 @@ from valkey_relay_state import (
     ACCEPT_RESPONSE_SCRIPT,
     CLAIM_SCRIPT,
     RENEW_CLAIM_SCRIPT,
+    RETRIEVE_RESPONSE_SCRIPT,
     SCRIPT_DIGESTS,
     SERVER_TIME_SCRIPT,
     DirectPrimary,
@@ -3019,6 +3022,309 @@ def _exact_key_snapshot(store, keys):
         datastore.xrange(keys[2]),
     )
 
+
+def _accepted_retrieval_fixture(stores, label):
+    first = stores[0]
+    node = f"{label}-node"
+    owner = _digest(f"{label}-owner")
+    consumer = f"{label}-consumer"
+    identity = (f"{label}-client", f"{label}-request")
+    credential = _digest(f"{label}-credential")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee",
+        1,
+        f"{label}-ciphertext",
+        f"{label}-key",
+        f"{label}-iv",
+    )
+    first.register(node, _capabilities(), owner)
+    _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+    claim = first.claim_queued_request(node, owner, consumer)
+    accepted = first.accept_encrypted_response(
+        node, owner, consumer, *identity, claim.generation, envelope
+    )
+    keys, member = _response_acceptance_authority(first, node, identity)
+    retrieval_digest = hashlib.sha256(credential.encode()).hexdigest()
+    first._foundation._client.hset(keys[4], "token_digest", retrieval_digest)
+    first._foundation._client.hset(
+        keys[9], "retrieval_credential_digest", retrieval_digest
+    )
+    return node, identity, credential, envelope, accepted, keys, member
+
+
+def test_response_retrievals_are_concurrent_replayable_and_independently_derived(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    stores = tuple(_registration_store(valkey_server, namespace) for _ in range(2))
+    fixture = _accepted_retrieval_fixture(stores, "concurrent-retrieval")
+    node, identity, credential, envelope, accepted, keys, member = fixture
+    barrier = Barrier(2, timeout=2)
+    originals = [store._foundation._client.evalsha for store in stores]
+    try:
+        for index, store in enumerate(stores):
+            original = originals[index]
+
+            def synchronized(*args, original=original):
+                if args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1:
+                    barrier.wait()
+                return original(*args)
+
+            store._foundation._client.evalsha = synchronized
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(store.retrieve_encrypted_response, *identity, credential)
+                for store in stores
+            ]
+            results = [future.result(timeout=3) for future in futures]
+        assert results[0] == results[1]
+        result = results[0]
+        assert result.state == "response_ready"
+        assert result.envelope == envelope
+        assert result.replay_expires_at_epoch == accepted.replay_expires_at_epoch
+        client_digest, request_digest = stores[0]._identity(*identity)
+        response_digest = hashlib.sha256(
+            stores[0]._serialized_response_envelope(envelope)
+        ).hexdigest()
+        message = (
+            b"token.place/relay-response-ack/v1\0"
+            + bytes.fromhex(client_digest)
+            + bytes.fromhex(request_digest)
+            + struct.pack("!d", accepted.accepted_at_epoch)
+            + bytes.fromhex(response_digest)
+        )
+        expected = hmac.new(
+            _ACKNOWLEDGEMENT_KEY, message, hashlib.sha256
+        ).hexdigest()
+        assert result.acknowledgement_token == expected
+        assert stores[0]._foundation._client.exists(keys[7]) == 1
+        assert stores[0]._foundation._client.zscore(keys[8], member) is not None
+    finally:
+        for store, original in zip(stores, originals):
+            store._foundation._client.evalsha = original
+        _delete_claim_fixture_state(stores[0], (node,), (identity,))
+        for store in stores:
+            store.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "value"),
+    (
+        ("credential", None),
+        ("credential", "short"),
+        ("credential", "A" * 64),
+        ("credential", "a" * 65),
+        ("credential", "b" * 64),
+        ("ack", "short"),
+        ("ack", "A" * 64),
+        ("ack", "a" * 65),
+        ("ack", "b" * 64),
+    ),
+)
+def test_response_retrieval_rejects_noncanonical_authority_without_disclosure_or_mutation(
+    valkey_server, kind, value
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    fixture = _accepted_retrieval_fixture((store,), f"invalid-{kind}-{uuid.uuid4().hex}")
+    node, identity, credential, envelope, _, keys, _ = fixture
+    try:
+        before = _exact_key_snapshot(store, keys)
+        if kind == "credential":
+            result = store.retrieve_encrypted_response(*identity, value)
+            assert result.state == "invalid_retrieval_credential"
+        else:
+            result = store.retrieve_encrypted_response(*identity, credential, value)
+            assert result.state == "invalid_acknowledgement"
+        assert result.envelope is None
+        assert result.acknowledgement_token is None
+        assert _exact_key_snapshot(store, keys) == before
+        assert store.retrieve_encrypted_response(*identity, credential).envelope == envelope
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+def test_response_acknowledgement_committed_lost_reply_requires_explicit_retry(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    stores = tuple(_registration_store(valkey_server, namespace) for _ in range(2))
+    fixture = _accepted_retrieval_fixture(stores, "lost-ack")
+    node, identity, credential, _, _, keys, member = fixture
+    ready = stores[0].retrieve_encrypted_response(*identity, credential)
+    original = stores[0]._foundation._client.evalsha
+    ack_dispatches = 0
+    try:
+        def lose_after_commit(*args):
+            nonlocal ack_dispatches
+            result = original(*args)
+            if args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1 and b"ack" in args:
+                ack_dispatches += 1
+                raise redis.ConnectionError("sensitive lost acknowledgement reply")
+            return result
+
+        stores[0]._foundation._client.evalsha = lose_after_commit
+        with pytest.raises(ValkeyUnavailableError, match="^state backend unavailable$"):
+            stores[0].retrieve_encrypted_response(
+                *identity, credential, ready.acknowledgement_token
+            )
+        assert ack_dispatches == 1
+        assert stores[0]._foundation._client.exists(keys[7]) == 0
+        assert stores[0]._foundation._client.zscore(keys[8], member) is None
+        stores[0]._foundation._client.evalsha = original
+        assert stores[1].retrieve_encrypted_response(
+            *identity, credential, ready.acknowledgement_token
+        ).state == "acknowledged"
+    finally:
+        stores[0]._foundation._client.evalsha = original
+        _delete_claim_fixture_state(stores[0], (node,), (identity,))
+        for store in stores:
+            store.close()
+
+
+def test_response_concurrent_acknowledgements_have_coherent_terminal(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    stores = tuple(_registration_store(valkey_server, namespace) for _ in range(2))
+    fixture = _accepted_retrieval_fixture(stores, "ack-race")
+    node, identity, credential, _, _, keys, member = fixture
+    ready = stores[0].retrieve_encrypted_response(*identity, credential)
+    barrier = Barrier(2, timeout=2)
+    originals = [store._foundation._client.evalsha for store in stores]
+    try:
+        for index, store in enumerate(stores):
+            original = originals[index]
+
+            def synchronized(*args, original=original):
+                if args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1 and b"ack" in args:
+                    barrier.wait()
+                return original(*args)
+
+            store._foundation._client.evalsha = synchronized
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(
+                    store.retrieve_encrypted_response,
+                    *identity,
+                    credential,
+                    ready.acknowledgement_token,
+                )
+                for store in stores
+            ]
+            outcomes = [future.result(timeout=3).state for future in futures]
+        assert outcomes == ["acknowledged", "acknowledged"]
+        assert stores[0]._foundation._client.exists(keys[7]) == 0
+        assert stores[0]._foundation._client.zscore(keys[8], member) is None
+        terminal = stores[0]._foundation._client.hgetall(keys[9])
+        assert terminal[b"outcome"] == b"completed"
+        assert terminal[b"retrieval_state"] == b"acknowledged"
+        terminal_dump = stores[0]._foundation._client.dump(keys[9])
+        assert stores[0].retrieve_encrypted_response(*identity, credential).state == "acknowledged"
+        assert stores[0]._foundation._client.dump(keys[9]) == terminal_dump
+    finally:
+        for store, original in zip(stores, originals):
+            store._foundation._client.evalsha = original
+        _delete_claim_fixture_state(stores[0], (node,), (identity,))
+        for store in stores:
+            store.close()
+
+
+def test_response_retrieval_cross_identity_credentials_and_tokens_are_fixed_and_non_mutating(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    first = _accepted_retrieval_fixture((store,), "cross-authority-a")
+    second = _accepted_retrieval_fixture((store,), "cross-authority-b")
+    fixtures = (first, second)
+    try:
+        ready = [
+            store.retrieve_encrypted_response(*item[1], item[2]) for item in fixtures
+        ]
+        snapshots = [_exact_key_snapshot(store, item[5]) for item in fixtures]
+        assert store.retrieve_encrypted_response(
+            *first[1], second[2]
+        ).state == "invalid_retrieval_credential"
+        assert store.retrieve_encrypted_response(
+            *first[1], first[2], ready[1].acknowledgement_token
+        ).state == "invalid_acknowledgement"
+        assert [
+            _exact_key_snapshot(store, item[5]) for item in fixtures
+        ] == snapshots
+        assert store.retrieve_encrypted_response(*first[1], first[2]).state == "response_ready"
+    finally:
+        _delete_claim_fixture_state(store, tuple(item[0] for item in fixtures), tuple(item[1] for item in fixtures))
+        store.close()
+
+
+def test_response_replay_expiry_is_inclusive_by_authoritative_valkey_time(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    fixture = _accepted_retrieval_fixture((store,), "inclusive-expiry")
+    node, identity, credential, envelope, _, keys, member = fixture
+    datastore = store._foundation._client
+    try:
+        seconds, micros = store._foundation.server_time()
+        before_boundary = seconds + micros / 1_000_000 + 10
+        raw = format(before_boundary, ".17g")
+        datastore.hset(keys[7], "replay_expires_at_epoch", raw)
+        datastore.hset(keys[9], "replay_expires_at_epoch", raw)
+        datastore.zadd(keys[8], {member: float(raw)})
+        assert store.retrieve_encrypted_response(*identity, credential).envelope == envelope
+
+        seconds, micros = store._foundation.server_time()
+        boundary = seconds + micros / 1_000_000
+        raw = format(boundary, ".17g")
+        datastore.hset(keys[7], "replay_expires_at_epoch", raw)
+        datastore.hset(keys[9], "replay_expires_at_epoch", raw)
+        datastore.zadd(keys[8], {member: float(raw)})
+        result = store.retrieve_encrypted_response(*identity, credential)
+        assert result.state == "retrieval_expired"
+        assert datastore.exists(keys[7]) == 0
+        assert datastore.zscore(keys[8], member) is None
+        terminal = datastore.hgetall(keys[9])
+        assert terminal[b"outcome"] == b"completed"
+        assert terminal[b"retrieval_state"] == b"retrieval_expired"
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "manifest_value",
+    (
+        _manifest(reader_min=2, reader_max=2),
+        _manifest(writer_min=2, writer_max=2, active_writer_revision=2),
+    ),
+)
+def test_response_retrieval_schema_gates_precede_protocol_dispatch(
+    valkey_server, manifest_value
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    fixture = _accepted_retrieval_fixture((store,), "retrieval-schema")
+    node, identity, credential, _, _, keys, _ = fixture
+    schema = store._foundation.config.key("schema")
+    original = store._foundation._client.evalsha
+    dispatches = []
+    try:
+        baseline = _exact_key_snapshot(store, keys)
+        store._foundation._client.set(schema, manifest_value.encode())
+
+        def record(*args):
+            dispatches.append(args[0])
+            return original(*args)
+
+        store._foundation._client.evalsha = record
+        with pytest.raises(ValkeySchemaIncompatibleError, match="^state schema incompatible$"):
+            store.retrieve_encrypted_response(*identity, credential)
+        assert RETRIEVE_RESPONSE_SCRIPT.eval_sha1 not in dispatches
+        assert _exact_key_snapshot(store, keys) == baseline
+    finally:
+        store._foundation._client.evalsha = original
+        store._foundation._client.set(schema, _manifest().encode())
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
 
 def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_server):
     namespace = uuid.uuid4().hex

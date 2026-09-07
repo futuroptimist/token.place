@@ -14,6 +14,8 @@ if [ ! -d "${WORKER_TMP_DIR}" ]; then
   mkdir -p "${WORKER_TMP_DIR}"
 fi
 
+# Application-owned structured logging intentionally omits client identity;
+# disable Gunicorn's default access format because it includes the peer IP.
 exec gunicorn \
   --bind "${HOST}:${PORT}" \
   --workers "${WORKERS}" \
@@ -21,6 +23,6 @@ exec gunicorn \
   --graceful-timeout "${GRACEFUL_TIMEOUT}" \
   --timeout "${TIMEOUT}" \
   --worker-tmp-dir "${WORKER_TMP_DIR}" \
-  --access-logfile '-' \
+  --access-logfile /dev/null \
   --error-logfile '-' \
   relay:app

@@ -251,7 +251,11 @@ def test_public_http_traffic_does_not_change_inference_outcomes() -> None:
 
 @patch.dict(
     "os.environ",
-    {"API_RATE_LIMIT": "10000/hour", "API_DAILY_QUOTA": "10000/day"},
+    {
+        "API_RATE_LIMIT": "10000/hour",
+        "API_DAILY_QUOTA": "10000/day",
+        "TOKENPLACE_TRUSTED_PROXY_NETWORKS": "198.51.0.0/16",
+    },
     clear=True,
 )
 def test_unmatched_paths_identities_and_attacker_values_cannot_add_series() -> None:
@@ -273,8 +277,9 @@ def test_unmatched_paths_identities_and_attacker_values_cannot_add_series() -> N
                 f"/{sentinels[0]}-{index}",
                 method="UNRECOGNIZED",
                 query_string={"value": sentinels[1]},
-                environ_base={"REMOTE_ADDR": f"198.51.{index // 256}.{index % 256}"},
+                environ_base={"REMOTE_ADDR": "198.51.100.1"},
                 headers={
+                    "CF-Connecting-IP": f"203.0.{index // 256}.{index % 256}",
                     "Forwarded": f"for={sentinels[3]}-{index}",
                     "X-Forwarded-For": f"203.0.113.{index % 256}",
                     "X-Limiter-Key": sentinels[4],

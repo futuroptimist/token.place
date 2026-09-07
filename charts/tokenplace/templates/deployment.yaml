@@ -93,6 +93,9 @@ spec:
           {{- if and .Values.ingress.enabled .Values.ingress.host }}
           {{- $_ := set $mergedEnv "TOKENPLACE_RELAY_PUBLIC_URL" (dict "name" "TOKENPLACE_RELAY_PUBLIC_URL" "value" (printf "https://%s" .Values.ingress.host)) }}
           {{- end }}
+          {{- if .Values.trustedProxy.networks }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_TRUSTED_PROXY_NETWORKS" (dict "name" "TOKENPLACE_TRUSTED_PROXY_NETWORKS" "value" .Values.trustedProxy.networks) }}
+          {{- end }}
           {{- if kindIs "map" .Values.env }}
           {{- range $key, $val := .Values.env }}
           {{- $name := (printf "%v" $key) }}

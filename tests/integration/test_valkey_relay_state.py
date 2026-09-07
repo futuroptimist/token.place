@@ -11,7 +11,7 @@ import subprocess
 import time
 import traceback
 import uuid
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 import redis
@@ -3320,56 +3320,67 @@ def test_response_acknowledgement_versus_expiry_has_coherent_expiry_winner(
     target_ready = stores[0].retrieve_encrypted_response(*target[1], target[2])
     datastore = stores[0]._foundation._client
     seconds, micros = stores[0]._foundation.server_time()
-    boundary_raw = format(seconds + micros / 1_000_000, ".17g")
+    boundary_raw = format(seconds + micros / 1_000_000 + 0.25, ".17g")
     datastore.hset(target[5][7], "replay_expires_at_epoch", boundary_raw)
     datastore.hset(target[5][9], "replay_expires_at_epoch", boundary_raw)
     datastore.zadd(target[5][8], {target[6]: float(boundary_raw)})
-    completed_authority = {
-        field: datastore.hget(target[5][9], field)
-        for field in (
-            "outcome",
-            "generation",
-            "accepted_at_epoch",
-            "response_digest",
-            "replay_expires_at_epoch",
-        )
-    }
+    terminal_before = datastore.hgetall(target[5][9])
     unrelated_before = (
-        datastore.hgetall(unrelated[5][7]),
-        datastore.hgetall(unrelated[5][9]),
-        datastore.zscore(unrelated[5][8], unrelated[6]),
+        tuple(datastore.dump(unrelated[5][index]) for index in (3, 4, 7, 9, 11)),
+        tuple(
+            datastore.zscore(unrelated[5][index], unrelated[6])
+            for index in (5, 6, 8, 10)
+        ),
     )
     response_expiry_before = datastore.zrange(target[5][8], 0, -1, withscores=True)
-    barrier = Barrier(2, timeout=2)
+    dispatch_barrier = Barrier(2, timeout=2)
+    acknowledgement_read = Event()
+    release_acknowledgement = Event()
     originals = [store._foundation._client.evalsha for store in stores]
+    ack_dispatches = 0
     try:
-        for index, store in enumerate(stores):
-            original = originals[index]
+        def pause_after_acknowledgement_read(*args):
+            nonlocal ack_dispatches
+            is_retrieval = args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1
+            if is_retrieval and b"read" in args:
+                result = originals[0](*args)
+                acknowledgement_read.set()
+                assert release_acknowledgement.wait(timeout=2)
+                return result
+            if is_retrieval and b"ack" in args:
+                ack_dispatches += 1
+                dispatch_barrier.wait()
+            return originals[0](*args)
 
-            def synchronized(*args, original=original):
-                if (
-                    args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1
-                    and b"read" in args
-                ):
-                    barrier.wait()
-                return original(*args)
+        def synchronize_expiry_read(*args):
+            if args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1 and b"read" in args:
+                dispatch_barrier.wait()
+            return originals[1](*args)
 
-            store._foundation._client.evalsha = synchronized
+        stores[0]._foundation._client.evalsha = pause_after_acknowledgement_read
+        stores[1]._foundation._client.evalsha = synchronize_expiry_read
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            read = pool.submit(
-                stores[0].retrieve_encrypted_response, *target[1], target[2]
-            )
             acknowledge = pool.submit(
-                stores[1].retrieve_encrypted_response,
+                stores[0].retrieve_encrypted_response,
                 *target[1],
                 target[2],
                 target_ready.acknowledgement_token,
             )
+            assert acknowledgement_read.wait(timeout=2)
+            while True:
+                current_seconds, current_micros = stores[1]._foundation.server_time()
+                if current_seconds + current_micros / 1_000_000 >= float(boundary_raw):
+                    break
+            read = pool.submit(
+                stores[1].retrieve_encrypted_response, *target[1], target[2]
+            )
+            release_acknowledgement.set()
             assert [
                 read.result(timeout=3).state,
                 acknowledge.result(timeout=3).state,
             ] == ["retrieval_expired", "retrieval_expired"]
 
+        assert ack_dispatches == 1
         assert datastore.exists(target[5][7]) == 0
         assert datastore.zscore(target[5][8], target[6]) is None
         assert datastore.zrange(target[5][8], 0, -1, withscores=True) == [
@@ -3377,14 +3388,21 @@ def test_response_acknowledgement_versus_expiry_has_coherent_expiry_winner(
         ]
         terminal = datastore.hgetall(target[5][9])
         assert terminal[b"retrieval_state"] == b"retrieval_expired"
-        assert {
-            field: terminal[field.encode()] for field in completed_authority
-        } == completed_authority
+        assert terminal == {
+            **terminal_before,
+            b"retrieval_state": b"retrieval_expired",
+        }
         assert (
-            datastore.hgetall(unrelated[5][7]),
-            datastore.hgetall(unrelated[5][9]),
-            datastore.zscore(unrelated[5][8], unrelated[6]),
+            tuple(datastore.dump(unrelated[5][index]) for index in (3, 4, 7, 9, 11)),
+            tuple(
+                datastore.zscore(unrelated[5][index], unrelated[6])
+                for index in (5, 6, 8, 10)
+            ),
         ) == unrelated_before
+        stores[1]._foundation._client.evalsha = originals[1]
+        assert stores[1].retrieve_encrypted_response(
+            *unrelated[1], unrelated[2]
+        ).envelope == unrelated[3]
     finally:
         for store, original in zip(stores, originals):
             store._foundation._client.evalsha = original

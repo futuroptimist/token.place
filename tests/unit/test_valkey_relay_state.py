@@ -289,6 +289,137 @@ def test_retrieve_response_rejects_invalid_identity_before_backend(client, reque
     foundation.execute.assert_not_called()
 
 
+def _retrieval_store_with_replies(*replies):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.side_effect = replies
+    return registration_store_with_foundation(foundation)
+
+
+def _ready_retrieval_reply(store, *, acknowledgement_digest=None):
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher", "key", "iv"
+    )
+    envelope_raw = store._serialized_response_envelope(envelope)
+    response_digest = hashlib.sha256(envelope_raw).hexdigest()
+    token = store._derive_acknowledgement_token(
+        store._identity("a" * 64, "b" * 64), 10.0, response_digest
+    )
+    return [
+        b"response_ready",
+        envelope_raw,
+        b"10",
+        b"20",
+        b"30",
+        response_digest.encode(),
+        (
+            acknowledgement_digest
+            or hashlib.sha256(token.encode()).hexdigest().encode()
+        ),
+    ], token
+
+
+@pytest.mark.parametrize(
+    "reply",
+    (
+        [b"invalid_ack"],
+        [b"schema"],
+        [b"unexpected"],
+        [b"response_ready", b"too", b"few"],
+        [b"response_ready", b"envelope", b"10", b"20", b"30", b"digest", 1],
+    ),
+)
+def test_retrieve_response_decodes_fixed_and_malformed_read_results(reply):
+    store = _retrieval_store_with_replies(reply)
+
+    if reply == [b"invalid_ack"]:
+        assert store.retrieve_encrypted_response(
+            "a" * 64, "b" * 64, "c" * 64
+        ).state == "invalid_acknowledgement"
+    else:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        [b"10", b"0" * 64, 1],
+        [b"nan", b"0" * 64, b"0" * 64],
+        [b"10", b"not-a-digest", b"0" * 64],
+    ),
+)
+def test_retrieve_response_rejects_malformed_acknowledged_metadata(metadata):
+    store = _retrieval_store_with_replies([b"acknowledged", *metadata])
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
+
+
+def test_retrieve_response_active_key_mismatch_is_typed_for_read_and_acknowledgement():
+    store = _retrieval_store_with_replies()
+    reply, token = _ready_retrieval_reply(store, acknowledgement_digest=b"0" * 64)
+    store._foundation.execute.side_effect = [reply, reply]
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
+    assert store.retrieve_encrypted_response(
+        "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+    ).state == "invalid_acknowledgement"
+
+
+@pytest.mark.parametrize(
+    ("ack_reply", "expected_status", "raises"),
+    (
+        ([b"invalid_ack"], "invalid_acknowledgement", False),
+        ([b"retrieval_expired"], "retrieval_expired", False),
+        ([b"invalid_credential"], "invalid_retrieval_credential", False),
+        ([b"unexpected"], None, True),
+    ),
+)
+def test_retrieve_response_decodes_fixed_ack_transition_results(
+    ack_reply, expected_status, raises
+):
+    store = _retrieval_store_with_replies()
+    ready, token = _ready_retrieval_reply(store)
+    store._foundation.execute.side_effect = [ready, ack_reply]
+
+    if raises:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store.retrieve_encrypted_response(
+                "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+            )
+    else:
+        result = store.retrieve_encrypted_response(
+            "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+        )
+        assert result.state == expected_status
+
+
+def test_retrieve_response_rejects_mismatched_ack_transition_authority():
+    store = _retrieval_store_with_replies()
+    ready, token = _ready_retrieval_reply(store)
+    store._foundation.execute.side_effect = [
+        ready,
+        [b"acknowledged", b"11", ready[5], ready[6]],
+    ]
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store.retrieve_encrypted_response(
+            "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+        )
+
+
 def config(**changes):
     values = dict(
         environment="test",

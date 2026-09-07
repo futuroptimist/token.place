@@ -193,7 +193,7 @@ def test_inspect_timeout_preserves_evidence(tmp_path, monkeypatch):
 
 
 def test_cleanup_failure_does_not_mask_original(tmp_path, monkeypatch):
-    values = iter(["a" * 40, "amd64", "sha256:" + "b" * 64, "container-id"])
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
     times = iter([100, 146])
     monkeypatch.setattr(gate.time, "monotonic", lambda: next(times))
     monkeypatch.setattr(gate, "request", lambda *_a, **_k: (0, ""))
@@ -207,7 +207,7 @@ def test_cleanup_failure_does_not_mask_original(tmp_path, monkeypatch):
 
 
 def test_platform_identity_mismatch_fails_before_checks(tmp_path, monkeypatch):
-    values = iter(["a" * 40, "arm64"])
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "arm64"])
     result, report = _run_main(tmp_path, monkeypatch, lambda *_a: next(values), lambda *_a, **_k: None)
     assert result == 1 and report["error_category"] == "platform_identity_mismatch"
 
@@ -258,11 +258,11 @@ def test_registry_identity_rejects_missing_or_wrong_platform_index_member(monkey
 
 
 @pytest.mark.parametrize("values,registry_args,category", [
-    (["a" * 40, "amd64"], ("--registry-coordinate", "repo@wrong", "--index-digest", INDEX_DIGEST,
+    (["sha256:" + "b" * 64, "a" * 40, "amd64"], ("--registry-coordinate", "repo@wrong", "--index-digest", INDEX_DIGEST,
       "--platform-digest", PLATFORM_DIGEST), "registry_identity_mismatch"),
-    (["a" * 40, "amd64", "[]"], ("--registry-coordinate", COORDINATE, "--index-digest", INDEX_DIGEST,
+    (["sha256:" + "b" * 64, "a" * 40, "amd64", "[]"], ("--registry-coordinate", COORDINATE, "--index-digest", INDEX_DIGEST,
       "--platform-digest", PLATFORM_DIGEST), "local_image_identity_mismatch"),
-    (["a" * 40, "amd64", json.dumps([COORDINATE]), _manifest(platform="linux/arm64")],
+    (["sha256:" + "b" * 64, "a" * 40, "amd64", json.dumps([COORDINATE]), _manifest(platform="linux/arm64")],
      ("--registry-coordinate", COORDINATE, "--index-digest", INDEX_DIGEST,
       "--platform-digest", PLATFORM_DIGEST), "index_platform_mismatch"),
 ])
@@ -282,7 +282,8 @@ def test_registry_mismatch_persists_not_run_evidence_before_probes(
 def test_main_runs_inspected_image_id_not_mutable_alias(tmp_path, monkeypatch):
     image_id = "sha256:" + "b" * 64
     calls = []
-    values = iter(["a" * 40, "amd64", image_id, "metrics", "rate", "daily"])
+    immutable_values = iter(["a" * 40, "amd64"])
+    phase_values = iter(["metrics", "rate", "daily"])
     monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: (200, ""))
     monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
         key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
@@ -293,7 +294,13 @@ def test_main_runs_inspected_image_id_not_mutable_alias(tmp_path, monkeypatch):
 
     def output(*args):
         calls.append(args)
-        return next(values)
+        if args[:3] == ("image", "inspect", "candidate"):
+            return image_id  # The alias now resolves to a replacement image.
+        if args[:3] == ("image", "inspect", image_id):
+            return next(immutable_values)
+        if args[0] == "run":
+            return next(phase_values)
+        pytest.fail(f"unexpected mutable-alias inspection: {args}")
 
     result, report = _run_main(
         tmp_path, monkeypatch, output,
@@ -303,9 +310,32 @@ def test_main_runs_inspected_image_id_not_mutable_alias(tmp_path, monkeypatch):
     assert [call[-1] for call in calls if call[0] == "run"] == [image_id] * 3
 
 
+def test_replacement_alias_registry_identity_cannot_validate_original(tmp_path, monkeypatch):
+    image_id = "sha256:" + "b" * 64
+
+    def output(*args):
+        if args[:3] == ("image", "inspect", "candidate"):
+            return image_id
+        if args[:3] == ("image", "inspect", image_id):
+            if args[-1] == "{{json .RepoDigests}}":
+                return "[]"
+            return "a" * 40 if "revision" in args[-1] else "amd64"
+        pytest.fail(f"replacement alias was inspected: {args}")
+
+    monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: pytest.fail("probe ran"))
+    result, report = _run_main(
+        tmp_path, monkeypatch, output,
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0),
+        ("--registry-coordinate", COORDINATE, "--index-digest", INDEX_DIGEST,
+         "--platform-digest", PLATFORM_DIGEST),
+    )
+    assert result == 1 and report["error_category"] == "local_image_identity_mismatch"
+    assert all(item["state"] == "not_run" for item in report["results"].values())
+
+
 def _run_qualified_main(tmp_path, monkeypatch, exemptions=(True, True), missing=None, cleanup_code=0,
                         protected=(True, True)):
-    values = iter(["a" * 40, "amd64", "sha256:" + "b" * 64, "metrics", "rate", "daily"])
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "metrics", "rate", "daily"])
     monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
     monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
         key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")

@@ -273,17 +273,19 @@ def main() -> int:
     try:
         requirements = load_contract()
         evidence["results"] = {item["id"]: {"state": "not_run", "passed": False} for item in requirements}
-        revision = docker_output("image", "inspect", args.image, "--format", '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
-        architecture = docker_output("image", "inspect", args.image, "--format", "{{.Architecture}}")
-        if architecture != args.platform.split("/")[1]:
-            raise GateFailure("platform_identity_mismatch")
-        validate_candidate_identity(args.source_commit, revision, args.resolved_revision)
-        validate_registry_identity(args.image, args.platform, args.registry_coordinate, args.index_digest,
-                                   args.platform_digest)
+        # Resolve a mutable alias once, before metadata checks, so provenance and probes
+        # cannot be split across different images if that alias changes mid-gate.
         image_id = docker_output("image", "inspect", args.image, "--format", "{{.Id}}")
         if not DIGEST.fullmatch(image_id):
             raise GateFailure("local_image_identity_invalid")
         evidence["image_id"] = image_id
+        revision = docker_output("image", "inspect", image_id, "--format", '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+        architecture = docker_output("image", "inspect", image_id, "--format", "{{.Architecture}}")
+        if architecture != args.platform.split("/")[1]:
+            raise GateFailure("platform_identity_mismatch")
+        validate_candidate_identity(args.source_commit, revision, args.resolved_revision)
+        validate_registry_identity(image_id, args.platform, args.registry_coordinate, args.index_digest,
+                                   args.platform_digest)
 
         phases = [("metrics", "1000/minute", "1000/day"), ("rate", "1/minute", "1000/day"), ("daily", "1000/minute", "1/day")]
         for offset, (phase, rate, daily) in enumerate(phases):

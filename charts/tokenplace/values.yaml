@@ -57,6 +57,11 @@ service:
   type: ClusterIP
   port: 80
 
+# Empty is fail-closed: forwarded identity is ignored. Operators must supply
+# only the observed immediate Traefik peer CIDRs/addresses after live validation.
+rateLimit:
+  trustedProxies: []
+
 metrics:
   enabled: false
   path: /metrics

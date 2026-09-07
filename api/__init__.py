@@ -13,13 +13,15 @@ from typing import Any
 from flask import Response, g, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
-from flask_limiter.util import get_remote_address
 from limits.storage import storage_from_string
 from limits.strategies import FixedWindowRateLimiter
 from limits.util import parse
 from prometheus_client import Counter
 from prometheus_flask_exporter import PrometheusMetrics
 
+from api.client_identity import (
+    ClientIdentityPolicy, current_client_address, current_limiter_key,
+)
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 from config import get_config
@@ -431,13 +433,13 @@ def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]
         identity = _response_envelope_identity_for_rate_limit(data)
         if identity is not None:
             return identity
-        return "client_ip", get_remote_address()
+        return "client_ip", current_client_address()
 
     if path in {"/api/v1/relay/servers/control", "/api/v1/relay/servers/unregister", "/api/v1/relay/progress"}:
         identity = _control_server_owner_identity(data)
         if identity is not None:
             return identity
-        return "client_ip", get_remote_address()
+        return "client_ip", current_client_address()
 
     if isinstance(data, dict) and path in {
         "/api/v1/relay/servers/register",
@@ -447,7 +449,7 @@ def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]
         server_public_key = data.get("server_public_key")
         if isinstance(server_public_key, str) and server_public_key.strip():
             return "server_public_key", server_public_key.strip()
-    return "client_ip", get_remote_address()
+    return "client_ip", current_client_address()
 
 
 def _control_plane_bucket_identifier(
@@ -478,7 +480,6 @@ def _control_plane_storage_decr(
     if decr is None:
         LOGGER.warning(
             "rate_limit.control_plane_rollback_unavailable",
-            extra={"limiter_bucket_fingerprint": _fingerprint(":".join(identifiers))},
         )
         return
     decr(limit_item.key_for(*identifiers))
@@ -593,7 +594,7 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
                 return jsonify({"error": {"message": "Progress envelope too large", "code": 413}}), 413
             request._cached_data = raw_body
 
-        remote_address = get_remote_address()
+        remote_address = current_client_address()
         checks: list[tuple[str, str, Any]] = [
             ("client_ip", remote_address, route_limit["ip"])
         ]
@@ -616,7 +617,7 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         ):
             checks.append((identity_kind, identity_value, route_limit["identity"]))
 
-        allowed, retry_after, bucket_kind, bucket_key, limit_item = (
+        allowed, retry_after, bucket_kind, _bucket_key, limit_item = (
             _check_control_plane_limits(
                 control_plane_rate_limiter,
                 checks,
@@ -626,14 +627,12 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         if allowed:
             return None
 
-        bucket_fingerprint = _fingerprint(bucket_key)
         LOGGER.warning(
             "relay_control_plane_rate_limited",
             extra={
                 "route": route,
                 "route_class": CONTROL_PLANE_ROUTE_CLASS,
                 "limiter_bucket_kind": bucket_kind,
-                "limiter_bucket_fingerprint": bucket_fingerprint,
                 "retry_after": retry_after,
             },
         )
@@ -759,6 +758,10 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     contract. Defaults preserve the historical API behavior for other callers.
     """
 
+    app.extensions["tokenplace_client_identity_policy"] = ClientIdentityPolicy.from_environment()
+    # Flask-Limiter's INFO rejection message includes its derived storage key.
+    # Responses and bounded application telemetry provide the needed signal.
+    logging.getLogger("flask-limiter").setLevel(logging.WARNING)
     _install_public_api_v1_cors(app)
     _install_public_quota_metrics(app, metrics_registry)
 
@@ -776,7 +779,7 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
         limiter_kwargs["storage_uri"] = limiter_storage_uri
 
     limiter = Limiter(
-        get_remote_address,
+        current_limiter_key,
         app=app,
         **limiter_kwargs,
     )

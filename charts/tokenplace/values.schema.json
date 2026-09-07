@@ -3,6 +3,14 @@
   "type": "object",
   "additionalProperties": true,
   "properties": {
+    "rateLimit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trustedProxies"],
+      "properties": {
+        "trustedProxies": { "type": "string", "default": "", "maxLength": 4096 }
+      }
+    },
     "metrics": {
       "type": "object",
       "additionalProperties": false,

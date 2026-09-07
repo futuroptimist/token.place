@@ -21,6 +21,5 @@ exec gunicorn \
   --graceful-timeout "${GRACEFUL_TIMEOUT}" \
   --timeout "${TIMEOUT}" \
   --worker-tmp-dir "${WORKER_TMP_DIR}" \
-  --access-logfile '-' \
   --error-logfile '-' \
   relay:app

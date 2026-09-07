@@ -74,6 +74,13 @@ def test_defaults_render_no_service_monitor_and_no_metrics_token() -> None:
     env = _env_by_name(deployment)
     assert "TOKENPLACE_METRICS_TOKEN" not in env
     assert env["TOKENPLACE_METRICS_DISABLED"]["value"] == "1"
+    assert env["TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES"]["value"] == ""
+
+
+def test_trusted_proxy_value_renders_through_narrow_chart_interface() -> None:
+    docs = _render("--set", "rateLimit.trustedProxies=10.42.0.0/16")
+    env = _env_by_name(_kind(docs, "Deployment")[0])
+    assert env["TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES"]["value"] == "10.42.0.0/16"
 
 
 def test_service_monitor_requires_metrics_enabled() -> None:

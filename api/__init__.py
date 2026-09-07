@@ -727,6 +727,11 @@ def _install_public_quota_metrics(app, registry) -> None:
 
     @app.after_request
     def _record_public_quota_outcome(response):
+        # The relay owns this endpoint and serializes the registry before
+        # after-request callbacks run.  Do not let observing quota telemetry
+        # change the counter exposed by the following scrape.
+        if request.endpoint == "metrics":
+            return response
         reason = getattr(g, "tokenplace_public_quota_reason", None)
         if response.status_code == 429:
             outcome = "rejected"

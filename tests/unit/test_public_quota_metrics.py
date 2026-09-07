@@ -7,8 +7,8 @@ import subprocess
 import sys
 from unittest.mock import patch
 
-from flask import Flask
-from prometheus_client import CollectorRegistry, generate_latest
+from flask import Flask, Response
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
 from api import (
@@ -149,6 +149,24 @@ def test_public_information_get_and_head_are_exempt_by_stable_route_class() -> N
         for route_class in ("root", "public_metadata", "public_version")
         for method in ("GET", "HEAD")
     }
+
+
+def test_metrics_scrapes_do_not_mutate_public_quota_counter() -> None:
+    app, registry = _app()
+
+    @app.get("/metrics", endpoint="metrics")
+    def metrics() -> Response:
+        return Response(generate_latest(registry), mimetype=CONTENT_TYPE_LATEST)
+
+    with app.test_client() as client:
+        assert client.get("/api/v1/models").status_code == 200
+        before_scrapes = generate_latest(registry)
+        for _ in range(3):
+            response = client.get("/metrics")
+            assert response.status_code == 200
+
+    assert generate_latest(registry) == before_scrapes
+    assert all(label["route_class"] != "operational" for label in _samples(registry))
 
 
 @patch.dict(

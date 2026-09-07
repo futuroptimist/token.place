@@ -74,3 +74,30 @@ def test_gate_failure_blocks_all_promotions_and_uses_selected_provenance() -> No
     assert '--release-ref "${{ needs.build-and-smoke.outputs.selected_ref }}"' in block
     assert '--release-base "${{ needs.build-and-smoke.outputs.release_base }}"' in block
     assert "inputs.ref" in text and "inputs.base" in text
+
+
+def test_artifact_regressions_bootstrap_dependencies_and_cannot_skip() -> None:
+    text = WORKFLOW_PATH.read_text(encoding="utf-8")
+    artifact_step = text.index("Prove canonical recovered and historical artifacts")
+    smoke_step = text.index("Smoke test relay container", artifact_step)
+    block = text[artifact_step:smoke_step]
+    assert "pip install -r config/requirements_codex_verification.txt" in block
+    assert block.index("pip install") < block.index("docker info") < block.index("pytest")
+    assert "continue-on-error" not in block
+    assert "|| true" not in block
+
+
+def test_either_platform_qualification_failure_blocks_promotion() -> None:
+    text = WORKFLOW_PATH.read_text(encoding="utf-8")
+    qualify = text.index("Pull and qualify every candidate platform")
+    upload = text.index("Upload publication safety evidence", qualify)
+    promotion = text.index("Promote qualified candidate to release tags", upload)
+    block = text[qualify:upload]
+    assert "set -euo pipefail" in block
+    assert "for platform in linux/amd64 linux/arm64" in block
+    assert block.count("python scripts/relay_release_safety_gate.py") == 1
+    assert "continue-on-error" not in block and "|| true" not in block
+    # The evidence upload is deliberately `always()`, but promotion has no such
+    # override; GitHub therefore skips it after either loop iteration fails.
+    promotion_header = text[promotion:text.index("run: |", promotion)]
+    assert "if:" not in promotion_header

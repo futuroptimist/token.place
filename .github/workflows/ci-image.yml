@@ -152,7 +152,10 @@ jobs:
           if-no-files-found: error
 
       - name: Prove canonical recovered and historical artifacts
-        run: python -m pytest -q tests/artifact/test_relay_release_safety_artifacts.py
+        run: |
+          python -m pip install -r config/requirements_codex_verification.txt
+          docker info >/dev/null
+          python -m pytest -q tests/artifact/test_relay_release_safety_artifacts.py
 
       - name: Smoke test relay container
         run: |

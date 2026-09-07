@@ -1807,7 +1807,9 @@ def test_missing_indexed_lifecycle_fails_closed_without_mutation(valkey_server):
     cfg = store._foundation.config
     node = store._node_digest("node")
     missing = "a" * 64 + ":" + "b" * 64
-    deadline = time.time() + 60
+    rounded_deadline = float(f"{time.time() + 60:.6f}")
+    deadline = math.nextafter(rounded_deadline, math.inf)
+    assert deadline != float(f"{deadline:.6f}")
     try:
         store.register("node", _capabilities(), owner)
         store._foundation._client.zadd(cfg.key("requests:deadline"), {missing: deadline})
@@ -3574,12 +3576,15 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
     response = EncryptedResponseEnvelope(
         "tokenplace_api_v1_relay_e2ee", 1, response_ciphertext, "response-key", "response-iv"
     )
-    deadline = time.time() + 60
+    rounded_deadline = float(f"{time.time() + 60:.6f}")
+    deadline = math.nextafter(rounded_deadline, math.inf)
+    assert deadline != float(f"{deadline:.6f}")
     try:
         first.register(node, _capabilities(), owner)
         selection = first.select_and_reserve(
             *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
         )
+        assert selection.request_deadline_epoch == deadline
         first.enqueue_encrypted_request(
             *identity,
             selection.reservation_token,
@@ -3593,6 +3598,7 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
             "cancel",
         )
         claim = first.claim_queued_request(node, owner, consumer)
+        assert claim.request_deadline_epoch == deadline
         accepted = first.accept_encrypted_response(
             node, owner, consumer, *identity, claim.generation, response
         )
@@ -3606,7 +3612,7 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
         assert initial == replay
         assert initial.state == "response_ready"
         assert initial.envelope == response
-        assert initial.request_deadline_epoch == float(f"{deadline:.6f}")
+        assert initial.request_deadline_epoch == deadline
         assert initial.replay_expires_at_epoch == accepted.replay_expires_at_epoch
         assert initial.acknowledgement_token is not None
         assert first.retrieve_encrypted_response(
@@ -5983,7 +5989,7 @@ def test_claim_lease_is_bounded_by_request_deadline(valkey_server):
 
         result = store.claim_queued_request(node_id, owner, "deadline-consumer")
         assert result.state == "claimed"
-        assert result.request_deadline_epoch == float(f"{deadline:.6f}")
+        assert result.request_deadline_epoch == deadline
         assert result.lease_expires_at_epoch <= deadline
         assert store._foundation._client.xlen(cfg.key("queue", node)) == 1
         assert store._foundation._client.hget(
@@ -6025,12 +6031,15 @@ def test_renew_claim_preserves_exact_deadline_representation(valkey_server):
     try:
         store.register(node_id, _capabilities(), owner)
         seconds, micros = store._foundation.server_time()
-        deadline = seconds + micros / 1_000_000 + 0.45
+        rounded_deadline = float(f"{seconds + micros / 1_000_000 + 0.45:.6f}")
+        deadline = math.nextafter(rounded_deadline, math.inf)
+        assert deadline != float(f"{deadline:.6f}")
         _enqueue_claim_fixture(store, node_id, owner, *identity, deadline)
         stored_deadline = store._foundation._client.hget(request_key, "deadline")
         decoded_deadline = float(stored_deadline)
         assert math.isfinite(decoded_deadline)
-        assert decoded_deadline == float(f"{deadline:.6f}")
+        assert stored_deadline == format(deadline, ".17g").encode()
+        assert decoded_deadline == deadline
 
         claimed = store.claim_queued_request(node_id, owner, consumer)
         assert claimed.state == "claimed"

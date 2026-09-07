@@ -620,9 +620,10 @@ SCHEDULER_STATE_SCRIPT = ReviewedScript(
 
 SELECT_AND_RESERVE_SOURCE = """\
 local leases, expiries, deadlines, cursor, request_key, reservation_key = unpack(KEYS)
-local prefix, client, request, model, tier, deadline, cancel, fingerprint,
-  token_digest = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], tonumber(ARGV[6]),
+local prefix, client, request, model, tier, deadline_value, cancel, fingerprint,
+  token_digest = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6],
   ARGV[7], ARGV[8], ARGV[9]
+local deadline=tonumber(deadline_value)
 local ttl, requested_tokens = tonumber(ARGV[10]), tonumber(ARGV[11])
 local max_res, max_client, max_node, max_depth, max_lifecycles,
   max_fingerprints, max_nodes, batch = tonumber(ARGV[12]), tonumber(ARGV[13]),
@@ -920,11 +921,11 @@ end
 local expires = math.min(now + ttl, deadline)
 redis.call('HSET', reservation_key, 'client', client, 'request', request,
   'fingerprint', fingerprint, 'node_digest', selected[4], 'node_id', selected[5],
-  'model', model, 'tier', tier, 'deadline', deadline, 'reservation_expires', expires,
+  'model', model, 'tier', tier, 'deadline', deadline_value, 'reservation_expires', expires,
   'token_digest', token_digest, 'cancellation_digest', cancel)
 redis.call('HSET', request_key, 'state', 'reserved', 'client', client, 'request', request,
   'node_digest', selected[4], 'node_id', selected[5], 'model', model, 'tier', tier,
-  'deadline', deadline, 'reservation_expires', expires, 'token_digest', token_digest,
+  'deadline', deadline_value, 'reservation_expires', expires, 'token_digest', token_digest,
   'cancellation_digest', cancel, 'fingerprint', fingerprint)
 redis.call('ZADD', expiries, expires, token_digest)
 redis.call('ZADD', deadlines, deadline, client .. ':' .. request)
@@ -937,7 +938,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "389fc52552c89aa804834830ef66fa197e4e97f6b62b7e0af6c0b5ee67c605a8",  # pragma: allowlist secret
+    "27c9e83a74c75de3a70d0e0602967e5ec872ef2a4191459a33a3921a08efc67c",  # pragma: allowlist secret
     True,
 )
 
@@ -1545,7 +1546,7 @@ local function lua_float(value)
   return value and string.len(value)<=32 and n and string.format('%.17g',n)==value
 end
 local function lua_number(value)
-  return python_float(value)
+  return lua_float(value)
 end
 if not digest(client) or not digest(request_digest) or not digest(retrieval_digest) or
    (supplied_ack~='' and not digest(supplied_ack)) or
@@ -1627,7 +1628,7 @@ return {'acknowledged',tv[9],tv[8],tv[13]}
 RETRIEVE_RESPONSE_SCRIPT = ReviewedScript(
     "retrieve_or_ack_response_v1",
     RETRIEVE_RESPONSE_SOURCE,
-    "b0257c0bab7d472aecb27a98ce4660c0b4119506d2b02b9a2b3f4e01b9d82193",  # pragma: allowlist secret
+    "2a57b24252d4667be561f7ba369ca201efb048752b7abe70829997937751085f",  # pragma: allowlist secret
     True,
 )
 
@@ -2261,7 +2262,7 @@ class ValkeyRegistrationStore:
             or not math.isfinite(float(deadline))
         ):
             raise RelayStateStoreError("request deadline must be finite")
-        return normalized_model, normalized_tier, float(f"{float(deadline):.6f}")
+        return normalized_model, normalized_tier, float(deadline)
 
     def _cancellation_digest(self, token: object, *, optional: bool = False) -> str:
         if optional and token is None:
@@ -2337,7 +2338,7 @@ class ValkeyRegistrationStore:
             request.encode(),
             model.encode(),
             tier.encode(),
-            repr(deadline).encode(),
+            format(deadline, ".17g").encode(),
             cancellation.encode(),
             fingerprint.encode(),
             token_digest.encode(),
@@ -2444,7 +2445,7 @@ class ValkeyRegistrationStore:
             request.encode(),
             model.encode(),
             tier.encode(),
-            repr(deadline).encode(),
+            format(deadline, ".17g").encode(),
             token_digest.encode(),
             cancellation.encode(),
             encoded,

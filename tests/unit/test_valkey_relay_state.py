@@ -249,7 +249,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "53458e8528e0c2d02c10472c45279a03be0884435461d36c6b2b37843cfb8bb7"  # pragma: allowlist secret
+    expected_digest = "0a903dd87505b22475818ab6fd520cf90a7036955dc4965115555bcc4a51cb65"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -263,6 +263,10 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
         RETRIEVE_RESPONSE_SCRIPT.source.index("if mode=='read' then")
     )
     assert "expected_envelope~=rv[8]" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "string.len(lv[14])>max_request_envelope" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "string.len(rv[8])>max_response_envelope" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "if terminal_expiry<=now then" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "return {'acknowledged',tv[9],tv[8],tv[13]}" in RETRIEVE_RESPONSE_SCRIPT.source
 
 
 @pytest.mark.parametrize(

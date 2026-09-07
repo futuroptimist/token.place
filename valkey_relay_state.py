@@ -1526,7 +1526,7 @@ RETRIEVE_RESPONSE_SOURCE = """\
 local response,terminal,response_expiries,terminal_expiries,request=unpack(KEYS)
 local client,request_digest,client_public_key,request_id,retrieval_digest,supplied_ack,mode,
   expected_envelope,expected_response_digest,expected_accepted=unpack(ARGV)
-local max_identity,max_node_id,max_envelope=tonumber(ARGV[11]),tonumber(ARGV[12]),tonumber(ARGV[13])
+local max_identity,max_node_id,max_request_envelope,max_response_envelope=tonumber(ARGV[11]),tonumber(ARGV[12]),tonumber(ARGV[13]),tonumber(ARGV[14])
 local member=client..':'..request_digest
 local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
 local function finite(value) local n=tonumber(value); return n and n==n and math.abs(n)~=math.huge and n end
@@ -1560,13 +1560,18 @@ if lv[1]~='response_ready' or lv[2]~=client or lv[3]~=request_digest or
    string.len(lv[6])<1 or string.len(lv[6])>max_node_id or not digest(lv[7]) or
    not deadline or deadline<accepted or not sequence or lifecycle_generation~=generation or
    lv[11]~=lv[9]..'-0' or lv[12]~=tv[12] or lv[13]~=tv[14] or
-   string.len(lv[14])<1 or string.len(lv[14])>max_envelope then return {'schema'} end
+   string.len(lv[14])<1 or string.len(lv[14])>max_request_envelope then return {'schema'} end
+if terminal_expiry<=now then
+  redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
+  redis.call('DEL',terminal); redis.call('ZREM',terminal_expiries,member); redis.call('DEL',request)
+  return {'invalid_credential'}
+end
 local response_exists=redis.call('EXISTS',response)
 local response_score=finite(redis.call('ZSCORE',response_expiries,member))
 if tv[3]=='acknowledged' then
   if response_exists~=0 or response_score then return {'schema'} end
   if supplied_ack~='' and supplied_ack~=tv[13] then return {'invalid_ack'} end
-  return {'acknowledged'}
+  return {'acknowledged',tv[9],tv[8],tv[13]}
 end
 if tv[3]=='retrieval_expired' then
   if response_exists~=0 or response_score then return {'schema'} end
@@ -1578,7 +1583,7 @@ local response_accepted,response_replay=finite(rv[9]),finite(rv[11]); local resp
 if response_exists~=1 or not response_score or response_score~=replay or rv[1]~=client or
    rv[2]~=request_digest or rv[3]~=client_public_key or rv[4]~=request_id or rv[5]~=tv[4] or
    string.len(rv[5])<1 or string.len(rv[5])>max_node_id or rv[6]~=tv[6] or
-   response_generation~=generation or string.len(rv[8])<1 or string.len(rv[8])>max_envelope or
+   response_generation~=generation or string.len(rv[8])<1 or string.len(rv[8])>max_response_envelope or
    response_accepted~=accepted or rv[10]~=tv[8] or response_replay~=replay or rv[12]~='response_ready' then return {'schema'} end
 if replay<=now then
   redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
@@ -1590,12 +1595,12 @@ if expected_envelope~=rv[8] or expected_response_digest~=tv[8] or expected_accep
 if supplied_ack=='' or supplied_ack~=tv[13] then return {'invalid_ack'} end
 redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
 redis.call('HSET',terminal,'retrieval_state','acknowledged')
-return {'acknowledged'}
+return {'acknowledged',tv[9],tv[8],tv[13]}
 """
 RETRIEVE_RESPONSE_SCRIPT = ReviewedScript(
     "retrieve_or_ack_response_v1",
     RETRIEVE_RESPONSE_SOURCE,
-    "53458e8528e0c2d02c10472c45279a03be0884435461d36c6b2b37843cfb8bb7",  # pragma: allowlist secret
+    "0a903dd87505b22475818ab6fd520cf90a7036955dc4965115555bcc4a51cb65",  # pragma: allowlist secret
     True,
 )
 
@@ -1874,6 +1879,8 @@ class ValkeyRegistrationStore:
         *,
         acknowledgement_key: bytes,
     ) -> None:
+        # This key is part of persisted response state: every worker sharing a
+        # namespace must receive the same restart-stable secret.
         if type(acknowledgement_key) is not bytes or len(acknowledgement_key) < 32:
             raise RelayStateStoreError("acknowledgement key is invalid")
         if not isinstance(foundation, ValkeyFoundation) or not isinstance(
@@ -2867,6 +2874,7 @@ class ValkeyRegistrationStore:
                         str(self.config.max_identity_bytes).encode(),
                         str(self.config.max_node_id_bytes).encode(),
                         str(self.config.max_envelope_bytes).encode(),
+                        str(self.config.max_response_envelope_bytes).encode(),
                     ),
                     max_result_bytes=self.config.max_response_envelope_bytes
                     + _CLAIM_RESULT_METADATA_BYTES,
@@ -2878,7 +2886,37 @@ class ValkeyRegistrationStore:
             return ResponseRetrievalResult("invalid_retrieval_credential")
         if status == "invalid_ack" and not values:
             return ResponseRetrievalResult("invalid_acknowledgement")
-        if status in {"acknowledged", "retrieval_expired"} and not values:
+        if status == "retrieval_expired" and not values:
+            return ResponseRetrievalResult(status)
+        if status == "acknowledged" and len(values) == 3:
+            if not all(isinstance(value, bytes) for value in values):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            try:
+                accepted = float(values[0])
+                response_digest = values[1].decode("ascii")
+                stored_ack = values[2].decode("ascii")
+                expected_token = self._derive_acknowledgement_token(
+                    (client, request), accepted, response_digest
+                )
+                expected_ack = hashlib.sha256(
+                    expected_token.encode("ascii")
+                ).hexdigest()
+                if (
+                    not math.isfinite(accepted)
+                    or accepted < 0
+                    or not _SHA256_RE.fullmatch(response_digest)
+                    or not _SHA256_RE.fullmatch(stored_ack)
+                ):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError, UnicodeDecodeError):
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
+            if acknowledgement_token is not None and (
+                not hmac.compare_digest(expected_ack, stored_ack)
+                or not hmac.compare_digest(supplied_ack, expected_ack)
+            ):
+                return ResponseRetrievalResult("invalid_acknowledgement")
             return ResponseRetrievalResult(status)
         if status == "schema":
             raise ValkeySchemaIncompatibleError("state schema incompatible")
@@ -2924,7 +2962,11 @@ class ValkeyRegistrationStore:
         )
         if status == "invalid_ack" and not values:
             return ResponseRetrievalResult("invalid_acknowledgement")
-        if status in {"acknowledged", "retrieval_expired"} and not values:
+        if status == "acknowledged" and len(values) == 3 and all(
+            isinstance(value, bytes) for value in values
+        ):
+            return ResponseRetrievalResult(status)
+        if status == "retrieval_expired" and not values:
             return ResponseRetrievalResult(status)
         if status == "invalid_credential" and not values:
             return ResponseRetrievalResult("invalid_retrieval_credential")

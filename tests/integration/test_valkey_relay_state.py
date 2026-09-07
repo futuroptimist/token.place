@@ -3075,12 +3075,22 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
     valkey_server,
 ):
     namespace = uuid.uuid4().hex
-    first = _registration_store(valkey_server, namespace)
-    second = _registration_store(valkey_server, namespace)
+    first = _registration_store(
+        valkey_server,
+        namespace,
+        max_envelope_bytes=256,
+        max_response_envelope_bytes=2048,
+    )
+    second = _registration_store(
+        valkey_server,
+        namespace,
+        max_envelope_bytes=256,
+        max_response_envelope_bytes=2048,
+    )
     node, owner, consumer = "retrieve-node", _digest("retrieve-owner"), "consumer"
     identity = ("retrieve-client", "retrieve-request")
     response = EncryptedResponseEnvelope(
-        "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "response-iv"
+        "tokenplace_api_v1_relay_e2ee", 1, "r" * 512, "response-key", "response-iv"
     )
     deadline = time.time() + 60
     try:
@@ -3142,6 +3152,49 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
         assert terminal.retrieval_state == "acknowledged"
         keys, member = _response_acceptance_authority(first, node, identity)
         assert first._foundation._client.zscore(keys[8], member) is None
+
+        rotated = ValkeyRegistrationStore(
+            _foundation(valkey_server, namespace),
+            RelayStateStoreConfig(
+                namespace="testing.valkey",
+                max_envelope_bytes=256,
+                max_response_envelope_bytes=2048,
+            ),
+            acknowledgement_key=b"rotated-test-acknowledgement-key!",
+        )
+        try:
+            assert rotated.retrieve_encrypted_response(
+                *identity,
+                selection.reservation_token,
+                initial.acknowledgement_token,
+            ).state == "invalid_acknowledgement"
+        finally:
+            rotated.close()
+
+        client_digest, request_digest = first._identity(*identity)
+        terminal_key = first._foundation.config.key(
+            "terminal", client_digest, request_digest
+        )
+        request_key = first._foundation.config.key(
+            "request", client_digest, request_digest
+        )
+        expired_at = time.time() - 1
+        first._foundation._client.hset(
+            terminal_key,
+            mapping={
+                "accepted_at_epoch": repr(expired_at - 2),
+                "replay_expires_at_epoch": repr(expired_at - 1),
+                "expires_at_epoch": repr(expired_at),
+            },
+        )
+        first._foundation._client.zadd(
+            first._foundation.config.key("terminals:expiry"),
+            {f"{client_digest}:{request_digest}": expired_at},
+        )
+        assert first.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        ).state == "invalid_retrieval_credential"
+        assert first._foundation._client.exists(terminal_key, request_key) == 0
     finally:
         _delete_claim_fixture_state(first, (node,), (identity,))
         first.close()

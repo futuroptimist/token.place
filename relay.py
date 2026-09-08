@@ -115,6 +115,24 @@ def setup_logging() -> logging.Logger:
 LOGGER = setup_logging()
 
 
+METRICS_MODE_ENV = "TOKENPLACE_METRICS_MODE"
+METRICS_MODES = ("normal", "degraded")
+
+
+def _load_metrics_mode() -> str:
+    """Load the explicit, startup-only application metrics mode."""
+
+    if METRICS_MODE_ENV not in os.environ:
+        return "normal"
+    mode = os.environ[METRICS_MODE_ENV]
+    if mode not in METRICS_MODES:
+        raise ValueError(
+            f"{METRICS_MODE_ENV} must be one of: {', '.join(METRICS_MODES)}"
+        )
+    return mode
+
+
+METRICS_MODE = _load_metrics_mode()
 RELAY_METRICS_REGISTRY = CollectorRegistry()
 _METRICS_INITIALIZED = False
 
@@ -429,7 +447,12 @@ def create_app() -> Flask:
 
     init_app(
         flask_app,
-        metrics_registry=RELAY_METRICS_REGISTRY,
+        # Public-quota instrumentation is part of the complete normal registry.
+        # Passing no registry prevents its collector and callback from existing
+        # at all in emergency degraded mode; rate limiting itself is unchanged.
+        metrics_registry=(
+            RELAY_METRICS_REGISTRY if METRICS_MODE == "normal" else None
+        ),
         metrics_export_defaults=False,
         metrics_path=None,
     )
@@ -500,10 +523,18 @@ def _collector(name: str, factory):
         return _NoopMetric()
 
 
-REQUEST_COUNTER = _collector("tokenplace_relay_requests_total", _get_request_counter)
+def _normal_collector(name: str, factory):
+    """Construct a normal-mode collector, or a stateless no-op in degraded mode."""
+
+    if METRICS_MODE == "degraded":
+        return _NoopMetric()
+    return _collector(name, factory)
 
 
-HTTP_REQUESTS_TOTAL = _collector(
+REQUEST_COUNTER = _normal_collector("tokenplace_relay_requests_total", _get_request_counter)
+
+
+HTTP_REQUESTS_TOTAL = _normal_collector(
     "tokenplace_http_requests_total",
     lambda: Counter(
         "tokenplace_http_requests_total",
@@ -512,7 +543,7 @@ HTTP_REQUESTS_TOTAL = _collector(
         registry=RELAY_METRICS_REGISTRY,
     ),
 )
-HTTP_REQUEST_DURATION_SECONDS = _collector(
+HTTP_REQUEST_DURATION_SECONDS = _normal_collector(
     "tokenplace_http_request_duration_seconds",
     lambda: Histogram(
         "tokenplace_http_request_duration_seconds",
@@ -522,43 +553,43 @@ HTTP_REQUEST_DURATION_SECONDS = _collector(
         registry=RELAY_METRICS_REGISTRY,
     ),
 )
-RELAY_QUEUE_DEPTH = _collector(
+RELAY_QUEUE_DEPTH = _normal_collector(
     "tokenplace_relay_queue_depth",
     lambda: Gauge("tokenplace_relay_queue_depth", "Current encrypted relay request queue depth.", ["provider_mode"], registry=RELAY_METRICS_REGISTRY),
 )
-RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS = _collector(
+RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS = _normal_collector(
     "tokenplace_relay_oldest_queued_request_age_seconds",
     lambda: Gauge("tokenplace_relay_oldest_queued_request_age_seconds", "Age of the oldest queued encrypted relay request.", ["provider_mode"], registry=RELAY_METRICS_REGISTRY),
 )
-COMPUTE_NODES_REGISTERED = _collector(
+COMPUTE_NODES_REGISTERED = _normal_collector(
     "tokenplace_compute_nodes_registered",
     lambda: Gauge("tokenplace_compute_nodes_registered", "Registered API v1 compute nodes.", registry=RELAY_METRICS_REGISTRY),
 )
-COMPUTE_NODES_HEALTHY = _collector(
+COMPUTE_NODES_HEALTHY = _normal_collector(
     "tokenplace_compute_nodes_healthy",
     lambda: Gauge("tokenplace_compute_nodes_healthy", "Healthy API v1 compute nodes using relay lease semantics.", registry=RELAY_METRICS_REGISTRY),
 )
-COMPUTE_NODE_LEASE_AGE_SECONDS = _collector(
+COMPUTE_NODE_LEASE_AGE_SECONDS = _normal_collector(
     "tokenplace_compute_node_lease_age_seconds",
     lambda: Gauge("tokenplace_compute_node_lease_age_seconds", "Oldest compute-node lease age without node identity.", registry=RELAY_METRICS_REGISTRY),
 )
-COMPUTE_NODE_EVICTIONS_TOTAL = _collector(
+COMPUTE_NODE_EVICTIONS_TOTAL = _normal_collector(
     "tokenplace_compute_node_evictions_total",
     lambda: Counter("tokenplace_compute_node_evictions_total", "Compute node evictions by fixed reason.", ["reason"], registry=RELAY_METRICS_REGISTRY),
 )
-RELAY_IN_FLIGHT_REQUESTS = _collector(
+RELAY_IN_FLIGHT_REQUESTS = _normal_collector(
     "tokenplace_relay_in_flight_requests",
     lambda: Gauge("tokenplace_relay_in_flight_requests", "Current encrypted relay requests dispatched to compute nodes.", registry=RELAY_METRICS_REGISTRY),
 )
-RELAY_OLDEST_IN_FLIGHT_AGE_SECONDS = _collector(
+RELAY_OLDEST_IN_FLIGHT_AGE_SECONDS = _normal_collector(
     "tokenplace_relay_oldest_in_flight_age_seconds",
     lambda: Gauge("tokenplace_relay_oldest_in_flight_age_seconds", "Age of the oldest in-flight encrypted relay request.", registry=RELAY_METRICS_REGISTRY),
 )
-RELAY_REQUEST_OUTCOMES_TOTAL = _collector(
+RELAY_REQUEST_OUTCOMES_TOTAL = _normal_collector(
     "tokenplace_relay_request_outcomes_total",
     lambda: Counter("tokenplace_relay_request_outcomes_total", "Terminal relay request outcomes by fixed enum.", ["outcome"], registry=RELAY_METRICS_REGISTRY),
 )
-RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL = _collector(
+RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL = _normal_collector(
     "tokenplace_relay_compute_control_requests_total",
     lambda: Counter(
         "tokenplace_relay_compute_control_requests_total",
@@ -567,7 +598,7 @@ RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL = _collector(
         registry=RELAY_METRICS_REGISTRY,
     ),
 )
-RELAY_COMPUTE_CONTROL_LEASE_RENEWALS_TOTAL = _collector(
+RELAY_COMPUTE_CONTROL_LEASE_RENEWALS_TOTAL = _normal_collector(
     "tokenplace_relay_compute_control_lease_renewals_total",
     lambda: Counter(
         "tokenplace_relay_compute_control_lease_renewals_total",
@@ -583,25 +614,39 @@ INSTRUMENTATION_UP = _collector(
     "tokenplace_instrumentation_up",
     lambda: Gauge("tokenplace_instrumentation_up", "Whether relay metrics instrumentation initialized.", registry=RELAY_METRICS_REGISTRY),
 )
+METRICS_DEGRADED = (
+    _collector(
+        "tokenplace_metrics_degraded",
+        lambda: Gauge(
+            "tokenplace_metrics_degraded",
+            "Whether intentional emergency degraded metrics mode is active.",
+            registry=RELAY_METRICS_REGISTRY,
+        ),
+    )
+    if METRICS_MODE == "degraded"
+    else _NoopMetric()
+)
 
 
 def _initialise_metric_labels() -> None:
     if _METRICS_CONSTRUCTION_FAILED:
         INSTRUMENTATION_UP.set(0)
         return
-    for outcome in OUTCOME_ENUM:
-        RELAY_REQUEST_OUTCOMES_TOTAL.labels(outcome)
-    for reason in EVICTION_REASON_ENUM:
-        COMPUTE_NODE_EVICTIONS_TOTAL.labels(reason)
-    for state in ("active", "cancelled", "expired", "acknowledged", "completed_unavailable"):
-        RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL.labels(state)
-    RELAY_QUEUE_DEPTH.labels("relay").set(0)
-    RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
+    if METRICS_MODE == "normal":
+        for outcome in OUTCOME_ENUM:
+            RELAY_REQUEST_OUTCOMES_TOTAL.labels(outcome)
+        for reason in EVICTION_REASON_ENUM:
+            COMPUTE_NODE_EVICTIONS_TOTAL.labels(reason)
+        for state in ("active", "cancelled", "expired", "acknowledged", "completed_unavailable"):
+            RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL.labels(state)
+        RELAY_QUEUE_DEPTH.labels("relay").set(0)
+        RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
     BUILD_INFO.labels(
         BUILD_METADATA.get("version", "dev"),
         _build_revision_label(BUILD_METADATA),
     ).set(1)
     INSTRUMENTATION_UP.set(1)
+    METRICS_DEGRADED.set(1)
     global _METRICS_INITIALIZED
     _METRICS_INITIALIZED = True
 
@@ -1762,7 +1807,7 @@ def _record_request_start():
     g.request_id = request.headers.get("X-Request-Id") or secrets.token_hex(8)
     if request.path.rstrip("/") == "/metrics" and not _metrics_token_is_valid():
         return Response("unauthorized\n", status=401, mimetype="text/plain")
-    if request.path.rstrip("/") == "/metrics":
+    if request.path.rstrip("/") == "/metrics" and METRICS_MODE == "normal":
         try:
             _update_runtime_gauges()
         except Exception:
@@ -1780,29 +1825,31 @@ def _log_request(response: Response):
     outcome = _outcome_for_response(response)
     provider_mode = "relay"
 
-    try:
-        REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
-        HTTP_REQUESTS_TOTAL.labels(_normalise_http_method(request.method), route, status_class, provider_mode, outcome).inc()
-    except Exception:  # pragma: no cover - defensive metric increment
-        LOGGER.debug(
-            "metrics.increment_failed",
-            extra={"route": route, "status_class": status_class, "outcome": outcome},
-        )
+    if METRICS_MODE == "normal":
+        try:
+            REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
+            HTTP_REQUESTS_TOTAL.labels(_normalise_http_method(request.method), route, status_class, provider_mode, outcome).inc()
+        except Exception:  # pragma: no cover - defensive metric increment
+            LOGGER.debug(
+                "metrics.increment_failed",
+                extra={"route": route, "status_class": status_class, "outcome": outcome},
+            )
 
     duration = None
     if hasattr(g, "request_start_time"):
         duration = max(time.time() - g.request_start_time, 0)
     try:
-        HTTP_REQUEST_DURATION_SECONDS.labels(
-            _normalise_http_method(request.method),
-            route,
-            status_class,
-            provider_mode,
-            outcome,
-        ).observe(duration or 0.0)
+        if METRICS_MODE == "normal":
+            HTTP_REQUEST_DURATION_SECONDS.labels(
+                _normalise_http_method(request.method),
+                route,
+                status_class,
+                provider_mode,
+                outcome,
+            ).observe(duration or 0.0)
     except Exception:  # pragma: no cover - defensive metric observation
         LOGGER.debug("metrics.duration_observe_failed", extra={"route": route})
-    if outcome == "rate_limited" and _is_relay_inference_route(route):
+    if METRICS_MODE == "normal" and outcome == "rate_limited" and _is_relay_inference_route(route):
         _record_terminal_outcome("rate_limited")
 
     if endpoint not in IGNORED_LOG_ENDPOINTS and request.path.rstrip("/") != "/metrics":

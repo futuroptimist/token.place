@@ -249,7 +249,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "2a57b24252d4667be561f7ba369ca201efb048752b7abe70829997937751085f"  # pragma: allowlist secret
+    expected_digest = "14c79fd64c7ede9d12172e4904a9a2c4414c916f3e7a481d9ddcb3134af942e3"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -267,8 +267,9 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     assert "string.len(rv[8])>max_response_envelope" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "if terminal_expiry<=now then" in RETRIEVE_RESPONSE_SCRIPT.source
     assert RETRIEVE_RESPONSE_SCRIPT.source.index("local response_exists=") < (
-        RETRIEVE_RESPONSE_SCRIPT.source.index("if terminal_expiry<=now then")
+        RETRIEVE_RESPONSE_SCRIPT.source.rindex("if terminal_expiry<=now then")
     )
+    assert "return {'completed_unavailable'}" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "rv[9]~=tv[9]" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "rv[11]~=tv[10]" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "return {'acknowledged',tv[9],tv[8],tv[13]}" in RETRIEVE_RESPONSE_SCRIPT.source
@@ -280,8 +281,8 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
 @pytest.mark.parametrize(
     ("script", "digest"),
     (
-        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "744e4377d900e56fdc359b674c480b94658e68a32af424673654630728750dc7"),
-        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "c2dacc5a3f5fc00c2bd0295c1e0461708497d812bc986760ca5b31bbc1920898"),
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "9be4cab128a2b78eccb75f3d6b48e6504ea28056c96a747bd5c5a9453dbdb902"),
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "1ed4b4897519322337fbffa65d4088c2c5f7569355bd02b34bee6bb19c571327"),
     ),
 )
 def test_control_transition_scripts_are_digest_pinned(script, digest):

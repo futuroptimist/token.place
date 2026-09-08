@@ -114,7 +114,24 @@ def setup_logging() -> logging.Logger:
 
 LOGGER = setup_logging()
 
+METRICS_MODE_ENV = "TOKENPLACE_METRICS_MODE"
+METRICS_MODES = ("normal", "degraded")
 
+
+def _load_metrics_mode() -> str:
+    """Load the immutable startup metrics mode, rejecting ambiguous values."""
+
+    value = os.environ.get(METRICS_MODE_ENV)
+    if value is None:
+        return "normal"
+    if value not in METRICS_MODES:
+        raise ValueError(
+            f"{METRICS_MODE_ENV} must be exactly one of: {', '.join(METRICS_MODES)}"
+        )
+    return value
+
+
+METRICS_MODE = _load_metrics_mode()
 RELAY_METRICS_REGISTRY = CollectorRegistry()
 _METRICS_INITIALIZED = False
 
@@ -432,6 +449,7 @@ def create_app() -> Flask:
         metrics_registry=RELAY_METRICS_REGISTRY,
         metrics_export_defaults=False,
         metrics_path=None,
+        install_application_metrics=METRICS_MODE == "normal",
     )
     LOGGER.info(
         "relay.app.initialized",
@@ -487,8 +505,10 @@ class _NoopMetric:
         return None
 
 
-def _collector(name: str, factory):
+def _collector(name: str, factory, *, normal_only: bool = True):
     global _METRICS_CONSTRUCTION_FAILED
+    if normal_only and METRICS_MODE == "degraded":
+        return _NoopMetric()
     try:
         return factory()
     except Exception:
@@ -578,10 +598,21 @@ RELAY_COMPUTE_CONTROL_LEASE_RENEWALS_TOTAL = _collector(
 BUILD_INFO = _collector(
     "tokenplace_build_info",
     lambda: Gauge("tokenplace_build_info", "token.place build metadata.", ["version", "revision"], registry=RELAY_METRICS_REGISTRY),
+    normal_only=False,
 )
 INSTRUMENTATION_UP = _collector(
     "tokenplace_instrumentation_up",
     lambda: Gauge("tokenplace_instrumentation_up", "Whether relay metrics instrumentation initialized.", registry=RELAY_METRICS_REGISTRY),
+    normal_only=False,
+)
+METRICS_DEGRADED = _collector(
+    "tokenplace_metrics_degraded",
+    lambda: Gauge(
+        "tokenplace_metrics_degraded",
+        "Whether the explicit emergency bounded-metrics mode is active.",
+        registry=RELAY_METRICS_REGISTRY,
+    ),
+    normal_only=False,
 )
 
 
@@ -589,19 +620,21 @@ def _initialise_metric_labels() -> None:
     if _METRICS_CONSTRUCTION_FAILED:
         INSTRUMENTATION_UP.set(0)
         return
-    for outcome in OUTCOME_ENUM:
-        RELAY_REQUEST_OUTCOMES_TOTAL.labels(outcome)
-    for reason in EVICTION_REASON_ENUM:
-        COMPUTE_NODE_EVICTIONS_TOTAL.labels(reason)
-    for state in ("active", "cancelled", "expired", "acknowledged", "completed_unavailable"):
-        RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL.labels(state)
-    RELAY_QUEUE_DEPTH.labels("relay").set(0)
-    RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
+    if METRICS_MODE == "normal":
+        for outcome in OUTCOME_ENUM:
+            RELAY_REQUEST_OUTCOMES_TOTAL.labels(outcome)
+        for reason in EVICTION_REASON_ENUM:
+            COMPUTE_NODE_EVICTIONS_TOTAL.labels(reason)
+        for state in ("active", "cancelled", "expired", "acknowledged", "completed_unavailable"):
+            RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL.labels(state)
+        RELAY_QUEUE_DEPTH.labels("relay").set(0)
+        RELAY_OLDEST_QUEUED_REQUEST_AGE_SECONDS.labels("relay").set(0)
     BUILD_INFO.labels(
         BUILD_METADATA.get("version", "dev"),
         _build_revision_label(BUILD_METADATA),
     ).set(1)
     INSTRUMENTATION_UP.set(1)
+    METRICS_DEGRADED.set(1 if METRICS_MODE == "degraded" else 0)
     global _METRICS_INITIALIZED
     _METRICS_INITIALIZED = True
 
@@ -673,6 +706,8 @@ def _outcome_for_response(response: Response) -> str:
 
 
 def _record_terminal_outcome(outcome: str) -> None:
+    if METRICS_MODE == "degraded":
+        return
     if outcome not in OUTCOME_ENUM:
         outcome = "failed"
     try:
@@ -749,6 +784,8 @@ def _metrics_token_is_valid() -> bool:
 
 
 def _update_runtime_gauges() -> None:
+    if METRICS_MODE == "degraded":
+        return
     now_wall = time.time()
     now_mono = time.monotonic()
     queue_depth = 0
@@ -1762,7 +1799,7 @@ def _record_request_start():
     g.request_id = request.headers.get("X-Request-Id") or secrets.token_hex(8)
     if request.path.rstrip("/") == "/metrics" and not _metrics_token_is_valid():
         return Response("unauthorized\n", status=401, mimetype="text/plain")
-    if request.path.rstrip("/") == "/metrics":
+    if request.path.rstrip("/") == "/metrics" and METRICS_MODE == "normal":
         try:
             _update_runtime_gauges()
         except Exception:
@@ -1780,29 +1817,31 @@ def _log_request(response: Response):
     outcome = _outcome_for_response(response)
     provider_mode = "relay"
 
-    try:
-        REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
-        HTTP_REQUESTS_TOTAL.labels(_normalise_http_method(request.method), route, status_class, provider_mode, outcome).inc()
-    except Exception:  # pragma: no cover - defensive metric increment
-        LOGGER.debug(
-            "metrics.increment_failed",
-            extra={"route": route, "status_class": status_class, "outcome": outcome},
-        )
+    if METRICS_MODE == "normal":
+        try:
+            REQUEST_COUNTER.labels(request.method, endpoint, status_code).inc()
+            HTTP_REQUESTS_TOTAL.labels(_normalise_http_method(request.method), route, status_class, provider_mode, outcome).inc()
+        except Exception:  # pragma: no cover - defensive metric increment
+            LOGGER.debug(
+                "metrics.increment_failed",
+                extra={"route": route, "status_class": status_class, "outcome": outcome},
+            )
 
     duration = None
     if hasattr(g, "request_start_time"):
         duration = max(time.time() - g.request_start_time, 0)
-    try:
-        HTTP_REQUEST_DURATION_SECONDS.labels(
-            _normalise_http_method(request.method),
-            route,
-            status_class,
-            provider_mode,
-            outcome,
-        ).observe(duration or 0.0)
-    except Exception:  # pragma: no cover - defensive metric observation
-        LOGGER.debug("metrics.duration_observe_failed", extra={"route": route})
-    if outcome == "rate_limited" and _is_relay_inference_route(route):
+    if METRICS_MODE == "normal":
+        try:
+            HTTP_REQUEST_DURATION_SECONDS.labels(
+                _normalise_http_method(request.method),
+                route,
+                status_class,
+                provider_mode,
+                outcome,
+            ).observe(duration or 0.0)
+        except Exception:  # pragma: no cover - defensive metric observation
+            LOGGER.debug("metrics.duration_observe_failed", extra={"route": route})
+    if METRICS_MODE == "normal" and outcome == "rate_limited" and _is_relay_inference_route(route):
         _record_terminal_outcome("rate_limited")
 
     if endpoint not in IGNORED_LOG_ENDPOINTS and request.path.rstrip("/") != "/metrics":
@@ -2488,6 +2527,8 @@ api_v1_control_tombstones_lock = threading.Lock()
 
 
 def _record_compute_control_state(state: str) -> None:
+    if METRICS_MODE == "degraded":
+        return
     if state not in {"active", "cancelled", "expired", "acknowledged", "completed_unavailable"}:
         state = "completed_unavailable"
     try:
@@ -2497,6 +2538,8 @@ def _record_compute_control_state(state: str) -> None:
 
 
 def _record_compute_control_lease_renewal() -> None:
+    if METRICS_MODE == "degraded":
+        return
     try:
         RELAY_COMPUTE_CONTROL_LEASE_RENEWALS_TOTAL.inc()
     except Exception:

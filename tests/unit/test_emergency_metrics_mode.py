@@ -114,6 +114,24 @@ print(json.dumps({"status": response.status_code, "body": response.get_data(as_t
                   "mode": relay.METRICS_MODE}))
 '''
 
+NORMAL_PROBE = r'''
+import json, re, relay
+from prometheus_client.parser import text_string_to_metric_families
+with relay.app.test_client() as client:
+    health = {path: client.get(path).status_code for path in ("/livez", "/healthz")}
+    unauthorized = client.get("/metrics").status_code
+    response = client.get("/metrics", headers={"Authorization": "Bearer metrics-credential-sentinel"})
+body = response.get_data(as_text=True)
+list(text_string_to_metric_families(body))
+families = {
+    name for name in re.findall(r"^# HELP (\S+)", body, re.MULTILINE)
+    if not name.endswith("_created")
+}
+print(json.dumps({"mode": relay.METRICS_MODE, "families": sorted(families),
+                  "quota": "tokenplace_public_quota_counter" in relay.app.extensions,
+                  "health": health, "unauthorized": unauthorized, "authorized": response.status_code}))
+'''
+
 
 def _run_probe(source: str, mode: str | None, **extra: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
@@ -133,50 +151,28 @@ def _probe(mode: str | None) -> dict[str, object]:
     return json.loads(completed.stdout.splitlines()[-1])
 
 
+def _normal_probe(mode: str | None) -> dict[str, object]:
+    completed = _run_probe(NORMAL_PROBE, mode)
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout.splitlines()[-1])
+    assert result == {
+        "mode": "normal",
+        "families": sorted(EXPECTED_NORMAL_FAMILIES),
+        "quota": True,
+        "health": {"/livez": 200, "/healthz": 200},
+        "unauthorized": 401,
+        "authorized": 200,
+    }
+    return result
+
+
 @pytest.mark.parametrize("mode", (None, "normal"))
 def test_normal_mode_preserves_complete_bounded_registry(mode: str | None) -> None:
-    source = r'''
-import json, re, relay
-from prometheus_client.parser import text_string_to_metric_families
-with relay.app.test_client() as client:
-    health = {path: client.get(path).status_code for path in ("/livez", "/healthz")}
-    unauthorized = client.get("/metrics").status_code
-    response = client.get("/metrics", headers={"Authorization": "Bearer metrics-credential-sentinel"})
-body = response.get_data(as_text=True)
-families = {
-    name for name in re.findall(r"^# HELP (\S+)", body, re.MULTILINE)
-    if not name.endswith("_created")
-}
-print(json.dumps({"mode": relay.METRICS_MODE, "families": sorted(families),
-                  "quota": "tokenplace_public_quota_counter" in relay.app.extensions,
-                  "health": health, "unauthorized": unauthorized, "authorized": response.status_code}))
-'''
-    completed = _run_probe(source, mode)
-    assert completed.returncode == 0
-    result = json.loads(completed.stdout.splitlines()[-1])
-    assert result["mode"] == "normal"
-    assert result["quota"] is True
-    assert result["health"] == {"/livez": 200, "/healthz": 200}
-    assert (result["unauthorized"], result["authorized"]) == (401, 200)
-    assert set(result["families"]) == EXPECTED_NORMAL_FAMILIES
+    _normal_probe(mode)
 
 
 def test_unset_and_explicit_normal_registries_match() -> None:
-    source = r'''
-import json, relay
-from prometheus_client.parser import text_string_to_metric_families
-body = relay.generate_latest(relay.RELAY_METRICS_REGISTRY).decode()
-samples = sorted(sample.name for family in text_string_to_metric_families(body)
-                 for sample in family.samples)
-print(json.dumps({"samples": samples,
-                  "quota": "tokenplace_public_quota_counter" in relay.app.extensions}))
-'''
-    results = []
-    for mode in (None, "normal"):
-        completed = _run_probe(source, mode)
-        assert completed.returncode == 0, completed.stderr
-        results.append(json.loads(completed.stdout.splitlines()[-1]))
-    assert results[0] == results[1]
+    assert _normal_probe(None) == _normal_probe("normal")
 
 
 def test_degraded_mode_is_exactly_three_stable_private_series_without_state() -> None:
@@ -254,14 +250,4 @@ def test_fresh_process_can_restore_normal_after_degraded() -> None:
     assert _probe("degraded")["samples"] == [
         "tokenplace_build_info", "tokenplace_instrumentation_up", "tokenplace_metrics_degraded",
     ]
-    restored = _probe("normal")
-    assert restored["mode"] == "normal"
-    assert restored["quota_extension"] is True
-    restored_samples = set(restored["samples"])
-    assert {
-        "tokenplace_build_info",
-        "tokenplace_compute_node_lease_age_seconds",
-        "tokenplace_http_request_duration_seconds_count",
-        "tokenplace_public_http_quota_outcomes_total",
-        "tokenplace_relay_requests_total",
-    }.issubset(restored_samples)
+    _normal_probe("normal")

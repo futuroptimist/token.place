@@ -510,6 +510,12 @@ def _collector(name: str, factory, *, degraded: bool = False):
     try:
         return factory()
     except Exception:
+        if METRICS_MODE == "degraded" and name == "tokenplace_metrics_degraded":
+            LOGGER.critical(
+                "metrics.degraded_indicator_construction_failed",
+                extra={"reason": "degraded_indicator_construction_failed"},
+            )
+            raise RuntimeError("required degraded metrics indicator unavailable") from None
         _METRICS_CONSTRUCTION_FAILED = True
         LOGGER.error(
             "metrics.collector_construction_failed",
@@ -611,6 +617,9 @@ METRICS_DEGRADED = _collector(
 
 
 def _initialise_metric_labels() -> None:
+    # The emergency-state indicator is independent of the rest of metrics
+    # initialization: publish it before considering failures in other collectors.
+    METRICS_DEGRADED.set(1 if METRICS_MODE == "degraded" else 0)
     if _METRICS_CONSTRUCTION_FAILED:
         INSTRUMENTATION_UP.set(0)
         return
@@ -628,7 +637,6 @@ def _initialise_metric_labels() -> None:
         _build_revision_label(BUILD_METADATA),
     ).set(1)
     INSTRUMENTATION_UP.set(1)
-    METRICS_DEGRADED.set(1 if METRICS_MODE == "degraded" else 0)
     global _METRICS_INITIALIZED
     _METRICS_INITIALIZED = True
 
@@ -866,6 +874,8 @@ except Exception:
         INSTRUMENTATION_UP.set(0)
     except Exception:
         pass
+    if METRICS_MODE == "degraded":
+        raise RuntimeError("required degraded metrics initialization failed") from None
 
 
 

@@ -121,7 +121,6 @@ Environment variables can be stored in a `.env` file and overridden in a `.env.l
 | SERVICE_NAME    | token.place  | Service identifier returned by health endpoints (whitespace-only overrides
 |                 |              | fall back to `token.place`)                                             |
 | API_DAILY_QUOTA | 1000/day     | Per-IP daily request quota; the public UI and release-metadata `GET`/`HEAD` routes listed above do not consume it |
-| TOKENPLACE_METRICS_MODE | normal | Startup-only application metrics mode; accepts exactly `normal` or emergency `degraded` (see [the operator procedure](docs/ops/emergency-metrics-mode.md)) |
 | USE_MOCK_LLM    | 0            | Use mock LLM instead of downloading a model (`1` to enable)        |
 | TOKEN_PLACE_ENV | development  | Deployment environment (`development`, `testing`, `production`)    |
 | CONTENT_MODERATION_MODE | disabled     | Set to `block` to enable request filtering before inference           |

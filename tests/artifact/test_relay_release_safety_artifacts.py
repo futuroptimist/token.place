@@ -23,6 +23,8 @@ QUOTA_IDS = {
     "quota.public_information_exempt",
     "quota.protected_rate_limited",
     "quota.protected_daily_limited",
+    "quota.mutating_rate_limited",
+    "quota.mutating_daily_limited",
 }
 
 
@@ -109,6 +111,8 @@ def test_historical_artifact_fails_both_incident_contracts(tmp_path: Path) -> No
     assert report["results"]["quota.public_information_exempt"]["passed"] is False
     assert report["results"]["quota.protected_rate_limited"]["passed"] is True
     assert report["results"]["quota.protected_daily_limited"]["passed"] is True
+    assert report["results"]["quota.mutating_rate_limited"]["passed"] is True
+    assert report["results"]["quota.mutating_daily_limited"]["passed"] is True
 
 
 def test_reenabled_flask_defaults_fails_only_metrics_incident(tmp_path: Path) -> None:

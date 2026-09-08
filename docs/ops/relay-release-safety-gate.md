@@ -1,8 +1,10 @@
 # Relay release safety gate
 
 Every production-eligible relay image publication is blocked on the behavioral contract in
-`config/relay_release_safety_contract.json`. The gate starts the built candidate image with an
-isolated, deliberately small quota and tests its HTTP and Prometheus surfaces. It does not query
+`config/relay_release_safety_contract.json`. The gate starts the built candidate image in isolated
+containers and tests its HTTP and Prometheus surfaces. The metrics container uses quota
+ceilings above the 2,048-request cardinality probe, while each deliberately small quota check gets
+a fresh container so no check consumes another check's state. It does not query
 staging or production, inspect commit ancestry, or record requests, client identity, credentials,
 or sampled paths.
 
@@ -37,6 +39,15 @@ platform and records the OCI index digest in the
 workflow summary. Missing, duplicate, skipped, malformed, mismatched, or false results fail
 closed. The report intentionally excludes request bodies, credentials, client identities, logs, and
 the randomized unmatched paths used by the probe.
+
+The metrics check sends two successive batches of 1,024 distinct randomized unmatched paths and
+records only each fixed batch size and bounded series-growth counts. It rejects default Flask
+metric families, raw/generated path labels, transformed per-path label growth, malformed metrics,
+and continued growth after the first batch. Quota checks independently prove the exact public
+`GET`/`HEAD` exemptions (`/`, `/api/v1/meta`, and `/api/v1/version`), the protected read
+`GET /api/v1/models`, and the mutating `POST /api/v1/relay/requests`. The mutating probe sends no
+body: its expected normal `400` validation response cannot enqueue a request, and the next request
+must receive `429`. Evidence retains only response classes, never request or response content.
 
 The evidence distinguishes `failed` from `not_run` checks and uses sanitized error categories.
 `startup_timeout` means the bounded readiness deadline expired (transient connection resets are

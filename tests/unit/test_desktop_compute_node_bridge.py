@@ -803,6 +803,17 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
         'maybe_reexec_for_runtime_refresh',
         lambda _setup, *, allow_reexec=True: None,
     )
+    # Runtime-focused tests must not inspect or provision the host interpreter.
+    # Tests of dependency failures and provisioning events replace this double.
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {
+            'ok': 'true',
+            'missing': '',
+            'action': 'already_available',
+        },
+    )
 
 
 def _reset_cancel_queue():
@@ -2254,6 +2265,21 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
 
     monkeypatch.setattr('builtins.__import__', fake_import)
     monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'true', 'missing': '', 'action': 'already_available'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {'runtime_action': 'probe_only'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup, *, allow_reexec=True: None,
+    )
+    monkeypatch.setattr(
         sys,
         'argv',
         [
@@ -3431,13 +3457,32 @@ def test_module_import_does_not_load_context_profiles_before_preflight(monkeypat
     assert 'model_path' not in payload
 
 
-def test_utils_package_keeps_lazy_convenience_exports():
+def test_utils_package_keeps_lazy_convenience_exports(monkeypatch):
     import utils
 
+    sentinels = {
+        'get_model_manager': object(),
+        'get_crypto_manager': object(),
+        'RelayClient': object(),
+    }
+    modules = {
+        'utils.llm.model_manager': ModuleType('utils.llm.model_manager'),
+        'utils.crypto.crypto_manager': ModuleType('utils.crypto.crypto_manager'),
+        'utils.networking.relay_client': ModuleType('utils.networking.relay_client'),
+    }
+    modules['utils.llm.model_manager'].get_model_manager = sentinels['get_model_manager']
+    modules['utils.crypto.crypto_manager'].get_crypto_manager = sentinels['get_crypto_manager']
+    modules['utils.networking.relay_client'].RelayClient = sentinels['RelayClient']
+    for module_name, module in modules.items():
+        monkeypatch.setitem(sys.modules, module_name, module)
+    for export_name in sentinels:
+        if export_name in utils.__dict__:
+            monkeypatch.delattr(utils, export_name)
+
     assert utils.get_temp_dir
-    assert utils.get_model_manager
-    assert utils.get_crypto_manager
-    assert utils.RelayClient
+    assert utils.get_model_manager is sentinels['get_model_manager']
+    assert utils.get_crypto_manager is sentinels['get_crypto_manager']
+    assert utils.RelayClient is sentinels['RelayClient']
     assert {
         'get_model_manager',
         'get_crypto_manager',
@@ -6688,6 +6733,13 @@ def test_windows_packaged_e2e_sets_up_rust_before_cargo_regressions() -> None:
 def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsys, monkeypatch):
     calls = []
 
+    class ChildPathRuntime(FakeRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.model_manager.child_model_path_exists = True
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ChildPathRuntime)
+
     monkeypatch.setattr(
         compute_node_bridge,
         'ensure_desktop_python_dependencies',
@@ -6704,13 +6756,6 @@ def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsy
     )
     monkeypatch.setattr(compute_node_bridge, 'maybe_reexec_for_runtime_refresh', lambda _setup: None)
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
-
-    class ChildPathRuntime(FakeRuntime):
-        def __init__(self, config):
-            super().__init__(config)
-            self.model_manager.child_model_path_exists = True
-
-    _install_fake_runtime_module(monkeypatch, runtime_cls=ChildPathRuntime)
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -7279,6 +7324,13 @@ sys.path.insert(0, {repo_root!r})
 import utils.networking.relay_client as rcm
 rcm._API_V1_CLEANUP_BUDGET_SECONDS = 0.2
 
+# Any accidental control/heartbeat/progress transport is a distinct hard failure,
+# rather than an exception the supervisor could catch before reaching teardown.
+def unexpected_network(*_args, **_kwargs):
+    print('UNEXPECTED_NETWORK_FROM_FATAL_CHILD', file=sys.stderr, flush=True)
+    os._exit(86)
+rcm.requests.post = unexpected_network
+
 # Create a minimal RelayClient.
 from unittest.mock import MagicMock, patch
 crypto = MagicMock()
@@ -7343,8 +7395,8 @@ sys.exit(0)
         text=True,
     )
 
-    assert result.returncode != 0, (
-        f"Expected nonzero exit from bridge fatal_bridge_teardown, "
+    assert result.returncode == 1, (
+        f"Expected exit 1 from bridge fatal_bridge_teardown, "
         f"got {result.returncode}. stdout: {result.stdout!r} stderr: {result.stderr!r}"
     )
     assert 'MARKER_REACHED_AFTER_SUPERVISE' not in result.stdout, (
@@ -7353,6 +7405,7 @@ sys.exit(0)
     assert 'fatal_teardown' in result.stderr, (
         f"Expected 'fatal_teardown' lifecycle log in stderr: {result.stderr!r}"
     )
+    assert 'UNEXPECTED_NETWORK_FROM_FATAL_CHILD' not in result.stderr
 
 
 def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inference(capsys, monkeypatch):

@@ -1481,14 +1481,14 @@ def test_claim_input_and_acknowledgement_validation_precede_dispatch():
         store.claimed_request("node-a", "")
     with pytest.raises(RelayStateStoreError, match="claim generation"):
         store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 0)
-    with pytest.raises(RelayStateStoreError, match="control tombstones"):
+    with pytest.raises(RelayStateStoreError, match="claim generation"):
         store.renew_claim_or_read_control(
             "node-a",
             "a" * 64,
             "consumer",
             "client",
             "request",
-            1,
+            0,
             acknowledge=True,
         )
     foundation.execute.assert_not_called()

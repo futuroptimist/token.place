@@ -699,7 +699,9 @@ class FalseErrorHeartbeatRuntime(FakeRuntime):
         self._processed = []
 
 
-def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
+def _install_fake_runtime_module(
+    monkeypatch, runtime_cls=FakeRuntime, *, isolate_dependencies=True
+):
     module = ModuleType('utils.compute_node_runtime')
 
     supported_modes = {'auto', 'cpu', 'gpu', 'hybrid'}
@@ -786,6 +788,12 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     module.apply_compute_mode = _apply_compute_mode
     module.compute_mode_diagnostics = _compute_mode_diagnostics
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    if isolate_dependencies:
+        monkeypatch.setattr(
+            compute_node_bridge,
+            'ensure_desktop_python_dependencies',
+            lambda **_kwargs: {'ok': 'true'},
+        )
     monkeypatch.setattr(
         compute_node_bridge,
         'ensure_desktop_llama_runtime',
@@ -2254,6 +2262,28 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
 
     monkeypatch.setattr('builtins.__import__', fake_import)
     monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'true'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda *_args, **_kwargs: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'skipped',
+            'interpreter': sys.executable,
+            'llama_module_path': 'fixture',
+            'fallback_reason': '',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
         sys,
         'argv',
         [
@@ -3431,13 +3461,31 @@ def test_module_import_does_not_load_context_profiles_before_preflight(monkeypat
     assert 'model_path' not in payload
 
 
-def test_utils_package_keeps_lazy_convenience_exports():
+def test_utils_package_keeps_lazy_convenience_exports(monkeypatch):
     import utils
 
-    assert utils.get_temp_dir
-    assert utils.get_model_manager
-    assert utils.get_crypto_manager
-    assert utils.RelayClient
+    sentinels = {
+        'get_model_manager': object(),
+        'get_crypto_manager': object(),
+        'RelayClient': object(),
+    }
+    modules = {
+        'utils.llm.model_manager': ModuleType('utils.llm.model_manager'),
+        'utils.crypto.crypto_manager': ModuleType('utils.crypto.crypto_manager'),
+        'utils.networking.relay_client': ModuleType('utils.networking.relay_client'),
+    }
+    modules['utils.llm.model_manager'].get_model_manager = sentinels['get_model_manager']
+    modules['utils.crypto.crypto_manager'].get_crypto_manager = sentinels['get_crypto_manager']
+    modules['utils.networking.relay_client'].RelayClient = sentinels['RelayClient']
+    for export_name in sentinels:
+        monkeypatch.delitem(utils.__dict__, export_name, raising=False)
+    for module_name, module in modules.items():
+        monkeypatch.setitem(sys.modules, module_name, module)
+
+    assert utils.get_temp_dir is not None
+    assert utils.get_model_manager is sentinels['get_model_manager']
+    assert utils.get_crypto_manager is sentinels['get_crypto_manager']
+    assert utils.RelayClient is sentinels['RelayClient']
     assert {
         'get_model_manager',
         'get_crypto_manager',
@@ -6710,7 +6758,9 @@ def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsy
             super().__init__(config)
             self.model_manager.child_model_path_exists = True
 
-    _install_fake_runtime_module(monkeypatch, runtime_cls=ChildPathRuntime)
+    _install_fake_runtime_module(
+        monkeypatch, runtime_cls=ChildPathRuntime, isolate_dependencies=False
+    )
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -7262,6 +7312,7 @@ def test_bridge_fatal_composition_via_wire_fatal_teardown_exits_subprocess(tmp_p
     repo_root = str(MODULE_PATH.parents[3])
     bridge_python_dir = str(MODULE_PATH.parent)
     bridge_path = str(MODULE_PATH)
+    network_marker = tmp_path / 'unexpected_network_use'
 
     child_script = tmp_path / 'child_bridge_fatal.py'
     child_script.write_text(
@@ -7279,6 +7330,13 @@ sys.path.insert(0, {repo_root!r})
 import utils.networking.relay_client as rcm
 rcm._API_V1_CLEANUP_BUDGET_SECONDS = 0.2
 
+network_marker = {str(network_marker)!r}
+def fail_network(*_args, **_kwargs):
+    with open(network_marker, 'w', encoding='utf-8') as marker:
+        marker.write('requests.post called')
+    raise AssertionError('fatal-child fixture attempted real HTTP')
+rcm.requests.post = fail_network
+
 # Create a minimal RelayClient.
 from unittest.mock import MagicMock, patch
 crypto = MagicMock()
@@ -7292,6 +7350,10 @@ with patch('utils.networking.relay_client.get_config_lazy', return_value=config)
 
 client._last_api_v1_work_relay_url = 'http://relay.example'
 client._polling_stopped_by_request = False
+client._post_api_v1_request_control = lambda **_kwargs: {{
+    'status': 'active',
+    'next_poll_seconds': 30,
+}}
 
 # Inference blocks forever so the quiescence check always times out.
 release_inference = threading.Event()
@@ -7343,8 +7405,8 @@ sys.exit(0)
         text=True,
     )
 
-    assert result.returncode != 0, (
-        f"Expected nonzero exit from bridge fatal_bridge_teardown, "
+    assert result.returncode == 1, (
+        f"Expected exit 1 from bridge fatal_bridge_teardown, "
         f"got {result.returncode}. stdout: {result.stdout!r} stderr: {result.stderr!r}"
     )
     assert 'MARKER_REACHED_AFTER_SUPERVISE' not in result.stdout, (
@@ -7353,6 +7415,7 @@ sys.exit(0)
     assert 'fatal_teardown' in result.stderr, (
         f"Expected 'fatal_teardown' lifecycle log in stderr: {result.stderr!r}"
     )
+    assert not network_marker.exists(), 'Fatal-child fixture attempted real HTTP'
 
 
 def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inference(capsys, monkeypatch):

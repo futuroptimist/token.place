@@ -3017,6 +3017,193 @@ def test_cancellation_is_shared_retrievable_and_retains_only_live_control(
         second.close()
 
 
+
+@pytest.mark.parametrize("retrieval_state", ("response_ready", "acknowledged", "retrieval_expired"))
+@pytest.mark.parametrize("transition", ("cancelled", "expired"))
+def test_cancel_or_expire_after_completed_response_preserves_authority(
+    valkey_server, retrieval_state, transition
+):
+    namespace = uuid.uuid4().hex
+    options = {
+        "terminal_retention_seconds": 30,
+        "control_tombstone_ttl_seconds": 30,
+        "response_replay_ttl_seconds": 10,
+    }
+    if retrieval_state == "retrieval_expired":
+        options["response_replay_ttl_seconds"] = 0.05
+    first = _registration_store(valkey_server, namespace, **options)
+    second = _registration_store(valkey_server, namespace, **options)
+    node, owner, consumer = "completed-race-node", _digest("completed-race-owner"), "consumer"
+    identity = (f"completed-{retrieval_state}-{transition}", "request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "response-iv"
+    )
+    try:
+        first.register(node, _capabilities(), owner)
+        deadline = first._foundation.server_time()[0] + 2
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        first.enqueue_encrypted_request(
+            *identity, selection.reservation_token, node, "qwen3-8b-instruct", "8k-fast",
+            deadline, EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request-ciphertext", "request-key", "request-iv"
+            ), "cancel",
+        )
+        claim = first.claim_queued_request(node, owner, consumer)
+        accepted = first.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation, envelope
+        )
+        if retrieval_state == "acknowledged":
+            ready = second.retrieve_encrypted_response(*identity, selection.reservation_token)
+            second.retrieve_encrypted_response(
+                *identity, selection.reservation_token, ready.acknowledgement_token
+            )
+        elif retrieval_state == "retrieval_expired":
+            _wait_for_server_epoch(first, accepted.replay_expires_at_epoch)
+            first._cleanup_completed_records()
+        keys, _ = _response_acceptance_authority(first, node, identity)
+        before = _exact_key_snapshot(first, keys)
+        result = second.cancel_or_expire_request(
+            *identity,
+            "cancel" if transition == "cancelled" else None,
+            status=transition,
+            reason=(
+                "requester_cancelled"
+                if transition == "cancelled"
+                else "request_deadline_expired"
+            ),
+        )
+        assert (result.state, result.reason, result.new_outcome) == (
+            "completed", "response_completed", False
+        )
+        assert _exact_key_snapshot(first, keys) == before
+        if transition == "cancelled":
+            invalid = first.cancel_or_expire_request(*identity, "wrong")
+            assert invalid.state == invalid.reason == "invalid_cancellation_proof"
+            assert _exact_key_snapshot(first, keys) == before
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize("transition", ("cancelled", "expired"))
+def test_accept_response_after_cancel_or_expire_preserves_authority(
+    valkey_server, transition
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server, namespace, terminal_retention_seconds=30,
+        control_tombstone_ttl_seconds=30, response_replay_ttl_seconds=30,
+    )
+    second = _registration_store(
+        valkey_server, namespace, terminal_retention_seconds=30,
+        control_tombstone_ttl_seconds=30, response_replay_ttl_seconds=30,
+    )
+    node, owner, consumer = f"{transition}-winner-node", _digest(f"{transition}-owner"), "consumer"
+    identity = (f"{transition}-winner-client", "request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "response-iv"
+    )
+    try:
+        first.register(node, _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + (0.15 if transition == "expired" else 10)
+        _enqueue_claim_fixture(first, node, owner, *identity, deadline)
+        claim = first.claim_queued_request(node, owner, consumer)
+        if transition == "expired":
+            _wait_for_server_epoch(first, deadline)
+        first.cancel_or_expire_request(
+            *identity, "cancel" if transition == "cancelled" else None,
+            status=transition,
+            reason="requester_cancelled" if transition == "cancelled" else "request_deadline_expired",
+        )
+        keys, member = _response_acceptance_authority(first, node, identity)
+        cfg = first._foundation.config
+        client, request = first._identity(*identity)
+        node_digest = first._node_digest(node)
+        control_key = cfg.key("control", node_digest, client, request)
+        control_index = cfg.key("control:expiry")
+        before = (_exact_key_snapshot(first, keys), first._foundation._client.hgetall(control_key),
+                  first._foundation._client.zscore(control_index, f"{node_digest}:{member}"))
+        with pytest.raises(RelayStateConflict, match="response lifecycle conflict"):
+            second.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, envelope
+            )
+        after = (_exact_key_snapshot(first, keys), first._foundation._client.hgetall(control_key),
+                 first._foundation._client.zscore(control_index, f"{node_digest}:{member}"))
+        assert after == before
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first._foundation._client.delete(first._foundation.config.key("control:expiry"))
+        first.close()
+        second.close()
+
+
+def test_terminal_race_returns_authoritative_domain_outcome(valkey_server):
+    namespace = uuid.uuid4().hex
+    stores = tuple(_registration_store(valkey_server, namespace) for _ in range(2))
+    node, owner, consumer = "terminal-race-node", _digest("terminal-race-owner"), "consumer"
+    identity = ("terminal-race-client", "terminal-race-request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "response-iv"
+    )
+    barrier = Barrier(2)
+    try:
+        stores[0].register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(stores[0], node, owner, *identity, time.time() + 60)
+        claim = stores[0].claim_queued_request(node, owner, consumer)
+
+        def cancel():
+            barrier.wait()
+            return stores[0].cancel_or_expire_request(*identity, "cancel")
+
+        def respond():
+            barrier.wait()
+            try:
+                return stores[1].accept_encrypted_response(
+                    node, owner, consumer, *identity, claim.generation, envelope
+                )
+            except RelayStateConflict:
+                return "conflict"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            cancel_result, response_result = (
+                future.result() for future in (executor.submit(cancel), executor.submit(respond))
+            )
+        cfg = stores[0]._foundation.config
+        client, request = stores[0]._identity(*identity)
+        terminal = stores[0]._foundation._client.hgetall(
+            cfg.key("terminal", client, request)
+        )
+        outcome = terminal[b"outcome"].decode()
+        assert outcome in {"cancelled", "completed"}
+        if outcome == "cancelled":
+            assert cancel_result.new_outcome is True and response_result == "conflict"
+        else:
+            assert (cancel_result.state, cancel_result.reason, cancel_result.new_outcome) == (
+                "completed", "response_completed", False
+            )
+            assert response_result.new_outcome is True
+        request_state = stores[0]._foundation._client.hget(
+            cfg.key("request", client, request), "state"
+        ).decode()
+        assert request_state == ("cancelled" if outcome == "cancelled" else "response_ready")
+        assert stores[0]._foundation._client.exists(
+            cfg.key("claim", client, request)
+        ) == 0
+        assert stores[0]._foundation._client.zscore(
+            cfg.key("claims:expiry"), f"{client}:{request}"
+        ) is None
+        assert stores[0]._foundation._client.exists(
+            cfg.key("response", client, request)
+        ) == (0 if outcome == "cancelled" else 1)
+    finally:
+        _delete_claim_fixture_state(stores[0], (node,), (identity,))
+        for store in stores:
+            store.close()
+
 def test_expired_addressed_control_identity_mismatch_is_not_deleted(valkey_server):
     namespace = uuid.uuid4().hex
     first = _registration_store(

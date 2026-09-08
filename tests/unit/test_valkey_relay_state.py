@@ -196,7 +196,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "d101757325aab739bb41ba5bcbb0ae33ee70377ce47db9d9293e5c6503fac4ab"  # pragma: allowlist secret
+    expected_digest = "de2a3e21f044af7a12296b39971053515e508b3eec6ed26bc3a38b54f32463d3"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -282,7 +282,7 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     ("script", "digest"),
     (
         (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "f5d586f732db17aad1669377045cd455840eb2650614e26ba0132c14e8a013c2"),
-        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "f5e3ebf30d79ea45edcacf1820c80b47624175c38bd5a1424712bcbb6e518371"),
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "2cc2c0ffe267d964eb9c58f3e9a85ccd2450a3ea6202163c805be775c60f3978"),
     ),
 )
 def test_control_transition_scripts_are_digest_pinned(script, digest):

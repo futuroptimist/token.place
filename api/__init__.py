@@ -750,7 +750,8 @@ def _install_public_quota_metrics(app, registry) -> None:
         return response
 
 
-def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metrics_path="/metrics"):
+def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metrics_path="/metrics",
+             metrics_instrumentation_enabled=True):
     """Initialize the API with the Flask app.
 
     Relay callers may pass a dedicated Prometheus registry and disable the
@@ -763,7 +764,8 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     # Responses and bounded application telemetry provide the needed signal.
     logging.getLogger("flask-limiter").setLevel(logging.WARNING)
     _install_public_api_v1_cors(app)
-    _install_public_quota_metrics(app, metrics_registry)
+    if metrics_instrumentation_enabled:
+        _install_public_quota_metrics(app, metrics_registry)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {
@@ -791,12 +793,13 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
 
     _install_control_plane_rate_limiter(app, limiter_storage_uri)
 
-    PrometheusMetrics(
-        app,
-        path=metrics_path,
-        export_defaults=metrics_export_defaults,
-        registry=metrics_registry,
-    )
+    if metrics_instrumentation_enabled:
+        PrometheusMetrics(
+            app,
+            path=metrics_path,
+            export_defaults=metrics_export_defaults,
+            registry=metrics_registry,
+        )
     app.register_blueprint(v1_routes.v1_bp)
     app.register_blueprint(v1_routes.openai_v1_bp)
     app.register_blueprint(v2_routes.v2_bp)

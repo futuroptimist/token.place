@@ -66,6 +66,7 @@
       "properties": {
         "enabled": { "type": "boolean", "default": false },
         "path": { "type": "string", "const": "/metrics", "default": "/metrics" },
+        "mode": { "type": "string", "enum": ["normal", "degraded"], "default": "normal" },
         "auth": {
           "type": "object",
           "additionalProperties": false,

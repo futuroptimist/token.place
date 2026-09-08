@@ -14,6 +14,7 @@ import valkey_relay_state
 
 from valkey_relay_state import (
     ACCEPT_RESPONSE_SCRIPT,
+    RETRIEVE_RESPONSE_SCRIPT,
     DirectPrimary,
     ReviewedScript,
     SchemaManifest,
@@ -195,7 +196,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "3559da1040624e6ac52d933a3d116c680d0398243ca4c68b308d0e1c4e10ecd8"  # pragma: allowlist secret
+    expected_digest = "fcbec2f8126ea96834b8196a907aced2fe5e82d41edfbe7f966f2820a89774d8"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -245,6 +246,181 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     assert expiry_guard_offset < ACCEPT_RESPONSE_SCRIPT.source.index(
         "redis.call('XDEL',queue"
     )
+
+
+def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
+    expected_digest = "2a57b24252d4667be561f7ba369ca201efb048752b7abe70829997937751085f"  # pragma: allowlist secret
+    assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
+    assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
+    assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
+    assert not re.search(
+        r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
+        RETRIEVE_RESPONSE_SCRIPT.source,
+    )
+    assert "local t=redis.call('TIME')" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "if replay<=now then" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert RETRIEVE_RESPONSE_SCRIPT.source.index("if replay<=now then") < (
+        RETRIEVE_RESPONSE_SCRIPT.source.index("if mode=='read' then")
+    )
+    assert "expected_envelope~=rv[8]" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "string.len(lv[14])>max_request_envelope" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "string.len(rv[8])>max_response_envelope" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "if terminal_expiry<=now then" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert RETRIEVE_RESPONSE_SCRIPT.source.index("local response_exists=") < (
+        RETRIEVE_RESPONSE_SCRIPT.source.index("if terminal_expiry<=now then")
+    )
+    assert "rv[9]~=tv[9]" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "rv[11]~=tv[10]" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "return {'acknowledged',tv[9],tv[8],tv[13]}" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "local canonical=string.format('%.6f',n)" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "string.format('%.17g',n)==value" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "local function lua_number(value)\n  return lua_float(value)" in RETRIEVE_RESPONSE_SCRIPT.source
+
+
+@pytest.mark.parametrize(
+    ("client", "request_id"),
+    ((None, "request"), ("client", None), ("", "request"), ("client", "")),
+)
+def test_retrieve_response_rejects_invalid_identity_before_backend(client, request_id):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(RelayStateStoreError, match="request identity is invalid"):
+        store.retrieve_encrypted_response(client, request_id, "a" * 64)
+
+    foundation.execute.assert_not_called()
+
+
+def _retrieval_store_with_replies(*replies):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.side_effect = replies
+    return registration_store_with_foundation(foundation)
+
+
+def _ready_retrieval_reply(store, *, acknowledgement_digest=None):
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher", "key", "iv"
+    )
+    envelope_raw = store._serialized_response_envelope(envelope)
+    response_digest = hashlib.sha256(envelope_raw).hexdigest()
+    token = store._derive_acknowledgement_token(
+        store._identity("a" * 64, "b" * 64), 10.0, response_digest
+    )
+    return [
+        b"response_ready",
+        envelope_raw,
+        b"10",
+        b"20",
+        b"30",
+        response_digest.encode(),
+        (
+            acknowledgement_digest
+            or hashlib.sha256(token.encode()).hexdigest().encode()
+        ),
+    ], token
+
+
+@pytest.mark.parametrize(
+    "reply",
+    (
+        [b"invalid_ack"],
+        [b"schema"],
+        [b"unexpected"],
+        [b"response_ready", b"too", b"few"],
+        [b"response_ready", b"envelope", b"10", b"20", b"30", b"digest", 1],
+    ),
+)
+def test_retrieve_response_decodes_fixed_and_malformed_read_results(reply):
+    store = _retrieval_store_with_replies(reply)
+
+    if reply == [b"invalid_ack"]:
+        assert store.retrieve_encrypted_response(
+            "a" * 64, "b" * 64, "c" * 64
+        ).state == "invalid_acknowledgement"
+    else:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        [b"10", b"0" * 64, 1],
+        [b"nan", b"0" * 64, b"0" * 64],
+        [b"10", b"not-a-digest", b"0" * 64],
+    ),
+)
+def test_retrieve_response_rejects_malformed_acknowledged_metadata(metadata):
+    store = _retrieval_store_with_replies([b"acknowledged", *metadata])
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
+
+
+def test_retrieve_response_active_key_mismatch_is_typed_for_read_and_acknowledgement():
+    store = _retrieval_store_with_replies()
+    reply, token = _ready_retrieval_reply(store, acknowledgement_digest=b"0" * 64)
+    store._foundation.execute.side_effect = [reply, reply]
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
+    assert store.retrieve_encrypted_response(
+        "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+    ).state == "invalid_acknowledgement"
+
+
+@pytest.mark.parametrize(
+    ("ack_reply", "expected_status", "raises"),
+    (
+        ([b"invalid_ack"], "invalid_acknowledgement", False),
+        ([b"retrieval_expired"], "retrieval_expired", False),
+        ([b"invalid_credential"], "invalid_retrieval_credential", False),
+        ([b"unexpected"], None, True),
+    ),
+)
+def test_retrieve_response_decodes_fixed_ack_transition_results(
+    ack_reply, expected_status, raises
+):
+    store = _retrieval_store_with_replies()
+    ready, token = _ready_retrieval_reply(store)
+    store._foundation.execute.side_effect = [ready, ack_reply]
+
+    if raises:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store.retrieve_encrypted_response(
+                "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+            )
+    else:
+        result = store.retrieve_encrypted_response(
+            "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+        )
+        assert result.state == expected_status
+
+
+def test_retrieve_response_rejects_mismatched_ack_transition_authority():
+    store = _retrieval_store_with_replies()
+    ready, token = _ready_retrieval_reply(store)
+    store._foundation.execute.side_effect = [
+        ready,
+        [b"acknowledged", b"11", ready[5], ready[6]],
+    ]
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store.retrieve_encrypted_response(
+            "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+        )
 
 
 def config(**changes):

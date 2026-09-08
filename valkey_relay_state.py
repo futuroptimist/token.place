@@ -40,6 +40,7 @@ from relay_state_store import (
     RelayStateStoreConfig,
     RelayStateStoreError,
     ResponseAcceptanceResult,
+    ResponseRetrievalResult,
     ResponseRecord,
     ReservationRecord,
     SchedulerNodeState,
@@ -619,9 +620,10 @@ SCHEDULER_STATE_SCRIPT = ReviewedScript(
 
 SELECT_AND_RESERVE_SOURCE = """\
 local leases, expiries, deadlines, cursor, request_key, reservation_key = unpack(KEYS)
-local prefix, client, request, model, tier, deadline, cancel, fingerprint,
-  token_digest = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], tonumber(ARGV[6]),
+local prefix, client, request, model, tier, deadline_value, cancel, fingerprint,
+  token_digest = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6],
   ARGV[7], ARGV[8], ARGV[9]
+local deadline=tonumber(deadline_value)
 local ttl, requested_tokens = tonumber(ARGV[10]), tonumber(ARGV[11])
 local max_res, max_client, max_node, max_depth, max_lifecycles,
   max_fingerprints, max_nodes, batch = tonumber(ARGV[12]), tonumber(ARGV[13]),
@@ -919,11 +921,11 @@ end
 local expires = math.min(now + ttl, deadline)
 redis.call('HSET', reservation_key, 'client', client, 'request', request,
   'fingerprint', fingerprint, 'node_digest', selected[4], 'node_id', selected[5],
-  'model', model, 'tier', tier, 'deadline', deadline, 'reservation_expires', expires,
+  'model', model, 'tier', tier, 'deadline', deadline_value, 'reservation_expires', expires,
   'token_digest', token_digest, 'cancellation_digest', cancel)
 redis.call('HSET', request_key, 'state', 'reserved', 'client', client, 'request', request,
   'node_digest', selected[4], 'node_id', selected[5], 'model', model, 'tier', tier,
-  'deadline', deadline, 'reservation_expires', expires, 'token_digest', token_digest,
+  'deadline', deadline_value, 'reservation_expires', expires, 'token_digest', token_digest,
   'cancellation_digest', cancel, 'fingerprint', fingerprint)
 redis.call('ZADD', expiries, expires, token_digest)
 redis.call('ZADD', deadlines, deadline, client .. ':' .. request)
@@ -936,7 +938,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "389fc52552c89aa804834830ef66fa197e4e97f6b62b7e0af6c0b5ee67c605a8",  # pragma: allowlist secret
+    "27c9e83a74c75de3a70d0e0602967e5ec872ef2a4191459a33a3921a08efc67c",  # pragma: allowlist secret
     True,
 )
 
@@ -1362,7 +1364,7 @@ local function validate_terminal_due(due,response_due)
     local accepted=finite(tv[9]); local replay=finite(tv[10]); local expiry=finite(tv[11])
     if not score or not accepted or not replay or not expiry or score~=expiry or expiry>now or
        accepted<0 or accepted>now or replay<accepted or expiry<replay or redis.call('EXISTS',tk)~=1 or
-       tv[1]~='completed' or tv[2]~='response_completed' or (tv[3]~='response_ready' and tv[3]~='retrieval_expired') or
+       tv[1]~='completed' or tv[2]~='response_completed' or (tv[3]~='response_ready' and tv[3]~='acknowledged' and tv[3]~='retrieval_expired') or
        string.len(tv[4] or '')<1 or string.len(tv[4] or '')>max_node_id or not digest(tv[5]) or
        not digest(tv[6]) or not integer(tv[7]) or not digest(tv[8]) or not digest(tv[12]) or
        not digest(tv[13]) or not digest(tv[14]) or tv[15]~=c or tv[16]~=q then return false end
@@ -1377,7 +1379,7 @@ local function validate_terminal_due(due,response_due)
        string.len(lv[14] or '')>max_request_envelope then return false end
     local response_exists=redis.call('EXISTS',prefix..'response:'..c..':'..q)
     local response_score=redis.call('ZSCORE',response_expiries,member)
-    if tv[3]=='retrieval_expired' and (response_exists~=0 or response_score) then return false end
+    if (tv[3]=='acknowledged' or tv[3]=='retrieval_expired') and (response_exists~=0 or response_score) then return false end
     if tv[3]=='response_ready' and (response_exists~=1 or not response_score or not contains(response_due,member)) then return false end
   end
   return true
@@ -1420,7 +1422,7 @@ local terminal_exists=redis.call('EXISTS',terminal)
 if terminal_exists~=0 or tp>0 then
   if terminal_exists~=1 or tp~=#tv then return {'schema'} end
   local g=integer(tv[7]); local a=finite(tv[9]); local replay=finite(tv[10]); local expires=finite(tv[11])
-  if tv[1]~='completed' or tv[2]~='response_completed' or (tv[3]~='response_ready' and tv[3]~='retrieval_expired') or not g or not a or not replay or not expires or replay<a or expires<a or not digest(tv[5]) or not digest(tv[6]) or not digest(tv[8]) or not digest(tv[12]) or not digest(tv[13]) or not digest(tv[14]) or tv[15]~=client or tv[16]~=request_digest then return {'schema'} end
+  if tv[1]~='completed' or tv[2]~='response_completed' or (tv[3]~='response_ready' and tv[3]~='acknowledged' and tv[3]~='retrieval_expired') or not g or not a or not replay or not expires or replay<a or expires<a or not digest(tv[5]) or not digest(tv[6]) or not digest(tv[8]) or not digest(tv[12]) or not digest(tv[13]) or not digest(tv[14]) or tv[15]~=client or tv[16]~=request_digest then return {'schema'} end
   if string.len(tv[4] or '')<1 or string.len(tv[4] or '')>max_node_id or a<0 or a>now then return {'schema'} end
   local member=client..':'..request_digest
   local terminal_score=finite(redis.call('ZSCORE',terminal_expiries,member))
@@ -1490,10 +1492,10 @@ local function bounded(index,kind,limit,per_limit)
       local values=redis.call('HMGET',key,'client','request','outcome','reason','retrieval_state','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch')
       local accepted_at=finite(values[7]); local replay_at=finite(values[8]); local stored=finite(values[9])
       if values[1]~=c or values[2]~=q or values[3]~='completed' or values[4]~='response_completed' or
-         (values[5]~='response_ready' and values[5]~='retrieval_expired') or not digest(values[6]) or
+         (values[5]~='response_ready' and values[5]~='acknowledged' and values[5]~='retrieval_expired') or not digest(values[6]) or
          not accepted_at or not replay_at or not stored or replay_at<accepted_at or stored<replay_at or stored~=score_value then return nil end
       local response_exists=redis.call('EXISTS',prefix..'response:'..c..':'..q)
-      if (values[5]=='response_ready' and response_exists~=1) or (values[5]=='retrieval_expired' and response_exists~=0) then return nil end
+      if (values[5]=='response_ready' and response_exists~=1) or ((values[5]=='acknowledged' or values[5]=='retrieval_expired') and response_exists~=0) then return nil end
     end
     if c==client then count=count+1 end
   end
@@ -1517,7 +1519,116 @@ return {'accepted',generation,accepted_value,replay_value}
 ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     "accept_encrypted_response_v1",
     ACCEPT_RESPONSE_SOURCE,
-    "3559da1040624e6ac52d933a3d116c680d0398243ca4c68b308d0e1c4e10ecd8",  # pragma: allowlist secret
+    "fcbec2f8126ea96834b8196a907aced2fe5e82d41edfbe7f966f2820a89774d8",  # pragma: allowlist secret
+    True,
+)
+
+RETRIEVE_RESPONSE_SOURCE = """\
+local response,terminal,response_expiries,terminal_expiries,request=unpack(KEYS)
+local client,request_digest,client_public_key,request_id,retrieval_digest,supplied_ack,mode,
+  expected_envelope,expected_response_digest,expected_accepted=unpack(ARGV)
+local max_identity,max_node_id,max_request_envelope,max_response_envelope=tonumber(ARGV[11]),tonumber(ARGV[12]),tonumber(ARGV[13]),tonumber(ARGV[14])
+local member=client..':'..request_digest
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local function finite(value) local n=tonumber(value); return n and n==n and math.abs(n)~=math.huge and n end
+local function digest(value) return value and string.len(value)==64 and not string.find(value,'[^0-9a-f]') end
+local function integer(value) local n=finite(value); return n and n>=1 and n<=9007199254740990 and n%1==0 and tostring(n)==value and n end
+local function python_float(value)
+  local n=finite(value)
+  if not value or string.len(value)>32 or not n then return false end
+  local canonical=string.format('%.6f',n)
+  canonical=string.gsub(canonical,'0+$',''); canonical=string.gsub(canonical,'%.$','')
+  if not string.find(canonical,'.',1,true) then canonical=canonical..'.0' end
+  return canonical==value
+end
+local function lua_float(value)
+  local n=finite(value)
+  return value and string.len(value)<=32 and n and string.format('%.17g',n)==value
+end
+local function lua_number(value)
+  return lua_float(value)
+end
+if not digest(client) or not digest(request_digest) or not digest(retrieval_digest) or
+   (supplied_ack~='' and not digest(supplied_ack)) or
+   string.len(client_public_key)<1 or string.len(client_public_key)>max_identity or
+   string.len(request_id)<1 or string.len(request_id)>max_identity or
+   (mode~='read' and mode~='ack') then return {'schema'} end
+local tv=redis.call('HMGET',terminal,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
+local present=0 for i=1,#tv do if tv[i] then present=present+1 end end
+if redis.call('EXISTS',terminal)==0 and present==0 then return {'invalid_credential'} end
+if redis.call('EXISTS',terminal)~=1 or present~=#tv then return {'schema'} end
+if not digest(tv[12]) then return {'schema'} end
+if tv[12]~=retrieval_digest then return {'invalid_credential'} end
+local accepted,replay,terminal_expiry=finite(tv[9]),finite(tv[10]),finite(tv[11])
+local generation=integer(tv[7]); local terminal_score=finite(redis.call('ZSCORE',terminal_expiries,member))
+if tv[1]~='completed' or tv[2]~='response_completed' or
+   (tv[3]~='response_ready' and tv[3]~='acknowledged' and tv[3]~='retrieval_expired') or
+   string.len(tv[4] or '')<1 or string.len(tv[4] or '')>max_node_id or
+   not digest(tv[5]) or not digest(tv[6]) or not generation or not digest(tv[8]) or
+   not accepted or not python_float(tv[9]) or accepted<0 or accepted>now or
+   not replay or not lua_float(tv[10]) or replay<accepted or
+   not terminal_expiry or not lua_float(tv[11]) or terminal_expiry<replay or not terminal_score or terminal_score~=terminal_expiry or
+   not digest(tv[13]) or not digest(tv[14]) or tv[15]~=client or tv[16]~=request_digest then return {'schema'} end
+local lv=redis.call('HMGET',request,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest','envelope')
+for i=1,#lv do if not lv[i] then return {'schema'} end end
+local deadline=finite(lv[8]); local sequence=integer(lv[9]); local lifecycle_generation=integer(lv[10])
+if lv[1]~='response_ready' or lv[2]~=client or lv[3]~=request_digest or
+   lv[4]~=client_public_key or lv[5]~=request_id or lv[6]~=tv[4] or
+   string.len(lv[6])<1 or string.len(lv[6])>max_node_id or not digest(lv[7]) or
+   not deadline or not lua_number(lv[8]) or deadline<accepted or not sequence or lifecycle_generation~=generation or lv[10]~=tv[7] or
+   lv[11]~=lv[9]..'-0' or lv[12]~=tv[12] or lv[13]~=tv[14] or
+   string.len(lv[14])<1 or string.len(lv[14])>max_request_envelope then return {'schema'} end
+local response_exists=redis.call('EXISTS',response)
+local response_score=finite(redis.call('ZSCORE',response_expiries,member))
+if tv[3]=='acknowledged' then
+  if response_exists~=0 or response_score then return {'schema'} end
+  if terminal_expiry<=now then
+    redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
+    redis.call('DEL',terminal); redis.call('ZREM',terminal_expiries,member); redis.call('DEL',request)
+    return {'invalid_credential'}
+  end
+  if supplied_ack~='' and supplied_ack~=tv[13] then return {'invalid_ack'} end
+  return {'acknowledged',tv[9],tv[8],tv[13]}
+end
+if tv[3]=='retrieval_expired' then
+  if response_exists~=0 or response_score then return {'schema'} end
+  if terminal_expiry<=now then
+    redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
+    redis.call('DEL',terminal); redis.call('ZREM',terminal_expiries,member); redis.call('DEL',request)
+    return {'invalid_credential'}
+  end
+  return {'retrieval_expired'}
+end
+local rv=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')
+for i=1,#rv do if not rv[i] then return {'schema'} end end
+local response_accepted,response_replay=finite(rv[9]),finite(rv[11]); local response_generation=integer(rv[7])
+if response_exists~=1 or not response_score or response_score~=replay or rv[1]~=client or
+   rv[2]~=request_digest or rv[3]~=client_public_key or rv[4]~=request_id or rv[5]~=tv[4] or
+   string.len(rv[5])<1 or string.len(rv[5])>max_node_id or rv[6]~=tv[6] or
+   response_generation~=generation or rv[7]~=tv[7] or string.len(rv[8])<1 or string.len(rv[8])>max_response_envelope or
+   response_accepted~=accepted or not python_float(rv[9]) or rv[9]~=tv[9] or rv[10]~=tv[8] or
+   response_replay~=replay or not lua_float(rv[11]) or rv[11]~=tv[10] or rv[12]~='response_ready' then return {'schema'} end
+if terminal_expiry<=now then
+  redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
+  redis.call('DEL',terminal); redis.call('ZREM',terminal_expiries,member); redis.call('DEL',request)
+  return {'invalid_credential'}
+end
+if replay<=now then
+  redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
+  redis.call('HSET',terminal,'retrieval_state','retrieval_expired')
+  return {'retrieval_expired'}
+end
+if mode=='read' then return {'response_ready',rv[8],tv[9],tv[10],lv[8],tv[8],tv[13]} end
+if expected_envelope~=rv[8] or expected_response_digest~=tv[8] or expected_accepted~=tv[9] then return {'schema'} end
+if supplied_ack=='' or supplied_ack~=tv[13] then return {'invalid_ack'} end
+redis.call('DEL',response); redis.call('ZREM',response_expiries,member)
+redis.call('HSET',terminal,'retrieval_state','acknowledged')
+return {'acknowledged',tv[9],tv[8],tv[13]}
+"""
+RETRIEVE_RESPONSE_SCRIPT = ReviewedScript(
+    "retrieve_or_ack_response_v1",
+    RETRIEVE_RESPONSE_SOURCE,
+    "2a57b24252d4667be561f7ba369ca201efb048752b7abe70829997937751085f",  # pragma: allowlist secret
     True,
 )
 
@@ -1531,6 +1642,7 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         CLAIM_SCRIPT.name: CLAIM_SCRIPT,
         RENEW_CLAIM_SCRIPT.name: RENEW_CLAIM_SCRIPT,
         ACCEPT_RESPONSE_SCRIPT.name: ACCEPT_RESPONSE_SCRIPT,
+        RETRIEVE_RESPONSE_SCRIPT.name: RETRIEVE_RESPONSE_SCRIPT,
     }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
@@ -1795,6 +1907,8 @@ class ValkeyRegistrationStore:
         *,
         acknowledgement_key: bytes,
     ) -> None:
+        # This key is part of persisted response state: every worker sharing a
+        # namespace must receive the same restart-stable secret.
         if type(acknowledgement_key) is not bytes or len(acknowledgement_key) < 32:
             raise RelayStateStoreError("acknowledgement key is invalid")
         if not isinstance(foundation, ValkeyFoundation) or not isinstance(
@@ -2224,7 +2338,7 @@ class ValkeyRegistrationStore:
             request.encode(),
             model.encode(),
             tier.encode(),
-            repr(deadline).encode(),
+            format(deadline, ".17g").encode(),
             cancellation.encode(),
             fingerprint.encode(),
             token_digest.encode(),
@@ -2331,7 +2445,7 @@ class ValkeyRegistrationStore:
             request.encode(),
             model.encode(),
             tier.encode(),
-            repr(deadline).encode(),
+            format(deadline, ".17g").encode(),
             token_digest.encode(),
             cancellation.encode(),
             encoded,
@@ -2605,7 +2719,7 @@ class ValkeyRegistrationStore:
             )
         response_digest = hashlib.sha256(encoded).hexdigest()
         seconds, micros = self._foundation.server_time()
-        accepted = seconds + micros / 1_000_000
+        accepted = float(f"{seconds}.{micros:06d}")
         message = (
             b"token.place/relay-response-ack/v1\0"
             + bytes.fromhex(client)
@@ -2715,6 +2829,178 @@ class ValkeyRegistrationStore:
             replay,
             status == "accepted",
         )
+
+    @staticmethod
+    def _safe_retrieval_credential_digest(credential: object) -> str:
+        if not isinstance(credential, str) or not _SHA256_RE.fullmatch(credential):
+            return "0" * 64
+        return hashlib.sha256(credential.encode("ascii")).hexdigest()
+
+    @staticmethod
+    def _safe_acknowledgement_digest(token: object) -> str:
+        if not isinstance(token, str) or not _SHA256_RE.fullmatch(token):
+            return "0" * 64
+        return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+    def _derive_acknowledgement_token(
+        self, identity: tuple[str, str], accepted_at_epoch: float, response_digest: str
+    ) -> str:
+        message = (
+            b"token.place/relay-response-ack/v1\0"
+            + bytes.fromhex(identity[0])
+            + bytes.fromhex(identity[1])
+            + struct.pack("!d", accepted_at_epoch)
+            + bytes.fromhex(response_digest)
+        )
+        return hmac.new(self._acknowledgement_key, message, hashlib.sha256).hexdigest()
+
+    def retrieve_encrypted_response(
+        self,
+        client_public_key: str,
+        request_id: str,
+        retrieval_credential: str,
+        acknowledgement_token: str | None = None,
+    ) -> ResponseRetrievalResult:
+        """Replay or atomically acknowledge an authenticated retained response."""
+        client, request = self._identity(client_public_key, request_id)
+        retrieval_digest = self._safe_retrieval_credential_digest(
+            retrieval_credential
+        )
+        supplied_ack = (
+            "" if acknowledgement_token is None else self._safe_acknowledgement_digest(acknowledgement_token)
+        )
+        cfg = self._foundation.config
+        keys = (
+            cfg.key("response", client, request),
+            cfg.key("terminal", client, request),
+            cfg.key("responses:expiry"),
+            cfg.key("terminals:expiry"),
+            cfg.key("request", client, request),
+        )
+
+        def transition(
+            mode: str,
+            envelope: bytes = b"",
+            response_digest: bytes = b"",
+            accepted: bytes = b"",
+        ) -> tuple[str, list[object]]:
+            return self._ascii_status(
+                self._foundation.execute(
+                    RETRIEVE_RESPONSE_SCRIPT.name,
+                    keys,
+                    (
+                        client.encode(),
+                        request.encode(),
+                        client_public_key.encode(),
+                        request_id.encode(),
+                        retrieval_digest.encode(),
+                        supplied_ack.encode(),
+                        mode.encode(),
+                        envelope,
+                        response_digest,
+                        accepted,
+                        str(self.config.max_identity_bytes).encode(),
+                        str(self.config.max_node_id_bytes).encode(),
+                        str(self.config.max_envelope_bytes).encode(),
+                        str(self.config.max_response_envelope_bytes).encode(),
+                    ),
+                    max_result_bytes=self.config.max_response_envelope_bytes
+                    + _CLAIM_RESULT_METADATA_BYTES,
+                )
+            )
+
+        status, values = transition("read")
+        if status == "invalid_credential" and not values:
+            return ResponseRetrievalResult("invalid_retrieval_credential")
+        if status == "invalid_ack" and not values:
+            return ResponseRetrievalResult("invalid_acknowledgement")
+        if status == "retrieval_expired" and not values:
+            return ResponseRetrievalResult(status)
+        if status == "acknowledged" and len(values) == 3:
+            if not all(isinstance(value, bytes) for value in values):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            try:
+                accepted = float(values[0])
+                response_digest = values[1].decode("ascii")
+                stored_ack = values[2].decode("ascii")
+                expected_token = self._derive_acknowledgement_token(
+                    (client, request), accepted, response_digest
+                )
+                expected_ack = hashlib.sha256(
+                    expected_token.encode("ascii")
+                ).hexdigest()
+                if (
+                    not math.isfinite(accepted)
+                    or accepted < 0
+                    or not _SHA256_RE.fullmatch(response_digest)
+                    or not _SHA256_RE.fullmatch(stored_ack)
+                ):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError, UnicodeDecodeError):
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
+            if acknowledgement_token is not None and (
+                not hmac.compare_digest(expected_ack, stored_ack)
+                or not hmac.compare_digest(supplied_ack, expected_ack)
+            ):
+                return ResponseRetrievalResult("invalid_acknowledgement")
+            return ResponseRetrievalResult(status)
+        if status == "schema":
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if status != "response_ready" or len(values) != 6:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        envelope_raw, accepted_raw, replay_raw, deadline_raw, digest_raw, ack_raw = values
+        if not all(isinstance(value, bytes) for value in values):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            accepted = float(accepted_raw)
+            replay = float(replay_raw)
+            deadline = float(deadline_raw)
+            response_digest = digest_raw.decode("ascii")
+            stored_ack = ack_raw.decode("ascii")
+            envelope = self._decode_response_envelope(envelope_raw)
+            raw_token = self._derive_acknowledgement_token(
+                (client, request), accepted, response_digest
+            )
+            if (
+                not all(map(math.isfinite, (accepted, replay, deadline)))
+                or accepted < 0
+                or replay < accepted
+                or deadline < accepted
+                or not _SHA256_RE.fullmatch(response_digest)
+                or hashlib.sha256(envelope_raw).hexdigest() != response_digest
+                or not _SHA256_RE.fullmatch(stored_ack)
+            ):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError, UnicodeDecodeError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+        if hashlib.sha256(raw_token.encode("ascii")).hexdigest() != stored_ack:
+            if acknowledgement_token is not None:
+                return ResponseRetrievalResult("invalid_acknowledgement")
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if acknowledgement_token is None:
+            return ResponseRetrievalResult(
+                "response_ready", envelope, raw_token, replay, deadline
+            )
+        if not hmac.compare_digest(supplied_ack, stored_ack):
+            return ResponseRetrievalResult("invalid_acknowledgement")
+        status, values = transition(
+            "ack", envelope_raw, digest_raw, accepted_raw
+        )
+        if status == "invalid_ack" and not values:
+            return ResponseRetrievalResult("invalid_acknowledgement")
+        if status == "acknowledged" and len(values) == 3 and all(
+            isinstance(value, bytes) for value in values
+        ):
+            if values != [accepted_raw, digest_raw, ack_raw]:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            return ResponseRetrievalResult(status)
+        if status == "retrieval_expired" and not values:
+            return ResponseRetrievalResult(status)
+        if status == "invalid_credential" and not values:
+            return ResponseRetrievalResult("invalid_retrieval_credential")
+        raise ValkeySchemaIncompatibleError("state schema incompatible")
 
     def _cleanup_completed_records(self) -> None:
         cfg = self._foundation.config
@@ -3169,7 +3455,7 @@ class ValkeyRegistrationStore:
                 or value[b"outcome"] != b"completed"
                 or value[b"reason"] != b"response_completed"
                 or value[b"retrieval_state"]
-                not in {b"response_ready", b"retrieval_expired"}
+                not in {b"response_ready", b"acknowledged", b"retrieval_expired"}
             ):
                 raise ValueError
         except (TypeError, ValueError, OverflowError):
@@ -3230,7 +3516,10 @@ class ValkeyRegistrationStore:
                         self._foundation._client.zscore, response_index, raw_member
                     )
                     retrieval_state = value[b"retrieval_state"]
-                    if value[b"retrieval_state"] == b"retrieval_expired":
+                    if value[b"retrieval_state"] in {
+                        b"acknowledged",
+                        b"retrieval_expired",
+                    }:
                         response_exists = self._foundation._call(
                             self._foundation._client.exists, response_key
                         )

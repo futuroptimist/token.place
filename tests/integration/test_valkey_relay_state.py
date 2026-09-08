@@ -2957,6 +2957,66 @@ def _enqueue_claim_fixture(
     return envelope
 
 
+@pytest.mark.parametrize("stage", ("reserved", "queued", "claimed"))
+def test_cancellation_is_shared_retrievable_and_retains_only_live_control(
+    valkey_server, stage
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    owner = _digest(f"cancel-owner-{stage}")
+    node_id = f"cancel-node-{stage}"
+    consumer = f"cancel-consumer-{stage}"
+    identity = (f"cancel-client-{stage}", f"cancel-request-{stage}")
+    try:
+        first.register(node_id, _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 5
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        generation = None
+        if stage != "reserved":
+            first.enqueue_encrypted_request(
+                *identity,
+                selection.reservation_token,
+                node_id,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                EncryptedRequestEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+                ),
+                "cancel",
+            )
+        if stage == "claimed":
+            generation = first.claim_queued_request(
+                node_id, owner, consumer
+            ).generation
+        created = second.cancel_or_expire_request(*identity, "cancel")
+        assert (created.state, created.reason, created.new_outcome) == (
+            "cancelled", "requester_cancelled", True
+        )
+        assert first.cancel_or_expire_request(
+            *identity, "cancel"
+        ) == dataclasses.replace(created, new_outcome=False)
+        assert second.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        ).state == "completed_unavailable"
+        assert len(first.control_tombstones()) == (1 if stage == "claimed" else 0)
+        if generation is not None:
+            control = second.renew_claim_or_read_control(
+                node_id, owner, consumer, *identity, generation
+            )
+            assert (control.state, control.reason) == (
+                "cancelled", "requester_cancelled"
+            )
+    finally:
+        _delete_claim_fixture_state(first, (node_id,), (identity,))
+        first.close()
+        second.close()
+
+
 def _delete_claim_fixture_state(store, node_ids, identities):
     cfg = store._foundation.config
     keys = [
@@ -6311,8 +6371,15 @@ def test_renew_claim_preserves_exact_deadline_representation(valkey_server):
         rejected = store.renew_claim(
             node_id, owner, consumer, *identity, claimed.generation
         )
-        assert rejected.state == "missing_or_expired"
-        assert _claim_authority_snapshot(store, node_id, *identity) == before_rejected
+        assert rejected.state == "expired"
+        assert rejected.reason == "request_deadline_expired"
+        assert rejected.generation == claimed.generation
+        after_terminalization = _claim_authority_snapshot(store, node_id, *identity)
+        assert after_terminalization != before_rejected
+        assert after_terminalization[0][b"state"] == b"expired"
+        assert after_terminalization[1] == {}
+        assert after_terminalization[3] == []
+        assert after_terminalization[4] == []
     finally:
         _delete_claim_fixture_state(store, (node_id,), (identity,))
         store.close()

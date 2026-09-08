@@ -5646,7 +5646,7 @@ def test_encrypted_response_stale_generation_is_fenced_after_reclaim(valkey_serv
 def test_encrypted_response_node_id_reuse_fences_old_claim(valkey_server, removal):
     namespace = uuid.uuid4().hex
     stores = tuple(
-        _registration_store(valkey_server, namespace, lease_ttl_seconds=0.05)
+        _registration_store(valkey_server, namespace, lease_ttl_seconds=2)
         for _ in range(2)
     )
     first, second = stores
@@ -5661,13 +5661,13 @@ def test_encrypted_response_node_id_reuse_fences_old_claim(valkey_server, remova
     fresh_envelope = dataclasses.replace(old_envelope, ciphertext="fresh-ciphertext")
     old_keys, _ = _response_acceptance_authority(first, node, identities[0])
     try:
-        registration = first.register(node, _capabilities(), old_owner)
+        first.register(node, _capabilities(), old_owner)
         _enqueue_claim_fixture(first, node, old_owner, *identities[0], time.time() + 60)
         old = second.claim_queued_request(node, old_owner, "old-consumer")
         if removal == "unregister":
             assert first.unregister(node, old_owner)
         else:
-            _wait_for_server_epoch(first, registration.lease_expires_at_epoch)
+            _mark_registrations_due(first, (node,))
         second.register(node, _capabilities(), new_owner)
 
         for attempted_owner in (old_owner, new_owner):
@@ -7552,7 +7552,7 @@ def test_generation_and_owner_fencing_survives_node_id_reuse(valkey_server, remo
     namespace = uuid.uuid4().hex
     stores = [
         _registration_store(
-            valkey_server, namespace, lease_ttl_seconds=0.05, claim_ttl_seconds=2
+            valkey_server, namespace, lease_ttl_seconds=2, claim_ttl_seconds=2
         )
         for _ in range(2)
     ]
@@ -7563,14 +7563,14 @@ def test_generation_and_owner_fencing_survives_node_id_reuse(valkey_server, remo
     cfg = first._foundation.config
     node = first._node_digest(node_id)
     try:
-        registration = first.register(node_id, _capabilities(), old_owner)
+        first.register(node_id, _capabilities(), old_owner)
         deadline = first._foundation.server_time()[0] + 60
         _enqueue_claim_fixture(first, node_id, old_owner, *identities[0], deadline)
         old = second.claim_queued_request(node_id, old_owner, "old-consumer")
         if removal == "unregister":
             assert second.unregister(node_id, old_owner)
         else:
-            _wait_for_server_epoch(first, registration.lease_expires_at_epoch)
+            _mark_registrations_due(first, (node_id,))
 
         second.register(node_id, _capabilities(), new_owner)
         _enqueue_claim_fixture(second, node_id, new_owner, *identities[1], deadline)

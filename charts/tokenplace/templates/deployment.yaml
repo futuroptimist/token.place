@@ -131,6 +131,7 @@ spec:
           {{- $_ := unset $mergedEnv "TOKENPLACE_METRICS_TOKEN" }}
           {{- $_ := set $mergedEnv "TOKENPLACE_METRICS_DISABLED" (dict "name" "TOKENPLACE_METRICS_DISABLED" "value" "1") }}
           {{- end }}
+          {{- $_ := set $mergedEnv "TOKENPLACE_METRICS_MODE" (dict "name" "TOKENPLACE_METRICS_MODE" "value" .Values.metrics.mode) }}
           image: {{ include "tokenplace.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:

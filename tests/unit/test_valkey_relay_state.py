@@ -38,6 +38,7 @@ from relay_state_store import (
     RelayStateConflict,
     RelayStateCredentialMismatch,
     RelayStateInvalidReservation,
+    RelayStateNoCapacity,
     RelayStateStoreConfig,
     RelayStateStoreError,
     SchedulerNodeState,
@@ -1672,6 +1673,61 @@ def test_enqueue_translates_fixed_script_results(result, expected):
             envelope,
             "cancel",
         )
+
+
+@pytest.mark.parametrize("operation", ["select", "enqueue"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        [b"deadline_due"],
+        [b"deadline_due", b"not-a-digest", b"b" * 64],
+    ],
+)
+def test_deadline_cleanup_bridge_rejects_malformed_digest_results(operation, reply):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        if operation == "select":
+            store.select_and_reserve("client", "request", "model", "8k-fast", 10)
+        else:
+            store.enqueue_encrypted_request(
+                "client", "request", "a" * 64, "node-a", "model", "8k-fast", 10,
+                envelope, "cancel",
+            )
+
+
+@pytest.mark.parametrize("operation", ["select", "enqueue"])
+def test_deadline_cleanup_bridge_bounds_capacity_deferred_retries(operation):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = [b"deadline_due", b"a" * 64, b"b" * 64]
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(store.config, node_transition_batch_size=1)
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+
+    with (
+        patch.object(
+            store,
+            "_cancel_or_expire_digests",
+            side_effect=RelayStateCapacityExceeded("retained terminal capacity exceeded"),
+        ),
+        pytest.raises(RelayStateNoCapacity, match="temporarily deferred"),
+    ):
+        if operation == "select":
+            store.select_and_reserve("client", "request", "model", "8k-fast", 10)
+        else:
+            store.enqueue_encrypted_request(
+                "client", "request", "a" * 64, "node-a", "model", "8k-fast", 10,
+                envelope, "cancel",
+            )
 
 
 @pytest.mark.parametrize(

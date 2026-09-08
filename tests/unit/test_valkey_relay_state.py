@@ -1515,6 +1515,92 @@ def test_renew_or_read_control_delegates_when_not_acknowledging():
     assert result.state == "missing_or_expired"
 
 
+def test_renew_or_read_control_terminalizes_and_decodes_deadline_control():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.side_effect = [
+        [b"deadline_due"],
+        [b"expired", b"1", b"request_deadline_expired", b"0"],
+    ]
+    store = registration_store_with_foundation(foundation)
+    terminal = Mock(state="expired")
+
+    with patch.object(store, "cancel_or_expire_request", return_value=terminal) as expire:
+        result = store.renew_claim_or_read_control(
+            "node-a", "a" * 64, "consumer", "client", "request", 1
+        )
+
+    assert result.state == "expired"
+    assert result.generation == 1
+    assert result.reason == "request_deadline_expired"
+    assert result.acknowledged is False
+    expire.assert_called_once_with(
+        "client",
+        "request",
+        status="expired",
+        reason="request_deadline_expired",
+    )
+    assert foundation.execute.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected_state", "expected_created"),
+    [
+        ([b"invalid_cancellation_proof"], "invalid_cancellation_proof", False),
+        ([b"not_expired", b"request_deadline_active"], "not_expired", False),
+        ([b"created", b"cancelled", b"requester_cancelled"], "cancelled", True),
+        ([b"existing", b"expired", b"request_deadline_expired"], "expired", False),
+    ],
+)
+def test_cancel_or_expire_request_decodes_fixed_results(
+    reply, expected_state, expected_created
+):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.return_value = b"b" * 64
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+
+    result = store.cancel_or_expire_request("client", "request", "cancel-token")
+
+    assert result.state == expected_state
+    assert result.new_outcome is expected_created
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"terminal_capacity"], RelayStateCapacityExceeded),
+        ([b"control_capacity"], RelayStateCapacityExceeded),
+        ([b"unknown"], ValkeySchemaIncompatibleError),
+    ],
+)
+def test_cancel_or_expire_request_rejects_fixed_failures(reply, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.return_value = None
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(expected):
+        store.cancel_or_expire_request("client", "request", "cancel-token")
+
+
+def test_cancel_or_expire_request_rejects_invalid_status_and_proof_locally():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(RelayStateStoreError, match="terminal status or reason"):
+        store.cancel_or_expire_request("client", "request", status="completed")
+    result = store.cancel_or_expire_request("", "request", "secret")
+    assert result.state == "invalid_cancellation_proof"
+    foundation.execute.assert_not_called()
+
+
 def test_live_claims_tolerates_a_removed_registration_after_read_gate():
     foundation = Mock(spec=ValkeyFoundation)
     foundation.config = config()

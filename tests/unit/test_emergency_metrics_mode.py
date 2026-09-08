@@ -31,6 +31,9 @@ with relay.app.test_client() as client:
                 "X-Request-Id": f"request-secret-{index}",
             },
         )
+        relay._record_request_terminal_outcome_once(
+            f"client-secret-{index}", f"terminal-request-secret-{index}", "completed"
+        )
     second = client.get("/metrics", headers=headers)
     after = second.get_data(as_text=True)
 families = list(text_string_to_metric_families(after))
@@ -43,6 +46,7 @@ print(json.dumps({
     "samples": samples,
     "stable": before == after,
     "quota_extension": "tokenplace_public_quota_counter" in relay.app.extensions,
+    "terminal_outcome_clients": len(relay.client_terminal_outcomes),
     "sensitive": any(value in after for value in (
         "sensitive-path", "query-secret", "198.51", "203.0.113", "192.0.2", "request-secret",
         "metrics-secret",
@@ -97,6 +101,7 @@ def test_degraded_mode_is_exactly_three_stable_private_series() -> None:
         ],
         "stable": True,
         "quota_extension": False,
+        "terminal_outcome_clients": 0,
         "sensitive": False,
     }
 

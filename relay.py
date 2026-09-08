@@ -717,6 +717,8 @@ def _record_request_terminal_outcome_once(
 ) -> bool:
     """Record a terminal request outcome once for a client/request pair."""
 
+    if METRICS_MODE == "degraded":
+        return False
     if not client_public_key or not request_id:
         return False
     if outcome not in OUTCOME_ENUM:

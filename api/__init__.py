@@ -750,7 +750,14 @@ def _install_public_quota_metrics(app, registry) -> None:
         return response
 
 
-def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metrics_path="/metrics"):
+def init_app(
+    app,
+    *,
+    metrics_registry=None,
+    metrics_export_defaults=True,
+    metrics_path="/metrics",
+    metrics_instrumentation_enabled=True,
+):
     """Initialize the API with the Flask app.
 
     Relay callers may pass a dedicated Prometheus registry and disable the
@@ -763,7 +770,8 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     # Responses and bounded application telemetry provide the needed signal.
     logging.getLogger("flask-limiter").setLevel(logging.WARNING)
     _install_public_api_v1_cors(app)
-    _install_public_quota_metrics(app, metrics_registry)
+    if metrics_instrumentation_enabled:
+        _install_public_quota_metrics(app, metrics_registry)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {

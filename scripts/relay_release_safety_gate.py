@@ -189,14 +189,17 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
 def execute_public_exemption_check(base_url: str) -> dict[str, dict[str, object]]:
     public = [request(base_url, path, method)[0] for method in ("GET", "HEAD")
               for path in PUBLIC_INFORMATION_PATHS for _ in range(2)]
-    # A near-match remains non-mutating (404) and must consume quota, proving
-    # that exemption matching is exact rather than prefix-based. Separate POST
-    # quota phases below prove mutating methods are not generally exempt.
-    near_match = [request(base_url, "/api/v1/meta/release-safety-near-match")[0] for _ in range(2)]
+    # The near-match must consume the single-request quota. A subsequent POST
+    # to an exact public path must therefore be limited rather than inheriting
+    # the GET/HEAD exemption. Together these requests prove that exemption
+    # matching is exact for both path and method.
+    near_match = request(base_url, "/api/v1/meta/release-safety-near-match")[0]
+    disallowed_method = request(base_url, "/api/v1/meta", "POST")[0]
     return {"quota.public_information_exempt": {
-        "passed": all(code == 200 for code in public) and near_match == [404, 429],
+        "passed": all(code == 200 for code in public) and near_match == 404 and disallowed_method == 429,
         "safe_methods_response_class": "2xx" if all(code == 200 for code in public) else "unexpected",
-        "near_match_response_classes": [f"{code // 100}xx" for code in near_match],
+        "near_match_status": near_match,
+        "disallowed_method_status": disallowed_method,
     }}
 
 
@@ -209,7 +212,7 @@ def execute_quota_check(base_url: str, limit_id: str, *, mutating: bool) -> dict
         expected_first = 200
     return {limit_id: {
         "passed": statuses == [expected_first, 429],
-        "response_classes": [f"{code // 100}xx" for code in statuses],
+        "status_codes": statuses,
     }}
 
 

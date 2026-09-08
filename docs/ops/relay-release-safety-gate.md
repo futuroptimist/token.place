@@ -39,13 +39,15 @@ platform and records the OCI index digest in the
 workflow summary. Missing, duplicate, skipped, malformed, mismatched, or false results fail
 closed. The report intentionally excludes request bodies, credentials, client identities, logs, and
 the randomized unmatched paths used by the probe. Evidence records only bounded series growth,
-request counts, response classes, and immutable identities.
+request counts, privacy-safe HTTP status codes, and immutable identities.
 
 The metrics phase sends two successive batches of 1,024 distinct unmatched paths. It independently
 rejects default Flask metric families and raw or attacker-controlled path labels, and requires the
 second batch to add no series identities. Quota phases prove that only `GET` and `HEAD` requests to
 `/`, `/api/v1/meta`, and `/api/v1/version` receive the public-information exemption; a non-mutating
-near-match then proves the exemption is not prefix-based. Separate fresh
+near-match consumes the one-request quota, after which a `POST` to the exact `/api/v1/meta` path
+must receive `429`. This proves the exemption is restricted by both exact path and HTTP method.
+Separate fresh
 containers prove rate and daily enforcement on the protected read route `/api/v1/models` and on the
 mutating route `/api/v1/relay/requests/cancel`. The mutating probe sends an empty JSON object: its
 first `400` response occurs during validation before any state-store mutation, and its second

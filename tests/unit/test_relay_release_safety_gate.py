@@ -232,13 +232,37 @@ def test_hashed_per_path_labels_fail_without_raw_probe_values(monkeypatch):
 
 @pytest.mark.parametrize("statuses,expected", [
     ([200] * 12 + [404, 429], True), ([500] + [200] * 11 + [404, 429], False),
-    ([200] * 12 + [404, 404], False),
+    ([200] * 12 + [404, 405], False), ([200] * 12 + [429, 429], False),
 ])
 def test_public_exemption_uses_exact_get_and_head_paths(monkeypatch, statuses, expected):
     iterator = iter(statuses)
-    monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: (next(iterator), ""))
+    calls = []
+
+    def fake_request(_base, path, method="GET", body=None):
+        calls.append((path, method, body))
+        return next(iterator), ""
+
+    monkeypatch.setattr(gate, "request", fake_request)
     results = gate.execute_public_exemption_check("http://loopback")
     assert all(v["passed"] for v in results.values()) is expected
+    assert calls[-2:] == [
+        ("/api/v1/meta/release-safety-near-match", "GET", None),
+        ("/api/v1/meta", "POST", None),
+    ]
+
+
+def test_public_and_quota_evidence_records_exact_privacy_safe_statuses(monkeypatch):
+    statuses = iter([200] * 12 + [404, 429])
+    monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: (next(statuses), ""))
+    public = gate.execute_public_exemption_check("http://loopback")["quota.public_information_exempt"]
+    assert public["near_match_status"] == 404
+    assert public["disallowed_method_status"] == 429
+
+    statuses = iter([400, 429])
+    mutation = gate.execute_quota_check(
+        "http://loopback", "quota.test", mutating=True,
+    )["quota.test"]
+    assert mutation["status_codes"] == [400, 429]
 
 
 @pytest.mark.parametrize("mutating,first", [(False, 200), (True, 400)])

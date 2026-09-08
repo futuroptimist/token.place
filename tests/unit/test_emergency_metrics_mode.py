@@ -9,7 +9,32 @@ import sys
 
 import pytest
 
-SENTINELS = ("path-sentinel", "identity-sentinel", "request-sentinel", "token-sentinel")
+METRICS_CREDENTIAL = "metrics-credential-sentinel"
+SENTINELS = (
+    "path-sentinel", "identity-sentinel", "request-sentinel", "token-sentinel",
+    METRICS_CREDENTIAL,
+)
+
+EXPECTED_NORMAL_FAMILIES = {
+    "tokenplace_build_info",
+    "tokenplace_compute_node_evictions_total",
+    "tokenplace_compute_node_lease_age_seconds",
+    "tokenplace_compute_nodes_healthy",
+    "tokenplace_compute_nodes_registered",
+    "tokenplace_http_request_duration_seconds",
+    "tokenplace_http_requests_total",
+    "tokenplace_instrumentation_up",
+    "tokenplace_metrics_degraded",
+    "tokenplace_public_http_quota_outcomes_total",
+    "tokenplace_relay_compute_control_lease_renewals_total",
+    "tokenplace_relay_compute_control_requests_total",
+    "tokenplace_relay_in_flight_requests",
+    "tokenplace_relay_oldest_in_flight_age_seconds",
+    "tokenplace_relay_oldest_queued_request_age_seconds",
+    "tokenplace_relay_queue_depth",
+    "tokenplace_relay_request_outcomes_total",
+    "tokenplace_relay_requests_total",
+}
 
 STRESS_PROBE = r'''
 import json
@@ -26,20 +51,22 @@ relay.RELAY_REQUEST_OUTCOMES_TOTAL = Bomb()
 relay.COMPUTE_NODE_EVICTIONS_TOTAL = Bomb()
 relay.RELAY_COMPUTE_CONTROL_REQUESTS_TOTAL = Bomb()
 relay.RELAY_COMPUTE_CONTROL_LEASE_RENEWALS_TOTAL = Bomb()
-headers = {"Authorization": "Bearer metrics-secret"}
+headers = {"Authorization": "Bearer metrics-credential-sentinel"}
 with relay.app.test_client() as client:
     health = {path: client.get(path).status_code for path in ("/livez", "/healthz")}
     unauthorized = client.get("/metrics", headers={"Authorization": "Bearer wrong"}).status_code
     first = client.get("/metrics", headers=headers)
     before = first.get_data(as_text=True)
     for index in range(2000):
-        identity = f"identity-sentinel-{index}"
+        direct_identity = f"192.0.2.{index % 254 + 1}"
+        forwarded_identity = f"198.51.100.{index % 254 + 1}"
         request_id = f"request-sentinel-{index}"
-        client.get(f"/static/path-sentinel-{index}?token=token-sentinel", environ_base={"REMOTE_ADDR": identity})
+        client.get(f"/static/path-sentinel-{index}?token=token-sentinel", environ_base={"REMOTE_ADDR": direct_identity})
         client.get(f"/path-sentinel-{index}?token=token-sentinel", headers={
-            "CF-Connecting-IP": identity, "X-Forwarded-For": identity, "X-Request-Id": request_id,
-        })
-        relay._record_request_terminal_outcome_once(identity, request_id, "completed")
+            "CF-Connecting-IP": forwarded_identity, "X-Forwarded-For": forwarded_identity,
+            "X-Request-Id": request_id,
+        }, environ_base={"REMOTE_ADDR": "10.1.2.3"})
+        relay._record_request_terminal_outcome_once(direct_identity, request_id, "completed")
     relay._record_terminal_outcome("completed")
     relay._record_compute_control_state("active")
     relay._record_compute_control_lease_renewal()
@@ -67,18 +94,18 @@ import json, os, prometheus_client
 real_gauge = prometheus_client.Gauge
 failure = os.environ["PROBE_FAILURE"]
 class GaugeProxy:
-    def __init__(self, metric): self.metric = metric
+    def __init__(self, name, metric): self.name, self.metric = name, metric
     def __getattr__(self, name): return getattr(self.metric, name)
+    def labels(self, *args, **kwargs):
+        return GaugeProxy(self.name, self.metric.labels(*args, **kwargs))
     def set(self, value):
-        if failure == "indicator_set": raise RuntimeError("private-sentinel")
+        if failure == self.name + ":set": raise RuntimeError("private-sentinel")
         return self.metric.set(value)
 def gauge(name, *args, **kwargs):
-    if name == "tokenplace_metrics_degraded" and failure == "indicator_construct":
-        raise RuntimeError("private-sentinel")
-    if name == "tokenplace_build_info" and failure == "other_retained_construct":
+    if failure == name + ":construct":
         raise RuntimeError("private-sentinel")
     metric = real_gauge(name, *args, **kwargs)
-    return GaugeProxy(metric) if name == "tokenplace_metrics_degraded" else metric
+    return GaugeProxy(name, metric)
 prometheus_client.Gauge = gauge
 import relay
 with relay.app.test_client() as client:
@@ -88,15 +115,18 @@ print(json.dumps({"status": response.status_code, "body": response.get_data(as_t
 '''
 
 
-def _run_probe(source: str, mode: str, **extra: str) -> subprocess.CompletedProcess[str]:
+def _run_probe(source: str, mode: str | None, **extra: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env.update(extra, TOKENPLACE_METRICS_MODE=mode, TOKENPLACE_METRICS_TOKEN="metrics-secret")
+    env.update(extra, TOKENPLACE_METRICS_TOKEN=METRICS_CREDENTIAL)
+    if mode is None:
+        env.pop("TOKENPLACE_METRICS_MODE", None)
+    else:
+        env["TOKENPLACE_METRICS_MODE"] = mode
     return subprocess.run([sys.executable, "-c", source], env=env, capture_output=True, text=True)
 
 
 def _probe(mode: str | None) -> dict[str, object]:
-    selected = "normal" if mode is None else mode
-    completed = _run_probe(STRESS_PROBE, selected)
+    completed = _run_probe(STRESS_PROBE, mode)
     assert completed.returncode == 0, completed.stderr
     combined = completed.stdout + completed.stderr
     assert all(sentinel not in combined for sentinel in SENTINELS)
@@ -106,25 +136,47 @@ def _probe(mode: str | None) -> dict[str, object]:
 @pytest.mark.parametrize("mode", (None, "normal"))
 def test_normal_mode_preserves_complete_bounded_registry(mode: str | None) -> None:
     source = r'''
-import json, relay
+import json, re, relay
 from prometheus_client.parser import text_string_to_metric_families
 with relay.app.test_client() as client:
-    client.get("/healthz")
-body = relay.generate_latest(relay.RELAY_METRICS_REGISTRY).decode()
-samples = {sample.name for family in text_string_to_metric_families(body) for sample in family.samples}
-print(json.dumps({"mode": relay.METRICS_MODE, "samples": sorted(samples),
-                  "quota": "tokenplace_public_quota_counter" in relay.app.extensions}))
+    health = {path: client.get(path).status_code for path in ("/livez", "/healthz")}
+    unauthorized = client.get("/metrics").status_code
+    response = client.get("/metrics", headers={"Authorization": "Bearer metrics-credential-sentinel"})
+body = response.get_data(as_text=True)
+families = {
+    name for name in re.findall(r"^# HELP (\S+)", body, re.MULTILINE)
+    if not name.endswith("_created")
+}
+print(json.dumps({"mode": relay.METRICS_MODE, "families": sorted(families),
+                  "quota": "tokenplace_public_quota_counter" in relay.app.extensions,
+                  "health": health, "unauthorized": unauthorized, "authorized": response.status_code}))
 '''
-    completed = _run_probe(source, "normal")
+    completed = _run_probe(source, mode)
     assert completed.returncode == 0
     result = json.loads(completed.stdout.splitlines()[-1])
     assert result["mode"] == "normal"
     assert result["quota"] is True
-    assert {
-        "tokenplace_http_requests_total", "tokenplace_public_http_quota_outcomes_total",
-        "tokenplace_relay_queue_depth", "tokenplace_relay_compute_control_requests_total",
-        "tokenplace_build_info", "tokenplace_instrumentation_up", "tokenplace_metrics_degraded",
-    }.issubset(result["samples"])
+    assert result["health"] == {"/livez": 200, "/healthz": 200}
+    assert (result["unauthorized"], result["authorized"]) == (401, 200)
+    assert set(result["families"]) == EXPECTED_NORMAL_FAMILIES
+
+
+def test_unset_and_explicit_normal_registries_match() -> None:
+    source = r'''
+import json, relay
+from prometheus_client.parser import text_string_to_metric_families
+body = relay.generate_latest(relay.RELAY_METRICS_REGISTRY).decode()
+samples = sorted(sample.name for family in text_string_to_metric_families(body)
+                 for sample in family.samples)
+print(json.dumps({"samples": samples,
+                  "quota": "tokenplace_public_quota_counter" in relay.app.extensions}))
+'''
+    results = []
+    for mode in (None, "normal"):
+        completed = _run_probe(source, mode)
+        assert completed.returncode == 0, completed.stderr
+        results.append(json.loads(completed.stdout.splitlines()[-1]))
+    assert results[0] == results[1]
 
 
 def test_degraded_mode_is_exactly_three_stable_private_series_without_state() -> None:
@@ -138,23 +190,19 @@ def test_degraded_mode_is_exactly_three_stable_private_series_without_state() ->
     }
 
 
-@pytest.mark.parametrize("failure", ("indicator_construct", "indicator_set"))
-def test_degraded_indicator_failure_fails_startup_privately(failure: str) -> None:
+@pytest.mark.parametrize("collector", (
+    "tokenplace_build_info", "tokenplace_instrumentation_up", "tokenplace_metrics_degraded",
+))
+@pytest.mark.parametrize("operation", ("construct", "set"))
+def test_required_degraded_collector_failure_fails_startup_privately(
+    collector: str, operation: str,
+) -> None:
+    failure = f"{collector}:{operation}"
     completed = _run_probe(FAILURE_PROBE, "degraded", PROBE_FAILURE=failure)
     assert completed.returncode != 0
     combined = completed.stdout + completed.stderr
     assert "private-sentinel" not in combined
     assert "required degraded metrics" in combined
-
-
-def test_other_collector_failure_retains_truthful_degraded_signal() -> None:
-    completed = _run_probe(FAILURE_PROBE, "degraded", PROBE_FAILURE="other_retained_construct")
-    assert completed.returncode == 0, completed.stderr
-    result = json.loads(completed.stdout.splitlines()[-1])
-    assert result["status"] == 200
-    assert "tokenplace_metrics_degraded 1.0" in result["body"]
-    assert "tokenplace_instrumentation_up 0.0" in result["body"]
-    assert "private-sentinel" not in completed.stdout + completed.stderr
 
 
 @pytest.mark.parametrize("mode", ("", "NORMAL", "Degraded", " degraded", "degraded ", "unknown"))
@@ -163,35 +211,57 @@ def test_invalid_mode_fails_startup_without_echoing_value(mode: str) -> None:
     combined = completed.stdout + completed.stderr
     assert completed.returncode != 0
     assert "TOKENPLACE_METRICS_MODE must be exactly one of: normal, degraded" in combined
-    assert "metrics-secret" not in combined
+    assert METRICS_CREDENTIAL not in combined
 
 
-def test_normal_runtime_metrics_errors_do_not_change_mode() -> None:
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    (("collector", 200), ("registry", 200), ("runtime_gauge", 503), ("serialization", 503)),
+)
+def test_normal_metrics_errors_do_not_change_mode(failure: str, expected_status: int) -> None:
     source = r'''
-import relay
+import json, os, relay
+failure = os.environ["PROBE_FAILURE"]
 class Bomb:
     def labels(self, *args): raise RuntimeError("sentinel")
     def set(self, *args): raise RuntimeError("sentinel")
-relay.RELAY_REQUEST_OUTCOMES_TOTAL = Bomb()
-relay._record_terminal_outcome("completed")
-relay._collector("broken", lambda: (_ for _ in ()).throw(RuntimeError("sentinel")))
-relay.RELAY_METRICS_REGISTRY.register = lambda collector: (_ for _ in ()).throw(RuntimeError("sentinel"))
-relay._collector("broken-registry", lambda: relay.Counter("broken_registry", "broken", registry=relay.RELAY_METRICS_REGISTRY))
-relay._update_runtime_gauges = lambda: (_ for _ in ()).throw(RuntimeError("sentinel"))
-relay.generate_latest = lambda registry: (_ for _ in ()).throw(RuntimeError("sentinel"))
+if failure == "collector":
+    relay._collector("broken", lambda: (_ for _ in ()).throw(RuntimeError("sentinel")))
+elif failure == "registry":
+    relay.RELAY_METRICS_REGISTRY.register = lambda collector: (_ for _ in ()).throw(RuntimeError("sentinel"))
+    relay._collector("broken-registry", lambda: relay.Counter("broken_registry", "broken", registry=relay.RELAY_METRICS_REGISTRY))
+elif failure == "runtime_gauge":
+    relay._update_runtime_gauges = lambda: (_ for _ in ()).throw(RuntimeError("sentinel"))
+else:
+    reached = {"serialization": False}
+    def fail_serialization(registry):
+        reached["serialization"] = True
+        raise RuntimeError("sentinel")
+    relay.generate_latest = fail_serialization
 with relay.app.test_client() as client:
-    status = client.get("/metrics", headers={"Authorization": "Bearer metrics-secret"}).status_code
-print(__import__("json").dumps({"mode": relay.METRICS_MODE, "status": status}))
+    status = client.get("/metrics", headers={"Authorization": "Bearer metrics-credential-sentinel"}).status_code
+print(json.dumps({"mode": relay.METRICS_MODE, "status": status,
+                  "serialization_reached": failure != "serialization" or reached["serialization"]}))
 '''
-    completed = _run_probe(source, "normal")
+    completed = _run_probe(source, "normal", PROBE_FAILURE=failure)
     assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout.splitlines()[-1]) == {"mode": "normal", "status": 503}
+    assert json.loads(completed.stdout.splitlines()[-1]) == {
+        "mode": "normal", "status": expected_status, "serialization_reached": True,
+    }
 
 
 def test_fresh_process_can_restore_normal_after_degraded() -> None:
     assert _probe("degraded")["samples"] == [
         "tokenplace_build_info", "tokenplace_instrumentation_up", "tokenplace_metrics_degraded",
     ]
-    completed = _run_probe("import relay; print(relay.METRICS_MODE)", "normal")
-    assert completed.returncode == 0
-    assert completed.stdout.splitlines()[-1] == "normal"
+    restored = _probe("normal")
+    assert restored["mode"] == "normal"
+    assert restored["quota_extension"] is True
+    restored_samples = set(restored["samples"])
+    assert {
+        "tokenplace_build_info",
+        "tokenplace_compute_node_lease_age_seconds",
+        "tokenplace_http_request_duration_seconds_count",
+        "tokenplace_public_http_quota_outcomes_total",
+        "tokenplace_relay_requests_total",
+    }.issubset(restored_samples)

@@ -510,12 +510,12 @@ def _collector(name: str, factory, *, degraded: bool = False):
     try:
         return factory()
     except Exception:
-        if METRICS_MODE == "degraded" and name == "tokenplace_metrics_degraded":
+        if METRICS_MODE == "degraded" and degraded:
             LOGGER.critical(
-                "metrics.degraded_indicator_construction_failed",
-                extra={"reason": "degraded_indicator_construction_failed"},
+                "metrics.required_degraded_collector_construction_failed",
+                extra={"reason": "required_degraded_collector_construction_failed"},
             )
-            raise RuntimeError("required degraded metrics indicator unavailable") from None
+            raise RuntimeError("required degraded metrics collector unavailable") from None
         _METRICS_CONSTRUCTION_FAILED = True
         LOGGER.error(
             "metrics.collector_construction_failed",

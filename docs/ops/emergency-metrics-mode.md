@@ -37,7 +37,10 @@ Degraded mode constructs a separate `CollectorRegistry` containing exactly three
 | `tokenplace_instrumentation_up` | no labels; value `1` after successful initialization | 1 |
 | `tokenplace_metrics_degraded` | no labels; fixed value `1` | 1 |
 
-Initialization publishes `tokenplace_metrics_degraded = 1` independently before checking any other collector failure. If the degraded-state gauge cannot be constructed or initialized, the relay fails startup with fixed, privacy-safe diagnostics rather than serving an ambiguous metrics response.
+Every retained collector is required. A successfully started degraded process therefore always
+exports exactly the three documented series. If the build identity, instrumentation-health, or
+degraded-state collector cannot be constructed or initialized, the relay fails startup with fixed,
+privacy-safe diagnostics rather than serving a partial or ambiguous metrics response.
 
 The exact degraded ceiling is therefore **3 time series per relay process**. Build labels come only
 from bounded startup release metadata, not requests. No request path, query, route, identity,

@@ -3054,6 +3054,218 @@ def _accepted_retrieval_fixture(stores, label):
     return node, identity, credential, envelope, accepted, keys, member
 
 
+def test_response_retrieval_namespace_isolation(valkey_server):
+    namespaces = (uuid.uuid4().hex, uuid.uuid4().hex)
+    stores = tuple(_registration_store(valkey_server, value) for value in namespaces)
+    identity = ("shared-retrieval-client", "shared-retrieval-request")
+    credential = _digest("shared-retrieval-credential")
+    fixtures = []
+    try:
+        for index, store in enumerate(stores):
+            node = f"namespace-retrieval-node-{index}"
+            owner = _digest(f"namespace-retrieval-owner-{index}")
+            consumer = f"namespace-retrieval-consumer-{index}"
+            envelope = EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee",
+                1,
+                f"namespace-retrieval-ciphertext-{index}",
+                f"namespace-retrieval-key-{index}",
+                f"namespace-retrieval-iv-{index}",
+            )
+            store.register(node, _capabilities(), owner)
+            _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+            claim = store.claim_queued_request(node, owner, consumer)
+            store.accept_encrypted_response(
+                node, owner, consumer, *identity, claim.generation, envelope
+            )
+            keys, member = _response_acceptance_authority(store, node, identity)
+            retrieval_digest = hashlib.sha256(credential.encode()).hexdigest()
+            store._foundation._client.hset(keys[4], "token_digest", retrieval_digest)
+            store._foundation._client.hset(
+                keys[9], "retrieval_credential_digest", retrieval_digest
+            )
+            fixtures.append((node, envelope, keys, member))
+
+        namespace_b = _exact_key_snapshot(stores[1], fixtures[1][2])
+        retrieved_a = stores[0].retrieve_encrypted_response(*identity, credential)
+        assert retrieved_a.state == "response_ready"
+        assert retrieved_a.envelope == fixtures[0][1]
+        assert _exact_key_snapshot(stores[1], fixtures[1][2]) == namespace_b
+
+        acknowledged = stores[0].retrieve_encrypted_response(
+            *identity, credential, retrieved_a.acknowledgement_token
+        )
+        assert acknowledged.state == "acknowledged"
+        assert _exact_key_snapshot(stores[1], fixtures[1][2]) == namespace_b
+        retrieved_b = stores[1].retrieve_encrypted_response(*identity, credential)
+        assert retrieved_b.state == "response_ready"
+        assert retrieved_b.envelope == fixtures[1][1]
+    finally:
+        for store, fixture in zip(stores, fixtures):
+            _delete_claim_fixture_state(store, (fixture[0],), (identity,))
+        for store in stores:
+            store.close()
+
+
+def test_response_retrieval_preserves_additive_fields_and_bounded_backlog(
+    valkey_server,
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, node_transition_batch_size=1
+    )
+    fixtures = []
+    try:
+        for label in ("additive-target", "backlog-a", "backlog-b"):
+            fixtures.append(_accepted_retrieval_fixture((store,), label))
+        target = fixtures[0]
+        _, identity, credential, envelope, _, keys, member = target
+        datastore = store._foundation._client
+        additive = {
+            keys[7]: (b"response-extension", b"response-preserved"),
+            keys[9]: (b"terminal-extension", b"terminal-preserved"),
+            keys[4]: (b"lifecycle-extension", b"lifecycle-preserved"),
+        }
+        for key, (field, value) in additive.items():
+            datastore.hset(key, field, value)
+
+        before = _exact_key_snapshot(store, keys)
+        response_before = datastore.hgetall(keys[7])
+        terminal_before = datastore.hgetall(keys[9])
+        lifecycle_before = datastore.hgetall(keys[4])
+        response_index_before = datastore.zrange(keys[8], 0, -1, withscores=True)
+        terminal_index_before = datastore.zrange(keys[10], 0, -1, withscores=True)
+        backlog_before = [
+            (
+                tuple(datastore.hgetall(fixture[5][index]) for index in (4, 7, 9)),
+                datastore.zscore(fixture[5][8], fixture[6]),
+                datastore.zscore(fixture[5][10], fixture[6]),
+            )
+            for fixture in fixtures[1:]
+        ]
+        result = store.retrieve_encrypted_response(*identity, credential)
+        assert result.state == "response_ready"
+        assert result.envelope == envelope
+        assert _exact_key_snapshot(store, keys) == before
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.state = "changed"
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.envelope.ciphertext = "changed"
+
+        acknowledged = store.retrieve_encrypted_response(
+            *identity, credential, result.acknowledgement_token
+        )
+        assert acknowledged.state == "acknowledged"
+        assert datastore.exists(keys[7]) == 0
+        assert datastore.zscore(keys[8], member) is None
+        expected_terminal = terminal_before | {b"retrieval_state": b"acknowledged"}
+        assert datastore.hgetall(keys[9]) == expected_terminal
+        assert datastore.hgetall(keys[4]) == lifecycle_before
+        assert datastore.zrange(keys[8], 0, -1, withscores=True) == [
+            entry for entry in response_index_before if entry[0].decode() != member
+        ]
+        assert datastore.zrange(keys[10], 0, -1, withscores=True) == terminal_index_before
+        assert response_before
+        for key, (field, value) in additive.items():
+            if key != keys[7]:
+                assert datastore.hget(key, field) == value
+        assert [
+            (
+                tuple(datastore.hgetall(fixture[5][index]) for index in (4, 7, 9)),
+                datastore.zscore(fixture[5][8], fixture[6]),
+                datastore.zscore(fixture[5][10], fixture[6]),
+            )
+            for fixture in fixtures[1:]
+        ] == backlog_before
+    finally:
+        _delete_claim_fixture_state(
+            store,
+            tuple(fixture[0] for fixture in fixtures),
+            tuple(fixture[1] for fixture in fixtures),
+        )
+        store.close()
+
+
+@pytest.mark.parametrize("failure_stage", ("read", "ack"))
+def test_response_retrieval_backend_failures_are_redacted(
+    valkey_server, caplog, failure_stage
+):
+    namespace = f"retrieval-redaction-{uuid.uuid4().hex}"
+    endpoint_marker = "retrieval-private-endpoint-marker"
+    store = _registration_store(valkey_server, namespace)
+    fixture = _accepted_retrieval_fixture((store,), f"redacted-{failure_stage}")
+    node, identity, credential, envelope, _, keys, _ = fixture
+    initial = store.retrieve_encrypted_response(*identity, credential)
+    token = initial.acknowledgement_token
+    assert token is not None
+    raw_acknowledgement_key = _ACKNOWLEDGEMENT_KEY.decode()
+    markers = (
+        credential,
+        token,
+        raw_acknowledgement_key,
+        envelope.ciphertext,
+        endpoint_marker,
+        namespace,
+        *keys,
+    )
+    original_evalsha = store._foundation._client.evalsha
+    dispatches = []
+    matching_dispatches = 0
+    before = _exact_key_snapshot(store, keys)
+    store._foundation._client.script_load(RETRIEVE_RESPONSE_SCRIPT.source)
+
+    def fail_retrieval(*args, **kwargs):
+        nonlocal matching_dispatches
+        if args[0] != RETRIEVE_RESPONSE_SCRIPT.eval_sha1:
+            return original_evalsha(*args, **kwargs)
+        matching_dispatches += 1
+        dispatches.append((args, kwargs))
+        if failure_stage == "read" or matching_dispatches == 2:
+            raise redis.ConnectionError(" ".join(markers))
+        return original_evalsha(*args, **kwargs)
+
+    try:
+        store._foundation._client.evalsha = fail_retrieval
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(
+                ValkeyUnavailableError, match="^state backend unavailable$"
+            ) as caught:
+                store.retrieve_encrypted_response(
+                    *identity,
+                    credential,
+                    token if failure_stage == "ack" else None,
+                )
+        assert caught.value.__cause__ is None
+        rendered = "".join(
+            (
+                str(caught.value),
+                repr(caught.value),
+                "".join(traceback.format_exception(caught.value)),
+                caplog.text,
+                repr(store),
+                repr(store._foundation),
+                repr(store._foundation.config),
+                repr(store._foundation.config.direct),
+            )
+        )
+        assert all(marker not in rendered for marker in markers)
+        assert len(dispatches) == (1 if failure_stage == "read" else 2)
+        for dispatched_args, dispatched_kwargs in dispatches:
+            assert dispatched_kwargs == {}
+            wire = tuple(
+                value if isinstance(value, bytes) else str(value).encode()
+                for value in dispatched_args[2:]
+            )
+            assert credential.encode() not in wire
+            assert token.encode() not in wire
+            assert _ACKNOWLEDGEMENT_KEY not in wire
+        assert _exact_key_snapshot(store, keys) == before
+    finally:
+        store._foundation._client.evalsha = original_evalsha
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
 def test_response_retrievals_are_concurrent_replayable_and_independently_derived(
     valkey_server,
 ):

@@ -26,6 +26,7 @@ EXPECTED_IDS = {
 UNMATCHED_BATCH_SIZE = 1024
 METRICS_RATE_LIMIT = "5000/minute"
 METRICS_DAILY_QUOTA = "5000/day"
+METRICS_SCRAPE_COUNT = 4
 PUBLIC_INFORMATION_PATHS = ("/", "/api/v1/meta", "/api/v1/version")
 PROTECTED_READ_PATH = "/api/v1/models"
 MUTATING_PATH = "/api/v1/relay/requests/cancel"
@@ -134,6 +135,8 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
             return results
         before = parse_metrics(before_text)
         first = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(UNMATCHED_BATCH_SIZE)]
+        if len(set(first)) < 1024:
+            return results
         if any(request(base_url, path)[0] != 404 for path in first):
             return results
         status, middle_text = request(base_url, "/metrics")
@@ -141,6 +144,8 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
             return results
         middle = parse_metrics(middle_text)
         second = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(UNMATCHED_BATCH_SIZE)]
+        if len(set(second)) < 1024 or set(first) & set(second):
+            return results
         if any(request(base_url, path)[0] != 404 for path in second):
             return results
         status, after_text = request(base_url, "/metrics")
@@ -159,10 +164,11 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
     results["metrics.no_flask_defaults"] = {"passed": not any(n.startswith("flask_http_") for n in names)}
     all_paths = first + second
     unsafe = False
-    # Bounded collectors may create their fixed ``unknown``/``other`` series
-    # lazily during the first unmatched batch. Only continued identity growth
-    # in the successive batch demonstrates transformed per-path labels.
-    continued_growth = after - middle
+    # Bounded collectors may create fixed fallback series lazily during the
+    # first unmatched batch. Inspect identities introduced by either batch so
+    # a collector cannot hide attacker-derived labels by stopping at a cap.
+    probe_growth = (middle - before) | (after - middle)
+    bounded_fallbacks = {"unknown", "other", "/{unmatched}"}
     for sample in after:
         for key, value in sample.labels:
             # Flask endpoint names and normalized route templates are bounded; the
@@ -171,7 +177,11 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
                 "release-safety-unmatched-" in value
                 or bool(re.search(r"/(?:[0-9a-f]{16,}|\d{6,})(?:/|$)", value, re.IGNORECASE))
             )
-            transformed_per_path = sample in continued_growth and key in {"path", "route", "endpoint", "url"}
+            transformed_per_path = (
+                sample in probe_growth
+                and key in {"path", "route", "endpoint", "url"}
+                and value not in bounded_fallbacks
+            )
             if raw_path or transformed_per_path or value in all_paths or "release-safety-unmatched-" in value:
                 unsafe = True
     results["metrics.no_raw_paths"] = {"passed": not unsafe}
@@ -189,18 +199,37 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
 def execute_public_exemption_check(base_url: str) -> dict[str, dict[str, object]]:
     public = [request(base_url, path, method)[0] for method in ("GET", "HEAD")
               for path in PUBLIC_INFORMATION_PATHS for _ in range(2)]
-    # The near-match must consume the single-request quota. A subsequent POST
-    # to an exact public path must therefore be limited rather than inheriting
-    # the GET/HEAD exemption. Together these requests prove that exemption
-    # matching is exact for both path and method.
-    near_match = request(base_url, "/api/v1/meta/release-safety-near-match")[0]
-    disallowed_method = request(base_url, "/api/v1/meta", "POST")[0]
+    # Use a registered endpoint as the quota sentinel. Flask-Limiter skips
+    # unrouted requests, so 404 responses cannot prove quota consumption.
+    sentinel = [request(base_url, PROTECTED_READ_PATH)[0] for _ in range(2)]
     return {"quota.public_information_exempt": {
-        "passed": all(code == 200 for code in public) and near_match == 404 and disallowed_method == 429,
+        "passed": all(code == 200 for code in public) and sentinel == [200, 429],
         "safe_methods_response_class": "2xx" if all(code == 200 for code in public) else "unexpected",
-        "near_match_status": near_match,
-        "disallowed_method_status": disallowed_method,
+        "sentinel_status_codes": sentinel,
     }}
+
+
+def inspect_public_exemption_predicate(container: str) -> bool:
+    """Prove exact public path/method matching inside the inspected image."""
+    program = """import json
+from flask import Flask
+from api import _is_public_api_rate_limit_exempt_path as exempt
+paths = ('/', '/api/v1/meta', '/api/v1/version')
+app = Flask(__name__)
+def check(path, method):
+    with app.test_request_context(path, method=method):
+        return exempt(path)
+result = all(check(path, method) for path in paths for method in ('GET', 'HEAD'))
+result = result and all(not check(path + ('release-safety-neighbor' if path == '/' else '/release-safety-neighbor'), 'GET') for path in paths)
+result = result and all(not check(path, 'POST') for path in paths)
+print(json.dumps({'passed': result}))
+"""
+    try:
+        output = docker_output("exec", container, "python", "-c", program)
+        result = json.loads(output)
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, TypeError):
+        return False
+    return result == {"passed": True}
 
 
 def execute_quota_check(base_url: str, limit_id: str, *, mutating: bool) -> dict[str, dict[str, object]]:
@@ -320,6 +349,12 @@ def main() -> int:
         validate_registry_identity(image_id, args.platform, args.registry_coordinate, args.index_digest,
                                    args.platform_digest)
 
+        complete_metrics_probe_count = 2 * UNMATCHED_BATCH_SIZE + METRICS_SCRAPE_COUNT
+        if any(int(limit.split("/", 1)[0]) <= complete_metrics_probe_count for limit in (
+            METRICS_RATE_LIMIT, METRICS_DAILY_QUOTA,
+        )):
+            raise GateFailure("metrics_probe_quota_invalid")
+
         phases = [
             ("metrics", METRICS_RATE_LIMIT, METRICS_DAILY_QUOTA, None),
             ("public", "1/minute", "1/day", "public"),
@@ -346,6 +381,10 @@ def main() -> int:
                 checked = execute_metrics_checks(base)
             elif phase == "public":
                 checked = execute_public_exemption_check(base)
+                public_result = checked.get("quota.public_information_exempt")
+                if public_result is not None:
+                    public_result["predicate_exact"] = inspect_public_exemption_predicate(container)
+                    public_result["passed"] = public_result["passed"] and public_result["predicate_exact"]
             else:
                 assert check_id is not None
                 checked = execute_quota_check(base, check_id, mutating=phase.startswith("mutating-"))

@@ -146,9 +146,25 @@ def test_hashed_raw_route_series_grows_even_with_scientific_values(monkeypatch):
 
 
 def test_bounded_template_metrics_pass_after_collector_warmup(monkeypatch):
-    monkeypatch.setattr(gate, "request", lambda _base, path, method="GET":
-                        (200, VALID) if path == "/metrics" else (404, ""))
+    unmatched = []
+
+    def fake_request(_base, path, method="GET"):
+        if path != "/metrics":
+            unmatched.append(path)
+            return 404, ""
+        return 200, VALID
+
+    monkeypatch.setattr(gate, "request", fake_request)
     assert all(v["passed"] for v in gate.execute_metrics_checks("http://loopback").values())
+    assert len(unmatched) == 2 * gate.UNMATCHED_BATCH_SIZE
+    assert len(set(unmatched[:gate.UNMATCHED_BATCH_SIZE])) >= 1024
+    assert len(set(unmatched[gate.UNMATCHED_BATCH_SIZE:])) >= 1024
+
+
+def test_metrics_phase_ceilings_exceed_complete_probe_count():
+    complete_probe_count = 2 * gate.UNMATCHED_BATCH_SIZE + gate.METRICS_SCRAPE_COUNT
+    assert int(gate.METRICS_RATE_LIMIT.split("/", 1)[0]) > complete_probe_count
+    assert int(gate.METRICS_DAILY_QUOTA.split("/", 1)[0]) > complete_probe_count
 
 
 def test_lazy_bounded_unmatched_collectors_are_not_per_path_growth(monkeypatch):
@@ -230,9 +246,30 @@ def test_hashed_per_path_labels_fail_without_raw_probe_values(monkeypatch):
     assert results["metrics.bounded_unmatched_paths"]["passed"] is False
 
 
+def test_capped_hashed_labels_fail_even_when_second_batch_stops_growing(monkeypatch):
+    scrapes = 0
+
+    def fake_request(_base, path, method="GET"):
+        nonlocal scrapes
+        if path != "/metrics":
+            return 404, ""
+        scrapes += 1
+        capped = "" if scrapes < 3 else "".join(
+            f'hits{{endpoint="{number:064x}"}} 1\n' for number in range(32)
+        )
+        return 200, VALID + capped
+
+    monkeypatch.setattr(gate, "request", fake_request)
+    results = gate.execute_metrics_checks("http://loopback")
+    assert results["metrics.no_raw_paths"]["passed"] is False
+    assert results["metrics.bounded_unmatched_paths"]["passed"] is True
+    assert results["metrics.bounded_unmatched_paths"]["first_batch_growth"] == 32
+    assert results["metrics.bounded_unmatched_paths"]["second_batch_growth"] == 0
+
+
 @pytest.mark.parametrize("statuses,expected", [
-    ([200] * 12 + [404, 429], True), ([500] + [200] * 11 + [404, 429], False),
-    ([200] * 12 + [404, 405], False), ([200] * 12 + [429, 429], False),
+    ([200] * 13 + [429], True), ([500] + [200] * 12 + [429], False),
+    ([200] * 14, False), ([200] * 12 + [429, 429], False),
 ])
 def test_public_exemption_uses_exact_get_and_head_paths(monkeypatch, statuses, expected):
     iterator = iter(statuses)
@@ -245,24 +282,60 @@ def test_public_exemption_uses_exact_get_and_head_paths(monkeypatch, statuses, e
     monkeypatch.setattr(gate, "request", fake_request)
     results = gate.execute_public_exemption_check("http://loopback")
     assert all(v["passed"] for v in results.values()) is expected
-    assert calls[-2:] == [
-        ("/api/v1/meta/release-safety-near-match", "GET", None),
-        ("/api/v1/meta", "POST", None),
-    ]
+    assert calls[-2:] == [(gate.PROTECTED_READ_PATH, "GET", None)] * 2
 
 
 def test_public_and_quota_evidence_records_exact_privacy_safe_statuses(monkeypatch):
-    statuses = iter([200] * 12 + [404, 429])
+    statuses = iter([200] * 13 + [429])
     monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: (next(statuses), ""))
     public = gate.execute_public_exemption_check("http://loopback")["quota.public_information_exempt"]
-    assert public["near_match_status"] == 404
-    assert public["disallowed_method_status"] == 429
+    assert public["sentinel_status_codes"] == [200, 429]
 
     statuses = iter([400, 429])
     mutation = gate.execute_quota_check(
         "http://loopback", "quota.test", mutating=True,
     )["quota.test"]
     assert mutation["status_codes"] == [400, 429]
+
+
+def test_registered_sentinel_observes_real_flask_limiter_routing():
+    from flask import Flask, request
+    from flask_limiter import Limiter
+
+    app = Flask(__name__)
+    public = set(gate.PUBLIC_INFORMATION_PATHS)
+    Limiter(
+        key_func=lambda: "release-safety-client",
+        app=app,
+        default_limits=["1/minute"],
+        default_limits_exempt_when=lambda: request.method in {"GET", "HEAD"} and request.path in public,
+        storage_uri="memory://",
+    )
+    for index, path in enumerate(gate.PUBLIC_INFORMATION_PATHS):
+        app.add_url_rule(path, f"public-{index}", lambda: "public", methods=["GET", "HEAD"])
+    app.add_url_rule(gate.PROTECTED_READ_PATH, "models", lambda: "models")
+
+    client = app.test_client()
+    assert [client.get(path).status_code for path in public for _ in range(2)] == [200] * 6
+    assert [client.head(path).status_code for path in public for _ in range(2)] == [200] * 6
+    assert [client.get(gate.PROTECTED_READ_PATH).status_code for _ in range(2)] == [200, 429]
+
+
+def test_unrouted_requests_do_not_prove_real_flask_limiter_enforcement():
+    from flask import Flask
+    from flask_limiter import Limiter
+
+    app = Flask(__name__)
+    Limiter(key_func=lambda: "client", app=app, default_limits=["1/minute"], storage_uri="memory://")
+    client = app.test_client()
+    assert [client.get("/unrouted").status_code for _ in range(2)] == [404, 404]
+
+
+@pytest.mark.parametrize("payload,expected", [('{"passed": true}', True), ('{"passed": false}', False),
+                                                ("not-json", False)])
+def test_in_image_public_predicate_inspection_fails_closed(monkeypatch, payload, expected):
+    monkeypatch.setattr(gate, "docker_output", lambda *args: payload)
+    assert gate.inspect_public_exemption_predicate("candidate") is expected
 
 
 @pytest.mark.parametrize("mutating,first", [(False, 200), (True, 400)])
@@ -419,6 +492,7 @@ def test_main_runs_inspected_image_id_not_mutable_alias(tmp_path, monkeypatch):
     monkeypatch.setattr(gate, "execute_public_exemption_check", lambda _base: {
         "quota.public_information_exempt": {"passed": True},
     })
+    monkeypatch.setattr(gate, "inspect_public_exemption_predicate", lambda _container: True)
     monkeypatch.setattr(gate, "execute_quota_check", lambda _base, limit_id, **_kwargs: {
         limit_id: {"passed": True},
     })
@@ -479,6 +553,7 @@ def _run_qualified_main(tmp_path, monkeypatch, public=True, missing=None, cleanu
     monkeypatch.setattr(gate, "execute_quota_check", lambda _base, limit_id, **_kwargs: (
         {} if missing == limit_id else {limit_id: {"passed": limit_id != failed_id}}
     ))
+    monkeypatch.setattr(gate, "inspect_public_exemption_predicate", lambda _container: True)
 
     def cleanup(*_args, **_kwargs):
         return subprocess.CompletedProcess([], cleanup_code)

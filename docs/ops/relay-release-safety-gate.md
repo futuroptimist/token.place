@@ -41,14 +41,19 @@ closed. The report intentionally excludes request bodies, credentials, client id
 the randomized unmatched paths used by the probe. Evidence records only bounded series growth,
 request counts, privacy-safe HTTP status codes, and immutable identities.
 
-The metrics phase sends two successive batches of 1,024 distinct unmatched paths. It independently
-rejects default Flask metric families and raw or attacker-controlled path labels, and requires the
-second batch to add no series identities. Quota phases prove that only `GET` and `HEAD` requests to
-`/`, `/api/v1/meta`, and `/api/v1/version` receive the public-information exemption; a non-mutating
-near-match consumes the one-request quota, after which a `POST` to the exact `/api/v1/meta` path
-must receive `429`. This proves the exemption is restricted by both exact path and HTTP method.
-Separate fresh
-containers prove rate and daily enforcement on the protected read route `/api/v1/models` and on the
+The metrics phase sends two successive batches of 1,024 distinct unmatched paths. Its rate and
+daily ceilings exceed the complete 2,052-request probe (including four metric scrapes). It
+independently rejects default Flask metric families and raw or attacker-controlled path labels,
+examines identities introduced in either batch (including collectors that stop at a fixed cap), and
+requires the second batch to add no series identities. Fixed lazy `unknown`, `other`, and
+`/{unmatched}` fallback series remain valid. Quota phases prove that only `GET` and `HEAD` requests
+to `/`, `/api/v1/meta`, and `/api/v1/version` receive the public-information exemption. After those
+public probes, the registered `/api/v1/models` route must return exactly `200` then `429`; unrouted
+404/405 responses are never accepted as quota enforcement. A bounded request-context check inside
+the inspected image independently requires the existing exemption predicate to accept every exact
+public GET/HEAD pair and reject neighboring paths and POST on each actual public path. The check
+fails closed if that predicate cannot be inspected. Separate fresh containers prove rate and daily
+enforcement on the protected read route `/api/v1/models` and on the
 mutating route `/api/v1/relay/requests/cancel`. The mutating probe sends an empty JSON object: its
 first `400` response occurs during validation before any state-store mutation, and its second
 request must receive `429` from the selected limiter.

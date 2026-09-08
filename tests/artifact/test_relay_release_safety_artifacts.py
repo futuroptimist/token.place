@@ -23,6 +23,8 @@ QUOTA_IDS = {
     "quota.public_information_exempt",
     "quota.protected_rate_limited",
     "quota.protected_daily_limited",
+    "quota.mutating_rate_limited",
+    "quota.mutating_daily_limited",
 }
 
 

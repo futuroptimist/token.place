@@ -1,8 +1,13 @@
 # Relay release safety gate
 
 Every production-eligible relay image publication is blocked on the behavioral contract in
-`config/relay_release_safety_contract.json`. The gate starts the built candidate image with an
-isolated, deliberately small quota and tests its HTTP and Prometheus surfaces. It does not query
+`config/relay_release_safety_contract.json`. The gate starts the built candidate image in
+isolated containers and tests its HTTP and Prometheus surfaces. The metrics phase uses quota ceilings
+above its two successive batches of 1,024 unique unmatched paths; separate deliberately low-quota
+containers prove rate and daily enforcement independently for the protected `GET /api/v1/models`
+route and for `POST /api/v1/relay/servers/unregister`. The mutating-route probe sends an empty,
+invalid request, requires the normal application response (`400`) first, and therefore cannot
+unregister a server before requiring the limiter response (`429`). The gate does not query
 staging or production, inspect commit ancestry, or record requests, client identity, credentials,
 or sampled paths.
 
@@ -36,7 +41,8 @@ only then attaches the production-eligible tags to the index. CI uploads one non
 platform and records the OCI index digest in the
 workflow summary. Missing, duplicate, skipped, malformed, mismatched, or false results fail
 closed. The report intentionally excludes request bodies, credentials, client identities, logs, and
-the randomized unmatched paths used by the probe.
+the randomized unmatched paths used by the probe. Evidence records only batch sizes, bounded series
+growth, response classes, and immutable identities.
 
 The evidence distinguishes `failed` from `not_run` checks and uses sanitized error categories.
 `startup_timeout` means the bounded readiness deadline expired (transient connection resets are

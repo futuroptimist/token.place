@@ -21,7 +21,9 @@ EXPECTED_IDS = {
     "metrics.valid_instrumentation", "metrics.no_flask_defaults", "metrics.no_raw_paths",
     "metrics.bounded_unmatched_paths", "quota.public_information_exempt",
     "quota.protected_rate_limited", "quota.protected_daily_limited",
+    "quota.mutating_rate_limited", "quota.mutating_daily_limited",
 }
+UNMATCHED_BATCH_SIZE = 1024
 GIT_SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 METRIC_NAME = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
@@ -123,14 +125,14 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
         if status != 200:
             return results
         before = parse_metrics(before_text)
-        first = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(24)]
+        first = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(UNMATCHED_BATCH_SIZE)]
         if any(request(base_url, path)[0] != 404 for path in first):
             return results
         status, middle_text = request(base_url, "/metrics")
         if status != 200:
             return results
         middle = parse_metrics(middle_text)
-        second = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(24)]
+        second = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(UNMATCHED_BATCH_SIZE)]
         if any(request(base_url, path)[0] != 404 for path in second):
             return results
         status, after_text = request(base_url, "/metrics")
@@ -167,19 +169,27 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
     results["metrics.no_raw_paths"] = {"passed": not unsafe}
     growth1, growth2 = len(middle - before), len(after - middle)
     results["metrics.bounded_unmatched_paths"] = {
-        "passed": growth2 == 0, "first_batch_growth": growth1, "second_batch_growth": growth2,
+        "passed": growth2 == 0,
+        "first_batch_requests": len(first), "second_batch_requests": len(second),
+        "first_batch_growth": growth1, "second_batch_growth": growth2,
     }
     return results
 
 
-def execute_quota_checks(base_url: str, limit_id: str) -> dict[str, dict[str, object]]:
+def execute_quota_checks(
+    base_url: str, limit_id: str, path: str, method: str, normal_status: int,
+) -> dict[str, dict[str, object]]:
     public = [request(base_url, path, method)[0] for method in ("GET", "HEAD")
               for path in ("/", "/api/v1/meta", "/api/v1/version") for _ in range(2)]
-    first = request(base_url, "/api/v1/models")[0]
-    second = request(base_url, "/api/v1/models")[0]
+    first = request(base_url, path, method)[0]
+    second = request(base_url, path, method)[0]
     return {
         "quota.public_information_exempt": {"passed": all(code == 200 for code in public)},
-        limit_id: {"passed": first == 200 and second == 429},
+        limit_id: {
+            "passed": first == normal_status and second == 429,
+            "normal_response_class": f"{normal_status // 100}xx",
+            "limited_response_class": f"{second // 100}xx" if second else "transport_failure",
+        },
     }
 
 
@@ -287,8 +297,18 @@ def main() -> int:
         validate_registry_identity(image_id, args.platform, args.registry_coordinate, args.index_digest,
                                    args.platform_digest)
 
-        phases = [("metrics", "1000/minute", "1000/day"), ("rate", "1/minute", "1000/day"), ("daily", "1000/minute", "1/day")]
-        for offset, (phase, rate, daily) in enumerate(phases):
+        phases = [
+            ("metrics", "10000/minute", "10000/day", None),
+            ("protected-rate", "1/minute", "1000/day",
+             ("quota.protected_rate_limited", "/api/v1/models", "GET", 200)),
+            ("protected-daily", "1000/minute", "1/day",
+             ("quota.protected_daily_limited", "/api/v1/models", "GET", 200)),
+            ("mutating-rate", "1/minute", "1000/day",
+             ("quota.mutating_rate_limited", "/api/v1/relay/servers/unregister", "POST", 400)),
+            ("mutating-daily", "1000/minute", "1/day",
+             ("quota.mutating_daily_limited", "/api/v1/relay/servers/unregister", "POST", 400)),
+        ]
+        for offset, (phase, rate, daily, quota_probe) in enumerate(phases):
             container = f"relay-safety-{phase}-{uuid.uuid4().hex[:8]}"
             containers.append(container)
             docker_output("run", "-d", "--rm", "--name", container, "-p", f"127.0.0.1:{args.port + offset}:5010",
@@ -303,14 +323,15 @@ def main() -> int:
             else:
                 raise GateFailure("startup_timeout")
             checked = execute_metrics_checks(base) if phase == "metrics" else execute_quota_checks(
-                base, f"quota.protected_{phase}_limited")
+                base, *quota_probe)
             for key, result in checked.items():
                 result["state"] = "passed" if result["passed"] else "failed"
                 if key == "quota.public_information_exempt":
                     aggregate = evidence["results"][key]
                     aggregate.setdefault("phases", {})[phase] = result
                     phase_results = aggregate["phases"]
-                    aggregate["passed"] = set(phase_results) == {"rate", "daily"} and all(
+                    expected_phases = {"protected-rate", "protected-daily", "mutating-rate", "mutating-daily"}
+                    aggregate["passed"] = set(phase_results) == expected_phases and all(
                         item["passed"] for item in phase_results.values()
                     )
                     aggregate["state"] = "passed" if aggregate["passed"] else "failed"

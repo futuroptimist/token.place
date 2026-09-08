@@ -8272,9 +8272,11 @@ def test_retention_reaper_reclaims_capacity_only_after_complete_validation(
         ("due", "cross_record_identity"),
         ("due", "cross_record_request"),
         ("due", "lifecycle_generation_mismatch"),
+        ("due", "claimed_lifecycle_fields_missing"),
         ("live", "partial_terminal"),
         ("live", "score_mismatch"),
         ("live", "lifecycle_generation_mismatch"),
+        ("live", "claimed_lifecycle_fields_missing"),
     ),
 )
 def test_retention_reaper_rejects_malformed_authority_without_mutation(
@@ -8323,6 +8325,15 @@ def test_retention_reaper_rejects_malformed_authority_without_mutation(
             client.hset(authority["request"], "node_id", "other-node")
         elif corruption == "lifecycle_generation_mismatch":
             client.hset(authority["request"], "claim_generation", "2")
+        elif corruption == "claimed_lifecycle_fields_missing":
+            client.hdel(
+                authority["request"],
+                "client_public_key",
+                "request_id",
+                "sequence",
+                "queue_entry",
+                "envelope",
+            )
         else:
             client.hset(authority["control"], "request", _digest("other-request"))
 

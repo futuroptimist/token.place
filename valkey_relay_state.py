@@ -1425,6 +1425,7 @@ local function lifecycle_valid(c,q,v,l,accepted)
      not digest(l[7]) or not digest(l[12]) or l[12]~=v[12] or l[13]~=v[14] or
      (l[13]~='' and not digest(l[13])) then return false end
   local extended=l[4] or l[5] or l[9] or l[11] or l[14]
+  if generation>0 and not extended then return false end
   if extended then
     local sequence=integer(l[9])
     if not l[4] or string.len(l[4])<1 or string.len(l[4])>max_identity or
@@ -1529,7 +1530,7 @@ return {'created',status,reason}
 CANCEL_REQUEST_SCRIPT = ReviewedScript(
     "cancel_or_expire_request_v1",
     CANCEL_REQUEST_SOURCE,
-    "580886a855a4d6889aefd8729f3d9a4f1431624fe088ed9c1ed93eca0859e4a8",
+    "f5e3ebf30d79ea45edcacf1820c80b47624175c38bd5a1424712bcbb6e518371",
     True,
 )
 

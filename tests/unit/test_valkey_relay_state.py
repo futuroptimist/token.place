@@ -282,7 +282,7 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     ("script", "digest"),
     (
         (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "f5d586f732db17aad1669377045cd455840eb2650614e26ba0132c14e8a013c2"),
-        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "580886a855a4d6889aefd8729f3d9a4f1431624fe088ed9c1ed93eca0859e4a8"),
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "f5e3ebf30d79ea45edcacf1820c80b47624175c38bd5a1424712bcbb6e518371"),
     ),
 )
 def test_control_transition_scripts_are_digest_pinned(script, digest):

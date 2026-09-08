@@ -64,28 +64,14 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "default": false
-        },
-        "path": {
-          "type": "string",
-          "const": "/metrics",
-          "default": "/metrics"
-        },
+        "enabled": { "type": "boolean", "default": false },
+        "path": { "type": "string", "const": "/metrics", "default": "/metrics" },
         "auth": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "existingSecret": {
-              "type": "string",
-              "default": ""
-            },
-            "secretKey": {
-              "type": "string",
-              "default": "token",
-              "minLength": 1
-            }
+            "existingSecret": { "type": "string", "default": "" },
+            "secretKey": { "type": "string", "default": "token", "minLength": 1 }
           }
         }
       }
@@ -94,47 +80,22 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "default": false
-        },
-        "interval": {
-          "type": "string",
-          "default": "30s"
-        },
-        "scrapeTimeout": {
-          "type": "string",
-          "default": "10s"
-        },
+        "enabled": { "type": "boolean", "default": false },
+        "interval": { "type": "string", "default": "30s" },
+        "scrapeTimeout": { "type": "string", "default": "10s" },
         "additionalLabels": {
           "type": "object",
-          "default": {
-            "release": "kube-prometheus-stack"
-          },
-          "additionalProperties": {
-            "type": "string"
-          }
+          "default": { "release": "kube-prometheus-stack" },
+          "additionalProperties": { "type": "string" }
         },
         "relabelings": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "app": {
-              "type": "string",
-              "default": "tokenplace"
-            },
-            "environment": {
-              "type": "string",
-              "default": ""
-            },
-            "release": {
-              "type": "string",
-              "default": ""
-            },
-            "cluster": {
-              "type": "string",
-              "default": ""
-            }
+            "app": { "type": "string", "default": "tokenplace" },
+            "environment": { "type": "string", "default": "" },
+            "release": { "type": "string", "default": "" },
+            "cluster": { "type": "string", "default": "" }
           }
         }
       }

@@ -65,6 +65,7 @@ rateLimit:
 metrics:
   enabled: false
   path: /metrics
+  mode: normal
   auth:
     existingSecret: ""
     secretKey: token

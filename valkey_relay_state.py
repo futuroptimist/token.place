@@ -1421,7 +1421,7 @@ end
 local function lifecycle_valid(c,q,v,l,accepted)
   local deadline=bounded_number(l[8],false); local generation=integer(l[10])
   if redis.call('EXISTS',prefix..'request:'..c..':'..q)~=1 or l[2]~=c or l[3]~=q or
-     not deadline or not generation or l[6]~=v[4] or l[6]=='' or string.len(l[6])>max_node_id or
+     not deadline or not generation or l[10]~=v[7] or l[6]~=v[4] or l[6]=='' or string.len(l[6])>max_node_id or
      not digest(l[7]) or not digest(l[12]) or l[12]~=v[12] or l[13]~=v[14] or
      (l[13]~='' and not digest(l[13])) then return false end
   local extended=l[4] or l[5] or l[9] or l[11] or l[14]
@@ -1529,7 +1529,7 @@ return {'created',status,reason}
 CANCEL_REQUEST_SCRIPT = ReviewedScript(
     "cancel_or_expire_request_v1",
     CANCEL_REQUEST_SOURCE,
-    "d442f3d827d82d1f0b170a32f570b7c77dc68e8038f1761a245c7f364f34491a",
+    "580886a855a4d6889aefd8729f3d9a4f1431624fe088ed9c1ed93eca0859e4a8",
     True,
 )
 

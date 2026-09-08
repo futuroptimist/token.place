@@ -28,6 +28,9 @@ SPEC = importlib.util.spec_from_file_location('desktop_compute_node_bridge', MOD
 compute_node_bridge = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(compute_node_bridge)
+_REAL_ENSURE_DESKTOP_PYTHON_DEPENDENCIES = (
+    compute_node_bridge.ensure_desktop_python_dependencies
+)
 
 
 def test_headless_boundary_result_contract_is_privacy_safe():
@@ -803,6 +806,15 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
         'maybe_reexec_for_runtime_refresh',
         lambda _setup, *, allow_reexec=True: None,
     )
+    if (
+        compute_node_bridge.ensure_desktop_python_dependencies
+        is _REAL_ENSURE_DESKTOP_PYTHON_DEPENDENCIES
+    ):
+        monkeypatch.setattr(
+            compute_node_bridge,
+            'ensure_desktop_python_dependencies',
+            lambda **_kwargs: {'ok': 'true'},
+        )
 
 
 def _reset_cancel_queue():
@@ -2254,6 +2266,21 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
 
     monkeypatch.setattr('builtins.__import__', fake_import)
     monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'true'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode: {'runtime_action': 'skipped'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup, *, allow_reexec=True: None,
+    )
+    monkeypatch.setattr(
         sys,
         'argv',
         [
@@ -3431,13 +3458,27 @@ def test_module_import_does_not_load_context_profiles_before_preflight(monkeypat
     assert 'model_path' not in payload
 
 
-def test_utils_package_keeps_lazy_convenience_exports():
+def test_utils_package_keeps_lazy_convenience_exports(monkeypatch):
     import utils
 
+    model_manager_export = object()
+    crypto_manager_export = object()
+    relay_client_export = object()
+
+    model_manager_module = ModuleType('utils.llm.model_manager')
+    model_manager_module.get_model_manager = model_manager_export
+    crypto_manager_module = ModuleType('utils.crypto.crypto_manager')
+    crypto_manager_module.get_crypto_manager = crypto_manager_export
+    relay_client_module = ModuleType('utils.networking.relay_client')
+    relay_client_module.RelayClient = relay_client_export
+    monkeypatch.setitem(sys.modules, 'utils.llm.model_manager', model_manager_module)
+    monkeypatch.setitem(sys.modules, 'utils.crypto.crypto_manager', crypto_manager_module)
+    monkeypatch.setitem(sys.modules, 'utils.networking.relay_client', relay_client_module)
+
     assert utils.get_temp_dir
-    assert utils.get_model_manager
-    assert utils.get_crypto_manager
-    assert utils.RelayClient
+    assert utils.get_model_manager is model_manager_export
+    assert utils.get_crypto_manager is crypto_manager_export
+    assert utils.RelayClient is relay_client_export
     assert {
         'get_model_manager',
         'get_crypto_manager',
@@ -7262,6 +7303,8 @@ def test_bridge_fatal_composition_via_wire_fatal_teardown_exits_subprocess(tmp_p
     repo_root = str(MODULE_PATH.parents[3])
     bridge_python_dir = str(MODULE_PATH.parent)
     bridge_path = str(MODULE_PATH)
+    ready_marker = tmp_path / 'child-ready'
+    network_marker = tmp_path / 'unexpected-network'
 
     child_script = tmp_path / 'child_bridge_fatal.py'
     child_script.write_text(
@@ -7279,6 +7322,14 @@ sys.path.insert(0, {repo_root!r})
 import utils.networking.relay_client as rcm
 rcm._API_V1_CLEANUP_BUDGET_SECONDS = 0.2
 
+# Any transport path not replaced below is a fixture failure, not best-effort I/O.
+network_marker = {str(network_marker)!r}
+def unexpected_network(*_args, **_kwargs):
+    with open(network_marker, 'w', encoding='utf-8') as marker:
+        marker.write('requests.post')
+    raise AssertionError('fatal-child fixture attempted real HTTP')
+rcm.requests.post = unexpected_network
+
 # Create a minimal RelayClient.
 from unittest.mock import MagicMock, patch
 crypto = MagicMock()
@@ -7292,6 +7343,10 @@ with patch('utils.networking.relay_client.get_config_lazy', return_value=config)
 
 client._last_api_v1_work_relay_url = 'http://relay.example'
 client._polling_stopped_by_request = False
+client._post_api_v1_request_control = lambda **_kwargs: {{
+    'status': 'active',
+    'next_poll_seconds': 30,
+}}
 
 # Inference blocks forever so the quiescence check always times out.
 release_inference = threading.Event()
@@ -7316,6 +7371,8 @@ class FakeRuntime:
         self.relay_client.fatal_bridge_teardown = cb
 
 compute_node_bridge._wire_fatal_teardown_for_runtime(FakeRuntime())
+with open({str(ready_marker)!r}, 'w', encoding='utf-8') as marker:
+    marker.write('wired')
 
 # Use a past local deadline so the poll loop exits on the first iteration.
 local_deadline = time.monotonic() - 1.0
@@ -7343,10 +7400,12 @@ sys.exit(0)
         text=True,
     )
 
-    assert result.returncode != 0, (
-        f"Expected nonzero exit from bridge fatal_bridge_teardown, "
+    assert result.returncode == 1, (
+        f"Expected exit 1 from bridge fatal_bridge_teardown, "
         f"got {result.returncode}. stdout: {result.stdout!r} stderr: {result.stderr!r}"
     )
+    assert ready_marker.read_text(encoding='utf-8') == 'wired'
+    assert not network_marker.exists(), 'Child fixture attempted real HTTP'
     assert 'MARKER_REACHED_AFTER_SUPERVISE' not in result.stdout, (
         "Execution must not reach the post-fatal marker"
     )

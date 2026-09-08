@@ -1,18 +1,19 @@
 """Security contract for bounded proxy-aware limiter identity."""
 
+import json
 import logging
 from pathlib import Path
 
 import pytest
 from flask import Flask, request
+from jsonschema import Draft7Validator
 
 from api import init_app
-from api.client_identity import (ClientIdentityPolicy,
-                                 TrustedProxyConfigurationError,
+from api.client_identity import (TrustedProxyConfigurationError,
                                  parse_trusted_proxy_networks)
 
 
-def _app(limit="1/minute"):
+def _app():
     app = Flask(__name__)
     app.config["TESTING"] = True
     init_app(app)
@@ -135,6 +136,8 @@ def test_direct_ipv4_mapped_address_has_one_canonical_bucket(monkeypatch):
         " 10.0.0.0/8",
         "10.0.0.0/7",
         "2001:db8::/31",
+        "::ffff:192.0.2.1",
+        "::ffff:192.0.2.0/120",
         "bad",
     ],
 )
@@ -142,6 +145,27 @@ def test_invalid_trusted_proxy_configuration_fails_startup(monkeypatch, value):
     monkeypatch.setenv("TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES", value)
     with pytest.raises(TrustedProxyConfigurationError):
         _app()
+
+
+@pytest.mark.parametrize(
+    ("trusted", "peer"),
+    [
+        ("10.0.0.0/8,2001:db8::/32", "10.1.2.3"),
+        ("2001:db8::/32,10.0.0.0/8", "2001:db8::1"),
+    ],
+)
+def test_dual_stack_allowlist_matches_only_the_peers_ip_version(
+    monkeypatch, trusted, peer
+):
+    monkeypatch.setenv("TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES", trusted)
+    app = _app()
+    with app.test_request_context(
+        "/",
+        environ_base={"REMOTE_ADDR": peer},
+        headers={"CF-Connecting-IP": "198.51.100.7"},
+    ):
+        policy = app.extensions["tokenplace_client_identity_policy"]
+        assert policy.client_address(request) == "198.51.100.7"
 
 
 def test_identity_sentinels_do_not_reach_public_surfaces(monkeypatch, caplog):
@@ -170,3 +194,19 @@ def test_gunicorn_access_log_format_omits_identity_and_request_target():
     assert all(token not in format_line for token in ("%(h)s", "%(L)s", "%(r)s", "%(U)s", "%(q)s"))
     assert "%(s)s" in format_line
     assert "%(m)s" in format_line
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not-an-ip", "0.0.0.0/0", "224.0.0.1", "::/0", "ff02::1", "::ffff:192.0.2.1"],
+)
+def test_chart_schema_rejects_obviously_invalid_trusted_proxy_values(value):
+    schema = json.loads(
+        Path("charts/tokenplace/values.schema.json").read_text(encoding="utf-8")
+    )
+    errors = list(
+        Draft7Validator(schema).iter_errors(
+            {"rateLimit": {"trustedProxies": [value]}}
+        )
+    )
+    assert errors

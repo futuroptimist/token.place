@@ -60,6 +60,12 @@ def parse_trusted_proxy_networks(
                 raise TrustedProxyConfigurationError(
                     "invalid trusted-proxy network"
                 ) from exc
+        if isinstance(network, ipaddress.IPv6Network) and (
+            network.network_address.ipv4_mapped is not None
+        ):
+            raise TrustedProxyConfigurationError(
+                "IPv4-mapped trusted-proxy networks are ambiguous"
+            )
         minimum_prefix = 8 if network.version == 4 else 32
         if (
             network.prefixlen < minimum_prefix
@@ -104,7 +110,10 @@ class ClientIdentityPolicy:
 
         peer = self._direct_peer(req)
         fallback = str(peer) if peer is not None else "invalid-direct-peer"
-        if peer is None or not any(peer in network for network in self.trusted_proxies):
+        if peer is None or not any(
+            peer.version == network.version and peer in network
+            for network in self.trusted_proxies
+        ):
             return fallback
 
         raw = req.headers.get(AUTHORITATIVE_HEADER)

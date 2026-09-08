@@ -5,12 +5,15 @@ import logging
 from pathlib import Path
 
 import pytest
+from prometheus_client import CollectorRegistry, generate_latest
 from flask import Flask, request
 from jsonschema import Draft7Validator
 
 from api import init_app
-from api.client_identity import (TrustedProxyConfigurationError,
-                                 parse_trusted_proxy_networks)
+from api.client_identity import (
+    TrustedProxyConfigurationError,
+    parse_trusted_proxy_networks,
+)
 
 
 def _app():
@@ -121,7 +124,9 @@ def test_direct_ipv4_mapped_address_has_one_canonical_bucket(monkeypatch):
     monkeypatch.delenv("TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES", raising=False)
     app = _app()
     policy = app.extensions["tokenplace_client_identity_policy"]
-    with app.test_request_context("/", environ_base={"REMOTE_ADDR": "::ffff:192.0.2.4"}):
+    with app.test_request_context(
+        "/", environ_base={"REMOTE_ADDR": "::ffff:192.0.2.4"}
+    ):
         mapped_key = policy.limiter_key(request)
     with app.test_request_context("/", environ_base={"REMOTE_ADDR": "192.0.2.4"}):
         assert policy.limiter_key(request) == mapped_key
@@ -132,6 +137,8 @@ def test_direct_ipv4_mapped_address_has_one_canonical_bucket(monkeypatch):
     [
         "0.0.0.0/0",
         "::/0",
+        "0.0.0.0/8",
+        "::/32",
         "10.0.0.1/8",
         " 10.0.0.0/8",
         "10.0.0.0/7",
@@ -151,6 +158,8 @@ def test_invalid_trusted_proxy_configuration_fails_startup(monkeypatch, value):
     ("trusted", "peer"),
     [
         ("10.0.0.0/8,2001:db8::/32", "10.1.2.3"),
+        ("2001:db8::/32,10.0.0.0/8", "10.1.2.3"),
+        ("10.0.0.0/8,2001:db8::/32", "2001:db8::1"),
         ("2001:db8::/32,10.0.0.0/8", "2001:db8::1"),
     ],
 )
@@ -166,6 +175,39 @@ def test_dual_stack_allowlist_matches_only_the_peers_ip_version(
     ):
         policy = app.extensions["tokenplace_client_identity_policy"]
         assert policy.client_address(request) == "198.51.100.7"
+
+
+def test_unique_trusted_identities_do_not_expand_metric_series(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES", "10.0.0.1")
+    monkeypatch.setenv("API_RATE_LIMIT", "10000/hour")
+    monkeypatch.setenv("API_DAILY_QUOTA", "10000/day")
+    registry = CollectorRegistry()
+    app = Flask(__name__)
+    app.config["TESTING"] = True
+    init_app(
+        app,
+        metrics_registry=registry,
+        metrics_export_defaults=False,
+        metrics_path=None,
+    )
+
+    with app.test_client() as client:
+        for index in range(2000):
+            response = client.get(
+                "/api/v1/models",
+                environ_base={"REMOTE_ADDR": "10.0.0.1"},
+                headers={"CF-Connecting-IP": f"198.51.{index // 256}.{index % 256}"},
+            )
+            assert response.status_code == 200
+
+    samples = [
+        sample
+        for family in registry.collect()
+        for sample in family.samples
+        if sample.name.startswith("tokenplace_public_http_quota_outcomes_")
+    ]
+    assert len(samples) == 2
+    assert "198.51." not in generate_latest(registry).decode()
 
 
 def test_identity_sentinels_do_not_reach_public_surfaces(monkeypatch, caplog):
@@ -191,22 +233,33 @@ def test_gunicorn_access_log_format_omits_identity_and_request_target():
     format_line = next(
         line for line in entrypoint.splitlines() if "--access-logformat" in line
     )
-    assert all(token not in format_line for token in ("%(h)s", "%(L)s", "%(r)s", "%(U)s", "%(q)s"))
+    assert all(
+        token not in format_line
+        for token in ("%(h)s", "%(L)s", "%(r)s", "%(U)s", "%(q)s")
+    )
     assert "%(s)s" in format_line
     assert "%(m)s" in format_line
 
 
 @pytest.mark.parametrize(
     "value",
-    ["not-an-ip", "0.0.0.0/0", "224.0.0.1", "::/0", "ff02::1", "::ffff:192.0.2.1"],
+    [
+        "not-an-ip",
+        "999.0.0.1",
+        "0.0.0.0/0",
+        "224.0.0.1",
+        "::/0",
+        "ff02::1",
+        ":::1",
+        "::ffff:192.0.2.1",
+        "::ffff:192.0.2.0/120",
+    ],
 )
 def test_chart_schema_rejects_obviously_invalid_trusted_proxy_values(value):
     schema = json.loads(
         Path("charts/tokenplace/values.schema.json").read_text(encoding="utf-8")
     )
     errors = list(
-        Draft7Validator(schema).iter_errors(
-            {"rateLimit": {"trustedProxies": [value]}}
-        )
+        Draft7Validator(schema).iter_errors({"rateLimit": {"trustedProxies": [value]}})
     )
     assert errors

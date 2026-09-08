@@ -69,7 +69,7 @@ def parse_trusted_proxy_networks(
         minimum_prefix = 8 if network.version == 4 else 32
         if (
             network.prefixlen < minimum_prefix
-            or network.is_unspecified
+            or network.network_address.is_unspecified
             or network.is_multicast
         ):
             raise TrustedProxyConfigurationError(

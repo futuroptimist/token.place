@@ -278,6 +278,19 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
 
 
 @pytest.mark.parametrize(
+    ("script", "digest"),
+    (
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "744e4377d900e56fdc359b674c480b94658e68a32af424673654630728750dc7"),
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "c2dacc5a3f5fc00c2bd0295c1e0461708497d812bc986760ca5b31bbc1920898"),
+    ),
+)
+def test_control_transition_scripts_are_digest_pinned(script, digest):
+    assert script.sha256 == digest
+    assert SCRIPT_DIGESTS[script.name] == digest
+    assert hashlib.sha256(script.source.encode()).hexdigest() == digest
+
+
+@pytest.mark.parametrize(
     ("client", "request_id"),
     ((None, "request"), ("client", None), ("", "request"), ("client", "")),
 )
@@ -1481,17 +1494,12 @@ def test_claim_input_and_acknowledgement_validation_precede_dispatch():
         store.claimed_request("node-a", "")
     with pytest.raises(RelayStateStoreError, match="claim generation"):
         store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 0)
-    with pytest.raises(RelayStateStoreError, match="control tombstones"):
-        store.renew_claim_or_read_control(
-            "node-a",
-            "a" * 64,
-            "consumer",
-            "client",
-            "request",
-            1,
-            acknowledge=True,
-        )
-    foundation.execute.assert_not_called()
+    foundation.execute.return_value = [b"owner_mismatch"]
+    assert store.renew_claim_or_read_control(
+        "node-a", "a" * 64, "consumer", "client", "request", 1,
+        acknowledge=True,
+    ).state == "owner_mismatch"
+    foundation.execute.assert_called_once()
 
 
 def test_renew_or_read_control_delegates_when_not_acknowledging():

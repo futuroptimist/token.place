@@ -1926,6 +1926,184 @@ def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(
         store._foundation._client.delete(*keys)
         store.close()
 
+
+@pytest.mark.parametrize("trigger", ("select", "enqueue"))
+def test_deadline_cleanup_deferred_by_terminal_capacity_remains_retryable(
+    valkey_server, trigger
+):
+    namespace = uuid.uuid4().hex
+    stores = tuple(
+        _registration_store(
+            valkey_server,
+            namespace,
+            max_terminal_records=1,
+            max_terminal_records_per_client=2,
+            max_queue_depth_per_node=8,
+            max_queued_requests=8,
+            max_claims=8,
+        )
+        for _ in range(2)
+    )
+    first, bridge = stores
+    node, owner, consumer = "deferred-deadline-node", _digest("deferred-owner"), "consumer"
+    retained = ("retained-client", f"retained-{trigger}")
+    due = ("due-client", f"due-{trigger}")
+    unrelated = ("unrelated-client", f"unrelated-{trigger}")
+    retry = ("retry-client", f"retry-{trigger}")
+    identities = (retained, due, unrelated, retry)
+    request_envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    response_envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "response", "response-key", "response-iv"
+    )
+    try:
+        first.register(node, _capabilities(concurrency=8), owner)
+        _enqueue_claim_fixture(first, node, owner, *retained, time.time() + 60)
+        retained_claim = first.claim_queued_request(node, owner, consumer)
+        first.accept_encrypted_response(
+            node, owner, consumer, *retained, retained_claim.generation, response_envelope
+        )
+        retained_keys = _retained_authority_keys(first, node, retained)
+
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 0.2
+        _enqueue_claim_fixture(first, node, owner, *due, deadline)
+        first.claim_queued_request(node, owner, consumer)
+        unrelated_selection = first.select_and_reserve(
+            *unrelated, "qwen3-8b-instruct", "8k-fast", time.time() + 30, "cancel"
+        )
+        time.sleep(0.25)
+        due_before = _lifecycle_authority_snapshot(first, node, due)
+
+        if trigger == "select":
+            bridge.select_and_reserve(
+                *retry, "qwen3-8b-instruct", "8k-fast", time.time() + 30, "cancel"
+            )
+        else:
+            bridge.enqueue_encrypted_request(
+                *unrelated,
+                unrelated_selection.reservation_token,
+                node,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                unrelated_selection.request_deadline_epoch,
+                request_envelope,
+                "cancel",
+            )
+        assert _lifecycle_authority_snapshot(first, node, due) == due_before
+
+        _force_retained_authority_due(first, retained_keys, completed=True)
+        if trigger == "select":
+            bridge.select_and_reserve(
+                "retry-again", retry[1], "qwen3-8b-instruct", "8k-fast",
+                time.time() + 30, "cancel"
+            )
+        else:
+            selection = bridge.select_and_reserve(
+                *retry, "qwen3-8b-instruct", "8k-fast", time.time() + 30, "cancel"
+            )
+            bridge.enqueue_encrypted_request(
+                *retry, selection.reservation_token, node, "qwen3-8b-instruct",
+                "8k-fast", selection.request_deadline_epoch, request_envelope, "cancel"
+            )
+
+        terminal_snapshot = _lifecycle_authority_snapshot(first, node, due)
+        terminal = terminal_snapshot[0][4]
+        assert (terminal[b"outcome"], terminal[b"reason"]) == (
+            b"expired", b"request_deadline_expired"
+        )
+        assert terminal_snapshot[0][1:4] == ({}, {}, {})
+        assert terminal_snapshot[2][:2] == (None, None)
+        assert not terminal_snapshot[3]
+        first.cancel_or_expire_request(
+            *due, status="expired", reason="request_deadline_expired"
+        )
+        assert _lifecycle_authority_snapshot(first, node, due) == terminal_snapshot
+    finally:
+        _delete_claim_fixture_state(first, (node,), identities)
+        cfg = first._foundation.config
+        first._foundation._client.delete(cfg.key("control:expiry"))
+        for store in stores:
+            store.close()
+
+
+@pytest.mark.parametrize("trigger", ("select", "enqueue"))
+def test_deadline_cleanup_bridge_races_response_without_mixed_authority(
+    valkey_server, trigger
+):
+    namespace = uuid.uuid4().hex
+    bridge, responder = tuple(
+        _registration_store(valkey_server, namespace) for _ in range(2)
+    )
+    node, owner, consumer = "deadline-race-node", _digest("deadline-race-owner"), "consumer"
+    identity = ("deadline-race-client", f"request-{trigger}")
+    unrelated = ("deadline-race-unrelated", f"request-{trigger}")
+    request_envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    response_envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "response", "response-key", "response-iv"
+    )
+    cleanup_entered, release_cleanup = Event(), Event()
+    original_cleanup = bridge._cancel_or_expire_digests
+    try:
+        bridge.register(node, _capabilities(concurrency=8), owner)
+        seconds, micros = bridge._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 0.2
+        _enqueue_claim_fixture(bridge, node, owner, *identity, deadline)
+        claim = bridge.claim_queued_request(node, owner, consumer)
+        selection = bridge.select_and_reserve(
+            *unrelated, "qwen3-8b-instruct", "8k-fast", time.time() + 30, "cancel"
+        )
+
+        def paused_cleanup(client, request, **kwargs):
+            cleanup_entered.set()
+            assert release_cleanup.wait(2)
+            return original_cleanup(client, request, **kwargs)
+
+        bridge._cancel_or_expire_digests = paused_cleanup
+        time.sleep(0.25)
+
+        def run_bridge():
+            if trigger == "select":
+                return bridge.select_and_reserve(
+                    "deadline-race-third", f"request-{trigger}",
+                    "qwen3-8b-instruct", "8k-fast", time.time() + 30, "cancel"
+                )
+            return bridge.enqueue_encrypted_request(
+                *unrelated, selection.reservation_token, node, "qwen3-8b-instruct",
+                "8k-fast", selection.request_deadline_epoch, request_envelope, "cancel"
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            bridge_future = executor.submit(run_bridge)
+            assert cleanup_entered.wait(2)
+            with pytest.raises(RelayStateConflict, match="response lifecycle conflict"):
+                responder.accept_encrypted_response(
+                    node, owner, consumer, *identity, claim.generation, response_envelope
+                )
+            release_cleanup.set()
+            bridge_future.result(timeout=2)
+
+        snapshot = _lifecycle_authority_snapshot(bridge, node, identity)
+        terminal = snapshot[0][4]
+        assert (terminal[b"outcome"], terminal[b"reason"], terminal[b"retrieval_state"]) == (
+            b"expired", b"request_deadline_expired", b"completed_unavailable"
+        )
+        assert snapshot[0][1:4] == ({}, {}, {})
+        assert snapshot[2][:3] == (None, None, None)
+        assert not snapshot[3]
+    finally:
+        release_cleanup.set()
+        bridge._cancel_or_expire_digests = original_cleanup
+        _delete_claim_fixture_state(bridge, (node,), (identity, unrelated))
+        cfg = bridge._foundation.config
+        bridge._foundation._client.delete(cfg.key("control:expiry"))
+        bridge.close()
+        responder.close()
+
+
 def test_malformed_expired_queue_authority_blocks_admission_without_mutation(
     valkey_server,
 ):
@@ -3530,6 +3708,38 @@ def _exact_key_snapshot(store, keys):
         ),
         tuple(datastore.hgetall(keys[index]) for index in (1, 3, 4, 7, 9, 11)),
         datastore.xrange(keys[2]),
+    )
+
+
+def _lifecycle_authority_snapshot(store, node_id, identity):
+    """Snapshot only one lifecycle's primary and indexed authority."""
+    datastore = store._foundation._client
+    cfg = store._foundation.config
+    client, request = store._identity(*identity)
+    node = store._node_digest(node_id)
+    member = f"{client}:{request}"
+    request_key = cfg.key("request", client, request)
+    request_record = datastore.hgetall(request_key)
+    queue_entry = request_record.get(b"queue_entry")
+    return (
+        tuple(
+            datastore.hgetall(cfg.key(kind, client, request))
+            for kind in ("request", "claim", "progress", "response", "terminal")
+        ),
+        datastore.hgetall(cfg.key("control", node, client, request)),
+        tuple(
+            datastore.zscore(cfg.key(index), indexed_member)
+            for index, indexed_member in (
+                ("requests:deadline", member),
+                ("claims:expiry", member),
+                ("responses:expiry", member),
+                ("terminals:expiry", member),
+                ("control:expiry", f"{node}:{member}"),
+            )
+        ),
+        datastore.xrange(
+            cfg.key("queue", node), queue_entry, queue_entry
+        ) if queue_entry else [],
     )
 
 

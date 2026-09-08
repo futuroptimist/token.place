@@ -74,6 +74,21 @@ def test_defaults_render_no_service_monitor_and_no_metrics_token() -> None:
     env = _env_by_name(deployment)
     assert "TOKENPLACE_METRICS_TOKEN" not in env
     assert env["TOKENPLACE_METRICS_DISABLED"]["value"] == "1"
+    assert env["TOKENPLACE_METRICS_MODE"]["value"] == "normal"
+
+
+@pytest.mark.parametrize("mode", ["normal", "degraded"])
+def test_metrics_mode_renders_reviewed_value(mode: str) -> None:
+    docs = _render("--set", f"metrics.mode={mode}")
+    env = _env_by_name(_kind(docs, "Deployment")[0])
+    assert env["TOKENPLACE_METRICS_MODE"]["value"] == mode
+
+
+@pytest.mark.parametrize("mode", ["", "invalid", "NORMAL", "Degraded"])
+def test_metrics_mode_rejects_unreviewed_values(mode: str) -> None:
+    result = _helm_template("--set", f"metrics.mode={mode}", check=False)
+    assert result.returncode != 0
+    assert any(path in result.stderr for path in ("metrics.mode", "/metrics/mode"))
 
 
 def test_service_monitor_requires_metrics_enabled() -> None:

@@ -64,6 +64,8 @@ rateLimit:
 
 metrics:
   enabled: false
+  # Emergency defense-in-depth switch. Changing it requires a controlled restart.
+  mode: normal
   path: /metrics
   auth:
     existingSecret: ""

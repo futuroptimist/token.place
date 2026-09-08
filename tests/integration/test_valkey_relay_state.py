@@ -334,6 +334,7 @@ def _wait_for_server_epoch(store, boundary, timeout=2.0):
 
     _wait_until(boundary_reached, timeout=timeout)
 
+
 def _registration_keys(store, *node_ids):
     return [
         store._foundation.config.key("schema"),
@@ -612,16 +613,20 @@ def test_scheduler_selection_policy_matches_in_memory_reference(valkey_server):
             for index in range(2)
         ]
         assert [result.selected_node_id for result in memory_results] == [
-            "node-b", "node-a"
+            "node-b",
+            "node-a",
         ]
         assert [result.selected_node_id for result in valkey_results] == [
             result.selected_node_id for result in memory_results
         ]
         selections.extend(
-            [("client", "full", None), *(
+            [
+                ("client", "full", None),
+                *(
                 ("valkey", f"round-{index}", result)
                 for index, result in enumerate(valkey_results)
-            )]
+                ),
+            ]
         )
     finally:
         _delete_scheduler_policy_state(first, [node for node, _ in nodes], selections)
@@ -753,9 +758,13 @@ def test_selection_final_capacity_race_is_atomic_across_valkey_stores(valkey_ser
         deadline = first._foundation.server_time()[0] + 60
         outcomes = _race_select_and_reserve((first, second), requests, deadline)
 
-        created = [outcome for outcome in outcomes if not isinstance(outcome, Exception)]
+        created = [
+            outcome for outcome in outcomes if not isinstance(outcome, Exception)
+        ]
         assert len(created) == 1 and created[0].created
-        assert sum(isinstance(outcome, RelayStateNoCapacity) for outcome in outcomes) == 1
+        assert (
+            sum(isinstance(outcome, RelayStateNoCapacity) for outcome in outcomes) == 1
+        )
         assert created[0].reservation_token is not None
         assert len(first.list_reservations()) == 1
         assert first._foundation._client.zcard(cfg.key("reservations:expiry")) == 1
@@ -779,9 +788,9 @@ def test_selection_final_capacity_race_is_atomic_across_valkey_stores(valkey_ser
             (memory, memory), requests, time.time() + 60
         )
         assert sum(not isinstance(item, Exception) for item in memory_outcomes) == 1
-        assert sum(
-            isinstance(item, RelayStateNoCapacity) for item in memory_outcomes
-        ) == 1
+        assert (
+            sum(isinstance(item, RelayStateNoCapacity) for item in memory_outcomes) == 1
+        )
     finally:
         keys = [
             cfg.key("schema"),
@@ -813,9 +822,7 @@ def test_selection_once_only_same_identity_across_valkey_stores(valkey_server):
     try:
         first.register("node", _capabilities(concurrency=1), _digest("owner"))
         deadline = first._foundation.server_time()[0] + 60
-        outcomes = _race_select_and_reserve(
-            (first, second), ("same", "same"), deadline
-        )
+        outcomes = _race_select_and_reserve((first, second), ("same", "same"), deadline)
 
         assert sum(outcome.created for outcome in outcomes) == 1
         assert sum(outcome.reservation_token is not None for outcome in outcomes) == 1
@@ -843,7 +850,10 @@ def test_selection_once_only_same_identity_across_valkey_stores(valkey_server):
             (memory, memory), ("same", "same"), time.time() + 60
         )
         assert sum(outcome.created for outcome in memory_outcomes) == 1
-        assert sum(outcome.reservation_token is not None for outcome in memory_outcomes) == 1
+        assert (
+            sum(outcome.reservation_token is not None for outcome in memory_outcomes)
+            == 1
+        )
         assert len(memory.list_reservations()) == 1
     finally:
         keys = [
@@ -1024,7 +1034,6 @@ def test_selection_capacity_bounds_match_memory_without_rejection_mutation(
         second.close()
 
 
-
 def test_scheduler_fairness_cursor_changes_only_for_new_reservations(valkey_server):
     namespace = uuid.uuid4().hex
     first = _registration_store(valkey_server, namespace, reservation_ttl_seconds=30)
@@ -1039,7 +1048,9 @@ def test_scheduler_fairness_cursor_changes_only_for_new_reservations(valkey_serv
 
         initial = first._foundation._client.hgetall(cursor)
         with pytest.raises(RelayStateNoCapacity):
-            second.select_and_reserve("client", "failed", "unsupported", "8k-fast", deadline)
+            second.select_and_reserve(
+                "client", "failed", "unsupported", "8k-fast", deadline
+            )
         assert first._foundation._client.hgetall(cursor) == initial
         assert first._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
         assert first._foundation._client.zcard(cfg.key("requests:deadline")) == 0
@@ -1076,10 +1087,12 @@ def test_scheduler_fairness_cursor_changes_only_for_new_reservations(valkey_serv
         assert created.selected_node_id == "node-b"
         assert successor.selected_node_id == "node-a"
         assert first._foundation._client.hget(cursor, "_activity") == b"2"
-        assert not first._foundation._client.exists(reservation_key)
+        # Deadline authority is retained until the terminal CAS records expiry.
+        assert first._foundation._client.exists(reservation_key)
     finally:
         _delete_scheduler_policy_state(
-            first, ("node-b", "node-a"),
+            first,
+            ("node-b", "node-a"),
             [("client", "failed", None), *selections],
         )
         first.close()
@@ -1110,8 +1123,13 @@ def test_cursor_fingerprint_index_preserves_additive_fields_and_evicts_determini
             '["qwen3-8b-instruct","new-model"]',
         )
         additive = {f"additive:{index}": f"value-{index}" for index in range(1_000)}
-        metadata = {"_count": 2, "_activity": 2, "_fp:1": fingerprints["alpha"],
-                    "_fp:2": fingerprints["beta"], **additive}
+        metadata = {
+            "_count": 2,
+            "_activity": 2,
+            "_fp:1": fingerprints["alpha"],
+            "_fp:2": fingerprints["beta"],
+            **additive,
+        }
         for index, name in enumerate(("alpha", "beta")):
             metadata[fingerprints[name]] = node_digest
             metadata["a:" + fingerprints[name]] = activities[index]
@@ -1131,13 +1149,20 @@ def test_cursor_fingerprint_index_preserves_additive_fields_and_evicts_determini
             cursor, "_fp:1", "_fp:2"
         )
     finally:
-        token = (_digest(selected.reservation_token) if selected and
-                 selected.reservation_token else _digest("unused"))
+        token = (
+            _digest(selected.reservation_token)
+            if selected and selected.reservation_token
+            else _digest("unused")
+        )
         client, request = store._identity("client", "request")
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cursor,
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            cfg.key("request", client, request),
             cfg.key("reservation", token),
         )
         store.close()
@@ -1158,18 +1183,30 @@ def test_cursor_fingerprint_index_protects_active_fingerprints(valkey_server):
     try:
         store.register("node", _capabilities(), _digest("owner"))
         store._foundation._client.hset(
-            cfg.key("node", node_digest), "supported_model_ids",
+            cfg.key("node", node_digest),
+            "supported_model_ids",
             '["qwen3-8b-instruct","new-model"]',
         )
-        store._foundation._client.hset(cursor, mapping={
-            "_count": 2, "_activity": 2, "_fp:1": active, "_fp:2": inactive,
-            active: node_digest, "a:" + active: 1,
-            inactive: node_digest, "a:" + inactive: 2,
-        })
+        store._foundation._client.hset(
+            cursor,
+            mapping={
+                "_count": 2,
+                "_activity": 2,
+                "_fp:1": active,
+                "_fp:2": inactive,
+                active: node_digest,
+                "a:" + active: 1,
+                inactive: node_digest,
+                "a:" + inactive: 2,
+            },
+        )
         store._foundation._client.hset(
             active_key,
-            mapping={"state": "reserved", "node_digest": node_digest,
-                     "fingerprint": active},
+            mapping={
+                "state": "reserved",
+                "node_digest": node_digest,
+                "fingerprint": active,
+            },
         )
         store._foundation._client.zadd(
             cfg.key("requests:deadline"),
@@ -1182,14 +1219,22 @@ def test_cursor_fingerprint_index_protects_active_fingerprints(valkey_server):
         assert store._foundation._client.hget(cursor, active) == node_digest.encode()
         assert store._foundation._client.hget(cursor, inactive) is None
     finally:
-        token = (_digest(selected.reservation_token) if selected and
-                 selected.reservation_token else _digest("unused"))
+        token = (
+            _digest(selected.reservation_token)
+            if selected and selected.reservation_token
+            else _digest("unused")
+        )
         client, request = store._identity("client", "request")
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node_digest), active_key,
-            cfg.key("request", client, request), cfg.key("reservation", token),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cursor,
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            active_key,
+            cfg.key("request", client, request),
+            cfg.key("reservation", token),
         )
         store.close()
 
@@ -1208,13 +1253,25 @@ def test_cursor_fingerprint_index_malformed_metadata_fails_without_mutation(
     deadline = time.time() + 30
     try:
         store.register("node", _capabilities(), _digest("owner"))
-        metadata = {"_count": 2, "_activity": 2, "_fp:1": first,
-                    "_fp:2": second, first: node_digest, second: node_digest,
-                    "a:" + first: 1, "a:" + second: 2, "additive": "kept"}
-        if corruption == "count": metadata["_count"] = 1
-        if corruption == "duplicate": metadata["_fp:2"] = first
-        if corruption == "mapping": del metadata[first]
-        if corruption == "activity": metadata["a:" + first] = "bad"
+        metadata = {
+            "_count": 2,
+            "_activity": 2,
+            "_fp:1": first,
+            "_fp:2": second,
+            first: node_digest,
+            second: node_digest,
+            "a:" + first: 1,
+            "a:" + second: 2,
+            "additive": "kept",
+        }
+        if corruption == "count":
+            metadata["_count"] = 1
+        if corruption == "duplicate":
+            metadata["_fp:2"] = first
+        if corruption == "mapping":
+            del metadata[first]
+        if corruption == "activity":
+            metadata["a:" + first] = "bad"
         store._foundation._client.hset(cursor, mapping=metadata)
         before = store._foundation._client.hgetall(cursor)
         client, request = store._identity("client", "request")
@@ -1229,8 +1286,11 @@ def test_cursor_fingerprint_index_malformed_metadata_fails_without_mutation(
         assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 0
     finally:
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cursor,
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
             cfg.key("node", node_digest),
         )
         store.close()
@@ -1286,9 +1346,13 @@ def test_cursor_fingerprint_index_rejects_invalid_global_activity_without_mutati
         assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 0
     finally:
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cursor,
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            cfg.key("request", client, request),
             cfg.key("reservation", token),
         )
         store.close()
@@ -1306,11 +1370,19 @@ def test_cursor_fingerprint_index_activity_advances_monotonically(valkey_server)
     selected = None
     try:
         store.register("node", _capabilities(), _digest("owner"))
-        store._foundation._client.hset(cursor, mapping={
-            "_count": 2, "_activity": 9, "_fp:1": first, "_fp:2": second,
-            first: node_digest, second: node_digest,
-            "a:" + first: 4, "a:" + second: 9,
-        })
+        store._foundation._client.hset(
+            cursor,
+            mapping={
+                "_count": 2,
+                "_activity": 9,
+                "_fp:1": first,
+                "_fp:2": second,
+                first: node_digest,
+                second: node_digest,
+                "a:" + first: 4,
+                "a:" + second: 9,
+            },
+        )
         selected = store.select_and_reserve(
             "client", "request", "qwen3-8b-instruct", "8k-fast", time.time() + 30
         )
@@ -1321,9 +1393,13 @@ def test_cursor_fingerprint_index_activity_advances_monotonically(valkey_server)
         client, request = store._identity("client", "request")
         token = _digest(selected.reservation_token) if selected else _digest("unused")
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cursor,
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            cfg.key("request", client, request),
             cfg.key("reservation", token),
         )
         store.close()
@@ -1343,15 +1419,20 @@ def test_cursor_fingerprint_index_empty_cursor_initializes_activity(valkey_serve
             "client", "request", "qwen3-8b-instruct", "8k-fast", time.time() + 30
         )
         assert store._foundation._client.hmget(cursor, "_count", "_activity") == [
-            b"1", b"1"
+            b"1",
+            b"1",
         ]
     finally:
         client, request = store._identity("client", "request")
         token = _digest(selected.reservation_token) if selected else _digest("unused")
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cursor,
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            cfg.key("request", client, request),
             cfg.key("reservation", token),
         )
         store.close()
@@ -1396,9 +1477,13 @@ def test_cursor_fingerprint_index_rejects_noncanonical_count_without_mutation(
         assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 0
     finally:
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cursor,
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            cfg.key("request", client, request),
             cfg.key("reservation", token),
         )
         store.close()
@@ -1434,9 +1519,13 @@ def test_cursor_fingerprint_index_rejects_empty_count_with_positive_activity(
         assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 0
     finally:
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cursor,
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            cfg.key("request", client, request),
         )
         store.close()
 
@@ -1464,9 +1553,13 @@ def test_cursor_fingerprint_index_explicit_zero_count_initializes(valkey_server)
         client, request = store._identity("client", "request")
         token = _digest(selected.reservation_token) if selected else _digest("unused")
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cursor,
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node_digest), cfg.key("request", client, request),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cursor,
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node_digest),
+            cfg.key("request", client, request),
             cfg.key("reservation", token),
         )
         store.close()
@@ -1497,8 +1590,15 @@ def test_idempotent_retries_require_exact_stream_authority(
             "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
         )
         queued = first.enqueue_encrypted_request(
-            "client", "request", selected.reservation_token, "node",
-            "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel",
+            "client",
+            "request",
+            selected.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
         )
         entry = first._foundation._client.hget(request_key, "queue_entry")
         assert entry is not None
@@ -1511,8 +1611,15 @@ def test_idempotent_retries_require_exact_stream_authority(
             "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
         ).created
         assert not second.enqueue_encrypted_request(
-            "client", "request", selected.reservation_token, "node",
-            "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel",
+            "client",
+            "request",
+            selected.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
         ).created
         assert first._foundation._client.xlen(queue_key) == 1
         assert queued.sequence == 1
@@ -1532,8 +1639,15 @@ def test_idempotent_retries_require_exact_stream_authority(
             )
         with pytest.raises(ValkeySchemaIncompatibleError):
             second.enqueue_encrypted_request(
-                "client", "request", selected.reservation_token, "node",
-                "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel",
+                "client",
+                "request",
+                selected.reservation_token,
+                "node",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                envelope,
+                "cancel",
             )
         assert first._foundation._client.hgetall(request_key) == lifecycle_before
         assert first._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
@@ -1545,9 +1659,14 @@ def test_idempotent_retries_require_exact_stream_authority(
             else "unused"
         )
         first._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node), queue_key, request_key,
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node),
+            queue_key,
+            request_key,
             cfg.key("reservation", token),
         )
         first.close()
@@ -1778,8 +1897,15 @@ def test_queued_requests_filters_claimed_and_expired_but_rejects_malformed_live(
             "client", "request", "qwen3-8b-instruct", "8k-fast", deadline
         )
         store.enqueue_encrypted_request(
-            "client", "request", selected.reservation_token, "node",
-            "qwen3-8b-instruct", "8k-fast", deadline, envelope, "cancel"
+            "client",
+            "request",
+            selected.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope,
+            "cancel",
         )
         store._foundation._client.hset(request_key, "state", "claimed")
         assert store.queued_requests("node") == ()
@@ -1794,9 +1920,14 @@ def test_queued_requests_filters_claimed_and_expired_but_rejects_malformed_live(
             store.queued_requests("node")
     finally:
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node), cfg.key("queue", node), request_key,
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            request_key,
         )
         store.close()
 
@@ -1812,7 +1943,9 @@ def test_missing_indexed_lifecycle_fails_closed_without_mutation(valkey_server):
     assert deadline != float(f"{deadline:.6f}")
     try:
         store.register("node", _capabilities(), owner)
-        store._foundation._client.zadd(cfg.key("requests:deadline"), {missing: deadline})
+        store._foundation._client.zadd(
+            cfg.key("requests:deadline"), {missing: deadline}
+        )
         before = store._foundation._client.hgetall(cfg.key("cursor"))
         with pytest.raises(ValkeySchemaIncompatibleError):
             store.select_and_reserve(
@@ -1822,8 +1955,11 @@ def test_missing_indexed_lifecycle_fails_closed_without_mutation(valkey_server):
         assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
     finally:
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
             cfg.key("node", node),
         )
         store.close()
@@ -1857,12 +1993,22 @@ def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(
         seconds, micros = store._foundation.server_time()
         queued_deadline = seconds + micros / 1_000_000 + 30
         queued = store.select_and_reserve(
-            "queued-client", "queued-request", "qwen3-8b-instruct", "8k-fast",
+            "queued-client",
+            "queued-request",
+            "qwen3-8b-instruct",
+            "8k-fast",
             queued_deadline,
         )
         store.enqueue_encrypted_request(
-            "queued-client", "queued-request", queued.reservation_token, "node",
-            "qwen3-8b-instruct", "8k-fast", queued_deadline, envelope, "cancel",
+            "queued-client",
+            "queued-request",
+            queued.reservation_token,
+            "node",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            queued_deadline,
+            envelope,
+            "cancel",
         )
         identities.append(("queued-client", "queued-request"))
         client = hashlib.sha256(b"client\0queued-client").hexdigest()
@@ -1885,27 +2031,41 @@ def test_expired_queue_reclaims_exact_stream_and_lifecycle_capacity(
 
         with pytest.raises(RelayStateInvalidReservation):
             store.select_and_reserve(
-                "queued-client", "queued-request", "qwen3-8b-instruct",
-                "8k-fast", expired_deadline,
+                "queued-client",
+                "queued-request",
+                "qwen3-8b-instruct",
+                "8k-fast",
+                expired_deadline,
             )
 
         assert store._foundation._client.xlen(cfg.key("queue", node)) == 0
         assert not store._foundation._client.exists(request_key)
-        assert store._foundation._client.zscore(
+        assert (
+            store._foundation._client.zscore(
             cfg.key("requests:deadline"), client + ":" + request
-        ) is None
+            )
+            is None
+        )
         assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
         assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
         assert not store._foundation._client.exists(claim_key)
-        assert store._foundation._client.zscore(
+        assert (
+            store._foundation._client.zscore(
             cfg.key("claims:expiry"), client + ":" + request
-        ) is None
+            )
+            is None
+        )
 
     finally:
         keys = [
-            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("claims:expiry"), cfg.key("node", node), cfg.key("queue", node),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
         ]
         for client_public_key, request_id in identities:
             keys.append(
@@ -1935,8 +2095,11 @@ def test_malformed_expired_queue_authority_blocks_admission_without_mutation(
         store._foundation._client.hset(
             request_key,
             mapping={
-                "state": "queued", "client": client, "request": request,
-                "node_digest": node, "deadline": time.time() - 1,
+                "state": "queued",
+                "client": client,
+                "request": request,
+                "node_digest": node,
+                "deadline": time.time() - 1,
                 "queue_entry": "missing-0",
             },
         )
@@ -1946,7 +2109,10 @@ def test_malformed_expired_queue_authority_blocks_admission_without_mutation(
         cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
         with pytest.raises(ValkeySchemaIncompatibleError):
             store.select_and_reserve(
-                "new", "request", "qwen3-8b-instruct", "8k-fast",
+                "new",
+                "request",
+                "qwen3-8b-instruct",
+                "8k-fast",
                 time.time() + 30,
             )
         assert store._foundation._client.exists(request_key)
@@ -1954,19 +2120,27 @@ def test_malformed_expired_queue_authority_blocks_admission_without_mutation(
         assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
     finally:
         store._foundation._client.delete(
-            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node), cfg.key("queue", node), request_key,
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            request_key,
         )
         store.close()
 
 
-def test_expired_addressed_reservation_is_reclaimed_beyond_cleanup_batch(
+def test_expired_addressed_reservation_is_preserved_for_terminalization(
     valkey_server,
 ):
     store = _registration_store(
-        valkey_server, uuid.uuid4().hex, node_transition_batch_size=1,
-        max_reservations=4, max_reservations_per_client=4,
+        valkey_server,
+        uuid.uuid4().hex,
+        node_transition_batch_size=1,
+        max_reservations=4,
+        max_reservations_per_client=4,
         max_reservations_per_node=4,
     )
     cfg = store._foundation.config
@@ -2008,24 +2182,31 @@ def test_expired_addressed_reservation_is_reclaimed_beyond_cleanup_batch(
         cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
         target = records[-1]
         target_deadline = expired - 1
-        with pytest.raises(RelayStateInvalidReservation):
+        with pytest.raises(ValkeySchemaIncompatibleError):
             store.select_and_reserve(
-                target[0], target[1], "qwen3-8b-instruct", "8k-fast",
+                target[0],
+                target[1],
+                "qwen3-8b-instruct",
+                "8k-fast",
                 target_deadline,
             )
 
-        assert not store._foundation._client.exists(
+        assert store._foundation._client.exists(
             cfg.key("request", target[2], target[3]),
             cfg.key("reservation", target[4]),
         )
-        assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 1
-        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 1
+        assert store._foundation._client.zcard(cfg.key("requests:deadline")) == 3
+        assert store._foundation._client.zcard(cfg.key("reservations:expiry")) == 3
         assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
     finally:
         keys = [
-            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
-            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
-            cfg.key("node", node), cfg.key("queue", node),
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
         ]
         for _, _, client, request, token in records:
             keys.extend(
@@ -2868,7 +3049,11 @@ def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_s
             "claim-node", owner, SchedulerNodeState(draining=True, claimed_work=1)
         )
         renewed = second.renew_claim(
-            "claim-node", owner, "consumer", "claim-client", "claim-request",
+            "claim-node",
+            owner,
+            "consumer",
+            "claim-client",
+            "claim-request",
             winner.generation,
         )
         assert renewed.state == "continued"
@@ -2933,6 +3118,7 @@ def test_claim_reclaim_renewal_and_generation_are_atomic_across_clients(valkey_s
         first._foundation._client.delete(*keys)
         first.close()
         second.close()
+
 
 def _enqueue_claim_fixture(
     store, node_id, owner, client, request, deadline, envelope=None
@@ -3011,6 +3197,56 @@ def _response_acceptance_authority(store, node_id, identity):
         ),
         f"{client}:{request}",
     )
+
+
+def test_cancellation_creates_authenticated_acknowledgeable_control(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node_id, identity, owner = (
+        "cancel-node",
+        ("cancel-client", "cancel-request"),
+        _digest("owner"),
+    )
+    try:
+        store.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node_id, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node_id, owner, "consumer")
+
+        result = store.cancel_or_expire_request(*identity, "cancel")
+        assert (result.state, result.reason, result.new_outcome) == (
+            "cancelled",
+            "requester_cancelled",
+            True,
+        )
+        retry = store.cancel_or_expire_request(*identity, "cancel")
+        assert not retry.new_outcome
+        control = store.renew_claim_or_read_control(
+            node_id, owner, "consumer", *identity, claim.generation
+        )
+        assert (control.state, control.reason, control.acknowledged) == (
+            "cancelled",
+            "requester_cancelled",
+            False,
+        )
+        acknowledged = store.renew_claim_or_read_control(
+            node_id,
+            owner,
+            "consumer",
+            *identity,
+            claim.generation,
+            acknowledge=True,
+        )
+        assert acknowledged.state == "acknowledged"
+        assert acknowledged.acknowledged
+        assert store.control_tombstones()[0].acknowledged
+    finally:
+        client, request = store._identity(*identity)
+        node = store._node_digest(node_id)
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store._foundation._client.delete(
+            store._foundation.config.key("control", node, client, request),
+            store._foundation.config.key("control:expiry"),
+        )
+        store.close()
 
 
 def _exact_key_snapshot(store, keys):
@@ -3163,7 +3399,9 @@ def test_response_retrieval_preserves_additive_fields_and_bounded_backlog(
         assert datastore.zrange(keys[8], 0, -1, withscores=True) == [
             entry for entry in response_index_before if entry[0].decode() != member
         ]
-        assert datastore.zrange(keys[10], 0, -1, withscores=True) == terminal_index_before
+        assert (
+            datastore.zrange(keys[10], 0, -1, withscores=True) == terminal_index_before
+        )
         assert response_before
         for key, (field, value) in additive.items():
             if key != keys[7]:
@@ -3307,9 +3545,7 @@ def test_response_retrievals_are_concurrent_replayable_and_independently_derived
             + struct.pack("!d", accepted.accepted_at_epoch)
             + bytes.fromhex(response_digest)
         )
-        expected = hmac.new(
-            _ACKNOWLEDGEMENT_KEY, message, hashlib.sha256
-        ).hexdigest()
+        expected = hmac.new(_ACKNOWLEDGEMENT_KEY, message, hashlib.sha256).hexdigest()
         assert result.acknowledgement_token == expected
         assert stores[0]._foundation._client.exists(keys[7]) == 1
         assert stores[0]._foundation._client.zscore(keys[8], member) is not None
@@ -3339,7 +3575,9 @@ def test_response_retrieval_rejects_noncanonical_authority_without_disclosure_or
     valkey_server, kind, value
 ):
     store = _registration_store(valkey_server, uuid.uuid4().hex)
-    fixture = _accepted_retrieval_fixture((store,), f"invalid-{kind}-{uuid.uuid4().hex}")
+    fixture = _accepted_retrieval_fixture(
+        (store,), f"invalid-{kind}-{uuid.uuid4().hex}"
+    )
     node, identity, credential, envelope, _, keys, _ = fixture
     try:
         before = _exact_key_snapshot(store, keys)
@@ -3352,7 +3590,10 @@ def test_response_retrieval_rejects_noncanonical_authority_without_disclosure_or
         assert result.envelope is None
         assert result.acknowledgement_token is None
         assert _exact_key_snapshot(store, keys) == before
-        assert store.retrieve_encrypted_response(*identity, credential).envelope == envelope
+        assert (
+            store.retrieve_encrypted_response(*identity, credential).envelope
+            == envelope
+        )
     finally:
         _delete_claim_fixture_state(store, (node,), (identity,))
         store.close()
@@ -3369,6 +3610,7 @@ def test_response_acknowledgement_committed_lost_reply_requires_explicit_retry(
     original = stores[0]._foundation._client.evalsha
     ack_dispatches = 0
     try:
+
         def lose_after_commit(*args):
             nonlocal ack_dispatches
             result = original(*args)
@@ -3386,9 +3628,14 @@ def test_response_acknowledgement_committed_lost_reply_requires_explicit_retry(
         assert stores[0]._foundation._client.exists(keys[7]) == 0
         assert stores[0]._foundation._client.zscore(keys[8], member) is None
         stores[0]._foundation._client.evalsha = original
-        assert stores[1].retrieve_encrypted_response(
+        assert (
+            stores[1]
+            .retrieve_encrypted_response(
             *identity, credential, ready.acknowledgement_token
-        ).state == "acknowledged"
+            )
+            .state
+            == "acknowledged"
+        )
     finally:
         stores[0]._foundation._client.evalsha = original
         _delete_claim_fixture_state(stores[0], (node,), (identity,))
@@ -3434,7 +3681,10 @@ def test_response_concurrent_acknowledgements_have_coherent_terminal(
         assert terminal[b"outcome"] == b"completed"
         assert terminal[b"retrieval_state"] == b"acknowledged"
         terminal_dump = stores[0]._foundation._client.dump(keys[9])
-        assert stores[0].retrieve_encrypted_response(*identity, credential).state == "acknowledged"
+        assert (
+            stores[0].retrieve_encrypted_response(*identity, credential).state
+            == "acknowledged"
+        )
         assert stores[0]._foundation._client.dump(keys[9]) == terminal_dump
     finally:
         for store, original in zip(stores, originals):
@@ -3452,9 +3702,7 @@ def test_response_concurrent_conflicting_acknowledgement_has_one_valid_winner(
     target = _accepted_retrieval_fixture(stores, "conflicting-ack-target")
     unrelated = _accepted_retrieval_fixture(stores, "conflicting-ack-unrelated")
     target_ready = stores[0].retrieve_encrypted_response(*target[1], target[2])
-    unrelated_ready = stores[1].retrieve_encrypted_response(
-        *unrelated[1], unrelated[2]
-    )
+    unrelated_ready = stores[1].retrieve_encrypted_response(*unrelated[1], unrelated[2])
     datastore = stores[0]._foundation._client
     unrelated_before = (
         datastore.hgetall(unrelated[5][7]),
@@ -3469,10 +3717,7 @@ def test_response_concurrent_conflicting_acknowledgement_has_one_valid_winner(
             original = originals[index]
 
             def synchronized(*args, original=original):
-                if (
-                    args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1
-                    and b"read" in args
-                ):
+                if args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1 and b"read" in args:
                     barrier.wait()
                 return original(*args)
 
@@ -3507,9 +3752,10 @@ def test_response_concurrent_conflicting_acknowledgement_has_one_valid_winner(
             datastore.zscore(unrelated[5][8], unrelated[6]),
         ) == unrelated_before
         stores[1]._foundation._client.evalsha = originals[1]
-        assert stores[1].retrieve_encrypted_response(
-            *unrelated[1], unrelated[2]
-        ).envelope == unrelated[3]
+        assert (
+            stores[1].retrieve_encrypted_response(*unrelated[1], unrelated[2]).envelope
+            == unrelated[3]
+        )
     finally:
         for store, original in zip(stores, originals):
             store._foundation._client.evalsha = original
@@ -3551,6 +3797,7 @@ def test_response_acknowledgement_versus_expiry_has_coherent_expiry_winner(
     originals = [store._foundation._client.evalsha for store in stores]
     ack_dispatches = 0
     try:
+
         def pause_after_acknowledgement_read(*args):
             nonlocal ack_dispatches
             is_retrieval = args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1
@@ -3612,9 +3859,10 @@ def test_response_acknowledgement_versus_expiry_has_coherent_expiry_winner(
             ),
         ) == unrelated_before
         stores[1]._foundation._client.evalsha = originals[1]
-        assert stores[1].retrieve_encrypted_response(
-            *unrelated[1], unrelated[2]
-        ).envelope == unrelated[3]
+        assert (
+            stores[1].retrieve_encrypted_response(*unrelated[1], unrelated[2]).envelope
+            == unrelated[3]
+        )
     finally:
         for store, original in zip(stores, originals):
             store._foundation._client.evalsha = original
@@ -3639,18 +3887,27 @@ def test_response_retrieval_cross_identity_credentials_and_tokens_are_fixed_and_
             store.retrieve_encrypted_response(*item[1], item[2]) for item in fixtures
         ]
         snapshots = [_exact_key_snapshot(store, item[5]) for item in fixtures]
-        assert store.retrieve_encrypted_response(
-            *first[1], second[2]
-        ).state == "invalid_retrieval_credential"
-        assert store.retrieve_encrypted_response(
+        assert (
+            store.retrieve_encrypted_response(*first[1], second[2]).state
+            == "invalid_retrieval_credential"
+        )
+        assert (
+            store.retrieve_encrypted_response(
             *first[1], first[2], ready[1].acknowledgement_token
-        ).state == "invalid_acknowledgement"
-        assert [
-            _exact_key_snapshot(store, item[5]) for item in fixtures
-        ] == snapshots
-        assert store.retrieve_encrypted_response(*first[1], first[2]).state == "response_ready"
+            ).state
+            == "invalid_acknowledgement"
+        )
+        assert [_exact_key_snapshot(store, item[5]) for item in fixtures] == snapshots
+        assert (
+            store.retrieve_encrypted_response(*first[1], first[2]).state
+            == "response_ready"
+        )
     finally:
-        _delete_claim_fixture_state(store, tuple(item[0] for item in fixtures), tuple(item[1] for item in fixtures))
+        _delete_claim_fixture_state(
+            store,
+            tuple(item[0] for item in fixtures),
+            tuple(item[1] for item in fixtures),
+        )
         store.close()
 
 
@@ -3668,7 +3925,10 @@ def test_response_replay_expiry_is_inclusive_by_authoritative_valkey_time(
         datastore.hset(keys[7], "replay_expires_at_epoch", raw)
         datastore.hset(keys[9], "replay_expires_at_epoch", raw)
         datastore.zadd(keys[8], {member: float(raw)})
-        assert store.retrieve_encrypted_response(*identity, credential).envelope == envelope
+        assert (
+            store.retrieve_encrypted_response(*identity, credential).envelope
+            == envelope
+        )
 
         seconds, micros = store._foundation.server_time()
         boundary = seconds + micros / 1_000_000
@@ -3713,7 +3973,9 @@ def test_response_retrieval_schema_gates_precede_protocol_dispatch(
             return original(*args)
 
         store._foundation._client.evalsha = record
-        with pytest.raises(ValkeySchemaIncompatibleError, match="^state schema incompatible$"):
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
             store.retrieve_encrypted_response(*identity, credential)
         assert RETRIEVE_RESPONSE_SCRIPT.eval_sha1 not in dispatches
         assert _exact_key_snapshot(store, keys) == baseline
@@ -3723,6 +3985,7 @@ def test_response_retrieval_schema_gates_precede_protocol_dispatch(
         _delete_claim_fixture_state(store, (node,), (identity,))
         store.close()
 
+
 def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_server):
     namespace = uuid.uuid4().hex
     first = _registration_store(valkey_server, namespace)
@@ -3730,7 +3993,11 @@ def test_encrypted_response_acceptance_is_atomic_shared_and_replay_safe(valkey_s
     node, owner, consumer = "response-node", _digest("response-owner"), "consumer-a"
     identity = ("response-client", "response-request")
     response = EncryptedResponseEnvelope(
-        "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "response-iv"
+        "tokenplace_api_v1_relay_e2ee",
+        1,
+        "response-ciphertext",
+        "response-key",
+        "response-iv",
     )
     deadline = time.time() + 60
     try:
@@ -3804,7 +4071,11 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
     node, owner, consumer = "retrieve-node", _digest("retrieve-owner"), "consumer"
     identity = ("retrieve-client", "retrieve-request")
     response = EncryptedResponseEnvelope(
-        "tokenplace_api_v1_relay_e2ee", 1, response_ciphertext, "response-key", "response-iv"
+        "tokenplace_api_v1_relay_e2ee",
+        1,
+        response_ciphertext,
+        "response-key",
+        "response-iv",
     )
     rounded_deadline = float(f"{time.time() + 60:.6f}")
     deadline = math.nextafter(rounded_deadline, math.inf)
@@ -3823,7 +4094,11 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
             "8k-fast",
             deadline,
             EncryptedRequestEnvelope(
-                "tokenplace_api_v1_relay_e2ee", 1, request_ciphertext, "request-key", "request-iv"
+                "tokenplace_api_v1_relay_e2ee",
+                1,
+                request_ciphertext,
+                "request-key",
+                "request-iv",
             ),
             "cancel",
         )
@@ -3845,12 +4120,16 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
         assert initial.request_deadline_epoch == deadline
         assert initial.replay_expires_at_epoch == accepted.replay_expires_at_epoch
         assert initial.acknowledgement_token is not None
-        assert first.retrieve_encrypted_response(
-            *identity, "0" * 64
-        ).state == "invalid_retrieval_credential"
-        assert first.retrieve_encrypted_response(
+        assert (
+            first.retrieve_encrypted_response(*identity, "0" * 64).state
+            == "invalid_retrieval_credential"
+        )
+        assert (
+            first.retrieve_encrypted_response(
             *identity, selection.reservation_token, "f" * 64
-        ).state == "invalid_acknowledgement"
+            ).state
+            == "invalid_acknowledgement"
+        )
         assert first.response_records()[0].envelope == response
 
         acknowledged = second.retrieve_encrypted_response(
@@ -3881,11 +4160,14 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
             acknowledgement_key=b"rotated-test-acknowledgement-key!",
         )
         try:
-            assert rotated.retrieve_encrypted_response(
+            assert (
+                rotated.retrieve_encrypted_response(
                 *identity,
                 selection.reservation_token,
                 initial.acknowledgement_token,
-            ).state == "invalid_acknowledgement"
+                ).state
+                == "invalid_acknowledgement"
+            )
         finally:
             rotated.close()
 
@@ -3910,9 +4192,12 @@ def test_encrypted_response_retrieval_is_replayable_shared_and_acknowledged_once
             first._foundation.config.key("terminals:expiry"),
             {f"{client_digest}:{request_digest}": expired_at},
         )
-        assert first.retrieve_encrypted_response(
+        assert (
+            first.retrieve_encrypted_response(
             *identity, selection.reservation_token
-        ).state == "invalid_retrieval_credential"
+            ).state
+            == "invalid_retrieval_credential"
+        )
         assert first._foundation._client.exists(terminal_key, request_key) == 0
     finally:
         _delete_claim_fixture_state(first, (node,), (identity,))
@@ -3964,7 +4249,10 @@ def test_due_response_retrieval_validates_all_authority_before_cleanup(
             datastore.delete(keys[7])
             datastore.zrem(keys[8], member)
 
-        now = sum(value / divisor for value, divisor in zip(store._foundation.server_time(), (1, 1_000_000)))
+        now = sum(
+            value / divisor
+            for value, divisor in zip(store._foundation.server_time(), (1, 1_000_000))
+        )
         accepted_raw = format(now - 3, ".17g")
         replay_raw = format(now - 2, ".17g")
         expiry_raw = format(now - 1, ".17g")
@@ -3976,7 +4264,9 @@ def test_due_response_retrieval_validates_all_authority_before_cleanup(
                 "expires_at_epoch": expiry_raw,
             },
         )
-        datastore.zadd(keys[10], {member: float(expiry_raw), unrelated_member: now + 99})
+        datastore.zadd(
+            keys[10], {member: float(expiry_raw), unrelated_member: now + 99}
+        )
         if retrieval_state == "response_ready":
             datastore.hset(
                 keys[7],
@@ -3985,7 +4275,9 @@ def test_due_response_retrieval_validates_all_authority_before_cleanup(
                     "replay_expires_at_epoch": replay_raw,
                 },
             )
-            datastore.zadd(keys[8], {member: float(replay_raw), unrelated_member: now + 98})
+            datastore.zadd(
+                keys[8], {member: float(replay_raw), unrelated_member: now + 98}
+            )
         else:
             datastore.zadd(keys[8], {unrelated_member: now + 98})
 
@@ -3999,7 +4291,9 @@ def test_due_response_retrieval_validates_all_authority_before_cleanup(
             datastore.zadd(keys[8], {member: float(replay_raw)})
 
         before = _exact_key_snapshot(store, keys)
-        with pytest.raises(ValkeySchemaIncompatibleError, match="state schema incompatible"):
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
             store.retrieve_encrypted_response(*identity, credential)
         assert _exact_key_snapshot(store, keys) == before
         assert datastore.zscore(keys[8], unrelated_member) == pytest.approx(now + 98)
@@ -4037,13 +4331,31 @@ def test_coherent_due_response_retrieval_reaps_only_addressed_authority(valkey_s
         retrieval_digest = hashlib.sha256(credential.encode()).hexdigest()
         datastore.hset(keys[4], "token_digest", retrieval_digest)
         datastore.hset(keys[9], "retrieval_credential_digest", retrieval_digest)
-        now = sum(value / divisor for value, divisor in zip(store._foundation.server_time(), (1, 1_000_000)))
+        now = sum(
+            value / divisor
+            for value, divisor in zip(store._foundation.server_time(), (1, 1_000_000))
+        )
         accepted_raw = repr(float(f"{now - 3:.6f}"))
         replay_raw, expiry_raw = (format(now - offset, ".17g") for offset in (2, 1))
-        datastore.hset(keys[7], mapping={"accepted_at_epoch": accepted_raw, "replay_expires_at_epoch": replay_raw})
-        datastore.hset(keys[9], mapping={"accepted_at_epoch": accepted_raw, "replay_expires_at_epoch": replay_raw, "expires_at_epoch": expiry_raw})
+        datastore.hset(
+            keys[7],
+            mapping={
+                "accepted_at_epoch": accepted_raw,
+                "replay_expires_at_epoch": replay_raw,
+            },
+        )
+        datastore.hset(
+            keys[9],
+            mapping={
+                "accepted_at_epoch": accepted_raw,
+                "replay_expires_at_epoch": replay_raw,
+                "expires_at_epoch": expiry_raw,
+            },
+        )
         datastore.zadd(keys[8], {member: float(replay_raw), unrelated_member: now + 98})
-        datastore.zadd(keys[10], {member: float(expiry_raw), unrelated_member: now + 99})
+        datastore.zadd(
+            keys[10], {member: float(expiry_raw), unrelated_member: now + 99}
+        )
 
         result = store.retrieve_encrypted_response(*identity, credential)
         assert result.state == "invalid_retrieval_credential"
@@ -4087,9 +4399,7 @@ def test_response_retrieval_rejects_coordinated_noncanonical_timestamp_authority
     valkey_server, field
 ):
     store = _registration_store(valkey_server, uuid.uuid4().hex)
-    fixture = _accepted_retrieval_fixture(
-        (store,), f"canonical-authority-{field}"
-    )
+    fixture = _accepted_retrieval_fixture((store,), f"canonical-authority-{field}")
     node, identity, credential, _, _, keys, member = fixture
     datastore = store._foundation._client
     unrelated_member = f"{'9' * 64}:{'8' * 64}"
@@ -4142,6 +4452,7 @@ def test_response_acknowledgement_revalidates_canonical_authority_after_read(
     datastore.zadd(keys[8], {unrelated_member: time.time() + 100})
     datastore.zadd(keys[10], {unrelated_member: time.time() + 200})
     try:
+
         def corrupt_before_ack(*args, **kwargs):
             nonlocal dispatches, corrupted_snapshot
             if args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1:
@@ -4178,7 +4489,10 @@ def test_response_acknowledgement_revalidates_canonical_authority_after_read(
             "replay_expires_at_epoch",
             canonical_replay,
         )
-        assert store.retrieve_encrypted_response(*identity, credential).envelope == envelope
+        assert (
+            store.retrieve_encrypted_response(*identity, credential).envelope
+            == envelope
+        )
     finally:
         datastore.evalsha = original_evalsha
         _delete_claim_fixture_state(store, (node,), (identity,))
@@ -4194,9 +4508,12 @@ def test_response_retrieval_canonical_timestamp_authority_acknowledges(valkey_se
     try:
         ready = store.retrieve_encrypted_response(*identity, credential)
         assert ready.envelope == envelope
-        assert store.retrieve_encrypted_response(
+        assert (
+            store.retrieve_encrypted_response(
             *identity, credential, ready.acknowledgement_token
-        ).state == "acknowledged"
+            ).state
+            == "acknowledged"
+        )
     finally:
         _delete_claim_fixture_state(store, (node,), (identity,))
         store.close()
@@ -4275,9 +4592,7 @@ def test_encrypted_response_compatibility_gates_fail_closed_before_state_or_acce
 
 
 def test_encrypted_response_namespace_isolation(valkey_server):
-    stores = [
-        _registration_store(valkey_server, uuid.uuid4().hex) for _ in range(2)
-    ]
+    stores = [_registration_store(valkey_server, uuid.uuid4().hex) for _ in range(2)]
     node, owner, consumer = (
         "namespace-response-node",
         _digest("namespace-response-owner"),
@@ -4318,15 +4633,24 @@ def test_encrypted_response_namespace_isolation(valkey_server):
         )
         assert accepted.new_outcome is True
         assert _exact_key_snapshot(stores[1], authorities[1][0]) == before[1]
-        assert stores[1]._foundation._client.exists(
+        assert (
+            stores[1]._foundation._client.exists(
             authorities[1][0][7], authorities[1][0][9]
-        ) == 0
-        assert stores[1]._foundation._client.zscore(
+            )
+            == 0
+        )
+        assert (
+            stores[1]._foundation._client.zscore(
             authorities[1][0][8], authorities[1][1]
-        ) is None
-        assert stores[1]._foundation._client.zscore(
+            )
+            is None
+        )
+        assert (
+            stores[1]._foundation._client.zscore(
             authorities[1][0][10], authorities[1][1]
-        ) is None
+            )
+            is None
+        )
 
         namespace_a = _exact_key_snapshot(stores[0], authorities[0][0])
         accepted_other = stores[1].accept_encrypted_response(
@@ -4456,9 +4780,7 @@ def test_encrypted_response_backend_failures_are_typed_redacted_and_not_replayed
         store._foundation._client.evalsha = fail_acceptance
         caplog.clear()
         with caplog.at_level(logging.DEBUG):
-            with pytest.raises(
-                expected_error, match=f"^{expected_message}$"
-            ) as caught:
+            with pytest.raises(expected_error, match=f"^{expected_message}$") as caught:
                 store.accept_encrypted_response(
                     node, owner, consumer, *identity, claim.generation, envelope
                 )
@@ -4481,9 +4803,8 @@ def test_encrypted_response_backend_failures_are_typed_redacted_and_not_replayed
         dispatched_args, dispatched_kwargs = dispatches[0]
         assert dispatched_kwargs == {}
         assert all(
-            _ACKNOWLEDGEMENT_KEY not in (
-                value if isinstance(value, bytes) else str(value).encode()
-            )
+            _ACKNOWLEDGEMENT_KEY
+            not in (value if isinstance(value, bytes) else str(value).encode())
             for value in dispatched_args[2:]
         )
         assert _exact_key_snapshot(store, keys) == before
@@ -4636,9 +4957,9 @@ def test_encrypted_response_concurrent_identical_acceptance_has_one_outcome(
 
         assert dispatches == [1, 1]
         assert sorted(result.new_outcome for result in results) == [False, True]
-        assert dataclasses.replace(results[0], new_outcome=False) == dataclasses.replace(
-            results[1], new_outcome=False
-        )
+        assert dataclasses.replace(
+            results[0], new_outcome=False
+        ) == dataclasses.replace(results[1], new_outcome=False)
         keys, member = _response_acceptance_authority(first, node, identity)
         assert len(first._foundation._client.hgetall(keys[7])) == 12
         assert len(first._foundation._client.hgetall(keys[9])) == 16
@@ -5050,9 +5371,10 @@ def test_encrypted_response_retries_retained_retrieval_expired_terminal(valkey_s
         first._cleanup_completed_records()
         assert datastore.exists(cfg.key("response", client, request)) == 0
         assert datastore.zscore(cfg.key("responses:expiry"), member) is None
-        assert datastore.hget(
-            cfg.key("terminal", client, request), "retrieval_state"
-        ) == b"retrieval_expired"
+        assert (
+            datastore.hget(cfg.key("terminal", client, request), "retrieval_state")
+            == b"retrieval_expired"
+        )
 
         datastore.delete(cfg.key("node", node_digest))
         datastore.zrem(cfg.key("nodes:lease"), node_digest)
@@ -5080,7 +5402,9 @@ def test_encrypted_response_retries_retained_retrieval_expired_terminal(valkey_s
         second.close()
 
 
-@pytest.mark.parametrize("terminal_fields", ({"additive": "value"}, {"outcome": "completed"}))
+@pytest.mark.parametrize(
+    "terminal_fields", ({"additive": "value"}, {"outcome": "completed"})
+)
 def test_encrypted_response_rejects_preexisting_terminal_authority_without_mutation(
     valkey_server, terminal_fields
 ):
@@ -5145,7 +5469,10 @@ def test_encrypted_response_complete_terminal_preserves_additive_fields(valkey_s
 
 
 @pytest.mark.parametrize("retrieval_state", ("response_ready", "retrieval_expired"))
-@pytest.mark.parametrize("corruption", ("empty_node", "oversized_node", "negative_accepted", "future_accepted"))
+@pytest.mark.parametrize(
+    "corruption",
+    ("empty_node", "oversized_node", "negative_accepted", "future_accepted"),
+)
 def test_encrypted_response_rejects_invalid_retained_terminal_bounds_without_mutation(
     valkey_server, retrieval_state, corruption
 ):
@@ -5153,7 +5480,9 @@ def test_encrypted_response_rejects_invalid_retained_terminal_bounds_without_mut
     store = _registration_store(
         valkey_server,
         namespace,
-        response_replay_ttl_seconds=0.05 if retrieval_state == "retrieval_expired" else 300,
+        response_replay_ttl_seconds=(
+            0.05 if retrieval_state == "retrieval_expired" else 300
+        ),
         terminal_retention_seconds=600,
     )
     node, owner, consumer = "bounded-node", _digest("bounded-owner"), "consumer"
@@ -5285,9 +5614,11 @@ def test_encrypted_response_retained_retry_validates_complete_paired_authority(
                 bound = (
                     store.config.max_response_envelope_bytes
                     if field == "envelope"
-                    else store.config.max_node_id_bytes
+                    else (
+                        store.config.max_node_id_bytes
                     if field == "node_id"
                     else store.config.max_identity_bytes
+                )
                 )
                 replacement = b"x" * (bound + 1)
             datastore.hset(response_key, field, replacement)
@@ -5344,6 +5675,7 @@ def test_encrypted_response_cleanup_rejects_malformed_authority_without_writes(
     response_index = cfg.key("responses:expiry")
     terminal_index = cfg.key("terminals:expiry")
     datastore = store._foundation._client
+
     def snapshot():
         return (
             tuple(datastore.hgetall(key) for key in (response, terminal, lifecycle)),
@@ -5473,10 +5805,18 @@ def test_encrypted_response_cleanup_validates_batch_before_exact_reaping(valkey_
             response = cfg.key("response", client, request)
             terminal = cfg.key("terminal", client, request)
             lifecycle = cfg.key("request", client, request)
-            datastore.hset(response, "replay_expires_at_epoch", repr(accepted.accepted_at_epoch))
-            datastore.hset(terminal, "replay_expires_at_epoch", repr(accepted.accepted_at_epoch))
-            datastore.zadd(cfg.key("responses:expiry"), {member: accepted.accepted_at_epoch})
-            records.append((member, response, terminal, lifecycle, accepted.accepted_at_epoch))
+            datastore.hset(
+                response, "replay_expires_at_epoch", repr(accepted.accepted_at_epoch)
+            )
+            datastore.hset(
+                terminal, "replay_expires_at_epoch", repr(accepted.accepted_at_epoch)
+            )
+            datastore.zadd(
+                cfg.key("responses:expiry"), {member: accepted.accepted_at_epoch}
+            )
+            records.append(
+                (member, response, terminal, lifecycle, accepted.accepted_at_epoch)
+            )
 
         datastore.hdel(records[1][3], "request_id")
         hash_keys = tuple(key for record in records for key in record[1:4])
@@ -5485,7 +5825,9 @@ def test_encrypted_response_cleanup_validates_batch_before_exact_reaping(valkey_
         def snapshot():
             return (
                 tuple(datastore.hgetall(key) for key in hash_keys),
-                tuple(datastore.zrange(key, 0, -1, withscores=True) for key in index_keys),
+                tuple(
+                    datastore.zrange(key, 0, -1, withscores=True) for key in index_keys
+                ),
             )
 
         before = snapshot()
@@ -5521,7 +5863,10 @@ def test_encrypted_response_cleanup_reaps_exact_response_then_terminal(valkey_se
         )
         due = accepted.accepted_at_epoch
         datastore.hset(response, "replay_expires_at_epoch", repr(due))
-        datastore.hset(terminal, mapping={"replay_expires_at_epoch": repr(due), "additive": "preserved"})
+        datastore.hset(
+            terminal,
+            mapping={"replay_expires_at_epoch": repr(due), "additive": "preserved"},
+        )
         datastore.hset(lifecycle, "additive", "preserved")
         datastore.zadd(cfg.key("responses:expiry"), {member: due})
         lifecycle_before = datastore.dump(lifecycle)
@@ -5589,12 +5934,8 @@ def test_encrypted_response_inclusive_expiry_boundaries_are_non_mutating(
     valkey_server, boundary, claim_ttl, deadline_offset
 ):
     namespace = uuid.uuid4().hex
-    first = _registration_store(
-        valkey_server, namespace, claim_ttl_seconds=claim_ttl
-    )
-    second = _registration_store(
-        valkey_server, namespace, claim_ttl_seconds=claim_ttl
-    )
+    first = _registration_store(valkey_server, namespace, claim_ttl_seconds=claim_ttl)
+    second = _registration_store(valkey_server, namespace, claim_ttl_seconds=claim_ttl)
     node, owner, consumer = "boundary-node", _digest("boundary-owner"), "consumer"
     identity = (f"{boundary}-client", f"{boundary}-request")
     response = EncryptedResponseEnvelope(
@@ -5628,9 +5969,7 @@ def test_encrypted_response_inclusive_expiry_boundaries_are_non_mutating(
         )
         _wait_for_server_epoch(first, due)
 
-        with pytest.raises(
-            RelayStateConflict, match="^response lifecycle conflict$"
-        ):
+        with pytest.raises(RelayStateConflict, match="^response lifecycle conflict$"):
             second.accept_encrypted_response(
                 node, owner, consumer, *identity, claim.generation, response
             )
@@ -5659,7 +5998,10 @@ def test_encrypted_response_first_transition_removes_exact_authority_once(
     first = _registration_store(valkey_server, namespace, max_claims=8)
     second = _registration_store(valkey_server, namespace, max_claims=8)
     node, owner, consumer = "transition-node", _digest("transition-owner"), "consumer"
-    identities = (("transition-client-a", "request-a"), ("transition-client-b", "request-b"))
+    identities = (
+        ("transition-client-a", "request-a"),
+        ("transition-client-b", "request-b"),
+    )
     envelope = EncryptedResponseEnvelope(
         "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
     )
@@ -5704,9 +6046,10 @@ def test_encrypted_response_first_transition_removes_exact_authority_once(
         assert datastore.exists(keys[11]) == 0
         assert datastore.hget(keys[4], "state") == b"response_ready"
         assert datastore.hget(node_key, "scheduler_claimed_work") == scheduler_before
-        assert tuple(
-            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
-        ) == neighbor_hashes_before
+        assert (
+            tuple(datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11))
+            == neighbor_hashes_before
+        )
         assert (
             datastore.zscore(keys[5], neighbor_member),
             datastore.zscore(keys[6], neighbor_member),
@@ -5719,9 +6062,10 @@ def test_encrypted_response_first_transition_removes_exact_authority_once(
         assert not retried.new_outcome
         assert retried == dataclasses.replace(accepted, new_outcome=False)
         assert _exact_key_snapshot(first, keys) == after
-        assert tuple(
-            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
-        ) == neighbor_hashes_before
+        assert (
+            tuple(datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11))
+            == neighbor_hashes_before
+        )
         assert (
             datastore.zscore(keys[5], neighbor_member),
             datastore.zscore(keys[6], neighbor_member),
@@ -5989,13 +6333,14 @@ def test_claim_queued_request_rejects_malformed_addressed_authority_without_muta
             client.hgetall(request_key),
             client.hgetall(claim_key),
             client.hgetall(cursor_key),
-            tuple(client.zrange(key, 0, -1, withscores=True) for key in sorted_set_keys),
+            tuple(
+                client.zrange(key, 0, -1, withscores=True) for key in sorted_set_keys
+            ),
         )
+
     try:
         store.register(node_id, _capabilities(), owner)
-        _enqueue_claim_fixture(
-            store, node_id, owner, client_id, request_id, deadline
-        )
+        _enqueue_claim_fixture(store, node_id, owner, client_id, request_id, deadline)
 
         reclaim_case = malformed_authority.startswith("claim_") or (
             malformed_authority == "generation_cursor_behind_reclaim"
@@ -6130,9 +6475,12 @@ def test_claim_fifo_skips_live_claim_and_returns_typed_empty(valkey_server):
         assert first._foundation._client.zcard(cfg.key("requests:deadline")) == 2
         assert first._foundation._client.zcard(cfg.key("reservations:expiry")) == 0
         assert len(first.active_claims(node_id)) == 2
-        assert first._foundation._client.hget(
+        assert (
+            first._foundation._client.hget(
             cfg.key("node", node), "scheduler_claimed_work"
-        ) == b"0"
+            )
+            == b"0"
+        )
     finally:
         _delete_claim_fixture_state(first, (node_id,), identities)
         first.close()
@@ -6222,20 +6570,29 @@ def test_claim_lease_is_bounded_by_request_deadline(valkey_server):
         assert result.request_deadline_epoch == deadline
         assert result.lease_expires_at_epoch <= deadline
         assert store._foundation._client.xlen(cfg.key("queue", node)) == 1
-        assert store._foundation._client.hget(
+        assert (
+            store._foundation._client.hget(
             cfg.key("request", client, request), "claim_generation"
-        ) == str(result.generation).encode()
+            )
+            == str(result.generation).encode()
+        )
 
         _wait_for_server_epoch(store, deadline)
         assert store.active_claims(node_id) == ()
         empty = store.claim_queued_request(node_id, owner, "deadline-consumer-final")
         assert empty.state == "empty" and empty.generation is None
-        assert store._foundation._client.zscore(
+        assert (
+            store._foundation._client.zscore(
             cfg.key("claims:expiry"), f"{client}:{request}"
-        ) == deadline
-        assert store._foundation._client.hget(
+            )
+            == deadline
+        )
+        assert (
+            store._foundation._client.hget(
             cfg.key("request", client, request), "claim_generation"
-        ) == str(result.generation).encode()
+            )
+            == str(result.generation).encode()
+        )
         assert store._foundation._client.xlen(cfg.key("queue", node)) == 1
     finally:
         _delete_claim_fixture_state(store, (node_id,), (identity,))
@@ -6273,9 +6630,10 @@ def test_renew_claim_preserves_exact_deadline_representation(valkey_server):
 
         claimed = store.claim_queued_request(node_id, owner, consumer)
         assert claimed.state == "claimed"
-        assert store._foundation._client.hget(
-            claim_key, "lease_expires"
-        ) == stored_deadline
+        assert (
+            store._foundation._client.hget(claim_key, "lease_expires")
+            == stored_deadline
+        )
         request_before = store._foundation._client.hgetall(request_key)
         claim_before = store._foundation._client.hgetall(claim_key)
         cursor_before = store._foundation._client.hgetall(cfg.key("cursor"))
@@ -6289,12 +6647,14 @@ def test_renew_claim_preserves_exact_deadline_representation(valkey_server):
         assert renewed.state == "continued"
         assert renewed.lease_expires_at_epoch == decoded_deadline
         assert renewed.lease_expires_at_epoch <= decoded_deadline
-        assert store._foundation._client.hget(
-            claim_key, "lease_expires"
-        ) == stored_deadline
-        assert store._foundation._client.zscore(
-            cfg.key("claims:expiry"), member
-        ) == decoded_deadline
+        assert (
+            store._foundation._client.hget(claim_key, "lease_expires")
+            == stored_deadline
+        )
+        assert (
+            store._foundation._client.zscore(cfg.key("claims:expiry"), member)
+            == decoded_deadline
+        )
 
         claim_after = store._foundation._client.hgetall(claim_key)
         assert {k: v for k, v in claim_after.items() if k != b"lease_expires"} == {
@@ -6302,9 +6662,12 @@ def test_renew_claim_preserves_exact_deadline_representation(valkey_server):
         }
         assert store._foundation._client.hgetall(request_key) == request_before
         assert store._foundation._client.hgetall(cfg.key("cursor")) == cursor_before
-        assert store._foundation._client.xrange(
+        assert (
+            store._foundation._client.xrange(
             cfg.key("queue", store._node_digest(node_id))
-        ) == queue_before
+            )
+            == queue_before
+        )
 
         _wait_for_server_epoch(store, deadline)
         before_rejected = _claim_authority_snapshot(store, node_id, *identity)
@@ -6331,6 +6694,7 @@ def _claim_authority_snapshot(store, node_id, client_id, request_id):
         datastore.xrange(cfg.key("queue", node)),
         datastore.zrange(cfg.key("claims:expiry"), 0, -1, withscores=True),
     )
+
 
 def _claim_namespace_snapshot(store, node_id, identities):
     cfg = store._foundation.config
@@ -6703,8 +7067,6 @@ def test_claim_unknown_fields_survive_renewal_and_reclaim(valkey_server):
         store.close()
 
 
-
-
 def test_renew_claim_authenticates_exact_live_authority(valkey_server):
     namespace = uuid.uuid4().hex
     first = _registration_store(valkey_server, namespace, claim_ttl_seconds=2)
@@ -6822,6 +7184,7 @@ def test_renew_claim_authenticates_exact_live_authority(valkey_server):
         first.close()
         second.close()
 
+
 @pytest.mark.parametrize("removal", ("unregister", "expiry"))
 def test_generation_and_owner_fencing_survives_node_id_reuse(valkey_server, removal):
     namespace = uuid.uuid4().hex
@@ -6884,6 +7247,7 @@ def test_generation_and_owner_fencing_survives_node_id_reuse(valkey_server, remo
         for store in stores:
             store.close()
 
+
 def test_concurrent_renewal_and_reclaim_has_coherent_generation(valkey_server):
     namespace = uuid.uuid4().hex
     first = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.08)
@@ -6942,6 +7306,7 @@ def test_concurrent_renewal_and_reclaim_has_coherent_generation(valkey_server):
         )
         first.close()
         second.close()
+
 
 @pytest.mark.parametrize("removal", ("unregister", "expiry"))
 def test_concurrent_renewal_and_registration_removal_fences_former_owner(
@@ -7014,6 +7379,7 @@ def test_concurrent_renewal_and_registration_removal_fences_former_owner(
         )
         first.close()
         second.close()
+
 
 def test_claim_capacity_fails_closed_on_malformed_live_claim_authority(
     valkey_server,
@@ -7212,8 +7578,6 @@ def test_claim_capacity_counts_only_complete_live_claims(valkey_server):
             )
         store._foundation._client.delete(*keys)
         store.close()
-
-
 
 
 def test_claim_capacity_fails_closed_on_nonlive_or_mismatched_lifecycle_authority(
@@ -7672,7 +8036,9 @@ def test_claim_result_budget_accepts_large_bounded_result(valkey_server):
         store.close()
 
 
-def test_completed_record_reads_hide_expired_backlog_beyond_cleanup_batch(valkey_server):
+def test_completed_record_reads_hide_expired_backlog_beyond_cleanup_batch(
+    valkey_server,
+):
     namespace = uuid.uuid4().hex
     store = _registration_store(
         valkey_server,
@@ -7683,7 +8049,9 @@ def test_completed_record_reads_hide_expired_backlog_beyond_cleanup_batch(valkey
         node_transition_batch_size=1,
     )
     node, owner, consumer = "expiry-node", _digest("expiry-owner"), "expiry-consumer"
-    identities = tuple(("expiry-client", f"expiry-request-{index}") for index in range(3))
+    identities = tuple(
+        ("expiry-client", f"expiry-request-{index}") for index in range(3)
+    )
     response = EncryptedResponseEnvelope(
         "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
     )

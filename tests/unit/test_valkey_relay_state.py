@@ -104,18 +104,14 @@ def test_response_envelope_decoder_rejects_malformed_or_noncanonical_bytes(raw):
     (
         (
             0,
-            EncryptedResponseEnvelope(
-                "tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"
-            ),
+            EncryptedResponseEnvelope("tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"),
             1024,
             "generation",
         ),
         (1, object(), 1024, "response envelope"),
         (
             1,
-            EncryptedResponseEnvelope(
-                "tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"
-            ),
+            EncryptedResponseEnvelope("tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"),
             1,
             "byte bound",
         ),
@@ -199,7 +195,10 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     expected_digest = "fcbec2f8126ea96834b8196a907aced2fe5e82d41edfbe7f966f2820a89774d8"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
-    assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
+    assert (
+        hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest()
+        == expected_digest
+    )
     assert not re.search(
         r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
         ACCEPT_RESPONSE_SCRIPT.source,
@@ -212,12 +211,28 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     assert ACCEPT_RESPONSE_SCRIPT.source.index(stale_guard) < (
         ACCEPT_RESPONSE_SCRIPT.source.index("redis.call('HSET',response")
     )
-    assert "if not accepted or accepted<0 or accepted>now then return {'malformed'} end" in ACCEPT_RESPONSE_SCRIPT.source
+    assert (
+        "if not accepted or accepted<0 or accepted>now then return {'malformed'} end"
+        in ACCEPT_RESPONSE_SCRIPT.source
+    )
     cleanup_offset = ACCEPT_RESPONSE_SCRIPT.source.index("local function cleanup()")
-    assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_response_due(response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
-    assert "'client_public_key','request_id','node_id','consumer_digest','generation','envelope'" in ACCEPT_RESPONSE_SCRIPT.source
-    assert "'retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request'" in ACCEPT_RESPONSE_SCRIPT.source
-    assert "local lv=redis.call('HMGET',lk,'state','client','request','client_public_key','request_id'" in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index(
+        "validate_response_due(response_due)", cleanup_offset
+    ) < ACCEPT_RESPONSE_SCRIPT.source.index(
+        "reap(response_due,terminal_due)", cleanup_offset
+    )
+    assert (
+        "'client_public_key','request_id','node_id','consumer_digest','generation','envelope'"
+        in ACCEPT_RESPONSE_SCRIPT.source
+    )
+    assert (
+        "'retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request'"
+        in ACCEPT_RESPONSE_SCRIPT.source
+    )
+    assert (
+        "local lv=redis.call('HMGET',lk,'state','client','request','client_public_key','request_id'"
+        in ACCEPT_RESPONSE_SCRIPT.source
+    )
     response_validator = ACCEPT_RESPONSE_SCRIPT.source.split(
         "local function validate_response_due(due)", 1
     )[1].split("local function contains", 1)[0]
@@ -227,16 +242,33 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     for validator in (response_validator, terminal_validator):
         assert "tv[12]~=lv[12]" in validator
         assert "tv[14]~=lv[13]" in validator
-    assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_terminal_due(terminal_due,response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
-    assert "redis.call('EXISTS',response)~=0 or response_indexed or terminal_indexed" in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index(
+        "validate_terminal_due(terminal_due,response_due)", cleanup_offset
+    ) < ACCEPT_RESPONSE_SCRIPT.source.index(
+        "reap(response_due,terminal_due)", cleanup_offset
+    )
+    assert (
+        "redis.call('EXISTS',response)~=0 or response_indexed or terminal_indexed"
+        in ACCEPT_RESPONSE_SCRIPT.source
+    )
     assert "if entries>=limit then return false end" in ACCEPT_RESPONSE_SCRIPT.source
     assert ACCEPT_RESPONSE_SCRIPT.source.index("for i=1,#members,2 do") < (
         ACCEPT_RESPONSE_SCRIPT.source.index("if entries>=limit then return false end")
     )
-    assert "local response_values=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')" in ACCEPT_RESPONSE_SCRIPT.source
-    assert "local terminal_exists=redis.call('EXISTS',terminal)" in ACCEPT_RESPONSE_SCRIPT.source
+    assert (
+        "local response_values=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')"
+        in ACCEPT_RESPONSE_SCRIPT.source
+    )
+    assert (
+        "local terminal_exists=redis.call('EXISTS',terminal)"
+        in ACCEPT_RESPONSE_SCRIPT.source
+    )
     assert "a<0 or a>now" in ACCEPT_RESPONSE_SCRIPT.source
-    assert ACCEPT_RESPONSE_SCRIPT.source.index("elseif response_exists~=0 or response_score") < ACCEPT_RESPONSE_SCRIPT.source.index("return {'existing',tostring(g),tv[9],tv[10]}")
+    assert ACCEPT_RESPONSE_SCRIPT.source.index(
+        "elseif response_exists~=0 or response_score"
+    ) < ACCEPT_RESPONSE_SCRIPT.source.index(
+        "return {'existing',tostring(g),tv[9],tv[10]}"
+    )
     expiry_guard = "if claim_expiry<=now or deadline<=now then return {'missing'} end"
     assert expiry_guard in ACCEPT_RESPONSE_SCRIPT.source
     expiry_guard_offset = ACCEPT_RESPONSE_SCRIPT.source.index(expiry_guard)
@@ -252,7 +284,10 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     expected_digest = "2a57b24252d4667be561f7ba369ca201efb048752b7abe70829997937751085f"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
-    assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
+    assert (
+        hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest()
+        == expected_digest
+    )
     assert not re.search(
         r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
         RETRIEVE_RESPONSE_SCRIPT.source,
@@ -271,10 +306,15 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     )
     assert "rv[9]~=tv[9]" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "rv[11]~=tv[10]" in RETRIEVE_RESPONSE_SCRIPT.source
-    assert "return {'acknowledged',tv[9],tv[8],tv[13]}" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert (
+        "return {'acknowledged',tv[9],tv[8],tv[13]}" in RETRIEVE_RESPONSE_SCRIPT.source
+    )
     assert "local canonical=string.format('%.6f',n)" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "string.format('%.17g',n)==value" in RETRIEVE_RESPONSE_SCRIPT.source
-    assert "local function lua_number(value)\n  return lua_float(value)" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert (
+        "local function lua_number(value)\n  return lua_float(value)"
+        in RETRIEVE_RESPONSE_SCRIPT.source
+    )
 
 
 @pytest.mark.parametrize(
@@ -315,10 +355,7 @@ def _ready_retrieval_reply(store, *, acknowledgement_digest=None):
         b"20",
         b"30",
         response_digest.encode(),
-        (
-            acknowledgement_digest
-            or hashlib.sha256(token.encode()).hexdigest().encode()
-        ),
+        (acknowledgement_digest or hashlib.sha256(token.encode()).hexdigest().encode()),
     ], token
 
 
@@ -336,9 +373,10 @@ def test_retrieve_response_decodes_fixed_and_malformed_read_results(reply):
     store = _retrieval_store_with_replies(reply)
 
     if reply == [b"invalid_ack"]:
-        assert store.retrieve_encrypted_response(
-            "a" * 64, "b" * 64, "c" * 64
-        ).state == "invalid_acknowledgement"
+        assert (
+            store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64).state
+            == "invalid_acknowledgement"
+        )
     else:
         with pytest.raises(
             ValkeySchemaIncompatibleError, match="state schema incompatible"
@@ -372,9 +410,12 @@ def test_retrieve_response_active_key_mismatch_is_typed_for_read_and_acknowledge
         ValkeySchemaIncompatibleError, match="state schema incompatible"
     ):
         store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
-    assert store.retrieve_encrypted_response(
+    assert (
+        store.retrieve_encrypted_response(
         "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
-    ).state == "invalid_acknowledgement"
+        ).state
+        == "invalid_acknowledgement"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1481,7 +1522,7 @@ def test_claim_input_and_acknowledgement_validation_precede_dispatch():
         store.claimed_request("node-a", "")
     with pytest.raises(RelayStateStoreError, match="claim generation"):
         store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 0)
-    with pytest.raises(RelayStateStoreError, match="control tombstones"):
+    with pytest.raises(RelayStateStoreError, match="control acknowledgement"):
         store.renew_claim_or_read_control(
             "node-a",
             "a" * 64,
@@ -1489,7 +1530,7 @@ def test_claim_input_and_acknowledgement_validation_precede_dispatch():
             "client",
             "request",
             1,
-            acknowledge=True,
+            acknowledge="yes",
         )
     foundation.execute.assert_not_called()
 
@@ -1611,7 +1652,9 @@ def test_accept_response_decodes_only_fixed_bounded_results(reply, error):
         )
 
 
-@pytest.mark.parametrize(("status", "new_outcome"), ((b"accepted", True), (b"existing", False)))
+@pytest.mark.parametrize(
+    ("status", "new_outcome"), ((b"accepted", True), (b"existing", False))
+)
 def test_accept_response_decodes_fixed_success_results(status, new_outcome):
     foundation = Mock(spec=ValkeyFoundation)
     foundation.config = config()
@@ -1627,7 +1670,11 @@ def test_accept_response_decodes_fixed_success_results(status, new_outcome):
     )
 
     assert result.new_outcome is new_outcome
-    assert (result.generation, result.accepted_at_epoch, result.replay_expires_at_epoch) == (
+    assert (
+        result.generation,
+        result.accepted_at_epoch,
+        result.replay_expires_at_epoch,
+    ) == (
         1,
         1.0,
         2.0,

@@ -77,6 +77,7 @@ spec:
                 "RELAY_PORT" (dict "name" "RELAY_PORT" "value" $relayPort)
                 "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")
                 "RELAY_THREADS" (dict "name" "RELAY_THREADS" "value" "4")
+                "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" (dict "name" "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" "value" (join "," .Values.rateLimit.trustedProxies))
                 "TOKENPLACE_RELAY_INTERNAL_URL" (dict "name" "TOKENPLACE_RELAY_INTERNAL_URL" "value" $selfDispatchURL)
                 "TOKENPLACE_FRONTEND_MODE" (dict "name" "TOKENPLACE_FRONTEND_MODE" "value" "production")
                 "TOKENPLACE_RELEASE_VERSION" (dict "name" "TOKENPLACE_RELEASE_VERSION" "value" .Chart.AppVersion)

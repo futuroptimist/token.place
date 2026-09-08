@@ -22,5 +22,6 @@ exec gunicorn \
   --timeout "${TIMEOUT}" \
   --worker-tmp-dir "${WORKER_TMP_DIR}" \
   --access-logfile '-' \
+  --access-logformat '{"event":"http_access","status":"%(s)s","method":"%(m)s"}' \
   --error-logfile '-' \
   relay:app

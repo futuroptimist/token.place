@@ -663,23 +663,12 @@ local function reclaim(c, q)
   if not indexed_deadline or math.abs(tonumber(indexed_deadline) - lifecycle_deadline) > 0.000001 then
     return false, 'schema'
   end
+  if lifecycle_deadline <= now then
+    if string.find(',' .. ARGV[23] .. ',', ',' .. c .. ':' .. q .. ',', 1, true) then return false, nil end
+    return false, 'deadline_due'
+  end
   if state == 'queued' or state == 'claimed' then
-    if lifecycle_deadline > now then return false, nil end
-    if not v[8] or v[8] == '' then return false, 'schema' end
-    local entries = redis.call('XRANGE', prefix .. 'queue:' .. v[4], v[8], v[8], 'COUNT', 1)
-    if #entries ~= 1 or entries[1][1] ~= v[8] then return false, 'schema' end
-    local ec, eq = nil, nil
-    local fields = entries[1][2]
-    for i=1,#fields,2 do
-      if fields[i] == 'client' then ec = fields[i+1] end
-      if fields[i] == 'request' then eq = fields[i+1] end
-    end
-    if ec ~= c or eq ~= q then return false, 'schema' end
-    redis.call('XDEL', prefix .. 'queue:' .. v[4], v[8])
-    if state == 'claimed' then
-      redis.call('DEL', prefix .. 'claim:' .. c .. ':' .. q)
-      redis.call('ZREM', prefix .. 'claims:expiry', c .. ':' .. q)
-    end
+    return false, nil
   else
     local expires = tonumber(v[7])
     if not v[6] or not expires then return false, 'schema' end
@@ -708,7 +697,7 @@ end
 
 -- Reclaim the addressed identity independently of the bounded general backlog.
 local addressed, reclaim_error, addressed_token = reclaim(client, request)
-if reclaim_error then return {reclaim_error} end
+if reclaim_error then return {reclaim_error, client, request} end
 local cleaned = 0
 local due = redis.call('ZRANGEBYSCORE', deadlines, '-inf', now, 'LIMIT', 0, batch + 1)
 for _, member in ipairs(due) do
@@ -720,7 +709,7 @@ for _, member in ipairs(due) do
       return {'schema'}
     end
     local ok, err = reclaim(due_c, due_q)
-    if err then return {err} end
+    if err then return {err, due_c, due_q} end
     if ok then cleaned = cleaned + 1 end
   end
 end
@@ -732,7 +721,7 @@ for _, token in ipairs(expired) do
     if not c or not q then return {'schema'} end
     if c ~= client or q ~= request or not addressed then
       local ok, err = reclaim(c, q)
-      if err then return {err} end
+      if err then return {err, c, q} end
       if ok then cleaned = cleaned + 1 end
     end
   end
@@ -940,7 +929,7 @@ return {'created', selected[5], tostring(expires)}
 SELECT_AND_RESERVE_SCRIPT = ReviewedScript(
     "select_and_reserve_v1",
     SELECT_AND_RESERVE_SOURCE,
-    "27c9e83a74c75de3a70d0e0602967e5ec872ef2a4191459a33a3921a08efc67c",  # pragma: allowlist secret
+    "9a12aeb8b536a59aede23c7fe0dae2aedc7d3e36828a8bb09fc7aec8264d0dbf",  # pragma: allowlist secret
     True,
 )
 
@@ -981,23 +970,12 @@ local function reclaim(c, q)
   if not indexed_deadline or math.abs(tonumber(indexed_deadline) - lifecycle_deadline) > 0.000001 then
     return false, 'schema'
   end
+  if lifecycle_deadline <= now then
+    if string.find(',' .. ARGV[18] .. ',', ',' .. c .. ':' .. q .. ',', 1, true) then return false, nil end
+    return false, 'deadline_due'
+  end
   if lifecycle_state == 'queued' or lifecycle_state == 'claimed' then
-    if lifecycle_deadline > now then return false, nil end
-    if not v[8] or v[8] == '' then return false, 'schema' end
-    local entries = redis.call('XRANGE', prefix .. 'queue:' .. v[4], v[8], v[8], 'COUNT', 1)
-    if #entries ~= 1 or entries[1][1] ~= v[8] then return false, 'schema' end
-    local ec, eq = nil, nil
-    local fields = entries[1][2]
-    for i=1,#fields,2 do
-      if fields[i] == 'client' then ec = fields[i+1] end
-      if fields[i] == 'request' then eq = fields[i+1] end
-    end
-    if ec ~= c or eq ~= q then return false, 'schema' end
-    redis.call('XDEL', prefix .. 'queue:' .. v[4], v[8])
-    if lifecycle_state == 'claimed' then
-      redis.call('DEL', prefix .. 'claim:' .. c .. ':' .. q)
-      redis.call('ZREM', prefix .. 'claims:expiry', c .. ':' .. q)
-    end
+    return false, nil
   else
     local expires = tonumber(v[7])
     if not v[6] or not expires then return false, 'schema' end
@@ -1018,7 +996,7 @@ local function reclaim(c, q)
   return true, nil, v[6]
 end
 local addressed, reclaim_error, addressed_token = reclaim(client, request)
-if reclaim_error then return {reclaim_error} end
+if reclaim_error then return {reclaim_error, client, request} end
 local cleaned = 0
 local due = redis.call('ZRANGEBYSCORE', deadlines, '-inf', now, 'LIMIT', 0, batch + 1)
 for _, member in ipairs(due) do
@@ -1030,7 +1008,7 @@ for _, member in ipairs(due) do
       return {'schema'}
     end
     local ok, err = reclaim(due_c, due_q)
-    if err then return {err} end
+    if err then return {err, due_c, due_q} end
     if ok then cleaned = cleaned + 1 end
   end
 end
@@ -1042,7 +1020,7 @@ for _, expired_token in ipairs(expired) do
     if not c or not q then return {'schema'} end
     if c ~= client or q ~= request or not addressed then
       local ok, err = reclaim(c, q)
-      if err then return {err} end
+      if err then return {err, c, q} end
       if ok then cleaned = cleaned + 1 end
     end
   end
@@ -1118,7 +1096,7 @@ return {'created', 'queued', values[7], tostring(sequence)}
 ENQUEUE_SCRIPT = ReviewedScript(
     "enqueue_encrypted_request_v1",
     ENQUEUE_SOURCE,
-    "62224003ccbab921f2ab7c1a74bf2564fb5eed5f28f198c25a374eb9986d9904",  # pragma: allowlist secret
+    "44053a611a055b6a26f1cf0f16af72f6dfa323d57cd1fa88433c254a768de5c1",  # pragma: allowlist secret
     True,
 )
 CLAIM_SOURCE = """\
@@ -2712,10 +2690,32 @@ class ValkeyRegistrationStore:
             str(self.config.node_transition_batch_size).encode(),
             *tier_bounds,
             repr(float(self.config.max_request_ttl_seconds)).encode(),
+            b"",
         )
-        status, values = self._ascii_status(
-            self._foundation.execute(SELECT_AND_RESERVE_SCRIPT.name, keys, args)
-        )
+        deferred: set[str] = set()
+        for _ in range(self.config.node_transition_batch_size + 2):
+            status, values = self._ascii_status(
+                self._foundation.execute(
+                    SELECT_AND_RESERVE_SCRIPT.name,
+                    keys,
+                    (*args[:-1], ",".join(sorted(deferred)).encode()),
+                )
+            )
+            if status != "deadline_due":
+                break
+            if len(values) != 2:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            due_client, due_request = map(self._decode_text, values)
+            if not _SHA256_RE.fullmatch(due_client) or not _SHA256_RE.fullmatch(
+                due_request
+            ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            try:
+                self._cancel_or_expire_digests(due_client, due_request)
+            except RelayStateCapacityExceeded:
+                deferred.add(f"{due_client}:{due_request}")
+        else:
+            raise RelayStateNoCapacity("deadline cleanup is temporarily deferred")
         if status == "capacity":
             raise RelayStateNoCapacity("no scheduler capacity")
         if status == "invalid":
@@ -2815,10 +2815,32 @@ class ValkeyRegistrationStore:
             client_public_key.encode(),
             request_id.encode(),
             str(self.config.node_transition_batch_size).encode(),
+            b"",
         )
-        status, values = self._ascii_status(
-            self._foundation.execute(ENQUEUE_SCRIPT.name, keys, args)
-        )
+        deferred: set[str] = set()
+        for _ in range(self.config.node_transition_batch_size + 2):
+            status, values = self._ascii_status(
+                self._foundation.execute(
+                    ENQUEUE_SCRIPT.name,
+                    keys,
+                    (*args[:-1], ",".join(sorted(deferred)).encode()),
+                )
+            )
+            if status != "deadline_due":
+                break
+            if len(values) != 2:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            due_client, due_request = map(self._decode_text, values)
+            if not _SHA256_RE.fullmatch(due_client) or not _SHA256_RE.fullmatch(
+                due_request
+            ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            try:
+                self._cancel_or_expire_digests(due_client, due_request)
+            except RelayStateCapacityExceeded:
+                deferred.add(f"{due_client}:{due_request}")
+        else:
+            raise RelayStateNoCapacity("deadline cleanup is temporarily deferred")
         if status == "invalid":
             raise RelayStateInvalidReservation("reservation invalid")
         if status == "conflict":
@@ -3156,6 +3178,19 @@ class ValkeyRegistrationStore:
             return TerminalTransitionResult(
                 "invalid_cancellation_proof", "invalid_cancellation_proof", False
             )
+        return self._cancel_or_expire_digests(
+            client, request, supplied=supplied, status=status, reason=reason
+        )
+
+    def _cancel_or_expire_digests(
+        self,
+        client: str,
+        request: str,
+        *,
+        supplied: str = "",
+        status: str = "expired",
+        reason: str = "request_deadline_expired",
+    ) -> TerminalTransitionResult:
         cfg = self._foundation.config
         zero = "0" * 64
         manifest = self._foundation.read_manifest()

@@ -281,6 +281,8 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
 @pytest.mark.parametrize(
     ("script", "digest"),
     (
+        (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "9a12aeb8b536a59aede23c7fe0dae2aedc7d3e36828a8bb09fc7aec8264d0dbf"),
+        (valkey_relay_state.ENQUEUE_SCRIPT, "44053a611a055b6a26f1cf0f16af72f6dfa323d57cd1fa88433c254a768de5c1"),
         (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "f5d586f732db17aad1669377045cd455840eb2650614e26ba0132c14e8a013c2"),
         (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "ff99af13a1111ff28e2814853476de894ee8a88f75a8bee10e849331cb53c92c"),
     ),

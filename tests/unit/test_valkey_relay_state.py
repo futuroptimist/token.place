@@ -196,7 +196,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "c3466653fb578f7759ec76bd67558c00728262046de77bcf7043cb1b827c41e4"  # pragma: allowlist secret
+    expected_digest = "22e8d35a6d98e57fbf59ed68e1d8434e05df5dfbb0fe02cedf35ea418cac715c"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest

@@ -1751,13 +1751,16 @@ if terminal_exists~=0 or tp>0 then
     if g>0 and not extended then return {'schema'} end
     if extended then
       if not lv[4] or string.len(lv[4])<1 or string.len(lv[4])>max_identity or
-         not lv[5] or string.len(lv[5])<1 or string.len(lv[5])>max_identity or not lv[9] or sequence<1 or
+         not lv[5] or string.len(lv[5])<1 or string.len(lv[5])>max_identity or not lv[9] or sequence==nil or sequence<1 or
          lv[11]~=lv[9]..'-0' or not lv[14] or string.len(lv[14])<1 or string.len(lv[14])>max_request_envelope or
          #redis.call('XRANGE',prefix..'queue:'..lv[7],lv[11],lv[11],'COUNT',1)~=0 then return {'schema'} end
     end
     local cm=lv[7]..':'..member; local ck=prefix..'control:'..lv[7]..':'..client..':'..request_digest
-    local control_exists=redis.call('EXISTS',ck); local control_score=finite(redis.call('ZSCORE',prefix..'control:expiry',cm))
-    if control_exists~=0 or control_score then
+    local control_exists=redis.call('EXISTS',ck)
+    local control_score_raw=redis.call('ZSCORE',prefix..'control:expiry',cm)
+    local control_score=finite(control_score_raw)
+    if g==0 and (control_exists~=0 or control_score_raw) then return {'schema'} end
+    if g>0 and (control_exists~=0 or control_score_raw) then
       local cv=redis.call('HMGET',ck,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','status','reason','deadline','acknowledged','expires_at_epoch')
       for i=1,#cv do if not cv[i] then return {'schema'} end end
       if control_exists~=1 or not control_score or finite(cv[12])~=control_score or cv[1]~=client or cv[2]~=request_digest or
@@ -1860,7 +1863,7 @@ return {'accepted',generation,accepted_value,replay_value}
 ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     "accept_encrypted_response_v1",
     ACCEPT_RESPONSE_SOURCE,
-    "c3466653fb578f7759ec76bd67558c00728262046de77bcf7043cb1b827c41e4",  # pragma: allowlist secret
+    "22e8d35a6d98e57fbf59ed68e1d8434e05df5dfbb0fe02cedf35ea418cac715c",  # pragma: allowlist secret
     True,
 )
 

@@ -3191,6 +3191,108 @@ def test_generation_zero_terminal_response_conflict_preserves_authority(
         second.close()
 
 
+def test_generation_zero_terminal_malformed_sequence_fails_without_mutation(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, identity = "malformed-sequence-node", ("malformed-sequence-client", "request")
+    try:
+        store.register(node, _capabilities(), _digest("malformed-sequence-owner"))
+        deadline = store._foundation.server_time()[0] + 10
+        selection = store.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        store.enqueue_encrypted_request(
+            *identity, selection.reservation_token, node, "qwen3-8b-instruct", "8k-fast",
+            deadline, EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+            ), "cancel",
+        )
+        store.cancel_or_expire_request(*identity, "cancel")
+        keys, member = _response_acceptance_authority(store, node, identity)
+        cfg = store._foundation.config
+        client, request = store._identity(*identity)
+        node_digest = store._node_digest(node)
+        control_key = cfg.key("control", node_digest, client, request)
+        control_index = cfg.key("control:expiry")
+        store._foundation._client.hset(keys[4], "sequence", "not-a-number")
+        before = (
+            _exact_key_snapshot(store, keys),
+            store._foundation._client.hgetall(control_key),
+            store._foundation._client.zscore(control_index, f"{node_digest}:{member}"),
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.accept_encrypted_response(
+                node, _digest("malformed-sequence-owner"), "consumer", *identity, 1,
+                EncryptedResponseEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "response", "key", "iv"
+                ),
+            )
+        assert before == (
+            _exact_key_snapshot(store, keys),
+            store._foundation._client.hgetall(control_key),
+            store._foundation._client.zscore(control_index, f"{node_digest}:{member}"),
+        )
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize("control_hash", (True, False), ids=("tombstone", "orphan-index"))
+def test_generation_zero_terminal_rejects_control_authority_without_mutation(
+    valkey_server, control_hash
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, identity = "generation-zero-control-node", ("control-client", "request")
+    try:
+        owner = _digest("generation-zero-control-owner")
+        store.register(node, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 10
+        store.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        store.cancel_or_expire_request(*identity, "cancel")
+        keys, member = _response_acceptance_authority(store, node, identity)
+        cfg = store._foundation.config
+        client, request = store._identity(*identity)
+        node_digest = store._node_digest(node)
+        control_key = cfg.key("control", node_digest, client, request)
+        control_index = cfg.key("control:expiry")
+        terminal = store._foundation._client.hgetall(keys[9])
+        expiry = float(terminal[b"expires_at_epoch"])
+        control_member = f"{node_digest}:{member}"
+        if control_hash:
+            store._foundation._client.hset(control_key, mapping={
+                "client": client, "request": request, "node_digest": node_digest,
+                "node_id": node, "owner_digest": "", "consumer_digest": "",
+                "generation": "0", "status": "cancelled",
+                "reason": "requester_cancelled", "deadline": str(deadline),
+                "acknowledged": "0", "expires_at_epoch": str(expiry),
+            })
+        store._foundation._client.zadd(control_index, {control_member: expiry})
+        before = (
+            _exact_key_snapshot(store, keys),
+            store._foundation._client.hgetall(control_key),
+            store._foundation._client.zscore(control_index, control_member),
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.accept_encrypted_response(
+                node, owner, "consumer", *identity, 1,
+                EncryptedResponseEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "response", "key", "iv"
+                ),
+            )
+        assert before == (
+            _exact_key_snapshot(store, keys),
+            store._foundation._client.hgetall(control_key),
+            store._foundation._client.zscore(control_index, control_member),
+        )
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store._foundation._client.delete(store._foundation.config.key("control:expiry"))
+        store.close()
+
+
 @pytest.mark.parametrize(
     ("generation", "owner", "consumer", "missing"),
     (

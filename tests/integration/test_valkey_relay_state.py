@@ -3141,6 +3141,101 @@ def test_accept_response_after_cancel_or_expire_preserves_authority(
         second.close()
 
 
+@pytest.mark.parametrize("stage", ("reserved", "queued"))
+@pytest.mark.parametrize("transition", ("cancelled", "expired"))
+def test_generation_zero_terminal_response_conflict_preserves_authority(
+    valkey_server, stage, transition
+):
+    namespace = uuid.uuid4().hex
+    options = {
+        "terminal_retention_seconds": 30,
+        "response_replay_ttl_seconds": 10,
+        "control_tombstone_ttl_seconds": 10,
+    }
+    first = _registration_store(valkey_server, namespace, **options)
+    second = _registration_store(valkey_server, namespace, **options)
+    node, owner, consumer = "generation-zero-node", _digest("generation-zero-owner"), "consumer"
+    identity = (f"generation-zero-{stage}-{transition}", "request")
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "response-iv"
+    )
+    try:
+        first.register(node, _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + (0.1 if transition == "expired" else 10)
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        if stage == "queued":
+            first.enqueue_encrypted_request(
+                *identity, selection.reservation_token, node, "qwen3-8b-instruct", "8k-fast",
+                deadline, EncryptedRequestEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+                ), "cancel",
+            )
+        if transition == "expired":
+            _wait_for_server_epoch(first, deadline)
+        first.cancel_or_expire_request(
+            *identity, "cancel" if transition == "cancelled" else None,
+            status=transition,
+            reason="requester_cancelled" if transition == "cancelled" else "request_deadline_expired",
+        )
+        keys, _ = _response_acceptance_authority(first, node, identity)
+        before = _exact_key_snapshot(first, keys)
+        with pytest.raises(RelayStateConflict, match="response lifecycle conflict"):
+            second.accept_encrypted_response(node, owner, consumer, *identity, 1, envelope)
+        assert _exact_key_snapshot(first, keys) == before
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
+    ("generation", "owner", "consumer", "missing"),
+    (
+        ("0", "", "", "owner_digest"),
+        ("0", "", "", "consumer_digest"),
+        ("0", _digest("owner"), "", None),
+        ("1", "", "", None),
+    ),
+)
+def test_malformed_existing_terminal_fails_without_mutation(
+    valkey_server, generation, owner, consumer, missing
+):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        terminal_retention_seconds=30,
+        response_replay_ttl_seconds=10,
+        control_tombstone_ttl_seconds=10,
+    )
+    node = "malformed-terminal-node"
+    identity = (f"malformed-terminal-{generation}-{missing}", "request")
+    try:
+        store.register(node, _capabilities(), _digest("registration-owner"))
+        deadline = store._foundation.server_time()[0] + 10
+        selection = store.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        store.cancel_or_expire_request(*identity, "cancel")
+        keys, _ = _response_acceptance_authority(store, node, identity)
+        terminal_key = keys[9]
+        store._foundation._client.hset(
+            terminal_key, mapping={"generation": generation, "owner_digest": owner,
+                                   "consumer_digest": consumer}
+        )
+        if missing:
+            store._foundation._client.hdel(terminal_key, missing)
+        before = _exact_key_snapshot(store, keys)
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.cancel_or_expire_request(*identity, "cancel")
+        assert _exact_key_snapshot(store, keys) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
 def test_terminal_race_returns_authoritative_domain_outcome(valkey_server):
     namespace = uuid.uuid4().hex
     stores = tuple(_registration_store(valkey_server, namespace) for _ in range(2))

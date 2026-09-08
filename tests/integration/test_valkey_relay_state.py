@@ -3017,6 +3017,52 @@ def test_cancellation_is_shared_retrievable_and_retains_only_live_control(
         second.close()
 
 
+def test_expired_addressed_control_identity_mismatch_is_not_deleted(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server, namespace, control_tombstone_ttl_seconds=0.001
+    )
+    second = _registration_store(
+        valkey_server, namespace, control_tombstone_ttl_seconds=0.001
+    )
+    node, owner, consumer = "control-identity-node", _digest("control-owner"), "consumer"
+    identity = ("control-identity-client", "control-identity-request")
+    cfg = first._foundation.config
+    client, request = first._identity(*identity)
+    node_digest = first._node_digest(node)
+    control_key = cfg.key("control", node_digest, client, request)
+    control_index = cfg.key("control:expiry")
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        claim = first.claim_queued_request(node, owner, consumer)
+        first.cancel_or_expire_request(*identity, "cancel")
+        first._foundation._client.hset(control_key, "client", _digest("mismatch"))
+        score = first._foundation._client.zscore(
+            control_index, f"{node_digest}:{client}:{request}"
+        )
+        _wait_for_server_epoch(first, score)
+        before = (
+            first._foundation._client.hgetall(control_key),
+            first._foundation._client.zrange(control_index, 0, -1, withscores=True),
+        )
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            second.renew_claim_or_read_control(
+                node, owner, consumer, *identity, claim.generation
+            )
+
+        assert before == (
+            first._foundation._client.hgetall(control_key),
+            first._foundation._client.zrange(control_index, 0, -1, withscores=True),
+        )
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first._foundation._client.delete(control_key, control_index)
+        first.close()
+        second.close()
+
+
 def _delete_claim_fixture_state(store, node_ids, identities):
     cfg = store._foundation.config
     keys = [

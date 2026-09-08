@@ -8116,3 +8116,255 @@ def test_completed_record_terminal_inspector_rejects_unknown_response_authority(
     finally:
         _delete_claim_fixture_state(store, (node,), (identity,))
         store.close()
+
+
+def _retained_authority_keys(store, node_id, identity):
+    cfg = store._foundation.config
+    client, request = store._identity(*identity)
+    node = store._node_digest(node_id)
+    return {
+        "request": cfg.key("request", client, request),
+        "response": cfg.key("response", client, request),
+        "terminal": cfg.key("terminal", client, request),
+        "control": cfg.key("control", node, client, request),
+        "response_index": cfg.key("responses:expiry"),
+        "terminal_index": cfg.key("terminals:expiry"),
+        "control_index": cfg.key("control:expiry"),
+        "deadline_index": cfg.key("requests:deadline"),
+        "member": f"{client}:{request}",
+        "control_member": f"{node}:{client}:{request}",
+    }
+
+
+def _force_retained_authority_due(store, keys, *, completed=False):
+    client = store._foundation._client
+    seconds, micros = store._foundation.server_time()
+    now = seconds + micros / 1_000_000
+    accepted, replay, terminal_expiry = now - 3, now - 2, now - 1
+    if client.hget(keys["terminal"], "outcome") == b"expired":
+        client.hset(keys["request"], "deadline", str(now - 4))
+    if completed:
+        client.hset(
+            keys["response"],
+            mapping={
+                "accepted_at_epoch": str(accepted),
+                "replay_expires_at_epoch": str(replay),
+            },
+        )
+        client.zadd(keys["response_index"], {keys["member"]: replay})
+    else:
+        replay = accepted
+    client.hset(
+        keys["terminal"],
+        mapping={
+            "accepted_at_epoch": str(accepted),
+            "replay_expires_at_epoch": str(replay),
+            "expires_at_epoch": str(terminal_expiry),
+        },
+    )
+    client.zadd(keys["terminal_index"], {keys["member"]: terminal_expiry})
+    if client.exists(keys["control"]):
+        client.hset(keys["control"], "expires_at_epoch", str(terminal_expiry))
+        client.zadd(
+            keys["control_index"], {keys["control_member"]: terminal_expiry}
+        )
+
+
+def test_retention_reaper_reclaims_capacity_only_after_complete_validation(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    constrained = _registration_store(
+        valkey_server,
+        namespace,
+        max_terminal_records=3,
+        max_terminal_records_per_client=3,
+        max_control_tombstones=1,
+        max_control_tombstones_per_node=1,
+    )
+    node, owner, consumer = "retention-node", _digest("retention-owner"), "consumer"
+    identities = tuple((f"retention-client-{i}", f"retention-request-{i}") for i in range(4))
+    keys = []
+    try:
+        first.register(node, _capabilities(), owner)
+        # A completed response exercises the response-ready retained shape.
+        _enqueue_claim_fixture(first, node, owner, *identities[2], time.time() + 60)
+        claim = first.claim_queued_request(node, owner, consumer)
+        first.accept_encrypted_response(
+            node,
+            owner,
+            consumer,
+            *identities[2],
+            claim.generation,
+            EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+            ),
+        )
+        keys.append(_retained_authority_keys(first, node, identities[2]))
+
+        # A claimed cancellation supplies the paired control authority.
+        _enqueue_claim_fixture(first, node, owner, *identities[0], time.time() + 60)
+        first.claim_queued_request(node, owner, consumer)
+        first.cancel_or_expire_request(*identities[0], "cancel")
+        keys.append(_retained_authority_keys(first, node, identities[0]))
+
+        # Build an authoritative reserved deadline expiry.
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 30
+        selection = first.select_and_reserve(
+            *identities[1], "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        expired_keys = _retained_authority_keys(first, node, identities[1])
+        past = seconds + micros / 1_000_000 - 1
+        reservation = first._foundation.config.key(
+            "reservation", hashlib.sha256(selection.reservation_token.encode()).hexdigest()
+        )
+        first._foundation._client.hset(expired_keys["request"], "deadline", str(past))
+        first._foundation._client.hset(reservation, "deadline", str(past))
+        first._foundation._client.zadd(
+            expired_keys["deadline_index"], {expired_keys["member"]: past}
+        )
+        first.cancel_or_expire_request(
+            *identities[1], status="expired", reason="request_deadline_expired"
+        )
+        keys.append(expired_keys)
+
+
+        for index, authority in enumerate(keys):
+            _force_retained_authority_due(first, authority, completed=authority == keys[0])
+
+        # All three terminal slots and the control slot are occupied until this
+        # transition validates and atomically reaps the complete bounded batch.
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 60
+        selection = constrained.select_and_reserve(
+            *identities[3], "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        assert constrained.cancel_or_expire_request(
+            *identities[3], "cancel"
+        ).new_outcome
+        assert selection.reservation_token
+        assert first._foundation._client.zcard(keys[0]["terminal_index"]) == 1
+        assert first._foundation._client.zcard(keys[0]["control_index"]) == 0
+    finally:
+        _delete_claim_fixture_state(first, (node,), identities)
+        first._foundation._client.delete(
+            first._foundation.config.key("control:expiry"),
+            *(authority[name] for authority in keys for name in ("control",)),
+        )
+        first.close()
+        constrained.close()
+
+
+@pytest.mark.parametrize(
+    ("candidate", "corruption"),
+    (
+        ("due", "partial_terminal"),
+        ("due", "oversized_node"),
+        ("due", "noncanonical_time"),
+        ("due", "missing_request"),
+        ("due", "score_mismatch"),
+        ("due", "partial_control"),
+        ("due", "control_score_mismatch"),
+        ("due", "orphan_control"),
+        ("due", "orphan_response"),
+        ("due", "cross_record_identity"),
+        ("due", "cross_record_request"),
+        ("live", "partial_terminal"),
+        ("live", "score_mismatch"),
+    ),
+)
+def test_retention_reaper_rejects_malformed_authority_without_mutation(
+    valkey_server, candidate, corruption
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "malformed-node", _digest("malformed-owner"), "consumer"
+    retained = ("malformed-client", "malformed-request")
+    attempted = ("attempted-client", "attempted-request")
+    authority = _retained_authority_keys(first, node, retained)
+    attempted_authority = _retained_authority_keys(first, node, attempted)
+    cfg = first._foundation.config
+    client = first._foundation._client
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *retained, time.time() + 60)
+        first.claim_queued_request(node, owner, consumer)
+        first.cancel_or_expire_request(*retained, "cancel")
+        if candidate == "due":
+            _force_retained_authority_due(first, authority)
+
+        if corruption == "partial_terminal":
+            client.hdel(authority["terminal"], "reason")
+        elif corruption == "oversized_node":
+            client.hset(authority["terminal"], "node_id", "x" * 8193)
+        elif corruption == "noncanonical_time":
+            client.hset(authority["terminal"], "accepted_at_epoch", "01")
+        elif corruption == "missing_request":
+            client.delete(authority["request"])
+        elif corruption == "score_mismatch":
+            score = client.zscore(authority["terminal_index"], authority["member"])
+            client.zadd(authority["terminal_index"], {authority["member"]: score + 1})
+        elif corruption == "partial_control":
+            client.hdel(authority["control"], "reason")
+        elif corruption == "control_score_mismatch":
+            score = client.zscore(authority["control_index"], authority["control_member"])
+            client.zadd(authority["control_index"], {authority["control_member"]: score + 1})
+        elif corruption == "orphan_control":
+            client.delete(authority["terminal"])
+            client.zrem(authority["terminal_index"], authority["member"])
+        elif corruption == "orphan_response":
+            client.hset(authority["response"], "client", _digest("orphan"))
+        elif corruption == "cross_record_request":
+            client.hset(authority["request"], "node_id", "other-node")
+        else:
+            client.hset(authority["control"], "request", _digest("other-request"))
+
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 60
+        second.select_and_reserve(
+            *attempted, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        snapshot_keys = tuple(
+            dict.fromkeys(
+                (
+                    authority["request"],
+                    authority["response"],
+                    authority["terminal"],
+                    authority["control"],
+                    authority["response_index"],
+                    authority["terminal_index"],
+                    authority["control_index"],
+                    attempted_authority["request"],
+                    cfg.key("reservation", (client.hget(
+                        attempted_authority["request"], "token_digest"
+                    ) or b"").decode()),
+                    cfg.key("reservations:expiry"),
+                    attempted_authority["deadline_index"],
+                )
+            )
+        )
+        def snapshot():
+            values = []
+            for key in snapshot_keys:
+                kind = client.type(key)
+                if kind == b"hash":
+                    value = tuple(sorted(client.hgetall(key).items()))
+                elif kind == b"zset":
+                    value = tuple(client.zrange(key, 0, -1, withscores=True))
+                else:
+                    value = client.get(key) if kind == b"string" else None
+                values.append((kind, value))
+            return tuple(values)
+
+        before = snapshot()
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            second.cancel_or_expire_request(*attempted, "cancel")
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(first, (node,), (retained, attempted))
+        client.delete(authority["control"], authority["control_index"])
+        first.close()
+        second.close()

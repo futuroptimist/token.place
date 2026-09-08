@@ -6339,7 +6339,7 @@ def test_api_v1_heartbeat_stops_when_response_posting_raises():
     assert client._api_v1_heartbeat_thread is None
 
 
-def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
+def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling(monkeypatch):
     manager = _ApiV1RuntimeManager()
     client = _api_v1_validation_client(manager)
     client.stop_polling = False
@@ -6356,6 +6356,30 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
         "iv": "encrypted_iv",
     }
     client._post_api_v1_response = MagicMock(return_value=_PostApiV1Outcome(submitted=True))
+    request_ids = ("req-heartbeat-1", "req-heartbeat-2")
+    control_polled = {request_id: threading.Event() for request_id in request_ids}
+    control_calls = []
+    owned_workers_before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith(("api_v1_inference", "api_v1_control"))
+    }
+    original_generate = client._generate_api_v1_response_with_runtime_model
+
+    def control_response(**kwargs):
+        request_id = kwargs["request_id"]
+        control_calls.append(request_id)
+        control_polled[request_id].set()
+        return {"status": "active", "next_poll_seconds": 30}
+
+    def generate_after_control_poll(**kwargs):
+        assert control_polled[kwargs["request_id"]].wait(timeout=1.0)
+        return original_generate(**kwargs)
+
+    network_post = MagicMock(side_effect=AssertionError("unit test attempted real HTTP"))
+    monkeypatch.setattr(relay_client_module.requests, "post", network_post)
+    client._post_api_v1_request_control = control_response
+    client._generate_api_v1_response_with_runtime_model = generate_after_control_poll
 
     first_result = client.process_client_request_result(TEST_VALID_RESPONSE.copy())
 
@@ -6370,6 +6394,14 @@ def test_api_v1_request_heartbeat_teardown_does_not_latch_global_polling():
     assert client.stop_polling is False
     assert client._polling_stopped_by_request is False
     assert client._post_api_v1_response.call_count == 2
+    assert set(control_calls) == set(request_ids)
+    assert all(event.is_set() for event in control_polled.values())
+    assert network_post.call_count == 0
+    assert {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith(("api_v1_inference", "api_v1_control"))
+    } <= owned_workers_before
 
 
 def test_api_v1_heartbeat_logs_sanitized_relay_targets():

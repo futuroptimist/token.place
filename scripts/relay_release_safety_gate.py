@@ -21,7 +21,14 @@ EXPECTED_IDS = {
     "metrics.valid_instrumentation", "metrics.no_flask_defaults", "metrics.no_raw_paths",
     "metrics.bounded_unmatched_paths", "quota.public_information_exempt",
     "quota.protected_rate_limited", "quota.protected_daily_limited",
+    "quota.mutating_rate_limited", "quota.mutating_daily_limited",
 }
+UNMATCHED_BATCH_SIZE = 1024
+METRICS_RATE_LIMIT = "5000/minute"
+METRICS_DAILY_QUOTA = "5000/day"
+PUBLIC_INFORMATION_PATHS = ("/", "/api/v1/meta", "/api/v1/version")
+PROTECTED_READ_PATH = "/api/v1/models"
+MUTATING_PATH = "/api/v1/relay/requests/cancel"
 GIT_SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 METRIC_NAME = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
@@ -60,8 +67,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def request(base_url: str, path: str, method: str = "GET") -> tuple[int, str]:
-    req = urllib.request.Request(f"{base_url}{path}", method=method)
+def request(
+    base_url: str, path: str, method: str = "GET", body: bytes | None = None,
+) -> tuple[int, str]:
+    headers = {"Content-Type": "application/json"} if body is not None else {}
+    req = urllib.request.Request(f"{base_url}{path}", data=body, headers=headers, method=method)
     try:
         opener = urllib.request.build_opener(_NoRedirect)
         with opener.open(req, timeout=5) as response:  # nosec B310 -- fixed loopback origin
@@ -123,14 +133,14 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
         if status != 200:
             return results
         before = parse_metrics(before_text)
-        first = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(24)]
+        first = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(UNMATCHED_BATCH_SIZE)]
         if any(request(base_url, path)[0] != 404 for path in first):
             return results
         status, middle_text = request(base_url, "/metrics")
         if status != 200:
             return results
         middle = parse_metrics(middle_text)
-        second = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(24)]
+        second = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(UNMATCHED_BATCH_SIZE)]
         if any(request(base_url, path)[0] != 404 for path in second):
             return results
         status, after_text = request(base_url, "/metrics")
@@ -167,20 +177,40 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
     results["metrics.no_raw_paths"] = {"passed": not unsafe}
     growth1, growth2 = len(middle - before), len(after - middle)
     results["metrics.bounded_unmatched_paths"] = {
-        "passed": growth2 == 0, "first_batch_growth": growth1, "second_batch_growth": growth2,
+        "passed": growth2 == 0,
+        "batch_size": UNMATCHED_BATCH_SIZE,
+        "total_unmatched_requests": 2 * UNMATCHED_BATCH_SIZE,
+        "first_batch_growth": growth1,
+        "second_batch_growth": growth2,
     }
     return results
 
 
-def execute_quota_checks(base_url: str, limit_id: str) -> dict[str, dict[str, object]]:
+def execute_public_exemption_check(base_url: str) -> dict[str, dict[str, object]]:
     public = [request(base_url, path, method)[0] for method in ("GET", "HEAD")
-              for path in ("/", "/api/v1/meta", "/api/v1/version") for _ in range(2)]
-    first = request(base_url, "/api/v1/models")[0]
-    second = request(base_url, "/api/v1/models")[0]
-    return {
-        "quota.public_information_exempt": {"passed": all(code == 200 for code in public)},
-        limit_id: {"passed": first == 200 and second == 429},
-    }
+              for path in PUBLIC_INFORMATION_PATHS for _ in range(2)]
+    # A near-match remains non-mutating (404) and must consume quota, proving
+    # that exemption matching is exact rather than prefix-based. Separate POST
+    # quota phases below prove mutating methods are not generally exempt.
+    near_match = [request(base_url, "/api/v1/meta/release-safety-near-match")[0] for _ in range(2)]
+    return {"quota.public_information_exempt": {
+        "passed": all(code == 200 for code in public) and near_match == [404, 429],
+        "safe_methods_response_class": "2xx" if all(code == 200 for code in public) else "unexpected",
+        "near_match_response_classes": [f"{code // 100}xx" for code in near_match],
+    }}
+
+
+def execute_quota_check(base_url: str, limit_id: str, *, mutating: bool) -> dict[str, dict[str, object]]:
+    if mutating:
+        statuses = [request(base_url, MUTATING_PATH, "POST", b"{}")[0] for _ in range(2)]
+        expected_first = 400
+    else:
+        statuses = [request(base_url, PROTECTED_READ_PATH)[0] for _ in range(2)]
+        expected_first = 200
+    return {limit_id: {
+        "passed": statuses == [expected_first, 429],
+        "response_classes": [f"{code // 100}xx" for code in statuses],
+    }}
 
 
 def validate_candidate_identity(source: str, revision: str, resolved_revision: str | None = None) -> None:
@@ -287,8 +317,15 @@ def main() -> int:
         validate_registry_identity(image_id, args.platform, args.registry_coordinate, args.index_digest,
                                    args.platform_digest)
 
-        phases = [("metrics", "1000/minute", "1000/day"), ("rate", "1/minute", "1000/day"), ("daily", "1000/minute", "1/day")]
-        for offset, (phase, rate, daily) in enumerate(phases):
+        phases = [
+            ("metrics", METRICS_RATE_LIMIT, METRICS_DAILY_QUOTA, None),
+            ("public", "1/minute", "1/day", "public"),
+            ("protected-rate", "1/minute", "5000/day", "quota.protected_rate_limited"),
+            ("protected-daily", "5000/minute", "1/day", "quota.protected_daily_limited"),
+            ("mutating-rate", "1/minute", "5000/day", "quota.mutating_rate_limited"),
+            ("mutating-daily", "5000/minute", "1/day", "quota.mutating_daily_limited"),
+        ]
+        for offset, (phase, rate, daily, check_id) in enumerate(phases):
             container = f"relay-safety-{phase}-{uuid.uuid4().hex[:8]}"
             containers.append(container)
             docker_output("run", "-d", "--rm", "--name", container, "-p", f"127.0.0.1:{args.port + offset}:5010",
@@ -302,20 +339,16 @@ def main() -> int:
                 time.sleep(.5)
             else:
                 raise GateFailure("startup_timeout")
-            checked = execute_metrics_checks(base) if phase == "metrics" else execute_quota_checks(
-                base, f"quota.protected_{phase}_limited")
+            if phase == "metrics":
+                checked = execute_metrics_checks(base)
+            elif phase == "public":
+                checked = execute_public_exemption_check(base)
+            else:
+                assert check_id is not None
+                checked = execute_quota_check(base, check_id, mutating=phase.startswith("mutating-"))
             for key, result in checked.items():
                 result["state"] = "passed" if result["passed"] else "failed"
-                if key == "quota.public_information_exempt":
-                    aggregate = evidence["results"][key]
-                    aggregate.setdefault("phases", {})[phase] = result
-                    phase_results = aggregate["phases"]
-                    aggregate["passed"] = set(phase_results) == {"rate", "daily"} and all(
-                        item["passed"] for item in phase_results.values()
-                    )
-                    aggregate["state"] = "passed" if aggregate["passed"] else "failed"
-                else:
-                    evidence["results"][key] = result
+                evidence["results"][key] = result
         evidence["passed"] = all(v.get("state") == "passed" for v in evidence["results"].values())
         if not evidence["passed"]:
             evidence["error_category"] = "mandatory_check_failed"

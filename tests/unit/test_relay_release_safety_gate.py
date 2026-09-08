@@ -161,7 +161,7 @@ def test_lazy_bounded_unmatched_collectors_are_not_per_path_growth(monkeypatch):
         scrapes += 1
         if scrapes <= 2:
             return 200, VALID
-        count = 24 if scrapes == 3 else 48
+        count = gate.UNMATCHED_BATCH_SIZE if scrapes == 3 else 2 * gate.UNMATCHED_BATCH_SIZE
         lazy = f'''tokenplace_http_requests_total{{method="GET",endpoint="unknown",route="other",status_class="4xx"}} {count}
 tokenplace_http_request_duration_seconds_count{{method="GET",endpoint="unknown",route="other",status_class="4xx"}} {count}
 tokenplace_http_request_duration_seconds_sum{{method="GET",endpoint="unknown",route="other",status_class="4xx"}} {count / 1000}
@@ -173,6 +173,8 @@ tokenplace_http_request_duration_seconds_sum{{method="GET",endpoint="unknown",ro
     assert all(result["passed"] for result in results.values())
     assert results["metrics.bounded_unmatched_paths"] == {
         "passed": True,
+        "batch_size": 1024,
+        "total_unmatched_requests": 2048,
         "first_batch_growth": 3,
         "second_batch_growth": 0,
     }
@@ -216,7 +218,9 @@ def test_hashed_per_path_labels_fail_without_raw_probe_values(monkeypatch):
         if path != "/metrics":
             return 404, ""
         scrapes += 1
-        count = 0 if scrapes < 3 else (24 if scrapes == 3 else 48)
+        count = 0 if scrapes < 3 else (
+            gate.UNMATCHED_BATCH_SIZE if scrapes == 3 else 2 * gate.UNMATCHED_BATCH_SIZE
+        )
         transformed = "".join(f'hits{{endpoint="digest-{number:064x}"}} 1\n' for number in range(count))
         return 200, VALID + transformed
 
@@ -227,14 +231,32 @@ def test_hashed_per_path_labels_fail_without_raw_probe_values(monkeypatch):
 
 
 @pytest.mark.parametrize("statuses,expected", [
-    ([200] * 12 + [200, 429], True), ([500] + [200] * 11 + [200, 429], False),
-    ([200] * 12 + [500, 429], False), ([200] * 12 + [0, 429], False),
+    ([200] * 12 + [404, 429], True), ([500] + [200] * 11 + [404, 429], False),
+    ([200] * 12 + [404, 404], False),
 ])
-def test_quota_requires_all_public_and_initial_protected_success(monkeypatch, statuses, expected):
+def test_public_exemption_uses_exact_get_and_head_paths(monkeypatch, statuses, expected):
     iterator = iter(statuses)
     monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: (next(iterator), ""))
-    results = gate.execute_quota_checks("http://loopback", "quota.protected_rate_limited")
+    results = gate.execute_public_exemption_check("http://loopback")
     assert all(v["passed"] for v in results.values()) is expected
+
+
+@pytest.mark.parametrize("mutating,first", [(False, 200), (True, 400)])
+def test_protected_and_non_mutating_invalid_mutation_quota_probes(monkeypatch, mutating, first):
+    statuses = iter([first, 429])
+    calls = []
+
+    def fake_request(_base, path, method="GET", body=None):
+        calls.append((path, method, body))
+        return next(statuses), ""
+
+    monkeypatch.setattr(gate, "request", fake_request)
+    result = gate.execute_quota_check("http://loopback", "quota.test", mutating=mutating)["quota.test"]
+    assert result["passed"] is True
+    if mutating:
+        assert calls == [(gate.MUTATING_PATH, "POST", b"{}") for _ in range(2)]
+    else:
+        assert calls == [(gate.PROTECTED_READ_PATH, "GET", None) for _ in range(2)]
 
 
 def test_exact_revision_and_verified_historical_abbreviation():
@@ -364,13 +386,17 @@ def test_main_runs_inspected_image_id_not_mutable_alias(tmp_path, monkeypatch):
     image_id = "sha256:" + "b" * 64
     calls = []
     immutable_values = iter(["a" * 40, "amd64"])
-    phase_values = iter(["metrics", "rate", "daily"])
+    phase_values = iter(["metrics", "public", "protected-rate", "protected-daily",
+                         "mutating-rate", "mutating-daily"])
     monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: (200, ""))
     monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
         key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
     })
-    monkeypatch.setattr(gate, "execute_quota_checks", lambda _base, limit_id: {
-        "quota.public_information_exempt": {"passed": True}, limit_id: {"passed": True},
+    monkeypatch.setattr(gate, "execute_public_exemption_check", lambda _base: {
+        "quota.public_information_exempt": {"passed": True},
+    })
+    monkeypatch.setattr(gate, "execute_quota_check", lambda _base, limit_id, **_kwargs: {
+        limit_id: {"passed": True},
     })
 
     def output(*args):
@@ -388,7 +414,7 @@ def test_main_runs_inspected_image_id_not_mutable_alias(tmp_path, monkeypatch):
         lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0),
     )
     assert result == 0 and report["image_id"] == image_id
-    assert [call[-1] for call in calls if call[0] == "run"] == [image_id] * 3
+    assert [call[-1] for call in calls if call[0] == "run"] == [image_id] * 6
 
 
 def test_replacement_alias_registry_identity_cannot_validate_original(tmp_path, monkeypatch):
@@ -414,25 +440,21 @@ def test_replacement_alias_registry_identity_cannot_validate_original(tmp_path, 
     assert all(item["state"] == "not_run" for item in report["results"].values())
 
 
-def _run_qualified_main(tmp_path, monkeypatch, exemptions=(True, True), missing=None, cleanup_code=0,
-                        protected=(True, True)):
-    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "metrics", "rate", "daily"])
+def _run_qualified_main(tmp_path, monkeypatch, public=True, missing=None, cleanup_code=0,
+                        failed_id=None):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "metrics", "public",
+                   "protected-rate", "protected-daily", "mutating-rate", "mutating-daily"])
     monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
     monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
         key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
     })
-    quota_calls = 0
-
-    def quota_results(_base, limit_id):
-        nonlocal quota_calls
-        phase = "rate" if quota_calls == 0 else "daily"
-        result = {limit_id: {"passed": protected[quota_calls]}}
-        if missing != phase:
-            result["quota.public_information_exempt"] = {"passed": exemptions[quota_calls]}
-        quota_calls += 1
-        return result
-
-    monkeypatch.setattr(gate, "execute_quota_checks", quota_results)
+    monkeypatch.setattr(gate, "execute_public_exemption_check", lambda _base: (
+        {} if missing == "quota.public_information_exempt" else
+        {"quota.public_information_exempt": {"passed": public}}
+    ))
+    monkeypatch.setattr(gate, "execute_quota_check", lambda _base, limit_id, **_kwargs: (
+        {} if missing == limit_id else {limit_id: {"passed": limit_id != failed_id}}
+    ))
 
     def cleanup(*_args, **_kwargs):
         return subprocess.CompletedProcess([], cleanup_code)
@@ -440,30 +462,37 @@ def _run_qualified_main(tmp_path, monkeypatch, exemptions=(True, True), missing=
     return _run_main(tmp_path, monkeypatch, lambda *_a: next(values), cleanup)
 
 
-@pytest.mark.parametrize("exemptions", [(False, True), (True, False)])
-def test_public_exemption_failure_is_retained_across_phases(tmp_path, monkeypatch, exemptions):
-    result, report = _run_qualified_main(tmp_path, monkeypatch, exemptions=exemptions)
+def test_public_exemption_failure_is_mandatory(tmp_path, monkeypatch):
+    result, report = _run_qualified_main(tmp_path, monkeypatch, public=False)
     public = report["results"]["quota.public_information_exempt"]
     assert result == 1 and report["error_category"] == "mandatory_check_failed"
     assert public["state"] == "failed"
-    assert {phase: item["passed"] for phase, item in public["phases"].items()} == {
-        "rate": exemptions[0], "daily": exemptions[1]
-    }
 
 
-@pytest.mark.parametrize("missing", ["rate", "daily"])
-def test_missing_public_exemption_phase_fails_closed(tmp_path, monkeypatch, missing):
+@pytest.mark.parametrize("missing", sorted(gate.EXPECTED_IDS - {
+    "metrics.valid_instrumentation", "metrics.no_flask_defaults", "metrics.no_raw_paths",
+    "metrics.bounded_unmatched_paths",
+}))
+def test_missing_quota_result_fails_closed(tmp_path, monkeypatch, missing):
     result, report = _run_qualified_main(tmp_path, monkeypatch, missing=missing)
-    public = report["results"]["quota.public_information_exempt"]
-    assert result == 1 and public["passed"] is False and public["state"] == "failed"
-    assert set(public["phases"]) == ({"daily"} if missing == "rate" else {"rate"})
+    assert result == 1 and report["results"][missing]["passed"] is False
+    assert report["results"][missing]["state"] == "not_run"
 
 
-def test_both_public_exemption_phases_pass(tmp_path, monkeypatch):
+def test_all_independent_quota_phases_pass(tmp_path, monkeypatch):
     result, report = _run_qualified_main(tmp_path, monkeypatch)
     public = report["results"]["quota.public_information_exempt"]
     assert result == 0 and report["passed"] is True
-    assert public["state"] == "passed" and set(public["phases"]) == {"rate", "daily"}
+    assert public["state"] == "passed"
+
+
+@pytest.mark.parametrize("failed_id", [
+    "quota.mutating_rate_limited", "quota.mutating_daily_limited",
+])
+def test_false_mutating_quota_result_fails_qualification(tmp_path, monkeypatch, failed_id):
+    result, report = _run_qualified_main(tmp_path, monkeypatch, failed_id=failed_id)
+    assert result == 1 and report["error_category"] == "mandatory_check_failed"
+    assert report["results"][failed_id] == {"passed": False, "state": "failed"}
 
 
 def test_nonzero_cleanup_fails_successful_qualification(tmp_path, monkeypatch):
@@ -473,6 +502,8 @@ def test_nonzero_cleanup_fails_successful_qualification(tmp_path, monkeypatch):
 
 
 def test_nonzero_cleanup_preserves_qualification_failure_category(tmp_path, monkeypatch):
-    result, report = _run_qualified_main(tmp_path, monkeypatch, cleanup_code=1, protected=(False, True))
+    result, report = _run_qualified_main(
+        tmp_path, monkeypatch, cleanup_code=1, failed_id="quota.protected_rate_limited"
+    )
     assert result == 1 and report["cleanup"] == "failed"
     assert report["error_category"] == "mandatory_check_failed"

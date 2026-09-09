@@ -284,7 +284,7 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     (
         (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "9a12aeb8b536a59aede23c7fe0dae2aedc7d3e36828a8bb09fc7aec8264d0dbf"),
         (valkey_relay_state.ENQUEUE_SCRIPT, "44053a611a055b6a26f1cf0f16af72f6dfa323d57cd1fa88433c254a768de5c1"),
-        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "f6d6e45121ad93cc243bf56c4c3a8f5687f64e4d32183749404957c90c189650"),
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "4ba1899b10bed4c1e70f5bbc9be342e85e1675eb3bfd2bec111cb954e86f2521"),
         (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "8e94a91717cf9f62e3151ec7a5aa20e29ab258ab57d9e179de3aee168714b4ad"),
     ),
 )
@@ -1485,6 +1485,31 @@ def test_renew_claim_rejects_malformed_script_results(result):
 
     with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
         store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 1)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        [b"cancelled", b"1", b"wrong", b"0"],
+        [b"cancelled", b"01", b"requester_cancelled", b"0"],
+        [b"cancelled", b"2", b"requester_cancelled", b"0"],
+        [b"cancelled", b"1", b"requester_cancelled", b"1"],
+        [b"expired", b"1", b"request_deadline_expired", b"2"],
+        [b"acknowledged", b"1", b"requester_cancelled", b"0"],
+        [b"acknowledged", b"1", b"arbitrary", b"1"],
+        [b"expired", b"1", b"request_deadline_expired", b"0", b"extra"],
+    ],
+)
+def test_control_result_decoder_rejects_noncanonical_fixed_shapes(result):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.renew_claim_or_read_control(
+            "node-a", "a" * 64, "consumer", "client", "request", 1
+        )
 
 
 def test_claim_input_and_acknowledgement_validation_precede_dispatch():

@@ -1273,7 +1273,8 @@ RENEW_CLAIM_SCRIPT = ReviewedScript(
 
 CONTROL_CLAIM_SOURCE = """\
 local leases,node,claim,request,claim_expiries,control,control_expiries,queue,deadlines,terminal,terminal_expiries,response,response_expiries,progress,reservation_expiries=unpack(KEYS)
-local node_digest,node_id,owner,consumer,client,request_digest,generation,ttl,ack=unpack(ARGV)
+local node_digest,node_id,owner,consumer,client,request_digest,generation,ttl,ack,client_public_key,request_id,max_node_id,max_identity,max_envelope=unpack(ARGV)
+max_node_id,max_identity,max_envelope=tonumber(max_node_id),tonumber(max_identity),tonumber(max_envelope)
 local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
 local function finite(value) local n=tonumber(value); return n and n==n and math.abs(n)~=math.huge and n end
 local function digest(value) return value and string.len(value)==64 and not string.find(value,'[^0-9a-f]') end
@@ -1295,17 +1296,20 @@ if present~=0 then
      (cv[8]~='cancelled' and cv[8]~='expired') or (cv[11]~='0' and cv[11]~='1') then return {'schema'} end
   if cv[1]~=client or cv[2]~=request_digest or cv[3]~=node_digest or cv[4]~=node_id then return {'schema'} end
   if cv[5]~=owner or cv[6]~=consumer or cv[7]~=generation then return {'owner_mismatch'} end
-  local tv=redis.call('HMGET',terminal,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','accepted_at_epoch','expires_at_epoch','client','request')
+  local tv=redis.call('HMGET',terminal,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
   for i=1,#tv do if not tv[i] then return {'schema'} end end
-  local terminal_expiry=canonical(tv[9]); local terminal_score=finite(redis.call('ZSCORE',terminal_expiries,client..':'..request_digest))
-  local rv=redis.call('HMGET',request,'state','client','request','node_id','node_digest','deadline','claim_generation')
+  local terminal_expiry=canonical(tv[11]); local terminal_score=finite(redis.call('ZSCORE',terminal_expiries,client..':'..request_digest))
+  local accepted=canonical(tv[9]); local replay=canonical(tv[10])
+  local rv=redis.call('HMGET',request,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest','envelope')
   for i=1,#rv do if not rv[i] then return {'schema'} end end
-  if redis.call('EXISTS',terminal)~=1 or not terminal_expiry or terminal_score~=terminal_expiry or tv[1]~=cv[8] or tv[2]~=cv[9] or
-     tv[3]~='completed_unavailable' or tv[4]~=cv[4] or tv[5]~=cv[5] or tv[6]~=cv[6] or tv[7]~=cv[7] or
-     not canonical(tv[8]) or tv[10]~=client or tv[11]~=request_digest or redis.call('EXISTS',request)~=1 or
-     rv[1]~=cv[8] or rv[2]~=client or rv[3]~=request_digest or rv[4]~=node_id or rv[5]~=node_digest or rv[6]~=cv[10] or rv[7]~=generation or
+  local sequence=integer(rv[9]); local current=integer(rv[10]); local entries=rv[11] and redis.call('XRANGE',queue,rv[11],rv[11],'COUNT',1) or {}
+  if redis.call('EXISTS',terminal)~=1 or not terminal_expiry or terminal_score~=terminal_expiry or not accepted or not replay or replay~=accepted or accepted>terminal_expiry or tv[1]~=cv[8] or tv[2]~=cv[9] or
+     tv[3]~='completed_unavailable' or tv[4]~=cv[4] or tv[5]~=cv[5] or tv[6]~=cv[6] or tv[7]~=cv[7] or tv[8]~='' or tv[12]=='' or tv[13]~='' or
+     (tv[1]=='cancelled' and not digest(tv[14])) or (tv[1]=='expired' and tv[14]~='' and not digest(tv[14])) or tv[15]~=client or tv[16]~=request_digest or redis.call('EXISTS',request)~=1 or
+     rv[1]~=cv[8] or rv[2]~=client or rv[3]~=request_digest or rv[4]~=client_public_key or rv[5]~=request_id or rv[6]~=node_id or rv[7]~=node_digest or rv[8]~=cv[10] or rv[10]~=generation or
+     not sequence or not current or rv[11]~=rv[9]..'-0' or not digest(rv[12]) or rv[13]~=tv[14] or rv[14]=='' or string.len(rv[4])>max_identity or string.len(rv[5])>max_identity or string.len(rv[6])>max_node_id or string.len(rv[14])>max_envelope or #entries~=0 or
      redis.call('EXISTS',claim)~=0 or redis.call('ZSCORE',claim_expiries,client..':'..request_digest) or redis.call('ZSCORE',deadlines,client..':'..request_digest) or
-     redis.call('EXISTS',response)~=0 or redis.call('ZSCORE',response_expiries,client..':'..request_digest) or redis.call('EXISTS',progress)~=0 then return {'schema'} end
+     redis.call('EXISTS',response)~=0 or redis.call('ZSCORE',response_expiries,client..':'..request_digest) or redis.call('EXISTS',progress)~=0 or redis.call('ZSCORE',reservation_expiries,rv[12]) then return {'schema'} end
   if expiry<=now then
     redis.call('DEL',control); redis.call('ZREM',control_expiries,control_member)
   else
@@ -1345,7 +1349,7 @@ return {'continued',generation,value}
 CONTROL_CLAIM_SCRIPT = ReviewedScript(
     "renew_claim_or_read_control_v1",
     CONTROL_CLAIM_SOURCE,
-    "f6d6e45121ad93cc243bf56c4c3a8f5687f64e4d32183749404957c90c189650",
+    "4ba1899b10bed4c1e70f5bbc9be342e85e1675eb3bfd2bec111cb954e86f2521",
     True,
 )
 
@@ -2538,6 +2542,7 @@ class ValkeyRegistrationStore:
             num=self.config.max_compute_nodes,
         )
         records = []
+
         # Whole-list snapshots are intentionally non-transactional; each record is
         # bounded, and nodes removed between the index and hash reads are omitted.
         for digest in digests:
@@ -3128,6 +3133,11 @@ class ValkeyRegistrationStore:
             str(generation).encode(),
             repr(float(self.config.claim_ttl_seconds)).encode(),
             b"1" if acknowledge else b"0",
+            client_public_key.encode(),
+            request_id.encode(),
+            str(self.config.max_node_id_bytes).encode(),
+            str(self.config.max_identity_bytes).encode(),
+            str(self.config.max_envelope_bytes).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(CONTROL_CLAIM_SCRIPT.name, keys, args)
@@ -3139,7 +3149,7 @@ class ValkeyRegistrationStore:
                 status="expired",
                 reason="request_deadline_expired",
             )
-            if terminal.state == "expired":
+            if terminal.state in {"cancelled", "expired", "completed"}:
                 status, values = self._ascii_status(
                     self._foundation.execute(CONTROL_CLAIM_SCRIPT.name, keys, args)
                 )
@@ -3149,28 +3159,51 @@ class ValkeyRegistrationStore:
             return ClaimRenewalResult(status)
         try:
             if status == "stale_generation" and len(values) == 1:
-                current = int(self._decode_text(values[0]))
-                if current < 1 or str(current) != self._decode_text(values[0]):
+                raw_current = self._decode_text(values[0])
+                current = int(raw_current)
+                if current < 1 or str(current) != raw_current:
                     raise ValueError
                 return ClaimRenewalResult(status, current)
             if status == "continued" and len(values) == 2:
-                current, lease = int(self._decode_text(values[0])), float(
-                    self._decode_text(values[1])
-                )
+                raw_current = self._decode_text(values[0])
+                current, lease = int(raw_current), float(self._decode_text(values[1]))
                 if (
                     current < 1
-                    or str(current) != self._decode_text(values[0])
+                    or current != generation
+                    or str(current) != raw_current
                     or not math.isfinite(lease)
                 ):
                     raise ValueError
                 return ClaimRenewalResult(status, current, lease)
             if status in {"cancelled", "expired", "acknowledged"} and len(values) == 3:
+                raw_generation = self._decode_text(values[0])
+                current = int(raw_generation)
+                result_reason = self._decode_text(values[1])
+                marker = self._decode_text(values[2])
+                expected_reason = {
+                    "cancelled": "requester_cancelled",
+                    "expired": "request_deadline_expired",
+                }
+                if (
+                    current < 1
+                    or current != generation
+                    or str(current) != raw_generation
+                    or marker not in {"0", "1"}
+                    or (status == "acknowledged" and marker != "1")
+                    or (status != "acknowledged" and marker != "0")
+                    or result_reason not in expected_reason.values()
+                    or (
+                        status != "acknowledged"
+                        and result_reason != expected_reason[status]
+                    )
+                ):
+                    raise ValueError
                 return ClaimRenewalResult(
                     status,
-                    int(self._decode_text(values[0])),
+                    current,
                     None,
-                    self._decode_text(values[1]),
-                    self._decode_text(values[2]) == "1",
+                    result_reason,
+                    marker == "1",
                 )
         except (ValueError, TypeError, OverflowError):
             pass
@@ -4365,6 +4398,18 @@ class ValkeyRegistrationStore:
         seconds, micros = self._foundation.server_time()
         now = seconds + micros / 1_000_000
         cfg = self._foundation.config
+
+        def canonical_number(raw: bytes) -> float:
+            if (
+                len(raw) > 32
+                or re.fullmatch(rb"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", raw) is None
+            ):
+                raise ValueError
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError
+            return value
+
         members = self._foundation._call(
             self._foundation._client.zrangebyscore,
             cfg.key("control:expiry"),
@@ -4417,8 +4462,8 @@ class ValkeyRegistrationStore:
             try:
                 generation, deadline, expiry, score = (
                     int(v[b"generation"]),
-                    float(v[b"deadline"]),
-                    float(v[b"expires_at_epoch"]),
+                    canonical_number(v[b"deadline"]),
+                    canonical_number(v[b"expires_at_epoch"]),
                     float(item[1]),
                 )
                 if (
@@ -4426,6 +4471,7 @@ class ValkeyRegistrationStore:
                     or v[b"request"].decode() != parts[2]
                     or v[b"node_digest"].decode() != parts[0]
                     or self._node_digest(v[b"node_id"].decode()) != parts[0]
+                    or not 0 < len(v[b"node_id"]) <= self.config.max_node_id_bytes
                     or not _SHA256_RE.fullmatch(v[b"owner_digest"].decode())
                     or not _SHA256_RE.fullmatch(v[b"consumer_digest"].decode())
                     or generation < 1
@@ -4439,6 +4485,113 @@ class ValkeyRegistrationStore:
                     or not all(map(math.isfinite, (deadline, expiry, score)))
                     or expiry != score
                     or expiry <= now
+                ):
+                    raise ValueError
+                terminal_fields = (
+                    b"outcome",
+                    b"reason",
+                    b"retrieval_state",
+                    b"node_id",
+                    b"owner_digest",
+                    b"consumer_digest",
+                    b"generation",
+                    b"response_digest",
+                    b"accepted_at_epoch",
+                    b"replay_expires_at_epoch",
+                    b"expires_at_epoch",
+                    b"retrieval_credential_digest",
+                    b"acknowledgement_digest",
+                    b"cancellation_token_digest",
+                    b"client",
+                    b"request",
+                )
+                request_fields = (
+                    b"state",
+                    b"client",
+                    b"request",
+                    b"client_public_key",
+                    b"request_id",
+                    b"node_id",
+                    b"node_digest",
+                    b"deadline",
+                    b"sequence",
+                    b"claim_generation",
+                    b"queue_entry",
+                    b"token_digest",
+                    b"cancellation_digest",
+                    b"envelope",
+                )
+                member = item[0]
+                terminal = self._completed_hash(
+                    cfg.key("terminal", parts[1], parts[2]), terminal_fields, {}
+                )
+                lifecycle = self._completed_hash(
+                    cfg.key("request", parts[1], parts[2]), request_fields, {}
+                )
+                if terminal is None or lifecycle is None:
+                    raise ValueError
+                terminal_expiry = canonical_number(terminal[b"expires_at_epoch"])
+                accepted = canonical_number(terminal[b"accepted_at_epoch"])
+                replay = canonical_number(terminal[b"replay_expires_at_epoch"])
+                terminal_score = self._foundation._call(
+                    self._foundation._client.zscore,
+                    cfg.key("terminals:expiry"),
+                    f"{parts[1]}:{parts[2]}",
+                )
+                sequence = int(lifecycle[b"sequence"])
+                lifecycle_generation = int(lifecycle[b"claim_generation"])
+                active = self._foundation._call(
+                    self._foundation._client.pipeline(transaction=True)
+                    .exists(cfg.key("claim", parts[1], parts[2]))
+                    .zscore(cfg.key("claims:expiry"), f"{parts[1]}:{parts[2]}")
+                    .zscore(cfg.key("requests:deadline"), f"{parts[1]}:{parts[2]}")
+                    .exists(cfg.key("response", parts[1], parts[2]))
+                    .zscore(cfg.key("responses:expiry"), f"{parts[1]}:{parts[2]}")
+                    .exists(cfg.key("progress", parts[1], parts[2]))
+                    .zscore(cfg.key("reservations:expiry"), lifecycle[b"token_digest"])
+                    .execute
+                )
+                if (
+                    terminal[b"outcome"] != v[b"status"]
+                    or terminal[b"reason"] != v[b"reason"]
+                    or terminal[b"retrieval_state"] != b"completed_unavailable"
+                    or terminal[b"node_id"] != v[b"node_id"]
+                    or terminal[b"owner_digest"] != v[b"owner_digest"]
+                    or terminal[b"consumer_digest"] != v[b"consumer_digest"]
+                    or terminal[b"generation"] != v[b"generation"]
+                    or terminal[b"response_digest"] != b""
+                    or accepted != replay
+                    or not isinstance(terminal_score, (int, float))
+                    or float(terminal_score) != terminal_expiry
+                    or terminal[b"client"] != v[b"client"]
+                    or terminal[b"request"] != v[b"request"]
+                    or lifecycle[b"state"] != v[b"status"]
+                    or lifecycle[b"client"] != v[b"client"]
+                    or lifecycle[b"request"] != v[b"request"]
+                    or lifecycle[b"node_id"] != v[b"node_id"]
+                    or lifecycle[b"node_digest"] != v[b"node_digest"]
+                    or lifecycle[b"deadline"] != v[b"deadline"]
+                    or lifecycle[b"claim_generation"] != v[b"generation"]
+                    or sequence < 1
+                    or str(sequence).encode() != lifecycle[b"sequence"]
+                    or lifecycle_generation != generation
+                    or str(lifecycle_generation).encode()
+                    != lifecycle[b"claim_generation"]
+                    or lifecycle[b"queue_entry"] != lifecycle[b"sequence"] + b"-0"
+                    or not self._completed_digest(lifecycle[b"token_digest"])
+                    or not 0
+                    < len(lifecycle[b"client_public_key"])
+                    <= self.config.max_identity_bytes
+                    or not 0
+                    < len(lifecycle[b"request_id"])
+                    <= self.config.max_identity_bytes
+                    or not 0
+                    < len(lifecycle[b"envelope"])
+                    <= self.config.max_envelope_bytes
+                    or lifecycle[b"cancellation_digest"]
+                    != terminal[b"cancellation_token_digest"]
+                    or member.decode() != f"{parts[0]}:{parts[1]}:{parts[2]}"
+                    or active != [0, None, None, 0, None, 0, None]
                 ):
                     raise ValueError
                 records.append(

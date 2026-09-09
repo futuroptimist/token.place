@@ -1596,6 +1596,27 @@ def test_cancel_or_expire_request_decodes_fixed_results(
     assert result.new_outcome is expected_created
 
 
+def test_cancel_or_expire_request_ignores_malformed_stored_node_digest():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.return_value = b"not-a-digest"
+    foundation.execute.return_value = [
+        b"existing",
+        b"expired",
+        b"request_deadline_expired",
+    ]
+    store = registration_store_with_foundation(foundation)
+
+    result = store.cancel_or_expire_request(
+        "client", "request", status="expired", reason="request_deadline_expired"
+    )
+
+    assert result.state == "expired"
+    keys = foundation.execute.call_args.args[1]
+    assert keys[2] == foundation.config.key("queue", "0" * 64)
+
+
 @pytest.mark.parametrize(
     ("reply", "expected"),
     [
@@ -1627,6 +1648,31 @@ def test_cancel_or_expire_request_rejects_invalid_status_and_proof_locally():
     result = store.cancel_or_expire_request("", "request", "secret")
     assert result.state == "invalid_cancellation_proof"
     foundation.execute.assert_not_called()
+
+
+def test_control_tombstones_rejects_oversized_index_results():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation.server_time.return_value = (1, 0)
+    foundation._call.return_value = [(b"member", 1.0), (b"member-2", 2.0)]
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(store._config, max_control_tombstones=1)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.control_tombstones()
+
+
+def test_control_tombstones_rejects_malformed_index_member():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation.server_time.return_value = (1, 0)
+    foundation._call.return_value = [(b"member",)]
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.control_tombstones()
 
 
 def test_live_claims_tolerates_a_removed_registration_after_read_gate():

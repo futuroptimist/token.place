@@ -75,6 +75,34 @@ unique candidate index. The workflow qualifies the two descriptors from that exa
 requires adding the platform to the build, exact manifest-membership assertion, qualification loop,
 workflow regression tests, and operator documentation in the same change.
 
+## Read-only qualification of an existing OCI index
+
+`.github/workflows/qualify-relay-oci.yml` is a manual, read-only executor for an already-published
+index in the fixed `ghcr.io/futuroptimist/tokenplace-relay` repository. It checks out the gate from
+`main`, records that gate commit independently from the image's source commit, resolves exactly one
+`linux/amd64` and one `linux/arm64` descriptor, and pulls and runs each descriptor by digest. It
+does not build, publish, promote, retag, deploy, or contact an application environment. Inputs are
+the full index digest, full source commit, reviewed release ref and base, and a short evidence label.
+
+Each run uploads one immutable artifact named
+`relay-oci-qualification-<run-id>-<attempt>`; the validated label is recorded inside its metadata.
+Its bounded files are
+`index-manifest.json` (a sanitized descriptor-only index),
+`relay-release-safety-amd64.json`, `relay-release-safety-arm64.json`, `metadata.json`, and
+`SHA256SUMS`. Upload runs even after a qualification failure. Qualification still fails closed if
+either evidence file is absent or malformed, any mandatory contract result is absent, duplicated,
+or unsuccessful, an immutable identity differs, or gate/local cleanup is unsuccessful. The files
+exclude credentials, headers, generated probe paths, request or response content, client
+identities, keys, tokens, ciphertext, prompts, and model output.
+
+After this workflow is merged, Step 05b plans the following two independent dispatches. These are
+parameters to be run later, **not claims of successful qualification**:
+
+| Evidence label | Index digest | Source commit | Release ref | Release base |
+|---|---|---|---|---|
+| `step-05b-qwen-main-8618c9a` | `sha256:b32ef19840dabe44caf7240b787af14dcf439b39357833e21a92c3dd511effd4` | `8618c9aba4b5dfe7980c2fe861095a92311145f2` | `main-8618c9a` | `main` |
+| `step-05b-llama-sha-6c39adc` | `sha256:543fde33aff45253630090b52d16163e3586da12c973f5c4a658ddc8927d0a68` | `6c39adc64e7bed4f85d07164aa2860e637919ca9` | `sha-6c39adc` | `release/relay-0.1.1` |
+
 ## Maintain the contract
 
 To add a mandatory requirement:

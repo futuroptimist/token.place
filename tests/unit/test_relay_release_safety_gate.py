@@ -226,6 +226,25 @@ def test_instrumentation_down_fails_even_when_expected_series_exist(monkeypatch)
     assert results["metrics.valid_instrumentation"]["passed"] is False
 
 
+def test_required_instrumentation_must_remain_in_final_scrape(monkeypatch):
+    scrapes = 0
+
+    def fake_request(_base, path, method="GET"):
+        nonlocal scrapes
+        if path != "/metrics":
+            return 404, ""
+        scrapes += 1
+        if scrapes < gate.METRICS_SCRAPE_COUNT:
+            return 200, VALID
+        return 200, "tokenplace_instrumentation_up 1\n"
+
+    monkeypatch.setattr(gate, "request", fake_request)
+    results = gate.execute_metrics_checks("http://loopback")
+    assert results["metrics.valid_instrumentation"]["passed"] is False
+    assert all(result["passed"] for result_id, result in results.items()
+               if result_id != "metrics.valid_instrumentation")
+
+
 def test_hashed_per_path_labels_fail_without_raw_probe_values(monkeypatch):
     scrapes = 0
 

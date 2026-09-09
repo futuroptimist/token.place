@@ -155,14 +155,19 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
     except GateFailure:
         return results
     observations = warmed | before | middle | after
-    names = {sample.name for sample in observations}
+    observed_names = {sample.name for sample in observations}
+    final_names = {sample.name for sample in after}
     expected = {"tokenplace_http_requests_total", "tokenplace_instrumentation_up"}
     instrumentation = [sample for sample in after if sample.name == "tokenplace_instrumentation_up"]
+    # Safety violations are sticky across scrapes, but required instrumentation
+    # must still be exported by the final scrape used for qualification.
     results["metrics.valid_instrumentation"] = {
-        "passed": expected <= names and bool(instrumentation)
+        "passed": expected <= final_names and bool(instrumentation)
         and all(float(sample.value) == 1 for sample in instrumentation)
     }
-    results["metrics.no_flask_defaults"] = {"passed": not any(n.startswith("flask_http_") for n in names)}
+    results["metrics.no_flask_defaults"] = {
+        "passed": not any(name.startswith("flask_http_") for name in observed_names)
+    }
     all_paths = first + second
     unsafe = False
     # Bounded collectors may create fixed fallback series lazily during the

@@ -788,6 +788,11 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
     monkeypatch.setattr(
         compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'true'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
         'ensure_desktop_llama_runtime',
         lambda _mode: {
             'selected_backend': 'cpu',
@@ -2254,6 +2259,29 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
 
     monkeypatch.setattr('builtins.__import__', fake_import)
     monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'true'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda *_args, **_kwargs: {
+            'selected_backend': 'cpu',
+            'runtime_action': 'skipped',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_load_context_profile_helpers',
+        lambda: (lambda _manager, _tier: None, lambda tier: tier),
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup: None,
+    )
+    monkeypatch.setattr(
         sys,
         'argv',
         [
@@ -3431,13 +3459,28 @@ def test_module_import_does_not_load_context_profiles_before_preflight(monkeypat
     assert 'model_path' not in payload
 
 
-def test_utils_package_keeps_lazy_convenience_exports():
+def test_utils_package_keeps_lazy_convenience_exports(monkeypatch):
     import utils
 
-    assert utils.get_temp_dir
-    assert utils.get_model_manager
-    assert utils.get_crypto_manager
-    assert utils.RelayClient
+    model_manager_module = ModuleType('utils.llm.model_manager')
+    crypto_manager_module = ModuleType('utils.crypto.crypto_manager')
+    relay_client_module = ModuleType('utils.networking.relay_client')
+    get_model_manager = object()
+    get_crypto_manager = object()
+    relay_client = object()
+    model_manager_module.get_model_manager = get_model_manager
+    crypto_manager_module.get_crypto_manager = get_crypto_manager
+    relay_client_module.RelayClient = relay_client
+    monkeypatch.setitem(sys.modules, model_manager_module.__name__, model_manager_module)
+    monkeypatch.setitem(sys.modules, crypto_manager_module.__name__, crypto_manager_module)
+    monkeypatch.setitem(sys.modules, relay_client_module.__name__, relay_client_module)
+    for name in ('get_model_manager', 'get_crypto_manager', 'RelayClient'):
+        monkeypatch.delitem(utils.__dict__, name, raising=False)
+
+    assert utils.get_temp_dir is utils.__dict__['get_temp_dir']
+    assert utils.get_model_manager is get_model_manager
+    assert utils.get_crypto_manager is get_crypto_manager
+    assert utils.RelayClient is relay_client
     assert {
         'get_model_manager',
         'get_crypto_manager',
@@ -6688,6 +6731,13 @@ def test_windows_packaged_e2e_sets_up_rust_before_cargo_regressions() -> None:
 def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsys, monkeypatch):
     calls = []
 
+    class ChildPathRuntime(FakeRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.model_manager.child_model_path_exists = True
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ChildPathRuntime)
+
     monkeypatch.setattr(
         compute_node_bridge,
         'ensure_desktop_python_dependencies',
@@ -6704,13 +6754,6 @@ def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsy
     )
     monkeypatch.setattr(compute_node_bridge, 'maybe_reexec_for_runtime_refresh', lambda _setup: None)
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
-
-    class ChildPathRuntime(FakeRuntime):
-        def __init__(self, config):
-            super().__init__(config)
-            self.model_manager.child_model_path_exists = True
-
-    _install_fake_runtime_module(monkeypatch, runtime_cls=ChildPathRuntime)
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -7264,6 +7307,8 @@ def test_bridge_fatal_composition_via_wire_fatal_teardown_exits_subprocess(tmp_p
     bridge_path = str(MODULE_PATH)
 
     child_script = tmp_path / 'child_bridge_fatal.py'
+    network_attempt = tmp_path / 'unexpected_network_attempt'
+    configuration_attempt = tmp_path / 'unexpected_configuration_attempt'
     child_script.write_text(
         f"""\
 import sys
@@ -7271,6 +7316,7 @@ import os
 import time
 import threading
 import importlib.util
+from types import ModuleType
 # Import repo modules FIRST so they are cached in sys.modules before
 # compute_node_bridge's path_bootstrap may reorder sys.path.
 sys.path.insert(0, {repo_root!r})
@@ -7279,19 +7325,43 @@ sys.path.insert(0, {repo_root!r})
 import utils.networking.relay_client as rcm
 rcm._API_V1_CLEANUP_BUDGET_SECONDS = 0.2
 
+# The child is a fresh interpreter, so install its transport tripwire here.
+# Any swallowed transport exception remains visible to the parent via the marker.
+network_attempt = {str(network_attempt)!r}
+def reject_network(*_args, **_kwargs):
+    with open(network_attempt, 'w', encoding='utf-8') as marker:
+        marker.write('unexpected relay HTTP')
+    raise AssertionError('fatal-child fixture attempted real relay HTTP')
+rcm.requests.post = reject_network
+
+# Keep configuration isolated for the child's entire supervisor lifetime.  The
+# sentinel module makes a fallback to the real lazy loader durable even though
+# relay logging catches configuration errors.
+configuration_attempt = {str(configuration_attempt)!r}
+def reject_configuration_initialization():
+    with open(configuration_attempt, 'w', encoding='utf-8') as marker:
+        marker.write('unexpected real configuration initialization')
+    raise AssertionError('fatal-child fixture attempted real configuration initialization')
+config_module = ModuleType('config')
+config_module.get_config = reject_configuration_initialization
+sys.modules['config'] = config_module
+
 # Create a minimal RelayClient.
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 crypto = MagicMock()
 crypto.public_key_b64 = 'testkey'
 model = MagicMock()
-config = MagicMock()
-config.is_production = False
-config.get.side_effect = lambda k, d=None: {{'relay.request_timeout': 15}}.get(k, d)
-with patch('utils.networking.relay_client.get_config_lazy', return_value=config):
-    client = rcm.RelayClient('http://relay.example', 443, crypto, model)
+fake_config = MagicMock()
+fake_config.is_production = False
+fake_config.get.side_effect = lambda k, d=None: {{'relay.request_timeout': 15}}.get(k, d)
+rcm.get_config_lazy = lambda: fake_config
+client = rcm.RelayClient('http://relay.example', 443, crypto, model)
 
 client._last_api_v1_work_relay_url = 'http://relay.example'
 client._polling_stopped_by_request = False
+client._post_api_v1_request_control = lambda **_kwargs: {{
+    'status': 'active', 'next_poll_seconds': 30,
+}}
 
 # Inference blocks forever so the quiescence check always times out.
 release_inference = threading.Event()
@@ -7343,8 +7413,8 @@ sys.exit(0)
         text=True,
     )
 
-    assert result.returncode != 0, (
-        f"Expected nonzero exit from bridge fatal_bridge_teardown, "
+    assert result.returncode == 1, (
+        f"Expected exit 1 from bridge fatal_bridge_teardown, "
         f"got {result.returncode}. stdout: {result.stdout!r} stderr: {result.stderr!r}"
     )
     assert 'MARKER_REACHED_AFTER_SUPERVISE' not in result.stdout, (
@@ -7352,6 +7422,11 @@ sys.exit(0)
     )
     assert 'fatal_teardown' in result.stderr, (
         f"Expected 'fatal_teardown' lifecycle log in stderr: {result.stderr!r}"
+    )
+    assert 'Traceback' not in result.stderr
+    assert not network_attempt.exists(), 'fatal-child fixture attempted real relay HTTP'
+    assert not configuration_attempt.exists(), (
+        'fatal-child fixture attempted real configuration initialization'
     )
 
 

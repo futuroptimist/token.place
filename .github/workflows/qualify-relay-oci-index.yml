@@ -1,0 +1,380 @@
+name: Qualify an existing relay OCI index
+
+on:
+  workflow_dispatch:
+    inputs:
+      index_digest:
+        description: Immutable OCI index digest (sha256 plus 64 lowercase hex characters)
+        required: true
+        type: string
+      source_commit:
+        description: Full source commit embedded in the image
+        required: true
+        type: string
+      release_ref:
+        description: Reviewed release ref
+        required: true
+        type: string
+      release_base:
+        description: Reviewed release base
+        required: true
+        type: string
+      evidence_label:
+        description: Short safe label for the evidence artifact
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  qualify:
+    name: Read-only AMD64 and ARM64 qualification
+    runs-on: ubuntu-latest
+    env:
+      OCI_REPOSITORY: ghcr.io/futuroptimist/tokenplace-relay
+      INPUT_INDEX_DIGEST: ${{ inputs.index_digest }}
+      INPUT_SOURCE_COMMIT: ${{ inputs.source_commit }}
+      INPUT_RELEASE_REF: ${{ inputs.release_ref }}
+      INPUT_RELEASE_BASE: ${{ inputs.release_base }}
+      INPUT_EVIDENCE_LABEL: ${{ inputs.evidence_label }}
+    steps:
+      - name: Validate untrusted dispatch inputs
+        id: inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+
+          digest = os.environ["INPUT_INDEX_DIGEST"]
+          commit = os.environ["INPUT_SOURCE_COMMIT"]
+          release_ref = os.environ["INPUT_RELEASE_REF"]
+          release_base = os.environ["INPUT_RELEASE_BASE"]
+          label = os.environ["INPUT_EVIDENCE_LABEL"]
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+              raise SystemExit("index_digest must be a full lowercase sha256 digest")
+          if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+              raise SystemExit("source_commit must be a full lowercase commit SHA")
+          safe_ref = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,126}[A-Za-z0-9])?")
+          for name, value in (("release_ref", release_ref), ("release_base", release_base)):
+              if safe_ref.fullmatch(value) is None or ".." in value or "//" in value:
+                  raise SystemExit(f"{name} is not a bounded safe ref")
+          if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}", label) is None:
+              raise SystemExit("evidence_label must be 1-48 safe characters")
+          output = os.environ["GITHUB_OUTPUT"]
+          with open(output, "a", encoding="utf-8") as stream:
+              stream.write(f"artifact_name=relay-oci-qualification-{label}\n")
+          PY
+
+      - name: Check out main-branch gate implementation
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Record gate implementation commit
+        id: gate
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU for ARM64
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Log in to GHCR with read-only package permission
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect and qualify immutable platform descriptors
+        id: qualification
+        continue-on-error: true
+        shell: bash
+        env:
+          GATE_COMMIT: ${{ steps.gate.outputs.commit }}
+        run: |
+          set -uo pipefail
+          mkdir -p qualification-evidence .qualification-tmp
+          final_status=0
+          cleanup() {
+            cleanup_status=0
+            mapfile -t containers < <(docker ps -aq --filter 'name=^relay-safety-' 2>/dev/null)
+            if ((${#containers[@]})); then
+              docker rm -f "${containers[@]}" >/dev/null 2>&1 || cleanup_status=1
+            fi
+            rm -rf .qualification-tmp || cleanup_status=1
+            if ((cleanup_status)); then
+              printf '%s\n' failed > qualification-evidence/executor-cleanup.txt
+              final_status=1
+            else
+              printf '%s\n' passed > qualification-evidence/executor-cleanup.txt
+            fi
+          }
+          trap cleanup EXIT
+
+          coordinate="${OCI_REPOSITORY}@${INPUT_INDEX_DIGEST}"
+          if ! docker buildx imagetools inspect --raw "${coordinate}" > .qualification-tmp/index-raw.json; then
+            final_status=1
+          else
+            if ! python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def unique(pairs):
+              out = {}
+              for key, value in pairs:
+                  if key in out:
+                      raise ValueError(f"duplicate JSON key: {key}")
+                  out[key] = value
+              return out
+
+          raw = Path(".qualification-tmp/index-raw.json").read_text(encoding="utf-8")
+          if len(raw.encode()) > 4_000_000:
+              raise SystemExit("index manifest exceeds size bound")
+          index = json.loads(raw, object_pairs_hook=unique)
+          manifests = index.get("manifests")
+          if not isinstance(manifests, list) or len(manifests) > 32:
+              raise SystemExit("malformed or oversized manifest list")
+          selected = {}
+          sanitized = {"schemaVersion": index.get("schemaVersion"), "mediaType": index.get("mediaType"), "manifests": []}
+          for item in manifests:
+              if not isinstance(item, dict) or set(item) - {"mediaType", "size", "digest", "platform", "annotations", "artifactType", "data"}:
+                  raise SystemExit("malformed descriptor")
+              digest = item.get("digest")
+              platform = item.get("platform")
+              if not isinstance(digest, str) or __import__("re").fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+                  raise SystemExit("malformed descriptor digest")
+              if not isinstance(platform, dict) or not isinstance(platform.get("os"), str) or not isinstance(platform.get("architecture"), str):
+                  raise SystemExit("malformed descriptor platform")
+              os_name, architecture = platform["os"], platform["architecture"]
+              executable = os_name != "unknown" and architecture != "unknown"
+              key = f"{os_name}/{architecture}"
+              if executable:
+                  if key not in ("linux/amd64", "linux/arm64") or key in selected:
+                      raise SystemExit(f"unexpected or duplicate executable platform: {key}")
+                  selected[key] = digest
+              sanitized["manifests"].append({
+                  "digest": digest, "mediaType": item.get("mediaType"), "size": item.get("size"),
+                  "platform": {"os": os_name, "architecture": architecture},
+              })
+          if set(selected) != {"linux/amd64", "linux/arm64"}:
+              raise SystemExit("index must contain exactly AMD64 and ARM64 executable descriptors")
+          Path("qualification-evidence/index-manifest.json").write_text(
+              json.dumps(sanitized, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          Path(".qualification-tmp/descriptors.json").write_text(json.dumps(selected), encoding="utf-8")
+          PY
+            then
+              final_status=1
+            fi
+          fi
+
+          for platform in linux/amd64 linux/arm64; do
+            arch="${platform#linux/}"
+            evidence="qualification-evidence/${arch}-evidence.json"
+            platform_digest="$(jq -er --arg platform "${platform}" '.[$platform]' .qualification-tmp/descriptors.json 2>/dev/null)" || {
+              final_status=1
+              continue
+            }
+            platform_coordinate="${OCI_REPOSITORY}@${platform_digest}"
+            image="tokenplace-relay-qualification-${arch}:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            if ! docker pull --platform "${platform}" "${platform_coordinate}"; then
+              final_status=1
+              continue
+            fi
+            if ! docker tag "${platform_coordinate}" "${image}"; then
+              final_status=1
+              continue
+            fi
+            port=15100
+            [[ "${arch}" == arm64 ]] && port=16100
+            python scripts/relay_release_safety_gate.py \
+              --image "${image}" \
+              --platform "${platform}" \
+              --source-commit "${INPUT_SOURCE_COMMIT}" \
+              --release-ref "${INPUT_RELEASE_REF}" \
+              --release-base "${INPUT_RELEASE_BASE}" \
+              --resolved-revision "${INPUT_SOURCE_COMMIT}" \
+              --registry-coordinate "${platform_coordinate}" \
+              --index-digest "${INPUT_INDEX_DIGEST}" \
+              --platform-digest "${platform_digest}" \
+              --port "${port}" \
+              --evidence "${evidence}" || final_status=1
+            docker image rm "${image}" "${platform_coordinate}" >/dev/null 2>&1 || final_status=1
+          done
+          cleanup
+          trap - EXIT
+          ((cleanup_status)) && final_status=1
+          exit "${final_status}"
+
+      - name: Validate and package bounded evidence
+        id: evidence
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          GATE_COMMIT: ${{ steps.gate.outputs.commit }}
+          INPUTS_OUTCOME: ${{ steps.inputs.outcome }}
+        run: |
+          set -uo pipefail
+          mkdir -p qualification-evidence
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          if os.environ.get("INPUTS_OUTCOME") != "success":
+              for name in (
+                  "INPUT_INDEX_DIGEST", "INPUT_SOURCE_COMMIT", "INPUT_RELEASE_REF",
+                  "INPUT_RELEASE_BASE", "INPUT_EVIDENCE_LABEL",
+              ):
+                  os.environ[name] = "invalid"
+
+          root = Path("qualification-evidence")
+          contract = json.loads(Path("config/relay_release_safety_contract.json").read_text(encoding="utf-8"))
+          required = [item["id"] for item in contract["requirements"]]
+
+          def unique(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate JSON key: {key}")
+                  value[key] = item
+              return value
+
+          manifest_file = root / "index-manifest.json"
+          descriptors = {}
+          if manifest_file.exists():
+              manifest = json.loads(manifest_file.read_text(encoding="utf-8"), object_pairs_hook=unique)
+              descriptors = {
+                  f'{item["platform"]["os"]}/{item["platform"]["architecture"]}': item["digest"]
+                  for item in manifest.get("manifests", [])
+                  if item.get("platform", {}).get("os") == "linux"
+              }
+          results = {}
+
+          for arch in ("amd64", "arm64"):
+              platform = f"linux/{arch}"
+              path = root / f"{arch}-evidence.json"
+              passed = False
+              error = "missing evidence"
+              try:
+                  if path.stat().st_size > 1_000_000:
+                      raise ValueError("evidence exceeds size bound")
+                  report = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique)
+                  forbidden_keys = {
+                      "credential", "credentials", "authorization", "authorization_header",
+                      "request_body", "response_body", "client_identity", "private_key", "token",
+                      "ciphertext", "prompt", "model_output", "generated_paths", "raw_paths",
+                  }
+                  def reject_sensitive(value):
+                      if isinstance(value, dict):
+                          if any(str(key).lower() in forbidden_keys for key in value):
+                              raise ValueError("evidence contains a prohibited field")
+                          for item in value.values():
+                              reject_sensitive(item)
+                      elif isinstance(value, list):
+                          for item in value:
+                              reject_sensitive(item)
+                  reject_sensitive(report)
+                  checks = report.get("results")
+                  if not isinstance(checks, dict) or list(checks) != required:
+                      raise ValueError("mandatory contract results are not present exactly once and in order")
+                  if any(value.get("state") != "passed" or value.get("passed") is not True for value in checks.values()):
+                      raise ValueError("mandatory contract result did not pass")
+                  expected = {
+                      "source_commit": os.environ["INPUT_SOURCE_COMMIT"],
+                      "release_ref": os.environ["INPUT_RELEASE_REF"],
+                      "release_base": os.environ["INPUT_RELEASE_BASE"],
+                      "index_digest": os.environ["INPUT_INDEX_DIGEST"],
+                      "platform": platform,
+                      "platform_digest": descriptors.get(platform),
+                      "registry_coordinate": f'{os.environ["OCI_REPOSITORY"]}@{descriptors.get(platform)}',
+                  }
+                  if any(report.get(key) != value for key, value in expected.items()):
+                      raise ValueError("evidence identity binding mismatch")
+                  if report.get("passed") is not True or report.get("cleanup") == "failed":
+                      raise ValueError("gate or cleanup did not pass")
+                  passed, error = True, None
+              except (OSError, ValueError, json.JSONDecodeError) as exc:
+                  error = str(exc)
+              results[platform] = {"passed": passed, "error": error}
+
+          executor_cleanup = (root / "executor-cleanup.txt").read_text(encoding="utf-8").strip() if (root / "executor-cleanup.txt").exists() else "missing"
+          if executor_cleanup != "passed":
+              results["executor_cleanup"] = {"passed": False, "error": "executor cleanup did not pass"}
+          metadata = {
+              "schema_version": 1,
+              "repository": os.environ["OCI_REPOSITORY"],
+              "source_commit": os.environ["INPUT_SOURCE_COMMIT"],
+              "release_ref": os.environ["INPUT_RELEASE_REF"],
+              "release_base": os.environ["INPUT_RELEASE_BASE"],
+              "index_digest": os.environ["INPUT_INDEX_DIGEST"],
+              "platform_digests": descriptors,
+              "gate_implementation_commit": os.environ.get("GATE_COMMIT", ""),
+              "results": results,
+              "passed": all(item["passed"] for item in results.values()) and len(results) == 2,
+          }
+          metadata_path = root / "metadata.json"
+          metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          if not manifest_file.exists():
+              manifest_file.write_text(json.dumps({"error": "index_manifest_unavailable"}) + "\n", encoding="utf-8")
+          for arch in ("amd64", "arm64"):
+              evidence_path = root / f"{arch}-evidence.json"
+              if not evidence_path.exists():
+                  evidence_path.write_text(
+                      json.dumps({"passed": False, "error_category": "missing_evidence"}) + "\n",
+                      encoding="utf-8",
+                  )
+          files = [root / "index-manifest.json", root / "amd64-evidence.json", root / "arm64-evidence.json", metadata_path]
+          sums = []
+          for path in files:
+              if path.exists():
+                  sums.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
+          (root / "SHA256SUMS").write_text("\n".join(sums) + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Existing relay OCI qualification\n\n")
+              summary.write(f"- Source: `{metadata['source_commit']}`\n- Index: `{metadata['index_digest']}`\n")
+              for platform in ("linux/amd64", "linux/arm64"):
+                  summary.write(f"- {platform}: descriptor `{descriptors.get(platform, 'unresolved')}`; passed `{results[platform]['passed']}`\n")
+              summary.write(f"- Gate implementation: `{metadata['gate_implementation_commit']}`\n")
+              summary.write(f"- Evidence artifact: `relay-oci-qualification-{os.environ['INPUT_EVIDENCE_LABEL']}`\n")
+          if not metadata["passed"]:
+              raise SystemExit("qualification evidence failed closed")
+          PY
+
+      - name: Upload immutable qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.inputs.outputs.artifact_name || format('relay-oci-qualification-invalid-{0}', github.run_id) }}
+          path: |
+            qualification-evidence/index-manifest.json
+            qualification-evidence/amd64-evidence.json
+            qualification-evidence/arm64-evidence.json
+            qualification-evidence/metadata.json
+            qualification-evidence/SHA256SUMS
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce qualification result after evidence upload
+        if: always()
+        shell: bash
+        env:
+          QUALIFICATION_OUTCOME: ${{ steps.qualification.outcome }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+        run: |
+          set -euo pipefail
+          [[ "${QUALIFICATION_OUTCOME}" == success ]]
+          [[ "${EVIDENCE_OUTCOME}" == success ]]

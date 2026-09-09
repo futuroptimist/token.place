@@ -3690,6 +3690,88 @@ def test_control_acknowledgement_is_idempotent_and_expiry_is_authenticated(
         second.close()
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "retrieval_digest",
+        "accepted_in_future",
+        "terminal_before_control",
+        "raw_client_identity",
+        "reservation_hash",
+    ),
+)
+def test_control_paired_authority_corruption_fails_without_mutation(
+    valkey_server, corruption
+):
+    namespace = uuid.uuid4().hex
+    stores = tuple(
+        _registration_store(
+            valkey_server,
+            namespace,
+            terminal_retention_seconds=60,
+            control_tombstone_ttl_seconds=30,
+            response_replay_ttl_seconds=30,
+        )
+        for _ in range(2)
+    )
+    first, second = stores
+    node, owner, consumer = "paired-control-node", _digest("paired-owner"), "consumer"
+    identity = (f"paired-control-{corruption}", "request")
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        claim = first.claim_queued_request(node, owner, consumer)
+        first.cancel_or_expire_request(*identity, "cancel")
+        cfg = first._foundation.config
+        client, request = first._identity(*identity)
+        node_digest = first._node_digest(node)
+        terminal = cfg.key("terminal", client, request)
+        lifecycle = cfg.key("request", client, request)
+        control = cfg.key("control", node_digest, client, request)
+        control_index = cfg.key("control:expiry")
+        if corruption == "retrieval_digest":
+            first._foundation._client.hset(terminal, "retrieval_credential_digest", _digest("bad"))
+        elif corruption == "accepted_in_future":
+            future = first._foundation.server_time()[0] + 120
+            first._foundation._client.hset(
+                terminal,
+                mapping={"accepted_at_epoch": future, "replay_expires_at_epoch": future},
+            )
+        elif corruption == "terminal_before_control":
+            control_expiry = first._foundation._client.hget(control, "expires_at_epoch")
+            first._foundation._client.hset(terminal, "expires_at_epoch", float(control_expiry) - 1)
+            first._foundation._client.zadd(
+                cfg.key("terminals:expiry"),
+                {f"{client}:{request}": float(control_expiry) - 1},
+            )
+        elif corruption == "raw_client_identity":
+            first._foundation._client.hset(lifecycle, "client_public_key", "different-client")
+        else:
+            token = first._foundation._client.hget(lifecycle, "token_digest").decode()
+            first._foundation._client.hset(cfg.key("reservation", token), "stray", "1")
+        keys = (
+            terminal,
+            lifecycle,
+            control,
+            cfg.key("terminals:expiry"),
+            control_index,
+            cfg.key("reservations:expiry"),
+        )
+        before = tuple(first._foundation._client.dump(key) for key in keys)
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            second.renew_claim_or_read_control(
+                node, owner, consumer, *identity, claim.generation, acknowledge=True
+            )
+        assert tuple(first._foundation._client.dump(key) for key in keys) == before
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            second.control_tombstones()
+        assert tuple(first._foundation._client.dump(key) for key in keys) == before
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        for store in stores:
+            store.close()
+
+
 @pytest.mark.parametrize("authority", ("progress", "orphan-control-index"))
 def test_control_renewal_rejects_unsupported_authority_without_mutation(
     valkey_server, authority

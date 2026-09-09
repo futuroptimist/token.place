@@ -1303,13 +1303,15 @@ if present~=0 then
   local rv=redis.call('HMGET',request,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest','envelope')
   for i=1,#rv do if not rv[i] then return {'schema'} end end
   local sequence=integer(rv[9]); local current=integer(rv[10]); local entries=rv[11] and redis.call('XRANGE',queue,rv[11],rv[11],'COUNT',1) or {}
-  if redis.call('EXISTS',terminal)~=1 or not terminal_expiry or terminal_score~=terminal_expiry or not accepted or not replay or replay~=accepted or accepted>terminal_expiry or tv[1]~=cv[8] or tv[2]~=cv[9] or
+  if redis.call('EXISTS',terminal)~=1 or not terminal_expiry or terminal_score~=terminal_expiry or not accepted or accepted>now or not replay or replay~=accepted or accepted>terminal_expiry or terminal_expiry<expiry or tv[1]~=cv[8] or tv[2]~=cv[9] or
      tv[3]~='completed_unavailable' or tv[4]~=cv[4] or tv[5]~=cv[5] or tv[6]~=cv[6] or tv[7]~=cv[7] or tv[8]~='' or tv[12]=='' or tv[13]~='' or
      (tv[1]=='cancelled' and not digest(tv[14])) or (tv[1]=='expired' and tv[14]~='' and not digest(tv[14])) or tv[15]~=client or tv[16]~=request_digest or redis.call('EXISTS',request)~=1 or
      rv[1]~=cv[8] or rv[2]~=client or rv[3]~=request_digest or rv[4]~=client_public_key or rv[5]~=request_id or rv[6]~=node_id or rv[7]~=node_digest or rv[8]~=cv[10] or rv[10]~=generation or
-     not sequence or not current or rv[11]~=rv[9]..'-0' or not digest(rv[12]) or rv[13]~=tv[14] or rv[14]=='' or string.len(rv[4])>max_identity or string.len(rv[5])>max_identity or string.len(rv[6])>max_node_id or string.len(rv[14])>max_envelope or #entries~=0 or
+     not sequence or not current or rv[11]~=rv[9]..'-0' or not digest(tv[12]) or not digest(rv[12]) or tv[12]~=rv[12] or rv[13]~=tv[14] or rv[14]=='' or string.len(rv[4])>max_identity or string.len(rv[5])>max_identity or string.len(rv[6])>max_node_id or string.len(rv[14])>max_envelope or #entries~=0 or
+     (tv[1]=='expired' and deadline>accepted) or
      redis.call('EXISTS',claim)~=0 or redis.call('ZSCORE',claim_expiries,client..':'..request_digest) or redis.call('ZSCORE',deadlines,client..':'..request_digest) or
-     redis.call('EXISTS',response)~=0 or redis.call('ZSCORE',response_expiries,client..':'..request_digest) or redis.call('EXISTS',progress)~=0 or redis.call('ZSCORE',reservation_expiries,rv[12]) then return {'schema'} end
+     redis.call('EXISTS',response)~=0 or redis.call('ZSCORE',response_expiries,client..':'..request_digest) or redis.call('EXISTS',progress)~=0 or
+     redis.call('ZSCORE',reservation_expiries,rv[12]) or redis.call('EXISTS',string.gsub(request,'request:'..client..':'..request_digest,'reservation:'..rv[12]))~=0 then return {'schema'} end
   if expiry<=now then
     redis.call('DEL',control); redis.call('ZREM',control_expiries,control_member)
   else
@@ -1349,7 +1351,7 @@ return {'continued',generation,value}
 CONTROL_CLAIM_SCRIPT = ReviewedScript(
     "renew_claim_or_read_control_v1",
     CONTROL_CLAIM_SOURCE,
-    "4ba1899b10bed4c1e70f5bbc9be342e85e1675eb3bfd2bec111cb954e86f2521",
+    "1f946df7bc85f1282bc97b1dfcd01b926824d07cefeb029b894fc1d23d50e911",
     True,
 )
 
@@ -4455,7 +4457,13 @@ class ValkeyRegistrationStore:
             if not isinstance(raw, list) or len(raw) != len(fields):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             if all(value is None for value in raw):
-                continue
+                if self._foundation._call(
+                    self._foundation._client.zscore,
+                    cfg.key("control:expiry"),
+                    item[0],
+                ) is None:
+                    continue
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
             if any(not isinstance(value, bytes) for value in raw):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             v = dict(zip(fields, raw))
@@ -4560,7 +4568,16 @@ class ValkeyRegistrationStore:
                     or terminal[b"consumer_digest"] != v[b"consumer_digest"]
                     or terminal[b"generation"] != v[b"generation"]
                     or terminal[b"response_digest"] != b""
+                    or not self._completed_digest(
+                        terminal[b"retrieval_credential_digest"]
+                    )
+                    or terminal[b"retrieval_credential_digest"]
+                    != lifecycle[b"token_digest"]
+                    or terminal[b"acknowledgement_digest"] != b""
                     or accepted != replay
+                    or accepted > now
+                    or accepted > terminal_expiry
+                    or terminal_expiry < expiry
                     or not isinstance(terminal_score, (int, float))
                     or float(terminal_score) != terminal_expiry
                     or terminal[b"client"] != v[b"client"]
@@ -4568,6 +4585,12 @@ class ValkeyRegistrationStore:
                     or lifecycle[b"state"] != v[b"status"]
                     or lifecycle[b"client"] != v[b"client"]
                     or lifecycle[b"request"] != v[b"request"]
+                    or hashlib.sha256(
+                        b"client\0" + lifecycle[b"client_public_key"]
+                    ).hexdigest()
+                    != parts[1]
+                    or hashlib.sha256(b"request\0" + lifecycle[b"request_id"]).hexdigest()
+                    != parts[2]
                     or lifecycle[b"node_id"] != v[b"node_id"]
                     or lifecycle[b"node_digest"] != v[b"node_digest"]
                     or lifecycle[b"deadline"] != v[b"deadline"]
@@ -4590,9 +4613,50 @@ class ValkeyRegistrationStore:
                     <= self.config.max_envelope_bytes
                     or lifecycle[b"cancellation_digest"]
                     != terminal[b"cancellation_token_digest"]
+                    or (
+                        terminal[b"outcome"] == b"cancelled"
+                        and not self._completed_digest(
+                            terminal[b"cancellation_token_digest"]
+                        )
+                    )
+                    or (
+                        terminal[b"outcome"] == b"expired"
+                        and terminal[b"cancellation_token_digest"] != b""
+                        and not self._completed_digest(
+                            terminal[b"cancellation_token_digest"]
+                        )
+                    )
+                    or (
+                        terminal[b"outcome"] == b"expired"
+                        and deadline > accepted
+                    )
                     or member.decode() != f"{parts[0]}:{parts[1]}:{parts[2]}"
                     or active != [0, None, None, 0, None, 0, None]
+                    or self._foundation._call(
+                        self._foundation._client.exists,
+                        cfg.key("reservation", lifecycle[b"token_digest"].decode()),
+                    )
+                    != 0
                 ):
+                    raise ValueError
+                final_control = self._foundation._call(
+                    self._foundation._client.hmget,
+                    cfg.key("control", *parts),
+                    fields,
+                )
+                final_score = self._foundation._call(
+                    self._foundation._client.zscore,
+                    cfg.key("control:expiry"),
+                    item[0],
+                )
+                if final_control != raw or final_score != item[1]:
+                    if (
+                        isinstance(final_control, list)
+                        and len(final_control) == len(fields)
+                        and all(value is None for value in final_control)
+                        and final_score is None
+                    ):
+                        continue
                     raise ValueError
                 records.append(
                     ControlTombstoneRecord(
@@ -4609,7 +4673,24 @@ class ValkeyRegistrationStore:
                         expiry,
                     )
                 )
-            except (ValueError, UnicodeError, OverflowError):
+            except (TypeError, ValueError, UnicodeError, OverflowError):
+                current_control = self._foundation._call(
+                    self._foundation._client.hmget,
+                    cfg.key("control", *parts),
+                    fields,
+                )
+                current_score = self._foundation._call(
+                    self._foundation._client.zscore,
+                    cfg.key("control:expiry"),
+                    item[0],
+                )
+                if (
+                    isinstance(current_control, list)
+                    and len(current_control) == len(fields)
+                    and all(value is None for value in current_control)
+                    and current_score is None
+                ):
+                    continue
                 raise ValkeySchemaIncompatibleError(
                     "state schema incompatible"
                 ) from None

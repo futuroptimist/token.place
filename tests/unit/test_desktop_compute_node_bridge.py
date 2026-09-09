@@ -3462,12 +3462,6 @@ def test_module_import_does_not_load_context_profiles_before_preflight(monkeypat
 def test_utils_package_keeps_lazy_convenience_exports(monkeypatch):
     import utils
 
-    # Importing the fake crypto leaf also initializes its parent package, whose
-    # eager convenience export would otherwise retain the sentinel after the
-    # fake leaf is restored. Track both parent bindings for fixture teardown.
-    monkeypatch.delitem(sys.modules, 'utils.crypto', raising=False)
-    monkeypatch.delattr(utils, 'crypto', raising=False)
-
     model_manager_module = ModuleType('utils.llm.model_manager')
     crypto_manager_module = ModuleType('utils.crypto.crypto_manager')
     relay_client_module = ModuleType('utils.networking.relay_client')
@@ -7314,6 +7308,7 @@ def test_bridge_fatal_composition_via_wire_fatal_teardown_exits_subprocess(tmp_p
 
     child_script = tmp_path / 'child_bridge_fatal.py'
     network_attempt = tmp_path / 'unexpected_network_attempt'
+    configuration_attempt = tmp_path / 'unexpected_configuration_attempt'
     child_script.write_text(
         f"""\
 import sys
@@ -7321,6 +7316,7 @@ import os
 import time
 import threading
 import importlib.util
+from types import ModuleType
 # Import repo modules FIRST so they are cached in sys.modules before
 # compute_node_bridge's path_bootstrap may reorder sys.path.
 sys.path.insert(0, {repo_root!r})
@@ -7338,16 +7334,28 @@ def reject_network(*_args, **_kwargs):
     raise AssertionError('fatal-child fixture attempted real relay HTTP')
 rcm.requests.post = reject_network
 
+# Keep configuration isolated for the child's entire supervisor lifetime.  The
+# sentinel module makes a fallback to the real lazy loader durable even though
+# relay logging catches configuration errors.
+configuration_attempt = {str(configuration_attempt)!r}
+def reject_configuration_initialization():
+    with open(configuration_attempt, 'w', encoding='utf-8') as marker:
+        marker.write('unexpected real configuration initialization')
+    raise AssertionError('fatal-child fixture attempted real configuration initialization')
+config_module = ModuleType('config')
+config_module.get_config = reject_configuration_initialization
+sys.modules['config'] = config_module
+
 # Create a minimal RelayClient.
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 crypto = MagicMock()
 crypto.public_key_b64 = 'testkey'
 model = MagicMock()
-config = MagicMock()
-config.is_production = False
-config.get.side_effect = lambda k, d=None: {{'relay.request_timeout': 15}}.get(k, d)
-with patch('utils.networking.relay_client.get_config_lazy', return_value=config):
-    client = rcm.RelayClient('http://relay.example', 443, crypto, model)
+fake_config = MagicMock()
+fake_config.is_production = False
+fake_config.get.side_effect = lambda k, d=None: {{'relay.request_timeout': 15}}.get(k, d)
+rcm.get_config_lazy = lambda: fake_config
+client = rcm.RelayClient('http://relay.example', 443, crypto, model)
 
 client._last_api_v1_work_relay_url = 'http://relay.example'
 client._polling_stopped_by_request = False
@@ -7417,6 +7425,9 @@ sys.exit(0)
     )
     assert 'Traceback' not in result.stderr
     assert not network_attempt.exists(), 'fatal-child fixture attempted real relay HTTP'
+    assert not configuration_attempt.exists(), (
+        'fatal-child fixture attempted real configuration initialization'
+    )
 
 
 def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inference(capsys, monkeypatch):

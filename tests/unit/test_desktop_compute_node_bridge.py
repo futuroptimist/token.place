@@ -3462,6 +3462,12 @@ def test_module_import_does_not_load_context_profiles_before_preflight(monkeypat
 def test_utils_package_keeps_lazy_convenience_exports(monkeypatch):
     import utils
 
+    # Importing the fake crypto leaf also initializes its parent package, whose
+    # eager convenience export would otherwise retain the sentinel after the
+    # fake leaf is restored. Track both parent bindings for fixture teardown.
+    monkeypatch.delitem(sys.modules, 'utils.crypto', raising=False)
+    monkeypatch.delattr(utils, 'crypto', raising=False)
+
     model_manager_module = ModuleType('utils.llm.model_manager')
     crypto_manager_module = ModuleType('utils.crypto.crypto_manager')
     relay_client_module = ModuleType('utils.networking.relay_client')

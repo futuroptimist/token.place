@@ -75,6 +75,47 @@ unique candidate index. The workflow qualifies the two descriptors from that exa
 requires adding the platform to the build, exact manifest-membership assertion, qualification loop,
 workflow regression tests, and operator documentation in the same change.
 
+## Read-only qualification of an existing OCI index
+
+`.github/workflows/qualify-existing-relay-oci.yml` is a manual, read-only executor for an
+already-published index in the fixed repository `ghcr.io/futuroptimist/tokenplace-relay`. It checks
+out the gate from `main` and records that gate implementation commit independently of the supplied
+artifact source commit. The dispatch accepts a lowercase full `sha256:` index digest, a lowercase
+full 40-character source commit, bounded release ref and base values, and a bounded evidence label.
+All values are validated before use. The executor does not build, publish, promote, retag, deploy,
+or inspect an external environment.
+
+The executor sanitizes the raw index, rejects malformed descriptors and executable platforms other
+than exactly one `linux/amd64` and one `linux/arm64`, and pulls each accepted descriptor by digest.
+It runs the current safety gate once per platform on separate loopback port ranges. Qualification
+fails closed unless both evidence documents parse, bind to all supplied and resolved identities,
+contain every mandatory contract result exactly once with a passing state, and report successful
+cleanup. The uploaded artifact is uniquely named
+`relay-oci-qualification-<evidence-label>-<run-id>-<run-attempt>` and contains:
+
+- `index-manifest.sanitized.json` — bounded descriptor and platform data, with annotations omitted;
+- `amd64-evidence.json` and `arm64-evidence.json` — the gate's privacy-safe schema-version 2 reports;
+- `metadata.json` — source, release, index, descriptor, gate-commit, cleanup, and result bindings;
+- `SHA256SUMS` — hashes for the four JSON records above.
+
+The workflow uploads available evidence even when qualification fails, then fails the job if either
+platform evidence is missing or invalid or local cleanup did not succeed. Evidence must remain free
+of credentials, authorization headers, generated paths, request or response bodies, client
+identities, keys, tokens, ciphertext, prompts, and model output.
+
+### Planned Step 05b dispatches
+
+These are the two reviewed parameter sets planned for separate dispatches **after this executor is
+merged**. Listing them here records intent only; neither artifact is claimed to have passed.
+
+| Input | Qwen candidate | Corrected Llama rollback |
+| --- | --- | --- |
+| `index_digest` | `sha256:b32ef19840dabe44caf7240b787af14dcf439b39357833e21a92c3dd511effd4` | `sha256:543fde33aff45253630090b52d16163e3586da12c973f5c4a658ddc8927d0a68` |
+| `source_commit` | `8618c9aba4b5dfe7980c2fe861095a92311145f2` | `6c39adc64e7bed4f85d07164aa2860e637919ca9` |
+| `release_ref` | `main-8618c9a` | `sha-6c39adc` |
+| `release_base` | `main` | `release/relay-0.1.1` |
+| `evidence_label` | `step-05b-qwen-8618c9a` | `step-05b-llama-6c39adc` |
+
 ## Maintain the contract
 
 To add a mandatory requirement:

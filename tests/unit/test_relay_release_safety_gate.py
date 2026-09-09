@@ -267,6 +267,35 @@ def test_capped_hashed_labels_fail_even_when_second_batch_stops_growing(monkeypa
     assert results["metrics.bounded_unmatched_paths"]["second_batch_growth"] == 0
 
 
+@pytest.mark.parametrize(
+    "middle_only,failed_id",
+    [
+        ('hits{route="/release-safety-unmatched-witness"} 1\n', "metrics.no_raw_paths"),
+        ("".join(f'hits{{endpoint=\"{number:064x}\"}} 1\n' for number in range(32)),
+         "metrics.no_raw_paths"),
+        ('flask_http_request_total{method="GET"} 1\n', "metrics.no_flask_defaults"),
+    ],
+)
+def test_middle_only_metrics_violations_remain_failures(monkeypatch, middle_only, failed_id):
+    scrapes = 0
+
+    def fake_request(_base, path, method="GET"):
+        nonlocal scrapes
+        if path != "/metrics":
+            return 404, ""
+        scrapes += 1
+        return 200, VALID + (middle_only if scrapes == 3 else "")
+
+    monkeypatch.setattr(gate, "request", fake_request)
+    results = gate.execute_metrics_checks("http://loopback")
+    assert results[failed_id]["passed"] is False
+    if failed_id == "metrics.no_raw_paths":
+        assert results["metrics.no_flask_defaults"]["passed"] is True
+    else:
+        assert results["metrics.no_raw_paths"]["passed"] is True
+    assert results["metrics.bounded_unmatched_paths"]["second_batch_growth"] == 0
+
+
 @pytest.mark.parametrize("statuses,expected", [
     ([200] * 13 + [429], True), ([500] + [200] * 12 + [429], False),
     ([200] * 14, False), ([200] * 12 + [429, 429], False),
@@ -331,8 +360,12 @@ def test_unrouted_requests_do_not_prove_real_flask_limiter_enforcement():
     assert [client.get("/unrouted").status_code for _ in range(2)] == [404, 404]
 
 
-@pytest.mark.parametrize("payload,expected", [('{"passed": true}', True), ('{"passed": false}', False),
-                                                ("not-json", False)])
+@pytest.mark.parametrize("payload,expected", [
+    ('{"passed": true}', True), ('{"passed": false}', False), ('{"passed": 1}', False),
+    ('{"passed": 1.0}', False), ('{"passed": "true"}', False), ('{"passed": null}', False),
+    ('[]', False), ('{}', False), ('{"passed": true, "extra": false}', False),
+    ('{"passed": false, "passed": true}', False), ("not-json", False),
+])
 def test_in_image_public_predicate_inspection_fails_closed(monkeypatch, payload, expected):
     monkeypatch.setattr(gate, "docker_output", lambda *args: payload)
     assert gate.inspect_public_exemption_predicate("candidate") is expected
@@ -539,7 +572,7 @@ def test_replacement_alias_registry_identity_cannot_validate_original(tmp_path, 
 
 
 def _run_qualified_main(tmp_path, monkeypatch, public=True, missing=None, cleanup_code=0,
-                        failed_id=None):
+                        failed_id=None, predicate=True, cleanup_calls=None):
     values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "metrics", "public",
                    "protected-rate", "protected-daily", "mutating-rate", "mutating-daily"])
     monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
@@ -553,9 +586,11 @@ def _run_qualified_main(tmp_path, monkeypatch, public=True, missing=None, cleanu
     monkeypatch.setattr(gate, "execute_quota_check", lambda _base, limit_id, **_kwargs: (
         {} if missing == limit_id else {limit_id: {"passed": limit_id != failed_id}}
     ))
-    monkeypatch.setattr(gate, "inspect_public_exemption_predicate", lambda _container: True)
+    monkeypatch.setattr(gate, "inspect_public_exemption_predicate", lambda _container: predicate)
 
     def cleanup(*_args, **_kwargs):
+        if cleanup_calls is not None:
+            cleanup_calls.append(_args)
         return subprocess.CompletedProcess([], cleanup_code)
 
     return _run_main(tmp_path, monkeypatch, lambda *_a: next(values), cleanup)
@@ -566,6 +601,17 @@ def test_public_exemption_failure_is_mandatory(tmp_path, monkeypatch):
     public = report["results"]["quota.public_information_exempt"]
     assert result == 1 and report["error_category"] == "mandatory_check_failed"
     assert public["state"] == "failed"
+
+
+def test_rejected_public_predicate_fails_qualification_and_still_cleans_up(tmp_path, monkeypatch):
+    cleanup_calls = []
+    result, report = _run_qualified_main(
+        tmp_path, monkeypatch, predicate=False, cleanup_calls=cleanup_calls,
+    )
+    public = report["results"]["quota.public_information_exempt"]
+    assert result == 1 and report["error_category"] == "mandatory_check_failed"
+    assert public["passed"] is False and public["predicate_exact"] is False
+    assert len(cleanup_calls) == 6
 
 
 @pytest.mark.parametrize("missing", sorted(gate.EXPECTED_IDS - {

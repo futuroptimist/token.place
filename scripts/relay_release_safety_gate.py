@@ -129,7 +129,7 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
     if status != 200:
         return results
     try:
-        parse_metrics(warm)  # warm lazy collectors before the baseline
+        warmed = parse_metrics(warm)  # warm lazy collectors before the baseline
         status, before_text = request(base_url, "/metrics")
         if status != 200:
             return results
@@ -154,7 +154,8 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
         after = parse_metrics(after_text)
     except GateFailure:
         return results
-    names = {sample.name for sample in after}
+    observations = warmed | before | middle | after
+    names = {sample.name for sample in observations}
     expected = {"tokenplace_http_requests_total", "tokenplace_instrumentation_up"}
     instrumentation = [sample for sample in after if sample.name == "tokenplace_instrumentation_up"]
     results["metrics.valid_instrumentation"] = {
@@ -169,7 +170,7 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
     # a collector cannot hide attacker-derived labels by stopping at a cap.
     probe_growth = (middle - before) | (after - middle)
     bounded_fallbacks = {"unknown", "other", "/{unmatched}"}
-    for sample in after:
+    for sample in observations:
         for key, value in sample.labels:
             # Flask endpoint names and normalized route templates are bounded; the
             # presence of an ``endpoint`` label alone is therefore not unsafe.
@@ -226,10 +227,15 @@ print(json.dumps({'passed': result}))
 """
     try:
         output = docker_output("exec", container, "python", "-c", program)
-        result = json.loads(output)
-    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, TypeError):
+        def reject_duplicate_keys(pairs):
+            if len({key for key, _ in pairs}) != len(pairs):
+                raise ValueError("duplicate key")
+            return dict(pairs)
+
+        result = json.loads(output, object_pairs_hook=reject_duplicate_keys)
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, TypeError, ValueError):
         return False
-    return result == {"passed": True}
+    return isinstance(result, dict) and set(result) == {"passed"} and result["passed"] is True
 
 
 def execute_quota_check(base_url: str, limit_id: str, *, mutating: bool) -> dict[str, dict[str, object]]:

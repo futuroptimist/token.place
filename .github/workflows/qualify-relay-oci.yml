@@ -1,0 +1,277 @@
+name: Qualify immutable relay OCI index
+
+on:
+  workflow_dispatch:
+    inputs:
+      index_digest:
+        description: Immutable OCI index digest (sha256 plus 64 lowercase hex characters)
+        required: true
+        type: string
+      source_commit:
+        description: Full source commit embedded in the image (40 lowercase hex characters)
+        required: true
+        type: string
+      release_ref:
+        description: Reviewed release ref (1-128 safe characters)
+        required: true
+        type: string
+      release_base:
+        description: Reviewed release base (1-128 safe characters)
+        required: true
+        type: string
+      evidence_label:
+        description: Short safe label for the evidence artifact
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  qualify:
+    name: Qualify both immutable platform descriptors
+    runs-on: ubuntu-latest
+    env:
+      OCI_REPOSITORY: ghcr.io/futuroptimist/tokenplace-relay
+      INPUT_INDEX_DIGEST: ${{ inputs.index_digest }}
+      INPUT_SOURCE_COMMIT: ${{ inputs.source_commit }}
+      INPUT_RELEASE_REF: ${{ inputs.release_ref }}
+      INPUT_RELEASE_BASE: ${{ inputs.release_base }}
+      INPUT_EVIDENCE_LABEL: ${{ inputs.evidence_label }}
+      EVIDENCE_DIR: relay-oci-qualification-evidence
+    steps:
+      - name: Check out the main-branch gate implementation
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record gate implementation commit
+        id: gate
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU for ARM64
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR read-only
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect and qualify immutable descriptors
+        id: qualify
+        env:
+          GATE_COMMIT: ${{ steps.gate.outputs.commit }}
+        run: |
+          set -u -o pipefail
+          mkdir -p "${EVIDENCE_DIR}"
+          printf '%s\n' '{"schema_version":1,"status":"qualification_started"}' > "${EVIDENCE_DIR}/qualification-status.json"
+          work="$(mktemp -d)"
+          cleanup_status=0
+          cleanup() {
+            for coordinate in "${AMD64_COORDINATE:-}" "${ARM64_COORDINATE:-}"; do
+              if [[ -n "${coordinate}" ]] && docker image inspect "${coordinate}" >/dev/null 2>&1; then
+                docker image rm "${coordinate}" >/dev/null 2>&1 || cleanup_status=1
+              fi
+            done
+            rm -rf "${work}" || cleanup_status=1
+            if [[ "${cleanup_status}" -ne 0 ]]; then
+              touch "${EVIDENCE_DIR}/cleanup-failed"
+            fi
+          }
+          trap cleanup EXIT
+
+          python - <<'PY'
+          import os, re
+          rules = {
+              "INPUT_INDEX_DIGEST": r"sha256:[0-9a-f]{64}",
+              "INPUT_SOURCE_COMMIT": r"[0-9a-f]{40}",
+              "INPUT_RELEASE_REF": r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}",
+              "INPUT_RELEASE_BASE": r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}",
+              "INPUT_EVIDENCE_LABEL": r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+          }
+          for name, pattern in rules.items():
+              if re.fullmatch(pattern, os.environ.get(name, "")) is None:
+                  raise SystemExit(f"invalid workflow input: {name}")
+          PY
+          validation_status=$?
+          if [[ "${validation_status}" -ne 0 ]]; then
+            exit "${validation_status}"
+          fi
+
+          index_coordinate="${OCI_REPOSITORY}@${INPUT_INDEX_DIGEST}"
+          docker buildx imagetools inspect --raw "${index_coordinate}" > "${work}/index-raw.json"
+          python - "${work}/index-raw.json" "${EVIDENCE_DIR}/index-manifest.json" <<'PY'
+          import json, re, sys
+          source, destination = sys.argv[1:]
+          raw = open(source, encoding="utf-8").read()
+          if len(raw) > 1_000_000:
+              raise SystemExit("index manifest exceeds the evidence bound")
+          value = json.loads(raw)
+          manifests = value.get("manifests")
+          if not isinstance(manifests, list):
+              raise SystemExit("OCI index has no manifests array")
+          wanted = {"linux/amd64": [], "linux/arm64": []}
+          sanitized = []
+          digest_pattern = re.compile(r"sha256:[0-9a-f]{64}")
+          for item in manifests:
+              if not isinstance(item, dict) or not isinstance(item.get("platform"), dict):
+                  raise SystemExit("malformed OCI descriptor")
+              platform = item["platform"]
+              os_name, architecture = platform.get("os"), platform.get("architecture")
+              digest, media_type, size = item.get("digest"), item.get("mediaType"), item.get("size")
+              if not digest_pattern.fullmatch(digest or "") or not isinstance(media_type, str) or not isinstance(size, int):
+                  raise SystemExit("malformed OCI descriptor identity")
+              key = f"{os_name}/{architecture}"
+              executable = os_name not in (None, "unknown") and architecture not in (None, "unknown")
+              if executable and key not in wanted:
+                  raise SystemExit(f"unexpected executable platform: {key}")
+              if key in wanted:
+                  wanted[key].append(digest)
+              sanitized.append({"digest": digest, "mediaType": media_type, "size": size,
+                                "platform": {"os": os_name, "architecture": architecture}})
+          if any(len(digests) != 1 for digests in wanted.values()):
+              raise SystemExit("index must contain exactly one amd64 and one arm64 executable descriptor")
+          with open(destination, "w", encoding="utf-8") as output:
+              json.dump({"schemaVersion": value.get("schemaVersion"), "mediaType": value.get("mediaType"),
+                         "manifests": sanitized}, output, sort_keys=True, separators=(",", ":"))
+              output.write("\n")
+          with open(destination + ".resolved", "w", encoding="utf-8") as output:
+              output.write(wanted["linux/amd64"][0] + "\n" + wanted["linux/arm64"][0] + "\n")
+          PY
+          mapfile -t descriptors < "${EVIDENCE_DIR}/index-manifest.json.resolved"
+          rm "${EVIDENCE_DIR}/index-manifest.json.resolved"
+          AMD64_DIGEST="${descriptors[0]}"
+          ARM64_DIGEST="${descriptors[1]}"
+          AMD64_COORDINATE="${OCI_REPOSITORY}@${AMD64_DIGEST}"
+          ARM64_COORDINATE="${OCI_REPOSITORY}@${ARM64_DIGEST}"
+          export AMD64_DIGEST ARM64_DIGEST AMD64_COORDINATE ARM64_COORDINATE
+          echo "amd64_digest=${AMD64_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "arm64_digest=${ARM64_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          overall=0
+          for specification in "linux/amd64|${AMD64_DIGEST}|15100" "linux/arm64|${ARM64_DIGEST}|15200"; do
+            IFS='|' read -r platform platform_digest port <<< "${specification}"
+            slug="${platform#linux/}"
+            platform_coordinate="${OCI_REPOSITORY}@${platform_digest}"
+            docker pull --platform "${platform}" "${platform_coordinate}" || overall=1
+            if [[ "${overall}" -eq 0 || -f "${EVIDENCE_DIR}/relay-release-safety-${slug}.json" == false ]]; then
+              python scripts/relay_release_safety_gate.py \
+                --image "${platform_coordinate}" \
+                --platform "${platform}" \
+                --source-commit "${INPUT_SOURCE_COMMIT}" \
+                --release-ref "${INPUT_RELEASE_REF}" \
+                --release-base "${INPUT_RELEASE_BASE}" \
+                --resolved-revision "${INPUT_SOURCE_COMMIT}" \
+                --registry-coordinate "${platform_coordinate}" \
+                --index-digest "${INPUT_INDEX_DIGEST}" \
+                --platform-digest "${platform_digest}" \
+                --port "${port}" \
+                --evidence "${EVIDENCE_DIR}/relay-release-safety-${slug}.json" || overall=1
+            fi
+          done
+
+          export QUALIFICATION_STATUS="${overall}"
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["EVIDENCE_DIR"])
+          contract = json.loads(Path("config/relay_release_safety_contract.json").read_text())
+          expected = [item["id"] for item in contract["requirements"]]
+          statuses = {}
+          validation_failed = False
+          def unique_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate JSON member: {key}")
+                  value[key] = item
+              return value
+          for arch, digest in (("amd64", os.environ["AMD64_DIGEST"]), ("arm64", os.environ["ARM64_DIGEST"])):
+              path = root / f"relay-release-safety-{arch}.json"
+              status = "missing"
+              try:
+                  evidence = json.loads(path.read_text(), object_pairs_hook=unique_object)
+                  results = evidence["results"]
+                  valid = (evidence.get("passed") is True and evidence.get("cleanup") == "passed"
+                           and list(results) == expected and len(results) == len(expected)
+                           and all(item.get("passed") is True and item.get("state") == "passed" for item in results.values())
+                           and evidence.get("source_commit") == os.environ["INPUT_SOURCE_COMMIT"]
+                           and evidence.get("release_ref") == os.environ["INPUT_RELEASE_REF"]
+                           and evidence.get("release_base") == os.environ["INPUT_RELEASE_BASE"]
+                           and evidence.get("index_digest") == os.environ["INPUT_INDEX_DIGEST"]
+                           and evidence.get("platform") == f"linux/{arch}"
+                           and evidence.get("platform_digest") == digest
+                           and evidence.get("registry_coordinate") == f'{os.environ["OCI_REPOSITORY"]}@{digest}')
+                  status = "passed" if valid else "failed"
+              except (OSError, ValueError, KeyError, TypeError):
+                  valid = False
+              validation_failed |= not valid
+              statuses[arch] = status
+          metadata = {"schema_version": 1, "evidence_label": os.environ["INPUT_EVIDENCE_LABEL"],
+                      "repository": os.environ["OCI_REPOSITORY"], "source_commit": os.environ["INPUT_SOURCE_COMMIT"],
+                      "release_ref": os.environ["INPUT_RELEASE_REF"], "release_base": os.environ["INPUT_RELEASE_BASE"],
+                      "index_digest": os.environ["INPUT_INDEX_DIGEST"], "gate_commit": os.environ["GATE_COMMIT"],
+                      "platforms": {"linux/amd64": {"digest": os.environ["AMD64_DIGEST"], "result": statuses["amd64"]},
+                                    "linux/arm64": {"digest": os.environ["ARM64_DIGEST"], "result": statuses["arm64"]}}}
+          (root / "metadata.json").write_text(json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n")
+          files = [root / "index-manifest.json", root / "relay-release-safety-amd64.json",
+                   root / "relay-release-safety-arm64.json", root / "metadata.json"]
+          with (root / "SHA256SUMS").open("w") as sums:
+              for path in files:
+                  if path.is_file():
+                      sums.write(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n")
+          if validation_failed or os.environ["QUALIFICATION_STATUS"] != "0":
+              raise SystemExit("both platform evidence documents must pass exact validation")
+          PY
+
+      - name: Verify cleanup completed
+        if: always()
+        run: test ! -e "${EVIDENCE_DIR}/cleanup-failed"
+
+      - name: Write qualification summary
+        if: always()
+        env:
+          GATE_COMMIT: ${{ steps.gate.outputs.commit }}
+          AMD64_DIGEST: ${{ steps.qualify.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.qualify.outputs.arm64_digest }}
+          ARTIFACT_NAME: relay-oci-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          metadata_path = Path(os.environ["EVIDENCE_DIR"]) / "metadata.json"
+          results = {"linux/amd64": "not produced", "linux/arm64": "not produced"}
+          source_commit = index_digest = "invalid or unavailable"
+          if metadata_path.is_file():
+              data = json.loads(metadata_path.read_text())
+              results = {key: value["result"] for key, value in data["platforms"].items()}
+              source_commit, index_digest = data["source_commit"], data["index_digest"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Immutable relay OCI qualification\n\n")
+              summary.write(f"- Source commit: `{source_commit}`\n")
+              summary.write(f"- Index: `{os.environ['OCI_REPOSITORY']}@{index_digest}`\n")
+              summary.write(f"- AMD64 descriptor: `{os.environ.get('AMD64_DIGEST') or 'unresolved'}` — **{results['linux/amd64']}**\n")
+              summary.write(f"- ARM64 descriptor: `{os.environ.get('ARM64_DIGEST') or 'unresolved'}` — **{results['linux/arm64']}**\n")
+              summary.write(f"- Gate implementation commit: `{os.environ['GATE_COMMIT']}`\n")
+              summary.write(f"- Evidence artifact: `{os.environ['ARTIFACT_NAME']}`\n")
+          PY
+
+      - name: Upload immutable qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-oci-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: relay-oci-qualification-evidence/
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 90

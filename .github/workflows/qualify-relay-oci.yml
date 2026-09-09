@@ -1,0 +1,359 @@
+name: Qualify an immutable relay OCI index
+
+on:
+  workflow_dispatch:
+    inputs:
+      index_digest:
+        description: Full sha256 digest of the published OCI index
+        required: true
+        type: string
+      source_commit:
+        description: Full source commit embedded in the image
+        required: true
+        type: string
+      release_ref:
+        description: Reviewed source ref (1-128 safe characters)
+        required: true
+        type: string
+      release_base:
+        description: Reviewed source base (1-128 safe characters)
+        required: true
+        type: string
+      evidence_label:
+        description: Lowercase evidence label (1-63 letters, digits, or hyphens)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  qualify:
+    name: Read-only multi-platform qualification
+    runs-on: ubuntu-latest
+    env:
+      OCI_REPOSITORY: ghcr.io/futuroptimist/tokenplace-relay
+      INPUT_INDEX_DIGEST: ${{ inputs.index_digest }}
+      INPUT_SOURCE_COMMIT: ${{ inputs.source_commit }}
+      INPUT_RELEASE_REF: ${{ inputs.release_ref }}
+      INPUT_RELEASE_BASE: ${{ inputs.release_base }}
+      INPUT_EVIDENCE_LABEL: ${{ inputs.evidence_label }}
+      ARTIFACT_NAME: relay-oci-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out the main-branch gate implementation
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record gate commit and validate untrusted inputs
+        id: inputs
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p qualification-artifacts
+          gate_commit="$(git rev-parse HEAD)"
+          [[ "${gate_commit}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${INPUT_INDEX_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "${INPUT_SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${INPUT_RELEASE_REF}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$ ]]
+          [[ "${INPUT_RELEASE_BASE}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$ ]]
+          [[ "${INPUT_EVIDENCE_LABEL}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]
+          for value in "${INPUT_RELEASE_REF}" "${INPUT_RELEASE_BASE}"; do
+            [[ "${value}" != *..* && "${value}" != *//* && "${value}" != */ ]]
+          done
+          printf 'GATE_COMMIT=%s\n' "${gate_commit}" >> "${GITHUB_ENV}"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          record = {
+              "evidence_label": os.environ["INPUT_EVIDENCE_LABEL"],
+              "index_digest": os.environ["INPUT_INDEX_DIGEST"],
+              "release_base": os.environ["INPUT_RELEASE_BASE"],
+              "release_ref": os.environ["INPUT_RELEASE_REF"],
+              "source_commit": os.environ["INPUT_SOURCE_COMMIT"],
+          }
+          Path("validated-inputs.json").write_text(
+              json.dumps(record, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Set up QEMU for ARM64
+        if: steps.inputs.outcome == 'success'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        if: steps.inputs.outcome == 'success'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR for package reads
+        if: steps.inputs.outcome == 'success'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect and validate the immutable index
+        id: index
+        if: steps.inputs.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="$(mktemp)"
+          trap 'rm -f "${raw}"' EXIT
+          coordinate="${OCI_REPOSITORY}@${INPUT_INDEX_DIGEST}"
+          docker buildx imagetools inspect --raw "${coordinate}" > "${raw}"
+          RAW_INDEX="${raw}" python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          digest_re = re.compile(r"sha256:[0-9a-f]{64}\Z")
+          raw_path = Path(os.environ["RAW_INDEX"])
+          if raw_path.stat().st_size > 1_000_000:
+              raise SystemExit("index manifest exceeds the evidence bound")
+          data = json.loads(raw_path.read_text(encoding="utf-8"))
+          manifests = data.get("manifests")
+          if not isinstance(manifests, list):
+              raise SystemExit("index has no descriptor list")
+          selected = {}
+          sanitized = {"schemaVersion": data.get("schemaVersion"), "mediaType": data.get("mediaType"), "manifests": []}
+          for item in manifests:
+              if not isinstance(item, dict) or not digest_re.fullmatch(str(item.get("digest", ""))):
+                  raise SystemExit("malformed descriptor")
+              platform = item.get("platform")
+              if not isinstance(platform, dict):
+                  raise SystemExit("descriptor has no platform")
+              os_name, arch = platform.get("os"), platform.get("architecture")
+              if not isinstance(os_name, str) or not isinstance(arch, str):
+                  raise SystemExit("malformed descriptor platform")
+              sanitized["manifests"].append({
+                  "digest": item["digest"], "mediaType": item.get("mediaType"),
+                  "platform": {"architecture": arch, "os": os_name},
+              })
+              pair = f"{os_name}/{arch}"
+              if pair in {"linux/amd64", "linux/arm64"}:
+                  if pair in selected:
+                      raise SystemExit(f"duplicate executable platform: {pair}")
+                  selected[pair] = item["digest"]
+              elif pair != "unknown/unknown":
+                  raise SystemExit(f"unexpected executable platform: {pair}")
+          if set(selected) != {"linux/amd64", "linux/arm64"}:
+              raise SystemExit("index must contain exactly one AMD64 and one ARM64 image")
+          Path("qualification-artifacts/index-manifest.json").write_text(
+              json.dumps(sanitized, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          output = Path(os.environ["GITHUB_ENV"])
+          with output.open("a", encoding="utf-8") as stream:
+              stream.write(f"AMD64_DIGEST={selected['linux/amd64']}\n")
+              stream.write(f"ARM64_DIGEST={selected['linux/arm64']}\n")
+          PY
+
+      - name: Pull and qualify both immutable platform descriptors
+        id: gates
+        if: steps.inputs.outcome == 'success' && steps.index.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          overall=0
+          for platform in linux/amd64 linux/arm64; do
+            arch="${platform#linux/}"
+            if [[ "${arch}" == "amd64" ]]; then
+              platform_digest="${AMD64_DIGEST}"
+              port=55100
+            else
+              platform_digest="${ARM64_DIGEST}"
+              port=55200
+            fi
+            coordinate="${OCI_REPOSITORY}@${platform_digest}"
+            evidence="qualification-artifacts/relay-release-safety-${arch}-evidence.json"
+            pulled=0
+            docker pull --platform "${platform}" "${coordinate}" || pulled=1
+            if [[ "${pulled}" -eq 0 ]]; then
+              python scripts/relay_release_safety_gate.py \
+                --image "${coordinate}" \
+                --platform "${platform}" \
+                --source-commit "${INPUT_SOURCE_COMMIT}" \
+                --release-ref "${INPUT_RELEASE_REF}" \
+                --release-base "${INPUT_RELEASE_BASE}" \
+                --resolved-revision "${INPUT_SOURCE_COMMIT}" \
+                --registry-coordinate "${coordinate}" \
+                --index-digest "${INPUT_INDEX_DIGEST}" \
+                --platform-digest "${platform_digest}" \
+                --port "${port}" \
+                --evidence "${evidence}" || overall=1
+              cleanup="passed"
+              mapfile -t leftovers < <(docker ps -aq --filter 'name=^/relay-safety-')
+              if (( ${#leftovers[@]} )); then
+                cleanup="failed"
+                docker rm -f "${leftovers[@]}" >/dev/null 2>&1 || true
+                overall=1
+              fi
+              EVIDENCE="${evidence}" CLEANUP="${cleanup}" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["EVIDENCE"])
+          value = json.loads(path.read_text(encoding="utf-8"))
+          value["cleanup"] = os.environ["CLEANUP"]
+          if value["cleanup"] != "passed":
+              value["passed"] = False
+              value.setdefault("error_category", "cleanup_failed")
+          path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+            else
+              overall=1
+            fi
+          done
+          exit "${overall}"
+
+      - name: Verify evidence and assemble bounded record
+        id: evidence
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          out = Path("qualification-artifacts")
+          validated_path = Path("validated-inputs.json")
+          validated = (
+              json.loads(validated_path.read_text(encoding="utf-8"))
+              if validated_path.is_file()
+              else {key: "invalid" for key in ("evidence_label", "index_digest", "release_base", "release_ref", "source_commit")}
+          )
+          contract = json.loads(Path("config/relay_release_safety_contract.json").read_text(encoding="utf-8"))
+          required = [entry["id"] for entry in contract["requirements"]]
+          if len(required) != len(set(required)):
+              raise SystemExit("mandatory contract contains duplicate IDs")
+          forbidden = {"authorization", "credentials", "request_body", "response", "responses", "response_body", "client_identity", "key", "token", "ciphertext", "prompt", "model_output", "raw_path", "generated_path"}
+          statuses = {}
+          digests = {"linux/amd64": os.environ.get("AMD64_DIGEST", "unresolved"), "linux/arm64": os.environ.get("ARM64_DIGEST", "unresolved")}
+          errors = []
+          for platform, arch in (("linux/amd64", "amd64"), ("linux/arm64", "arm64")):
+              path = out / f"relay-release-safety-{arch}-evidence.json"
+              try:
+                  if path.stat().st_size > 1_000_000:
+                      raise ValueError("evidence exceeds bound")
+                  evidence = json.loads(path.read_text(encoding="utf-8"))
+                  def field_names(value):
+                      if isinstance(value, dict):
+                          for key, child in value.items():
+                              yield str(key).lower()
+                              yield from field_names(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              yield from field_names(child)
+                  if set(field_names(evidence)) & forbidden:
+                      raise ValueError("evidence contains a forbidden field")
+                  results = evidence.get("results")
+                  if not isinstance(results, dict) or set(results) != set(required) or len(results) != len(required):
+                      raise ValueError("mandatory results are missing, duplicated, or reordered")
+                  if any(value.get("state") != "passed" or value.get("passed") is not True for value in results.values()):
+                      raise ValueError("mandatory result did not pass")
+                  expected = {
+                      "passed": True, "cleanup": "passed", "source_commit": validated["source_commit"],
+                      "release_ref": validated["release_ref"], "release_base": validated["release_base"],
+                      "platform": platform,
+                      "index_digest": validated["index_digest"], "platform_digest": digests[platform],
+                      "registry_coordinate": f"{os.environ['OCI_REPOSITORY']}@{digests[platform]}",
+                  }
+                  for key, value in expected.items():
+                      if evidence.get(key) != value:
+                          raise ValueError(f"identity or cleanup mismatch: {key}")
+                  statuses[platform] = "passed"
+              except Exception as exc:
+                  statuses[platform] = "failed"
+                  errors.append(f"{platform}: {type(exc).__name__}")
+          metadata = {
+              "schema_version": 1, "evidence_label": validated["evidence_label"],
+              "repository": os.environ["OCI_REPOSITORY"], "source_commit": validated["source_commit"],
+              "index_digest": validated["index_digest"], "release_ref": validated["release_ref"],
+              "release_base": validated["release_base"], "gate_commit": os.environ.get("GATE_COMMIT", "unresolved"),
+              "platform_digests": digests, "platform_results": statuses,
+          }
+          metadata_path = out / "qualification-metadata.json"
+          metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          names = ["index-manifest.json", "relay-release-safety-amd64-evidence.json", "relay-release-safety-arm64-evidence.json", "qualification-metadata.json"]
+          missing = [name for name in names if not (out / name).is_file()]
+          sums = []
+          for name in names:
+              path = out / name
+              if path.is_file():
+                  sums.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}")
+          (out / "SHA256SUMS").write_text("\n".join(sums) + "\n", encoding="utf-8")
+          if missing or errors or statuses != {"linux/amd64": "passed", "linux/arm64": "passed"}:
+              raise SystemExit("evidence failed closed: " + ", ".join(missing + errors))
+          PY
+
+      - name: Upload the immutable qualification evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: qualification-artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Write qualification summary
+        if: always()
+        shell: bash
+        run: |
+          amd64_result="failed"
+          arm64_result="failed"
+          source="invalid"
+          index_digest="invalid"
+          if [[ -f qualification-artifacts/qualification-metadata.json ]]; then
+            amd64_result="$(jq -r '.platform_results["linux/amd64"] // "failed"' qualification-artifacts/qualification-metadata.json)"
+            arm64_result="$(jq -r '.platform_results["linux/arm64"] // "failed"' qualification-artifacts/qualification-metadata.json)"
+            source="$(jq -r '.source_commit' qualification-artifacts/qualification-metadata.json)"
+            index_digest="$(jq -r '.index_digest' qualification-artifacts/qualification-metadata.json)"
+          fi
+          {
+            echo "## Immutable relay OCI qualification"
+            echo ""
+            echo "Source: \`${source}\`"
+            echo "Index: \`${OCI_REPOSITORY}@${index_digest}\`"
+            echo "AMD64 descriptor: \`${AMD64_DIGEST:-unresolved}\` — ${amd64_result}"
+            echo "ARM64 descriptor: \`${ARM64_DIGEST:-unresolved}\` — ${arm64_result}"
+            echo "Gate implementation commit: \`${GATE_COMMIT:-unresolved}\`"
+            echo "Evidence artifact: \`${ARTIFACT_NAME}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Remove local qualification files
+        id: cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f validated-inputs.json
+          rm -rf qualification-artifacts
+          [[ ! -e validated-inputs.json && ! -e qualification-artifacts ]]
+
+      - name: Enforce qualification result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ steps.inputs.outcome }}" == "success" ]]
+          [[ "${{ steps.index.outcome }}" == "success" ]]
+          [[ "${{ steps.gates.outcome }}" == "success" ]]
+          [[ "${{ steps.evidence.outcome }}" == "success" ]]
+          [[ "${{ steps.cleanup.outcome }}" == "success" ]]

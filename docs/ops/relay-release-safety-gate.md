@@ -75,6 +75,45 @@ unique candidate index. The workflow qualifies the two descriptors from that exa
 requires adding the platform to the build, exact manifest-membership assertion, qualification loop,
 workflow regression tests, and operator documentation in the same change.
 
+## Read-only qualification of an existing OCI index
+
+`.github/workflows/qualify-relay-oci.yml` is a manual, read-only executor for an already-published
+index in the fixed `ghcr.io/futuroptimist/tokenplace-relay` repository. It checks out `main` so the
+gate implementation commit is distinct from the artifact's declared source commit. The executor
+validates every input before shell use, inspects the immutable index, resolves exactly one
+`linux/amd64` and one `linux/arm64` descriptor, pulls each descriptor by digest, and runs the gate
+once per platform. It does not build, publish, promote, retag, deploy, or contact an application
+environment.
+
+The uploaded `relay-oci-qualification-<run-id>-<attempt>` artifact contains:
+
+- `index-manifest.json`, a bounded and sanitized copy containing only index media type, schema
+  version, descriptor media types, descriptor digests, and platforms;
+- `relay-release-safety-amd64-evidence.json` and
+  `relay-release-safety-arm64-evidence.json`, the platform gate reports;
+- `qualification-metadata.json`, which binds the label, repository, source/ref/base, index and
+  platform digests, gate implementation commit, and platform outcomes; and
+- `SHA256SUMS`, covering the four JSON documents above.
+
+The artifact upload runs even after an earlier failure. Qualification still fails unless both
+evidence files parse, contain every current contract result exactly once with a passing state,
+match all supplied and resolved identities, and report successful container cleanup. Reports are
+bounded and rejected if they contain fields for credentials, authorization, bodies, responses,
+client identities, keys, tokens, ciphertext, prompts, model output, or generated/raw paths.
+
+### Planned Step 05b dispatches (not yet executed)
+
+After this executor has merged, operators plan these two separate manual dispatches. Listing them
+does **not** claim that either artifact has passed qualification.
+
+| Input | Qwen candidate | Corrected Llama rollback |
+| --- | --- | --- |
+| `index_digest` | `sha256:b32ef19840dabe44caf7240b787af14dcf439b39357833e21a92c3dd511effd4` | `sha256:543fde33aff45253630090b52d16163e3586da12c973f5c4a658ddc8927d0a68` |
+| `source_commit` | `8618c9aba4b5dfe7980c2fe861095a92311145f2` | `6c39adc64e7bed4f85d07164aa2860e637919ca9` |
+| `release_ref` | `main-8618c9a` | `sha-6c39adc` |
+| `release_base` | `main` | `release/relay-0.1.1` |
+| `evidence_label` | `step-05b-qwen-8618c9a` | `step-05b-llama-6c39adc` |
+
 ## Maintain the contract
 
 To add a mandatory requirement:

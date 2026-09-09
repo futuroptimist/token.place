@@ -44,6 +44,9 @@ def test_exact_descriptors_are_inspected_pulled_and_qualified_without_mutation()
     assert 'coordinate="${OCI_REPOSITORY}@${platform_digest}"' in text
     assert "duplicate executable platform" in text
     assert "unexpected executable platform" in text
+    assert "application/vnd.oci.image.manifest.v1+json" in text
+    assert "application/vnd.docker.distribution.manifest.v2+json" in text
+    assert "platform descriptor is not an executable image manifest" in text
     assert 'set(selected) != {"linux/amd64", "linux/arm64"}' in text
     gate = text[text.index("Pull and qualify both immutable") : text.index("Verify evidence")]
     assert "for platform in linux/amd64 linux/arm64" in gate
@@ -69,6 +72,7 @@ def test_evidence_fails_closed_and_uploads_even_on_failure() -> None:
     assert "mandatory result did not pass" in verify
     assert "source_commit" in verify and "index_digest" in verify and "platform_digest" in verify
     assert "forbidden" in verify and "field_names(evidence)" in verify
+    assert "path.unlink(missing_ok=True)" in verify
     assert 'names = ["index-manifest.json", "relay-release-safety-amd64-evidence.json", "relay-release-safety-arm64-evidence.json", "qualification-metadata.json"]' in verify
     assert 'out / "SHA256SUMS"' in verify
     upload = text[text.index("Upload the immutable") : text.index("Write qualification summary")]
@@ -82,8 +86,12 @@ def test_main_gate_commit_cleanup_and_safe_summary_are_explicit() -> None:
     text = _text()
     checkout = text[text.index("Check out the main-branch") : text.index("Record gate commit")]
     assert "ref: main" in checkout and "persist-credentials: false" in checkout
+    action_uses = re.findall(r"(?m)^\s+uses:\s+([^\s#]+)", text)
+    assert action_uses and all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", use) for use in action_uses)
     assert 'gate_commit="$(git rev-parse HEAD)"' in text
     assert "docker rm -f" in text and 'cleanup="failed"' in text
+    assert "--filter 'name=relay-safety-'" in text
+    assert 'value.setdefault("cleanup", detected_cleanup)' in text
     assert "rm -f validated-inputs.json" in text and "rm -rf qualification-artifacts" in text
     assert "steps.cleanup.outcome" in text
     assert "Source:" in text and "AMD64 descriptor:" in text and "ARM64 descriptor:" in text

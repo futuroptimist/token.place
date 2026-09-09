@@ -42,7 +42,7 @@ jobs:
       ARTIFACT_NAME: relay-oci-qualification-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out the main-branch gate implementation
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
           fetch-depth: 1
@@ -85,17 +85,17 @@ jobs:
 
       - name: Set up QEMU for ARM64
         if: steps.inputs.outcome == 'success'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
         if: steps.inputs.outcome == 'success'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR for package reads
         if: steps.inputs.outcome == 'success'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -119,6 +119,10 @@ jobs:
           from pathlib import Path
 
           digest_re = re.compile(r"sha256:[0-9a-f]{64}\Z")
+          runnable_media_types = {
+              "application/vnd.docker.distribution.manifest.v2+json",
+              "application/vnd.oci.image.manifest.v1+json",
+          }
           raw_path = Path(os.environ["RAW_INDEX"])
           if raw_path.stat().st_size > 1_000_000:
               raise SystemExit("index manifest exceeds the evidence bound")
@@ -143,6 +147,8 @@ jobs:
               })
               pair = f"{os_name}/{arch}"
               if pair in {"linux/amd64", "linux/arm64"}:
+                  if item.get("mediaType") not in runnable_media_types:
+                      raise SystemExit(f"platform descriptor is not an executable image manifest: {pair}")
                   if pair in selected:
                       raise SystemExit(f"duplicate executable platform: {pair}")
                   selected[pair] = item["digest"]
@@ -194,7 +200,7 @@ jobs:
                 --port "${port}" \
                 --evidence "${evidence}" || overall=1
               cleanup="passed"
-              mapfile -t leftovers < <(docker ps -aq --filter 'name=^/relay-safety-')
+              mapfile -t leftovers < <(docker ps -aq --filter 'name=relay-safety-')
               if (( ${#leftovers[@]} )); then
                 cleanup="failed"
                 docker rm -f "${leftovers[@]}" >/dev/null 2>&1 || true
@@ -207,7 +213,11 @@ jobs:
 
           path = Path(os.environ["EVIDENCE"])
           value = json.loads(path.read_text(encoding="utf-8"))
-          value["cleanup"] = os.environ["CLEANUP"]
+          detected_cleanup = os.environ["CLEANUP"]
+          if detected_cleanup != "passed":
+              value["cleanup"] = detected_cleanup
+          else:
+              value.setdefault("cleanup", detected_cleanup)
           if value["cleanup"] != "passed":
               value["passed"] = False
               value.setdefault("error_category", "cleanup_failed")
@@ -265,7 +275,7 @@ jobs:
                       raise ValueError("evidence contains a forbidden field")
                   results = evidence.get("results")
                   if not isinstance(results, dict) or set(results) != set(required) or len(results) != len(required):
-                      raise ValueError("mandatory results are missing, duplicated, or reordered")
+                      raise ValueError("mandatory results contain missing or unexpected IDs")
                   if any(value.get("state") != "passed" or value.get("passed") is not True for value in results.values()):
                       raise ValueError("mandatory result did not pass")
                   expected = {
@@ -282,6 +292,8 @@ jobs:
               except Exception as exc:
                   statuses[platform] = "failed"
                   errors.append(f"{platform}: {type(exc).__name__}")
+                  # Never retain or upload evidence that failed schema/sensitivity checks.
+                  path.unlink(missing_ok=True)
           metadata = {
               "schema_version": 1, "evidence_label": validated["evidence_label"],
               "repository": os.environ["OCI_REPOSITORY"], "source_commit": validated["source_commit"],
@@ -305,7 +317,7 @@ jobs:
 
       - name: Upload the immutable qualification evidence bundle
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: qualification-artifacts/

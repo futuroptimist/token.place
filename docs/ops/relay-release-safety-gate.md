@@ -83,7 +83,11 @@ gate implementation commit is distinct from the artifact's declared source commi
 validates every input before shell use, inspects the immutable index, resolves exactly one
 `linux/amd64` and one `linux/arm64` descriptor, pulls each descriptor by digest, and runs the gate
 once per platform. It does not build, publish, promote, retag, deploy, or contact an application
-environment.
+environment. Index decoding rejects duplicate JSON members and requires schema version 2 with an
+OCI index or Docker manifest-list media type. Executable descriptors must have bounded, correctly
+typed fields and an OCI image-manifest or Docker v2 image-manifest media type; a nested index can
+never stand in for the digest of an executable image. Permitted `unknown/unknown` non-executable
+descriptors are validated but omitted from the sanitized index record.
 
 The uploaded `relay-oci-qualification-<run-id>-<attempt>` artifact contains:
 
@@ -95,16 +99,29 @@ The uploaded `relay-oci-qualification-<run-id>-<attempt>` artifact contains:
   platform digests, gate implementation commit, and platform outcomes; and
 - `SHA256SUMS`, covering the four JSON documents above.
 
-The artifact upload runs even after an earlier failure. Qualification still fails unless both
-evidence files parse, contain every current contract result exactly once with a passing state,
-match all supplied and resolved identities, and report successful container cleanup. Reports are
-bounded and rejected if they contain fields for credentials, authorization, bodies, responses,
+The artifact upload runs even after an earlier failure and names exactly those four JSON files plus
+`SHA256SUMS`. Raw gate reports remain outside the upload directory. Missing, malformed, oversized,
+duplicate-member, sensitive, or otherwise rejected reports are replaced with a minimal bounded
+failure record; rejected bytes and exception/input details are never copied into the bundle.
+Checksums cover the final sanitized bytes even on failure.
+
+Qualification still fails unless both schema-version-2 evidence objects contain every requirement
+from the checked-out contract exactly once with a literal `true` passing value, match all supplied
+and resolved identities, and have confirmed gate and container-cleanup success. A gate may omit
+`cleanup` only on success, in which case the executor adds `passed` after checking Docker itself;
+an explicit gate cleanup failure is never overwritten. Docker listing, each owned-container
+removal, raw-file cleanup, artifact cleanup, gate execution, and both platform runs feed the final
+outcome and summary. Cleanup is attempted on failed and interrupted paths, and failures fail closed.
+Reports are rejected if they contain fields for credentials, authorization, bodies, responses,
 client identities, keys, tokens, ciphertext, prompts, model output, or generated/raw paths.
 
 ### Planned Step 05b dispatches (not yet executed)
 
 After this executor has merged, operators plan these two separate manual dispatches. Listing them
 does **not** claim that either artifact has passed qualification.
+
+Progress ledger remains unchanged: **Step 05b is in progress; Step 06 has zero attempts.** Neither
+planned parameter set below has been dispatched.
 
 | Input | Qwen candidate | Corrected Llama rollback |
 | --- | --- | --- |

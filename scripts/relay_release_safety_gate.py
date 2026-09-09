@@ -21,7 +21,15 @@ EXPECTED_IDS = {
     "metrics.valid_instrumentation", "metrics.no_flask_defaults", "metrics.no_raw_paths",
     "metrics.bounded_unmatched_paths", "quota.public_information_exempt",
     "quota.protected_rate_limited", "quota.protected_daily_limited",
+    "quota.mutating_rate_limited", "quota.mutating_daily_limited",
 }
+UNMATCHED_BATCH_SIZE = 1024
+METRICS_RATE_LIMIT = "5000/minute"
+METRICS_DAILY_QUOTA = "5000/day"
+METRICS_SCRAPE_COUNT = 4
+PUBLIC_INFORMATION_PATHS = ("/", "/api/v1/meta", "/api/v1/version")
+PROTECTED_READ_PATH = "/api/v1/models"
+MUTATING_PATH = "/api/v1/relay/requests/cancel"
 GIT_SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 METRIC_NAME = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
@@ -60,8 +68,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def request(base_url: str, path: str, method: str = "GET") -> tuple[int, str]:
-    req = urllib.request.Request(f"{base_url}{path}", method=method)
+def request(
+    base_url: str, path: str, method: str = "GET", body: bytes | None = None,
+) -> tuple[int, str]:
+    headers = {"Content-Type": "application/json"} if body is not None else {}
+    req = urllib.request.Request(f"{base_url}{path}", data=body, headers=headers, method=method)
     try:
         opener = urllib.request.build_opener(_NoRedirect)
         with opener.open(req, timeout=5) as response:  # nosec B310 -- fixed loopback origin
@@ -118,19 +129,23 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
     if status != 200:
         return results
     try:
-        parse_metrics(warm)  # warm lazy collectors before the baseline
+        warmed = parse_metrics(warm)  # warm lazy collectors before the baseline
         status, before_text = request(base_url, "/metrics")
         if status != 200:
             return results
         before = parse_metrics(before_text)
-        first = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(24)]
+        first = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(UNMATCHED_BATCH_SIZE)]
+        if len(set(first)) < 1024:
+            return results
         if any(request(base_url, path)[0] != 404 for path in first):
             return results
         status, middle_text = request(base_url, "/metrics")
         if status != 200:
             return results
         middle = parse_metrics(middle_text)
-        second = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(24)]
+        second = [f"/release-safety-unmatched-{uuid.uuid4().hex}" for _ in range(UNMATCHED_BATCH_SIZE)]
+        if len(set(second)) < 1024 or set(first) & set(second):
+            return results
         if any(request(base_url, path)[0] != 404 for path in second):
             return results
         status, after_text = request(base_url, "/metrics")
@@ -139,21 +154,28 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
         after = parse_metrics(after_text)
     except GateFailure:
         return results
-    names = {sample.name for sample in after}
+    observations = warmed | before | middle | after
+    observed_names = {sample.name for sample in observations}
+    final_names = {sample.name for sample in after}
     expected = {"tokenplace_http_requests_total", "tokenplace_instrumentation_up"}
     instrumentation = [sample for sample in after if sample.name == "tokenplace_instrumentation_up"]
+    # Safety violations are sticky across scrapes, but required instrumentation
+    # must still be exported by the final scrape used for qualification.
     results["metrics.valid_instrumentation"] = {
-        "passed": expected <= names and bool(instrumentation)
+        "passed": expected <= final_names and bool(instrumentation)
         and all(float(sample.value) == 1 for sample in instrumentation)
     }
-    results["metrics.no_flask_defaults"] = {"passed": not any(n.startswith("flask_http_") for n in names)}
+    results["metrics.no_flask_defaults"] = {
+        "passed": not any(name.startswith("flask_http_") for name in observed_names)
+    }
     all_paths = first + second
     unsafe = False
-    # Bounded collectors may create their fixed ``unknown``/``other`` series
-    # lazily during the first unmatched batch. Only continued identity growth
-    # in the successive batch demonstrates transformed per-path labels.
-    continued_growth = after - middle
-    for sample in after:
+    # Bounded collectors may create fixed fallback series lazily during the
+    # first unmatched batch. Inspect identities introduced by either batch so
+    # a collector cannot hide attacker-derived labels by stopping at a cap.
+    probe_growth = (middle - before) | (after - middle)
+    bounded_fallbacks = {"unknown", "other", "/{unmatched}"}
+    for sample in observations:
         for key, value in sample.labels:
             # Flask endpoint names and normalized route templates are bounded; the
             # presence of an ``endpoint`` label alone is therefore not unsafe.
@@ -161,26 +183,77 @@ def execute_metrics_checks(base_url: str) -> dict[str, dict[str, object]]:
                 "release-safety-unmatched-" in value
                 or bool(re.search(r"/(?:[0-9a-f]{16,}|\d{6,})(?:/|$)", value, re.IGNORECASE))
             )
-            transformed_per_path = sample in continued_growth and key in {"path", "route", "endpoint", "url"}
+            transformed_per_path = (
+                sample in probe_growth
+                and key in {"path", "route", "endpoint", "url"}
+                and value not in bounded_fallbacks
+            )
             if raw_path or transformed_per_path or value in all_paths or "release-safety-unmatched-" in value:
                 unsafe = True
     results["metrics.no_raw_paths"] = {"passed": not unsafe}
     growth1, growth2 = len(middle - before), len(after - middle)
     results["metrics.bounded_unmatched_paths"] = {
-        "passed": growth2 == 0, "first_batch_growth": growth1, "second_batch_growth": growth2,
+        "passed": growth2 == 0,
+        "batch_size": UNMATCHED_BATCH_SIZE,
+        "total_unmatched_requests": 2 * UNMATCHED_BATCH_SIZE,
+        "first_batch_growth": growth1,
+        "second_batch_growth": growth2,
     }
     return results
 
 
-def execute_quota_checks(base_url: str, limit_id: str) -> dict[str, dict[str, object]]:
+def execute_public_exemption_check(base_url: str) -> dict[str, dict[str, object]]:
     public = [request(base_url, path, method)[0] for method in ("GET", "HEAD")
-              for path in ("/", "/api/v1/meta", "/api/v1/version") for _ in range(2)]
-    first = request(base_url, "/api/v1/models")[0]
-    second = request(base_url, "/api/v1/models")[0]
-    return {
-        "quota.public_information_exempt": {"passed": all(code == 200 for code in public)},
-        limit_id: {"passed": first == 200 and second == 429},
-    }
+              for path in PUBLIC_INFORMATION_PATHS for _ in range(2)]
+    # Use a registered endpoint as the quota sentinel. Flask-Limiter skips
+    # unrouted requests, so 404 responses cannot prove quota consumption.
+    sentinel = [request(base_url, PROTECTED_READ_PATH)[0] for _ in range(2)]
+    return {"quota.public_information_exempt": {
+        "passed": all(code == 200 for code in public) and sentinel == [200, 429],
+        "safe_methods_response_class": "2xx" if all(code == 200 for code in public) else "unexpected",
+        "sentinel_status_codes": sentinel,
+    }}
+
+
+def inspect_public_exemption_predicate(container: str) -> bool:
+    """Prove exact public path/method matching inside the inspected image."""
+    program = """import json
+from flask import Flask
+from api import _is_public_api_rate_limit_exempt_path as exempt
+paths = ('/', '/api/v1/meta', '/api/v1/version')
+app = Flask(__name__)
+def check(path, method):
+    with app.test_request_context(path, method=method):
+        return exempt(path)
+result = all(check(path, method) for path in paths for method in ('GET', 'HEAD'))
+result = result and all(not check(path + ('release-safety-neighbor' if path == '/' else '/release-safety-neighbor'), 'GET') for path in paths)
+result = result and all(not check(path, 'POST') for path in paths)
+print(json.dumps({'passed': result}))
+"""
+    try:
+        output = docker_output("exec", container, "python", "-c", program)
+        def reject_duplicate_keys(pairs):
+            if len({key for key, _ in pairs}) != len(pairs):
+                raise ValueError("duplicate key")
+            return dict(pairs)
+
+        result = json.loads(output, object_pairs_hook=reject_duplicate_keys)
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(result, dict) and set(result) == {"passed"} and result["passed"] is True
+
+
+def execute_quota_check(base_url: str, limit_id: str, *, mutating: bool) -> dict[str, dict[str, object]]:
+    if mutating:
+        statuses = [request(base_url, MUTATING_PATH, "POST", b"{}")[0] for _ in range(2)]
+        expected_first = 400
+    else:
+        statuses = [request(base_url, PROTECTED_READ_PATH)[0] for _ in range(2)]
+        expected_first = 200
+    return {limit_id: {
+        "passed": statuses == [expected_first, 429],
+        "status_codes": statuses,
+    }}
 
 
 def validate_candidate_identity(source: str, revision: str, resolved_revision: str | None = None) -> None:
@@ -287,8 +360,21 @@ def main() -> int:
         validate_registry_identity(image_id, args.platform, args.registry_coordinate, args.index_digest,
                                    args.platform_digest)
 
-        phases = [("metrics", "1000/minute", "1000/day"), ("rate", "1/minute", "1000/day"), ("daily", "1000/minute", "1/day")]
-        for offset, (phase, rate, daily) in enumerate(phases):
+        complete_metrics_probe_count = 2 * UNMATCHED_BATCH_SIZE + METRICS_SCRAPE_COUNT
+        if any(int(limit.split("/", 1)[0]) <= complete_metrics_probe_count for limit in (
+            METRICS_RATE_LIMIT, METRICS_DAILY_QUOTA,
+        )):
+            raise GateFailure("metrics_probe_quota_invalid")
+
+        phases = [
+            ("metrics", METRICS_RATE_LIMIT, METRICS_DAILY_QUOTA, None),
+            ("public", "1/minute", "1/day", "public"),
+            ("protected-rate", "1/minute", "5000/day", "quota.protected_rate_limited"),
+            ("protected-daily", "5000/minute", "1/day", "quota.protected_daily_limited"),
+            ("mutating-rate", "1/minute", "5000/day", "quota.mutating_rate_limited"),
+            ("mutating-daily", "5000/minute", "1/day", "quota.mutating_daily_limited"),
+        ]
+        for offset, (phase, rate, daily, check_id) in enumerate(phases):
             container = f"relay-safety-{phase}-{uuid.uuid4().hex[:8]}"
             containers.append(container)
             docker_output("run", "-d", "--rm", "--name", container, "-p", f"127.0.0.1:{args.port + offset}:5010",
@@ -302,20 +388,20 @@ def main() -> int:
                 time.sleep(.5)
             else:
                 raise GateFailure("startup_timeout")
-            checked = execute_metrics_checks(base) if phase == "metrics" else execute_quota_checks(
-                base, f"quota.protected_{phase}_limited")
+            if phase == "metrics":
+                checked = execute_metrics_checks(base)
+            elif phase == "public":
+                checked = execute_public_exemption_check(base)
+                public_result = checked.get("quota.public_information_exempt")
+                if public_result is not None:
+                    public_result["predicate_exact"] = inspect_public_exemption_predicate(container)
+                    public_result["passed"] = public_result["passed"] and public_result["predicate_exact"]
+            else:
+                assert check_id is not None
+                checked = execute_quota_check(base, check_id, mutating=phase.startswith("mutating-"))
             for key, result in checked.items():
                 result["state"] = "passed" if result["passed"] else "failed"
-                if key == "quota.public_information_exempt":
-                    aggregate = evidence["results"][key]
-                    aggregate.setdefault("phases", {})[phase] = result
-                    phase_results = aggregate["phases"]
-                    aggregate["passed"] = set(phase_results) == {"rate", "daily"} and all(
-                        item["passed"] for item in phase_results.values()
-                    )
-                    aggregate["state"] = "passed" if aggregate["passed"] else "failed"
-                else:
-                    evidence["results"][key] = result
+                evidence["results"][key] = result
         evidence["passed"] = all(v.get("state") == "passed" for v in evidence["results"].values())
         if not evidence["passed"]:
             evidence["error_category"] = "mandatory_check_failed"

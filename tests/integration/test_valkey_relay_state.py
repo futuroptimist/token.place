@@ -3643,6 +3643,90 @@ def test_expired_addressed_control_identity_mismatch_is_not_deleted(valkey_serve
         second.close()
 
 
+def test_control_acknowledgement_is_idempotent_and_expiry_is_authenticated(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server, namespace, control_tombstone_ttl_seconds=0.05
+    )
+    second = _registration_store(
+        valkey_server, namespace, control_tombstone_ttl_seconds=0.05
+    )
+    node, owner, consumer = "control-ack-node", _digest("control-ack-owner"), "consumer"
+    identity = ("control-ack-client", "control-ack-request")
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        claim = first.claim_queued_request(node, owner, consumer)
+        first.cancel_or_expire_request(*identity, "cancel")
+        for store in (second, first):
+            result = store.renew_claim_or_read_control(
+                node, owner, consumer, *identity, claim.generation, acknowledge=True
+            )
+            assert (result.state, result.acknowledged) == ("acknowledged", True)
+
+        cfg = first._foundation.config
+        client, request = first._identity(*identity)
+        node_digest = first._node_digest(node)
+        control = cfg.key("control", node_digest, client, request)
+        index = cfg.key("control:expiry")
+        member = f"{node_digest}:{client}:{request}"
+        expiry = first._foundation._client.zscore(index, member)
+        _wait_for_server_epoch(first, expiry)
+        before = (first._foundation._client.dump(control), first._foundation._client.dump(index))
+        assert second.renew_claim_or_read_control(
+            node, _digest("wrong-owner"), consumer, *identity, claim.generation
+        ).state == "owner_mismatch"
+        assert (first._foundation._client.dump(control), first._foundation._client.dump(index)) == before
+        assert second.renew_claim_or_read_control(
+            node, owner, consumer, *identity, claim.generation
+        ).state == "missing_or_expired"
+        assert first._foundation._client.exists(control) == 0
+        assert first._foundation._client.zscore(index, member) is None
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize("authority", ("progress", "orphan-control-index"))
+def test_control_renewal_rejects_unsupported_authority_without_mutation(
+    valkey_server, authority
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, consumer = "control-schema-node", _digest("control-schema-owner"), "consumer"
+    identity = (f"control-schema-{authority}", "request")
+    try:
+        store.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(store, node, owner, *identity, time.time() + 60)
+        claim = store.claim_queued_request(node, owner, consumer)
+        cfg = store._foundation.config
+        client, request = store._identity(*identity)
+        node_digest = store._node_digest(node)
+        if authority == "progress":
+            store._foundation._client.hset(
+                cfg.key("progress", client, request), "unsupported", "1"
+            )
+        else:
+            store._foundation._client.zadd(
+                cfg.key("control:expiry"),
+                {f"{node_digest}:{client}:{request}": time.time() + 60},
+            )
+        before = _claim_authority_snapshot(store, node, *identity)
+        extra = store._foundation._client.dump(cfg.key("control:expiry"))
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.renew_claim_or_read_control(
+                node, owner, consumer, *identity, claim.generation
+            )
+        assert _claim_authority_snapshot(store, node, *identity) == before
+        assert store._foundation._client.dump(cfg.key("control:expiry")) == extra
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store._foundation._client.delete(store._foundation.config.key("control:expiry"))
+        store.close()
+
+
 def _delete_claim_fixture_state(store, node_ids, identities):
     cfg = store._foundation.config
     keys = [

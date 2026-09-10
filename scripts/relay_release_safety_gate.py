@@ -342,7 +342,26 @@ def main() -> int:
         "index_digest": args.index_digest, "platform": args.platform, "platform_digest": args.platform_digest,
         "contract": str(CONTRACT_PATH.relative_to(ROOT)), "results": {}, "passed": False,
     }
-    containers: list[str] = []
+    owned_containers: set[str] = set()
+    cleanup_failed = False
+
+    def container_exists(container: str) -> bool:
+        completed = subprocess.run(
+            ["docker", "container", "inspect", container], check=False,
+            capture_output=True, timeout=15,
+        )
+        return completed.returncode == 0
+
+    def remove_owned(container: str) -> bool:
+        """Remove a container proven to belong to this invocation."""
+        completed = subprocess.run(
+            ["docker", "rm", "-f", container], check=False,
+            capture_output=True, timeout=15,
+        )
+        if completed.returncode == 0:
+            owned_containers.discard(container)
+            return True
+        return False
     try:
         requirements = load_contract()
         evidence["results"] = {item["id"]: {"state": "not_run", "passed": False} for item in requirements}
@@ -376,45 +395,60 @@ def main() -> int:
         ]
         for offset, (phase, rate, daily, check_id) in enumerate(phases):
             container = f"relay-safety-{phase}-{uuid.uuid4().hex[:8]}"
-            containers.append(container)
-            docker_output("run", "-d", "--rm", "--name", container, "-p", f"127.0.0.1:{args.port + offset}:5010",
-                          "-e", "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0", "-e", f"API_RATE_LIMIT={rate}",
-                          "-e", f"API_DAILY_QUOTA={daily}", image_id)
-            base = f"http://127.0.0.1:{args.port + offset}"
-            deadline = time.monotonic() + 45
-            while time.monotonic() < deadline:
-                if request(base, "/livez")[0] == 200:
-                    break
-                time.sleep(.5)
-            else:
-                raise GateFailure("startup_timeout")
-            if phase == "metrics":
-                checked = execute_metrics_checks(base)
-            elif phase == "public":
-                checked = execute_public_exemption_check(base)
-                public_result = checked.get("quota.public_information_exempt")
-                if public_result is not None:
-                    public_result["predicate_exact"] = inspect_public_exemption_predicate(container)
-                    public_result["passed"] = public_result["passed"] and public_result["predicate_exact"]
-            else:
-                assert check_id is not None
-                checked = execute_quota_check(base, check_id, mutating=phase.startswith("mutating-"))
-            for key, result in checked.items():
-                result["state"] = "passed" if result["passed"] else "failed"
-                evidence["results"][key] = result
+            try:
+                try:
+                    docker_output("run", "-d", "--rm", "--name", container, "-p", f"127.0.0.1:{args.port + offset}:5010",
+                                  "-e", "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0", "-e", f"API_RATE_LIMIT={rate}",
+                                  "-e", f"API_DAILY_QUOTA={daily}", image_id)
+                    owned_containers.add(container)
+                except BaseException:
+                    # A failed/interrupting docker invocation may still have created
+                    # the uniquely named container. Prove ownership before removal.
+                    try:
+                        if container_exists(container):
+                            owned_containers.add(container)
+                    except (OSError, subprocess.SubprocessError):
+                        cleanup_failed = True
+                    raise
+                base = f"http://127.0.0.1:{args.port + offset}"
+                deadline = time.monotonic() + 45
+                while time.monotonic() < deadline:
+                    if request(base, "/livez")[0] == 200:
+                        break
+                    time.sleep(.5)
+                else:
+                    raise GateFailure("startup_timeout")
+                if phase == "metrics":
+                    checked = execute_metrics_checks(base)
+                elif phase == "public":
+                    checked = execute_public_exemption_check(base)
+                    public_result = checked.get("quota.public_information_exempt")
+                    if public_result is not None:
+                        public_result["predicate_exact"] = inspect_public_exemption_predicate(container)
+                        public_result["passed"] = public_result["passed"] and public_result["predicate_exact"]
+                else:
+                    assert check_id is not None
+                    checked = execute_quota_check(base, check_id, mutating=phase.startswith("mutating-"))
+                for key, result in checked.items():
+                    result["state"] = "passed" if result["passed"] else "failed"
+                    evidence["results"][key] = result
+            finally:
+                if container in owned_containers:
+                    try:
+                        if not remove_owned(container):
+                            cleanup_failed = True
+                    except (OSError, subprocess.SubprocessError):
+                        cleanup_failed = True
         evidence["passed"] = all(v.get("state") == "passed" for v in evidence["results"].values())
         if not evidence["passed"]:
             evidence["error_category"] = "mandatory_check_failed"
     except (GateFailure, subprocess.SubprocessError, OSError) as exc:
         evidence["error_category"] = _category(exc)
     finally:
-        cleanup_failed = False
-        for container in containers:
+        # Bounded fallback for interruption or a failed immediate removal.
+        for container in tuple(owned_containers):
             try:
-                completed = subprocess.run(
-                    ["docker", "rm", "-f", container], check=False, capture_output=True, timeout=15
-                )
-                if completed.returncode != 0:
+                if not remove_owned(container):
                     cleanup_failed = True
             except (OSError, subprocess.SubprocessError):
                 cleanup_failed = True

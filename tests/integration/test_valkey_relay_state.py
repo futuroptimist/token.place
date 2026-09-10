@@ -9370,6 +9370,78 @@ def test_node_removed_record_rejects_malformed_terminal_authority(
         store.close()
 
 
+@pytest.mark.parametrize("malformed_digest", ("short", "g" * 64))
+def test_node_removed_record_rejects_malformed_control_cancellation_authority(
+    valkey_server, malformed_digest
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node = f"malformed-control-{malformed_digest[:4]}"
+    owner, consumer = _digest(f"owner-{malformed_digest}"), "consumer"
+    identity = (f"client-{malformed_digest[:4]}", f"request-{malformed_digest[:4]}")
+    try:
+        first.register(node, _capabilities(), owner)
+        _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
+        claimed = first.claim_queued_request(node, owner, consumer)
+        assert claimed is not None
+        result = first.unregister_node_and_transition_work(node, owner)
+        assert result.state == "complete"
+
+        cfg = first._foundation.config
+        client, request = first._identity(*identity)
+        node_digest = first._node_digest(node)
+        terminal_key = cfg.key("terminal", client, request)
+        request_key = cfg.key("request", client, request)
+        control_key = cfg.key("control", node_digest, client, request)
+        first._foundation._client.hset(
+            terminal_key, "cancellation_token_digest", malformed_digest
+        )
+        first._foundation._client.hset(
+            request_key, "cancellation_digest", malformed_digest
+        )
+        authority = {
+            key: first._foundation._client.hgetall(key)
+            for key in (terminal_key, request_key, control_key)
+        }
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            second.control_tombstones()
+        for acknowledge in (False, True):
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                second.renew_claim_or_read_control(
+                    node,
+                    owner,
+                    consumer,
+                    *identity,
+                    claimed.generation,
+                    acknowledge=acknowledge,
+                )
+            assert {
+                key: first._foundation._client.hgetall(key)
+                for key in (terminal_key, request_key, control_key)
+            } == authority
+            assert first._foundation._client.hget(
+                control_key, "acknowledged"
+            ) == b"0"
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        cfg = first._foundation.config
+        node_digest = first._node_digest(node)
+        client, request = first._identity(*identity)
+        first._foundation._client.delete(
+            cfg.key("node_work", node_digest),
+            cfg.key("node_tombstone", node_digest),
+            cfg.key("former_owner", node_digest, owner),
+            cfg.key("control", node_digest, client, request),
+            cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+            cfg.key("control:expiry"),
+        )
+        first.close()
+        second.close()
+
+
 def test_retention_reaper_reclaims_capacity_only_after_complete_validation(
     valkey_server,
 ):

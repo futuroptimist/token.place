@@ -284,7 +284,7 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     (
         (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "8d119dd0fa0d018b21c228468c86903a9ec9be7c78cd1af74b3ff61370f0b90e"),  # pragma: allowlist secret
         (valkey_relay_state.ENQUEUE_SCRIPT, "4874ac2612eecf044ed75efc7fdbd1ed8ca47944fbe437702be9d7119f3c40d7"),  # pragma: allowlist secret
-        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "3c64632c533e7775ddca620ec77aa6bba72c43b7c73c84dd3ed3b67ec37447be"),  # pragma: allowlist secret
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "1e56de3cc00a648f79257438009d40c2846e857fac6ce6ff6920f908b713cfeb"),  # pragma: allowlist secret
         (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "2c278634aef69bc277c86100740852f5cf7f26999e1597c3986dfbd514e9f5e4"),  # pragma: allowlist secret
     ),
 )

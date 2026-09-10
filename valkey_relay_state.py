@@ -1283,7 +1283,7 @@ if present~=0 then
   local sequence=integer(rv[9]); local current=integer(rv[10]); local entries=rv[11] and redis.call('XRANGE',queue,rv[11],rv[11],'COUNT',1) or {}
   if redis.call('EXISTS',terminal)~=1 or not terminal_expiry or terminal_score~=terminal_expiry or not accepted or accepted>now or not replay or replay~=accepted or accepted>terminal_expiry or terminal_expiry<expiry or tv[1]~=cv[8] or tv[2]~=cv[9] or
      tv[3]~='completed_unavailable' or tv[4]~=cv[4] or tv[5]~=cv[5] or tv[6]~=cv[6] or tv[7]~=cv[7] or tv[8]~='' or tv[12]=='' or tv[13]~='' or
-     (tv[1]=='cancelled' and tv[2]~='server_unregistered' and not digest(tv[14])) or (tv[1]=='expired' and tv[14]~='' and not digest(tv[14])) or tv[15]~=client or tv[16]~=request_digest or redis.call('EXISTS',request)~=1 or
+     (tv[14]~='' and not digest(tv[14])) or (tv[2]=='requester_cancelled' and tv[14]=='') or tv[15]~=client or tv[16]~=request_digest or redis.call('EXISTS',request)~=1 or
      rv[1]~=cv[8] or rv[2]~=client or rv[3]~=request_digest or rv[4]~=client_public_key or rv[5]~=request_id or rv[6]~=node_id or rv[7]~=node_digest or rv[8]~=cv[10] or rv[10]~=generation or
      not sequence or not current or rv[11]~=rv[9]..'-0' or not digest(tv[12]) or not digest(rv[12]) or tv[12]~=rv[12] or rv[13]~=tv[14] or rv[14]=='' or string.len(rv[4])>max_identity or string.len(rv[5])>max_identity or string.len(rv[6])>max_node_id or string.len(rv[14])>max_envelope or #entries~=0 or
      (tv[1]=='expired' and deadline>accepted) or
@@ -1329,7 +1329,7 @@ return {'continued',generation,value}
 CONTROL_CLAIM_SCRIPT = ReviewedScript(
     "renew_claim_or_read_control_v1",
     CONTROL_CLAIM_SOURCE,
-    "3c64632c533e7775ddca620ec77aa6bba72c43b7c73c84dd3ed3b67ec37447be",  # pragma: allowlist secret
+    "1e56de3cc00a648f79257438009d40c2846e857fac6ce6ff6920f908b713cfeb",  # pragma: allowlist secret
     True,
 )
 
@@ -4918,6 +4918,12 @@ class ValkeyRegistrationStore:
                     <= self.config.max_envelope_bytes
                     or lifecycle[b"cancellation_digest"]
                     != terminal[b"cancellation_token_digest"]
+                    or (
+                        terminal[b"cancellation_token_digest"] != b""
+                        and not self._completed_digest(
+                            terminal[b"cancellation_token_digest"]
+                        )
+                    )
                     or (
                         terminal[b"reason"] == b"requester_cancelled"
                         and not self._completed_digest(

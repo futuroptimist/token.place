@@ -610,7 +610,12 @@ def _run_qualified_main(tmp_path, monkeypatch, public=True, missing=None, cleanu
     def cleanup(*_args, **_kwargs):
         if cleanup_calls is not None:
             cleanup_calls.append(_args)
-        return subprocess.CompletedProcess([], cleanup_code)
+        command = _args[0]
+        # A failed removal must still report the container as present. This
+        # distinguishes a real cleanup failure from Docker confirming that an
+        # ``--rm`` container has already disappeared.
+        code = 0 if command[1:3] == ["container", "inspect"] else cleanup_code
+        return subprocess.CompletedProcess([], code)
 
     return _run_main(tmp_path, monkeypatch, lambda *_a: next(values), cleanup)
 
@@ -670,4 +675,114 @@ def test_nonzero_cleanup_preserves_qualification_failure_category(tmp_path, monk
         tmp_path, monkeypatch, cleanup_code=1, failed_id="quota.protected_rate_limited"
     )
     assert result == 1 and report["cleanup"] == "failed"
-    assert report["error_category"] == "mandatory_check_failed"
+    assert report["error_category"] == "cleanup_failed"
+
+
+def _prepare_serial_lifecycle(tmp_path, monkeypatch, *, launch_failure=None, probe_failure=None,
+                              cleanup_failure=False):
+    image_id = "sha256:" + "b" * 64
+    identity = iter([image_id, "a" * 40, "amd64"])
+    events: list[tuple[str, str]] = []
+    active: set[str] = set()
+    maximum_active = 0
+    removals = 0
+
+    def output(*args):
+        nonlocal maximum_active
+        if args[0] != "run":
+            return next(identity)
+        name = args[args.index("--name") + 1]
+        phase = name.removeprefix("relay-safety-").rsplit("-", 1)[0]
+        events.append(("run", phase))
+        if phase == launch_failure:
+            raise subprocess.CalledProcessError(125, ["docker", *args])
+        active.add(name)
+        maximum_active = max(maximum_active, len(active))
+        return name
+
+    def docker_run(command, **_kwargs):
+        nonlocal removals
+        name = command[-1]
+        if command[1:3] == ["container", "inspect"]:
+            return subprocess.CompletedProcess(command, 0 if name in active else 1)
+        assert command[1:3] == ["rm", "-f"]
+        phase = name.removeprefix("relay-safety-").rsplit("-", 1)[0]
+        events.append(("rm", phase))
+        removals += 1
+        if cleanup_failure and removals == 1:
+            return subprocess.CompletedProcess(command, 1)
+        active.discard(name)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(gate, "request", lambda *_args, **_kwargs: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: (
+        (_ for _ in ()).throw(gate.GateFailure("metrics_malformed"))
+        if probe_failure == "metrics" else {
+            key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
+        }
+    ))
+    monkeypatch.setattr(gate, "execute_public_exemption_check", lambda _base: {
+        "quota.public_information_exempt": {"passed": True},
+    })
+    monkeypatch.setattr(gate, "inspect_public_exemption_predicate", lambda _container: True)
+    monkeypatch.setattr(gate, "execute_quota_check", lambda _base, limit_id, **_kwargs: {
+        limit_id: {"passed": True},
+    })
+    monkeypatch.setattr(gate.subprocess, "run", docker_run)
+    return output, events, active, lambda: maximum_active
+
+
+def test_phase_containers_execute_serially_and_preserve_all_requirements(tmp_path, monkeypatch):
+    output, events, active, maximum_active = _prepare_serial_lifecycle(tmp_path, monkeypatch)
+    result, report = _run_main(tmp_path, monkeypatch, output)
+    phases = ["metrics", "public", "protected-rate", "protected-daily",
+              "mutating-rate", "mutating-daily"]
+    assert result == 0 and report["passed"] is True
+    assert events == [event for phase in phases for event in (("run", phase), ("rm", phase))]
+    assert maximum_active() == 1 and not active
+    assert set(report["results"]) == gate.EXPECTED_IDS
+    assert all(value == {"passed": True, "state": "passed"}
+               or value.get("passed") is True and value.get("state") == "passed"
+               for value in report["results"].values())
+
+
+def test_launch_failure_preserves_category_and_does_not_remove_absent_name(tmp_path, monkeypatch):
+    output, events, active, _maximum_active = _prepare_serial_lifecycle(
+        tmp_path, monkeypatch, launch_failure="protected-rate",
+    )
+    result, report = _run_main(tmp_path, monkeypatch, output)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert events == [("run", "metrics"), ("rm", "metrics"),
+                      ("run", "public"), ("rm", "public"),
+                      ("run", "protected-rate")]
+    assert not active
+
+
+def test_probe_failure_immediately_cleans_current_container(tmp_path, monkeypatch):
+    output, events, active, _maximum_active = _prepare_serial_lifecycle(
+        tmp_path, monkeypatch, probe_failure="metrics",
+    )
+    result, report = _run_main(tmp_path, monkeypatch, output)
+    assert result == 1 and report["error_category"] == "metrics_malformed"
+    assert events == [("run", "metrics"), ("rm", "metrics")]
+    assert not active
+
+
+def test_immediate_cleanup_failure_is_sticky_and_retried_by_fallback(tmp_path, monkeypatch):
+    output, events, active, _maximum_active = _prepare_serial_lifecycle(
+        tmp_path, monkeypatch, cleanup_failure=True,
+    )
+    result, report = _run_main(tmp_path, monkeypatch, output)
+    assert result == 1 and report["error_category"] == "cleanup_failed"
+    assert report["cleanup"] == "failed"
+    assert events == [("run", "metrics"), ("rm", "metrics"), ("rm", "metrics")]
+    assert not active
+
+
+def test_interrupt_still_immediately_cleans_current_container(tmp_path, monkeypatch):
+    output, events, active, _maximum_active = _prepare_serial_lifecycle(tmp_path, monkeypatch)
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        _run_main(tmp_path, monkeypatch, output)
+    assert events == [("run", "metrics"), ("rm", "metrics")]
+    assert not active

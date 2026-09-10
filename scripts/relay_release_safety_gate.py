@@ -309,6 +309,34 @@ def docker_output(*args: str) -> str:
     return subprocess.run(["docker", *args], check=True, capture_output=True, text=True, timeout=30).stdout.strip()
 
 
+def container_exists(container: str) -> bool | None:
+    """Return whether an exact gate-owned name exists, or None if Docker cannot decide."""
+    try:
+        completed = subprocess.run(
+            ["docker", "container", "inspect", container], check=False,
+            capture_output=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    return None
+
+
+def cleanup_container(container: str) -> bool:
+    """Remove one container, accepting an already-absent gate-owned container."""
+    try:
+        completed = subprocess.run(
+            ["docker", "rm", "-f", container], check=False,
+            capture_output=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 or container_exists(container) is False
+
+
 def _category(exc: BaseException) -> str:
     if isinstance(exc, GateFailure):
         return str(exc) if re.fullmatch(r"[a-z_]+", str(exc)) else "qualification_failed"
@@ -342,7 +370,11 @@ def main() -> int:
         "index_digest": args.index_digest, "platform": args.platform, "platform_digest": args.platform_digest,
         "contract": str(CONTRACT_PATH.relative_to(ROOT)), "results": {}, "passed": False,
     }
-    containers: list[str] = []
+    # Only names whose creation by this invocation was confirmed are eligible
+    # for cleanup. Entries remain here until removal is confirmed, providing a
+    # bounded outer fallback for interruption or failed immediate cleanup.
+    containers: set[str] = set()
+    cleanup_failed = False
     try:
         requirements = load_contract()
         evidence["results"] = {item["id"]: {"state": "not_run", "passed": False} for item in requirements}
@@ -376,47 +408,59 @@ def main() -> int:
         ]
         for offset, (phase, rate, daily, check_id) in enumerate(phases):
             container = f"relay-safety-{phase}-{uuid.uuid4().hex[:8]}"
-            containers.append(container)
-            docker_output("run", "-d", "--rm", "--name", container, "-p", f"127.0.0.1:{args.port + offset}:5010",
-                          "-e", "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0", "-e", f"API_RATE_LIMIT={rate}",
-                          "-e", f"API_DAILY_QUOTA={daily}", image_id)
-            base = f"http://127.0.0.1:{args.port + offset}"
-            deadline = time.monotonic() + 45
-            while time.monotonic() < deadline:
-                if request(base, "/livez")[0] == 200:
-                    break
-                time.sleep(.5)
-            else:
-                raise GateFailure("startup_timeout")
-            if phase == "metrics":
-                checked = execute_metrics_checks(base)
-            elif phase == "public":
-                checked = execute_public_exemption_check(base)
-                public_result = checked.get("quota.public_information_exempt")
-                if public_result is not None:
-                    public_result["predicate_exact"] = inspect_public_exemption_predicate(container)
-                    public_result["passed"] = public_result["passed"] and public_result["predicate_exact"]
-            else:
-                assert check_id is not None
-                checked = execute_quota_check(base, check_id, mutating=phase.startswith("mutating-"))
-            for key, result in checked.items():
-                result["state"] = "passed" if result["passed"] else "failed"
-                evidence["results"][key] = result
+            created = False
+            try:
+                docker_output("run", "-d", "--rm", "--name", container, "-p", f"127.0.0.1:{args.port + offset}:5010",
+                              "-e", "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0", "-e", f"API_RATE_LIMIT={rate}",
+                              "-e", f"API_DAILY_QUOTA={daily}", image_id)
+                created = True
+                containers.add(container)
+                base = f"http://127.0.0.1:{args.port + offset}"
+                deadline = time.monotonic() + 45
+                while time.monotonic() < deadline:
+                    if request(base, "/livez")[0] == 200:
+                        break
+                    time.sleep(.5)
+                else:
+                    raise GateFailure("startup_timeout")
+                if phase == "metrics":
+                    checked = execute_metrics_checks(base)
+                elif phase == "public":
+                    checked = execute_public_exemption_check(base)
+                    public_result = checked.get("quota.public_information_exempt")
+                    if public_result is not None:
+                        public_result["predicate_exact"] = inspect_public_exemption_predicate(container)
+                        public_result["passed"] = public_result["passed"] and public_result["predicate_exact"]
+                else:
+                    assert check_id is not None
+                    checked = execute_quota_check(base, check_id, mutating=phase.startswith("mutating-"))
+                for key, result in checked.items():
+                    result["state"] = "passed" if result["passed"] else "failed"
+                    evidence["results"][key] = result
+            finally:
+                if not created:
+                    exists = container_exists(container)
+                    if exists is True:
+                        containers.add(container)
+                    elif exists is None:
+                        cleanup_failed = True
+                if container in containers:
+                    if cleanup_container(container):
+                        containers.remove(container)
+                    else:
+                        cleanup_failed = True
+            if cleanup_failed:
+                raise GateFailure("cleanup_failed")
         evidence["passed"] = all(v.get("state") == "passed" for v in evidence["results"].values())
         if not evidence["passed"]:
             evidence["error_category"] = "mandatory_check_failed"
     except (GateFailure, subprocess.SubprocessError, OSError) as exc:
         evidence["error_category"] = _category(exc)
     finally:
-        cleanup_failed = False
-        for container in containers:
-            try:
-                completed = subprocess.run(
-                    ["docker", "rm", "-f", container], check=False, capture_output=True, timeout=15
-                )
-                if completed.returncode != 0:
-                    cleanup_failed = True
-            except (OSError, subprocess.SubprocessError):
+        for container in tuple(containers):
+            if cleanup_container(container):
+                containers.remove(container)
+            else:
                 cleanup_failed = True
         if cleanup_failed:
             evidence["cleanup"] = "failed"

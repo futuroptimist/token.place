@@ -302,6 +302,14 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "ZRANGE',work,1,tonumber(batch)" in script.source
 
 
+def test_node_removed_record_encoding_is_generation_and_timestamp_canonical():
+    source = valkey_relay_state.NODE_TRANSITION_SCRIPT.source
+    assert "'state','cancelled','claim_generation',generation" in source
+    assert "local generation=r[11] or '0'" in source
+    assert "local accepted=string.format('%.6f',now)" in source
+    assert "local replay=string.format('%.17g',tonumber(accepted))" in source
+
+
 @pytest.mark.parametrize(
     ("client", "request_id"),
     ((None, "request"), ("client", None), ("", "request"), ("client", "")),

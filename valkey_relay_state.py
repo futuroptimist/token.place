@@ -2093,8 +2093,10 @@ for _,v in ipairs(validated) do
     local count=0; for _,m in ipairs(redis.call('ZRANGE',terminal_expiries,0,-1)) do if string.sub(m,1,65)==client..':' then count=count+1 end end
     if count>=tonumber(max_client_terminals) then return {'terminal_capacity'} end
     local expires=string.format('%.17g',now+tonumber(terminal_ttl)); local generation=r[11] or '0'; local owner_value,consumer='',''
+    local accepted=string.format('%.6f',now); accepted=string.gsub(accepted,'0+$',''); accepted=string.gsub(accepted,'%.$',''); if not string.find(accepted,'.',1,true) then accepted=accepted..'.0' end
+    local replay=string.format('%.17g',tonumber(accepted))
     if claim then owner_value=owner; consumer=claim[6]; claims=claims+1 end
-    redis.call('HSET',prefix..'terminal:'..client..':'..request,'client',client,'request',request,'node_id',node_id,'owner_digest',owner_value,'consumer_digest',consumer,'generation',generation,'response_digest','','accepted_at_epoch',tostring(now),'replay_expires_at_epoch',tostring(now),'expires_at_epoch',expires,'outcome','cancelled','retrieval_state','completed_unavailable','retrieval_credential_digest',r[7],'acknowledgement_digest','','reason','server_unregistered','cancellation_token_digest',r[8])
+    redis.call('HSET',prefix..'terminal:'..client..':'..request,'client',client,'request',request,'node_id',node_id,'owner_digest',owner_value,'consumer_digest',consumer,'generation',generation,'response_digest','','accepted_at_epoch',accepted,'replay_expires_at_epoch',replay,'expires_at_epoch',expires,'outcome','cancelled','retrieval_state','completed_unavailable','retrieval_credential_digest',r[7],'acknowledgement_digest','','reason','server_unregistered','cancellation_token_digest',r[8])
     redis.call('ZADD',terminal_expiries,expires,member)
     if state=='reserved' then reservations=reservations+1; redis.call('DEL',prefix..'reservation:'..r[7]); redis.call('ZREM',reservation_expiries,r[7]) else queued=queued+1; redis.call('XDEL',prefix..'queue:'..node_digest,r[9]) end
     if claim then
@@ -2103,7 +2105,7 @@ for _,v in ipairs(validated) do
       redis.call('ZADD',control_expiries,ce,cm)
     end
     redis.call('DEL',prefix..'claim:'..client..':'..request); redis.call('ZREM',claim_expiries,member); redis.call('ZREM',deadlines,member)
-    redis.call('HSET',prefix..'request:'..client..':'..request,'state','cancelled')
+    redis.call('HSET',prefix..'request:'..client..':'..request,'state','cancelled','claim_generation',generation)
     outcomes=outcomes+1
   end
   redis.call('ZREM',work,member)
@@ -2120,7 +2122,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "d8ddadad3873d2263b136c6f662833c54bb70966cbb062c808e7c7814f99b742",  # pragma: allowlist secret
+    "e9494416684894065baa8ec79c0a70b241f2ada32da4fa09b211f9df34c3fab6",  # pragma: allowlist secret
     True,
 )
 
@@ -3473,15 +3475,23 @@ class ValkeyRegistrationStore:
                     or marker not in {"0", "1"}
                     or (status == "acknowledged" and marker != "1")
                     or (status != "acknowledged" and marker != "0")
-                    or result_reason
-                    not in {
-                        *expected_reason.values(),
-                        "server_unregistered",
-                    }
                     or (
-                        status != "acknowledged"
+                        status == "cancelled"
                         and result_reason
-                        not in {expected_reason[status], "server_unregistered"}
+                        not in {"requester_cancelled", "server_unregistered"}
+                    )
+                    or (
+                        status == "expired"
+                        and result_reason != "request_deadline_expired"
+                    )
+                    or (
+                        status == "acknowledged"
+                        and result_reason
+                        not in {
+                            "requester_cancelled",
+                            "request_deadline_expired",
+                            "server_unregistered",
+                        }
                     )
                 ):
                     raise ValueError
@@ -4386,7 +4396,10 @@ class ValkeyRegistrationStore:
                     and cancellation_digest != b""
                     and not self._completed_digest(cancellation_digest)
                 )
-                or (value[b"outcome"] == b"cancelled" and cancellation_digest == b"")
+                or (
+                    value[b"reason"] == b"requester_cancelled"
+                    and cancellation_digest == b""
+                )
                 or (generation < 0 if cancellation_terminal else generation < 1)
                 or str(generation).encode() != value[b"generation"]
                 or not all(map(math.isfinite, (accepted, replay, expires)))
@@ -4408,6 +4421,7 @@ class ValkeyRegistrationStore:
                     (b"completed", b"response_completed", b"acknowledged"),
                     (b"completed", b"response_completed", b"retrieval_expired"),
                     (b"cancelled", b"requester_cancelled", b"completed_unavailable"),
+                    (b"cancelled", b"server_unregistered", b"completed_unavailable"),
                     (b"expired", b"request_deadline_expired", b"completed_unavailable"),
                 }
             ):
@@ -4775,6 +4789,7 @@ class ValkeyRegistrationStore:
                     or (v[b"status"], v[b"reason"])
                     not in {
                         (b"cancelled", b"requester_cancelled"),
+                        (b"cancelled", b"server_unregistered"),
                         (b"expired", b"request_deadline_expired"),
                     }
                     or v[b"acknowledged"] not in {b"0", b"1"}
@@ -4904,7 +4919,7 @@ class ValkeyRegistrationStore:
                     or lifecycle[b"cancellation_digest"]
                     != terminal[b"cancellation_token_digest"]
                     or (
-                        terminal[b"outcome"] == b"cancelled"
+                        terminal[b"reason"] == b"requester_cancelled"
                         and not self._completed_digest(
                             terminal[b"cancellation_token_digest"]
                         )

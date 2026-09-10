@@ -17,6 +17,7 @@ from scripts import relay_release_safety_gate as gate
 WORKFLOW = Path(".github/workflows/qualify-relay-oci.yml")
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
+SOURCE_COMMIT = "c" * 40
 
 
 def workflow() -> dict:
@@ -52,8 +53,11 @@ def index_env(tmp_path: Path, payload: str) -> dict[str, str]:
     (tmp_path / "artifacts").mkdir()
     bindir = tmp_path / "bin"; bindir.mkdir()
     docker = bindir / "docker"
-    docker.write_text("#!/bin/sh\nprintf '%s' \"$INDEX_INPUT\"\n", encoding="utf-8"); docker.chmod(0o755)
-    return {"PATH": f"{bindir}:{os.environ['PATH']}", "INDEX_INPUT": payload, "RAW_DIR": "raw", "ARTIFACT_DIR": "artifacts", "OCI_REPOSITORY": "example.test/relay", "INPUT_INDEX_DIGEST": DIGEST_A, "GITHUB_ENV": str(tmp_path / "env")}
+    docker.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_CALLS\"\nprintf '%s' \"$INDEX_INPUT\"\n", encoding="utf-8"); docker.chmod(0o755)
+    return {"PATH": f"{bindir}:{os.environ['PATH']}", "INDEX_INPUT": payload,
+        "DOCKER_CALLS": str(tmp_path / "docker-calls"), "RAW_DIR": "raw",
+        "ARTIFACT_DIR": "artifacts", "OCI_REPOSITORY": "example.test/relay",
+        "INPUT_INDEX_DIGEST": DIGEST_A, "GITHUB_ENV": str(tmp_path / "env")}
 
 
 def test_manual_permissions_coordinates_and_prohibited_operations() -> None:
@@ -69,12 +73,58 @@ def test_manual_permissions_coordinates_and_prohibited_operations() -> None:
     assert upload["if"] == "always()" and len(upload["with"]["path"].splitlines()) == 5
 
 
+def validation_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
+    bindir = tmp_path / "bin"; bindir.mkdir()
+    git = bindir / "git"
+    git.write_text(f"#!/bin/sh\nprintf '%s\\n' {SOURCE_COMMIT}\n", encoding="utf-8"); git.chmod(0o755)
+    values = {"INPUT_INDEX_DIGEST": DIGEST_A, "INPUT_SOURCE_COMMIT": SOURCE_COMMIT,
+        "INPUT_RELEASE_REF": "refs/tags/v0.1.0", "INPUT_RELEASE_BASE": "main",
+        "INPUT_EVIDENCE_LABEL": "step-05b", "RAW_DIR": "raw", "ARTIFACT_DIR": "artifacts",
+        "GITHUB_ENV": str(tmp_path / "github-env"), "PATH": f"{bindir}:{os.environ['PATH']}"}
+    values.update(overrides)
+    return values
+
+
+def test_input_validation_accepts_valid_bounds_and_gates_registry_steps(tmp_path: Path) -> None:
+    env = validation_env(tmp_path, INPUT_RELEASE_REF="r" * 128,
+        INPUT_RELEASE_BASE="b" * 128, INPUT_EVIDENCE_LABEL="e" * 63)
+    result = run(script("Record gate commit and validate untrusted inputs"), tmp_path, env)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((tmp_path / "raw/validated-inputs.json").read_text()) == {
+        "evidence_label": "e" * 63, "index_digest": DIGEST_A, "release_base": "b" * 128,
+        "release_ref": "r" * 128, "source_commit": SOURCE_COMMIT}
+    conditional = {step["name"]: step.get("if") for step in workflow()["jobs"]["qualify"]["steps"]}
+    assert all(conditional[name] == "steps.inputs.outcome == 'success'" for name in (
+        "Set up QEMU for ARM64", "Set up Docker Buildx", "Log in to GHCR for package reads",
+        "Inspect and validate the immutable index"))
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("INPUT_INDEX_DIGEST", "sha256:" + "g" * 64),
+    ("INPUT_SOURCE_COMMIT", "c" * 39),
+    ("INPUT_RELEASE_REF", "refs/tags/bad;touch-pwned"),
+    ("INPUT_RELEASE_REF", "refs//tags/v1"),
+    ("INPUT_RELEASE_BASE", "../main"),
+    ("INPUT_RELEASE_BASE", "b" * 129),
+    ("INPUT_EVIDENCE_LABEL", "Bad_Label"),
+    ("INPUT_EVIDENCE_LABEL", "e" * 64),
+])
+def test_invalid_inputs_fail_without_a_validated_record(tmp_path: Path, key: str, value: str) -> None:
+    result = run(script("Record gate commit and validate untrusted inputs"), tmp_path,
+        validation_env(tmp_path, **{key: value}))
+    assert result.returncode != 0
+    assert not (tmp_path / "raw/validated-inputs.json").exists()
+    assert not (tmp_path / "pwned").exists()
+
+
 def test_valid_index_is_sanitized_and_registry_runs_once(tmp_path: Path) -> None:
     payload = json.dumps(index_payload(descriptor("linux", "amd64", DIGEST_A), descriptor("linux", "arm64", DIGEST_B)))
     result = run(script("Inspect and validate the immutable index"), tmp_path, index_env(tmp_path, payload))
     assert result.returncode == 0, result.stderr
     value = json.loads((tmp_path / "artifacts/index-manifest.json").read_text())
     assert [item["platform"]["architecture"] for item in value["manifests"]] == ["amd64", "arm64"]
+    assert (tmp_path / "docker-calls").read_text().splitlines() == [
+        f"buildx imagetools inspect --raw example.test/relay@{DIGEST_A}"]
     assert not (tmp_path / "raw/index.raw.json").exists()
 
 
@@ -187,14 +237,62 @@ def test_nested_sensitive_bytes_never_enter_bundle(monkeypatch: pytest.MonkeyPat
 
 def test_gate_runs_both_platforms_and_records_executor_failures(tmp_path: Path) -> None:
     (tmp_path / "raw").mkdir(); (tmp_path / "scripts").mkdir(); bindir = tmp_path / "bin"; bindir.mkdir()
-    (bindir / "docker").write_text("#!/bin/sh\ncase \"$1 $2\" in 'ps -aq') exit \"${PS_STATUS:-0}\";; esac\nexit 0\n"); (bindir / "docker").chmod(0o755)
-    gate = tmp_path / "scripts/relay_release_safety_gate.py"; gate.write_text("import json,sys\np=sys.argv[sys.argv.index('--evidence')+1]; json.dump({'schema_version':2},open(p,'w'))\n")
-    env = {"PATH": f"{bindir}:{os.environ['PATH']}", "RAW_DIR": "raw", "OCI_REPOSITORY": "example.test/relay", "AMD64_DIGEST": DIGEST_A, "ARM64_DIGEST": DIGEST_B, "INPUT_SOURCE_COMMIT": "c"*40, "INPUT_RELEASE_REF": "ref", "INPUT_RELEASE_BASE": "base", "INPUT_INDEX_DIGEST": DIGEST_A}
+    (bindir / "docker").write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALLS/docker\"\ncase \"$1 $2\" in 'ps -aq') exit \"${PS_STATUS:-0}\";; esac\nexit 0\n"); (bindir / "docker").chmod(0o755)
+    gate = tmp_path / "scripts/relay_release_safety_gate.py"; gate.write_text("import json,os,sys\nopen(os.environ['CALLS']+'/gate','a').write(' '.join(sys.argv[1:])+'\\n')\np=sys.argv[sys.argv.index('--evidence')+1]; json.dump({'schema_version':2},open(p,'w'))\n")
+    calls = tmp_path / "calls"; calls.mkdir()
+    env = {"PATH": f"{bindir}:{os.environ['PATH']}", "CALLS": str(calls), "RAW_DIR": "raw", "OCI_REPOSITORY": "example.test/relay", "AMD64_DIGEST": DIGEST_A, "ARM64_DIGEST": DIGEST_B, "INPUT_SOURCE_COMMIT": SOURCE_COMMIT, "INPUT_RELEASE_REF": "ref", "INPUT_RELEASE_BASE": "base", "INPUT_INDEX_DIGEST": DIGEST_A}
     result = run(script("Pull and qualify both immutable platform descriptors"), tmp_path, env)
     assert result.returncode == 0
     assert all((tmp_path / f"raw/{arch}-outcome.json").exists() for arch in ("amd64", "arm64"))
+    docker_calls = (calls / "docker").read_text().splitlines()
+    pulls = [line for line in docker_calls if line.startswith("pull ")]
+    assert pulls == [f"pull --platform linux/amd64 example.test/relay@{DIGEST_A}",
+        f"pull --platform linux/arm64 example.test/relay@{DIGEST_B}"]
+    gate_calls = (calls / "gate").read_text().splitlines()
+    assert len(gate_calls) == 2
+    for arch, digest, port, call in zip(("amd64", "arm64"), (DIGEST_A, DIGEST_B), ("55100", "55200"), gate_calls):
+        args = call.split()
+        expected = {"--image": f"example.test/relay@{digest}", "--platform": f"linux/{arch}",
+            "--source-commit": SOURCE_COMMIT, "--release-ref": "ref", "--release-base": "base",
+            "--resolved-revision": SOURCE_COMMIT, "--registry-coordinate": f"example.test/relay@{digest}",
+            "--index-digest": DIGEST_A, "--platform-digest": digest, "--port": port,
+            "--evidence": f"raw/relay-release-safety-{arch}-evidence.json"}
+        assert {flag: args[args.index(flag) + 1] for flag in expected} == expected
     env["PS_STATUS"] = "1"; result = run(script("Pull and qualify both immutable platform descriptors"), tmp_path, env)
     assert result.returncode != 0 and json.loads((tmp_path / "raw/amd64-outcome.json").read_text())["cleanup_status"] != 0
+
+
+@pytest.mark.parametrize(("qualification", "amd64", "arm64", "cleanup"), [
+    (True, "passed", "passed", "success"),
+    (False, "failed", "passed", "success"),
+    (False, "passed", "passed", "failure"),
+    (False, "failed", "failed", "skipped"),
+], ids=("success", "gate-failure", "cleanup-failure", "early-validation-failure"))
+def test_summary_executes_and_reports_complete_identity(tmp_path: Path, qualification: bool,
+        amd64: str, arm64: str, cleanup: str) -> None:
+    artifacts = tmp_path / "artifacts"; artifacts.mkdir()
+    early = cleanup == "skipped"
+    source = "invalid" if early else SOURCE_COMMIT
+    index_digest = "invalid" if early else DIGEST_A
+    amd64_digest, arm64_digest = (("unresolved", "unresolved") if early else (DIGEST_A, DIGEST_B))
+    gate_commit = "unresolved" if early else "d" * 40
+    metadata = {"source_commit": source, "repository": "example.test/relay",
+        "index_digest": index_digest,
+        "platform_digests": {"linux/amd64": amd64_digest, "linux/arm64": arm64_digest},
+        "gate_commit": gate_commit, "platform_results": {"linux/amd64": amd64, "linux/arm64": arm64},
+        "qualification_passed": qualification,
+        "executor_outcomes": {"inputs": "failure" if early else "success", "cleanup": cleanup}}
+    (artifacts / "qualification-metadata.json").write_text(json.dumps(metadata))
+    summary = tmp_path / "summary"
+    result = run(script("Write qualification summary"), tmp_path, {"ARTIFACT_DIR": "artifacts",
+        "ARTIFACT_NAME": "qualification-123", "GITHUB_STEP_SUMMARY": str(summary)})
+    assert result.returncode == 0, result.stderr
+    text = summary.read_text()
+    for expected in (source, f"example.test/relay@{index_digest}", amd64_digest, arm64_digest,
+        gate_commit, f"AMD64 result: {amd64}", f"ARM64 result: {arm64}",
+        f'"cleanup":"{cleanup}"', f"Qualification passed: {str(qualification).lower()}",
+        "Artifact: qualification-123"):
+        assert expected in text
 
 
 @pytest.mark.parametrize("mode", ["list", "remove", "files"])

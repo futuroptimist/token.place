@@ -323,9 +323,20 @@ jobs:
         if: always()
         shell: bash
         run: |
+          set -euo pipefail
           metadata="${ARTIFACT_DIR}/qualification-metadata.json"
           echo '## Immutable relay OCI qualification' >> "${GITHUB_STEP_SUMMARY}"
-          jq -r '"Qualification: \(.qualification_passed)\nAMD64: \(.platform_results[\"linux/amd64\"])\nARM64: \(.platform_results[\"linux/arm64\"])\nIndex: \(.repository)@\(.index_digest)\nGate commit: \(.gate_commit)"' "${metadata}" >> "${GITHUB_STEP_SUMMARY}"
+          jq -r '[
+            "Source commit: " + .source_commit,
+            "Index: " + .repository + "@" + .index_digest,
+            "AMD64 descriptor: " + .platform_digests["linux/amd64"],
+            "ARM64 descriptor: " + .platform_digests["linux/arm64"],
+            "Gate commit: " + .gate_commit,
+            "AMD64 result: " + .platform_results["linux/amd64"],
+            "ARM64 result: " + .platform_results["linux/arm64"],
+            "Executor outcomes: " + (.executor_outcomes | tojson),
+            "Qualification passed: " + (.qualification_passed | tostring)
+          ] | .[]' "${metadata}" >> "${GITHUB_STEP_SUMMARY}"
           echo "Artifact: ${ARTIFACT_NAME}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Remove uploaded local evidence

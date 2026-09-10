@@ -13,6 +13,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import requests
 import yaml
 
 from utils import compute_node_runtime
@@ -808,6 +809,46 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
         'maybe_reexec_for_runtime_refresh',
         lambda _setup, *, allow_reexec=True: None,
     )
+
+
+def _install_custom_runtime_isolation(monkeypatch, module):
+    """Install a custom runtime double without allowing native bootstrap work."""
+    unexpected_attempts = []
+
+    def _unexpected(kind):
+        def fail(*_args, **_kwargs):
+            unexpected_attempts.append(kind)
+            raise AssertionError(f'unexpected test side effect: {kind}')
+
+        return fail
+
+    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'true'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode, **_kwargs: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'skipped',
+            'interpreter': sys.executable,
+            'llama_module_path': 'test-double',
+            'fallback_reason': '',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup, *, allow_reexec=True: None,
+    )
+    monkeypatch.setattr(subprocess, 'Popen', _unexpected('native process'))
+    monkeypatch.setattr(subprocess, 'run', _unexpected('native process'))
+    monkeypatch.setattr(requests.sessions.Session, 'request', _unexpected('network'))
+    return unexpected_attempts
 
 
 def _reset_cancel_queue():
@@ -1806,7 +1847,7 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
 
     module.resolve_relay_url = _resolve_relay_url
     module.compute_mode_diagnostics = lambda _model_manager: {}
-    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    unexpected_attempts = _install_custom_runtime_isolation(monkeypatch, module)
     monkeypatch.setenv('TOKENPLACE_RELAY_URL', 'https://token.place')
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
 
@@ -1821,6 +1862,7 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
     assert status == 0
     assert captured['config'].relay_url == 'http://127.0.0.1:5010'
     assert captured['config'].use_configured_relay_fallbacks is False
+    assert unexpected_attempts == []
 
 
 def test_run_supplies_stop_requested_as_runtime_cancellation_predicate(monkeypatch):
@@ -1888,7 +1930,7 @@ def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
     module.apply_compute_mode = lambda _model_manager, mode: mode
     module.SUPPORTED_COMPUTE_MODES = {'auto', 'cpu', 'cuda', 'metal'}
     module.compute_mode_diagnostics = lambda _model_manager: {}
-    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    unexpected_attempts = _install_custom_runtime_isolation(monkeypatch, module)
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
 
     args = SimpleNamespace(
@@ -1914,6 +1956,7 @@ def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
         ('http://127.0.0.1:5010',),
         ('https://staging.token.place',),
     ]
+    assert unexpected_attempts == []
 
 
 
@@ -7541,7 +7584,51 @@ def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inferenc
 
 
 
-def _load_desktop_relay_operator_parity_module():
+def _load_desktop_relay_operator_parity_module(monkeypatch):
+    unexpected_attempts = []
+
+    def _unexpected(kind):
+        def fail(*_args, **_kwargs):
+            unexpected_attempts.append(kind)
+            raise AssertionError(f'unexpected parity-helper side effect: {kind}')
+
+        return fail
+
+    requests_module = ModuleType('requests')
+    requests_module.get = _unexpected('network')
+    requests_module.post = _unexpected('network')
+    subprocess_module = ModuleType('subprocess')
+    subprocess_module.PIPE = subprocess.PIPE
+    subprocess_module.STDOUT = subprocess.STDOUT
+    subprocess_module.TimeoutExpired = subprocess.TimeoutExpired
+    subprocess_module.Popen = _unexpected('native process')
+
+    encryption_module = ModuleType('api.v1.encryption')
+    encryption_module.EncryptionManager = type('UnusedEncryptionManager', (), {})
+    api_module = ModuleType('api')
+    api_module.__path__ = []
+    api_v1_module = ModuleType('api.v1')
+    api_v1_module.__path__ = []
+    packaged_helpers = ModuleType('desktop_tauri_packaged_helpers')
+    for name in (
+        'create_macos_bundle_layout',
+        'create_packaged_layout',
+        'reserve_free_port',
+        'wait_for_livez',
+    ):
+        setattr(packaged_helpers, name, _unexpected(f'unused packaged helper: {name}'))
+
+    for name, module in {
+        'requests': requests_module,
+        'subprocess': subprocess_module,
+        'api': api_module,
+        'api.v1': api_v1_module,
+        'api.v1.encryption': encryption_module,
+        'desktop_tauri_packaged_helpers': packaged_helpers,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(sys, 'path', list(sys.path))
+
     module_path = (
         Path(__file__).resolve().parents[2]
         / 'desktop-tauri'
@@ -7552,18 +7639,19 @@ def _load_desktop_relay_operator_parity_module():
     parity = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(parity)
-    return parity
+    return parity, unexpected_attempts
 
 
-def test_relay_operator_parity_uses_cpu_for_simulated_macos_bridge_mode():
-    parity = _load_desktop_relay_operator_parity_module()
+def test_relay_operator_parity_uses_cpu_for_simulated_macos_bridge_mode(monkeypatch):
+    parity, unexpected_attempts = _load_desktop_relay_operator_parity_module(monkeypatch)
 
     assert parity._bridge_compute_mode(simulated_platform='Darwin') == 'cpu'
     assert parity._bridge_compute_mode(simulated_platform='macOS') == 'cpu'
+    assert unexpected_attempts == []
 
 
-def test_relay_operator_parity_accepts_mock_llm_macos_fallback_reason():
-    parity = _load_desktop_relay_operator_parity_module()
+def test_relay_operator_parity_accepts_mock_llm_macos_fallback_reason(monkeypatch):
+    parity, unexpected_attempts = _load_desktop_relay_operator_parity_module(monkeypatch)
 
     parity._assert_ready_runtime_fields(
         {
@@ -7579,10 +7667,11 @@ def test_relay_operator_parity_accepts_mock_llm_macos_fallback_reason():
         },
         layout_label='macOS Contents/Resources',
     )
+    assert unexpected_attempts == []
 
 
 def test_relay_operator_start_bridge_passes_simulated_platform_to_compute_mode(monkeypatch, tmp_path):
-    parity = _load_desktop_relay_operator_parity_module()
+    parity, unexpected_attempts = _load_desktop_relay_operator_parity_module(monkeypatch)
     modes = []
 
     class Process:
@@ -7610,10 +7699,11 @@ def test_relay_operator_start_bridge_passes_simulated_platform_to_compute_mode(m
     bridge._thread.join(timeout=1)
 
     assert modes == ['cpu']
+    assert unexpected_attempts == []
 
 
 def test_relay_operator_layout_parity_preserves_simulated_platform_on_restart(monkeypatch, tmp_path):
-    parity = _load_desktop_relay_operator_parity_module()
+    parity, unexpected_attempts = _load_desktop_relay_operator_parity_module(monkeypatch)
 
     calls = []
 
@@ -7656,6 +7746,7 @@ def test_relay_operator_layout_parity_preserves_simulated_platform_on_restart(mo
     )
 
     assert [call['simulated_platform'] for call in calls] == ['Darwin', 'Darwin']
+    assert unexpected_attempts == []
 
 
 def _load_packaged_operator_e2e_module():

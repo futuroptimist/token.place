@@ -633,6 +633,117 @@ def test_rejected_public_predicate_fails_qualification_and_still_cleans_up(tmp_p
     assert len(cleanup_calls) == 6
 
 
+def test_phases_are_serial_and_complete_all_nine_requirements(tmp_path, monkeypatch):
+    events = []
+    active = set()
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    phases = ["metrics", "public", "protected-rate", "protected-daily",
+              "mutating-rate", "mutating-daily"]
+
+    def output(*args):
+        if args[0] != "run":
+            return next(values)
+        name = args[args.index("--name") + 1]
+        assert not active
+        active.add(name)
+        events.append(("run", name))
+        return "container-id"
+
+    def cleanup(args, **_kwargs):
+        assert args[:3] == ["docker", "rm", "-f"]
+        name = args[3]
+        assert active == {name}
+        active.remove(name)
+        events.append(("rm", name))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
+        key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
+    })
+    monkeypatch.setattr(gate, "execute_public_exemption_check", lambda _base: {
+        "quota.public_information_exempt": {"passed": True},
+    })
+    monkeypatch.setattr(gate, "inspect_public_exemption_predicate", lambda _container: True)
+    monkeypatch.setattr(gate, "execute_quota_check", lambda _base, limit_id, **_kwargs: {
+        limit_id: {"passed": True},
+    })
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+
+    assert result == 0 and report["passed"] is True and not active
+    assert set(report["results"]) == gate.EXPECTED_IDS
+    assert all(item["state"] == "passed" for item in report["results"].values())
+    assert [kind for kind, _name in events] == [item for _ in phases for item in ("run", "rm")]
+    assert [name.split("-")[2] for kind, name in events if kind == "run"][:2] == ["metrics", "public"]
+    assert [next(phase for phase in phases if f"relay-safety-{phase}-" in name)
+            for kind, name in events if kind == "run"] == phases
+
+
+def test_launch_failure_preserves_category_and_verifies_absence(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    inspections = []
+
+    def output(*args):
+        if args[0] == "run":
+            raise subprocess.CalledProcessError(125, args)
+        return next(values)
+
+    def inspect(args, **_kwargs):
+        inspections.append(args)
+        return subprocess.CompletedProcess(args, 0, b"")
+
+    result, report = _run_main(tmp_path, monkeypatch, output, inspect)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert len(inspections) == 1 and inspections[0][1:3] == ["ps", "-aq"]
+    assert "cleanup" not in report
+
+
+def test_probe_exception_immediately_removes_current_container(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
+    cleanup_calls = []
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks",
+                        lambda _base: (_ for _ in ()).throw(OSError("probe secret")))
+    result, report = _run_main(
+        tmp_path, monkeypatch, lambda *_a: next(values),
+        lambda args, **_kwargs: cleanup_calls.append(args) or subprocess.CompletedProcess(args, 0),
+    )
+    assert result == 1 and report["error_category"] == "runtime_unavailable"
+    assert len(cleanup_calls) == 1 and cleanup_calls[0][:3] == ["docker", "rm", "-f"]
+
+
+def test_immediate_cleanup_failure_is_sticky_and_fallback_retries(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
+    cleanup_calls = []
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
+        key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
+    })
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        return subprocess.CompletedProcess(args, 1 if len(cleanup_calls) == 1 else 0)
+
+    result, report = _run_main(tmp_path, monkeypatch, lambda *_a: next(values), cleanup)
+    assert result == 1 and report["error_category"] == "cleanup_failed"
+    assert report["cleanup"] == "failed"
+    assert len(cleanup_calls) == 2 and cleanup_calls[0] == cleanup_calls[1]
+
+
+def test_interrupt_still_immediately_cleans_current_container(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
+    cleanup_calls = []
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks",
+                        lambda _base: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        _run_main(
+            tmp_path, monkeypatch, lambda *_a: next(values),
+            lambda args, **_kwargs: cleanup_calls.append(args) or subprocess.CompletedProcess(args, 0),
+        )
+    assert len(cleanup_calls) == 1 and cleanup_calls[0][:3] == ["docker", "rm", "-f"]
+
+
 @pytest.mark.parametrize("missing", sorted(gate.EXPECTED_IDS - {
     "metrics.valid_instrumentation", "metrics.no_flask_defaults", "metrics.no_raw_paths",
     "metrics.bounded_unmatched_paths",
@@ -666,8 +777,15 @@ def test_nonzero_cleanup_fails_successful_qualification(tmp_path, monkeypatch):
 
 
 def test_nonzero_cleanup_preserves_qualification_failure_category(tmp_path, monkeypatch):
-    result, report = _run_qualified_main(
-        tmp_path, monkeypatch, cleanup_code=1, failed_id="quota.protected_rate_limited"
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
+        key: {"passed": key != "metrics.no_raw_paths"}
+        for key in gate.EXPECTED_IDS if key.startswith("metrics.")
+    })
+    result, report = _run_main(
+        tmp_path, monkeypatch, lambda *_a: next(values),
+        lambda args, **_kwargs: subprocess.CompletedProcess(args, 1),
     )
     assert result == 1 and report["cleanup"] == "failed"
     assert report["error_category"] == "mandatory_check_failed"

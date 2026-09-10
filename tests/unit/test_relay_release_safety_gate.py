@@ -648,6 +648,120 @@ def test_all_independent_quota_phases_pass(tmp_path, monkeypatch):
     public = report["results"]["quota.public_information_exempt"]
     assert result == 0 and report["passed"] is True
     assert public["state"] == "passed"
+    assert set(report["results"]) == gate.EXPECTED_IDS
+    assert all(item["state"] == "passed" for item in report["results"].values())
+
+
+def test_phases_are_serial_and_removed_in_order(tmp_path, monkeypatch):
+    image_id = "sha256:" + "b" * 64
+    metadata = iter([image_id, "a" * 40, "amd64"])
+    events = []
+    active = set()
+    max_active = 0
+    expected = ["metrics", "public", "protected-rate", "protected-daily",
+                "mutating-rate", "mutating-daily"]
+
+    def output(*args):
+        nonlocal max_active
+        if args[0] != "run":
+            return next(metadata)
+        name = args[args.index("--name") + 1]
+        phase = name.removeprefix("relay-safety-").rsplit("-", 1)[0]
+        events.append(("run", phase))
+        active.add(name)
+        max_active = max(max_active, len(active))
+        return "container-id"
+
+    def cleanup(args, **_kwargs):
+        assert args[:3] == ["docker", "rm", "-f"]
+        name = args[3]
+        phase = name.removeprefix("relay-safety-").rsplit("-", 1)[0]
+        assert name in active
+        active.remove(name)
+        events.append(("rm", phase))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
+        key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
+    })
+    monkeypatch.setattr(gate, "execute_public_exemption_check", lambda _base: {
+        "quota.public_information_exempt": {"passed": True},
+    })
+    monkeypatch.setattr(gate, "inspect_public_exemption_predicate", lambda _container: True)
+    monkeypatch.setattr(gate, "execute_quota_check", lambda _base, check_id, **_kwargs: {
+        check_id: {"passed": True},
+    })
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+    assert result == 0 and report["passed"] is True
+    assert max_active == 1 and not active
+    assert events == [event for phase in expected for event in (("run", phase), ("rm", phase))]
+
+
+def test_failed_launch_preserves_error_and_verifies_no_owned_container(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    cleanup_calls = []
+
+    def output(*args):
+        if args[0] == "run":
+            raise subprocess.CalledProcessError(125, args)
+        return next(values)
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        assert args[:3] == ["docker", "container", "inspect"]
+        return subprocess.CompletedProcess(args, 1)
+
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert len(cleanup_calls) == 1
+    assert "cleanup" not in report
+
+
+def test_probe_failure_immediately_removes_current_container(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
+    cleanup_calls = []
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks",
+                        lambda _base: (_ for _ in ()).throw(gate.GateFailure("metrics_malformed")))
+    result, report = _run_main(
+        tmp_path, monkeypatch, lambda *_args: next(values),
+        lambda args, **_kwargs: cleanup_calls.append(args) or subprocess.CompletedProcess(args, 0),
+    )
+    assert result == 1 and report["error_category"] == "metrics_malformed"
+    assert len(cleanup_calls) == 1 and cleanup_calls[0][:3] == ["docker", "rm", "-f"]
+
+
+def test_immediate_cleanup_failure_is_sticky_and_fallback_retries(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
+    cleanup_calls = []
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
+        key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
+    })
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        return subprocess.CompletedProcess(args, 1 if len(cleanup_calls) == 1 else 0)
+
+    result, report = _run_main(tmp_path, monkeypatch, lambda *_args: next(values), cleanup)
+    assert result == 1 and report["error_category"] == "cleanup_failed"
+    assert report["cleanup"] == "failed"
+    assert len(cleanup_calls) == 2
+
+
+def test_interrupt_still_removes_current_container(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
+    cleanup_calls = []
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks",
+                        lambda _base: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        _run_main(
+            tmp_path, monkeypatch, lambda *_args: next(values),
+            lambda args, **_kwargs: cleanup_calls.append(args) or subprocess.CompletedProcess(args, 0),
+        )
+    assert len(cleanup_calls) == 1 and cleanup_calls[0][:3] == ["docker", "rm", "-f"]
 
 
 @pytest.mark.parametrize("failed_id", [
@@ -665,9 +779,10 @@ def test_nonzero_cleanup_fails_successful_qualification(tmp_path, monkeypatch):
     assert report["cleanup"] == "failed" and report["error_category"] == "cleanup_failed"
 
 
-def test_nonzero_cleanup_preserves_qualification_failure_category(tmp_path, monkeypatch):
+def test_early_cleanup_failure_prevents_later_qualification_check(tmp_path, monkeypatch):
     result, report = _run_qualified_main(
         tmp_path, monkeypatch, cleanup_code=1, failed_id="quota.protected_rate_limited"
     )
     assert result == 1 and report["cleanup"] == "failed"
-    assert report["error_category"] == "mandatory_check_failed"
+    assert report["error_category"] == "cleanup_failed"
+    assert report["results"]["quota.protected_rate_limited"]["state"] == "not_run"

@@ -116,7 +116,10 @@ operator knobs.
 | `response:{client_digest}:{request_digest}`, `responses:expiry` | exact validated encrypted response envelope, accepted epoch, retrieval acknowledgement-token digest, acknowledgement state, and replay deadline | one bounded envelope per request; unacknowledged responses remain idempotently replayable until the lesser of the configured response-retention deadline and total lifecycle maximum; acknowledgement deletes or marks the envelope consumed atomically |
 | `progress:{client_digest}:{request_digest}` | latest exact validated encrypted progress envelope | one bounded envelope, replacement only; expires no later than the request |
 | `control:{node_digest}:{client_digest}:{request_digest}`, `control:expiry` | fixed terminal status/reason, canonical client/request identity, owner digest, acknowledgement state; expiry members contain the node and both identity digests | one per affected claim; configured tombstone TTL capped at five minutes |
+| `node_work:{node_digest}` | canonical `client_digest:request_digest` members for every reserved, queued, or claimed lifecycle owned by the node | capped by the configured per-node reservation plus queue bounds; membership is created with reservation authority and removed only when that lifecycle authority ends |
+| `node_transition:{node_digest}` | owner digest, cause, fixed terminal status/reason, immutable transition epoch, and completion state | at most configured pending-transition capacity; retained until every member of the authoritative node-work index is handled |
 | `node_tombstone:{node_digest}`, `node_tombstones:expiry` | unregistered/expired marker and owner digest | at most recent-node capacity; five-minute maximum TTL |
+| `former_owner:{node_digest}:{owner_digest}`, `former_owners:expiry` | immutable completed cause and transition epoch for an exact removed owner | at most configured former-owner capacity; retained through terminal retention; multiple owners for a reused node ID coexist |
 | `terminal:{client_digest}:{request_digest}`, `terminals:expiry` | one fixed outcome/status/reason, accepted response digest when applicable, outcome-counted flag | one per request; configured terminal TTL; the record is the dedup authority |
 | `ratelimit:{route_class}:{identity_digest}:{window}` | fixed-window counter and window epoch | bounded route classes and digest identities; expires at window end plus clock-skew allowance |
 
@@ -126,6 +129,22 @@ background sweeper invokes the same reviewed transition scripts. Key TTLs are a 
 zset deadlines and transition logic are the protocol authority. No persisted value uses
 `time.monotonic()`. Scripts obtain Valkey `TIME`, and clients express externally supplied deadlines
 as validated UTC epoch values.
+
+The per-node work index is mandatory authority, not a cache. Registration creates an empty,
+schema-marked index, and selection, enqueue, claim, response, cancellation, deadline, reservation
+expiry, and node-transition scripts validate and maintain it in the same atomic mutation as the
+lifecycle record. An absent index for a live or transitioning node, an index member without its
+exact lifecycle authority, or lifecycle authority absent from the selected node's index is schema
+corruption and fails closed. Node eviction reads only a configured-size batch from this index; it
+must not use `SCAN`, inspect every request, or interpret a missing index as an empty node.
+
+This index cannot be introduced as an optional additive field while an older supported writer can
+create or mutate lifecycles without maintaining it. Before enabling these transitions, operators
+must advance the manifest's active writer revision and supported writer minimum to a revision whose
+complete mutating-script digest set maintains `node_work`. Older readers may remain in the read
+range because the new keys do not alter their existing record decoding, but older writers must fail
+the write gate before protocol access. The manifest change and script deployment therefore precede
+creation of the first indexed registration; there is no lazy backfill from broad key discovery.
 
 ## Atomicity and data-structure roles
 

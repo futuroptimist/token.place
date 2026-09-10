@@ -75,6 +75,65 @@ unique candidate index. The workflow qualifies the two descriptors from that exa
 requires adding the platform to the build, exact manifest-membership assertion, qualification loop,
 workflow regression tests, and operator documentation in the same change.
 
+## Read-only qualification of an existing OCI index
+
+`.github/workflows/qualify-relay-oci.yml` is a manual, read-only executor for an already-published
+index in the fixed `ghcr.io/futuroptimist/tokenplace-relay` repository. It checks out `main` so the
+gate implementation commit is distinct from the artifact's declared source commit. The executor
+validates every input before shell use, inspects the immutable index, resolves exactly one
+`linux/amd64` and one `linux/arm64` descriptor, pulls each descriptor by digest, and runs the gate
+once per platform. It does not build, publish, promote, retag, deploy, or contact an application
+environment. Index decoding rejects duplicate JSON members and requires schema version 2 with an
+OCI index or Docker manifest-list media type. Executable descriptors must have bounded, correctly
+typed fields and an OCI image-manifest or Docker v2 image-manifest media type; a nested index can
+never stand in for the digest of an executable image. Permitted `unknown/unknown` non-executable
+descriptors are validated but omitted from the sanitized index record.
+
+The uploaded `relay-oci-qualification-<run-id>-<attempt>` artifact contains:
+
+- `index-manifest.json`, a bounded and sanitized copy containing only index media type, schema
+  version, descriptor media types, descriptor digests, and platforms;
+- `relay-release-safety-amd64-evidence.json` and
+  `relay-release-safety-arm64-evidence.json`, the platform gate reports;
+- `qualification-metadata.json`, which binds the label, repository, source/ref/base, index and
+  platform digests, gate implementation commit, and platform outcomes; and
+- `SHA256SUMS`, covering the four JSON documents above.
+
+The artifact upload runs even after an earlier failure and names exactly those four JSON files plus
+`SHA256SUMS`. Raw gate reports remain outside the upload directory. Missing, malformed, oversized,
+duplicate-member, sensitive, or otherwise rejected reports are replaced with a minimal bounded
+failure record; rejected bytes and exception/input details are never copied into the bundle.
+Checksums cover the final sanitized bytes even on failure.
+
+Qualification still fails unless both schema-version-2 evidence objects contain every requirement
+from the checked-out contract exactly once with a literal `true` passing value, match all supplied
+and resolved identities, identify the checked-out contract path and a full local image SHA-256
+digest, and have confirmed gate and container-cleanup success. The verifier projects only the
+current gate's known result members: literal pass/state values, bounded integer metric counts,
+bounded HTTP status-code pairs, the fixed safe response class, and the exact public-route
+predicate result. Unknown top-level or nested members and incorrectly typed schema/pass values are
+rejected rather than copied. A gate may omit
+`cleanup` only on success, in which case the executor adds `passed` after checking Docker itself;
+an explicit gate cleanup failure is never overwritten. Docker listing, each owned-container
+removal, raw-file cleanup, artifact cleanup, gate execution, and both platform runs feed the final
+outcome and summary. Cleanup is attempted on failed and interrupted paths, and failures fail closed.
+
+### Planned Step 05b dispatches (not yet executed)
+
+After this executor has merged, operators plan these two separate manual dispatches. Listing them
+does **not** claim that either artifact has passed qualification.
+
+Progress ledger remains unchanged: **Step 05b is in progress; Step 06 has zero attempts.** Neither
+planned parameter set below has been dispatched.
+
+| Input | Qwen candidate | Corrected Llama rollback |
+| --- | --- | --- |
+| `index_digest` | `sha256:b32ef19840dabe44caf7240b787af14dcf439b39357833e21a92c3dd511effd4` | `sha256:543fde33aff45253630090b52d16163e3586da12c973f5c4a658ddc8927d0a68` |
+| `source_commit` | `8618c9aba4b5dfe7980c2fe861095a92311145f2` | `6c39adc64e7bed4f85d07164aa2860e637919ca9` |
+| `release_ref` | `main-8618c9a` | `sha-6c39adc` |
+| `release_base` | `main` | `release/relay-0.1.1` |
+| `evidence_label` | `step-05b-qwen-8618c9a` | `step-05b-llama-6c39adc` |
+
 ## Maintain the contract
 
 To add a mandatory requirement:

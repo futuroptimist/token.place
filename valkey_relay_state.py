@@ -32,6 +32,8 @@ from relay_state_store import (
     EncryptedRequestEnvelope,
     EncryptedResponseEnvelope,
     EnqueueResult,
+    NodeTombstoneRecord,
+    NodeTransitionResult,
     QueuedRequest,
     RelayStateCapacityExceeded,
     RelayStateConflict,
@@ -86,11 +88,14 @@ _KEY_COMPONENT_COUNTS = {
     "responses:expiry": 0,
     "control:expiry": 0,
     "node_tombstones:expiry": 0,
+    "former_owners:expiry": 0,
     "terminals:expiry": 0,
     "node": 1,
     "reservation": 1,
     "queue": 1,
     "node_tombstone": 1,
+    "node_transition": 1,
+    "former_owner": 2,
     "request": 2,
     "claim": 2,
     "response": 2,
@@ -516,6 +521,13 @@ for _, expired_digest in ipairs(due) do
 end
 local exists = redis.call('EXISTS', node) == 1
 if operation == 'register' or operation == 'renew' then
+  if redis.call('EXISTS', prefix .. 'node_transition:' .. digest) == 1 then
+    return {'transition_required'}
+  end
+  if operation == 'register' and
+     redis.call('EXISTS', prefix .. 'former_owner:' .. digest .. ':' .. owner) == 1 then
+    return {'credential_mismatch'}
+  end
   if operation == 'register' then
     if exists then
       if redis.call('HGET', node, 'control_credential_digest') ~= owner then
@@ -586,7 +598,7 @@ return {'invalid'}
 REGISTRATION_TRANSITION_SCRIPT = ReviewedScript(
     "registration_transition_v1",
     REGISTRATION_TRANSITION_SOURCE,
-    "ce651ae95d14c5980782937816e5d10c628c3ce4663f0a85f7d0470c3988e092",  # pragma: allowlist secret
+    "f3e72690376b76d5478b08d991dec662d856ae0c363b51e6ce877aa2d33ae286",  # pragma: allowlist secret
     True,
 )
 
@@ -2000,6 +2012,55 @@ RETRIEVE_RESPONSE_SCRIPT = ReviewedScript(
     True,
 )
 
+# Node removal has its own transition rather than sharing registration's former
+# destructive expiry path.  This first bounded transition deliberately refuses
+# a node with indexed scheduler work; later lifecycle scripts can only remove
+# that fence after maintaining the per-node work authority introduced with the
+# full eviction transition.
+NODE_TRANSITION_SOURCE = """\
+local leases,node,cursor,tomb_exp,tomb,pending,fence_exp,fence=unpack(KEYS)
+local digest,owner,cause=ARGV[1],ARGV[2],ARGV[3]
+local max_pending,max_tombs,max_fences=tonumber(ARGV[4]),tonumber(ARGV[5]),tonumber(ARGV[6])
+local tomb_ttl,retention=tonumber(ARGV[7]),tonumber(ARGV[8])
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local function finite(v) local n=tonumber(v); if not n or n~=n or n==math.huge or n==-math.huge then return nil end; return n end
+if cause~='explicit_unregister' and cause~='registration_lease_expired' then return {'invalid'} end
+local due=redis.call('ZRANGEBYSCORE',tomb_exp,'-inf',now,'LIMIT',0,max_tombs)
+for _,m in ipairs(due) do redis.call('DEL',ARGV[9]..'node_tombstone:'..m); redis.call('ZREM',tomb_exp,m) end
+local old_fences=redis.call('ZRANGEBYSCORE',fence_exp,'-inf',now,'LIMIT',0,max_fences)
+for _,m in ipairs(old_fences) do redis.call('DEL',ARGV[9]..'former_owner:'..m); redis.call('ZREM',fence_exp,m) end
+if redis.call('EXISTS',node)==0 then
+  if redis.call('EXISTS',fence)==1 then
+    local fv=redis.call('HMGET',fence,'node_digest','owner_digest','cause','transition_epoch','expires_at_epoch')
+    if not fv[1] or fv[1]~=digest or fv[2]~=owner or not finite(fv[4]) or not finite(fv[5]) then return {'schema'} end
+    return {'already_complete',fv[3],fv[4]}
+  end
+  return {'not_found'}
+end
+local v=redis.call('HMGET',node,'control_credential_digest','lease_expires_at_epoch','scheduler_claimed_work','scheduler_reserved_work','scheduler_queued_work')
+if not v[1] or not finite(v[2]) or not finite(v[3]) then return {'schema'} end
+if cause=='explicit_unregister' and v[1]~=owner then return {'credential_mismatch'} end
+if cause=='registration_lease_expired' and finite(v[2])>now then return {'lease_active'} end
+if (finite(v[3]) or 0)~=0 or (finite(v[4]) or 0)~=0 or (finite(v[5]) or 0)~=0 then return {'work_index_required'} end
+owner=v[1]
+if redis.call('ZCARD',tomb_exp)>=max_tombs or redis.call('ZCARD',fence_exp)>=max_fences then return {'capacity'} end
+if redis.call('EXISTS',pending)==1 then return {'conflict'} end
+local tomb_deadline=math.min(now+tomb_ttl,now+300); local fence_deadline=now+retention
+if not finite(tomb_deadline) or not finite(fence_deadline) then return {'schema'} end
+redis.call('DEL',node); redis.call('ZREM',leases,digest)
+redis.call('HSET',tomb,'node_digest',digest,'owner_digest',owner,'cause',cause,'status','cancelled','transition_epoch',now,'completed','1','expires_at_epoch',tomb_deadline)
+redis.call('ZADD',tomb_exp,tomb_deadline,digest)
+redis.call('HSET',fence,'node_digest',digest,'owner_digest',owner,'cause',cause,'status','cancelled','transition_epoch',now,'expires_at_epoch',fence_deadline)
+redis.call('ZADD',fence_exp,fence_deadline,digest..':'..owner)
+return {'complete',cause,tostring(now),'0','0','0','0','0','0'}
+"""
+NODE_TRANSITION_SCRIPT = ReviewedScript(
+    "transition_node_v1",
+    NODE_TRANSITION_SOURCE,
+    "655b7f86134739872f8f0c318f44868db601132bddb93061e8faf3e596bce0e8",
+    True,
+)
+
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
     {
         SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT,
@@ -2013,6 +2074,7 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         CANCEL_REQUEST_SCRIPT.name: CANCEL_REQUEST_SCRIPT,
         ACCEPT_RESPONSE_SCRIPT.name: ACCEPT_RESPONSE_SCRIPT,
         RETRIEVE_RESPONSE_SCRIPT.name: RETRIEVE_RESPONSE_SCRIPT,
+        NODE_TRANSITION_SCRIPT.name: NODE_TRANSITION_SCRIPT,
     }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
@@ -2390,6 +2452,7 @@ class ValkeyRegistrationStore:
             "deadline": 1,
             "not_found": 1,
             "schema": 1,
+            "transition_required": 1,
             "ok": 2 if operation in {"register", "renew", "reap"} else 1,
         }
         if code not in expected_lengths or len(result) != expected_lengths[code]:
@@ -2404,6 +2467,8 @@ class ValkeyRegistrationStore:
             raise RelayStateStoreError("registration deadline must be finite")
         if code == "schema":
             raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if code == "transition_required":
+            raise RelayStateConflict("node transition is required")
         return code, list(result[1:])
 
     @staticmethod
@@ -2575,12 +2640,141 @@ class ValkeyRegistrationStore:
         return tuple(sorted(expired, key=lambda record: record.node_id))
 
     def unregister(self, node_id: str, control_credential_digest: str) -> bool:
-        self._validate_node_id(node_id)
-        self._validate_digest(control_credential_digest)
-        return (
-            self._transition("unregister", node_id, control_credential_digest, ())[0]
-            == "ok"
+        result = self.unregister_node_and_transition_work(
+            node_id, control_credential_digest
         )
+        return result.state not in {"not_found", "already_complete"}
+
+    def unregister_node_and_transition_work(
+        self,
+        node_id: str,
+        control_credential_digest: str | None = None,
+        *,
+        cause: str = "explicit_unregister",
+    ) -> NodeTransitionResult:
+        """Fence and remove a work-free node with retained retry authority.
+
+        The reviewed transition fails closed when scheduler counters show work;
+        destructive removal is never used as a substitute for enumeration.
+        """
+        self._validate_node_id(node_id)
+        if cause not in {"explicit_unregister", "registration_lease_expired"}:
+            raise RelayStateStoreError("node transition cause is invalid")
+        if cause == "explicit_unregister":
+            self._validate_digest(control_credential_digest)
+        owner = control_credential_digest or ""
+        digest = self._node_digest(node_id)
+        cfg = self._foundation.config
+        keys = (
+            cfg.key("nodes:lease"),
+            cfg.key("node", digest),
+            cfg.key("cursor"),
+            cfg.key("node_tombstones:expiry"),
+            cfg.key("node_tombstone", digest),
+            cfg.key("node_transition", digest),
+            cfg.key("former_owners:expiry"),
+            cfg.key("former_owner", digest, owner or "0" * 64),
+        )
+        args = (
+            digest.encode(),
+            owner.encode(),
+            cause.encode(),
+            str(self.config.max_pending_node_transitions).encode(),
+            str(self.config.max_node_tombstones).encode(),
+            str(self.config.max_removed_owner_fences).encode(),
+            repr(float(self.config.node_tombstone_ttl_seconds)).encode(),
+            repr(float(self.config.terminal_retention_seconds)).encode(),
+            cfg.key_prefix.encode(),
+        )
+        result = self._foundation.execute(NODE_TRANSITION_SCRIPT.name, keys, args)
+        code, values = self._ascii_status(result)
+        if code == "credential_mismatch":
+            raise RelayStateCredentialMismatch("control credential digest mismatch")
+        if code == "conflict":
+            raise RelayStateConflict("node transition cause conflicts")
+        if code == "capacity":
+            raise RelayStateCapacityExceeded("node transition capacity reached")
+        if code in {"schema", "work_index_required"}:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if code in {"not_found", "lease_active"} and not values:
+            return NodeTransitionResult(code, cause, None, 0, 0, 0, 0, 0, False)
+        if code == "already_complete" and len(values) == 2:
+            return NodeTransitionResult(
+                code,
+                self._decode_text(values[0]),
+                float(values[1]),
+                0,
+                0,
+                0,
+                0,
+                0,
+                False,
+            )
+        if code == "complete" and len(values) == 8:
+            decoded_cause = self._decode_text(values[0])
+            numbers = [int(value) for value in values[2:7]]
+            return NodeTransitionResult(
+                code, decoded_cause, float(values[1]), *numbers, bool(int(values[7]))
+            )
+        raise ValkeySchemaIncompatibleError("state schema incompatible")
+
+    def node_tombstones(self) -> tuple[NodeTombstoneRecord, ...]:
+        """Return a bounded immutable snapshot of retained node tombstones."""
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_read_compatible(manifest)
+        cfg = self._foundation.config
+        seconds, micros = self._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        digests = self._foundation._call(
+            self._foundation._client.zrangebyscore,
+            cfg.key("node_tombstones:expiry"),
+            f"({now}",
+            "+inf",
+            start=0,
+            num=self.config.max_node_tombstones,
+        )
+        records = []
+        for raw_digest in digests:
+            if not isinstance(raw_digest, bytes) or not re.fullmatch(
+                rb"[0-9a-f]{64}", raw_digest
+            ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            values = self._foundation._call(
+                self._foundation._client.hmget,
+                cfg.key("node_tombstone", raw_digest.decode()),
+                (
+                    "node_digest",
+                    "owner_digest",
+                    "cause",
+                    "status",
+                    "transition_epoch",
+                    "completed",
+                    "expires_at_epoch",
+                ),
+            )
+            if (
+                not isinstance(values, (list, tuple))
+                or len(values) != 7
+                or any(v is None for v in values)
+            ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            try:
+                records.append(
+                    NodeTombstoneRecord(
+                        values[0].decode(),
+                        values[1].decode(),
+                        values[2].decode(),
+                        values[3].decode(),
+                        float(values[4]),
+                        values[5] == b"1",
+                        float(values[6]),
+                    )
+                )
+            except (AttributeError, UnicodeDecodeError, ValueError):
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
+        return tuple(sorted(records, key=lambda item: item.node_identity_digest))
 
     @staticmethod
     def _ascii_status(result: object) -> tuple[str, list[object]]:
@@ -4457,11 +4651,14 @@ class ValkeyRegistrationStore:
             if not isinstance(raw, list) or len(raw) != len(fields):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             if all(value is None for value in raw):
-                if self._foundation._call(
-                    self._foundation._client.zscore,
-                    cfg.key("control:expiry"),
-                    item[0],
-                ) is None:
+                if (
+                    self._foundation._call(
+                        self._foundation._client.zscore,
+                        cfg.key("control:expiry"),
+                        item[0],
+                    )
+                    is None
+                ):
                     continue
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             if any(not isinstance(value, bytes) for value in raw):
@@ -4589,7 +4786,9 @@ class ValkeyRegistrationStore:
                         b"client\0" + lifecycle[b"client_public_key"]
                     ).hexdigest()
                     != parts[1]
-                    or hashlib.sha256(b"request\0" + lifecycle[b"request_id"]).hexdigest()
+                    or hashlib.sha256(
+                        b"request\0" + lifecycle[b"request_id"]
+                    ).hexdigest()
                     != parts[2]
                     or lifecycle[b"node_id"] != v[b"node_id"]
                     or lifecycle[b"node_digest"] != v[b"node_digest"]
@@ -4626,10 +4825,7 @@ class ValkeyRegistrationStore:
                             terminal[b"cancellation_token_digest"]
                         )
                     )
-                    or (
-                        terminal[b"outcome"] == b"expired"
-                        and deadline > accepted
-                    )
+                    or (terminal[b"outcome"] == b"expired" and deadline > accepted)
                     or member.decode() != f"{parts[0]}:{parts[1]}:{parts[2]}"
                     or active != [0, None, None, 0, None, 0, None]
                     or self._foundation._call(

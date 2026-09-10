@@ -534,6 +534,8 @@ def test_registry_mismatch_persists_not_run_evidence_before_probes(
 def test_main_runs_inspected_image_id_not_mutable_alias(tmp_path, monkeypatch):
     image_id = "sha256:" + "b" * 64
     calls = []
+    lifecycle = []
+    active = set()
     immutable_values = iter(["a" * 40, "amd64"])
     phase_values = iter(["metrics", "public", "protected-rate", "protected-daily",
                          "mutating-rate", "mutating-daily"])
@@ -556,15 +558,52 @@ def test_main_runs_inspected_image_id_not_mutable_alias(tmp_path, monkeypatch):
         if args[:3] == ("image", "inspect", image_id):
             return next(immutable_values)
         if args[0] == "run":
+            name = args[args.index("--name") + 1]
+            assert not active
+            active.add(name)
+            lifecycle.append(("run", name))
             return next(phase_values)
         pytest.fail(f"unexpected mutable-alias inspection: {args}")
 
+    def cleanup(args, **_kwargs):
+        assert args[:3] == ["docker", "rm", "-f"]
+        name = args[3]
+        assert name in active
+        active.remove(name)
+        lifecycle.append(("rm", name))
+        return subprocess.CompletedProcess(args, 0)
+
     result, report = _run_main(
         tmp_path, monkeypatch, output,
-        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0),
+        cleanup,
     )
     assert result == 0 and report["image_id"] == image_id
     assert [call[-1] for call in calls if call[0] == "run"] == [image_id] * 6
+    assert not active
+    assert [operation for operation, _name in lifecycle] == ["run", "rm"] * 6
+    assert [name.split("-")[2] for operation, name in lifecycle if operation == "run"] == [
+        "metrics", "public", "protected", "protected", "mutating", "mutating",
+    ]
+
+
+def test_failed_launch_preserves_runtime_error_and_proves_absence(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    calls = []
+
+    def output(*args):
+        if args[0] == "run":
+            raise subprocess.CalledProcessError(125, args)
+        return next(values)
+
+    def inspect_absence(args, **_kwargs):
+        calls.append(args)
+        assert args[:3] == ["docker", "container", "inspect"]
+        return subprocess.CompletedProcess(args, 1)
+
+    result, report = _run_main(tmp_path, monkeypatch, output, inspect_absence)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert len(calls) == 1
+    assert "cleanup" not in report
 
 
 def test_replacement_alias_registry_identity_cannot_validate_original(tmp_path, monkeypatch):
@@ -660,9 +699,14 @@ def test_false_mutating_quota_result_fails_qualification(tmp_path, monkeypatch, 
 
 
 def test_nonzero_cleanup_fails_successful_qualification(tmp_path, monkeypatch):
-    result, report = _run_qualified_main(tmp_path, monkeypatch, cleanup_code=1)
+    cleanup_calls = []
+    result, report = _run_qualified_main(
+        tmp_path, monkeypatch, cleanup_code=1, cleanup_calls=cleanup_calls,
+    )
     assert result == 1 and report["passed"] is False
     assert report["cleanup"] == "failed" and report["error_category"] == "cleanup_failed"
+    # Every immediate failure remains sticky and receives one bounded fallback retry.
+    assert len(cleanup_calls) == 12
 
 
 def test_nonzero_cleanup_preserves_qualification_failure_category(tmp_path, monkeypatch):

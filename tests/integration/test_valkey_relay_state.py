@@ -9442,6 +9442,168 @@ def test_node_removed_record_rejects_malformed_control_cancellation_authority(
         second.close()
 
 
+@pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
+def test_node_pending_recovery_resumes_bounded_transition_from_another_store(
+    valkey_server, cause
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(
+        valkey_server, namespace, node_transition_batch_size=1
+    )
+    second = _registration_store(
+        valkey_server, namespace, node_transition_batch_size=1
+    )
+    node, owner = f"pending-{cause}", _digest(f"pending-owner-{cause}")
+    identities = tuple((f"pending-client-{i}-{cause}", f"pending-request-{i}") for i in range(3))
+    selections = []
+    try:
+        first.register(node, _capabilities(concurrency=4), owner)
+        seconds, micros = first._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        for identity in identities:
+            selections.append(
+                first.select_and_reserve(
+                    *identity, "qwen3-8b-instruct", "8k-fast", now + 60
+                )
+            )
+        if cause == "registration_lease_expired":
+            digest = first._node_digest(node)
+            first._foundation._client.hset(
+                first._foundation.config.key("node", digest),
+                "lease_expires_at_epoch",
+                str(now),
+            )
+            first._foundation._client.zadd(
+                first._foundation.config.key("nodes:lease"), {digest: now}
+            )
+            started = first.unregister_node_and_transition_work(node, cause=cause)
+        else:
+            started = first.unregister_node_and_transition_work(node, owner, cause=cause)
+        assert started.state == "transitioning"
+        assert started.processed_count == 1 and started.new_outcomes == 1
+        epoch = started.transition_epoch
+        first.close()
+
+        cfg, digest = second._foundation.config, second._node_digest(node)
+        assert second._foundation._client.zscore(
+            cfg.key("node_transitions:pending"), digest
+        ) is not None
+        assert second.expire() == ()
+        assert second.expire() == ()
+        terminals = second.terminal_records()
+        assert len(terminals) == 3
+        assert all(
+            (record.outcome, record.reason) == ("cancelled", "server_unregistered")
+            for record in terminals
+        )
+        tombstone = second.node_tombstones()[0]
+        assert tombstone.cause == cause
+        assert tombstone.transition_epoch == epoch
+        assert tombstone.completed
+        assert second._foundation._client.exists(
+            cfg.key("node_transition", digest)
+        ) == 0
+        assert second._foundation._client.zscore(
+            cfg.key("node_transitions:pending"), digest
+        ) is None
+    finally:
+        _delete_claim_fixture_state(second, (node,), identities)
+        cfg, digest = second._foundation.config, second._node_digest(node)
+        second._foundation._client.delete(
+            *(cfg.key("reservation", _digest(item.reservation_token)) for item in selections),
+            cfg.key("node_work", digest),
+            cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest),
+            cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"),
+            cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        second.close()
+
+
+def test_node_pending_recovery_orphan_index_fences_registration_and_renewal(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner = "pending-orphan", _digest("pending-orphan-owner")
+    cfg, digest = store._foundation.config, store._node_digest(node)
+    try:
+        store._foundation._client.zadd(
+            cfg.key("node_transitions:pending"), {digest: 0}
+        )
+        with pytest.raises(RelayStateConflict, match="node transition is incomplete"):
+            store.register(node, _capabilities(), owner)
+        assert store.renew(node, owner) is None
+        assert store._foundation._client.exists(cfg.key("node", digest)) == 0
+        assert store._foundation._client.zscore(
+            cfg.key("node_transitions:pending"), digest
+        ) == 0
+    finally:
+        store._foundation._client.delete(
+            cfg.key("schema"), cfg.key("node_transitions:pending")
+        )
+        store.close()
+
+
+def test_node_pending_recovery_stale_discovery_does_not_remove_replacement(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, node_transition_batch_size=1)
+    sweeper = _registration_store(valkey_server, namespace, node_transition_batch_size=1)
+    finisher = _registration_store(valkey_server, namespace, node_transition_batch_size=1)
+    node, owner, replacement = (
+        "pending-race",
+        _digest("pending-race-owner"),
+        _digest("pending-race-replacement"),
+    )
+    identities = (("pending-race-client-1", "request-1"), ("pending-race-client-2", "request-2"))
+    try:
+        first.register(node, _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        for identity in identities:
+            first.select_and_reserve(
+                *identity,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                seconds + micros / 1_000_000 + 60,
+            )
+        assert first.unregister_node_and_transition_work(
+            node, owner
+        ).continuation_required
+        original = sweeper.unregister_node_and_transition_work
+
+        def complete_before_resume(*args, **kwargs):
+            assert kwargs["_expected_transition_epoch"]
+            assert finisher.unregister_node_and_transition_work(node, owner).state == "complete"
+            finisher.register(node, _capabilities(), replacement)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            sweeper, "unregister_node_and_transition_work", complete_before_resume
+        )
+        assert sweeper.expire() == ()
+        current = finisher.get(node)
+        assert current is not None
+        assert current.control_credential_digest == replacement
+    finally:
+        _delete_claim_fixture_state(finisher, (node,), identities)
+        cfg, digest = finisher._foundation.config, finisher._node_digest(node)
+        finisher._foundation._client.delete(
+            cfg.key("node_work", digest),
+            cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest),
+            cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"),
+            cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        first.close()
+        sweeper.close()
+        finisher.close()
+
+
 def test_retention_reaper_reclaims_capacity_only_after_complete_validation(
     valkey_server,
 ):

@@ -300,6 +300,14 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert hashlib.sha256(script.source.encode()).hexdigest() == script.sha256
     assert "SCAN" not in script.source.upper()
     assert "ZRANGE',work,1,tonumber(batch)" in script.source
+    assert "expected_epoch" in script.source
+    assert "redis.call('ZADD',pending_index,now,node_digest)" in script.source
+
+
+def test_registration_transition_fences_both_pending_authorities():
+    source = REGISTRATION_TRANSITION_SCRIPT.source
+    assert "prefix .. 'node_transition:' .. digest" in source
+    assert "prefix .. 'node_transitions:pending', digest" in source
 
 
 def test_node_removed_record_encoding_is_generation_and_timestamp_canonical():

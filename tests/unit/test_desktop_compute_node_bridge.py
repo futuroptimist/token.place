@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -848,6 +849,9 @@ def _install_custom_runtime_isolation(monkeypatch, module):
     monkeypatch.setattr(subprocess, 'Popen', _unexpected('native process'))
     monkeypatch.setattr(subprocess, 'run', _unexpected('native process'))
     monkeypatch.setattr(requests.sessions.Session, 'request', _unexpected('network'))
+    monkeypatch.setattr(socket, 'create_connection', _unexpected('network: socket.create_connection'))
+    monkeypatch.setattr(os, 'execv', _unexpected('re-exec: os.execv'))
+    monkeypatch.setattr(os, 'execve', _unexpected('re-exec: os.execve'))
     return unexpected_attempts
 
 
@@ -7603,8 +7607,13 @@ def _load_desktop_relay_operator_parity_module(monkeypatch):
     subprocess_module.TimeoutExpired = subprocess.TimeoutExpired
     subprocess_module.Popen = _unexpected('native process')
 
+    class UnexpectedEncryptionManager:
+        def __init__(self, *_args, **_kwargs):
+            unexpected_attempts.append('API/encryption bootstrap: EncryptionManager')
+            raise AssertionError('unexpected parity-helper side effect: API/encryption bootstrap')
+
     encryption_module = ModuleType('api.v1.encryption')
-    encryption_module.EncryptionManager = type('UnusedEncryptionManager', (), {})
+    encryption_module.EncryptionManager = UnexpectedEncryptionManager
     api_module = ModuleType('api')
     api_module.__path__ = []
     api_v1_module = ModuleType('api.v1')
@@ -7628,6 +7637,9 @@ def _load_desktop_relay_operator_parity_module(monkeypatch):
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(sys, 'path', list(sys.path))
+    monkeypatch.setattr(socket, 'create_connection', _unexpected('network: socket.create_connection'))
+    monkeypatch.setattr(os, 'execv', _unexpected('re-exec: os.execv'))
+    monkeypatch.setattr(os, 'execve', _unexpected('re-exec: os.execve'))
 
     module_path = (
         Path(__file__).resolve().parents[2]

@@ -330,7 +330,17 @@ def _cleanup_phase_container(container: str, *, created: bool) -> bool:
                 check=False, capture_output=True, timeout=15,
             )
             if inspected.returncode != 0:
-                return True
+                stderr = inspected.stderr.decode(errors="replace") if isinstance(
+                    inspected.stderr, bytes
+                ) else inspected.stderr or ""
+                missing = re.search(
+                    rf"No such (?:container|object):\s*{re.escape(container)}\s*$",
+                    stderr,
+                )
+                # An inspect failure only proves absence when Docker explicitly
+                # identifies this named container as missing. Daemon and access
+                # errors remain cleanup failures and are retried by the fallback.
+                return missing is not None
         removed = subprocess.run(
             ["docker", "rm", "-f", container], check=False, capture_output=True, timeout=15
         )

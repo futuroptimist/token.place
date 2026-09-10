@@ -710,12 +710,37 @@ def test_failed_launch_preserves_error_and_verifies_no_owned_container(tmp_path,
     def cleanup(args, **_kwargs):
         cleanup_calls.append(args)
         assert args[:3] == ["docker", "container", "inspect"]
-        return subprocess.CompletedProcess(args, 1)
+        container = args[3]
+        return subprocess.CompletedProcess(
+            args, 1, stderr=f"Error: No such object: {container}\n".encode()
+        )
 
     result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
     assert result == 1 and report["error_category"] == "runtime_command_failed"
     assert len(cleanup_calls) == 1
     assert "cleanup" not in report
+
+
+def test_failed_launch_inspect_error_fails_closed_and_retries(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    cleanup_calls = []
+
+    def output(*args):
+        if args[0] == "run":
+            raise subprocess.CalledProcessError(125, args)
+        return next(values)
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        assert args[:3] == ["docker", "container", "inspect"]
+        return subprocess.CompletedProcess(
+            args, 1, stderr=b"error during connect: Docker daemon unavailable\n"
+        )
+
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert report["cleanup"] == "failed"
+    assert len(cleanup_calls) == 2
 
 
 def test_probe_failure_immediately_removes_current_container(tmp_path, monkeypatch):

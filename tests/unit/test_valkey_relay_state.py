@@ -310,6 +310,130 @@ def test_node_removed_record_encoding_is_generation_and_timestamp_canonical():
     assert "local replay=string.format('%.17g',tonumber(accepted))" in source
 
 
+def _node_transition_store_with_reply(reply):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.execute.return_value = reply
+    return registration_store_with_foundation(foundation)
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    (
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"credential_mismatch"], RelayStateCredentialMismatch),
+        ([b"conflict"], RelayStateConflict),
+        ([b"pending_capacity"], RelayStateCapacityExceeded),
+        ([b"transitioning", b"explicit_unregister", b"bad"], ValkeySchemaIncompatibleError),
+        (
+            [
+                b"transitioning",
+                b"explicit_unregister",
+                b"1.0",
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,
+            ],
+            ValkeySchemaIncompatibleError,
+        ),
+        ([b"unexpected"], ValkeySchemaIncompatibleError),
+    ),
+)
+def test_node_transition_reply_rejects_typed_and_malformed_results(reply, error):
+    store = _node_transition_store_with_reply(reply)
+
+    with pytest.raises(error):
+        store.unregister_node_and_transition_work("node-a", "a" * 64)
+
+
+@pytest.mark.parametrize(
+    ("cause", "credential", "message"),
+    (
+        ("unsupported", "a" * 64, "cause is invalid"),
+        ("registration_lease_expired", "a" * 64, "does not accept credentials"),
+    ),
+)
+def test_node_transition_rejects_invalid_cause_inputs(cause, credential, message):
+    store = registration_store_with_foundation(Mock(spec=ValkeyFoundation))
+
+    with pytest.raises(RelayStateStoreError, match=message):
+        store.unregister_node_and_transition_work("node-a", credential, cause=cause)
+
+
+def _node_tombstone_store(indexed, raw=None):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation._client = MagicMock()
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    calls = [indexed]
+    if raw is not None:
+        calls.append(raw)
+    foundation._call.side_effect = calls
+    return registration_store_with_foundation(foundation)
+
+
+def test_node_tombstones_decodes_a_valid_bounded_snapshot():
+    node_digest = b"a" * 64
+    owner_digest = b"b" * 64
+    store = _node_tombstone_store(
+        [(node_digest, 200.0)],
+        [
+            node_digest,
+            owner_digest,
+            b"explicit_unregister",
+            b"cancelled",
+            b"100.0",
+            b"1",
+            b"200.0",
+        ],
+    )
+
+    records = store.node_tombstones()
+
+    assert len(records) == 1
+    assert dataclasses.asdict(records[0]) == {
+        "node_identity_digest": node_digest.decode(),
+        "control_credential_digest": owner_digest.decode(),
+        "cause": "explicit_unregister",
+        "status": "cancelled",
+        "transition_epoch": 100.0,
+        "completed": True,
+        "expires_at_epoch": 200.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("indexed", "raw"),
+    (
+        ("not-a-list", None),
+        ([(b"invalid", 200.0)], None),
+        ([(b"a" * 64, 200.0)], [None] * 7),
+        (
+            [(b"a" * 64, 200.0)],
+            [
+                b"a" * 64,
+                b"b" * 64,
+                b"explicit_unregister",
+                b"cancelled",
+                b"invalid",
+                b"1",
+                b"200.0",
+            ],
+        ),
+    ),
+)
+def test_node_tombstones_rejects_malformed_authority(indexed, raw):
+    store = _node_tombstone_store(indexed, raw)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.node_tombstones()
+
+
 @pytest.mark.parametrize(
     ("client", "request_id"),
     ((None, "request"), ("client", None), ("", "request"), ("client", "")),

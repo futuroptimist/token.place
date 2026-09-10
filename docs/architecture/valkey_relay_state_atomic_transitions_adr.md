@@ -116,8 +116,8 @@ operator knobs.
 | `response:{client_digest}:{request_digest}`, `responses:expiry` | exact validated encrypted response envelope, accepted epoch, retrieval acknowledgement-token digest, acknowledgement state, and replay deadline | one bounded envelope per request; unacknowledged responses remain idempotently replayable until the lesser of the configured response-retention deadline and total lifecycle maximum; acknowledgement deletes or marks the envelope consumed atomically |
 | `progress:{client_digest}:{request_digest}` | latest exact validated encrypted progress envelope | one bounded envelope, replacement only; expires no later than the request |
 | `control:{node_digest}:{client_digest}:{request_digest}`, `control:expiry` | fixed terminal status/reason, canonical client/request identity, owner digest, acknowledgement state; expiry members contain the node and both identity digests | one per affected claim; configured tombstone TTL capped at five minutes |
-| `node_work:{node_digest}` | canonical `client_digest:request_digest` members for every reserved, queued, or claimed lifecycle owned by the node | capped by the configured per-node reservation plus queue bounds; membership is created with reservation authority and removed only when that lifecycle authority ends |
-| `node_transition:{node_digest}` | owner digest, cause, fixed terminal status/reason, immutable transition epoch, and completion state | at most configured pending-transition capacity; retained until every member of the authoritative node-work index is handled |
+| `node_work:{node_digest}` | sorted set containing the reserved schema marker member `!schema:{revision}` at score `0` plus canonical `client_digest:request_digest` members at score `1` for every reserved, queued, or claimed lifecycle owned by the node | capped by the configured per-node reservation plus queue bounds plus one marker; lifecycle membership is created with reservation authority and removed only when that lifecycle authority ends; the marker is removed only with the index after transition completion |
+| `node_transition:{node_digest}`, `node_transitions:pending` | owner digest, cause, fixed terminal status/reason, immutable transition epoch, and completion state; the pending zset maps the node digest to its server-time retry deadline | at most configured pending-transition capacity; both authorities are retained until every member of the authoritative node-work index is handled, independent of tombstone expiry |
 | `node_tombstone:{node_digest}`, `node_tombstones:expiry` | unregistered/expired marker and owner digest | at most recent-node capacity; five-minute maximum TTL |
 | `former_owner:{node_digest}:{owner_digest}`, `former_owners:expiry` | immutable completed cause and transition epoch for an exact removed owner | at most configured former-owner capacity; retained through terminal retention; multiple owners for a reused node ID coexist |
 | `terminal:{client_digest}:{request_digest}`, `terminals:expiry` | one fixed outcome/status/reason, accepted response digest when applicable, outcome-counted flag | one per request; configured terminal TTL; the record is the dedup authority |
@@ -130,21 +130,54 @@ zset deadlines and transition logic are the protocol authority. No persisted val
 `time.monotonic()`. Scripts obtain Valkey `TIME`, and clients express externally supplied deadlines
 as validated UTC epoch values.
 
-The per-node work index is mandatory authority, not a cache. Registration creates an empty,
-schema-marked index, and selection, enqueue, claim, response, cancellation, deadline, reservation
-expiry, and node-transition scripts validate and maintain it in the same atomic mutation as the
-lifecycle record. An absent index for a live or transitioning node, an index member without its
-exact lifecycle authority, or lifecycle authority absent from the selected node's index is schema
-corruption and fails closed. Node eviction reads only a configured-size batch from this index; it
-must not use `SCAN`, inspect every request, or interpret a missing index as an empty node.
+The per-node work index is mandatory authority, not a cache. It is a sorted set whose reserved
+`!schema:{revision}` member is outside the canonical digest-member grammar and therefore cannot
+collide with lifecycle identity. Registration creates the set with that marker at score `0`; an
+idle node remains observable because Valkey never sees an empty set. Lifecycle members have score
+`1`, so a bounded `ZRANGE ... BYSCORE LIMIT` excludes the marker without broad discovery. Selection,
+enqueue, claim, response, cancellation, deadline, reservation expiry, and node-transition scripts
+validate and maintain the index in the same atomic mutation as the lifecycle record. They never
+remove the marker while the node is live or transitioning. An absent or wrongly marked index for a
+live or transitioning node, an index member without its exact lifecycle authority, or lifecycle
+authority absent from the selected node's index is schema corruption and fails closed. Node eviction
+reads only a configured-size batch from this index; it must not use `SCAN`, inspect every request, or
+interpret a missing index as an empty node.
+
+Starting unregister or eviction atomically creates `node_transition:{node_digest}` and adds the node
+to `node_transitions:pending` before removing it from eligibility. Every batch refreshes the pending
+member's server-time retry deadline. The bounded background sweeper reads due members from this
+authoritative global zset and invokes the same transition script, so progress does not depend on the
+initiator surviving or on finding a per-node key. Capacity exhaustion must fail before mutation; a
+pending transition and its index cannot expire merely because its control tombstone expires. The
+final batch removes the index marker and key, transition record, and pending member atomically after
+all lifecycle members are gone.
+
+Registration and renewal must inspect transition authority before changing node state. If either
+`node_transition:{node_digest}` or its `node_transitions:pending` member exists, registration fails
+closed with a bounded transition-pending result; it must not create, reset, or adopt `node_work`.
+Reuse of the node ID is permitted only after the final transition batch has removed both authorities,
+at which point a new registration creates a newly marked empty index.
 
 This index cannot be introduced as an optional additive field while an older supported writer can
 create or mutate lifecycles without maintaining it. Before enabling these transitions, operators
-must advance the manifest's active writer revision and supported writer minimum to a revision whose
-complete mutating-script digest set maintains `node_work`. Older readers may remain in the read
-range because the new keys do not alter their existing record decoding, but older writers must fail
-the write gate before protocol access. The manifest change and script deployment therefore precede
-creation of the first indexed registration; there is no lazy backfill from broad key discovery.
+must advance the manifest's active writer revision and minimum supported writer revision to a
+revision whose complete mutating-script digest set maintains `node_work`. The existing compatibility
+gate still requires a process's entire compiled script-digest map to equal the manifest map, including
+for reads. Consequently, a process built with the previous digest map cannot remain in protocol
+service after cutover merely because its reader revision is in range; only reader-only processes with
+the exact new digest map and a supported reader revision may remain. Older writers must fail the write
+gate before protocol access.
+
+The writer gate alone is not a migration. Before changing the manifest in a nonempty namespace,
+operators must enter a maintenance window, stop old writers, and drain every existing reservation,
+queued entry, and claim to terminal state. They then enumerate the bounded authoritative
+`nodes:lease` index (not `SCAN`) and use a reviewed bounded migration script to create and validate a
+marked, lifecycle-empty `node_work` index for every remaining live registration. If complete drain
+and validation cannot be proven, operators must instead cut over to a fresh major namespace; they
+must not activate indexed transitions in the old namespace. Only after one of those paths completes
+may operators atomically publish the new manifest revision and complete script-digest map, deploy
+compatible processes, and permit new registrations. There is no lazy backfill, partial adoption, or
+broad key discovery.
 
 ## Atomicity and data-structure roles
 

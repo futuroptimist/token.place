@@ -5,10 +5,13 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
+
+from scripts import relay_release_safety_gate as gate
 
 
 WORKFLOW = Path(".github/workflows/qualify-relay-oci.yml")
@@ -96,25 +99,53 @@ def test_duplicate_index_members_fail_before_sanitization(tmp_path: Path) -> Non
 
 def evidence_env(tmp_path: Path) -> dict[str, str]:
     (tmp_path / "raw").mkdir(); (tmp_path / "artifacts").mkdir(); (tmp_path / "config").mkdir()
-    required = ["first", "second"]
-    (tmp_path / "config/relay_release_safety_contract.json").write_text(json.dumps({"requirements": [{"id": item} for item in required]}))
+    contract = Path("config/relay_release_safety_contract.json").read_text()
+    (tmp_path / "config/relay_release_safety_contract.json").write_text(contract)
     inputs = {"evidence_label": "candidate", "index_digest": DIGEST_A, "release_base": "main", "release_ref": "refs/tags/v1", "source_commit": "c" * 40}
     (tmp_path / "raw/validated-inputs.json").write_text(json.dumps(inputs))
     (tmp_path / "artifacts/index-manifest.json").write_text(json.dumps(index_payload(descriptor("linux", "amd64", DIGEST_A), descriptor("linux", "arm64", DIGEST_B))))
     return {"RAW_DIR": "raw", "ARTIFACT_DIR": "artifacts", "OCI_REPOSITORY": "example.test/relay", "AMD64_DIGEST": DIGEST_A, "ARM64_DIGEST": DIGEST_B, "GATE_COMMIT": "d" * 40}
 
 
-def write_evidence(tmp_path: Path, arch: str, *, cleanup: str | None = None, sensitive: bool = False) -> None:
+def write_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, arch: str) -> Path:
     platform = f"linux/{arch}"; digest = DIGEST_A if arch == "amd64" else DIGEST_B
-    value = {"schema_version": 2, "passed": True, "source_commit": "c" * 40, "release_ref": "refs/tags/v1", "release_base": "main", "platform": platform, "index_digest": DIGEST_A, "platform_digest": digest, "registry_coordinate": f"example.test/relay@{digest}", "results": {"second": {"state": "passed", "passed": True}, "first": {"state": "passed", "passed": True}}}
-    if cleanup is not None: value["cleanup"] = cleanup
-    if sensitive: value["prompt"] = "DO-NOT-UPLOAD"
-    (tmp_path / f"raw/relay-release-safety-{arch}-evidence.json").write_text(json.dumps(value))
+    target = tmp_path / f"raw/relay-release-safety-{arch}-evidence.json"
+    metrics = {
+        "metrics.valid_instrumentation": {"passed": True},
+        "metrics.no_flask_defaults": {"passed": True},
+        "metrics.no_raw_paths": {"passed": True},
+        "metrics.bounded_unmatched_paths": {"passed": True, "batch_size": 1024,
+            "total_unmatched_requests": 2048, "first_batch_growth": 1, "second_batch_growth": 0},
+    }
+    monkeypatch.setattr(gate, "docker_output", lambda *args: (
+        "sha256:" + "e" * 64 if args[-1] == "{{.Id}}" else
+        "c" * 40 if "revision" in args[-1] else arch
+    ))
+    monkeypatch.setattr(gate, "validate_registry_identity", lambda *args: None)
+    monkeypatch.setattr(gate, "request", lambda *args, **kwargs: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda *_: metrics)
+    monkeypatch.setattr(gate, "execute_public_exemption_check", lambda *_: {"quota.public_information_exempt": {
+        "passed": True, "safe_methods_response_class": "2xx", "sentinel_status_codes": [200, 429]}})
+    monkeypatch.setattr(gate, "inspect_public_exemption_predicate", lambda *_: True)
+    monkeypatch.setattr(gate, "execute_quota_check", lambda _url, result_id, **_kwargs: {
+        result_id: {"passed": True, "status_codes": [200 if "mutating" not in result_id else 400, 429]}})
+    original_run = subprocess.run
+    monkeypatch.setattr(gate.subprocess, "run", lambda args, **kwargs: (
+        subprocess.CompletedProcess(args, 0, "", "") if args[:3] == ["docker", "rm", "-f"]
+        else original_run(args, **kwargs)
+    ))
+    monkeypatch.setattr(sys, "argv", ["relay_release_safety_gate.py", "--image", f"example.test/relay@{digest}",
+        "--platform", platform, "--source-commit", "c" * 40, "--release-ref", "refs/tags/v1",
+        "--release-base", "main", "--registry-coordinate", f"example.test/relay@{digest}",
+        "--index-digest", DIGEST_A, "--platform-digest", digest, "--resolved-revision", "c" * 40,
+        "--port", "15012", "--evidence", str(target)])
+    assert gate.main() == 0
     (tmp_path / f"raw/{arch}-outcome.json").write_text('{"cleanup_status":0,"gate_status":0}')
+    return target
 
 
-def test_sorted_evidence_and_absent_cleanup_succeed_with_exact_hashes(tmp_path: Path) -> None:
-    env = evidence_env(tmp_path); write_evidence(tmp_path, "amd64"); write_evidence(tmp_path, "arm64")
+def test_current_gate_evidence_succeeds_with_exact_hashes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    env = evidence_env(tmp_path); write_evidence(monkeypatch, tmp_path, "amd64"); write_evidence(monkeypatch, tmp_path, "arm64")
     result = run(script("Verify evidence and assemble bounded record"), tmp_path, env)
     assert result.returncode == 0, result.stderr
     metadata = json.loads((tmp_path / "artifacts/qualification-metadata.json").read_text())
@@ -123,25 +154,35 @@ def test_sorted_evidence_and_absent_cleanup_succeed_with_exact_hashes(tmp_path: 
         digest, name = line.split("  "); assert hashlib.sha256((tmp_path / "artifacts" / name).read_bytes()).hexdigest() == digest
 
 
-@pytest.mark.parametrize("corrupt", ["duplicate", "missing", "failed", "identity"])
-def test_evidence_duplicate_missing_failed_and_identity_mismatch_fail(tmp_path: Path, corrupt: str) -> None:
-    env = evidence_env(tmp_path); write_evidence(tmp_path, "amd64"); write_evidence(tmp_path, "arm64")
+@pytest.mark.parametrize("corrupt", ["duplicate", "missing", "failed", "identity", "passed_int", "schema_float"])
+def test_invalid_evidence_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, corrupt: str) -> None:
+    env = evidence_env(tmp_path); write_evidence(monkeypatch, tmp_path, "amd64"); write_evidence(monkeypatch, tmp_path, "arm64")
     path = tmp_path / "raw/relay-release-safety-amd64-evidence.json"; value = json.loads(path.read_text())
     if corrupt == "duplicate": path.write_text(path.read_text().replace('"passed": true', '"passed": false, "passed": true', 1))
-    elif corrupt == "missing": del value["results"]["first"]; path.write_text(json.dumps(value))
-    elif corrupt == "failed": value["results"]["first"]["passed"] = False; path.write_text(json.dumps(value))
-    else: value["platform_digest"] = DIGEST_B; path.write_text(json.dumps(value))
+    elif corrupt == "missing": value["results"].pop(next(iter(value["results"]))); path.write_text(json.dumps(value))
+    elif corrupt == "failed": value["results"][next(iter(value["results"]))]["passed"] = False; path.write_text(json.dumps(value))
+    elif corrupt == "identity": value["platform_digest"] = DIGEST_B; path.write_text(json.dumps(value))
+    elif corrupt == "passed_int": value["passed"] = 1; path.write_text(json.dumps(value))
+    else: value["schema_version"] = 2.0; path.write_text(json.dumps(value))
     result = run(script("Verify evidence and assemble bounded record"), tmp_path, env)
     assert result.returncode != 0
     assert json.loads((tmp_path / "artifacts/relay-release-safety-amd64-evidence.json").read_text())["error_category"] == "evidence_rejected"
 
 
-def test_sensitive_rejected_bytes_never_enter_failure_bundle(tmp_path: Path) -> None:
-    env = evidence_env(tmp_path); write_evidence(tmp_path, "amd64", sensitive=True); write_evidence(tmp_path, "arm64")
+@pytest.mark.parametrize("location", ["response_headers", "error_category"])
+def test_nested_sensitive_bytes_never_enter_bundle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, location: str) -> None:
+    env = evidence_env(tmp_path); path = write_evidence(monkeypatch, tmp_path, "amd64"); write_evidence(monkeypatch, tmp_path, "arm64")
+    value = json.loads(path.read_text())
+    result = value["results"][next(iter(value["results"]))]
+    if location == "response_headers": result[location] = {"authorization": "DO-NOT-UPLOAD"}
+    else: value[location] = {"payload": "DO-NOT-UPLOAD"}
+    path.write_text(json.dumps(value))
     result = run(script("Verify evidence and assemble bounded record"), tmp_path, env)
     assert result.returncode != 0
     assert b"DO-NOT-UPLOAD" not in b"".join(path.read_bytes() for path in (tmp_path / "artifacts").iterdir())
     assert len(list((tmp_path / "artifacts").iterdir())) == 5
+    for line in (tmp_path / "artifacts/SHA256SUMS").read_text().splitlines():
+        digest, name = line.split("  "); assert hashlib.sha256((tmp_path / "artifacts" / name).read_bytes()).hexdigest() == digest
 
 
 def test_gate_runs_both_platforms_and_records_executor_failures(tmp_path: Path) -> None:

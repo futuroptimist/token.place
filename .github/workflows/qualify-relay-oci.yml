@@ -204,7 +204,34 @@ jobs:
               if len(required)!=len(set(required)): raise ValueError("duplicate contract IDs")
           except Exception: required=[]; failures.append("contract")
           digests={"linux/amd64":os.environ.get("AMD64_DIGEST","unresolved"),"linux/arm64":os.environ.get("ARM64_DIGEST","unresolved")}
-          statuses={}; forbidden={"authorization","credentials","request_body","response","responses","response_body","client_identity","key","token","ciphertext","prompt","model_output","raw_path","generated_path"}
+          statuses={}
+          contract_path="config/relay_release_safety_contract.json"
+          digest=lambda value: isinstance(value,str) and len(value)==71 and value.startswith("sha256:") and all(c in "0123456789abcdef" for c in value[7:])
+          def bounded_int(value, lower=0, upper=10_000):
+              return type(value) is int and lower <= value <= upper
+          def project_result(result_id, value):
+              if not isinstance(value,dict) or value.get("state")!="passed" or value.get("passed") is not True:
+                  raise ValueError("failed result")
+              projected={"passed":True,"state":"passed"}
+              if result_id=="metrics.bounded_unmatched_paths":
+                  fields=("batch_size","total_unmatched_requests","first_batch_growth","second_batch_growth")
+                  if set(value)!={"passed","state",*fields} or any(not bounded_int(value[key]) for key in fields):
+                      raise ValueError("invalid bounded-metrics result")
+                  projected.update((key,value[key]) for key in fields)
+              elif result_id=="quota.public_information_exempt":
+                  fields={"passed","state","safe_methods_response_class","sentinel_status_codes","predicate_exact"}
+                  codes=value.get("sentinel_status_codes")
+                  if set(value)!=fields or value.get("safe_methods_response_class")!="2xx" or value.get("predicate_exact") is not True or not isinstance(codes,list) or len(codes)!=2 or any(not bounded_int(code,100,599) for code in codes):
+                      raise ValueError("invalid public-quota result")
+                  projected.update(safe_methods_response_class="2xx",sentinel_status_codes=list(codes),predicate_exact=True)
+              elif result_id.startswith("quota."):
+                  codes=value.get("status_codes")
+                  if set(value)!={"passed","state","status_codes"} or not isinstance(codes,list) or len(codes)!=2 or any(not bounded_int(code,100,599) for code in codes):
+                      raise ValueError("invalid quota result")
+                  projected["status_codes"]=list(codes)
+              elif set(value)!={"passed","state"}:
+                  raise ValueError("unexpected result member")
+              return projected
           for platform,arch in (("linux/amd64","amd64"),("linux/arm64","arm64")):
               source=raw/f"relay-release-safety-{arch}-evidence.json"; target=out/f"relay-release-safety-{arch}-evidence.json"
               try:
@@ -212,22 +239,15 @@ jobs:
                   outcome=load(raw/f"{arch}-outcome.json",4096)
                   if set(outcome)!={"cleanup_status","gate_status"} or any(type(outcome[k]) is not int for k in outcome): raise ValueError("invalid outcome")
                   if outcome!={"cleanup_status":0,"gate_status":0}: raise ValueError("executor failed")
-                  def names(value):
-                      if isinstance(value,dict):
-                          for key,child in value.items(): yield key.lower(); yield from names(child)
-                      elif isinstance(value,list):
-                          for child in value: yield from names(child)
-                  if set(names(evidence)) & forbidden: raise ValueError("forbidden field")
                   results=evidence.get("results")
-                  if evidence.get("schema_version") != 2 or not isinstance(results,dict) or list(sorted(results)) != sorted(required): raise ValueError("invalid results")
-                  if any(not isinstance(v,dict) or v.get("state")!="passed" or v.get("passed") is not True for v in results.values()): raise ValueError("failed result")
+                  if type(evidence.get("schema_version")) is not int or evidence["schema_version"] != 2 or evidence.get("passed") is not True or not isinstance(results,dict) or set(results)!=set(required): raise ValueError("invalid results")
                   expected={"passed":True,"source_commit":validated["source_commit"],"release_ref":validated["release_ref"],"release_base":validated["release_base"],"platform":platform,"index_digest":validated["index_digest"],"platform_digest":digests[platform],"registry_coordinate":f"{os.environ['OCI_REPOSITORY']}@{digests[platform]}"}
                   if any(evidence.get(k)!=v for k,v in expected.items()): raise ValueError("identity mismatch")
-                  if "cleanup" not in evidence: evidence["cleanup"]="passed"
-                  if evidence.get("cleanup")!="passed": raise ValueError("gate cleanup failed")
-                  allowed=set(expected)|{"schema_version","cleanup","results","error_category"}
-                  if set(evidence)-allowed: raise ValueError("unexpected evidence member")
-                  target.write_text(json.dumps(evidence,indent=2,sort_keys=True)+"\n"); statuses[platform]="passed"
+                  allowed=set(expected)|{"schema_version","cleanup","results","contract","image_id"}
+                  if set(evidence)-allowed or evidence.get("contract")!=contract_path or not digest(evidence.get("image_id")) or evidence.get("cleanup","passed")!="passed": raise ValueError("invalid evidence member")
+                  projected={key:evidence[key] for key in expected}
+                  projected.update(schema_version=2,contract=contract_path,image_id=evidence["image_id"],cleanup="passed",results={key:project_result(key,results[key]) for key in required})
+                  target.write_text(json.dumps(projected,indent=2,sort_keys=True)+"\n"); statuses[platform]="passed"
               except Exception:
                   statuses[platform]="failed"; failures.append(platform)
                   target.write_text(json.dumps({"schema_version":2,"passed":False,"platform":platform,"error_category":"evidence_rejected"},sort_keys=True)+"\n")

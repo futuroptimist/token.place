@@ -107,13 +107,16 @@ Checksums cover the final sanitized bytes even on failure.
 
 Qualification still fails unless both schema-version-2 evidence objects contain every requirement
 from the checked-out contract exactly once with a literal `true` passing value, match all supplied
-and resolved identities, and have confirmed gate and container-cleanup success. A gate may omit
+and resolved identities, identify the checked-out contract path and a full local image SHA-256
+digest, and have confirmed gate and container-cleanup success. The verifier projects only the
+current gate's known result members: literal pass/state values, bounded integer metric counts,
+bounded HTTP status-code pairs, the fixed safe response class, and the exact public-route
+predicate result. Unknown top-level or nested members and incorrectly typed schema/pass values are
+rejected rather than copied. A gate may omit
 `cleanup` only on success, in which case the executor adds `passed` after checking Docker itself;
 an explicit gate cleanup failure is never overwritten. Docker listing, each owned-container
 removal, raw-file cleanup, artifact cleanup, gate execution, and both platform runs feed the final
 outcome and summary. Cleanup is attempted on failed and interrupted paths, and failures fail closed.
-Reports are rejected if they contain fields for credentials, authorization, bodies, responses,
-client identities, keys, tokens, ciphertext, prompts, model output, or generated/raw paths.
 
 ### Planned Step 05b dispatches (not yet executed)
 

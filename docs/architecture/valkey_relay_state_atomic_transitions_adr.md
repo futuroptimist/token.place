@@ -196,6 +196,26 @@ health source, or terminal-state authority.
 
 ### The ten required transitions
 
+#### Bounded node-removal enumeration authority
+
+Each registered node owns a namespaced `node_work:<node-digest>` sorted set.  A fixed
+`!schema:1` sentinel is created in the registration transition, so a missing set is
+distinguishable from an empty node and fails closed.  Reservation admission adds the
+canonical `<client-digest>:<request-digest>` member with its allocation sequence;
+enqueue and claim retain it, while every terminal or abandoned-reservation transition
+removes it atomically.  Node removal reads only the configured batch from this set and
+therefore never uses `SCAN`, Stream-wide discovery, or an unbounded lifecycle walk.
+
+An incomplete removal is authoritative in `node_transition:<node-digest>` and the
+bounded `node_transitions:pending` index.  Completion is retained independently in a short
+node tombstone and in one owner-digest-keyed former-owner fence whose expiry follows
+terminal retention.  This separation permits node-ID reuse by a new owner without
+allowing a prior owner to register, renew, poll, or complete new work.  The index and
+transition scripts are a writer-visible schema addition: deployments must advertise
+the updated reviewed-script manifest before admitting writes, and mixed writers that
+do not maintain `node_work` are not write-compatible.  Readers continue to tolerate
+the additive hashes and sorted sets.
+
 1. **Register or renew.** Validate bounds, reap the addressed expired registration, compare the
    credential digest for a live node, upsert its node hash, and update `nodes:lease` using server
    time. Registration retains the original owner digest as specified by the registration ADR.

@@ -35,6 +35,7 @@ from valkey_relay_state import (
     CANCEL_REQUEST_SCRIPT,
     CLAIM_SCRIPT,
     CONTROL_CLAIM_SCRIPT,
+    PENDING_TRANSITION_READ_SCRIPT,
     RENEW_CLAIM_SCRIPT,
     RETRIEVE_RESPONSE_SCRIPT,
     SCRIPT_DIGESTS,
@@ -9532,6 +9533,14 @@ def test_node_pending_recovery_orphan_index_fences_registration_and_renewal(
         store._foundation._client.zadd(
             cfg.key("node_transitions:pending"), {digest: 0}
         )
+        before = store._foundation._client.zrange(
+            cfg.key("node_transitions:pending"), 0, -1, withscores=True
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.expire()
+        assert store._foundation._client.zrange(
+            cfg.key("node_transitions:pending"), 0, -1, withscores=True
+        ) == before
         with pytest.raises(RelayStateConflict, match="node transition is incomplete"):
             store.register(node, _capabilities(), owner)
         assert store.renew(node, owner) is None
@@ -9572,16 +9581,16 @@ def test_node_pending_recovery_stale_discovery_does_not_remove_replacement(
         assert first.unregister_node_and_transition_work(
             node, owner
         ).continuation_required
-        original = sweeper.unregister_node_and_transition_work
+        original = sweeper._foundation.execute
 
-        def complete_before_resume(*args, **kwargs):
-            assert kwargs["_expected_transition_epoch"]
-            assert finisher.unregister_node_and_transition_work(node, owner).state == "complete"
-            finisher.register(node, _capabilities(), replacement)
-            return original(*args, **kwargs)
+        def complete_before_hydration(script_name, *args, **kwargs):
+            if script_name == PENDING_TRANSITION_READ_SCRIPT.name:
+                assert finisher.unregister_node_and_transition_work(node, owner).state == "complete"
+                finisher.register(node, _capabilities(), replacement)
+            return original(script_name, *args, **kwargs)
 
         monkeypatch.setattr(
-            sweeper, "unregister_node_and_transition_work", complete_before_resume
+            sweeper._foundation, "execute", complete_before_hydration
         )
         assert sweeper.expire() == ()
         current = finisher.get(node)
@@ -9602,6 +9611,112 @@ def test_node_pending_recovery_stale_discovery_does_not_remove_replacement(
         first.close()
         sweeper.close()
         finisher.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("node_id", "different-node"), ("transition_epoch", "")),
+)
+def test_node_pending_recovery_rejects_invalid_identity_before_dispatch(
+    valkey_server, monkeypatch, field, value
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, node_transition_batch_size=1
+    )
+    node, owner = "pending-invalid", _digest("pending-invalid-owner")
+    identities = (("pending-invalid-client-1", "request-1"), ("pending-invalid-client-2", "request-2"))
+    cfg, digest = store._foundation.config, store._node_digest(node)
+    try:
+        store.register(node, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        for identity in identities:
+            store.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast", seconds + micros / 1_000_000 + 60
+            )
+        assert store.unregister_node_and_transition_work(
+            node, owner
+        ).continuation_required
+        store._foundation._client.hset(
+            cfg.key("node_transition", digest), field, value
+        )
+        keys = (
+            cfg.key("node_transition", digest),
+            cfg.key("node_transitions:pending"),
+            cfg.key("node_work", digest),
+        )
+        before = (
+            store._foundation._client.hgetall(keys[0]),
+            store._foundation._client.zrange(keys[1], 0, -1, withscores=True),
+            store._foundation._client.zrange(keys[2], 0, -1, withscores=True),
+        )
+        monkeypatch.setattr(
+            store,
+            "unregister_node_and_transition_work",
+            lambda *args, **kwargs: pytest.fail("invalid discovery was dispatched"),
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.expire()
+        assert (
+            store._foundation._client.hgetall(keys[0]),
+            store._foundation._client.zrange(keys[1], 0, -1, withscores=True),
+            store._foundation._client.zrange(keys[2], 0, -1, withscores=True),
+        ) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), identities)
+        store._foundation._client.delete(
+            cfg.key("node_work", digest),
+            cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest),
+            cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"),
+            cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        store.close()
+
+
+def test_node_pending_recovery_leaves_not_yet_due_transition_untouched(valkey_server):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, node_transition_batch_size=1
+    )
+    node, owner = "pending-future", _digest("pending-future-owner")
+    identities = (("pending-future-client-1", "request-1"), ("pending-future-client-2", "request-2"))
+    cfg, digest = store._foundation.config, store._node_digest(node)
+    try:
+        store.register(node, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        for identity in identities:
+            store.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast", now + 60
+            )
+        assert store.unregister_node_and_transition_work(
+            node, owner
+        ).continuation_required
+        store._foundation._client.zadd(
+            cfg.key("node_transitions:pending"), {digest: now + 60}
+        )
+        keys = (cfg.key("node_transition", digest), cfg.key("node_transitions:pending"), cfg.key("node_work", digest))
+        before = (
+            store._foundation._client.hgetall(keys[0]),
+            store._foundation._client.zrange(keys[1], 0, -1, withscores=True),
+            store._foundation._client.zrange(keys[2], 0, -1, withscores=True),
+        )
+        assert store.expire() == ()
+        assert (
+            store._foundation._client.hgetall(keys[0]),
+            store._foundation._client.zrange(keys[1], 0, -1, withscores=True),
+            store._foundation._client.zrange(keys[2], 0, -1, withscores=True),
+        ) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), identities)
+        store._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        store.close()
 
 
 def test_retention_reaper_reclaims_capacity_only_after_complete_validation(

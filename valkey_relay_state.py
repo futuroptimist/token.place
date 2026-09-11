@@ -2012,8 +2012,8 @@ local pv=redis.call('HMGET',pending,'node_id','node_digest','owner_digest','caus
 local pending_exists=redis.call('EXISTS',pending)==1
 local owner,epoch
 if not pending_exists then
-  if expected_epoch~='' then return {'stale'} end
   if redis.call('ZSCORE',pending_index,node_digest) then return {'schema'} end
+  if expected_epoch~='' then return {'stale'} end
   local live=redis.call('EXISTS',node)==1
   if not live then
     local tv=redis.call('HMGET',tomb,'owner_digest','cause','transition_epoch','completed')
@@ -2129,8 +2129,26 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "57a3c7c3f5e451200db577a827f9b2efb0f6f86ca905d36467aeb3aef333d1dc",  # pragma: allowlist secret
+    "a2745642df5a61a060896cb899ce2effd7289094ad8b7ade9c9220a9dcb5eab3",  # pragma: allowlist secret
     True,
+)
+
+PENDING_TRANSITION_READ_SOURCE = r"""
+local pending,pending_index=KEYS[1],KEYS[2]
+local node_digest=ARGV[1]
+local exists=redis.call('EXISTS',pending)==1
+local score=redis.call('ZSCORE',pending_index,node_digest)
+if not exists and not score then return {'absent'} end
+if not exists or not score or not tonumber(score) then return {'schema'} end
+local values=redis.call('HMGET',pending,'node_id','node_digest','owner_digest','cause','transition_epoch')
+for _,value in ipairs(values) do if not value then return {'schema'} end end
+return {'record',unpack(values)}
+"""
+PENDING_TRANSITION_READ_SCRIPT = ReviewedScript(
+    "pending_transition_read_v1",
+    PENDING_TRANSITION_READ_SOURCE,
+    "96cf5943b044c4f2064f20f866c322b0ddad3f47b8943c37e903c01b848fb6da",  # pragma: allowlist secret
+    False,
 )
 
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
@@ -2147,6 +2165,7 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         ACCEPT_RESPONSE_SCRIPT.name: ACCEPT_RESPONSE_SCRIPT,
         RETRIEVE_RESPONSE_SCRIPT.name: RETRIEVE_RESPONSE_SCRIPT,
         NODE_TRANSITION_SCRIPT.name: NODE_TRANSITION_SCRIPT,
+        PENDING_TRANSITION_READ_SCRIPT.name: PENDING_TRANSITION_READ_SCRIPT,
     }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
@@ -2766,14 +2785,22 @@ class ValkeyRegistrationStore:
             ):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             digest_text = pending_digest.decode("ascii")
-            raw = self._foundation._call(
-                self._foundation._client.hmget,
-                cfg.key("node_transition", digest_text),
-                ("node_id", "node_digest", "owner_digest", "cause", "transition_epoch"),
+            status, raw = self._ascii_status(
+                self._foundation.execute(
+                    PENDING_TRANSITION_READ_SCRIPT.name,
+                    (
+                        cfg.key("node_transition", digest_text),
+                        cfg.key("node_transitions:pending"),
+                    ),
+                    (digest_text.encode(),),
+                )
             )
+            if status == "absent" and not raw:
+                continue
+            if status != "record":
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
             if (
-                not isinstance(raw, (list, tuple))
-                or len(raw) != 5
+                len(raw) != 5
                 or any(not isinstance(value, bytes) for value in raw)
             ):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
@@ -2789,10 +2816,20 @@ class ValkeyRegistrationStore:
                 ) from None
             if (
                 recorded_digest != digest_text
+                or self._node_digest(pending_node) != digest_text
                 or not re.fullmatch(r"[0-9a-f]{64}", pending_owner)
                 or pending_cause
                 not in {"explicit_unregister", "registration_lease_expired"}
+                or not pending_epoch
             ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            try:
+                epoch_number = float(pending_epoch)
+            except ValueError:
+                raise ValkeySchemaIncompatibleError(
+                    "state schema incompatible"
+                ) from None
+            if not math.isfinite(epoch_number):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             self.unregister_node_and_transition_work(
                 pending_node,

@@ -302,6 +302,12 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "ZRANGE',work,1,tonumber(batch)" in script.source
     assert "expected_epoch" in script.source
     assert "redis.call('ZADD',pending_index,now,node_digest)" in script.source
+    assert "if redis.call('ZSCORE',pending_index,node_digest) then return {'schema'} end" in script.source
+
+    reader = valkey_relay_state.PENDING_TRANSITION_READ_SCRIPT
+    assert SCRIPT_DIGESTS[reader.name] == reader.sha256
+    assert hashlib.sha256(reader.source.encode()).hexdigest() == reader.sha256
+    assert not reader.mutates
 
 
 def test_registration_transition_fences_both_pending_authorities():

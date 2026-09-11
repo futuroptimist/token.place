@@ -180,16 +180,32 @@ def write_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, arch: str) -
     monkeypatch.setattr(gate, "execute_quota_check", lambda _url, result_id, **_kwargs: {
         result_id: {"passed": True, "status_codes": [200 if "mutating" not in result_id else 400, 429]}})
     original_run = subprocess.run
-    monkeypatch.setattr(gate.subprocess, "run", lambda args, **kwargs: (
-        subprocess.CompletedProcess(args, 0, "", "") if args[:3] == ["docker", "rm", "-f"]
-        else original_run(args, **kwargs)
-    ))
+    container_id = "f" * 64
+    ownership_labels: set[str] = set()
+
+    def mock_run(args, **kwargs):
+        if args[:4] == ["docker", "ps", "-aq", "--no-trunc"]:
+            filters = [args[index + 1] for index, value in enumerate(args) if value == "--filter"]
+            assert len(filters) == 2
+            assert re.fullmatch(r"name=\^/relay-safety-[a-z-]+-[0-9a-f]{8}\$", filters[0])
+            assert re.fullmatch(
+                r"label=io\.token\.place\.relay-safety-invocation=[0-9a-f]{32}", filters[1]
+            )
+            ownership_labels.add(filters[1])
+            return subprocess.CompletedProcess(args, 0, container_id + "\n", "")
+        if args[:3] == ["docker", "rm", "-f"]:
+            assert args == ["docker", "rm", "-f", container_id]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", mock_run)
     monkeypatch.setattr(sys, "argv", ["relay_release_safety_gate.py", "--image", f"example.test/relay@{digest}",
         "--platform", platform, "--source-commit", "c" * 40, "--release-ref", "refs/tags/v1",
         "--release-base", "main", "--registry-coordinate", f"example.test/relay@{digest}",
         "--index-digest", DIGEST_A, "--platform-digest", digest, "--resolved-revision", "c" * 40,
         "--port", "15012", "--evidence", str(target)])
     assert gate.main() == 0
+    assert len(ownership_labels) == 1
     (tmp_path / f"raw/{arch}-outcome.json").write_text('{"cleanup_status":0,"gate_status":0}')
     return target
 

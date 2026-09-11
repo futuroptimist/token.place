@@ -10457,6 +10457,19 @@ def test_node_transition_capacity_fences_and_reports_admissible_prefix(
         assert blocked.processed_count == blocked.new_outcomes == 0
         assert blocked.continuation_required
         assert len(observer.terminal_records()) == 1
+
+        _force_retained_authority_due(
+            observer, _retained_authority_keys(observer, node, identities[0])
+        )
+        completed = observer.unregister_node_and_transition_work(
+            node, owner if cause == "explicit_unregister" else None, cause=cause
+        )
+        assert completed.state == "complete"
+        assert completed.processed_count == completed.new_outcomes == 1
+        assert completed.reservations_terminalized == (0 if claimed else 1)
+        assert completed.claims_terminalized == (1 if claimed else 0)
+        assert not completed.continuation_required
+        assert len(observer.terminal_records()) == 1
     finally:
         _delete_claim_fixture_state(observer, (node,), identities)
         cfg, digest = observer._foundation.config, observer._node_digest(node)
@@ -10787,3 +10800,75 @@ def test_retention_reaper_rejects_malformed_authority_without_mutation(
         client.delete(authority["control"], authority["control_index"])
         first.close()
         second.close()
+
+@pytest.mark.parametrize(
+    ("retained_state", "corruption"),
+    (
+        ("due", "missing_deadline"),
+        ("due", "orphan_claim"),
+        ("live", "oversized_envelope"),
+        ("live", "control_owner_mismatch"),
+    ),
+)
+def test_node_transition_capacity_rejects_inconsistent_retained_authority_without_mutation(
+    valkey_server, retained_state, corruption
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
+    retained_node, target_node = "capacity-retained", "capacity-target"
+    retained_owner, target_owner = _digest("capacity-retained-owner"), _digest("capacity-target-owner")
+    retained_identity = ("capacity-retained-client", "request")
+    target_identity = ("capacity-target-client", "request")
+    try:
+        store.register(retained_node, _capabilities(), retained_owner)
+        deadline = time.time() + 60
+        _enqueue_claim_fixture(store, retained_node, retained_owner, *retained_identity, deadline)
+        store.claim_queued_request(retained_node, retained_owner, "retained-consumer")
+        store.cancel_or_expire_request(*retained_identity, "cancel")
+        retained = _retained_authority_keys(store, retained_node, retained_identity)
+        if retained_state == "due":
+            _force_retained_authority_due(store, retained)
+
+        datastore = store._foundation._client
+        if corruption == "missing_deadline":
+            datastore.hdel(retained["request"], "deadline")
+        elif corruption == "orphan_claim":
+            client, request = store._identity(*retained_identity)
+            datastore.hset(
+                store._foundation.config.key("claim", client, request),
+                mapping={"orphan": "1"},
+            )
+        elif corruption == "oversized_envelope":
+            datastore.hset(
+                retained["request"],
+                "envelope",
+                "x" * (store.config.max_envelope_bytes + 1),
+            )
+        else:
+            datastore.hset(retained["control"], "owner_digest", _digest("wrong-owner"))
+
+        store.register(target_node, _capabilities(), target_owner)
+        store.select_and_reserve(
+            *target_identity, "qwen3-8b-instruct", "8k-fast", time.time() + 60
+        )
+        client, request = store._identity(*retained_identity)
+        retained_node_digest = store._node_digest(retained_node)
+        extra = tuple(retained[key] for key in ("request", "terminal", "response", "control")) + (
+            store._foundation.config.key("claim", client, request),
+            store._foundation.config.key("node", retained_node_digest),
+        )
+        before = _node_transition_authority_snapshot(
+            observer, target_node, (target_identity,), extra=extra
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            observer.unregister_node_and_transition_work(target_node, target_owner)
+        assert _node_transition_authority_snapshot(
+            observer, target_node, (target_identity,), extra=extra
+        ) == before
+    finally:
+        _delete_claim_fixture_state(
+            observer, (retained_node, target_node), (retained_identity, target_identity)
+        )
+        observer.close()
+        store.close()

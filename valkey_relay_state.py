@@ -2188,65 +2188,108 @@ for _,member in ipairs(members) do
 end
 -- Capacity inspection is bounded by the configured maxima.  Validate every
 -- authority that can affect admission before reclaiming it or fencing a node.
-local function retained_terminal_valid(member,score)
-  local p=string.find(member,':',1,true); if p~=65 then return false end
-  local client,request=string.sub(member,1,p-1),string.sub(member,p+1)
-  if not digest(client) or not digest(request) then return false end
-  local tk=prefix..'terminal:'..client..':'..request; local lk=prefix..'request:'..client..':'..request
-  local tv=redis.call('HMGET',tk,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
-  local lv=redis.call('HMGET',lk,'state','client','request','node_digest','node_id','deadline','token_digest','cancellation_digest','queue_entry','sequence','claim_generation','client_public_key','request_id','envelope')
-  for _,v in ipairs(tv) do if v==false then return false end end
-  if not lv[1] or redis.call('EXISTS',tk)~=1 then return false end
-  local accepted=canonical_number(tv[9],true); local replay=canonical_number(tv[10],true); local expiry=canonical_number(tv[11],false); local generation=integer(tv[7])
-  local unavailable=(tv[1]=='cancelled' and (tv[2]=='requester_cancelled' or tv[2]=='server_unregistered') and tv[3]=='completed_unavailable') or (tv[1]=='expired' and tv[2]=='request_deadline_expired' and tv[3]=='completed_unavailable')
-  local completed=tv[1]=='completed' and tv[2]=='response_completed' and (tv[3]=='response_ready' or tv[3]=='acknowledged' or tv[3]=='retrieval_expired')
-  if score~=expiry or not accepted or accepted>now or not replay or replay<accepted or not expiry or expiry<replay or not generation or
-     tv[15]~=client or tv[16]~=request or tv[4]~=lv[5] or tv[4]=='' or string.len(tv[4])>max_node_id or
-     lv[2]~=client or lv[3]~=request or not digest(lv[4]) or tv[12]~=lv[7] or tv[14]~=lv[8] or tv[7]~=lv[11] or not digest(tv[12]) or
-     (not unavailable and not completed) then return false end
-  local response=prefix..'response:'..client..':'..request; local response_score=finite(redis.call('ZSCORE',prefix..'responses:expiry',member))
-  if unavailable then
-    local proof=(tv[2]=='requester_cancelled' and digest(tv[14])) or (tv[2]~='requester_cancelled' and (tv[14]=='' or digest(tv[14])))
-    return proof and replay==accepted and tv[8]=='' and tv[13]=='' and lv[1]==tv[1] and redis.call('EXISTS',response)==0 and not response_score and
-      ((generation==0 and tv[5]=='' and tv[6]=='') or (generation>0 and digest(tv[5]) and digest(tv[6])))
-  end
-  if generation<1 or not digest(tv[5]) or not digest(tv[6]) or not digest(tv[8]) or not digest(tv[13]) or not digest(tv[14]) or lv[1]~='response_ready' then return false end
-  if tv[3]~='response_ready' then return redis.call('EXISTS',response)==0 and not response_score end
-  local rv=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')
-  for _,v in ipairs(rv) do if v==false then return false end end
-  return redis.call('EXISTS',response)==1 and response_score==replay and rv[1]==client and rv[2]==request and rv[3]==lv[12] and rv[4]==lv[13] and rv[5]==tv[4] and rv[6]==tv[6] and rv[7]==tv[7] and string.len(rv[8])>=1 and string.len(rv[8])<=max_response_envelope and rv[9]==tv[9] and rv[10]==tv[8] and rv[11]==tv[10] and rv[12]=='response_ready'
+local terminal_fields={'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request'}
+local request_fields={'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','cancellation_digest','envelope'}
+local control_fields={'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','status','reason','deadline','acknowledged','expires_at_epoch'}
+local function bounded_number(value,allow_zero)
+  if not value or string.len(value)>32 or not string.match(value,'^%d+%.?%d*$') or string.sub(value,-1)=='.' then return false end
+  if string.sub(value,1,1)=='0' and string.len(value)>1 and string.sub(value,2,2)~='.' then return false end
+  local n=finite(value); return n and (allow_zero or n>0) and n>=0 and n
 end
-local function retained_control_valid(member,score)
-  local a=string.find(member,':',1,true); local b=a and string.find(member,':',a+1,true)
-  local n=a and string.sub(member,1,a-1); local client=b and string.sub(member,a+1,b-1); local request=b and string.sub(member,b+1)
-  if not digest(n) or not digest(client) or not digest(request) then return false end
-  local ck=prefix..'control:'..n..':'..client..':'..request
-  local cv=redis.call('HMGET',ck,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','status','reason','deadline','acknowledged','expires_at_epoch')
-  for _,v in ipairs(cv) do if v==false then return false end end
-  local expiry=canonical_number(cv[12],false); local deadline=canonical_number(cv[10],false); local generation=positive_integer(cv[7])
-  local pair=(cv[8]=='cancelled' and (cv[9]=='requester_cancelled' or cv[9]=='server_unregistered')) or (cv[8]=='expired' and cv[9]=='request_deadline_expired')
-  local terminal_member=client..':'..request; local terminal_score=finite(redis.call('ZSCORE',terminal_expiries,terminal_member))
-  return redis.call('EXISTS',ck)==1 and score==expiry and cv[1]==client and cv[2]==request and cv[3]==n and cv[4]~='' and string.len(cv[4])<=max_node_id and digest(cv[5]) and digest(cv[6]) and generation and pair and deadline and (cv[11]=='0' or cv[11]=='1') and terminal_score and retained_terminal_valid(terminal_member,terminal_score)
+local function lifecycle_valid(c,q,v,l,accepted)
+  local deadline=bounded_number(l[8],false); local generation=integer(l[10])
+  if redis.call('EXISTS',prefix..'request:'..c..':'..q)~=1 or l[2]~=c or l[3]~=q or
+     not deadline or not generation or l[10]~=v[7] or l[6]~=v[4] or l[6]=='' or string.len(l[6])>max_node_id or
+     not digest(l[7]) or not digest(l[12]) or l[12]~=v[12] or l[13]~=v[14] or
+     (l[13]~='' and not digest(l[13])) then return false end
+  local extended=l[4] or l[5] or l[9] or l[11] or l[14]
+  if generation>0 and not extended then return false end
+  if extended then
+    local sequence=integer(l[9])
+    if not l[4] or string.len(l[4])<1 or string.len(l[4])>max_identity or
+       not l[5] or string.len(l[5])<1 or string.len(l[5])>max_identity or not sequence or sequence<1 or
+       l[11]~=l[9]..'-0' or not l[14] or string.len(l[14])<1 or string.len(l[14])>max_request_envelope then return false end
+  elseif l[4] or l[5] or l[9] or l[11] or l[14] then return false end
+  if l[1]=='expired' and deadline>accepted then return false end
+  local m=c..':'..q
+  if redis.call('ZSCORE',prefix..'requests:deadline',m) or redis.call('EXISTS',prefix..'claim:'..c..':'..q)~=0 or
+     redis.call('ZSCORE',prefix..'claims:expiry',m) or redis.call('EXISTS',prefix..'progress:'..c..':'..q)~=0 or
+     redis.call('EXISTS',prefix..'reservation:'..l[12])~=0 or redis.call('ZSCORE',prefix..'reservations:expiry',l[12]) then return false end
+  if extended then
+    local entries=redis.call('XRANGE',prefix..'queue:'..l[7],l[11],l[11],'COUNT',1)
+    if #entries~=0 then return false end
+  end
+  return true
+end
+local function retained_terminal_valid(m,score_value,due)
+  local sep=string.find(m,':',1,true); local c=sep and string.sub(m,1,sep-1); local q=sep and string.sub(m,sep+1)
+  if not digest(c) or not digest(q) or not score_value then return false end
+  local tk=prefix..'terminal:'..c..':'..q; local lk=prefix..'request:'..c..':'..q
+  local v=redis.call('HMGET',tk,unpack(terminal_fields)); local l=redis.call('HMGET',lk,unpack(request_fields))
+  for i=1,#v do if v[i]==false then return false end end
+  for i=1,#l do if l[i]==false and (i==1 or i==2 or i==3 or i==6 or i==7 or i==8 or i==10 or i==12 or i==13) then return false end end
+  local accepted=bounded_number(v[9],true); local replay=bounded_number(v[10],true); local expiry=bounded_number(v[11],false); local g=integer(v[7])
+  if redis.call('EXISTS',tk)~=1 or score_value~=expiry or (due and expiry>now) or (not due and expiry<=now) or
+     not accepted or accepted>now or not replay or replay<accepted or expiry<replay or v[15]~=c or v[16]~=q or
+     v[4]=='' or string.len(v[4])>max_node_id or not digest(v[12]) or not lifecycle_valid(c,q,v,l,accepted) then return false end
+  if v[1]=='cancelled' or v[1]=='expired' then
+    local cancellation_ok=(v[1]=='cancelled' and ((v[2]=='requester_cancelled' and digest(v[14])) or (v[2]=='server_unregistered' and (v[14]=='' or digest(v[14]))))) or
+      (v[1]=='expired' and v[2]=='request_deadline_expired' and (v[14]=='' or digest(v[14])))
+    if not cancellation_ok or v[3]~='completed_unavailable' or v[8]~='' or replay~=accepted or v[13]~='' or
+       l[1]~=v[1] or redis.call('EXISTS',prefix..'response:'..c..':'..q)~=0 or redis.call('ZSCORE',prefix..'responses:expiry',m) then return false end
+    if g==0 then
+      if v[5]~='' or v[6]~='' then return false end
+    elseif not digest(v[5]) or not digest(v[6]) then return false end
+    return true
+  end
+  if v[1]~='completed' or v[2]~='response_completed' or (v[3]~='response_ready' and v[3]~='acknowledged' and v[3]~='retrieval_expired') or
+     not digest(v[5]) or not digest(v[6]) or not g or g<1 or not digest(v[8]) or not digest(v[13]) or not digest(v[14]) or l[1]~='response_ready' then return false end
+  local rk=prefix..'response:'..c..':'..q; local rs=redis.call('ZSCORE',prefix..'responses:expiry',m); local response_score=rs and finite(rs)
+  if v[3]=='response_ready' then
+    local rv=redis.call('HMGET',rk,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')
+    for i=1,#rv do if rv[i]==false then return false end end
+    return redis.call('EXISTS',rk)==1 and response_score==replay and rv[1]==c and rv[2]==q and rv[3]==l[4] and rv[4]==l[5] and
+      rv[5]==v[4] and rv[6]==v[6] and rv[7]==v[7] and rv[8] and string.len(rv[8])>=1 and string.len(rv[8])<=max_response_envelope and
+      rv[9]==v[9] and rv[10]==v[8] and rv[11]==v[10] and rv[12]=='response_ready'
+  end
+  return redis.call('EXISTS',rk)==0 and not rs
+end
+local function retained_control_valid(m,score_value,due)
+  local a=string.find(m,':',1,true); local b=a and string.find(m,':',a+1,true); local n=a and string.sub(m,1,a-1); local c=b and string.sub(m,a+1,b-1); local q=b and string.sub(m,b+1)
+  if not digest(n) or not digest(c) or not digest(q) or not score_value then return false end
+  local ck=prefix..'control:'..n..':'..c..':'..q
+  local v=redis.call('HMGET',ck,unpack(control_fields)); for i=1,#v do if v[i]==false then return false end end
+  local expiry=bounded_number(v[12],false); local deadline=bounded_number(v[10],false); local generation=integer(v[7])
+  local pair=(v[8]=='cancelled' and (v[9]=='requester_cancelled' or v[9]=='server_unregistered')) or (v[8]=='expired' and v[9]=='request_deadline_expired')
+  if redis.call('EXISTS',ck)~=1 or v[1]~=c or v[2]~=q or v[3]~=n or v[4]=='' or string.len(v[4])>max_node_id or
+     not digest(v[5]) or not digest(v[6]) or not generation or generation<1 or not pair or not deadline or
+     (v[11]~='0' and v[11]~='1') or score_value~=expiry or (due and expiry>now) or (not due and expiry<=now) then return false end
+  local ts_raw=redis.call('ZSCORE',terminal_expiries,c..':'..q); local ts=ts_raw and finite(ts_raw)
+  if not ts or not retained_terminal_valid(c..':'..q,ts,ts<=now) then return false end
+  local tv=redis.call('HMGET',prefix..'terminal:'..c..':'..q,'outcome','reason','node_id','owner_digest','consumer_digest','generation','accepted_at_epoch')
+  local lv=redis.call('HMGET',prefix..'request:'..c..':'..q,'node_digest','deadline')
+  return tv[1]==v[8] and tv[2]==v[9] and tv[3]==v[4] and tv[4]==v[5] and tv[5]==v[6] and tv[6]==v[7] and
+    lv[1]==n and lv[2]==v[10] and finite(tv[7])<=deadline
 end
 local due_terminals=redis.call('ZRANGEBYSCORE',terminal_expiries,'-inf',now,'LIMIT',0,tonumber(max_terminals)+1)
 local due_terminal_set={}; local paired_controls={}
 for _,m in ipairs(due_terminals) do
-  local score=finite(redis.call('ZSCORE',terminal_expiries,m)); if not retained_terminal_valid(m,score) then return {'schema'} end
+  local score=finite(redis.call('ZSCORE',terminal_expiries,m)); if not retained_terminal_valid(m,score,true) then return {'schema'} end
   due_terminal_set[m]=true
   local p=string.find(m,':',1,true); local client,request=string.sub(m,1,p-1),string.sub(m,p+1); local n=redis.call('HGET',prefix..'request:'..client..':'..request,'node_digest')
   local cm=n..':'..m; local cs=finite(redis.call('ZSCORE',control_expiries,cm)); local exists=redis.call('EXISTS',prefix..'control:'..n..':'..client..':'..request)
-  if (exists~=0 or cs) and (exists~=1 or not cs or not retained_control_valid(cm,cs)) then return {'schema'} end
+  if (exists~=0 or cs) and (exists~=1 or not cs or not retained_control_valid(cm,cs,cs<=now)) then return {'schema'} end
   if exists==1 then paired_controls[cm]=true end
 end
 local due_controls=redis.call('ZRANGEBYSCORE',control_expiries,'-inf',now,'LIMIT',0,tonumber(max_controls)+1)
-local due_control_set={}; for _,m in ipairs(due_controls) do local score=finite(redis.call('ZSCORE',control_expiries,m)); if not retained_control_valid(m,score) then return {'schema'} end; due_control_set[m]=true end
+local due_control_set={}; for _,m in ipairs(due_controls) do local score=finite(redis.call('ZSCORE',control_expiries,m)); if not retained_control_valid(m,score,true) then return {'schema'} end; due_control_set[m]=true end
 local terminal_rows=redis.call('ZRANGE',terminal_expiries,0,tonumber(max_terminals)+#due_terminals,'WITHSCORES')
 local terminal_count,client_counts=0,{}
-for i=1,#terminal_rows,2 do local m=terminal_rows[i]; if not due_terminal_set[m] then if not retained_terminal_valid(m,finite(terminal_rows[i+1])) then return {'schema'} end; terminal_count=terminal_count+1; local client=string.sub(m,1,64); client_counts[client]=(client_counts[client] or 0)+1 end end
+for i=1,#terminal_rows,2 do local m=terminal_rows[i]; if not due_terminal_set[m] then if not retained_terminal_valid(m,finite(terminal_rows[i+1]),false) then return {'schema'} end; terminal_count=terminal_count+1; local client=string.sub(m,1,64); client_counts[client]=(client_counts[client] or 0)+1 end end
 if terminal_count~=redis.call('ZCARD',terminal_expiries)-#due_terminals then return {'schema'} end
 local control_rows=redis.call('ZRANGE',control_expiries,0,tonumber(max_controls)+#due_controls+#due_terminals,'WITHSCORES')
 local control_count,node_counts=0,{}
-for i=1,#control_rows,2 do local m=control_rows[i]; if not due_control_set[m] and not paired_controls[m] then if not retained_control_valid(m,finite(control_rows[i+1])) then return {'schema'} end; control_count=control_count+1; local n=string.sub(m,1,64); node_counts[n]=(node_counts[n] or 0)+1 end end
+for i=1,#control_rows,2 do local m=control_rows[i]; if not due_control_set[m] and not paired_controls[m] then if not retained_control_valid(m,finite(control_rows[i+1]),false) then return {'schema'} end; control_count=control_count+1; local n=string.sub(m,1,64); node_counts[n]=(node_counts[n] or 0)+1 end end
 local projected_controls=redis.call('ZCARD',control_expiries); for _ in pairs(due_control_set) do projected_controls=projected_controls-1 end; for m in pairs(paired_controls) do if not due_control_set[m] then projected_controls=projected_controls-1 end end
 if control_count~=projected_controls then return {'schema'} end
 local admitted={}; local added_terminals,added_controls=0,0
@@ -2308,7 +2351,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "9f7fcd1f14dd2a73cb2fd4382b339cb41c5ed74aa8b7f88784a62a20251e85b1",  # pragma: allowlist secret
+    "e510e41b54aceb6c37ed785a73ca6926738306160fc43ffe2f2632063fab9bfa",  # pragma: allowlist secret
     True,
 )
 

@@ -334,6 +334,8 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "local admitted={}" in script.source
     assert "local due_terminals=redis.call('ZRANGEBYSCORE'" in script.source
     assert "local due_controls=redis.call('ZRANGEBYSCORE'" in script.source
+    assert "local function lifecycle_valid(c,q,v,l,accepted)" in script.source
+    assert "tv[1]==v[8] and tv[2]==v[9]" in script.source
 
     reader = valkey_relay_state.PENDING_TRANSITION_READ_SCRIPT
     assert SCRIPT_DIGESTS[reader.name] == reader.sha256

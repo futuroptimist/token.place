@@ -9863,6 +9863,82 @@ def test_node_transition_prevalidation_malformed_initial_work_is_atomic(
         store.close()
 
 
+@pytest.mark.parametrize(
+    "corruption", ("generation_zero", "negative_times", "exponent_deadline", "lease_after_deadline")
+)
+@pytest.mark.parametrize("continuation", (False, True))
+def test_node_transition_prevalidation_rejects_noncanonical_claim_numbers_without_mutation(
+    valkey_server, corruption, continuation
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(
+        valkey_server, namespace, node_transition_batch_size=1 if continuation else 4
+    )
+    observer = _registration_store(
+        valkey_server, namespace, node_transition_batch_size=1 if continuation else 4
+    )
+    node, owner, consumer = "prevalidate-numbers", _digest("numbers-owner"), "consumer"
+    identities = (("numbers-client", "valid-first"),) if not continuation else (
+        ("numbers-client", "valid-first"), ("numbers-client", "corrupt-second")
+    )
+    try:
+        writer.register(node, _capabilities(), owner)
+        deadline = writer._foundation.server_time()[0] + 60
+        for identity in identities:
+            _enqueue_claim_fixture(writer, node, owner, *identity, deadline)
+            writer.claim_queued_request(node, owner, consumer)
+        cfg, digest = writer._foundation.config, writer._node_digest(node)
+        corrupt_identity = identities[-1]
+        client, request = writer._identity(*corrupt_identity)
+        member = f"{client}:{request}"
+        lifecycle = cfg.key("request", client, request)
+        claim = cfg.key("claim", client, request)
+        if continuation:
+            for score, identity in enumerate(identities, 1):
+                c, r = writer._identity(*identity)
+                writer._foundation._client.zadd(
+                    cfg.key("node_work", digest), {f"{c}:{r}": score}
+                )
+        if corruption == "generation_zero":
+            writer._foundation._client.hset(lifecycle, "claim_generation", "0")
+            writer._foundation._client.hset(claim, "generation", "0")
+        elif corruption == "negative_times":
+            writer._foundation._client.hset(lifecycle, "deadline", "-1")
+            writer._foundation._client.hset(claim, mapping={"deadline": "-1", "lease_expires": "-2"})
+            writer._foundation._client.zadd(cfg.key("requests:deadline"), {member: -1})
+            writer._foundation._client.zadd(cfg.key("claims:expiry"), {member: -2})
+        elif corruption == "exponent_deadline":
+            writer._foundation._client.hset(lifecycle, "deadline", "1.7e3")
+            writer._foundation._client.hset(claim, mapping={"deadline": "1.7e3", "lease_expires": "1600"})
+            writer._foundation._client.zadd(cfg.key("requests:deadline"), {member: 1700})
+            writer._foundation._client.zadd(cfg.key("claims:expiry"), {member: 1600})
+        else:
+            writer._foundation._client.hset(lifecycle, "deadline", "1700")
+            writer._foundation._client.hset(claim, mapping={"deadline": "1700", "lease_expires": "1800"})
+            writer._foundation._client.zadd(cfg.key("requests:deadline"), {member: 1700})
+            writer._foundation._client.zadd(cfg.key("claims:expiry"), {member: 1800})
+
+        if continuation:
+            first = writer.unregister_node_and_transition_work(node, owner)
+            assert first.state == "transitioning"
+            assert first.processed_count == 1
+        before = _node_transition_authority_snapshot(observer, node, identities)
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            observer.unregister_node_and_transition_work(node, owner)
+        assert _node_transition_authority_snapshot(observer, node, identities) == before
+    finally:
+        _delete_claim_fixture_state(writer, (node,), identities)
+        cfg, digest = writer._foundation.config, writer._node_digest(node)
+        writer._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        writer.close()
+        observer.close()
+
+
 @pytest.mark.parametrize("corruption", ("missing_identity", "mismatched_identity"))
 def test_node_transition_prevalidation_later_cleanup_candidate_is_atomic(
     valkey_server, corruption

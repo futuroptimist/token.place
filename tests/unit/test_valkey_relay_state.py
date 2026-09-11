@@ -313,8 +313,12 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "entries[1][2][2]~=client" in script.source
     assert "redis.call('ZCARD',tomb_expiries)-#expired_tombs" in script.source
     assert "redis.call('ZCARD',fence_expiries)-#expired_fences" in script.source
-    assert "not python_float(tv[9])" in script.source
+    assert "local accepted=canonical_number(tv[9],true)" in script.source
     assert "string.len(response[8])>max_response_envelope" in script.source
+    assert "A generation-zero reservation terminal legitimately predates enqueue metadata" in script.source
+    assert "tomb_exists~=(tomb_score~=nil)" in script.source
+    assert "fence_exists~=(fence_score~=nil)" in script.source
+    assert "redis.call('ZSCORE',terminal_expiries,member)" in script.source
 
     reader = valkey_relay_state.PENDING_TRANSITION_READ_SCRIPT
     assert SCRIPT_DIGESTS[reader.name] == reader.sha256

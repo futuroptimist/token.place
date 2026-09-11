@@ -2048,10 +2048,22 @@ if not pending_exists then
   if cause=='registration_lease_expired' and lease>now then return {'lease_active'} end
   if redis.call('ZRANK',work,'!schema:1')~=0 or redis.call('ZSCORE',work,'!schema:1')~='0' then return {'schema'} end
   if redis.call('ZCARD',pending_index)>=tonumber(max_pending) then return {'pending_capacity'} end
-  local tomb_survives=redis.call('EXISTS',tomb)==1 and not selected(expired_tombs,node_digest)
+  local tomb_exists=redis.call('EXISTS',tomb)==1; local tomb_score=finite(redis.call('ZSCORE',tomb_expiries,node_digest))
+  if tomb_exists~=(tomb_score~=nil) then return {'schema'} end
+  if tomb_exists then
+    local av=redis.call('HMGET',tomb,'node_digest','owner_digest','cause','status','transition_epoch','completed','expires_at_epoch')
+    if av[1]~=node_digest or not digest(av[2]) or (av[3]~='explicit_unregister' and av[3]~='registration_lease_expired') or av[4]~='cancelled' or not finite(av[5]) or (av[6]~='0' and av[6]~='1') or finite(av[7])~=tomb_score then return {'schema'} end
+  end
+  local tomb_survives=tomb_exists and not selected(expired_tombs,node_digest)
   if redis.call('ZCARD',tomb_expiries)-#expired_tombs+(tomb_survives and 0 or 1)>tonumber(max_tombs) then return {'tombstone_capacity'} end
   local fm=node_digest..':'..nv[2]
-  local fence_survives=redis.call('EXISTS',prefix..'former_owner:'..node_digest..':'..nv[2])==1 and not selected(expired_fences,fm)
+  local addressed_fence=prefix..'former_owner:'..node_digest..':'..nv[2]; local fence_exists=redis.call('EXISTS',addressed_fence)==1; local fence_score=finite(redis.call('ZSCORE',fence_expiries,fm))
+  if fence_exists~=(fence_score~=nil) then return {'schema'} end
+  if fence_exists then
+    local av=redis.call('HMGET',addressed_fence,'node_digest','owner_digest','cause','status','transition_epoch','expires_at_epoch')
+    if av[1]~=node_digest or av[2]~=nv[2] or (av[3]~='explicit_unregister' and av[3]~='registration_lease_expired') or av[4]~='cancelled' or not finite(av[5]) or finite(av[6])~=fence_score then return {'schema'} end
+  end
+  local fence_survives=fence_exists and not selected(expired_fences,fm)
   if redis.call('ZCARD',fence_expiries)-#expired_fences+(fence_survives and 0 or 1)>tonumber(max_fences) then return {'fence_capacity'} end
   owner=nv[2]; epoch=string.format('%.17g',now); initial=true
 else
@@ -2081,13 +2093,19 @@ for _,member in ipairs(members) do
     local accepted=canonical_number(tv[9],true); local replay=canonical_number(tv[10],true); local expiry=canonical_number(tv[11],false); local generation=integer(tv[7])
     local unavailable=(tv[1]=='cancelled' and (tv[2]=='requester_cancelled' or tv[2]=='server_unregistered') and tv[3]=='completed_unavailable') or (tv[1]=='expired' and tv[2]=='request_deadline_expired' and tv[3]=='completed_unavailable')
     local completed=tv[1]=='completed' and tv[2]=='response_completed' and (tv[3]=='response_ready' or tv[3]=='acknowledged' or tv[3]=='retrieval_expired')
-    if not accepted or not python_float(tv[9]) or accepted>now or not replay or not lua_float(tv[10]) or replay<accepted or not expiry or not lua_float(tv[11]) or expiry<replay or finite(redis.call('ZSCORE',terminal_expiries,member))~=expiry or tv[4]~=node_id or tv[4]=='' or string.len(tv[4])>max_node_id or tv[15]~=client or tv[16]~=request or not digest(tv[12]) or
+    if not accepted or accepted>now or not replay or replay<accepted or not expiry or not lua_float(tv[11]) or expiry<replay or finite(redis.call('ZSCORE',terminal_expiries,member))~=expiry or tv[4]~=node_id or tv[4]=='' or string.len(tv[4])>max_node_id or tv[15]~=client or tv[16]~=request or not digest(tv[12]) or
        not generation or r[1]~=(unavailable and tv[1] or 'response_ready') or r[11]~=tv[7] or r[7]~=tv[12] or r[8]~=tv[14] or (not unavailable and not completed) or
        redis.call('ZSCORE',deadlines,member) or redis.call('EXISTS',prefix..'claim:'..client..':'..request)~=0 or redis.call('ZSCORE',claim_expiries,member) or redis.call('EXISTS',prefix..'reservation:'..r[7])~=0 or redis.call('ZSCORE',reservation_expiries,r[7]) then return {'schema'} end
-    local deadline=canonical_number(r[6],false); local sequence=integer(r[10])
-    if not deadline or not digest(r[4]) or not r[12] or string.len(r[12])<1 or string.len(r[12])>max_identity or not r[13] or string.len(r[13])<1 or string.len(r[13])>max_identity or
-       not sequence or sequence<1 or r[9]~=r[10]..'-0' or not r[14] or string.len(r[14])<1 or string.len(r[14])>max_request_envelope or
-       (completed and deadline<accepted) or #redis.call('XRANGE',prefix..'queue:'..r[4],r[9],r[9],'COUNT',1)~=0 then return {'schema'} end
+    local deadline=canonical_number(r[6],false); local extended=r[9] or r[10] or r[12] or r[13] or r[14]
+    if not deadline or not digest(r[4]) then return {'schema'} end
+    -- A generation-zero reservation terminal legitimately predates enqueue metadata.
+    if generation>0 or completed or extended then
+      local sequence=integer(r[10])
+      if not r[12] or string.len(r[12])<1 or string.len(r[12])>max_identity or not r[13] or string.len(r[13])<1 or string.len(r[13])>max_identity or
+         not sequence or sequence<1 or r[9]~=r[10]..'-0' or not r[14] or string.len(r[14])<1 or string.len(r[14])>max_request_envelope or
+         #redis.call('XRANGE',prefix..'queue:'..r[4],r[9],r[9],'COUNT',1)~=0 then return {'schema'} end
+    end
+    if completed and deadline<accepted then return {'schema'} end
     local response_key=prefix..'response:'..client..':'..request; local response_exists=redis.call('EXISTS',response_key); local response_score=finite(redis.call('ZSCORE',prefix..'responses:expiry',member))
     if unavailable then
       local proof=(tv[2]=='requester_cancelled' and digest(tv[14])) or (tv[2]~='requester_cancelled' and (tv[14]=='' or digest(tv[14])))
@@ -2095,7 +2113,7 @@ for _,member in ipairs(members) do
          (tv[1]=='expired' and deadline>accepted) then return {'schema'} end
       if (generation==0 and (tv[5]~='' or tv[6]~='')) or (generation>0 and (not digest(tv[5]) or not digest(tv[6]))) then return {'schema'} end
     else
-      if generation<1 or not digest(tv[5]) or not digest(tv[6]) or not digest(tv[8]) or not digest(tv[13]) or not digest(tv[14]) then return {'schema'} end
+      if not lua_float(tv[10]) or generation<1 or not digest(tv[5]) or not digest(tv[6]) or not digest(tv[8]) or not digest(tv[13]) or not digest(tv[14]) then return {'schema'} end
       if tv[3]=='response_ready' then
         local response=redis.call('HMGET',response_key,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')
         for _,value in ipairs(response) do if value==false then return {'schema'} end end
@@ -2105,15 +2123,17 @@ for _,member in ipairs(members) do
     end
     table.insert(validated,{member,'terminal',client,request,r})
   else
+  if redis.call('ZSCORE',terminal_expiries,member) or redis.call('EXISTS',prefix..'response:'..client..':'..request)~=0 or redis.call('ZSCORE',prefix..'responses:expiry',member) then return {'schema'} end
   if finite(redis.call('ZSCORE',deadlines,member))~=finite(r[6]) then return {'schema'} end
   if r[1]~='reserved' and r[1]~='queued' and r[1]~='claimed' then return {'schema'} end
   if r[1]=='reserved' then
     local rk=prefix..'reservation:'..r[7]; local rv=redis.call('HMGET',rk,'client','request','node_digest','node_id','deadline','token_digest','cancellation_digest','reservation_expires')
     for _,v in ipairs(rv) do if not v then return {'schema'} end end
-    if rv[1]~=client or rv[2]~=request or rv[3]~=node_digest or rv[4]~=node_id or rv[5]~=r[6] or rv[6]~=r[7] or rv[7]~=r[8] or not finite(rv[8]) or finite(redis.call('ZSCORE',reservation_expiries,r[7]))~=finite(rv[8]) then return {'schema'} end
+    if rv[1]~=client or rv[2]~=request or rv[3]~=node_digest or rv[4]~=node_id or rv[5]~=r[6] or rv[6]~=r[7] or rv[7]~=r[8] or not finite(rv[8]) or finite(redis.call('ZSCORE',reservation_expiries,r[7]))~=finite(rv[8]) or redis.call('EXISTS',prefix..'claim:'..client..':'..request)~=0 or redis.call('ZSCORE',claim_expiries,member) then return {'schema'} end
   else
     local entries=redis.call('XRANGE',prefix..'queue:'..node_digest,r[9],r[9],'COUNT',1)
     if #entries~=1 or entries[1][1]~=r[9] or #entries[1][2]~=4 or entries[1][2][1]~='client' or entries[1][2][2]~=client or entries[1][2][3]~='request' or entries[1][2][4]~=request then return {'schema'} end
+    if redis.call('EXISTS',prefix..'reservation:'..r[7])~=0 or redis.call('ZSCORE',reservation_expiries,r[7]) then return {'schema'} end
   end
   local claim=false
   if r[1]=='claimed' then
@@ -2121,6 +2141,7 @@ for _,member in ipairs(members) do
     for _,v in ipairs(cv) do if not v then return {'schema'} end end
     if cv[1]~=client or cv[2]~=request or cv[3]~=node_digest or cv[4]~=node_id or cv[5]~=owner or not digest(cv[6]) or cv[7]~=r[6] or cv[8]~=r[10] or cv[9]~=r[11] or not finite(cv[10]) or finite(redis.call('ZSCORE',claim_expiries,member))~=finite(cv[10]) then return {'schema'} end
     claim=cv
+  elseif redis.call('EXISTS',prefix..'claim:'..client..':'..request)~=0 or redis.call('ZSCORE',claim_expiries,member) then return {'schema'}
   end
   needed_terminals=needed_terminals+1; if claim then needed_controls=needed_controls+1 end
   table.insert(validated,{member,r[1],client,request,r,claim})
@@ -2179,7 +2200,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "6f9c19755776fd6adcac4675cbc7c2d8fe07ffbcfa98f09e1d6350cabdaf5682",  # pragma: allowlist secret
+    "99597457604c1c3bab30eb1ee9894ada72fbebb42724232bd32b05309fc53b74",  # pragma: allowlist secret
     True,
 )
 

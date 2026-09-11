@@ -9948,6 +9948,91 @@ def test_node_transition_prevalidation_terminal_winner_is_complete_and_atomic(
         store.close()
 
 
+@pytest.mark.parametrize("partial_enqueue", (False, True))
+def test_node_transition_prevalidation_accepts_unenqueued_terminal_only_without_partial_metadata(
+    valkey_server, partial_enqueue
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner = "prevalidate-unenqueued", _digest("prevalidate-unenqueued-owner")
+    identity = ("prevalidate-unenqueued-client", f"request-{partial_enqueue}")
+    try:
+        store.register(node, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 60
+        store.select_and_reserve(*identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel")
+        store.cancel_or_expire_request(*identity, "cancel")
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        client, request = store._identity(*identity)
+        member = f"{client}:{request}"
+        lifecycle = cfg.key("request", client, request)
+        store._foundation._client.zadd(cfg.key("node_work", digest), {member: 1})
+        if partial_enqueue:
+            store._foundation._client.hset(lifecycle, "sequence", "1")
+        before = _node_transition_authority_snapshot(store, node, (identity,))
+        if partial_enqueue:
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                store.unregister_node_and_transition_work(node, owner)
+            assert _node_transition_authority_snapshot(store, node, (identity,)) == before
+        else:
+            assert store.unregister_node_and_transition_work(node, owner).state == "complete"
+            assert store._foundation._client.hget(
+                cfg.key("terminal", client, request), "generation"
+            ) == b"0"
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        store._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        store.close()
+
+
+@pytest.mark.parametrize("orphan", ("terminal_index", "response_hash", "response_index", "claim"))
+def test_node_transition_prevalidation_rejects_state_inappropriate_active_authority(
+    valkey_server, orphan
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, identity = "prevalidate-orphan", _digest("prevalidate-orphan-owner"), ("orphan-client", f"request-{orphan}")
+    try:
+        store.register(node, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 60
+        store.select_and_reserve(*identity, "qwen3-8b-instruct", "8k-fast", deadline, None)
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        client, request = store._identity(*identity); member = f"{client}:{request}"
+        if orphan == "terminal_index": store._foundation._client.zadd(cfg.key("terminals:expiry"), {member: deadline})
+        elif orphan == "response_hash": store._foundation._client.hset(cfg.key("response", client, request), "status", "response_ready")
+        elif orphan == "response_index": store._foundation._client.zadd(cfg.key("responses:expiry"), {member: deadline})
+        else: store._foundation._client.hset(cfg.key("claim", client, request), "generation", "1")
+        before = _node_transition_authority_snapshot(store, node, (identity,))
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.unregister_node_and_transition_work(node, owner)
+        assert _node_transition_authority_snapshot(store, node, (identity,)) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize("authority", ("tombstone", "fence"))
+def test_node_transition_prevalidation_rejects_addressed_retained_orphan(valkey_server, authority):
+    store = _registration_store(valkey_server, uuid.uuid4().hex, max_node_tombstones=1, max_removed_owner_fences=1)
+    node, owner = f"prevalidate-addressed-{authority}", _digest(f"addressed-{authority}-owner")
+    try:
+        store.register(node, _capabilities(), owner)
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        key = cfg.key("node_tombstone", digest) if authority == "tombstone" else cfg.key("former_owner", digest, owner)
+        store._foundation._client.hset(key, "expires_at_epoch", str(store._foundation.server_time()[0] + 60))
+        before = _node_transition_authority_snapshot(store, node, (), (key,))
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.unregister_node_and_transition_work(node, owner)
+        assert _node_transition_authority_snapshot(store, node, (), (key,)) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), ())
+        store._foundation._client.delete(key)
+        store.close()
+
+
 def test_node_transition_prevalidation_continuation_rejects_without_mutation(
     valkey_server,
 ):

@@ -611,7 +611,8 @@ def _run_qualified_main(tmp_path, monkeypatch, public=True, missing=None, cleanu
         if cleanup_calls is not None:
             cleanup_calls.append(_args)
         code = cleanup_code() if callable(cleanup_code) else cleanup_code
-        return subprocess.CompletedProcess([], code)
+        stdout = b"owned-container-id\n" if _args[0][1:3] == ["ps", "-aq"] and code == 0 else b""
+        return subprocess.CompletedProcess([], code, stdout=stdout)
 
     return _run_main(tmp_path, monkeypatch, lambda *_a: next(values), cleanup)
 
@@ -631,7 +632,7 @@ def test_rejected_public_predicate_fails_qualification_and_still_cleans_up(tmp_p
     public = report["results"]["quota.public_information_exempt"]
     assert result == 1 and report["error_category"] == "mandatory_check_failed"
     assert public["passed"] is False and public["predicate_exact"] is False
-    assert len(cleanup_calls) == 6
+    assert len(cleanup_calls) == 12
 
 
 @pytest.mark.parametrize("missing", sorted(gate.EXPECTED_IDS - {
@@ -659,6 +660,7 @@ def test_phases_are_serial_and_removed_in_order(tmp_path, monkeypatch):
     events = []
     active = set()
     max_active = 0
+    ownership_labels = set()
     expected = ["metrics", "public", "protected-rate", "protected-daily",
                 "mutating-rate", "mutating-daily"]
 
@@ -667,6 +669,10 @@ def test_phases_are_serial_and_removed_in_order(tmp_path, monkeypatch):
         if args[0] != "run":
             return next(metadata)
         name = args[args.index("--name") + 1]
+        label = args[args.index("--label") + 1]
+        ownership_labels.add(label)
+        assert label.startswith("io.token.place.relay-safety-invocation=")
+        assert len(label.rsplit("=", 1)[1]) == 32
         phase = name.removeprefix("relay-safety-").rsplit("-", 1)[0]
         events.append(("run", phase))
         active.add(name)
@@ -674,8 +680,13 @@ def test_phases_are_serial_and_removed_in_order(tmp_path, monkeypatch):
         return "container-id"
 
     def cleanup(args, **_kwargs):
+        if args[1:3] == ["ps", "-aq"]:
+            name = args[args.index("--filter") + 1].removeprefix("name=^/").removesuffix("$")
+            assert name in active
+            assert args[-1] == f"label={next(iter(ownership_labels))}"
+            return subprocess.CompletedProcess(args, 0, stdout=f"id-{name}\n".encode())
         assert args[:3] == ["docker", "rm", "-f"]
-        name = args[3]
+        name = args[3].removeprefix("id-")
         phase = name.removeprefix("relay-safety-").rsplit("-", 1)[0]
         assert name in active
         active.remove(name)
@@ -696,10 +707,11 @@ def test_phases_are_serial_and_removed_in_order(tmp_path, monkeypatch):
     result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
     assert result == 0 and report["passed"] is True
     assert max_active == 1 and not active
+    assert len(ownership_labels) == 1
     assert events == [event for phase in expected for event in (("run", phase), ("rm", phase))]
 
 
-def test_failed_launch_preserves_error_and_verifies_no_owned_container(tmp_path, monkeypatch):
+def test_preexisting_same_name_without_ownership_label_is_never_removed(tmp_path, monkeypatch):
     values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
     cleanup_calls = []
 
@@ -710,7 +722,9 @@ def test_failed_launch_preserves_error_and_verifies_no_owned_container(tmp_path,
 
     def cleanup(args, **_kwargs):
         cleanup_calls.append(args)
-        assert args[:4] == ["docker", "ps", "-aq", "--filter"]
+        assert args[:4] == ["docker", "ps", "-aq", "--no-trunc"]
+        assert args[-1].startswith("label=io.token.place.relay-safety-invocation=")
+        # Docker returns nothing because the colliding same-name container lacks that label.
         return subprocess.CompletedProcess(args, 0, stdout=b"")
 
     result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
@@ -730,7 +744,7 @@ def test_failed_launch_absence_query_error_fails_closed_and_retries(tmp_path, mo
 
     def cleanup(args, **_kwargs):
         cleanup_calls.append(args)
-        assert args[:4] == ["docker", "ps", "-aq", "--filter"]
+        assert args[:4] == ["docker", "ps", "-aq", "--no-trunc"]
         return subprocess.CompletedProcess(
             args, 1, stderr=b"error during connect: Docker daemon unavailable\n"
         )
@@ -744,17 +758,22 @@ def test_failed_launch_absence_query_error_fails_closed_and_retries(tmp_path, mo
 def test_failed_launch_found_container_is_removed(tmp_path, monkeypatch):
     values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
     cleanup_calls = []
+    run_label = None
 
     def output(*args):
+        nonlocal run_label
         if args[0] == "run":
+            run_label = args[args.index("--label") + 1]
             raise subprocess.CalledProcessError(125, args)
         return next(values)
 
     def cleanup(args, **_kwargs):
         cleanup_calls.append(args)
         if args[1:3] == ["ps", "-aq"]:
+            assert args[-1] == f"label={run_label}"
             return subprocess.CompletedProcess(args, 0, stdout=b"container-id\n")
         assert args[:3] == ["docker", "rm", "-f"]
+        assert args[3] == "container-id"
         return subprocess.CompletedProcess(args, 0)
 
     result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
@@ -792,10 +811,12 @@ def test_probe_failure_immediately_removes_current_container(tmp_path, monkeypat
                         lambda _base: (_ for _ in ()).throw(gate.GateFailure("metrics_malformed")))
     result, report = _run_main(
         tmp_path, monkeypatch, lambda *_args: next(values),
-        lambda args, **_kwargs: cleanup_calls.append(args) or subprocess.CompletedProcess(args, 0),
+        lambda args, **_kwargs: cleanup_calls.append(args) or subprocess.CompletedProcess(
+            args, 0, stdout=b"container-id\n" if args[1:3] == ["ps", "-aq"] else b""
+        ),
     )
     assert result == 1 and report["error_category"] == "metrics_malformed"
-    assert len(cleanup_calls) == 1 and cleanup_calls[0][:3] == ["docker", "rm", "-f"]
+    assert [call[1] for call in cleanup_calls] == ["ps", "rm"]
 
 
 def test_immediate_cleanup_failure_is_sticky_and_fallback_retries(tmp_path, monkeypatch):
@@ -808,7 +829,9 @@ def test_immediate_cleanup_failure_is_sticky_and_fallback_retries(tmp_path, monk
 
     def cleanup(args, **_kwargs):
         cleanup_calls.append(args)
-        return subprocess.CompletedProcess(args, 1 if len(cleanup_calls) == 1 else 0)
+        if len(cleanup_calls) == 1:
+            return subprocess.CompletedProcess(args, 1)
+        return subprocess.CompletedProcess(args, 0, stdout=b"")
 
     result, report = _run_main(tmp_path, monkeypatch, lambda *_args: next(values), cleanup)
     assert result == 1 and report["error_category"] == "cleanup_failed"
@@ -825,9 +848,11 @@ def test_interrupt_still_removes_current_container(tmp_path, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         _run_main(
             tmp_path, monkeypatch, lambda *_args: next(values),
-            lambda args, **_kwargs: cleanup_calls.append(args) or subprocess.CompletedProcess(args, 0),
+            lambda args, **_kwargs: cleanup_calls.append(args) or subprocess.CompletedProcess(
+                args, 0, stdout=b"container-id\n" if args[1:3] == ["ps", "-aq"] else b""
+            ),
         )
-    assert len(cleanup_calls) == 1 and cleanup_calls[0][:3] == ["docker", "rm", "-f"]
+    assert [call[1] for call in cleanup_calls] == ["ps", "rm"]
 
 
 @pytest.mark.parametrize("failed_id", [
@@ -846,7 +871,7 @@ def test_nonzero_cleanup_fails_successful_qualification(tmp_path, monkeypatch):
 
 
 def test_failed_mandatory_check_preserved_when_cleanup_fails(tmp_path, monkeypatch):
-    cleanup_codes = iter([0, 1, 0])
+    cleanup_codes = iter([0, 0, 1, 0, 0])
     result, report = _run_qualified_main(
         tmp_path, monkeypatch, cleanup_code=lambda: next(cleanup_codes), public=False
     )

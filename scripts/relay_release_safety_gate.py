@@ -321,23 +321,26 @@ def _category(exc: BaseException) -> str:
     return "runtime_unavailable"
 
 
-def _cleanup_phase_container(container: str, *, created: bool) -> bool:
-    """Remove one invocation-owned phase container, or prove a failed launch left none."""
+def _cleanup_phase_container(container: str, *, ownership: str) -> bool:
+    """Remove one invocation-owned phase container by ID, or prove none exists."""
     try:
-        if not created:
-            queried = subprocess.run(
-                ["docker", "ps", "-aq", "--filter", f"name=^/{container}$"],
-                check=False, capture_output=True, timeout=15,
-            )
-            if queried.returncode != 0:
-                return False
-            output = queried.stdout.decode(errors="replace") if isinstance(
-                queried.stdout, bytes
-            ) else queried.stdout or ""
-            if not output.strip():
-                return True
+        queried = subprocess.run(
+            ["docker", "ps", "-aq", "--no-trunc", "--filter", f"name=^/{container}$",
+             "--filter", f"label=io.token.place.relay-safety-invocation={ownership}"],
+            check=False, capture_output=True, timeout=15,
+        )
+        if queried.returncode != 0:
+            return False
+        output = queried.stdout.decode(errors="replace") if isinstance(
+            queried.stdout, bytes
+        ) else queried.stdout or ""
+        container_ids = output.split()
+        if not container_ids:
+            return True
+        if len(container_ids) != 1:
+            return False
         removed = subprocess.run(
-            ["docker", "rm", "-f", container], check=False, capture_output=True, timeout=15
+            ["docker", "rm", "-f", container_ids[0]], check=False, capture_output=True, timeout=15
         )
         return removed.returncode == 0
     except (OSError, subprocess.SubprocessError):
@@ -365,7 +368,8 @@ def main() -> int:
         "index_digest": args.index_digest, "platform": args.platform, "platform_digest": args.platform_digest,
         "contract": str(CONTRACT_PATH.relative_to(ROOT)), "results": {}, "passed": False,
     }
-    pending_cleanup: dict[str, bool] = {}
+    ownership = uuid.uuid4().hex
+    pending_cleanup: set[str] = set()
     cleanup_failed = False
     try:
         requirements = load_contract()
@@ -400,13 +404,13 @@ def main() -> int:
         ]
         for offset, (phase, rate, daily, check_id) in enumerate(phases):
             container = f"relay-safety-{phase}-{uuid.uuid4().hex[:8]}"
-            pending_cleanup[container] = False
+            pending_cleanup.add(container)
             try:
-                docker_output("run", "-d", "--rm", "--name", container, "-p",
+                docker_output("run", "-d", "--rm", "--name", container,
+                              "--label", f"io.token.place.relay-safety-invocation={ownership}", "-p",
                               f"127.0.0.1:{args.port + offset}:5010",
                               "-e", "TOKENPLACE_RELAY_REQUIRE_UPSTREAM_HEALTH=0", "-e",
                               f"API_RATE_LIMIT={rate}", "-e", f"API_DAILY_QUOTA={daily}", image_id)
-                pending_cleanup[container] = True
                 base = f"http://127.0.0.1:{args.port + offset}"
                 deadline = time.monotonic() + 45
                 while time.monotonic() < deadline:
@@ -430,8 +434,8 @@ def main() -> int:
                     result["state"] = "passed" if result["passed"] else "failed"
                     evidence["results"][key] = result
             finally:
-                if _cleanup_phase_container(container, created=pending_cleanup[container]):
-                    del pending_cleanup[container]
+                if _cleanup_phase_container(container, ownership=ownership):
+                    pending_cleanup.remove(container)
                 else:
                     cleanup_failed = True
             if cleanup_failed:
@@ -447,9 +451,9 @@ def main() -> int:
     finally:
         # Bounded fallback: retry only invocation-owned containers whose immediate
         # cleanup did not complete (or whose phase was interrupted mid-cleanup).
-        for container, created in tuple(pending_cleanup.items()):
-            if _cleanup_phase_container(container, created=created):
-                del pending_cleanup[container]
+        for container in tuple(pending_cleanup):
+            if _cleanup_phase_container(container, ownership=ownership):
+                pending_cleanup.remove(container)
             else:
                 cleanup_failed = True
         if cleanup_failed:

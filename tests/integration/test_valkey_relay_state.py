@@ -9782,7 +9782,17 @@ def test_node_transition_prevalidation_projects_retained_cleanup_capacity(
         else:
             retained = cfg.key("former_owner", old_node, old_owner)
             index, member = cfg.key("former_owners:expiry"), f"{old_node}:{old_owner}"
-        store._foundation._client.hset(retained, "expires_at_epoch", repr(score))
+        retained_fields = {
+            "node_digest": old_node,
+            "owner_digest": old_owner,
+            "cause": "explicit_unregister",
+            "status": "cancelled",
+            "transition_epoch": repr(score - 60),
+            "expires_at_epoch": repr(score),
+        }
+        if authority == "tombstone":
+            retained_fields["completed"] = "1"
+        store._foundation._client.hset(retained, mapping=retained_fields)
         store._foundation._client.zadd(index, {member: score})
         before = _node_transition_authority_snapshot(store, node, (), (retained,))
         if expired:
@@ -9853,7 +9863,10 @@ def test_node_transition_prevalidation_malformed_initial_work_is_atomic(
         store.close()
 
 
-def test_node_transition_prevalidation_later_cleanup_candidate_is_atomic(valkey_server):
+@pytest.mark.parametrize("corruption", ("missing_identity", "mismatched_identity"))
+def test_node_transition_prevalidation_later_cleanup_candidate_is_atomic(
+    valkey_server, corruption
+):
     store = _registration_store(valkey_server, uuid.uuid4().hex)
     node, owner = "prevalidate-cleanup", _digest("prevalidate-cleanup-owner")
     cfg = store._foundation.config
@@ -9863,8 +9876,18 @@ def test_node_transition_prevalidation_later_cleanup_candidate_is_atomic(valkey_
         seconds, micros = store._foundation.server_time()
         now = seconds + micros / 1_000_000
         first_key, second_key = cfg.key("node_tombstone", first), cfg.key("node_tombstone", second)
-        store._foundation._client.hset(first_key, "expires_at_epoch", str(now - 2))
-        store._foundation._client.hset(second_key, "expires_at_epoch", "malformed")
+        fields = {
+            "owner_digest": _digest("cleanup-owner"),
+            "cause": "explicit_unregister", "status": "cancelled",
+            "transition_epoch": repr(now - 10), "completed": "1",
+        }
+        store._foundation._client.hset(
+            first_key, mapping={**fields, "node_digest": first, "expires_at_epoch": str(now - 2)}
+        )
+        second_fields = {**fields, "expires_at_epoch": str(now - 1)}
+        if corruption == "mismatched_identity":
+            second_fields["node_digest"] = first
+        store._foundation._client.hset(second_key, mapping=second_fields)
         store._foundation._client.zadd(cfg.key("node_tombstones:expiry"), {first: now - 2, second: now - 1})
         before = _node_transition_authority_snapshot(store, node, (), (first_key, second_key))
         with pytest.raises(ValkeySchemaIncompatibleError):
@@ -9989,7 +10012,13 @@ def test_node_transition_prevalidation_accepts_unenqueued_terminal_only_without_
         store.close()
 
 
-@pytest.mark.parametrize("orphan", ("terminal_index", "response_hash", "response_index", "claim"))
+@pytest.mark.parametrize(
+    "orphan",
+    (
+        "terminal_index", "response_hash", "response_index", "claim",
+        "control_hash", "control_index", "claim_generation", "envelope",
+    ),
+)
 def test_node_transition_prevalidation_rejects_state_inappropriate_active_authority(
     valkey_server, orphan
 ):
@@ -10004,7 +10033,10 @@ def test_node_transition_prevalidation_rejects_state_inappropriate_active_author
         if orphan == "terminal_index": store._foundation._client.zadd(cfg.key("terminals:expiry"), {member: deadline})
         elif orphan == "response_hash": store._foundation._client.hset(cfg.key("response", client, request), "status", "response_ready")
         elif orphan == "response_index": store._foundation._client.zadd(cfg.key("responses:expiry"), {member: deadline})
-        else: store._foundation._client.hset(cfg.key("claim", client, request), "generation", "1")
+        elif orphan == "claim": store._foundation._client.hset(cfg.key("claim", client, request), "generation", "1")
+        elif orphan == "control_hash": store._foundation._client.hset(cfg.key("control", digest, client, request), "generation", "1")
+        elif orphan == "control_index": store._foundation._client.zadd(cfg.key("control:expiry"), {f"{digest}:{member}": deadline})
+        else: store._foundation._client.hset(cfg.key("request", client, request), orphan, "1")
         before = _node_transition_authority_snapshot(store, node, (identity,))
         with pytest.raises(ValkeySchemaIncompatibleError):
             store.unregister_node_and_transition_work(node, owner)

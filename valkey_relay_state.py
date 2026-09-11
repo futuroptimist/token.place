@@ -1988,8 +1988,8 @@ local leases,node,cursor,pending,pending_index,work,tomb,tomb_expiries,fence,fen
   deadlines,reservation_expiries,claim_expiries,terminal_expiries,control_expiries=unpack(KEYS)
 local prefix,node_digest,node_id,supplied,cause,batch,max_pending,max_tombs,max_fences,
   tomb_ttl,terminal_ttl,control_ttl,max_terminals,max_client_terminals,max_controls,max_node_controls,expected_epoch,
-  max_node_id,max_identity,max_request_envelope,max_response_envelope=unpack(ARGV)
-max_node_id,max_identity,max_request_envelope,max_response_envelope=tonumber(max_node_id),tonumber(max_identity),tonumber(max_request_envelope),tonumber(max_response_envelope)
+  max_node_id,max_identity,max_request_envelope,max_response_envelope,max_model_id=unpack(ARGV)
+max_node_id,max_identity,max_request_envelope,max_response_envelope,max_model_id=tonumber(max_node_id),tonumber(max_identity),tonumber(max_request_envelope),tonumber(max_response_envelope),tonumber(max_model_id)
 local function digest(v) return v and string.match(v,'^[0-9a-f]+$') and string.len(v)==64 end
 local function finite(v) local n=tonumber(v); if not n or n~=n or n==math.huge or n==-math.huge then return nil end; return n end
 local function integer(v) local n=finite(v); if not n or n<0 or n>9007199254740990 or n~=math.floor(n) or tostring(n)~=v then return nil end; return n end
@@ -2006,6 +2006,7 @@ local function python_float(v)
   return canonical==v
 end
 local function lua_float(v) local n=finite(v); return v and string.len(v)<=32 and n and string.format('%.17g',n)==v end
+local function utf8_length(v) local _,continuations=string.gsub(v,'[\128-\191]',''); return string.len(v)-continuations end
 local function selected(values,member) for _,value in ipairs(values) do if value==member then return true end end; return false end
 if not digest(node_digest) or (supplied~='' and not digest(supplied)) or
    (cause~='explicit_unregister' and cause~='registration_lease_expired') or
@@ -2049,10 +2050,27 @@ if not pending_exists then
     end
     return {'not_found'}
   end
-  local nv=redis.call('HMGET',node,'node_id','control_credential_digest','lease_expires_at_epoch','scheduler_healthy','scheduler_draining','scheduler_claimed_work','registration_order')
+  local nv=redis.call('HMGET',node,'node_id','control_credential_digest','registered_at_epoch','supported_model_ids','active_context_tier','maximum_total_context_tokens','default_output_token_reservation','maximum_output_tokens','max_concurrency','backend_class','api_version','lease_expires_at_epoch','scheduler_healthy','scheduler_draining','scheduler_claimed_work','registration_order')
   for _,v in ipairs(nv) do if not v then return {'schema'} end end
-  local indexed=finite(redis.call('ZSCORE',leases,node_digest)); local lease=finite(nv[3])
-  if nv[1]~=node_id or not digest(nv[2]) or not indexed or indexed~=lease then return {'schema'} end
+  local indexed=finite(redis.call('ZSCORE',leases,node_digest)); local registered=canonical_number(nv[3],true); local lease=canonical_number(nv[12],true)
+  local json_ok,models=pcall(cjson.decode,nv[4]); local model_count,maximum_model_key=0,0; local seen_models={}
+  if json_ok and type(models)=='table' then
+    for key,value in pairs(models) do
+      model_count=model_count+1
+      if type(key)~='number' or key<1 or key~=math.floor(key) or type(value)~='string' or string.len(value)<1 or utf8_length(value)>max_model_id or
+         string.lower(value)~=value or string.match(value,'^%s') or string.match(value,'%s$') or seen_models[value] then json_ok=false; break end
+      seen_models[value]=true
+      if key>maximum_model_key then maximum_model_key=key end
+    end
+  end
+  local total=positive_integer(nv[6]); local default_output=positive_integer(nv[7]); local maximum_output=positive_integer(nv[8]); local concurrency=positive_integer(nv[9]); local claimed=integer(nv[15]); local registration_order=positive_integer(nv[16]); local tier_min=false
+  if nv[5]=='8k-fast' then tier_min=8192 elseif nv[5]=='64k-full' then tier_min=65536 end
+  local backend=nv[10]=='cpu' or nv[10]=='cuda' or nv[10]=='metal' or nv[10]=='vulkan' or nv[10]=='gpu' or nv[10]=='unknown'
+  local registration_sequence=positive_integer(redis.call('HGET',cursor,'_registration_sequence'))
+  if nv[1]~=node_id or string.len(nv[1])<1 or string.len(nv[1])>max_node_id or not digest(nv[2]) or
+     not registered or not indexed or not lease or indexed~=lease or not json_ok or string.len(nv[4])>65536 or model_count<1 or model_count>64 or maximum_model_key~=model_count or
+     not tier_min or not total or total>1000000 or total<tier_min or not default_output or default_output>1000000 or not maximum_output or maximum_output>1000000 or default_output>maximum_output or
+     not concurrency or concurrency>128 or not backend or nv[11]~='v1' or (nv[13]~='0' and nv[13]~='1') or (nv[14]~='0' and nv[14]~='1') or not claimed or claimed>1000000 or not registration_order or not registration_sequence or registration_order>registration_sequence then return {'schema'} end
   if cause=='explicit_unregister' and nv[2]~=supplied then return {'credential_mismatch'} end
   if cause=='registration_lease_expired' and lease>now then return {'lease_active'} end
   if redis.call('ZRANK',work,'!schema:1')~=0 or redis.call('ZSCORE',work,'!schema:1')~='0' then return {'schema'} end
@@ -2219,7 +2237,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "ce38b8c779d5d8fd6dd198a5eedd9ed65f270dcc5ed53255b72d77e3e0b79af1",  # pragma: allowlist secret
+    "a38fd69d6b8bc6fad0a7f5d53c025f1be8a15e55be96ad99aafbc229d816afaa",  # pragma: allowlist secret
     True,
 )
 
@@ -2995,6 +3013,7 @@ class ValkeyRegistrationStore:
             str(self.config.max_identity_bytes).encode(),
             str(self.config.max_envelope_bytes).encode(),
             str(self.config.max_response_envelope_bytes).encode(),
+            str(self.config.max_model_id_bytes).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(NODE_TRANSITION_SCRIPT.name, keys, args)

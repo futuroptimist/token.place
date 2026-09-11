@@ -9863,6 +9863,104 @@ def test_node_transition_prevalidation_malformed_initial_work_is_atomic(
         store.close()
 
 
+@pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("scheduler_healthy", "2"),
+        ("scheduler_draining", "garbage"),
+        ("scheduler_claimed_work", "-1"),
+        ("registration_order", "-1"),
+        ("supported_model_ids", "not-json"),
+        ("supported_model_ids", None),
+        ("supported_model_ids", '["' + "m" * 129 + '"]'),
+        ("active_context_tier", "unknown"),
+        ("maximum_total_context_tokens", "8191"),
+        ("default_output_token_reservation", "2049"),
+        ("max_concurrency", "0"),
+        ("backend_class", "other"),
+        ("api_version", "v2"),
+        ("registered_at_epoch", "-1"),
+    ),
+)
+def test_node_transition_prevalidation_rejects_malformed_registration_without_mutation(
+    valkey_server, cause, field, value
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
+    node = f"registration-{cause}-{field}-{uuid.uuid4().hex}"
+    owner = _digest(node)
+    cfg = writer._foundation.config
+    digest = writer._node_digest(node)
+    node_key = cfg.key("node", digest)
+    former_owner = cfg.key("former_owner", digest, owner)
+    try:
+        writer.register(node, _capabilities(), owner)
+        if cause == "registration_lease_expired":
+            writer._foundation._client.hset(node_key, "lease_expires_at_epoch", "0")
+            writer._foundation._client.zadd(cfg.key("nodes:lease"), {digest: 0})
+        if value is None:
+            writer._foundation._client.hdel(node_key, field)
+        else:
+            writer._foundation._client.hset(node_key, field, value)
+        before = _node_transition_authority_snapshot(
+            observer, node, (), (former_owner,)
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            observer.unregister_node_and_transition_work(
+                node,
+                owner if cause == "explicit_unregister" else None,
+                cause=cause,
+            )
+        assert _node_transition_authority_snapshot(
+            observer, node, (), (former_owner,)
+        ) == before
+    finally:
+        _delete_claim_fixture_state(writer, (node,), ())
+        writer._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), former_owner,
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        observer.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
+def test_node_transition_prevalidation_accepts_valid_scheduler_registration(
+    valkey_server, cause
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner = f"valid-registration-{cause}", _digest(f"valid-owner-{cause}")
+    cfg, digest = store._foundation.config, store._node_digest(node)
+    try:
+        store.register(node, _capabilities(), owner)
+        store._foundation._client.hset(
+            cfg.key("node", digest),
+            mapping={"scheduler_healthy": "0", "scheduler_draining": "1"},
+        )
+        if cause == "registration_lease_expired":
+            store._foundation._client.hset(
+                cfg.key("node", digest), "lease_expires_at_epoch", "0"
+            )
+            store._foundation._client.zadd(cfg.key("nodes:lease"), {digest: 0})
+        result = store.unregister_node_and_transition_work(
+            node, owner if cause == "explicit_unregister" else None, cause=cause
+        )
+        assert result.state == "complete"
+    finally:
+        _delete_claim_fixture_state(store, (node,), ())
+        store._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        store.close()
+
+
 @pytest.mark.parametrize(
     "corruption", ("generation_zero", "negative_times", "exponent_deadline", "lease_after_deadline")
 )

@@ -610,7 +610,8 @@ def _run_qualified_main(tmp_path, monkeypatch, public=True, missing=None, cleanu
     def cleanup(*_args, **_kwargs):
         if cleanup_calls is not None:
             cleanup_calls.append(_args)
-        return subprocess.CompletedProcess([], cleanup_code)
+        code = cleanup_code() if callable(cleanup_code) else cleanup_code
+        return subprocess.CompletedProcess([], code)
 
     return _run_main(tmp_path, monkeypatch, lambda *_a: next(values), cleanup)
 
@@ -709,11 +710,8 @@ def test_failed_launch_preserves_error_and_verifies_no_owned_container(tmp_path,
 
     def cleanup(args, **_kwargs):
         cleanup_calls.append(args)
-        assert args[:3] == ["docker", "container", "inspect"]
-        container = args[3]
-        return subprocess.CompletedProcess(
-            args, 1, stderr=f"Error: No such object: {container}\n".encode()
-        )
+        assert args[:4] == ["docker", "ps", "-aq", "--filter"]
+        return subprocess.CompletedProcess(args, 0, stdout=b"")
 
     result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
     assert result == 1 and report["error_category"] == "runtime_command_failed"
@@ -721,7 +719,7 @@ def test_failed_launch_preserves_error_and_verifies_no_owned_container(tmp_path,
     assert "cleanup" not in report
 
 
-def test_failed_launch_inspect_error_fails_closed_and_retries(tmp_path, monkeypatch):
+def test_failed_launch_absence_query_error_fails_closed_and_retries(tmp_path, monkeypatch):
     values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
     cleanup_calls = []
 
@@ -732,10 +730,53 @@ def test_failed_launch_inspect_error_fails_closed_and_retries(tmp_path, monkeypa
 
     def cleanup(args, **_kwargs):
         cleanup_calls.append(args)
-        assert args[:3] == ["docker", "container", "inspect"]
+        assert args[:4] == ["docker", "ps", "-aq", "--filter"]
         return subprocess.CompletedProcess(
             args, 1, stderr=b"error during connect: Docker daemon unavailable\n"
         )
+
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert report["cleanup"] == "failed"
+    assert len(cleanup_calls) == 2
+
+
+def test_failed_launch_found_container_is_removed(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    cleanup_calls = []
+
+    def output(*args):
+        if args[0] == "run":
+            raise subprocess.CalledProcessError(125, args)
+        return next(values)
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        if args[1:3] == ["ps", "-aq"]:
+            return subprocess.CompletedProcess(args, 0, stdout=b"container-id\n")
+        assert args[:3] == ["docker", "rm", "-f"]
+        return subprocess.CompletedProcess(args, 0)
+
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert [call[1] for call in cleanup_calls] == ["ps", "rm"]
+    assert "cleanup" not in report
+
+
+def test_failed_launch_fallback_success_keeps_cleanup_failure_sticky(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    cleanup_calls = []
+
+    def output(*args):
+        if args[0] == "run":
+            raise subprocess.CalledProcessError(125, args)
+        return next(values)
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        if len(cleanup_calls) == 1:
+            raise subprocess.TimeoutExpired(args, 15)
+        return subprocess.CompletedProcess(args, 0, stdout=b"")
 
     result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
     assert result == 1 and report["error_category"] == "runtime_command_failed"
@@ -802,6 +843,16 @@ def test_nonzero_cleanup_fails_successful_qualification(tmp_path, monkeypatch):
     result, report = _run_qualified_main(tmp_path, monkeypatch, cleanup_code=1)
     assert result == 1 and report["passed"] is False
     assert report["cleanup"] == "failed" and report["error_category"] == "cleanup_failed"
+
+
+def test_failed_mandatory_check_preserved_when_cleanup_fails(tmp_path, monkeypatch):
+    cleanup_codes = iter([0, 1, 0])
+    result, report = _run_qualified_main(
+        tmp_path, monkeypatch, cleanup_code=lambda: next(cleanup_codes), public=False
+    )
+    assert result == 1 and report["cleanup"] == "failed"
+    assert report["error_category"] == "mandatory_check_failed"
+    assert report["results"]["quota.public_information_exempt"]["state"] == "failed"
 
 
 def test_early_cleanup_failure_prevents_later_qualification_check(tmp_path, monkeypatch):

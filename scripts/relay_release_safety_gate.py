@@ -325,22 +325,17 @@ def _cleanup_phase_container(container: str, *, created: bool) -> bool:
     """Remove one invocation-owned phase container, or prove a failed launch left none."""
     try:
         if not created:
-            inspected = subprocess.run(
-                ["docker", "container", "inspect", container],
+            queried = subprocess.run(
+                ["docker", "ps", "-aq", "--filter", f"name=^/{container}$"],
                 check=False, capture_output=True, timeout=15,
             )
-            if inspected.returncode != 0:
-                stderr = inspected.stderr.decode(errors="replace") if isinstance(
-                    inspected.stderr, bytes
-                ) else inspected.stderr or ""
-                missing = re.search(
-                    rf"No such (?:container|object):\s*{re.escape(container)}\s*$",
-                    stderr,
-                )
-                # An inspect failure only proves absence when Docker explicitly
-                # identifies this named container as missing. Daemon and access
-                # errors remain cleanup failures and are retried by the fallback.
-                return missing is not None
+            if queried.returncode != 0:
+                return False
+            output = queried.stdout.decode(errors="replace") if isinstance(
+                queried.stdout, bytes
+            ) else queried.stdout or ""
+            if not output.strip():
+                return True
         removed = subprocess.run(
             ["docker", "rm", "-f", container], check=False, capture_output=True, timeout=15
         )

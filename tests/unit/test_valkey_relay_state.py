@@ -345,6 +345,20 @@ def _node_transition_store_with_reply(reply):
                 b"transitioning",
                 b"explicit_unregister",
                 b"1.0",
+                b"not-an-integer",
+                0,
+                0,
+                0,
+                0,
+                1,
+            ],
+            ValkeySchemaIncompatibleError,
+        ),
+        (
+            [
+                b"transitioning",
+                b"explicit_unregister",
+                b"1.0",
                 0,
                 0,
                 0,
@@ -376,6 +390,19 @@ def test_node_transition_rejects_invalid_cause_inputs(cause, credential, message
 
     with pytest.raises(RelayStateStoreError, match=message):
         store.unregister_node_and_transition_work("node-a", credential, cause=cause)
+
+
+def test_node_transition_accepts_stale_pending_recovery_result():
+    store = _node_transition_store_with_reply([b"stale"])
+
+    result = store.unregister_node_and_transition_work(
+        "node-a",
+        cause="registration_lease_expired",
+        _expected_transition_epoch="1.0",
+    )
+
+    assert result.state == "stale"
+    assert not result.continuation_required
 
 
 def _node_tombstone_store(indexed, raw=None):
@@ -435,6 +462,18 @@ def test_node_tombstones_decodes_a_valid_bounded_snapshot():
                 b"explicit_unregister",
                 b"cancelled",
                 b"invalid",
+                b"1",
+                b"200.0",
+            ],
+        ),
+        (
+            [(b"a" * 64, 200.0)],
+            [
+                b"a" * 64,
+                b"b" * 64,
+                b"explicit_unregister",
+                b"invalid-status",
+                b"100.0",
                 b"1",
                 b"200.0",
             ],

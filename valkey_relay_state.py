@@ -2244,6 +2244,7 @@ local function retained_terminal_valid(m,score_value,due)
   end
   if v[1]~='completed' or v[2]~='response_completed' or (v[3]~='response_ready' and v[3]~='acknowledged' and v[3]~='retrieval_expired') or
      not digest(v[5]) or not digest(v[6]) or not g or g<1 or not digest(v[8]) or not digest(v[13]) or not digest(v[14]) or l[1]~='response_ready' then return false end
+  if accepted>bounded_number(l[8],false) then return false end
   local rk=prefix..'response:'..c..':'..q; local rs=redis.call('ZSCORE',prefix..'responses:expiry',m); local response_score=rs and finite(rs)
   if v[3]=='response_ready' then
     local rv=redis.call('HMGET',rk,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')
@@ -2268,8 +2269,11 @@ local function retained_control_valid(m,score_value,due)
   if not ts or not retained_terminal_valid(c..':'..q,ts,ts<=now) then return false end
   local tv=redis.call('HMGET',prefix..'terminal:'..c..':'..q,'outcome','reason','node_id','owner_digest','consumer_digest','generation','accepted_at_epoch')
   local lv=redis.call('HMGET',prefix..'request:'..c..':'..q,'node_digest','deadline')
+  local accepted=finite(tv[7])
+  -- Expiry and unregister acceptance can legitimately follow the request deadline.
   return tv[1]==v[8] and tv[2]==v[9] and tv[3]==v[4] and tv[4]==v[5] and tv[5]==v[6] and tv[6]==v[7] and
-    lv[1]==n and lv[2]==v[10] and finite(tv[7])<=deadline
+    lv[1]==n and lv[2]==v[10] and accepted and
+    ((v[8]=='expired' and deadline<=accepted) or v[9]=='server_unregistered' or accepted<=deadline)
 end
 local due_terminals=redis.call('ZRANGEBYSCORE',terminal_expiries,'-inf',now,'LIMIT',0,tonumber(max_terminals)+1)
 local due_terminal_set={}; local paired_controls={}
@@ -2351,7 +2355,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "e510e41b54aceb6c37ed785a73ca6926738306160fc43ffe2f2632063fab9bfa",  # pragma: allowlist secret
+    "d36afbb9aa40cc6d9bfb6f15c534f1c7f3a7258f185f0855e07d57200263a51a",  # pragma: allowlist secret
     True,
 )
 

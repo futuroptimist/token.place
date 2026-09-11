@@ -9719,6 +9719,116 @@ def test_node_pending_recovery_leaves_not_yet_due_transition_untouched(valkey_se
         store.close()
 
 
+def _node_transition_authority_snapshot(store, node_id, identities, extra=()):
+    """Return byte-exact dumps of addressed node-transition authority."""
+    cfg = store._foundation.config
+    node = store._node_digest(node_id)
+    keys = [
+        cfg.key("nodes:lease"), cfg.key("node", node), cfg.key("queue", node),
+        cfg.key("node_work", node), cfg.key("node_transition", node),
+        cfg.key("node_tombstone", node), cfg.key("node_transitions:pending"),
+        cfg.key("node_tombstones:expiry"), cfg.key("former_owners:expiry"),
+        cfg.key("requests:deadline"), cfg.key("reservations:expiry"),
+        cfg.key("claims:expiry"), cfg.key("terminals:expiry"),
+    ]
+    for identity in identities:
+        client, request = store._identity(*identity)
+        record = cfg.key("request", client, request)
+        token = store._foundation._client.hget(record, "token_digest")
+        keys.extend((record, cfg.key("claim", client, request), cfg.key("terminal", client, request)))
+        if token:
+            keys.append(cfg.key("reservation", token.decode("ascii")))
+    keys.extend(extra)
+    datastore = store._foundation._client
+    def snapshot(key):
+        kind = datastore.type(key)
+        if kind == b"hash":
+            value = tuple(sorted(datastore.hgetall(key).items()))
+        elif kind == b"zset":
+            value = tuple(datastore.zrange(key, 0, -1, withscores=True))
+        elif kind == b"stream":
+            value = tuple(datastore.xrange(key))
+        else:
+            value = datastore.get(key) if kind == b"string" else None
+        return kind, value
+    return tuple((key, snapshot(key)) for key in keys)
+
+
+@pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
+@pytest.mark.parametrize("corruption", ("missing_deadline", "cross_linked_queue"))
+def test_node_transition_prevalidation_malformed_initial_work_is_atomic(
+    valkey_server, cause, corruption
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex, node_transition_batch_size=4)
+    node, owner = f"prevalidate-{cause}-{corruption}", _digest(f"owner-{cause}-{corruption}")
+    identities = (("prevalidate-client-1", "request-1"), ("prevalidate-client-2", "request-2"))
+    try:
+        store.register(node, _capabilities(concurrency=4), owner)
+        seconds, micros = store._foundation.server_time()
+        for identity in identities:
+            _enqueue_claim_fixture(
+                store, node, owner, *identity, seconds + micros / 1_000_000 + 60
+            )
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        client, request = store._identity(*identities[1])
+        member = f"{client}:{request}"
+        if corruption == "missing_deadline":
+            store._foundation._client.zrem(cfg.key("requests:deadline"), member)
+        else:
+            other_client, other_request = store._identity(*identities[0])
+            entry = store._foundation._client.hget(
+                cfg.key("request", other_client, other_request), "queue_entry"
+            )
+            store._foundation._client.hset(
+                cfg.key("request", client, request), "queue_entry", entry
+            )
+        if cause == "registration_lease_expired":
+            store._foundation._client.hset(cfg.key("node", digest), "lease_expires_at_epoch", "0")
+            store._foundation._client.zadd(cfg.key("nodes:lease"), {digest: 0})
+        before = _node_transition_authority_snapshot(store, node, identities)
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            if cause == "explicit_unregister":
+                store.unregister_node_and_transition_work(node, owner, cause=cause)
+            else:
+                store.unregister_node_and_transition_work(node, cause=cause)
+        assert _node_transition_authority_snapshot(store, node, identities) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), identities)
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        store._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), cfg.key("node_transitions:pending"),
+            cfg.key("node_tombstones:expiry"), cfg.key("former_owners:expiry"),
+        )
+        store.close()
+
+
+def test_node_transition_prevalidation_later_cleanup_candidate_is_atomic(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner = "prevalidate-cleanup", _digest("prevalidate-cleanup-owner")
+    cfg = store._foundation.config
+    first, second = _digest("cleanup-first"), _digest("cleanup-second")
+    try:
+        store.register(node, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        first_key, second_key = cfg.key("node_tombstone", first), cfg.key("node_tombstone", second)
+        store._foundation._client.hset(first_key, "expires_at_epoch", str(now - 2))
+        store._foundation._client.hset(second_key, "expires_at_epoch", "malformed")
+        store._foundation._client.zadd(cfg.key("node_tombstones:expiry"), {first: now - 2, second: now - 1})
+        before = _node_transition_authority_snapshot(store, node, (), (first_key, second_key))
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.unregister_node_and_transition_work(node, owner)
+        assert _node_transition_authority_snapshot(store, node, (), (first_key, second_key)) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), ())
+        store._foundation._client.delete(
+            cfg.key("node_work", store._node_digest(node)), cfg.key("node_tombstone", first),
+            cfg.key("node_tombstone", second), cfg.key("node_tombstones:expiry"),
+        )
+        store.close()
+
+
 def test_retention_reaper_reclaims_capacity_only_after_complete_validation(
     valkey_server,
 ):

@@ -303,6 +303,14 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "expected_epoch" in script.source
     assert "redis.call('ZADD',pending_index,now,node_digest)" in script.source
     assert "if redis.call('ZSCORE',pending_index,node_digest) then return {'schema'} end" in script.source
+    assert script.source.index("local expired_tombs=") < script.source.index(
+        "for _,m in ipairs(expired_tombs) do redis.call('DEL'"
+    )
+    assert script.source.index("local members=redis.call('ZRANGE',work") < (
+        script.source.index("if initial then")
+    )
+    assert "finite(redis.call('ZSCORE',deadlines,member))~=finite(r[6])" in script.source
+    assert "entries[1][2][2]~=client" in script.source
 
     reader = valkey_relay_state.PENDING_TRANSITION_READ_SCRIPT
     assert SCRIPT_DIGESTS[reader.name] == reader.sha256

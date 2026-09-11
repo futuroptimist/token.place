@@ -1991,26 +1991,31 @@ local prefix,node_digest,node_id,supplied,cause,batch,max_pending,max_tombs,max_
 local function digest(v) return v and string.match(v,'^[0-9a-f]+$') and string.len(v)==64 end
 local function finite(v) local n=tonumber(v); if not n or n~=n or n==math.huge or n==-math.huge then return nil end; return n end
 local function integer(v) local n=finite(v); if not n or n<0 or n~=math.floor(n) or tostring(n)~=v then return nil end; return n end
+local function canonical_number(v,zero)
+  if not v or string.len(v)>32 or not string.match(v,'^%d+%.?%d*$') or string.sub(v,-1)=='.' then return nil end
+  if string.sub(v,1,1)=='0' and string.len(v)>1 and string.sub(v,2,2)~='.' then return nil end
+  local n=finite(v); if not n or n<0 or (not zero and n==0) then return nil end; return n
+end
 if not digest(node_digest) or (supplied~='' and not digest(supplied)) or
    (cause~='explicit_unregister' and cause~='registration_lease_expired') or
    (expected_epoch~='' and not finite(expected_epoch)) then return {'schema'} end
 local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
 -- Retained authorities are bounded and reaped in deterministic score/member order.
-for _,m in ipairs(redis.call('ZRANGEBYSCORE',tomb_expiries,'-inf',now,'LIMIT',0,batch)) do
+local expired_tombs=redis.call('ZRANGEBYSCORE',tomb_expiries,'-inf',now,'LIMIT',0,batch)
+for _,m in ipairs(expired_tombs) do
   local tk=prefix..'node_tombstone:'..m; local e=finite(redis.call('HGET',tk,'expires_at_epoch'))
   if not digest(m) or not e or e>now or finite(redis.call('ZSCORE',tomb_expiries,m))~=e then return {'schema'} end
-  redis.call('DEL',tk); redis.call('ZREM',tomb_expiries,m)
 end
-for _,m in ipairs(redis.call('ZRANGEBYSCORE',fence_expiries,'-inf',now,'LIMIT',0,batch)) do
+local expired_fences=redis.call('ZRANGEBYSCORE',fence_expiries,'-inf',now,'LIMIT',0,batch)
+for _,m in ipairs(expired_fences) do
   local p=string.find(m,':',1,true); if p~=65 then return {'schema'} end
   local node_key_digest,od=string.sub(m,1,p-1),string.sub(m,p+1); local fk=prefix..'former_owner:'..node_key_digest..':'..od
   local e=finite(redis.call('HGET',fk,'expires_at_epoch'))
   if not digest(node_key_digest) or not digest(od) or not e or e>now or finite(redis.call('ZSCORE',fence_expiries,m))~=e or redis.call('EXISTS',prefix..'node_transition:'..node_key_digest)==1 then return {'schema'} end
-  redis.call('DEL',fk); redis.call('ZREM',fence_expiries,m)
 end
 local pv=redis.call('HMGET',pending,'node_id','node_digest','owner_digest','cause','status','reason','transition_epoch')
 local pending_exists=redis.call('EXISTS',pending)==1
-local owner,epoch
+local owner,epoch,initial=false
 if not pending_exists then
   if redis.call('ZSCORE',pending_index,node_digest) then return {'schema'} end
   if expected_epoch~='' then return {'stale'} end
@@ -2036,15 +2041,7 @@ if not pending_exists then
   if redis.call('EXISTS',tomb)==0 and redis.call('ZCARD',tomb_expiries)>=tonumber(max_tombs) then return {'tombstone_capacity'} end
   local fm=node_digest..':'..nv[2]
   if redis.call('EXISTS',prefix..'former_owner:'..node_digest..':'..nv[2])==0 and redis.call('ZCARD',fence_expiries)>=tonumber(max_fences) then return {'fence_capacity'} end
-  owner=nv[2]; epoch=string.format('%.17g',now)
-  local tomb_expiry=string.format('%.17g',math.min(now+tonumber(tomb_ttl),now+300)); local fe=string.format('%.17g',now+tonumber(terminal_ttl))
-  redis.call('HSET',pending,'node_id',node_id,'node_digest',node_digest,'owner_digest',owner,'cause',cause,'status','cancelled','reason','server_unregistered','transition_epoch',epoch)
-  redis.call('ZADD',pending_index,now,node_digest)
-  redis.call('HSET',tomb,'node_digest',node_digest,'owner_digest',owner,'cause',cause,'status','cancelled','transition_epoch',epoch,'completed','0','expires_at_epoch',tomb_expiry)
-  redis.call('ZADD',tomb_expiries,tomb_expiry,node_digest)
-  redis.call('HSET',prefix..'former_owner:'..node_digest..':'..owner,'node_digest',node_digest,'owner_digest',owner,'cause',cause,'status','cancelled','transition_epoch',epoch,'expires_at_epoch',fe)
-  redis.call('ZADD',fence_expiries,fe,fm)
-  redis.call('DEL',node); redis.call('ZREM',leases,node_digest)
+  owner=nv[2]; epoch=string.format('%.17g',now); initial=true
 else
   for _,v in ipairs(pv) do if not v then return {'schema'} end end
   if pv[1]~=node_id or pv[2]~=node_digest or not digest(pv[3]) or pv[5]~='cancelled' or pv[6]~='server_unregistered' or not finite(pv[7]) then return {'schema'} end
@@ -2067,8 +2064,31 @@ for _,member in ipairs(members) do
   if redis.call('EXISTS',prefix..'progress:'..client..':'..request)~=0 then return {'schema'} end
   local terminal_key=prefix..'terminal:'..client..':'..request
   if redis.call('EXISTS',terminal_key)==1 then
+    local tv=redis.call('HMGET',terminal_key,'outcome','reason','retrieval_state','node_id','owner_digest','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','expires_at_epoch','retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request')
+    for _,value in ipairs(tv) do if value==false then return {'schema'} end end
+    local accepted=canonical_number(tv[9],true); local replay=canonical_number(tv[10],true); local expiry=canonical_number(tv[11],false); local generation=integer(tv[7])
+    local unavailable=(tv[1]=='cancelled' and (tv[2]=='requester_cancelled' or tv[2]=='server_unregistered') and tv[3]=='completed_unavailable') or (tv[1]=='expired' and tv[2]=='request_deadline_expired' and tv[3]=='completed_unavailable')
+    local completed=tv[1]=='completed' and tv[2]=='response_completed' and (tv[3]=='response_ready' or tv[3]=='acknowledged' or tv[3]=='retrieval_expired')
+    if not accepted or not replay or not expiry or expiry<replay or finite(redis.call('ZSCORE',terminal_expiries,member))~=expiry or tv[4]~=node_id or tv[15]~=client or tv[16]~=request or not digest(tv[12]) or
+       not generation or r[1]~=(unavailable and tv[1] or 'response_ready') or r[11]~=tv[7] or r[7]~=tv[12] or r[8]~=tv[14] or (not unavailable and not completed) or
+       redis.call('ZSCORE',deadlines,member) or redis.call('EXISTS',prefix..'claim:'..client..':'..request)~=0 or redis.call('ZSCORE',claim_expiries,member) or redis.call('EXISTS',prefix..'reservation:'..r[7])~=0 or redis.call('ZSCORE',reservation_expiries,r[7]) then return {'schema'} end
+    if r[9] and #redis.call('XRANGE',prefix..'queue:'..node_digest,r[9],r[9],'COUNT',1)~=0 then return {'schema'} end
+    local response_key=prefix..'response:'..client..':'..request; local response_exists=redis.call('EXISTS',response_key); local response_score=finite(redis.call('ZSCORE',prefix..'responses:expiry',member))
+    if unavailable then
+      local proof=(tv[2]=='requester_cancelled' and digest(tv[14])) or (tv[2]~='requester_cancelled' and (tv[14]=='' or digest(tv[14])))
+      if not proof or replay~=accepted or tv[8]~='' or tv[13]~='' or response_exists~=0 or response_score then return {'schema'} end
+      if (generation==0 and (tv[5]~='' or tv[6]~='')) or (generation>0 and (not digest(tv[5]) or not digest(tv[6]))) then return {'schema'} end
+    else
+      if generation<1 or not digest(tv[5]) or not digest(tv[6]) or not digest(tv[8]) or not digest(tv[13]) or not digest(tv[14]) then return {'schema'} end
+      if tv[3]=='response_ready' then
+        local response=redis.call('HMGET',response_key,'client','request','node_id','consumer_digest','generation','response_digest','accepted_at_epoch','replay_expires_at_epoch','status')
+        for _,value in ipairs(response) do if value==false then return {'schema'} end end
+        if response_exists~=1 or response_score~=replay or response[1]~=client or response[2]~=request or response[3]~=node_id or response[4]~=tv[6] or response[5]~=tv[7] or response[6]~=tv[8] or response[7]~=tv[9] or response[8]~=tv[10] or response[9]~='response_ready' then return {'schema'} end
+      elseif response_exists~=0 or response_score then return {'schema'} end
+    end
     table.insert(validated,{member,'terminal',client,request,r})
   else
+  if finite(redis.call('ZSCORE',deadlines,member))~=finite(r[6]) then return {'schema'} end
   if r[1]~='reserved' and r[1]~='queued' and r[1]~='claimed' then return {'schema'} end
   if r[1]=='reserved' then
     local rk=prefix..'reservation:'..r[7]; local rv=redis.call('HMGET',rk,'client','request','node_digest','node_id','deadline','token_digest','cancellation_digest','reservation_expires')
@@ -2076,7 +2096,7 @@ for _,member in ipairs(members) do
     if rv[1]~=client or rv[2]~=request or rv[3]~=node_digest or rv[4]~=node_id or rv[5]~=r[6] or rv[6]~=r[7] or rv[7]~=r[8] or not finite(rv[8]) or finite(redis.call('ZSCORE',reservation_expiries,r[7]))~=finite(rv[8]) then return {'schema'} end
   else
     local entries=redis.call('XRANGE',prefix..'queue:'..node_digest,r[9],r[9],'COUNT',1)
-    if #entries~=1 or entries[1][1]~=r[9] then return {'schema'} end
+    if #entries~=1 or entries[1][1]~=r[9] or #entries[1][2]~=4 or entries[1][2][1]~='client' or entries[1][2][2]~=client or entries[1][2][3]~='request' or entries[1][2][4]~=request then return {'schema'} end
   end
   local claim=false
   if r[1]=='claimed' then
@@ -2089,8 +2109,21 @@ for _,member in ipairs(members) do
   table.insert(validated,{member,r[1],client,request,r,claim})
   end
 end
-if redis.call('ZCARD',terminal_expiries)+needed_terminals>tonumber(max_terminals) then redis.call('ZADD',pending_index,now,node_digest); return {'terminal_capacity'} end
-if redis.call('ZCARD',control_expiries)+needed_controls>tonumber(max_controls) then redis.call('ZADD',pending_index,now,node_digest); return {'control_capacity'} end
+for _,m in ipairs(expired_tombs) do redis.call('DEL',prefix..'node_tombstone:'..m); redis.call('ZREM',tomb_expiries,m) end
+for _,m in ipairs(expired_fences) do
+  local p=string.find(m,':',1,true); redis.call('DEL',prefix..'former_owner:'..string.sub(m,1,p-1)..':'..string.sub(m,p+1)); redis.call('ZREM',fence_expiries,m)
+end
+if redis.call('ZCARD',terminal_expiries)+needed_terminals>tonumber(max_terminals) then if not initial then redis.call('ZADD',pending_index,now,node_digest) end; return {'terminal_capacity'} end
+if redis.call('ZCARD',control_expiries)+needed_controls>tonumber(max_controls) then if not initial then redis.call('ZADD',pending_index,now,node_digest) end; return {'control_capacity'} end
+if initial then
+  local tomb_expiry=string.format('%.17g',math.min(now+tonumber(tomb_ttl),now+300)); local fe=string.format('%.17g',now+tonumber(terminal_ttl)); local fm=node_digest..':'..owner
+  redis.call('HSET',pending,'node_id',node_id,'node_digest',node_digest,'owner_digest',owner,'cause',cause,'status','cancelled','reason','server_unregistered','transition_epoch',epoch)
+  redis.call('ZADD',pending_index,now,node_digest)
+  redis.call('HSET',tomb,'node_digest',node_digest,'owner_digest',owner,'cause',cause,'status','cancelled','transition_epoch',epoch,'completed','0','expires_at_epoch',tomb_expiry)
+  redis.call('ZADD',tomb_expiries,tomb_expiry,node_digest)
+  redis.call('HSET',prefix..'former_owner:'..node_digest..':'..owner,'node_digest',node_digest,'owner_digest',owner,'cause',cause,'status','cancelled','transition_epoch',epoch,'expires_at_epoch',fe)
+  redis.call('ZADD',fence_expiries,fe,fm); redis.call('DEL',node); redis.call('ZREM',leases,node_digest)
+end
 local reservations,queued,claims,outcomes=0,0,0,0
 for _,v in ipairs(validated) do
   local member,state,client,request,r,claim=unpack(v)
@@ -2129,7 +2162,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "a2745642df5a61a060896cb899ce2effd7289094ad8b7ade9c9220a9dcb5eab3",  # pragma: allowlist secret
+    "a6eb412eca12b5a1ad47656bb58a632f288fbfe24aa4e2ed4f373ceb3f9b1355",  # pragma: allowlist secret
     True,
 )
 

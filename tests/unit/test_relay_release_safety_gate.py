@@ -610,7 +610,9 @@ def _run_qualified_main(tmp_path, monkeypatch, public=True, missing=None, cleanu
     def cleanup(*_args, **_kwargs):
         if cleanup_calls is not None:
             cleanup_calls.append(_args)
-        return subprocess.CompletedProcess([], cleanup_code)
+        code = cleanup_code() if callable(cleanup_code) else cleanup_code
+        stdout = b"owned-container-id\n" if _args[0][1:3] == ["ps", "-aq"] and code == 0 else b""
+        return subprocess.CompletedProcess([], code, stdout=stdout)
 
     return _run_main(tmp_path, monkeypatch, lambda *_a: next(values), cleanup)
 
@@ -630,7 +632,7 @@ def test_rejected_public_predicate_fails_qualification_and_still_cleans_up(tmp_p
     public = report["results"]["quota.public_information_exempt"]
     assert result == 1 and report["error_category"] == "mandatory_check_failed"
     assert public["passed"] is False and public["predicate_exact"] is False
-    assert len(cleanup_calls) == 6
+    assert len(cleanup_calls) == 12
 
 
 @pytest.mark.parametrize("missing", sorted(gate.EXPECTED_IDS - {
@@ -648,6 +650,209 @@ def test_all_independent_quota_phases_pass(tmp_path, monkeypatch):
     public = report["results"]["quota.public_information_exempt"]
     assert result == 0 and report["passed"] is True
     assert public["state"] == "passed"
+    assert set(report["results"]) == gate.EXPECTED_IDS
+    assert all(item["state"] == "passed" for item in report["results"].values())
+
+
+def test_phases_are_serial_and_removed_in_order(tmp_path, monkeypatch):
+    image_id = "sha256:" + "b" * 64
+    metadata = iter([image_id, "a" * 40, "amd64"])
+    events = []
+    active = set()
+    max_active = 0
+    ownership_labels = set()
+    expected = ["metrics", "public", "protected-rate", "protected-daily",
+                "mutating-rate", "mutating-daily"]
+
+    def output(*args):
+        nonlocal max_active
+        if args[0] != "run":
+            return next(metadata)
+        name = args[args.index("--name") + 1]
+        label = args[args.index("--label") + 1]
+        ownership_labels.add(label)
+        assert label.startswith("io.token.place.relay-safety-invocation=")
+        assert len(label.rsplit("=", 1)[1]) == 32
+        phase = name.removeprefix("relay-safety-").rsplit("-", 1)[0]
+        events.append(("run", phase))
+        active.add(name)
+        max_active = max(max_active, len(active))
+        return "container-id"
+
+    def cleanup(args, **_kwargs):
+        if args[1:3] == ["ps", "-aq"]:
+            name = args[args.index("--filter") + 1].removeprefix("name=^/").removesuffix("$")
+            assert name in active
+            assert args[-1] == f"label={next(iter(ownership_labels))}"
+            return subprocess.CompletedProcess(args, 0, stdout=f"id-{name}\n".encode())
+        assert args[:3] == ["docker", "rm", "-f"]
+        name = args[3].removeprefix("id-")
+        phase = name.removeprefix("relay-safety-").rsplit("-", 1)[0]
+        assert name in active
+        active.remove(name)
+        events.append(("rm", phase))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
+        key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
+    })
+    monkeypatch.setattr(gate, "execute_public_exemption_check", lambda _base: {
+        "quota.public_information_exempt": {"passed": True},
+    })
+    monkeypatch.setattr(gate, "inspect_public_exemption_predicate", lambda _container: True)
+    monkeypatch.setattr(gate, "execute_quota_check", lambda _base, check_id, **_kwargs: {
+        check_id: {"passed": True},
+    })
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+    assert result == 0 and report["passed"] is True
+    assert max_active == 1 and not active
+    assert len(ownership_labels) == 1
+    assert events == [event for phase in expected for event in (("run", phase), ("rm", phase))]
+
+
+def test_preexisting_same_name_without_ownership_label_is_never_removed(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    cleanup_calls = []
+
+    def output(*args):
+        if args[0] == "run":
+            raise subprocess.CalledProcessError(125, args)
+        return next(values)
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        assert args[:4] == ["docker", "ps", "-aq", "--no-trunc"]
+        assert args[-1].startswith("label=io.token.place.relay-safety-invocation=")
+        # Docker returns nothing because the colliding same-name container lacks that label.
+        return subprocess.CompletedProcess(args, 0, stdout=b"")
+
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert len(cleanup_calls) == 1
+    assert "cleanup" not in report
+
+
+def test_failed_launch_absence_query_error_fails_closed_and_retries(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    cleanup_calls = []
+
+    def output(*args):
+        if args[0] == "run":
+            raise subprocess.CalledProcessError(125, args)
+        return next(values)
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        assert args[:4] == ["docker", "ps", "-aq", "--no-trunc"]
+        return subprocess.CompletedProcess(
+            args, 1, stderr=b"error during connect: Docker daemon unavailable\n"
+        )
+
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert report["cleanup"] == "failed"
+    assert len(cleanup_calls) == 2
+
+
+def test_failed_launch_found_container_is_removed(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    cleanup_calls = []
+    run_label = None
+
+    def output(*args):
+        nonlocal run_label
+        if args[0] == "run":
+            run_label = args[args.index("--label") + 1]
+            raise subprocess.CalledProcessError(125, args)
+        return next(values)
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        if args[1:3] == ["ps", "-aq"]:
+            assert args[-1] == f"label={run_label}"
+            return subprocess.CompletedProcess(args, 0, stdout=b"container-id\n")
+        assert args[:3] == ["docker", "rm", "-f"]
+        assert args[3] == "container-id"
+        return subprocess.CompletedProcess(args, 0)
+
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert [call[1] for call in cleanup_calls] == ["ps", "rm"]
+    assert "cleanup" not in report
+
+
+def test_failed_launch_fallback_success_keeps_cleanup_failure_sticky(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64"])
+    cleanup_calls = []
+
+    def output(*args):
+        if args[0] == "run":
+            raise subprocess.CalledProcessError(125, args)
+        return next(values)
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        if len(cleanup_calls) == 1:
+            raise subprocess.TimeoutExpired(args, 15)
+        return subprocess.CompletedProcess(args, 0, stdout=b"")
+
+    result, report = _run_main(tmp_path, monkeypatch, output, cleanup)
+    assert result == 1 and report["error_category"] == "runtime_command_failed"
+    assert report["cleanup"] == "failed"
+    assert len(cleanup_calls) == 2
+
+
+def test_probe_failure_immediately_removes_current_container(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
+    cleanup_calls = []
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks",
+                        lambda _base: (_ for _ in ()).throw(gate.GateFailure("metrics_malformed")))
+    result, report = _run_main(
+        tmp_path, monkeypatch, lambda *_args: next(values),
+        lambda args, **_kwargs: cleanup_calls.append(args) or subprocess.CompletedProcess(
+            args, 0, stdout=b"container-id\n" if args[1:3] == ["ps", "-aq"] else b""
+        ),
+    )
+    assert result == 1 and report["error_category"] == "metrics_malformed"
+    assert [call[1] for call in cleanup_calls] == ["ps", "rm"]
+
+
+def test_immediate_cleanup_failure_is_sticky_and_fallback_retries(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
+    cleanup_calls = []
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks", lambda _base: {
+        key: {"passed": True} for key in gate.EXPECTED_IDS if key.startswith("metrics.")
+    })
+
+    def cleanup(args, **_kwargs):
+        cleanup_calls.append(args)
+        if len(cleanup_calls) == 1:
+            return subprocess.CompletedProcess(args, 1)
+        return subprocess.CompletedProcess(args, 0, stdout=b"")
+
+    result, report = _run_main(tmp_path, monkeypatch, lambda *_args: next(values), cleanup)
+    assert result == 1 and report["error_category"] == "cleanup_failed"
+    assert report["cleanup"] == "failed"
+    assert len(cleanup_calls) == 2
+
+
+def test_interrupt_still_removes_current_container(tmp_path, monkeypatch):
+    values = iter(["sha256:" + "b" * 64, "a" * 40, "amd64", "container-id"])
+    cleanup_calls = []
+    monkeypatch.setattr(gate, "request", lambda *_a, **_k: (200, ""))
+    monkeypatch.setattr(gate, "execute_metrics_checks",
+                        lambda _base: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        _run_main(
+            tmp_path, monkeypatch, lambda *_args: next(values),
+            lambda args, **_kwargs: cleanup_calls.append(args) or subprocess.CompletedProcess(
+                args, 0, stdout=b"container-id\n" if args[1:3] == ["ps", "-aq"] else b""
+            ),
+        )
+    assert [call[1] for call in cleanup_calls] == ["ps", "rm"]
 
 
 @pytest.mark.parametrize("failed_id", [
@@ -665,9 +870,20 @@ def test_nonzero_cleanup_fails_successful_qualification(tmp_path, monkeypatch):
     assert report["cleanup"] == "failed" and report["error_category"] == "cleanup_failed"
 
 
-def test_nonzero_cleanup_preserves_qualification_failure_category(tmp_path, monkeypatch):
+def test_failed_mandatory_check_preserved_when_cleanup_fails(tmp_path, monkeypatch):
+    cleanup_codes = iter([0, 0, 1, 0, 0])
+    result, report = _run_qualified_main(
+        tmp_path, monkeypatch, cleanup_code=lambda: next(cleanup_codes), public=False
+    )
+    assert result == 1 and report["cleanup"] == "failed"
+    assert report["error_category"] == "mandatory_check_failed"
+    assert report["results"]["quota.public_information_exempt"]["state"] == "failed"
+
+
+def test_early_cleanup_failure_prevents_later_qualification_check(tmp_path, monkeypatch):
     result, report = _run_qualified_main(
         tmp_path, monkeypatch, cleanup_code=1, failed_id="quota.protected_rate_limited"
     )
     assert result == 1 and report["cleanup"] == "failed"
-    assert report["error_category"] == "mandatory_check_failed"
+    assert report["error_category"] == "cleanup_failed"
+    assert report["results"]["quota.protected_rate_limited"]["state"] == "not_run"

@@ -328,6 +328,12 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert script.source.index("registration_bytes>65536") < script.source.index(
         "pcall(cjson.decode,nv[4])"
     )
+    assert "ZRANGE',terminal_expiries,0,-1" not in script.source
+    assert "tonumber(max_client_terminals)" in script.source
+    assert "tonumber(max_node_controls)" in script.source
+    assert "local admitted={}" in script.source
+    assert "local due_terminals=redis.call('ZRANGEBYSCORE'" in script.source
+    assert "local due_controls=redis.call('ZRANGEBYSCORE'" in script.source
 
     reader = valkey_relay_state.PENDING_TRANSITION_READ_SCRIPT
     assert SCRIPT_DIGESTS[reader.name] == reader.sha256

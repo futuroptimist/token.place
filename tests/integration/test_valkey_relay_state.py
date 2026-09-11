@@ -536,12 +536,15 @@ def test_scheduler_state_lifecycle_unregister_and_inclusive_expiry(valkey_server
         assert not first._foundation._client.exists(node_key)
         assert first._foundation._client.zscore(leases, node_digest) is None
 
-        first.register("scheduler-node", _capabilities(), owner)
+        replacement_owner = _digest("scheduler-lifecycle-replacement-owner")
+        with pytest.raises(RelayStateCredentialMismatch):
+            first.register("scheduler-node", _capabilities(), owner)
+        first.register("scheduler-node", _capabilities(), replacement_owner)
         seconds, micros = first._foundation.server_time()
         cutoff = seconds + micros / 1_000_000
         first._foundation._client.zadd(leases, {node_digest: cutoff})
         assert not second.set_scheduler_state(
-            "scheduler-node", owner, SchedulerNodeState(draining=True)
+            "scheduler-node", replacement_owner, SchedulerNodeState(draining=True)
         )
         with pytest.raises(RelayStateNoCapacity):
             second.select_and_reserve(

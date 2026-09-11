@@ -9928,6 +9928,113 @@ def test_node_transition_prevalidation_rejects_malformed_registration_without_mu
         writer.close()
 
 
+@pytest.mark.parametrize(
+    ("cause", "model_id"),
+    (
+        ("explicit_unregister", "model"),
+        ("registration_lease_expired", "模型" * 64),
+    ),
+)
+def test_node_transition_prevalidation_uses_registration_model_contract(
+    valkey_server, cause, model_id
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(
+        valkey_server, namespace, max_model_id_bytes=4
+    )
+    observer = _registration_store(
+        valkey_server, namespace, max_model_id_bytes=4
+    )
+    node, owner = f"registration-model-{cause}", _digest(f"owner-{cause}")
+    capabilities = dataclasses.replace(
+        _capabilities(), supported_model_ids=(model_id,)
+    )
+    cfg, digest = writer._foundation.config, writer._node_digest(node)
+    try:
+        writer.register(node, capabilities, owner)
+        if cause == "registration_lease_expired":
+            writer._foundation._client.hset(
+                cfg.key("node", digest), "lease_expires_at_epoch", "0"
+            )
+            writer._foundation._client.zadd(cfg.key("nodes:lease"), {digest: 0})
+        result = observer.unregister_node_and_transition_work(
+            node, owner if cause == "explicit_unregister" else None, cause=cause
+        )
+        assert result.state == "complete"
+    finally:
+        _delete_claim_fixture_state(writer, (node,), ())
+        writer._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        observer.close()
+        writer.close()
+
+
+@pytest.mark.parametrize(
+    ("cause", "corruption", "owned_work"),
+    (
+        ("explicit_unregister", "model_too_long", True),
+        ("registration_lease_expired", "oversized_model_json", False),
+        ("explicit_unregister", "oversized_registration", False),
+    ),
+)
+def test_node_transition_prevalidation_rejects_oversized_registration_models(
+    valkey_server, cause, corruption, owned_work
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(
+        valkey_server, namespace, max_model_id_bytes=1024
+    )
+    observer = _registration_store(
+        valkey_server, namespace, max_model_id_bytes=1024
+    )
+    node, owner = f"registration-model-{corruption}", _digest(f"owner-{corruption}")
+    identity = ("registration-model-client", f"request-{corruption}")
+    identities = (identity,) if owned_work else ()
+    cfg, digest = writer._foundation.config, writer._node_digest(node)
+    former_owner = cfg.key("former_owner", digest, owner)
+    try:
+        writer.register(node, _capabilities(), owner)
+        if owned_work:
+            writer.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast", time.time() + 60, "cancel"
+            )
+        node_key = cfg.key("node", digest)
+        if corruption == "model_too_long":
+            models = '["' + "m" * 129 + '"]'
+        elif corruption == "oversized_model_json":
+            models = '["model"]' + " " * (65_537 - len('["model"]'))
+        else:
+            models = '["model"]' + " " * (65_500 - len('["model"]'))
+        writer._foundation._client.hset(node_key, "supported_model_ids", models)
+        if cause == "registration_lease_expired":
+            writer._foundation._client.hset(node_key, "lease_expires_at_epoch", "0")
+            writer._foundation._client.zadd(cfg.key("nodes:lease"), {digest: 0})
+        before = _node_transition_authority_snapshot(
+            observer, node, identities, (former_owner,)
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            observer.unregister_node_and_transition_work(
+                node, owner if cause == "explicit_unregister" else None, cause=cause
+            )
+        assert _node_transition_authority_snapshot(
+            observer, node, identities, (former_owner,)
+        ) == before
+    finally:
+        _delete_claim_fixture_state(writer, (node,), identities)
+        writer._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), former_owner,
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        observer.close()
+        writer.close()
+
+
 @pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
 def test_node_transition_prevalidation_accepts_valid_scheduler_registration(
     valkey_server, cause

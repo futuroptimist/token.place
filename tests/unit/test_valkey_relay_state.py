@@ -323,6 +323,11 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "not request_deadline" in script.source
     assert "reservation_expiry>request_deadline" in script.source
     assert "claim_expiry>request_deadline" in script.source
+    assert "utf8_length(value)>128" in script.source
+    assert "model_count>64" in script.source
+    assert script.source.index("registration_bytes>65536") < script.source.index(
+        "pcall(cjson.decode,nv[4])"
+    )
 
     reader = valkey_relay_state.PENDING_TRANSITION_READ_SCRIPT
     assert SCRIPT_DIGESTS[reader.name] == reader.sha256

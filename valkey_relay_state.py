@@ -1988,8 +1988,8 @@ local leases,node,cursor,pending,pending_index,work,tomb,tomb_expiries,fence,fen
   deadlines,reservation_expiries,claim_expiries,terminal_expiries,control_expiries=unpack(KEYS)
 local prefix,node_digest,node_id,supplied,cause,batch,max_pending,max_tombs,max_fences,
   tomb_ttl,terminal_ttl,control_ttl,max_terminals,max_client_terminals,max_controls,max_node_controls,expected_epoch,
-  max_node_id,max_identity,max_request_envelope,max_response_envelope,max_model_id=unpack(ARGV)
-max_node_id,max_identity,max_request_envelope,max_response_envelope,max_model_id=tonumber(max_node_id),tonumber(max_identity),tonumber(max_request_envelope),tonumber(max_response_envelope),tonumber(max_model_id)
+  max_node_id,max_identity,max_request_envelope,max_response_envelope=unpack(ARGV)
+max_node_id,max_identity,max_request_envelope,max_response_envelope=tonumber(max_node_id),tonumber(max_identity),tonumber(max_request_envelope),tonumber(max_response_envelope)
 local function digest(v) return v and string.match(v,'^[0-9a-f]+$') and string.len(v)==64 end
 local function finite(v) local n=tonumber(v); if not n or n~=n or n==math.huge or n==-math.huge then return nil end; return n end
 local function integer(v) local n=finite(v); if not n or n<0 or n>9007199254740990 or n~=math.floor(n) or tostring(n)~=v then return nil end; return n end
@@ -2052,12 +2052,14 @@ if not pending_exists then
   end
   local nv=redis.call('HMGET',node,'node_id','control_credential_digest','registered_at_epoch','supported_model_ids','active_context_tier','maximum_total_context_tokens','default_output_token_reservation','maximum_output_tokens','max_concurrency','backend_class','api_version','lease_expires_at_epoch','scheduler_healthy','scheduler_draining','scheduler_claimed_work','registration_order')
   for _,v in ipairs(nv) do if not v then return {'schema'} end end
+  local registration_bytes=0
+  for i=1,12 do registration_bytes=registration_bytes+string.len(nv[i]); if registration_bytes>65536 then return {'schema'} end end
   local indexed=finite(redis.call('ZSCORE',leases,node_digest)); local registered=canonical_number(nv[3],true); local lease=canonical_number(nv[12],true)
   local json_ok,models=pcall(cjson.decode,nv[4]); local model_count,maximum_model_key=0,0; local seen_models={}
   if json_ok and type(models)=='table' then
     for key,value in pairs(models) do
       model_count=model_count+1
-      if type(key)~='number' or key<1 or key~=math.floor(key) or type(value)~='string' or string.len(value)<1 or utf8_length(value)>max_model_id or
+      if model_count>64 or type(key)~='number' or key<1 or key~=math.floor(key) or type(value)~='string' or string.len(value)<1 or utf8_length(value)>128 or
          string.lower(value)~=value or string.match(value,'^%s') or string.match(value,'%s$') or seen_models[value] then json_ok=false; break end
       seen_models[value]=true
       if key>maximum_model_key then maximum_model_key=key end
@@ -2237,7 +2239,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "a38fd69d6b8bc6fad0a7f5d53c025f1be8a15e55be96ad99aafbc229d816afaa",  # pragma: allowlist secret
+    "ad65c6375b1ef644e99b22c4e38df43589fa9773362dcc0469f57257874fc9ee",  # pragma: allowlist secret
     True,
 )
 
@@ -3013,7 +3015,6 @@ class ValkeyRegistrationStore:
             str(self.config.max_identity_bytes).encode(),
             str(self.config.max_envelope_bytes).encode(),
             str(self.config.max_response_envelope_bytes).encode(),
-            str(self.config.max_model_id_bytes).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(NODE_TRANSITION_SCRIPT.name, keys, args)

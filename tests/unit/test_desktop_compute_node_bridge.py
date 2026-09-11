@@ -7685,6 +7685,25 @@ def test_relay_operator_parity_accepts_mock_llm_macos_fallback_reason(monkeypatc
 def test_relay_operator_start_bridge_passes_simulated_platform_to_compute_mode(monkeypatch, tmp_path):
     parity, unexpected_attempts = _load_desktop_relay_operator_parity_module(monkeypatch)
     modes = []
+    log_writes = []
+
+    real_write_log = parity._write_log
+
+    def write_log_within_tmp(path, text):
+        resolved_path = path.resolve()
+        try:
+            resolved_path.relative_to(tmp_path.resolve())
+        except ValueError:
+            raise AssertionError(f'log destination escapes pytest temporary directory: {path}') from None
+        log_writes.append(resolved_path)
+        real_write_log(path, text)
+
+    repository_log_path = parity.LOG_DIR / 'relay-operator-parity-bridge-macOS-Contents-Resources-session-1.log'
+    with pytest.raises(AssertionError, match='log destination escapes pytest temporary directory'):
+        write_log_within_tmp(repository_log_path, '# boundary check must not be written\n')
+
+    monkeypatch.setattr(parity, 'LOG_DIR', tmp_path / 'parity-logs')
+    monkeypatch.setattr(parity, '_write_log', write_log_within_tmp)
 
     class Process:
         stdout = iter(())
@@ -7710,6 +7729,12 @@ def test_relay_operator_start_bridge_passes_simulated_platform_to_compute_mode(m
     )
     bridge._thread.join(timeout=1)
 
+    assert bridge.log_path.resolve().is_relative_to(tmp_path.resolve())
+    assert log_writes == [bridge.log_path.resolve()]
+    assert bridge.log_path.read_text(encoding='utf-8').startswith(
+        '# bridge layout=macOS Contents/Resources session=macOS-Contents-Resources-1-'
+    )
+    assert not bridge._thread.is_alive()
     assert modes == ['cpu']
     assert unexpected_attempts == []
 

@@ -197,7 +197,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "22e8d35a6d98e57fbf59ed68e1d8434e05df5dfbb0fe02cedf35ea418cac715c"  # pragma: allowlist secret
+    expected_digest = "60ff30dd9990e3ea5a7da5dd670da5c58ecbac5e70db0e816a4bf9f6f6aba1a6"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -250,7 +250,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "d6d9c71ff70648b0ddba22be73d36ac6593d60628b4cc4810a25ff77b6e06a9c"  # pragma: allowlist secret
+    expected_digest = "82d25c377e3df42263b09540f18557a0579e270f25b2c811d0876c7a96e81e45"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -282,16 +282,24 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
 @pytest.mark.parametrize(
     ("script", "digest"),
     (
-        (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "9a12aeb8b536a59aede23c7fe0dae2aedc7d3e36828a8bb09fc7aec8264d0dbf"),
-        (valkey_relay_state.ENQUEUE_SCRIPT, "44053a611a055b6a26f1cf0f16af72f6dfa323d57cd1fa88433c254a768de5c1"),
-        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "1f946df7bc85f1282bc97b1dfcd01b926824d07cefeb029b894fc1d23d50e911"),
-        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "8e94a91717cf9f62e3151ec7a5aa20e29ab258ab57d9e179de3aee168714b4ad"),
+        (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "8d119dd0fa0d018b21c228468c86903a9ec9be7c78cd1af74b3ff61370f0b90e"),  # pragma: allowlist secret
+        (valkey_relay_state.ENQUEUE_SCRIPT, "4874ac2612eecf044ed75efc7fdbd1ed8ca47944fbe437702be9d7119f3c40d7"),  # pragma: allowlist secret
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "3c64632c533e7775ddca620ec77aa6bba72c43b7c73c84dd3ed3b67ec37447be"),  # pragma: allowlist secret
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "2c278634aef69bc277c86100740852f5cf7f26999e1597c3986dfbd514e9f5e4"),  # pragma: allowlist secret
     ),
 )
 def test_control_transition_scripts_are_digest_pinned(script, digest):
     assert script.sha256 == digest
     assert SCRIPT_DIGESTS[script.name] == digest
     assert hashlib.sha256(script.source.encode()).hexdigest() == digest
+
+
+def test_node_transition_script_is_registered_digest_pinned_and_bounded():
+    script = valkey_relay_state.NODE_TRANSITION_SCRIPT
+    assert SCRIPT_DIGESTS[script.name] == script.sha256
+    assert hashlib.sha256(script.source.encode()).hexdigest() == script.sha256
+    assert "SCAN" not in script.source.upper()
+    assert "ZRANGE',work,1,tonumber(batch)" in script.source
 
 
 @pytest.mark.parametrize(

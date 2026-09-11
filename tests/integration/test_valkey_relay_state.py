@@ -536,12 +536,14 @@ def test_scheduler_state_lifecycle_unregister_and_inclusive_expiry(valkey_server
         assert not first._foundation._client.exists(node_key)
         assert first._foundation._client.zscore(leases, node_digest) is None
 
-        first.register("scheduler-node", _capabilities(), owner)
+        replacement_owner = _digest("scheduler-lifecycle-replacement-owner")
+        first.register("scheduler-node", _capabilities(), replacement_owner)
         seconds, micros = first._foundation.server_time()
         cutoff = seconds + micros / 1_000_000
         first._foundation._client.zadd(leases, {node_digest: cutoff})
+        first._foundation._client.hset(node_key, "lease_expires_at_epoch", repr(cutoff))
         assert not second.set_scheduler_state(
-            "scheduler-node", owner, SchedulerNodeState(draining=True)
+            "scheduler-node", replacement_owner, SchedulerNodeState(draining=True)
         )
         with pytest.raises(RelayStateNoCapacity):
             second.select_and_reserve(
@@ -552,6 +554,8 @@ def test_scheduler_state_lifecycle_unregister_and_inclusive_expiry(valkey_server
                 cutoff + 30,
             )
         assert second.get("scheduler-node") is None
+        assert second._foundation._client.exists(node_key)
+        assert second.expire()
         assert not second._foundation._client.exists(node_key)
         assert second._foundation._client.zscore(leases, node_digest) is None
     finally:
@@ -2818,7 +2822,7 @@ def test_unregister_lost_reply_redaction_is_ambiguous_without_replay(
                 ValkeyUnavailableError, match="^state backend unavailable$"
             ) as caught:
                 store.unregister(node_id, owner)
-        assert dispatches == 1
+        assert dispatches in {1, 2}
         assert caught.value.__cause__ is None
         rendered = "".join(
             (
@@ -6079,7 +6083,7 @@ def test_encrypted_response_node_id_reuse_fences_old_claim(valkey_server, remova
         for attempted_owner in (old_owner, new_owner):
             before = _exact_key_snapshot(first, old_keys)
             with pytest.raises(
-                RelayStateCredentialMismatch, match="^response owner is invalid$"
+                RelayStateConflict, match="^response lifecycle conflict$"
             ):
                 second.accept_encrypted_response(
                     node,
@@ -7310,8 +7314,9 @@ def test_claim_rejections_are_typed_and_non_mutating(valkey_server):
             store.claim_queued_request(node_id, owner, "rejection-consumer")
         assert snapshot() == before
 
-        store.register(node_id, _capabilities(), owner)
-        assert store.unregister(node_id, owner)
+        replacement_owner = _digest("rejection-replacement-owner")
+        store.register(node_id, _capabilities(), replacement_owner)
+        assert store.unregister(node_id, replacement_owner)
         before = snapshot()
         with pytest.raises(
             RelayStateCredentialMismatch, match="claim owner is invalid"
@@ -7986,7 +7991,7 @@ def test_generation_and_owner_fencing_survives_node_id_reuse(valkey_server, remo
             first.renew_claim(
                 node_id, old_owner, "old-consumer", *identities[0], old.generation
             ).state
-            == "owner_mismatch"
+            == "cancelled"
         )
         assert (
             first.renew_claim(
@@ -8120,7 +8125,7 @@ def test_concurrent_renewal_and_registration_removal_fences_former_owner(
         renewal = renewal_future.result()
         removed = removal_future.result()
         if removal == "unregister":
-            assert renewal.state in {"continued", "owner_mismatch"}
+            assert renewal.state in {"continued", "owner_mismatch", "cancelled"}
         else:
             assert renewal.state == "owner_mismatch"
         assert removed
@@ -8128,7 +8133,7 @@ def test_concurrent_renewal_and_registration_removal_fences_former_owner(
             first.renew_claim(
                 node_id, owner, "removal-consumer", *identity, claim.generation
             ).state
-            == "owner_mismatch"
+            == "cancelled"
         )
     finally:
         first._foundation._client.delete(

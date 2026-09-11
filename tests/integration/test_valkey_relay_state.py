@@ -9730,12 +9730,17 @@ def _node_transition_authority_snapshot(store, node_id, identities, extra=()):
         cfg.key("node_tombstones:expiry"), cfg.key("former_owners:expiry"),
         cfg.key("requests:deadline"), cfg.key("reservations:expiry"),
         cfg.key("claims:expiry"), cfg.key("terminals:expiry"),
+        cfg.key("responses:expiry"), cfg.key("control:expiry"),
     ]
     for identity in identities:
         client, request = store._identity(*identity)
         record = cfg.key("request", client, request)
         token = store._foundation._client.hget(record, "token_digest")
-        keys.extend((record, cfg.key("claim", client, request), cfg.key("terminal", client, request)))
+        keys.extend((
+            record, cfg.key("claim", client, request),
+            cfg.key("terminal", client, request), cfg.key("response", client, request),
+            cfg.key("control", node, client, request),
+        ))
         if token:
             keys.append(cfg.key("reservation", token.decode("ascii")))
     keys.extend(extra)
@@ -9752,6 +9757,51 @@ def _node_transition_authority_snapshot(store, node_id, identities, extra=()):
             value = datastore.get(key) if kind == b"string" else None
         return kind, value
     return tuple((key, snapshot(key)) for key in keys)
+
+
+@pytest.mark.parametrize("authority", ("tombstone", "fence"))
+@pytest.mark.parametrize("expired", (True, False))
+def test_node_transition_prevalidation_projects_retained_cleanup_capacity(
+    valkey_server, authority, expired
+):
+    limits = {
+        "max_node_tombstones": 1 if authority == "tombstone" else 4,
+        "max_removed_owner_fences": 1 if authority == "fence" else 4,
+    }
+    store = _registration_store(valkey_server, uuid.uuid4().hex, **limits)
+    node, owner = f"projected-{authority}-{expired}", _digest(f"owner-{authority}-{expired}")
+    old_node, old_owner = _digest(f"old-node-{authority}"), _digest(f"old-owner-{authority}")
+    cfg = store._foundation.config
+    try:
+        store.register(node, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        score = seconds + micros / 1_000_000 + (-1 if expired else 60)
+        if authority == "tombstone":
+            retained = cfg.key("node_tombstone", old_node)
+            index, member = cfg.key("node_tombstones:expiry"), old_node
+        else:
+            retained = cfg.key("former_owner", old_node, old_owner)
+            index, member = cfg.key("former_owners:expiry"), f"{old_node}:{old_owner}"
+        store._foundation._client.hset(retained, "expires_at_epoch", repr(score))
+        store._foundation._client.zadd(index, {member: score})
+        before = _node_transition_authority_snapshot(store, node, (), (retained,))
+        if expired:
+            assert store.unregister_node_and_transition_work(node, owner).state == "complete"
+            assert store._foundation._client.exists(retained) == 0
+        else:
+            with pytest.raises(RelayStateCapacityExceeded):
+                store.unregister_node_and_transition_work(node, owner)
+            assert _node_transition_authority_snapshot(store, node, (), (retained,)) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), ())
+        digest = store._node_digest(node)
+        store._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"), retained,
+        )
+        store.close()
 
 
 @pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
@@ -9825,6 +9875,114 @@ def test_node_transition_prevalidation_later_cleanup_candidate_is_atomic(valkey_
         store._foundation._client.delete(
             cfg.key("node_work", store._node_digest(node)), cfg.key("node_tombstone", first),
             cfg.key("node_tombstone", second), cfg.key("node_tombstones:expiry"),
+        )
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "corruption", (None, "accepted_encoding", "timeline", "lifecycle_identity", "response_payload")
+)
+def test_node_transition_prevalidation_terminal_winner_is_complete_and_atomic(
+    valkey_server, corruption
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner, consumer = "prevalidate-terminal", _digest("terminal-owner"), "consumer"
+    identity = ("prevalidate-terminal-client", f"request-{corruption}")
+    cfg = store._foundation.config
+    try:
+        store.register(node, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 60
+        selection = store.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        store.enqueue_encrypted_request(
+            *identity, selection.reservation_token, node, "qwen3-8b-instruct", "8k-fast",
+            deadline, EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request-ciphertext", "request-key", "request-iv"
+            ), "cancel",
+        )
+        claim = store.claim_queued_request(node, owner, consumer)
+        store.accept_encrypted_response(
+            node, owner, consumer, *identity, claim.generation,
+            EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "response-ciphertext", "response-key", "response-iv"
+            ),
+        )
+        client, request = store._identity(*identity)
+        member = f"{client}:{request}"
+        terminal = cfg.key("terminal", client, request)
+        lifecycle = cfg.key("request", client, request)
+        response = cfg.key("response", client, request)
+        store._foundation._client.zadd(
+            cfg.key("node_work", store._node_digest(node)), {member: 1}
+        )
+        if corruption == "accepted_encoding":
+            store._foundation._client.hset(terminal, "accepted_at_epoch", "1e0")
+        elif corruption == "timeline":
+            store._foundation._client.hset(terminal, "replay_expires_at_epoch", "0")
+        elif corruption == "lifecycle_identity":
+            store._foundation._client.hset(lifecycle, "request_id", "")
+        elif corruption == "response_payload":
+            store._foundation._client.hset(response, "envelope", "")
+        before = _node_transition_authority_snapshot(store, node, identity and (identity,))
+        if corruption is not None:
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                store.unregister_node_and_transition_work(node, owner)
+            assert _node_transition_authority_snapshot(store, node, (identity,)) == before
+        else:
+            terminal_before = store._foundation._client.hgetall(terminal)
+            response_before = store._foundation._client.hgetall(response)
+            assert store.unregister_node_and_transition_work(node, owner).state == "complete"
+            assert store._foundation._client.hgetall(terminal) == terminal_before
+            assert store._foundation._client.hgetall(response) == response_before
+            assert store.terminal_records()[0].outcome == "completed"
+    finally:
+        _delete_claim_fixture_state(store, (node,), (identity,))
+        digest = store._node_digest(node)
+        store._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+        )
+        store.close()
+
+
+def test_node_transition_prevalidation_continuation_rejects_without_mutation(
+    valkey_server,
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, node_transition_batch_size=1
+    )
+    node, owner = "prevalidate-continuation", _digest("continuation-owner")
+    identities = (("continuation-client-1", "request-1"), ("continuation-client-2", "request-2"))
+    try:
+        store.register(node, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        for identity in identities:
+            store.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast",
+                seconds + micros / 1_000_000 + 60, None,
+            )
+        cfg = store._foundation.config
+        client, request = store._identity(*identities[1])
+        store._foundation._client.hset(
+            cfg.key("request", client, request), "deadline", "invalid"
+        )
+        first = store.unregister_node_and_transition_work(node, owner)
+        assert first.state == "transitioning" and first.processed_count == 1
+        before = _node_transition_authority_snapshot(store, node, identities)
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.unregister_node_and_transition_work(node, owner)
+        assert _node_transition_authority_snapshot(store, node, identities) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), identities)
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        store._foundation._client.delete(
+            cfg.key("node_work", digest), cfg.key("node_transition", digest),
+            cfg.key("node_tombstone", digest), cfg.key("former_owner", digest, owner),
+            cfg.key("node_transitions:pending"), cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
         )
         store.close()
 

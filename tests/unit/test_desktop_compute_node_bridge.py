@@ -7685,6 +7685,21 @@ def test_relay_operator_parity_accepts_mock_llm_macos_fallback_reason(monkeypatc
 def test_relay_operator_start_bridge_passes_simulated_platform_to_compute_mode(monkeypatch, tmp_path):
     parity, unexpected_attempts = _load_desktop_relay_operator_parity_module(monkeypatch)
     modes = []
+    log_destinations = []
+    real_write_log = parity._write_log
+
+    def write_log_with_boundary(path, text):
+        log_path = Path(path).resolve()
+        log_destinations.append(log_path)
+        assert log_path.is_relative_to(tmp_path.resolve()), f'log path escaped tmp_path: {log_path}'
+        real_write_log(path, text)
+
+    old_log_path = parity.LOG_DIR / 'would-write-outside-tmp.log'
+    with pytest.raises(AssertionError, match='log path escaped tmp_path'):
+        write_log_with_boundary(old_log_path, 'must not be written')
+
+    monkeypatch.setattr(parity, '_write_log', write_log_with_boundary)
+    monkeypatch.setattr(parity, 'LOG_DIR', tmp_path / 'parity-logs')
 
     class Process:
         stdout = iter(())
@@ -7710,6 +7725,12 @@ def test_relay_operator_start_bridge_passes_simulated_platform_to_compute_mode(m
     )
     bridge._thread.join(timeout=1)
 
+    assert bridge.log_path.resolve().is_relative_to(tmp_path.resolve())
+    assert log_destinations == [old_log_path.resolve(), bridge.log_path.resolve()]
+    assert bridge.log_path.read_text(encoding='utf-8').startswith(
+        '# bridge layout=macOS Contents/Resources session=macOS-Contents-Resources-1-'
+    )
+    assert not bridge._thread.is_alive()
     assert modes == ['cpu']
     assert unexpected_attempts == []
 

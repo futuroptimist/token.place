@@ -5435,8 +5435,9 @@ class ValkeyRegistrationStore:
                     and all(value is None for value in raw)
                     and field_count == 0 and current_score is None):
                 continue
+            # HMGET has a fixed reply shape; the stored hash may have additive fields.
             if (not isinstance(raw, list) or len(raw) != len(fields)
-                    or type(field_count) is not int or field_count != len(fields)
+                    or type(field_count) is not int or field_count < len(fields)
                     or type(current_score) not in {int, float} or isinstance(current_score, bool)
                     or any(not isinstance(value, bytes) for value in raw)
                     or any(len(value) > _MAX_RESULT_BYTES for value in raw)
@@ -5458,7 +5459,7 @@ class ValkeyRegistrationStore:
                     or transition_raw.decode("ascii") != format(transition, ".17g")
                     or expiry_raw.decode("ascii") != format(expiry, ".17g")
                     or transition > expiry
-                    or expiry != float(format(transition + self.config.node_tombstone_ttl_seconds, ".17g"))
+                    or expiry - transition > 300.0
                     or expiry != float(current_score)
                     or expiry <= now
                 ):

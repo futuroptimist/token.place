@@ -9238,6 +9238,47 @@ def test_node_tombstones_handles_concurrent_removal_or_replacement(valkey_server
         observer.close()
 
 
+@pytest.mark.parametrize("writer_ttl,observer_ttl", ((60, 300), (300, 60)))
+def test_node_tombstones_preserves_additive_fields_across_retention_settings(
+    valkey_server, writer_ttl, observer_ttl
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(
+        valkey_server, namespace, node_tombstone_ttl_seconds=writer_ttl
+    )
+    observer = _registration_store(
+        valkey_server, namespace, node_tombstone_ttl_seconds=observer_ttl
+    )
+    node, owner = f"tombstone-ttl-{writer_ttl}", _digest(f"owner-{writer_ttl}")
+    cfg, member = writer._foundation.config, writer._node_digest(node)
+    key, index = cfg.key("node_tombstone", member), cfg.key("node_tombstones:expiry")
+    try:
+        writer.register(node, _capabilities(), owner)
+        result = writer.unregister_node_and_transition_work(node, owner)
+        assert result.state == "complete"
+        writer._foundation._client.hset(key, "future_field", "bounded-value")
+        before_hash = writer._foundation._client.hgetall(key)
+        before_score = writer._foundation._client.zscore(index, member)
+
+        records = observer.node_tombstones()
+
+        assert len(records) == 1
+        assert records[0].node_identity_digest == member
+        assert records[0].expires_at_epoch == before_score
+        assert writer._foundation._client.hgetall(key) == before_hash
+        assert writer._foundation._client.zscore(index, member) == before_score
+    finally:
+        writer._foundation._client.delete(
+            key,
+            index,
+            cfg.key("former_owner", member, owner),
+            cfg.key("former_owners:expiry"),
+            cfg.key("node_work", member),
+        )
+        writer.close()
+        observer.close()
+
+
 @pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
 @pytest.mark.parametrize("stage", ("reserved", "queued", "claimed"))
 def test_node_removed_record_round_trips_terminal_retrieval_and_control(

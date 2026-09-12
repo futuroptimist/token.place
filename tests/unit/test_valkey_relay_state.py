@@ -448,7 +448,7 @@ def test_node_transition_accepts_stale_pending_recovery_result():
     assert not result.continuation_required
 
 
-def _node_tombstone_store(indexed, raw=None):
+def _node_tombstone_store(indexed, raw=None, *, field_count=7, current_score=...):
     foundation = Mock(spec=ValkeyFoundation)
     foundation._client = MagicMock()
     foundation.config = config()
@@ -456,8 +456,12 @@ def _node_tombstone_store(indexed, raw=None):
     foundation.server_time.return_value = (100, 0)
     calls = [indexed]
     if raw is not None:
-        score = indexed[0][1] if isinstance(indexed, list) and indexed else None
-        calls.append([raw, 7, score])
+        score = (
+            indexed[0][1]
+            if current_score is ... and isinstance(indexed, list) and indexed
+            else current_score
+        )
+        calls.append([raw, field_count, score])
     foundation._call.side_effect = calls
     return registration_store_with_foundation(foundation)
 
@@ -490,6 +494,28 @@ def test_node_tombstones_decodes_a_valid_bounded_snapshot():
         "completed": True,
         "expires_at_epoch": 400.0,
     }
+
+
+def test_node_tombstones_accepts_additive_fields_and_writer_retention():
+    node_digest = b"a" * 64
+    store = _node_tombstone_store(
+        [(node_digest, 400.0)],
+        [
+            node_digest,
+            b"b" * 64,
+            b"explicit_unregister",
+            b"cancelled",
+            b"100",
+            b"1",
+            b"400",
+        ],
+        field_count=8,
+    )
+    store._config = dataclasses.replace(
+        store.config, node_tombstone_ttl_seconds=60
+    )
+
+    assert store.node_tombstones()[0].expires_at_epoch == 400.0
 
 
 @pytest.mark.parametrize(
@@ -526,6 +552,33 @@ def test_node_tombstones_decodes_a_valid_bounded_snapshot():
 )
 def test_node_tombstones_rejects_malformed_authority(indexed, raw):
     store = _node_tombstone_store(indexed, raw)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.node_tombstones()
+
+
+@pytest.mark.parametrize(
+    ("raw", "field_count", "current_score"),
+    (
+        ([b"a"] * 6, 7, 200.0),
+        ([b"a"] * 8, 8, 200.0),
+        ([None] * 7, 1, 200.0),
+        ([None] + [b"a"] * 6, 8, 200.0),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"200"], 7, None),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"200"], 7, 201.0),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"99"], 7, 99.0),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"401"], 7, 401.0),
+    ),
+)
+def test_node_tombstones_rejects_invalid_reply_or_timeline(
+    raw, field_count, current_score
+):
+    store = _node_tombstone_store(
+        [(b"a" * 64, 200.0)],
+        raw,
+        field_count=field_count,
+        current_score=current_score,
+    )
 
     with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
         store.node_tombstones()

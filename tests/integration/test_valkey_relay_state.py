@@ -10752,6 +10752,138 @@ def test_node_transition_capacity_accepts_post_deadline_controls_live_and_due(
 
 
 @pytest.mark.parametrize("retained_state", ("live", "due"))
+@pytest.mark.parametrize("outcome", ("expiry", "unregister"))
+def test_cancel_retained_control_timeline_accepts_writer_records(
+    valkey_server, outcome, retained_state
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
+    retained_node, target_node = "cancel-retained", "cancel-target"
+    retained_owner, target_owner = _digest("cancel-retained-owner"), _digest("cancel-target-owner")
+    retained, target = ("cancel-retained-client", outcome), ("cancel-target-client", retained_state)
+    try:
+        writer.register(retained_node, _capabilities(), retained_owner)
+        _enqueue_claim_fixture(writer, retained_node, retained_owner, *retained, time.time() + 60)
+        writer.claim_queued_request(retained_node, retained_owner, "retained-consumer")
+        keys = _retained_authority_keys(writer, retained_node, retained)
+        past = time.time() - 2
+        claim_key = writer._foundation.config.key("claim", *writer._identity(*retained))
+        writer._foundation._client.hset(keys["request"], "deadline", str(past))
+        writer._foundation._client.hset(
+            claim_key, mapping={"deadline": str(past), "lease_expires": str(past)}
+        )
+        writer._foundation._client.zadd(
+            writer._foundation.config.key("claims:expiry"), {keys["member"]: past}
+        )
+        writer._foundation._client.zadd(keys["deadline_index"], {keys["member"]: past})
+        if outcome == "expiry":
+            retained_result = writer.cancel_or_expire_request(
+                *retained, status="expired", reason="request_deadline_expired"
+            )
+            assert retained_result.new_outcome
+        else:
+            retained_result = writer.unregister_node_and_transition_work(
+                retained_node, retained_owner
+            )
+            assert retained_result.new_outcomes == 1
+        if retained_state == "due":
+            _force_retained_authority_due(writer, keys)
+
+        writer.register(target_node, _capabilities(), target_owner)
+        _enqueue_claim_fixture(writer, target_node, target_owner, *target, time.time() + 60)
+        writer.claim_queued_request(target_node, target_owner, "target-consumer")
+        cancelled = observer.cancel_or_expire_request(*target, "cancel")
+        assert (cancelled.state, cancelled.reason, cancelled.new_outcome) == (
+            "cancelled", "requester_cancelled", True
+        )
+        target_keys = _retained_authority_keys(observer, target_node, target)
+        assert observer._foundation._client.hget(
+            target_keys["terminal"], "outcome"
+        ) == b"cancelled"
+        assert observer._foundation._client.zscore(
+            target_keys["terminal_index"], target_keys["member"]
+        ) is not None
+        expected_exists = 1 if retained_state == "live" else 0
+        assert writer._foundation._client.exists(keys["terminal"]) == expected_exists
+        assert writer._foundation._client.exists(keys["control"]) == expected_exists
+    finally:
+        _delete_claim_fixture_state(
+            observer, (retained_node, target_node), (retained, target)
+        )
+        observer.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("retained_state", ("live", "due"))
+@pytest.mark.parametrize("corruption", ("paired_owner", "expiry_order"))
+def test_cancel_retained_control_timeline_rejects_corruption_without_mutation(
+    valkey_server, corruption, retained_state
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
+    retained_node, target_node = "cancel-corrupt-retained", "cancel-corrupt-target"
+    retained_owner, target_owner = _digest("cancel-corrupt-owner"), _digest("cancel-corrupt-target-owner")
+    retained, target = ("cancel-corrupt-client", corruption), ("cancel-corrupt-target-client", retained_state)
+    try:
+        writer.register(retained_node, _capabilities(), retained_owner)
+        deadline = time.time() - 2
+        _enqueue_claim_fixture(writer, retained_node, retained_owner, *retained, time.time() + 60)
+        writer.claim_queued_request(retained_node, retained_owner, "retained-consumer")
+        keys = _retained_authority_keys(writer, retained_node, retained)
+        claim_key = writer._foundation.config.key("claim", *writer._identity(*retained))
+        writer._foundation._client.hset(keys["request"], "deadline", str(deadline))
+        writer._foundation._client.hset(
+            claim_key, mapping={"deadline": str(deadline), "lease_expires": str(deadline)}
+        )
+        writer._foundation._client.zadd(
+            writer._foundation.config.key("claims:expiry"), {keys["member"]: deadline}
+        )
+        writer._foundation._client.zadd(keys["deadline_index"], {keys["member"]: deadline})
+        writer.cancel_or_expire_request(
+            *retained, status="expired", reason="request_deadline_expired"
+        )
+        if corruption == "paired_owner":
+            writer._foundation._client.hset(keys["control"], "owner_digest", _digest("wrong-owner"))
+        else:
+            accepted = float(writer._foundation._client.hget(keys["terminal"], "accepted_at_epoch"))
+            invalid_deadline = str(accepted + 1)
+            writer._foundation._client.hset(keys["request"], "deadline", invalid_deadline)
+            writer._foundation._client.hset(keys["control"], "deadline", invalid_deadline)
+        if retained_state == "due":
+            _force_retained_authority_due(writer, keys)
+            if corruption == "expiry_order":
+                accepted = float(writer._foundation._client.hget(keys["terminal"], "accepted_at_epoch"))
+                invalid_deadline = str(accepted + 1)
+                writer._foundation._client.hset(keys["request"], "deadline", invalid_deadline)
+                writer._foundation._client.hset(keys["control"], "deadline", invalid_deadline)
+
+        writer.register(target_node, _capabilities(), target_owner)
+        _enqueue_claim_fixture(writer, target_node, target_owner, *target, time.time() + 60)
+        writer.claim_queued_request(target_node, target_owner, "target-consumer")
+        authority_keys = tuple(keys[name] for name in (
+            "request", "terminal", "control", "terminal_index", "control_index"
+        ))
+        before = (
+            _lifecycle_authority_snapshot(observer, target_node, target),
+            tuple(observer._foundation._client.dump(key) for key in authority_keys),
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            observer.cancel_or_expire_request(*target, "cancel")
+        assert (
+            _lifecycle_authority_snapshot(observer, target_node, target),
+            tuple(observer._foundation._client.dump(key) for key in authority_keys),
+        ) == before
+    finally:
+        _delete_claim_fixture_state(
+            observer, (retained_node, target_node), (retained, target)
+        )
+        observer.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("retained_state", ("live", "due"))
 def test_node_transition_capacity_rejects_completed_response_after_deadline_without_mutation(
     valkey_server, retained_state
 ):

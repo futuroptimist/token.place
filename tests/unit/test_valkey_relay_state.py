@@ -285,13 +285,20 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
         (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "8d119dd0fa0d018b21c228468c86903a9ec9be7c78cd1af74b3ff61370f0b90e"),  # pragma: allowlist secret
         (valkey_relay_state.ENQUEUE_SCRIPT, "4874ac2612eecf044ed75efc7fdbd1ed8ca47944fbe437702be9d7119f3c40d7"),  # pragma: allowlist secret
         (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "1e56de3cc00a648f79257438009d40c2846e857fac6ce6ff6920f908b713cfeb"),  # pragma: allowlist secret
-        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "2c278634aef69bc277c86100740852f5cf7f26999e1597c3986dfbd514e9f5e4"),  # pragma: allowlist secret
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "33b19e7589961b771656069bb64b3425aa055d8526628523a53b9c3a8c26f91f"),  # pragma: allowlist secret
     ),
 )
 def test_control_transition_scripts_are_digest_pinned(script, digest):
     assert script.sha256 == digest
     assert SCRIPT_DIGESTS[script.name] == digest
     assert hashlib.sha256(script.source.encode()).hexdigest() == digest
+
+
+def test_cancel_retained_control_timeline_is_outcome_specific():
+    source = valkey_relay_state.CANCEL_REQUEST_SCRIPT.source
+    assert "v[9]=='server_unregistered'" in source
+    assert "v[8]=='expired' and deadline<=accepted" in source
+    assert "or accepted<=deadline" in source
 
 
 def test_node_transition_script_is_registered_digest_pinned_and_bounded():

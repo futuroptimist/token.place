@@ -1528,8 +1528,11 @@ local function control_valid(m,score_value,due)
   if not ts or not terminal_valid(c..':'..q,ts,ts<=now) then return false end
   local tv=redis.call('HMGET',prefix..'terminal:'..c..':'..q,'outcome','reason','node_id','owner_digest','consumer_digest','generation','accepted_at_epoch')
   local lv=redis.call('HMGET',prefix..'request:'..c..':'..q,'node_digest','deadline')
+  local accepted=finite(tv[7])
+  -- Expiry and node removal may be accepted after the request deadline; a requester cancellation may not.
   return tv[1]==v[8] and tv[2]==v[9] and tv[3]==v[4] and tv[4]==v[5] and tv[5]==v[6] and tv[6]==v[7] and
-    lv[1]==n and lv[2]==v[10] and finite(tv[7])<=deadline
+    lv[1]==n and lv[2]==v[10] and accepted and
+    (v[9]=='server_unregistered' or (v[8]=='expired' and deadline<=accepted) or accepted<=deadline)
 end
 local due_terminals=redis.call('ZRANGEBYSCORE',terminal_expiries,'-inf',now,'LIMIT',0,tonumber(max_terminals)+1)
 for _,m in ipairs(due_terminals) do if not terminal_valid(m,finite(redis.call('ZSCORE',terminal_expiries,m)),true) then return {'schema'} end end
@@ -1569,7 +1572,7 @@ return {'created',status,reason}
 CANCEL_REQUEST_SCRIPT = ReviewedScript(
     "cancel_or_expire_request_v1",
     CANCEL_REQUEST_SOURCE,
-    "2c278634aef69bc277c86100740852f5cf7f26999e1597c3986dfbd514e9f5e4",  # pragma: allowlist secret
+    "33b19e7589961b771656069bb64b3425aa055d8526628523a53b9c3a8c26f91f",  # pragma: allowlist secret
     True,
 )
 

@@ -8152,6 +8152,82 @@ def test_concurrent_renewal_and_registration_removal_fences_former_owner(
         first.close()
         second.close()
 
+
+@pytest.mark.parametrize("renew_first", (True, False))
+def test_node_transition_accepts_writer_epoch_during_claim_renewal_orderings(
+    valkey_server, renew_first
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(
+        valkey_server, namespace, lease_ttl_seconds=0.08, claim_ttl_seconds=2
+    )
+    remover = _registration_store(
+        valkey_server, namespace, lease_ttl_seconds=0.08, claim_ttl_seconds=2
+    )
+    node_id, owner = "writer-epoch-node", _digest("writer-epoch-owner")
+    identity = ("writer-epoch-client", "writer-epoch-request")
+    cfg, node = writer._foundation.config, writer._node_digest(node_id)
+    client, request = writer._identity(*identity)
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        stored_lease = writer._foundation._client.hget(
+            cfg.key("node", node), "lease_expires_at_epoch"
+        )
+        assert stored_lease is not None
+        # Valkey's Lua-number serialization can choose exponent form for this
+        # registration-writer field depending on the timestamp's significant digits.
+        exponent_lease = f"{float(stored_lease):.16e}"
+        writer._foundation._client.hset(
+            cfg.key("node", node), "lease_expires_at_epoch", exponent_lease
+        )
+        writer._foundation._client.zadd(
+            cfg.key("nodes:lease"), {node: float(exponent_lease)}
+        )
+        _enqueue_claim_fixture(
+            writer,
+            node_id,
+            owner,
+            *identity,
+            writer._foundation.server_time()[0] + 60,
+        )
+        claim = writer.claim_queued_request(node_id, owner, "writer-epoch-consumer")
+
+        if renew_first:
+            assert writer.renew_claim(
+                node_id, owner, "writer-epoch-consumer", *identity, claim.generation
+            ).state == "continued"
+        result = remover.unregister_node_and_transition_work(node_id, owner)
+        assert result.state == "complete"
+        assert result.claims_terminalized == 1
+        assert result.new_outcomes == 1
+        if not renew_first:
+            assert writer.renew_claim(
+                node_id, owner, "writer-epoch-consumer", *identity, claim.generation
+            ).state == "cancelled"
+        terminal, = remover.terminal_records()
+        assert terminal.outcome == "cancelled"
+        assert terminal.reason == "server_unregistered"
+        assert remover._foundation._client.zrange(
+            cfg.key("node_work", node), 0, -1
+        ) == [b"!schema:1"]
+    finally:
+        _delete_claim_fixture_state(writer, (node_id,), (identity,))
+        writer._foundation._client.delete(
+            cfg.key("node_work", node),
+            cfg.key("node_transition", node),
+            cfg.key("node_tombstone", node),
+            cfg.key("former_owner", node, owner),
+            cfg.key("node_transitions:pending"),
+            cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+            cfg.key("terminals:expiry"),
+            cfg.key("control:expiry"),
+            cfg.key("terminal", client, request),
+            cfg.key("control", node, client, request),
+        )
+        remover.close()
+        writer.close()
+
 def test_claim_capacity_fails_closed_on_malformed_live_claim_authority(
     valkey_server,
 ):

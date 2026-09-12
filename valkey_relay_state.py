@@ -2000,6 +2000,17 @@ local function canonical_number(v,zero)
   if string.sub(v,1,1)=='0' and string.len(v)>1 and string.sub(v,2,2)~='.' then return nil end
   local n=finite(v); if not n or n<0 or (not zero and n==0) then return nil end; return n
 end
+-- Registration writes Lua numbers directly, which Valkey may persist in either
+-- decimal or exponent form depending on the timestamp's significant digits.
+local function registration_epoch(v,zero)
+  if not v or string.len(v)>32 then return nil end
+  local decimal=string.match(v,'^%d+%.?%d*$') and string.sub(v,-1)~='.' and
+    not (string.sub(v,1,1)=='0' and string.len(v)>1 and string.sub(v,2,2)~='.')
+  local exponent=string.match(v,'^[1-9]%d*%.?%d*[eE][%+%-]?%d+$')
+  local n=(decimal or exponent) and finite(v)
+  if not n or n<0 or (not zero and n==0) then return nil end
+  return n
+end
 local function python_float(v)
   local n=finite(v); if not n or string.len(v)>32 then return false end
   local canonical=string.format('%.6f',n); canonical=string.gsub(canonical,'0+$',''); canonical=string.gsub(canonical,'%.$','')
@@ -2062,7 +2073,7 @@ if not pending_exists then
   for _,v in ipairs(nv) do if not v then return {'schema'} end end
   local registration_bytes=0
   for i=1,12 do registration_bytes=registration_bytes+string.len(nv[i]); if registration_bytes>65536 then return {'schema'} end end
-  local indexed=finite(redis.call('ZSCORE',leases,node_digest)); local registered=canonical_number(nv[3],true); local lease=canonical_number(nv[12],true)
+  local indexed=finite(redis.call('ZSCORE',leases,node_digest)); local registered=registration_epoch(nv[3],true); local lease=registration_epoch(nv[12],true)
   local json_ok,models=pcall(cjson.decode,nv[4]); local model_count,maximum_model_key=0,0; local seen_models={}
   if json_ok and type(models)=='table' then
     for key,value in pairs(models) do
@@ -2387,7 +2398,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "8f2967dbe268c07d42f42415e80e70de34065d8cbc94b0c19c7de2d221a82644",  # pragma: allowlist secret
+    "a70a6796bec90deaafa6def0cd0a36df4b22b4c6f1a2536579c61ce2dbfad7bb",  # pragma: allowlist secret
     True,
 )
 

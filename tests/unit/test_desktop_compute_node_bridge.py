@@ -1,6 +1,7 @@
 """Unit tests for the desktop compute-node bridge."""
 
 import importlib.util
+import hashlib
 import json
 import os
 import queue
@@ -75,12 +76,20 @@ class _CompletionPreflightManager:
     def __init__(self):
         self.llm = object()
         self.last_compute_diagnostics = {}
+        fixture = b"fixture"
+        self.model_profile = {
+            "artifact_size_bytes": len(fixture),
+            "artifact_sha256": hashlib.sha256(fixture).hexdigest(),
+        }
 
     def worker_lifecycle_status(self):
         return {"worker_alive": self.llm is not None}
 
     def _validate_existing_model_artifact(self, **_kwargs):
         return True, "valid"
+
+    def _close_llm_proxy(self, _loaded):
+        return True
 
 
 class _CompletionPreflightRuntime:
@@ -102,13 +111,14 @@ class _CompletionPreflightRuntime:
         self.model_manager.last_compute_diagnostics = {
             "api_v1_readiness_completion_smoke_result": "passed" if self.outcome == "success" else self.outcome,
             "api_v1_readiness_backend_used": "cuda",
+            "device_backend": "cuda",
+            "offloaded_layers": "all_supported_layers",
         }
         return self.outcome == "success"
 
     def stop(self, **_kwargs):
         if not self.cleanup:
             raise RuntimeError("sensitive cleanup detail")
-        self.model_manager.llm = None
 
 
 def _completion_preflight_args(model):
@@ -117,7 +127,7 @@ def _completion_preflight_args(model):
 
 def _completion_preflight_environment(monkeypatch):
     for name, value in {
-        "TOKENPLACE_APP_VERSION": "0.1.18",
+        "TOKENPLACE_APP_VERSION": "0.1.19",
         "TOKENPLACE_BUILD_ID": "build-test",
         "TOKENPLACE_TARGET_TRIPLE": "x86_64-pc-windows-msvc",
         "TOKENPLACE_BUNDLED_RUNTIME_ID": "runtime-test",
@@ -155,9 +165,12 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
     ("mutation", "expected"),
     [
         ("identity", "runtime_identity_mismatch"),
+        ("blank_identity", "runtime_identity_mismatch"),
         ("model", "model_identity_mismatch"),
+        ("artifact_hash", "model_identity_mismatch"),
         ("fallback", "gpu_runtime_unavailable"),
         ("observed_cpu", "cpu_fallback_or_unverified_gpu"),
+        ("missing_offload", "cpu_fallback_or_unverified_gpu"),
         ("malformed", "completion_failed"),
         ("worker_exit", "worker_or_protocol_failure"),
         ("deadline", "phase_deadline_exceeded"),
@@ -173,6 +186,8 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     runtime_options = {}
     if mutation == "identity":
         monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "system-runtime")
+    elif mutation == "blank_identity":
+        monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "  ")
     elif mutation == "model":
         model = tmp_path / "unapproved.gguf"
         model.write_bytes(b"fixture")
@@ -193,6 +208,15 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
                     self.model_manager.last_compute_diagnostics["api_v1_readiness_backend_used"] = "cpu"
                     return result
                 self.ensure_api_v1_runtime_ready = cpu_result
+            elif mutation == "artifact_hash":
+                self.model_manager.model_profile["artifact_sha256"] = "0" * 64
+            elif mutation == "missing_offload":
+                original = self.ensure_api_v1_runtime_ready
+                def missing_offload_result():
+                    result = original()
+                    self.model_manager.last_compute_diagnostics.pop("offloaded_layers")
+                    return result
+                self.ensure_api_v1_runtime_ready = missing_offload_result
             elif mutation == "malformed":
                 self.outcome = "invalid_api_v1_envelope"
             elif mutation == "worker_exit":
@@ -212,6 +236,13 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     serialized = json.dumps(evidence)
     assert "secret child log" not in serialized
     assert "fixture" not in serialized
+
+
+def test_gpu_preflight_bounded_call_enforces_deadline():
+    with pytest.raises(TimeoutError):
+        compute_node_bridge._gpu_preflight_bounded_call(
+            lambda: time.sleep(1), time.monotonic() + 0.01
+        )
 
 
 @pytest.mark.parametrize(

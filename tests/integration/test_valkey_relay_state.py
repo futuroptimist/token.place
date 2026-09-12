@@ -10706,6 +10706,191 @@ def test_node_transition_capacity_initial_zero_progress_still_fences_node(valkey
         store.close()
 
 
+@pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
+def test_node_transition_fairness_zero_progress_releases_scheduler_slot(
+    valkey_server, cause
+):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        max_scheduler_fingerprints=1,
+        max_terminal_records=1,
+    )
+    blocker, departing, survivor = (
+        "fairness-blocker",
+        "fairness-departing",
+        "fairness-survivor",
+    )
+    blocker_owner, owner, survivor_owner = map(
+        _digest, ("fairness-blocker-owner", "fairness-owner", "fairness-survivor-owner")
+    )
+    retained, owned, replacement = (
+        ("fairness-retained", "request"),
+        ("fairness-owned", "request"),
+        ("fairness-replacement", "request"),
+    )
+    capabilities = _scheduler_policy_capabilities(models=("model-a", "model-b"))
+    try:
+        store.register(blocker, capabilities, blocker_owner)
+        store.select_and_reserve(
+            *retained, "model-a", "8k-fast", time.time() + 60, "cancel"
+        )
+        store.cancel_or_expire_request(*retained, "cancel")
+        store.set_scheduler_state(
+            blocker, blocker_owner, SchedulerNodeState(healthy=False)
+        )
+        store.register(departing, capabilities, owner)
+        store.select_and_reserve(*owned, "model-a", "8k-fast", time.time() + 60)
+        store.register(survivor, capabilities, survivor_owner)
+        if cause == "registration_lease_expired":
+            digest = store._node_digest(departing)
+            node_key = store._foundation.config.key("node", digest)
+            past = time.time() - 1
+            store._foundation._client.hset(
+                node_key, "lease_expires_at_epoch", str(past)
+            )
+            store._foundation._client.zadd(
+                store._foundation.config.key("nodes:lease"), {digest: past}
+            )
+
+        result = store.unregister_node_and_transition_work(
+            departing, owner if cause == "explicit_unregister" else None, cause=cause
+        )
+        assert (result.state, result.processed_count) == ("transitioning", 0)
+        cursor = store._foundation._client.hgetall(
+            store._foundation.config.key("cursor")
+        )
+        assert cursor[b"_count"] == cursor[b"_activity"] == b"0"
+        selected = store.select_and_reserve(
+            *replacement, "model-b", "8k-fast", time.time() + 60
+        )
+        assert selected.selected_node_id == survivor
+    finally:
+        _delete_claim_fixture_state(
+            store, (blocker, departing, survivor), (retained, owned, replacement)
+        )
+        store.close()
+
+
+def test_node_transition_fairness_removes_only_departing_mappings_once(valkey_server):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=3
+    )
+    departing, survivor = "fairness-many", "fairness-survivor"
+    owner, survivor_owner = _digest("fairness-many-owner"), _digest(
+        "fairness-survivor-owner"
+    )
+    fingerprints = tuple(
+        _digest(value) for value in ("affected-one", "survivor", "affected-two")
+    )
+    try:
+        store.register(departing, _capabilities(), owner)
+        store.register(survivor, _capabilities(), survivor_owner)
+        cursor_key = store._foundation.config.key("cursor")
+        cursor = store._foundation._client
+        cursor.hset(
+            cursor_key,
+            mapping={
+                "_count": "3",
+                "_activity": "9007199254740990",
+                "_fp:1": fingerprints[0],
+                fingerprints[0]: store._node_digest(departing),
+                f"a:{fingerprints[0]}": "1",
+                "_fp:2": fingerprints[1],
+                fingerprints[1]: store._node_digest(survivor),
+                f"a:{fingerprints[1]}": "9007199254740989",
+                "_fp:3": fingerprints[2],
+                fingerprints[2]: store._node_digest(departing),
+                f"a:{fingerprints[2]}": "9007199254740990",
+            },
+        )
+        sequence_before = cursor.hget(cursor_key, "_registration_sequence")
+        result = store.unregister_node_and_transition_work(departing, owner)
+        assert result.state == "complete"
+        remaining = cursor.hgetall(cursor_key)
+        assert remaining[b"_count"] == b"1"
+        assert remaining[b"_activity"] == b"9007199254740990"
+        assert remaining[b"_registration_sequence"] == sequence_before
+        assert (
+            remaining[fingerprints[1].encode()] == store._node_digest(survivor).encode()
+        )
+        assert remaining[f"a:{fingerprints[1]}".encode()] == b"9007199254740989"
+        assert remaining[b"_fp:2"] == fingerprints[1].encode()
+        before_retry = cursor.hgetall(cursor_key)
+        retry = store.unregister_node_and_transition_work(departing, owner)
+        assert retry.state == "already_complete"
+        assert cursor.hgetall(cursor_key) == before_retry
+
+        memory = InMemoryRelayStateStore(
+            RelayStateStoreConfig(namespace="testing.memory"),
+            acknowledgement_key=_ACKNOWLEDGEMENT_KEY,
+        )
+        memory.register(departing, _capabilities(), owner)
+        memory.register(survivor, _capabilities(), survivor_owner)
+        memory._fairness_cursors = {
+            fingerprints[0]: (departing, 1),
+            fingerprints[1]: (survivor, 2),
+            fingerprints[2]: (departing, 3),
+        }
+        memory.unregister_node_and_transition_work(departing, owner)
+        assert memory._fairness_cursors == {fingerprints[1]: (survivor, 2)}
+    finally:
+        _delete_claim_fixture_state(store, (departing, survivor), ())
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        {"_count": "2"},
+        {"_activity": "01"},
+        {"a:{fingerprint}": "1e3"},
+        {"{fingerprint}": "not-a-digest"},
+    ),
+)
+def test_node_transition_fairness_rejects_malformed_cursor_before_mutation(
+    valkey_server, mutation
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, max_scheduler_fingerprints=1
+    )
+    node, owner = "fairness-malformed", _digest("fairness-malformed-owner")
+    fingerprint = _digest("fairness-malformed-fingerprint")
+    try:
+        store.register(node, _capabilities(), owner)
+        cursor_key = store._foundation.config.key("cursor")
+        store._foundation._client.hset(
+            cursor_key,
+            mapping={
+                "_count": "1",
+                "_activity": "1",
+                "_fp:1": fingerprint,
+                fingerprint: store._node_digest(node),
+                f"a:{fingerprint}": "1",
+            },
+        )
+        store._foundation._client.hset(
+            cursor_key,
+            mapping={
+                key.format(fingerprint=fingerprint): value
+                for key, value in mutation.items()
+            },
+        )
+        before = _node_transition_authority_snapshot(
+            store, node, (), extra=(cursor_key,)
+        )
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.unregister_node_and_transition_work(node, owner)
+        assert (
+            _node_transition_authority_snapshot(store, node, (), extra=(cursor_key,))
+            == before
+        )
+    finally:
+        _delete_claim_fixture_state(store, (node,), ())
+        store.close()
+
+
+
 def test_node_transition_capacity_rejects_malformed_index_without_fencing(valkey_server):
     store = _registration_store(valkey_server, uuid.uuid4().hex, max_terminal_records=2)
     node, owner = "capacity-malformed", _digest("capacity-malformed-owner")

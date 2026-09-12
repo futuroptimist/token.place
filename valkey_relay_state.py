@@ -1988,8 +1988,9 @@ local leases,node,cursor,pending,pending_index,work,tomb,tomb_expiries,fence,fen
   deadlines,reservation_expiries,claim_expiries,terminal_expiries,control_expiries=unpack(KEYS)
 local prefix,node_digest,node_id,supplied,cause,batch,max_pending,max_tombs,max_fences,
   tomb_ttl,terminal_ttl,control_ttl,max_terminals,max_client_terminals,max_controls,max_node_controls,expected_epoch,
-  max_node_id,max_identity,max_request_envelope,max_response_envelope=unpack(ARGV)
+  max_node_id,max_identity,max_request_envelope,max_response_envelope,max_fingerprints=unpack(ARGV)
 max_node_id,max_identity,max_request_envelope,max_response_envelope=tonumber(max_node_id),tonumber(max_identity),tonumber(max_request_envelope),tonumber(max_response_envelope)
+max_fingerprints=tonumber(max_fingerprints)
 local function digest(v) return v and string.match(v,'^[0-9a-f]+$') and string.len(v)==64 end
 local function finite(v) local n=tonumber(v); if not n or n~=n or n==math.huge or n==-math.huge then return nil end; return n end
 local function integer(v) local n=finite(v); if not n or n<0 or n>9007199254740990 or n~=math.floor(n) or tostring(n)~=v then return nil end; return n end
@@ -2008,6 +2009,12 @@ end
 local function lua_float(v) local n=finite(v); return v and string.len(v)<=32 and n and string.format('%.17g',n)==v end
 local function utf8_length(v) local _,continuations=string.gsub(v,'[\128-\191]',''); return string.len(v)-continuations end
 local function selected(values,member) for _,value in ipairs(values) do if value==member then return true end end; return false end
+local function canonical_decimal(value)
+  return value and (value=='0' or string.match(value,'^[1-9]%d*$'))
+end
+local function decimal_lte(left,right)
+  return string.len(left)<string.len(right) or (string.len(left)==string.len(right) and left<=right)
+end
 if not digest(node_digest) or (supplied~='' and not digest(supplied)) or
    (cause~='explicit_unregister' and cause~='registration_lease_expired') or
    (expected_epoch~='' and not finite(expected_epoch)) then return {'schema'} end
@@ -2036,6 +2043,7 @@ end
 local pv=redis.call('HMGET',pending,'node_id','node_digest','owner_digest','cause','status','reason','transition_epoch')
 local pending_exists=redis.call('EXISTS',pending)==1
 local owner,epoch,initial=false
+local cursor_count,cursor_removals=0,{}
 if not pending_exists then
   if redis.call('ZSCORE',pending_index,node_digest) then return {'schema'} end
   if expected_epoch~='' then return {'stale'} end
@@ -2073,6 +2081,24 @@ if not pending_exists then
      not registered or not indexed or not lease or indexed~=lease or not json_ok or string.len(nv[4])>65536 or model_count<1 or model_count>64 or maximum_model_key~=model_count or
      not tier_min or not total or total>1000000 or total<tier_min or not default_output or default_output>1000000 or not maximum_output or maximum_output>1000000 or default_output>maximum_output or
      not concurrency or concurrency>128 or not backend or nv[11]~='v1' or (nv[13]~='0' and nv[13]~='1') or (nv[14]~='0' and nv[14]~='1') or not claimed or claimed>1000000 or not registration_order or not registration_sequence or registration_order>registration_sequence then return {'schema'} end
+  local count_raw=redis.call('HGET',cursor,'_count'); cursor_count=count_raw and tonumber(count_raw) or 0
+  local activity=redis.call('HGET',cursor,'_activity')
+  if (count_raw and (not canonical_decimal(count_raw) or not cursor_count)) or cursor_count<0 or cursor_count>max_fingerprints or
+     (cursor_count==0 and activity and activity~='0') or (cursor_count>0 and not activity) or
+     (activity and (not canonical_decimal(activity) or not decimal_lte(activity,'9223372036854775806'))) then return {'schema'} end
+  local occupied=0; local cursor_seen={}
+  for slot=1,max_fingerprints do
+    local slot_field='_fp:'..slot; local fingerprint=redis.call('HGET',cursor,slot_field)
+    if fingerprint then
+      if not digest(fingerprint) or cursor_seen[fingerprint] then return {'schema'} end
+      local mapping,fingerprint_activity=unpack(redis.call('HMGET',cursor,fingerprint,'a:'..fingerprint))
+      if not digest(mapping) or not activity or not canonical_decimal(fingerprint_activity) or fingerprint_activity=='0' or
+         not decimal_lte(fingerprint_activity,activity) then return {'schema'} end
+      cursor_seen[fingerprint]=true; occupied=occupied+1
+      if mapping==node_digest then table.insert(cursor_removals,{fingerprint,slot_field}) end
+    end
+  end
+  if occupied~=cursor_count then return {'schema'} end
   if cause=='explicit_unregister' and nv[2]~=supplied then return {'credential_mismatch'} end
   if cause=='registration_lease_expired' and lease>now then return {'lease_active'} end
   if redis.call('ZRANK',work,'!schema:1')~=0 or redis.call('ZSCORE',work,'!schema:1')~='0' then return {'schema'} end
@@ -2319,6 +2345,12 @@ if initial then
   redis.call('ZADD',tomb_expiries,tomb_expiry,node_digest)
   redis.call('HSET',prefix..'former_owner:'..node_digest..':'..owner,'node_digest',node_digest,'owner_digest',owner,'cause',cause,'status','cancelled','transition_epoch',epoch,'expires_at_epoch',fe)
   redis.call('ZADD',fence_expiries,fe,fm); redis.call('DEL',node); redis.call('ZREM',leases,node_digest)
+  if #cursor_removals>0 then
+    for _,entry in ipairs(cursor_removals) do redis.call('HDEL',cursor,entry[1],'a:'..entry[1],entry[2]) end
+    local remaining_cursors=cursor_count-#cursor_removals
+    redis.call('HSET',cursor,'_count',remaining_cursors)
+    if remaining_cursors==0 then redis.call('HSET',cursor,'_activity','0') end
+  end
 end
 local reservations,queued,claims,outcomes=0,0,0,0
 for _,v in ipairs(validated) do
@@ -2355,7 +2387,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "d36afbb9aa40cc6d9bfb6f15c534f1c7f3a7258f185f0855e07d57200263a51a",  # pragma: allowlist secret
+    "8f2967dbe268c07d42f42415e80e70de34065d8cbc94b0c19c7de2d221a82644",  # pragma: allowlist secret
     True,
 )
 
@@ -3131,6 +3163,7 @@ class ValkeyRegistrationStore:
             str(self.config.max_identity_bytes).encode(),
             str(self.config.max_envelope_bytes).encode(),
             str(self.config.max_response_envelope_bytes).encode(),
+            str(self.config.max_scheduler_fingerprints).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(NODE_TRANSITION_SCRIPT.name, keys, args)

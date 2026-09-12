@@ -338,6 +338,9 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "tv[1]==v[8] and tv[2]==v[9]" in script.source
     assert "if accepted>bounded_number(l[8],false)" in script.source
     assert "v[9]=='server_unregistered' or accepted<=deadline" in script.source
+    assert "for slot=1,max_fingerprints do" in script.source
+    assert "if mapping==node_digest then table.insert(cursor_removals" in script.source
+    assert "redis.call('HSET',cursor,'_count',remaining_cursors)" in script.source
 
     reader = valkey_relay_state.PENDING_TRANSITION_READ_SCRIPT
     assert SCRIPT_DIGESTS[reader.name] == reader.sha256

@@ -2184,10 +2184,36 @@ else
   if not finite(redis.call('ZSCORE',pending_index,node_digest)) then return {'schema'} end
   if expected_epoch~='' and pv[7]~=expected_epoch then return {'stale'} end
   if pv[4]~=cause then return {'conflict'} end
-  if cause=='explicit_unregister' and pv[3]~=supplied then return {'credential_mismatch'} end
+  if cause=='explicit_unregister' and pv[3]~=supplied then
+    -- A completed owner's retained fence is distinct from the fence reserved by
+    -- the replacement owner's current pending transition.
+    local fm=node_digest..':'..supplied; local fx=redis.call('EXISTS',fence)==1
+    local fs=finite(redis.call('ZSCORE',fence_expiries,fm))
+    if fx~=(fs~=nil) then return {'schema'} end
+    if fx then
+      local fv=redis.call('HMGET',fence,'node_digest','owner_digest','cause','status','transition_epoch','expires_at_epoch')
+      local fe=finite(fv[6])
+      if fv[1]~=node_digest or fv[2]~=supplied or (fv[3]~='explicit_unregister' and fv[3]~='registration_lease_expired') or
+         fv[4]~='cancelled' or not finite(fv[5]) or not fe or fe~=fs then return {'schema'} end
+      if fe>now then return {'already_complete',fv[3],fv[5]} end
+    end
+    return {'credential_mismatch'}
+  end
   owner=pv[3]; epoch=pv[7]
   if redis.call('EXISTS',node)~=0 or redis.call('ZSCORE',leases,node_digest) then return {'schema'} end
   if redis.call('ZRANK',work,'!schema:1')~=0 or redis.call('ZSCORE',work,'!schema:1')~='0' then return {'schema'} end
+  local fm=node_digest..':'..owner; local pending_fence=prefix..'former_owner:'..node_digest..':'..owner
+  local fx=redis.call('EXISTS',pending_fence)==1; local fs=finite(redis.call('ZSCORE',fence_expiries,fm))
+  if not fx or not fs then return {'schema'} end
+  local fv=redis.call('HMGET',pending_fence,'node_digest','owner_digest','cause','status','transition_epoch','expires_at_epoch')
+  if fv[1]~=node_digest or fv[2]~=owner or fv[3]~=cause or fv[4]~='cancelled' or fv[5]~=epoch or finite(fv[6])~=fs then return {'schema'} end
+  local tx=redis.call('EXISTS',tomb)==1; local ts=finite(redis.call('ZSCORE',tomb_expiries,node_digest))
+  if tx~=(ts~=nil) then return {'schema'} end
+  if tx then
+    local tv=redis.call('HMGET',tomb,'node_digest','owner_digest','cause','status','transition_epoch','completed','expires_at_epoch')
+    if tv[1]~=node_digest or tv[2]~=owner or tv[3]~=cause or tv[4]~='cancelled' or tv[5]~=epoch or
+       tv[6]~='0' or finite(tv[7])~=ts then return {'schema'} end
+  end
 end
 local members=redis.call('ZRANGE',work,1,tonumber(batch)); local validated={}; local needed_terminals,needed_controls=0,0
 for _,member in ipairs(members) do
@@ -2449,7 +2475,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "31e8682870b8c33e42956a2ebcd2fc4c376aa32657b01aa52b9e04bb68dfd212",  # pragma: allowlist secret
+    "7127cd4d12f03c80864f68c54eb62b8b9e45e92b0ad7c25a0c028258d561729a",  # pragma: allowlist secret
     True,
 )
 

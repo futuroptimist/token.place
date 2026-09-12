@@ -11111,6 +11111,85 @@ def test_node_owner_retention_rejects_malformed_fence_pair_before_registration(
         store.close()
 
 
+def test_node_owner_retention_retry_precedes_replacement_pending_transition(
+    valkey_server,
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, node_transition_batch_size=1
+    )
+    node = "retained-owner-pending-replacement"
+    owner_a, owner_b = map(_digest, ("retained-owner-a", "retained-owner-b"))
+    identities = (("retained-pending-client", "one"), ("retained-pending-client", "two"))
+    try:
+        store.register(node, _capabilities(), owner_a)
+        original = store.unregister_node_and_transition_work(node, owner_a)
+        assert original.state == "complete"
+
+        store.register(node, _capabilities(), owner_b)
+        for identity in identities:
+            store.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast", time.time() + 60
+            )
+        pending = store.unregister_node_and_transition_work(node, owner_b)
+        assert pending.state == "transitioning"
+
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        extra = (
+            cfg.key("former_owner", digest, owner_a),
+            cfg.key("former_owner", digest, owner_b),
+        )
+        before = _node_transition_authority_snapshot(store, node, identities, extra)
+        retry = store.unregister_node_and_transition_work(node, owner_a)
+        assert retry.state == "already_complete"
+        assert retry.cause == original.cause
+        assert retry.transition_epoch == original.transition_epoch
+        assert _node_transition_authority_snapshot(store, node, identities, extra) == before
+
+        completed = store.unregister_node_and_transition_work(node, owner_b)
+        assert completed.state == "complete"
+        assert completed.transition_epoch == pending.transition_epoch
+    finally:
+        _delete_claim_fixture_state(store, (node,), identities)
+        store.close()
+
+
+@pytest.mark.parametrize("authority", ("fence_owner", "fence_index", "tomb_owner", "tomb_index"))
+def test_node_owner_retention_continuation_rejects_damaged_addressed_authority(
+    valkey_server, authority
+):
+    store = _registration_store(
+        valkey_server, uuid.uuid4().hex, node_transition_batch_size=1
+    )
+    node, owner = "retained-owner-damaged", _digest("retained-owner-damaged")
+    identities = (("retained-damaged-client", "one"), ("retained-damaged-client", "two"))
+    try:
+        store.register(node, _capabilities(), owner)
+        for identity in identities:
+            store.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast", time.time() + 60
+            )
+        assert store.unregister_node_and_transition_work(node, owner).state == "transitioning"
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        fence = cfg.key("former_owner", digest, owner)
+        tomb = cfg.key("node_tombstone", digest)
+        if authority == "fence_owner":
+            store._foundation._client.hset(fence, "owner_digest", _digest("wrong"))
+        elif authority == "fence_index":
+            store._foundation._client.zrem(cfg.key("former_owners:expiry"), f"{digest}:{owner}")
+        elif authority == "tomb_owner":
+            store._foundation._client.hset(tomb, "owner_digest", _digest("wrong"))
+        else:
+            store._foundation._client.zrem(cfg.key("node_tombstones:expiry"), digest)
+        extra = (fence,)
+        before = _node_transition_authority_snapshot(store, node, identities, extra)
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.unregister_node_and_transition_work(node, owner)
+        assert _node_transition_authority_snapshot(store, node, identities, extra) == before
+    finally:
+        _delete_claim_fixture_state(store, (node,), identities)
+        store.close()
+
+
 @pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
 def test_node_transition_fairness_zero_progress_releases_scheduler_slot(
     valkey_server, cause

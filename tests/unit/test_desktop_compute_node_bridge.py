@@ -73,8 +73,10 @@ class _CompletionPreflightManager:
     file_name = "Qwen3-8B-Q4_K_M.gguf"
     use_mock_llm = False
 
-    def __init__(self):
+    def __init__(self, model_path):
         self.llm = object()
+        self.model_path = str(model_path)
+        self.models_dir = str(model_path.parent)
         self.last_compute_diagnostics = {}
         fixture = b"fixture"
         self.model_profile = {
@@ -88,16 +90,22 @@ class _CompletionPreflightManager:
     def _validate_existing_model_artifact(self, **_kwargs):
         return True, "valid"
 
+    def _is_managed_canonical_model_path(self):
+        return Path(self.model_path).resolve() == Path(self.models_dir, self.file_name).resolve()
+
     def _close_llm_proxy(self, _loaded):
         return True
 
 
 class _CompletionPreflightRuntime:
+    model_path = None
+
     def __init__(self, _config, *, outcome="success", duplicate=False, cleanup=True):
-        self.model_manager = _CompletionPreflightManager()
+        self.model_manager = _CompletionPreflightManager(type(self).model_path)
         self.outcome = outcome
         self.duplicate = duplicate
         self.cleanup = cleanup
+        self.stop_saw_loaded_worker = False
         self.relay_client = SimpleNamespace(
             _generate_api_v1_response_with_runtime_model=lambda **_kwargs: {
                 "api_v1_response": {"message": {"role": "assistant", "content": "private output"}}
@@ -117,11 +125,13 @@ class _CompletionPreflightRuntime:
         return self.outcome == "success"
 
     def stop(self, **_kwargs):
+        self.stop_saw_loaded_worker = self.model_manager.llm is not None
         if not self.cleanup:
             raise RuntimeError("sensitive cleanup detail")
 
 
 def _completion_preflight_args(model):
+    _CompletionPreflightRuntime.model_path = model
     return SimpleNamespace(model=str(model), mode="gpu", context_tier="8k-fast")
 
 
@@ -147,8 +157,14 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
     model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
     model.write_bytes(b"fixture")
 
+    created = []
+    def runtime_factory(config):
+        runtime = _CompletionPreflightRuntime(config)
+        created.append(runtime)
+        return runtime
+
     code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
-        _completion_preflight_args(model), _CompletionPreflightRuntime
+        _completion_preflight_args(model), runtime_factory
     )
 
     assert code == 0
@@ -156,6 +172,8 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
     assert evidence["completion"]["count"] == 1
     assert evidence["backend"] == {"declared": "cuda", "observed": "cuda", "gpu_verified": True}
     assert evidence["cleanup"] == {"attempted": True, "verified": True, "owned_worker_alive": False}
+    assert created[0].stop_saw_loaded_worker is True
+    assert created[0].model_manager.llm is None
     serialized = json.dumps(evidence)
     assert "private output" not in serialized
     assert str(model.parent) not in serialized
@@ -206,6 +224,7 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
                 def cpu_result():
                     result = original()
                     self.model_manager.last_compute_diagnostics["api_v1_readiness_backend_used"] = "cpu"
+                    self.model_manager.last_compute_diagnostics["device_backend"] = "cpu"
                     return result
                 self.ensure_api_v1_runtime_ready = cpu_result
             elif mutation == "artifact_hash":

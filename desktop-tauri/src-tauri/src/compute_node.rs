@@ -2960,6 +2960,7 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
                 .and_then(Value::as_u64)
                 .is_some_and(|value| value <= 180_000)
             && event.pointer("/cleanup/verified").and_then(Value::as_bool) == Some(true)
+            && event.pointer("/cleanup/attempted").and_then(Value::as_bool) == Some(true)
             && event
                 .pointer("/cleanup/owned_worker_alive")
                 .and_then(Value::as_bool)
@@ -3024,6 +3025,33 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
         anyhow::bail!("gpu_completion_preflight_rejected")
     }
     Ok(event)
+}
+
+/// Produce the same privacy-safe protocol shape when native preparation fails
+/// before the Python qualification child can emit evidence.
+pub(crate) fn gpu_completion_preflight_native_failure() -> Value {
+    let phases = serde_json::json!({
+        "runtime_startup": {"deadline_ms": 45000, "elapsed_ms": 0, "outcome": "failed"},
+        "model_load": {"deadline_ms": 120000, "elapsed_ms": 0, "outcome": "not_started"},
+        "generation": {"deadline_ms": 45000, "elapsed_ms": 0, "outcome": "not_started"},
+        "cancellation": {"deadline_ms": 5000, "elapsed_ms": 0, "outcome": "not_started"},
+        "cleanup": {"deadline_ms": 10000, "elapsed_ms": 0, "outcome": "passed"}
+    });
+    serde_json::json!({
+        "schema_version": 1,
+        "qualification": "installed_gpu_child_worker_completion",
+        "success": false,
+        "failure_code": "worker_or_protocol_failure",
+        "artifact": {"filename": "unknown", "size_bytes": 0},
+        "identity": {"app_version": "unknown", "build_id": "unknown", "target_triple": "unknown", "bundled_runtime_id": "unknown", "runtime_id": "unknown"},
+        "backend": {"declared": "unknown", "observed": "unknown", "gpu_verified": false},
+        "completion": {"path": "shared_api_v1_generation", "count": 0, "max_output_tokens": 64, "result": "not_started"},
+        "phases": phases,
+        "total_deadline_ms": 180000,
+        "total_elapsed_ms": 0,
+        "cleanup": {"attempted": true, "verified": true, "owned_worker_alive": false},
+        "side_effects": {"relay_contacts": 0, "registrations": 0, "benchmark_attempts": 0}
+    })
 }
 
 pub(crate) fn operator_gpu_completion_preflight_record(
@@ -9227,6 +9255,10 @@ mod tests {
             "side_effects": {"relay_contacts": 0, "registrations": 0, "benchmark_attempts": 0}
         });
         assert!(validate_gpu_completion_preflight_event(accepted.clone()).is_ok());
+        assert!(
+            validate_gpu_completion_preflight_event(gpu_completion_preflight_native_failure())
+                .is_ok()
+        );
         for pointer in ["/backend/gpu_verified", "/cleanup/verified"] {
             let mut rejected = accepted.clone();
             *rejected.pointer_mut(pointer).expect("fixture pointer") = Value::Bool(false);

@@ -3408,8 +3408,13 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         if model.name != expected_filename or expected_filename != "Qwen3-8B-Q4_K_M.gguf":
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
+        canonical_model = Path(str(getattr(manager, "model_path", ""))).resolve()
+        managed_path_check = getattr(manager, "_is_managed_canonical_model_path", None)
+        if (model != canonical_model or not callable(managed_path_check)
+                or managed_path_check() is not True):
+            evidence["failure_code"] = "model_identity_mismatch"
+            return 3, evidence
         evidence["artifact"] = {"filename": model.name, "size_bytes": model.stat().st_size}
-        manager.model_path = str(model)
         manager.parent_model_path_exists = True
         manager.model_path_was_relative = False
         validate_artifact = getattr(manager, "_validate_existing_model_artifact", None)
@@ -3461,11 +3466,13 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             return 5, evidence
 
         def counted_generate(*call_args: Any, **call_kwargs: Any) -> Any:
-            nonlocal completion_count, generation_elapsed_ms
+            nonlocal completion_count, generation_elapsed_ms, active_phase, active_phase_started
             completion_count += 1
             if completion_count > 1:
                 raise RuntimeError("duplicate_qualification_completion")
             generation_started = time.monotonic()
+            active_phase = "generation"
+            active_phase_started = generation_started
             try:
                 return generate(*call_args, **call_kwargs)
             finally:
@@ -3480,7 +3487,9 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         load_elapsed = int((time.monotonic() - model_phase_started) * 1000)
         diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
         smoke_result = diagnostics.get("api_v1_readiness_completion_smoke_result")
-        observed = diagnostics.get("api_v1_readiness_backend_used") or diagnostics.get("backend_used")
+        # The readiness backend is a requested/planned value.  Only diagnostics
+        # produced after worker load attest where the model actually executed.
+        observed = diagnostics.get("device_backend")
         evidence["phases"]["model_load"].update(
             elapsed_ms=max(0, load_elapsed - generation_elapsed_ms),
             outcome="passed" if ready else "failed",
@@ -3520,6 +3529,27 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             outcome="failed",
         )
         evidence["failure_code"] = "phase_deadline_exceeded"
+        if active_phase == "generation" and manager is not None:
+            cancellation_started = time.monotonic()
+            cancellation_ok = False
+            try:
+                terminate = getattr(manager, "terminate_active_worker_for_cancellation", None)
+                if callable(terminate):
+                    cancellation_ok = bool(terminate(
+                        reason="gpu_preflight_generation_timeout", recreate=False
+                    ))
+                status = manager.worker_lifecycle_status()
+                cancellation_ok = cancellation_ok and status.get("worker_alive") is not True
+            except Exception:
+                cancellation_ok = False
+            evidence["phases"]["cancellation"].update(
+                elapsed_ms=int((time.monotonic() - cancellation_started) * 1000),
+                outcome="passed" if cancellation_ok else "failed",
+            )
+            if (not cancellation_ok or
+                    evidence["phases"]["cancellation"]["elapsed_ms"] >
+                    GPU_COMPLETION_PHASE_DEADLINES_MS["cancellation"]):
+                evidence["failure_code"] = "generation_cancelled"
         return 7, evidence
     except concurrent.futures.CancelledError:
         evidence["failure_code"] = "generation_cancelled"
@@ -3538,12 +3568,6 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         cleanup_ok = True
         if runtime is not None:
             try:
-                loaded_runtime = getattr(manager, "llm", None)
-                if loaded_runtime is not None:
-                    manager.llm = None
-                    close_runtime = getattr(manager, "_close_llm_proxy", None)
-                    if not callable(close_runtime) or close_runtime(loaded_runtime) is not True:
-                        raise RuntimeError("gpu_preflight_worker_cleanup_failed")
                 cleanup_deadline = min(
                     started + GPU_COMPLETION_TOTAL_DEADLINE_MS / 1000,
                     cleanup_started + GPU_COMPLETION_PHASE_DEADLINES_MS["cleanup"] / 1000,
@@ -3551,6 +3575,14 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
                 _gpu_preflight_bounded_call(
                     lambda: runtime.stop(shutdown_deadline=cleanup_deadline), cleanup_deadline
                 )
+                # stop() owns relay lifecycle only.  Explicitly detach and close
+                # the model worker through ModelManager's owned-worker cleanup.
+                loaded_runtime = getattr(manager, "llm", None)
+                if loaded_runtime is not None:
+                    manager.llm = None
+                    close_runtime = getattr(manager, "_close_llm_proxy", None)
+                    if not callable(close_runtime) or close_runtime(loaded_runtime) is not True:
+                        raise RuntimeError("gpu_preflight_worker_cleanup_failed")
                 status = manager.worker_lifecycle_status() if callable(getattr(manager, "worker_lifecycle_status", None)) else {}
                 cleanup_ok = status.get("worker_alive") is not True and getattr(manager, "llm", None) is None
             except Exception:

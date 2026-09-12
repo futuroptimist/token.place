@@ -319,7 +319,7 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "finite(redis.call('ZSCORE',deadlines,member))~=request_deadline" in script.source
     assert "entries[1][2][2]~=client" in script.source
     assert "redis.call('ZCARD',tomb_expiries)-#expired_tombs" in script.source
-    assert "redis.call('ZCARD',fence_expiries)-#expired_fences" in script.source
+    assert "redis.call('ZCARD',fence_expiries)-#deletable_fences" in script.source
     assert "local accepted=canonical_number(tv[9],true)" in script.source
     assert "string.len(response[8])>max_response_envelope" in script.source
     assert "A generation-zero reservation terminal legitimately predates enqueue metadata" in script.source
@@ -351,6 +351,9 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "for slot=1,max_fingerprints do" in script.source
     assert "if mapping==node_digest then table.insert(cursor_removals" in script.source
     assert "redis.call('HSET',cursor,'_count',remaining_cursors)" in script.source
+    assert "local deletable_fences={}" in script.source
+    assert "reserved=rv[2]==od and rv[3]==fv[3] and rv[6]==fv[5]" in script.source
+    assert "if redis.call('EXISTS',tomb)==1 then redis.call('HSET',tomb,'completed','1') end" in script.source
 
     reader = valkey_relay_state.PENDING_TRANSITION_READ_SCRIPT
     assert SCRIPT_DIGESTS[reader.name] == reader.sha256
@@ -362,6 +365,8 @@ def test_registration_transition_fences_both_pending_authorities():
     source = REGISTRATION_TRANSITION_SCRIPT.source
     assert "prefix .. 'node_transition:' .. digest" in source
     assert "prefix .. 'node_transitions:pending', digest" in source
+    assert "if fence_exists~=(fence_score~=nil) then return {'schema'} end" in source
+    assert "if expiry>now then return {'credential_mismatch'} end" in source
 
 
 def test_node_removed_record_encoding_is_generation_and_timestamp_canonical():

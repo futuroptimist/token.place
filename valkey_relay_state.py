@@ -485,6 +485,8 @@ local prefix, operation, digest, owner = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
 local ttl, capacity, batch = tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7])
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local function valid_digest(v) return v and string.match(v,'^[0-9a-f]+$') and string.len(v)==64 end
+local function finite(v) local n=tonumber(v); if not n or n~=n or n==math.huge or n==-math.huge then return nil end; return n end
 local fields = {'node_id', 'control_credential_digest', 'registered_at_epoch',
   'supported_model_ids', 'active_context_tier', 'maximum_total_context_tokens',
   'default_output_token_reservation', 'maximum_output_tokens', 'max_concurrency',
@@ -506,7 +508,23 @@ local exists = redis.call('EXISTS', node) == 1
 if operation == 'register' or operation == 'renew' then
   if redis.call('EXISTS', prefix .. 'node_transition:' .. digest) == 1 or
      redis.call('ZSCORE', prefix .. 'node_transitions:pending', digest) then return {'transitioning'} end
-  if operation == 'register' and redis.call('EXISTS', prefix .. 'former_owner:' .. digest .. ':' .. owner) == 1 then return {'credential_mismatch'} end
+  if operation == 'register' then
+    local fence_key=prefix..'former_owner:'..digest..':'..owner
+    local fence_member=digest..':'..owner
+    local fence_exists=redis.call('EXISTS',fence_key)==1
+    local fence_score=finite(redis.call('ZSCORE',prefix..'former_owners:expiry',fence_member))
+    if fence_exists~=(fence_score~=nil) then return {'schema'} end
+    if fence_exists then
+      local fv=redis.call('HMGET',fence_key,'node_digest','owner_digest','cause','status','transition_epoch','expires_at_epoch')
+      local expiry=finite(fv[6])
+      if fv[1]~=digest or fv[2]~=owner or not valid_digest(fv[2]) or
+         (fv[3]~='explicit_unregister' and fv[3]~='registration_lease_expired') or
+         fv[4]~='cancelled' or not finite(fv[5]) or not expiry or expiry~=fence_score then return {'schema'} end
+      if expiry>now then return {'credential_mismatch'} end
+      -- An expired, unreserved former owner no longer fences node-id reuse.
+      redis.call('DEL',fence_key); redis.call('ZREM',prefix..'former_owners:expiry',fence_member)
+    end
+  end
   if addressed_expiry and tonumber(addressed_expiry) <= now then return {'not_found'} end
   if operation == 'register' then
     if exists then
@@ -571,7 +589,7 @@ return {'invalid'}
 REGISTRATION_TRANSITION_SCRIPT = ReviewedScript(
     "registration_transition_v1",
     REGISTRATION_TRANSITION_SOURCE,
-    "abcf0409b3d7b4d135cf8631e223fa23f91afd975c0d74d59d00817967bf5f52",  # pragma: allowlist secret
+    "e0844f7c72b8ef3d9f0a43c05e7538fef186dd7b84430021fa2dca602717f78e",  # pragma: allowlist secret
     True,
 )
 
@@ -2044,6 +2062,7 @@ for _,m in ipairs(expired_tombs) do
      tv[4]~='cancelled' or not finite(tv[5]) or (tv[6]~='0' and tv[6]~='1') or not e or e>now or finite(redis.call('ZSCORE',tomb_expiries,m))~=e then return {'schema'} end
 end
 local expired_fences=redis.call('ZRANGEBYSCORE',fence_expiries,'-inf',now,'LIMIT',0,batch)
+local deletable_fences={}
 for _,m in ipairs(expired_fences) do
   local p=string.find(m,':',1,true); if p~=65 then return {'schema'} end
   local node_key_digest,od=string.sub(m,1,p-1),string.sub(m,p+1); local fk=prefix..'former_owner:'..node_key_digest..':'..od
@@ -2052,7 +2071,16 @@ for _,m in ipairs(expired_fences) do
   local e=finite(fv[6])
   if not digest(node_key_digest) or not digest(od) or fv[1]~=node_key_digest or fv[2]~=od or
      (fv[3]~='explicit_unregister' and fv[3]~='registration_lease_expired') or fv[4]~='cancelled' or not finite(fv[5]) or
-     not e or e>now or finite(redis.call('ZSCORE',fence_expiries,m))~=e or redis.call('EXISTS',prefix..'node_transition:'..node_key_digest)==1 then return {'schema'} end
+     not e or e>now or finite(redis.call('ZSCORE',fence_expiries,m))~=e then return {'schema'} end
+  local reserved=false; local pk=prefix..'node_transition:'..node_key_digest
+  if redis.call('EXISTS',pk)==1 then
+    local rv=redis.call('HMGET',pk,'node_digest','owner_digest','cause','status','reason','transition_epoch')
+    for _,v in ipairs(rv) do if not v then return {'schema'} end end
+    if rv[1]~=node_key_digest or not digest(rv[2]) or (rv[3]~='explicit_unregister' and rv[3]~='registration_lease_expired') or
+       rv[4]~='cancelled' or rv[5]~='server_unregistered' or not finite(rv[6]) then return {'schema'} end
+    reserved=rv[2]==od and rv[3]==fv[3] and rv[6]==fv[5]
+  end
+  if not reserved then table.insert(deletable_fences,m) end
 end
 local pv=redis.call('HMGET',pending,'node_id','node_digest','owner_digest','cause','status','reason','transition_epoch')
 local pending_exists=redis.call('EXISTS',pending)==1
@@ -2061,14 +2089,29 @@ local cursor_count,cursor_removals=0,{}
 if not pending_exists then
   if redis.call('ZSCORE',pending_index,node_digest) then return {'schema'} end
   if expected_epoch~='' then return {'stale'} end
+  -- Owner-specific retained authority wins over the latest node/tombstone owner.
+  if cause=='explicit_unregister' then
+    local fx=redis.call('EXISTS',fence)==1; local fm=node_digest..':'..supplied; local fs=finite(redis.call('ZSCORE',fence_expiries,fm))
+    if fx~=(fs~=nil) then return {'schema'} end
+    if fx then
+      local fv=redis.call('HMGET',fence,'node_digest','owner_digest','cause','status','transition_epoch','expires_at_epoch')
+      local fe=finite(fv[6])
+      if fv[1]~=node_digest or fv[2]~=supplied or (fv[3]~='explicit_unregister' and fv[3]~='registration_lease_expired') or
+         fv[4]~='cancelled' or not finite(fv[5]) or not fe or fe~=fs then return {'schema'} end
+      if fe>now then return {'already_complete',fv[3],fv[5]} end
+    end
+  end
   local live=redis.call('EXISTS',node)==1
   if not live then
-    local tv=redis.call('HMGET',tomb,'owner_digest','cause','transition_epoch','completed')
-    if tv[1] and cause=='explicit_unregister' and tv[1]~=supplied then return {'credential_mismatch'} end
-    if tv[1] and tv[4]=='1' and ((cause=='explicit_unregister' and tv[1]==supplied) or cause==tv[2]) then return {'already_complete',tv[2],tv[3]} end
-    if cause=='explicit_unregister' then
-      local fv=redis.call('HMGET',fence,'cause','transition_epoch','expires_at_epoch')
-      if fv[1] and finite(fv[3]) and finite(fv[3])>now then return {'already_complete',fv[1],fv[2]} end
+    local tx=redis.call('EXISTS',tomb)==1; local ts=finite(redis.call('ZSCORE',tomb_expiries,node_digest))
+    if tx~=(ts~=nil) then return {'schema'} end
+    if tx then
+      local tv=redis.call('HMGET',tomb,'node_digest','owner_digest','cause','status','transition_epoch','completed','expires_at_epoch')
+      local tomb_expiry_value=finite(tv[7])
+      if tv[1]~=node_digest or not digest(tv[2]) or (tv[3]~='explicit_unregister' and tv[3]~='registration_lease_expired') or
+         tv[4]~='cancelled' or not finite(tv[5]) or (tv[6]~='0' and tv[6]~='1') or not tomb_expiry_value or tomb_expiry_value~=ts then return {'schema'} end
+      if tomb_expiry_value>now and cause=='explicit_unregister' and tv[2]~=supplied then return {'credential_mismatch'} end
+      if tomb_expiry_value>now and tv[6]=='1' and ((cause=='explicit_unregister' and tv[2]==supplied) or cause==tv[3]) then return {'already_complete',tv[3],tv[5]} end
     end
     return {'not_found'}
   end
@@ -2132,8 +2175,8 @@ if not pending_exists then
     local av=redis.call('HMGET',addressed_fence,'node_digest','owner_digest','cause','status','transition_epoch','expires_at_epoch')
     if av[1]~=node_digest or av[2]~=nv[2] or (av[3]~='explicit_unregister' and av[3]~='registration_lease_expired') or av[4]~='cancelled' or not finite(av[5]) or finite(av[6])~=fence_score then return {'schema'} end
   end
-  local fence_survives=fence_exists and not selected(expired_fences,fm)
-  if redis.call('ZCARD',fence_expiries)-#expired_fences+(fence_survives and 0 or 1)>tonumber(max_fences) then return {'fence_capacity'} end
+  local fence_survives=fence_exists and not selected(deletable_fences,fm)
+  if redis.call('ZCARD',fence_expiries)-#deletable_fences+(fence_survives and 0 or 1)>tonumber(max_fences) then return {'fence_capacity'} end
   owner=nv[2]; epoch=string.format('%.17g',now); initial=true
 else
   for _,v in ipairs(pv) do if not v then return {'schema'} end end
@@ -2347,7 +2390,7 @@ for _,v in ipairs(validated) do
 end
 validated=admitted
 for _,m in ipairs(expired_tombs) do redis.call('DEL',prefix..'node_tombstone:'..m); redis.call('ZREM',tomb_expiries,m) end
-for _,m in ipairs(expired_fences) do local p=string.find(m,':',1,true); redis.call('DEL',prefix..'former_owner:'..string.sub(m,1,p-1)..':'..string.sub(m,p+1)); redis.call('ZREM',fence_expiries,m) end
+for _,m in ipairs(deletable_fences) do local p=string.find(m,':',1,true); redis.call('DEL',prefix..'former_owner:'..string.sub(m,1,p-1)..':'..string.sub(m,p+1)); redis.call('ZREM',fence_expiries,m) end
 for _,m in ipairs(due_terminals) do local p=string.find(m,':',1,true); local client,request=string.sub(m,1,p-1),string.sub(m,p+1); redis.call('DEL',prefix..'terminal:'..client..':'..request,prefix..'response:'..client..':'..request,prefix..'request:'..client..':'..request); redis.call('ZREM',terminal_expiries,m); redis.call('ZREM',prefix..'responses:expiry',m) end
 for m in pairs(paired_controls) do local a=string.find(m,':',1,true); local b=string.find(m,':',a+1,true); redis.call('DEL',prefix..'control:'..string.sub(m,1,a-1)..':'..string.sub(m,a+1,b-1)..':'..string.sub(m,b+1)); redis.call('ZREM',control_expiries,m) end
 for _,m in ipairs(due_controls) do local a=string.find(m,':',1,true); local b=string.find(m,':',a+1,true); redis.call('DEL',prefix..'control:'..string.sub(m,1,a-1)..':'..string.sub(m,a+1,b-1)..':'..string.sub(m,b+1)); redis.call('ZREM',control_expiries,m) end
@@ -2391,7 +2434,12 @@ end
 local remaining=redis.call('ZCARD',work)-1
 if remaining<0 then return {'schema'} end
 if remaining==0 then
-  redis.call('DEL',pending); redis.call('ZREM',pending_index,node_digest); redis.call('HSET',tomb,'completed','1')
+  redis.call('DEL',pending); redis.call('ZREM',pending_index,node_digest)
+  -- Pending authority may outlive the short tombstone; never resurrect it.
+  if redis.call('EXISTS',tomb)==1 then redis.call('HSET',tomb,'completed','1') end
+  local fe=string.format('%.17g',now+tonumber(terminal_ttl)); local fm=node_digest..':'..owner
+  redis.call('HSET',prefix..'former_owner:'..node_digest..':'..owner,'node_digest',node_digest,'owner_digest',owner,'cause',cause,'status','cancelled','transition_epoch',epoch,'expires_at_epoch',fe)
+  redis.call('ZADD',fence_expiries,fe,fm)
   return {'complete',cause,epoch,#validated,reservations,queued,claims,outcomes,'0'}
 end
 redis.call('ZADD',pending_index,now,node_digest)
@@ -2401,7 +2449,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "a70a6796bec90deaafa6def0cd0a36df4b22b4c6f1a2536579c61ce2dbfad7bb",  # pragma: allowlist secret
+    "31e8682870b8c33e42956a2ebcd2fc4c376aa32657b01aa52b9e04bb68dfd212",  # pragma: allowlist secret
     True,
 )
 

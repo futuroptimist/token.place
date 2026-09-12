@@ -10996,6 +10996,121 @@ def test_node_transition_capacity_initial_zero_progress_still_fences_node(valkey
         store.close()
 
 
+def test_node_owner_retention_preserves_each_owner_retry_and_releases_expired_fence(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node = "retained-owner-reuse"
+    owners = tuple(_digest(f"retained-owner-{index}") for index in range(3))
+    try:
+        epochs = []
+        for owner in owners[:2]:
+            store.register(node, _capabilities(), owner)
+            result = store.unregister_node_and_transition_work(node, owner)
+            assert result.state == "complete"
+            epochs.append(result.transition_epoch)
+
+        store.register(node, _capabilities(), owners[2])
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        node_before = store._foundation._client.hgetall(cfg.key("node", digest))
+        for owner, epoch in zip(owners[:2], epochs, strict=True):
+            retry = store.unregister_node_and_transition_work(node, owner)
+            assert retry.state == "already_complete"
+            assert retry.cause == "explicit_unregister"
+            assert retry.transition_epoch == epoch
+            assert store._foundation._client.hgetall(cfg.key("node", digest)) == node_before
+
+        store.unregister_node_and_transition_work(node, owners[2])
+        with pytest.raises(RelayStateCredentialMismatch):
+            store.register(node, _capabilities(), owners[2])
+        fence = cfg.key("former_owner", digest, owners[2])
+        member = f"{digest}:{owners[2]}"
+        seconds, micros = store._foundation.server_time()
+        now = seconds + micros / 1_000_000
+        store._foundation._client.hset(fence, "expires_at_epoch", str(now - 1))
+        store._foundation._client.zadd(cfg.key("former_owners:expiry"), {member: now - 1})
+        store.register(node, _capabilities(), owners[2])
+        assert store._foundation._client.exists(fence) == 0
+        assert store._foundation._client.zscore(cfg.key("former_owners:expiry"), member) is None
+    finally:
+        store.close()
+
+
+def test_node_owner_retention_completion_outlives_short_tombstone_without_resurrection(
+    valkey_server,
+):
+    store = _registration_store(
+        valkey_server,
+        uuid.uuid4().hex,
+        node_transition_batch_size=1,
+        node_tombstone_ttl_seconds=0.001,
+    )
+    node, owner = "retained-owner-continuation", _digest("retained-owner-continuation")
+    identities = (("retained-owner-client", "one"), ("retained-owner-client", "two"))
+    try:
+        store.register(node, _capabilities(), owner)
+        for identity in identities:
+            store.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast", time.time() + 60
+            )
+        first = store.unregister_node_and_transition_work(node, owner)
+        assert first.state == "transitioning"
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        tomb = cfg.key("node_tombstone", digest)
+        fence = cfg.key("former_owner", digest, owner)
+        fence_member = f"{digest}:{owner}"
+        seconds, micros = store._foundation.server_time()
+        past = seconds + micros / 1_000_000 - 1
+        store._foundation._client.hset(tomb, "expires_at_epoch", str(past))
+        store._foundation._client.zadd(cfg.key("node_tombstones:expiry"), {digest: past})
+        store._foundation._client.hset(fence, "expires_at_epoch", str(past))
+        store._foundation._client.zadd(cfg.key("former_owners:expiry"), {fence_member: past})
+
+        completed = store.unregister_node_and_transition_work(node, owner)
+        assert completed.state == "complete"
+        assert completed.transition_epoch == first.transition_epoch
+        assert store._foundation._client.exists(tomb) == 0
+        retained = store._foundation._client.hgetall(fence)
+        assert set(retained) == {
+            b"node_digest", b"owner_digest", b"cause", b"status",
+            b"transition_epoch", b"expires_at_epoch",
+        }
+        assert float(retained[b"transition_epoch"]) == first.transition_epoch
+        assert float(retained[b"expires_at_epoch"]) > past
+        retry = store.unregister_node_and_transition_work(node, owner)
+        assert retry.state == "already_complete"
+        assert retry.transition_epoch == first.transition_epoch
+    finally:
+        _delete_claim_fixture_state(store, (node,), identities)
+        store.close()
+
+
+def test_node_owner_retention_rejects_malformed_fence_pair_before_registration(
+    valkey_server,
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node, owner = "retained-owner-corrupt", _digest("retained-owner-corrupt")
+    try:
+        store.register(node, _capabilities(), owner)
+        store.unregister_node_and_transition_work(node, owner)
+        cfg, digest = store._foundation.config, store._node_digest(node)
+        fence = cfg.key("former_owner", digest, owner)
+        index = cfg.key("former_owners:expiry")
+        member = f"{digest}:{owner}"
+        before_hash = store._foundation._client.hgetall(fence)
+        before_score = store._foundation._client.zscore(index, member)
+        store._foundation._client.zadd(index, {member: before_score + 1})
+        corrupt_score = store._foundation._client.zscore(index, member)
+
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            store.register(node, _capabilities(), owner)
+        assert store._foundation._client.hgetall(fence) == before_hash
+        assert store._foundation._client.zscore(index, member) == corrupt_score
+        assert store._foundation._client.exists(cfg.key("node", digest)) == 0
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
 def test_node_transition_fairness_zero_progress_releases_scheduler_slot(
     valkey_server, cause

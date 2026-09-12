@@ -320,6 +320,90 @@ def test_gpu_preflight_rejects_silent_cpu_fallback(monkeypatch, capsys):
     assert event["startup_result"] == "runtime_validation_failed"
 
 
+def _configure_installed_gpu_completion(monkeypatch, tmp_path, *, observed="cuda",
+                                        smoke="passed", cleanup_error=False):
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"controlled-model-identity")
+    for name, value in {
+        "TOKENPLACE_APP_VERSION": "0.1.18", "TOKENPLACE_BUILD_ID": "build",
+        "TOKENPLACE_TARGET_TRIPLE": "target", "TOKENPLACE_BUNDLED_RUNTIME_ID": "runtime",
+        "TOKENPLACE_RUNTIME_ID": "runtime", "TOKENPLACE_LAUNCHER_SOURCE": "bundled_runtime",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(compute_node_bridge, "ensure_desktop_python_dependencies",
+                        lambda: {"ok": "true"})
+    monkeypatch.setattr(compute_node_bridge, "_ensure_desktop_llama_runtime_for_context",
+                        lambda *_: {"selected_backend": "cuda"})
+    monkeypatch.setattr(compute_node_bridge, "_load_context_profile_helpers",
+                        lambda: (lambda *_: None, lambda tier: tier))
+
+    class Manager:
+        use_mock_llm = False
+        model_profile = {"provider": "qwen"}
+        last_compute_diagnostics = {}
+
+    class Runtime:
+        def __init__(self, _config):
+            self.model_manager = Manager()
+
+        def ensure_api_v1_runtime_ready(self):
+            assert os.environ["TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION"] == "1"
+            self.model_manager.last_compute_diagnostics = {
+                "api_v1_readiness_completion_smoke_result": smoke,
+                "api_v1_readiness_completion_smoke_max_tokens": 4,
+                "backend_used": observed,
+            }
+            return True
+
+        def stop(self, **_kwargs):
+            if cleanup_error:
+                raise RuntimeError("PRIVATE generated response")
+
+    monkeypatch.setattr(compute_node_runtime, "ComputeNodeRuntime", Runtime)
+    monkeypatch.setattr(compute_node_runtime, "apply_compute_mode", lambda *_: None)
+    return SimpleNamespace(mode="cuda", model=str(model), context_tier="8k-fast")
+
+
+def test_installed_gpu_completion_success_is_one_and_private(monkeypatch, tmp_path, capsys):
+    args = _configure_installed_gpu_completion(monkeypatch, tmp_path)
+    assert compute_node_bridge.installed_gpu_completion_preflight(args) == 0
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[0] == {"phase": "startup_ready", "type": "headless_internal"}
+    result = records[-1]
+    assert result["success"] is True
+    assert result["completion_count"] == 1
+    assert result["observed_backend"] == "cuda"
+    assert result["cleanup_status"] == "verified"
+    serialized = json.dumps(result).lower()
+    assert not any(secret in serialized for secret in
+                   ("generated response", "controlled-model-identity", "prompt", "ciphertext", "environment"))
+
+
+@pytest.mark.parametrize(("observed", "smoke", "expected"), [
+    ("cpu", "passed", "cpu_fallback_rejected"),
+    ("cuda", "failed", "completion_failed"),
+])
+def test_installed_gpu_completion_fails_closed(monkeypatch, tmp_path, capsys,
+                                               observed, smoke, expected):
+    args = _configure_installed_gpu_completion(
+        monkeypatch, tmp_path, observed=observed, smoke=smoke)
+    assert compute_node_bridge.installed_gpu_completion_preflight(args) != 0
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert result["failure_code"] == expected
+    assert result["success"] is False
+    assert result["cleanup_status"] == "verified"
+
+
+def test_installed_gpu_completion_cleanup_failure_overrides_acceptance(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_installed_gpu_completion(monkeypatch, tmp_path, cleanup_error=True)
+    assert compute_node_bridge.installed_gpu_completion_preflight(args) == 8
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert result["failure_code"] == "cleanup_failed"
+    assert result["success"] is False
+    assert "PRIVATE" not in json.dumps(result)
+
+
 @pytest.fixture(autouse=True)
 def _default_desktop_runtime_arch(monkeypatch):
     """Keep win32 platform simulations independent from the host CPU architecture."""

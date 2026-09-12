@@ -407,6 +407,11 @@ def _node_transition_store_with_reply(reply):
             ValkeySchemaIncompatibleError,
         ),
         ([b"unexpected"], ValkeySchemaIncompatibleError),
+        ([b"already_complete", b"unknown", b"1"], ValkeySchemaIncompatibleError),
+        ([b"already_complete", b"explicit_unregister", b"nan"], ValkeySchemaIncompatibleError),
+        ([b"complete", b"explicit_unregister", b"1", 2, 0, 1, 0, 2, 0], ValkeySchemaIncompatibleError),
+        ([b"complete", b"explicit_unregister", b"1", 0, 0, 0, 0, 0, 1], ValkeySchemaIncompatibleError),
+        ([b"transitioning", b"explicit_unregister", b"1", 0, 0, 0, 0, 0, 0], ValkeySchemaIncompatibleError),
     ),
 )
 def test_node_transition_reply_rejects_typed_and_malformed_results(reply, error):
@@ -451,7 +456,8 @@ def _node_tombstone_store(indexed, raw=None):
     foundation.server_time.return_value = (100, 0)
     calls = [indexed]
     if raw is not None:
-        calls.append(raw)
+        score = indexed[0][1] if isinstance(indexed, list) and indexed else None
+        calls.append([raw, 7, score])
     foundation._call.side_effect = calls
     return registration_store_with_foundation(foundation)
 
@@ -460,15 +466,15 @@ def test_node_tombstones_decodes_a_valid_bounded_snapshot():
     node_digest = b"a" * 64
     owner_digest = b"b" * 64
     store = _node_tombstone_store(
-        [(node_digest, 200.0)],
+        [(node_digest, 400.0)],
         [
             node_digest,
             owner_digest,
             b"explicit_unregister",
             b"cancelled",
-            b"100.0",
+            b"100",
             b"1",
-            b"200.0",
+            b"400",
         ],
     )
 
@@ -482,7 +488,7 @@ def test_node_tombstones_decodes_a_valid_bounded_snapshot():
         "status": "cancelled",
         "transition_epoch": 100.0,
         "completed": True,
-        "expires_at_epoch": 200.0,
+        "expires_at_epoch": 400.0,
     }
 
 

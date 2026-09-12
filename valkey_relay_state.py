@@ -3190,38 +3190,50 @@ class ValkeyRegistrationStore:
         if status in {"not_found", "lease_active"} and not values:
             return NodeTransitionResult(status, cause, None, 0, 0, 0, 0, 0, False)
         if status == "already_complete" and len(values) == 2:
+            returned_cause = self._decode_text(values[0])
+            epoch_text = self._decode_text(values[1])
+            try:
+                epoch = float(epoch_text)
+            except (TypeError, ValueError, OverflowError):
+                raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+            if (returned_cause not in {"explicit_unregister", "registration_lease_expired"}
+                    or not math.isfinite(epoch) or epoch < 0
+                    or epoch_text != format(epoch, ".17g")):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
             return NodeTransitionResult(
-                status,
-                self._decode_text(values[0]),
-                float(self._decode_text(values[1])),
-                0,
-                0,
-                0,
-                0,
-                0,
-                False,
+                status, returned_cause, epoch, 0, 0, 0, 0, 0, False,
             )
         if status in {"transitioning", "complete"} and len(values) == 8:
             try:
                 returned_cause = self._decode_text(values[0])
-                epoch = float(self._decode_text(values[1]))
-                counts = [
-                    value if type(value) is int else int(self._decode_text(value))
-                    for value in values[2:7]
-                ]
-                continuation = (
-                    values[7]
-                    if type(values[7]) is int
-                    else int(self._decode_text(values[7]))
-                )
-            except (TypeError, ValueError):
+                epoch_text = self._decode_text(values[1])
+                epoch = float(epoch_text)
+                decoded_numbers = []
+                for value in values[2:]:
+                    if type(value) is int:
+                        decoded_numbers.append(value)
+                    else:
+                        text = self._decode_text(value)
+                        if re.fullmatch(r"(?:0|[1-9][0-9]*)", text) is None:
+                            raise ValueError
+                        decoded_numbers.append(int(text))
+                counts, continuation = decoded_numbers[:5], decoded_numbers[5]
+            except (TypeError, ValueError, OverflowError):
                 raise ValkeySchemaIncompatibleError(
                     "state schema incompatible"
                 ) from None
             if (
                 returned_cause != cause
+                or not math.isfinite(epoch) or epoch < 0
+                or epoch_text != format(epoch, ".17g")
                 or continuation not in {0, 1}
                 or any(value < 0 for value in counts)
+                or counts[0] > self.config.node_transition_batch_size
+                or counts[4] != counts[1] + counts[2]
+                or counts[4] > counts[0]
+                or counts[3] > counts[2]
+                or (status == "complete" and continuation != 0)
+                or (status == "transitioning" and continuation != 1)
             ):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             return NodeTransitionResult(
@@ -3234,6 +3246,8 @@ class ValkeyRegistrationStore:
         if not isinstance(result, (list, tuple)) or not result:
             raise ValkeySchemaIncompatibleError("state schema incompatible")
         value = result[0]
+        if isinstance(value, bytes) and len(value) > _MAX_RESULT_BYTES:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
         try:
             status = value.decode("ascii") if isinstance(value, bytes) else value
         except UnicodeDecodeError:
@@ -5400,24 +5414,38 @@ class ValkeyRegistrationStore:
             b"expires_at_epoch",
         )
         records = []
-        for member, score in indexed:
-            if not isinstance(member, bytes) or not re.fullmatch(
-                rb"[0-9a-f]{64}", member
-            ):
+        for row in indexed:
+            if not isinstance(row, (list, tuple)) or len(row) != 2:
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
-            raw = self._foundation._call(
-                self._foundation._client.hmget,
-                cfg.key("node_tombstone", member.decode()),
-                fields,
-            )
-            if not isinstance(raw, list) or any(
-                not isinstance(value, bytes) for value in raw
-            ):
+            member, score = row
+            if (not isinstance(member, bytes) or not re.fullmatch(rb"[0-9a-f]{64}", member)
+                    or type(score) not in {int, float} or isinstance(score, bool)
+                    or not math.isfinite(float(score))):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            key = cfg.key("node_tombstone", member.decode())
+            with self._foundation._client.pipeline(transaction=True) as pipeline:
+                pipeline.hmget(key, fields)
+                pipeline.hlen(key)
+                pipeline.zscore(cfg.key("node_tombstones:expiry"), member)
+                snapshot = self._foundation._call(pipeline.execute)
+            if not isinstance(snapshot, list) or len(snapshot) != 3:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            raw, field_count, current_score = snapshot
+            if (isinstance(raw, list) and len(raw) == len(fields)
+                    and all(value is None for value in raw)
+                    and field_count == 0 and current_score is None):
+                continue
+            if (not isinstance(raw, list) or len(raw) != len(fields)
+                    or type(field_count) is not int or field_count != len(fields)
+                    or type(current_score) not in {int, float} or isinstance(current_score, bool)
+                    or any(not isinstance(value, bytes) for value in raw)
+                    or any(len(value) > _MAX_RESULT_BYTES for value in raw)
+                    or sum(len(value) for value in raw) > _MAX_RESULT_BYTES):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             value = dict(zip(fields, raw))
             try:
-                transition = float(value[b"transition_epoch"])
-                expiry = float(value[b"expires_at_epoch"])
+                transition_raw, expiry_raw = value[b"transition_epoch"], value[b"expires_at_epoch"]
+                transition, expiry = float(transition_raw), float(expiry_raw)
                 if (
                     value[b"node_digest"] != member
                     or not re.fullmatch(rb"[0-9a-f]{64}", value[b"owner_digest"])
@@ -5425,12 +5453,17 @@ class ValkeyRegistrationStore:
                     not in {b"explicit_unregister", b"registration_lease_expired"}
                     or value[b"status"] != b"cancelled"
                     or value[b"completed"] not in {b"0", b"1"}
-                    or not all(map(math.isfinite, (transition, expiry, float(score))))
-                    or expiry != float(score)
+                    or not all(map(math.isfinite, (transition, expiry, float(current_score))))
+                    or transition < 0
+                    or transition_raw.decode("ascii") != format(transition, ".17g")
+                    or expiry_raw.decode("ascii") != format(expiry, ".17g")
+                    or transition > expiry
+                    or expiry != float(format(transition + self.config.node_tombstone_ttl_seconds, ".17g"))
+                    or expiry != float(current_score)
                     or expiry <= now
                 ):
                     raise ValueError
-            except (KeyError, TypeError, ValueError, OverflowError):
+            except (KeyError, TypeError, ValueError, OverflowError, UnicodeDecodeError):
                 raise ValkeySchemaIncompatibleError(
                     "state schema incompatible"
                 ) from None

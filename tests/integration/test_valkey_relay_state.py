@@ -9197,6 +9197,47 @@ def _force_retained_authority_due(store, keys, *, completed=False):
         )
 
 
+@pytest.mark.parametrize("replacement", (False, True))
+def test_node_tombstones_handles_concurrent_removal_or_replacement(valkey_server, replacement):
+    namespace = uuid.uuid4().hex
+    writer, observer = (_registration_store(valkey_server, namespace) for _ in range(2))
+    cfg = writer._foundation.config
+    member, owner = _digest("concurrent-tombstone").encode(), _digest("concurrent-owner")
+    key, index = cfg.key("node_tombstone", member.decode()), cfg.key("node_tombstones:expiry")
+    now = writer._foundation.server_time()[0]
+
+    def write_record(transition):
+        expiry = transition + 300.0
+        writer._foundation._client.hset(key, mapping={"node_digest": member, "owner_digest": owner,
+            "cause": "explicit_unregister", "status": "cancelled",
+            "transition_epoch": format(transition, ".17g"), "completed": "1",
+            "expires_at_epoch": format(expiry, ".17g")})
+        writer._foundation._client.zadd(index, {member: expiry})
+
+    write_record(float(now))
+    original_call, enumerated = observer._foundation._call, False
+    def interleaved_call(operation, *args, **kwargs):
+        nonlocal enumerated
+        result = original_call(operation, *args, **kwargs)
+        if operation == observer._foundation._client.zrangebyscore and not enumerated:
+            enumerated = True
+            writer._foundation._client.delete(key)
+            writer._foundation._client.zrem(index, member)
+            if replacement:
+                write_record(float(now + 1))
+        return result
+    observer._foundation._call = interleaved_call
+    try:
+        records = observer.node_tombstones()
+        assert len(records) == int(replacement)
+        assert writer._foundation._client.hlen(key) == (7 if replacement else 0)
+        assert writer._foundation._client.zcard(index) == int(replacement)
+    finally:
+        writer._foundation._client.delete(key, index)
+        writer.close()
+        observer.close()
+
+
 @pytest.mark.parametrize("cause", ("explicit_unregister", "registration_lease_expired"))
 @pytest.mark.parametrize("stage", ("reserved", "queued", "claimed"))
 def test_node_removed_record_round_trips_terminal_retrieval_and_control(

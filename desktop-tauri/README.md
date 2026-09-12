@@ -156,6 +156,47 @@ opt-in). `--dry-run` previews what would be removed.
   and migrate automatically from the legacy single Relay URL config field.
 - Log lines are redacted to metadata (byte counts, request ids).
 
+## Installed GPU completion qualification
+
+An installed, signed candidate has one opt-in local qualification command:
+
+```text
+token.place.desktop --installed-gpu-completion-preflight
+```
+
+This command performs **real GPU inference** and therefore requires explicit operator
+qualification authorization. It neither grants nor consumes a benchmark attempt. It does not
+contact a relay, register capacity, perform a benchmark handshake, or run during installation or
+ordinary startup. Source tests and the structural CPU smoke do not qualify an installer; signing
+and artifact verification do not qualify GPU execution; and this completion command does not
+authorize a later benchmark.
+
+The command resolves the bundled interpreter and configured model using the same packaged-resource
+and desktop configuration paths as operator startup. It rejects a system interpreter, a model whose
+filename differs from the approved profile, and CPU fallback. The production runtime readiness path
+then performs its single synthetic non-thinking API-v1 completion through the owned child worker.
+The response is accepted only when it is nonempty and well formed, exactly one completion is
+reported, CUDA or Metal use is observed with positive layer offload, and owned-worker teardown is
+verified.
+
+The fixed qualification budgets are: 15 seconds for startup, 120 seconds for model loading, 45
+seconds for generation, 5 seconds for cancellation, 10 seconds for cleanup, and 180 seconds total.
+The 120-second load budget matches the existing cold operator warm-load convention; the remaining
+budgets bound a 64-token synthetic completion and teardown while the total cap prevents phase
+slippage. The parent process also kills only the process tree it created if the total deadline is
+exceeded. Output is one allowlisted
+`token.place/installed-gpu-completion-preflight/v1` JSON object containing artifact/model/runtime
+identity, declared configuration, observed backend/offload evidence, phase outcomes, bounded
+timings, completion count, zero side-effect counters, and cleanup status. Prompt and generated text,
+ciphertext, keys, credentials, environment dumps, paths, and raw child logs are never included.
+
+Repository tests use controlled fixtures and are not CUDA/Metal qualification:
+
+```bash
+python -m pytest -q tests/unit/test_installed_completion_preflight.py
+cd desktop-tauri/src-tauri && cargo test
+```
+
 
 ## Multi-relay compute-node operation
 

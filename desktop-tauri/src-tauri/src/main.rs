@@ -693,6 +693,15 @@ pub fn run() {
                 println!("{}", payload);
                 std::process::exit(0);
             }
+            if std::env::args().any(|arg| arg == "--installed-gpu-completion-preflight") {
+                let config = load_config_from_path(&config_path(&cli_config_dir()))
+                    .map_err(std::io::Error::other)?;
+                let payload =
+                    compute_node::installed_completion_preflight_record(&config, &app.handle())
+                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                println!("{}", payload);
+                std::process::exit(0);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1195,6 +1204,7 @@ mod tests {
 
         let required = [
             "python/compute_node_bridge.py",
+            "python/installed_completion_preflight.py",
             "python/inference_sidecar.py",
             "python/model_bridge.py",
             "python/path_bootstrap.py",

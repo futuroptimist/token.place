@@ -96,6 +96,10 @@ class _CompletionPreflightManager:
     def _close_llm_proxy(self, _loaded):
         return True
 
+    def terminate_active_worker_for_cancellation(self, **_kwargs):
+        self.llm = None
+        return True
+
 
 class _CompletionPreflightRuntime:
     model_path = None
@@ -184,9 +188,17 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
     [
         ("identity", "runtime_identity_mismatch"),
         ("blank_identity", "runtime_identity_mismatch"),
+        ("missing_model", "model_missing"),
+        ("cpu_mode", "gpu_mode_required"),
         ("model", "model_identity_mismatch"),
         ("artifact_hash", "model_identity_mismatch"),
         ("fallback", "gpu_runtime_unavailable"),
+        ("mock", "mock_runtime_rejected"),
+        ("unmanaged", "model_identity_mismatch"),
+        ("validator_missing", "model_identity_validation_unavailable"),
+        ("profile_missing", "model_identity_validation_unavailable"),
+        ("generation_missing", "generation_boundary_missing"),
+        ("completion_missing", "completion_count_invalid"),
         ("observed_cpu", "cpu_fallback_or_unverified_gpu"),
         ("missing_offload", "cpu_fallback_or_unverified_gpu"),
         ("malformed", "completion_failed"),
@@ -209,6 +221,8 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     elif mutation == "model":
         model = tmp_path / "unapproved.gguf"
         model.write_bytes(b"fixture")
+    elif mutation == "missing_model":
+        model.unlink()
     elif mutation == "fallback":
         monkeypatch.setattr(compute_node_bridge, "_ensure_desktop_llama_runtime_for_context", lambda *_args: {"selected_backend": "cpu"})
     elif mutation == "duplicate":
@@ -229,6 +243,18 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
                 self.ensure_api_v1_runtime_ready = cpu_result
             elif mutation == "artifact_hash":
                 self.model_manager.model_profile["artifact_sha256"] = "0" * 64
+            elif mutation == "mock":
+                self.model_manager.use_mock_llm = True
+            elif mutation == "unmanaged":
+                self.model_manager._is_managed_canonical_model_path = lambda: False
+            elif mutation == "validator_missing":
+                self.model_manager._validate_existing_model_artifact = None
+            elif mutation == "profile_missing":
+                self.model_manager.model_profile = {}
+            elif mutation == "generation_missing":
+                self.relay_client._generate_api_v1_response_with_runtime_model = None
+            elif mutation == "completion_missing":
+                self.ensure_api_v1_runtime_ready = lambda: True
             elif mutation == "missing_offload":
                 original = self.ensure_api_v1_runtime_ready
                 def missing_offload_result():
@@ -241,13 +267,16 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
             elif mutation == "worker_exit":
                 self.ensure_api_v1_runtime_ready = lambda: (_ for _ in ()).throw(RuntimeError("secret child log"))
             elif mutation == "deadline":
-                self.ensure_api_v1_runtime_ready = lambda: (_ for _ in ()).throw(TimeoutError("secret timeout detail"))
+                self.relay_client._generate_api_v1_response_with_runtime_model = (
+                    lambda **_kwargs: (_ for _ in ()).throw(TimeoutError("secret timeout detail"))
+                )
             elif mutation == "cancellation":
                 self.ensure_api_v1_runtime_ready = lambda: (_ for _ in ()).throw(compute_node_bridge.concurrent.futures.CancelledError("secret cancellation detail"))
 
-    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
-        _completion_preflight_args(model), Runtime
-    )
+    args = _completion_preflight_args(model)
+    if mutation == "cpu_mode":
+        args.mode = "cpu"
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(args, Runtime)
 
     assert code != 0 or evidence["success"] is False
     assert evidence["success"] is False
@@ -262,6 +291,8 @@ def test_gpu_preflight_bounded_call_enforces_deadline():
         compute_node_bridge._gpu_preflight_bounded_call(
             lambda: time.sleep(1), time.monotonic() + 0.01
         )
+    with pytest.raises(TimeoutError):
+        compute_node_bridge._gpu_preflight_bounded_call(lambda: None, time.monotonic() - 1)
 
 
 @pytest.mark.parametrize(

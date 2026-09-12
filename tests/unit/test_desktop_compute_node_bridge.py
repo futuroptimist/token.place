@@ -295,6 +295,106 @@ def test_gpu_preflight_bounded_call_enforces_deadline():
         compute_node_bridge._gpu_preflight_bounded_call(lambda: None, time.monotonic() - 1)
 
 
+def test_installed_gpu_completion_preflight_starts_independent_generation_deadline(
+        monkeypatch, tmp_path):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+    runtime = _CompletionPreflightRuntime(SimpleNamespace())
+    runtime.model_manager = _CompletionPreflightManager(model)
+    seen_deadlines = []
+    real_bounded_call = compute_node_bridge._gpu_preflight_bounded_call
+
+    def recording_bounded_call(call, deadline):
+        seen_deadlines.append(deadline)
+        return real_bounded_call(call, deadline)
+
+    monkeypatch.setattr(compute_node_bridge, "_gpu_preflight_bounded_call", recording_bounded_call)
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), lambda _config: runtime
+    )
+
+    assert code == 0 and evidence["success"] is True
+    assert any(callable(deadline) for deadline in seen_deadlines)
+    # Startup, artifact validation, generation, stop, close, and lifecycle all
+    # receive concrete independently capped deadlines; readiness alone follows
+    # the callable that switches from model-load to generation at the boundary.
+    assert sum(not callable(deadline) for deadline in seen_deadlines) >= 6
+
+
+@pytest.mark.parametrize(("termination_result", "worker_alive"), [(False, False), (True, True)])
+def test_generation_timeout_fails_closed_when_cancellation_is_not_verified(
+        monkeypatch, tmp_path, termination_result, worker_alive):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+    monkeypatch.setitem(compute_node_bridge.GPU_COMPLETION_PHASE_DEADLINES_MS,
+                        "generation", 5)
+
+    class Runtime(_CompletionPreflightRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.relay_client._generate_api_v1_response_with_runtime_model = (
+                lambda **_kwargs: threading.Event().wait(0.05)
+            )
+            self.model_manager.terminate_active_worker_for_cancellation = (
+                lambda **_kwargs: termination_result
+            )
+            self.model_manager.worker_lifecycle_status = lambda: {
+                "worker_alive": worker_alive
+            }
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), Runtime
+    )
+
+    assert code != 0
+    assert evidence["success"] is False
+    assert evidence["failure_code"] in {"generation_cancelled", "cleanup_failed"}
+    assert evidence["phases"]["cancellation"]["outcome"] == "failed"
+
+
+def test_worker_close_is_bounded_and_cannot_leave_success_evidence(monkeypatch, tmp_path):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+    monkeypatch.setitem(compute_node_bridge.GPU_COMPLETION_PHASE_DEADLINES_MS, "cleanup", 5)
+
+    class Runtime(_CompletionPreflightRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.model_manager._close_llm_proxy = lambda _loaded: threading.Event().wait(0.05)
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), Runtime
+    )
+
+    assert code == 8
+    assert evidence["success"] is False
+    assert evidence["failure_code"] == "cleanup_failed"
+    assert evidence["cleanup"]["verified"] is False
+
+
+def test_total_deadline_during_cleanup_cannot_leave_success_evidence(monkeypatch, tmp_path):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+    monkeypatch.setattr(compute_node_bridge, "GPU_COMPLETION_TOTAL_DEADLINE_MS", 100)
+
+    class Runtime(_CompletionPreflightRuntime):
+        def stop(self, **_kwargs):
+            threading.Event().wait(0.2)
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), Runtime
+    )
+
+    assert code == 7
+    assert evidence["success"] is False
+    assert evidence["failure_code"] == "total_deadline_exceeded"
+    assert evidence["cleanup"]["verified"] is False
+
+
 @pytest.mark.parametrize(
     ("ready", "diagnostics", "expected"),
     [

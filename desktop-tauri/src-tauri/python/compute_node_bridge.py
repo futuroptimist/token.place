@@ -3271,7 +3271,7 @@ GPU_COMPLETION_PHASE_DEADLINES_MS = {
 GPU_COMPLETION_TOTAL_DEADLINE_MS = 180_000
 
 
-def _gpu_preflight_bounded_call(call: Any, deadline: float) -> Any:
+def _gpu_preflight_bounded_call(call: Any, deadline: Any) -> Any:
     """Run a qualification operation without letting it outlive its budget.
 
     A daemon thread is intentional here: dependency repair and native model
@@ -3279,7 +3279,8 @@ def _gpu_preflight_bounded_call(call: Any, deadline: float) -> Any:
     every supported desktop platform.  On expiry the bridge emits its bounded
     evidence and exits, which also terminates the unfinished daemon operation.
     """
-    remaining = deadline - time.monotonic()
+    deadline_value = deadline() if callable(deadline) else deadline
+    remaining = deadline_value - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("gpu_preflight_deadline")
     results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
@@ -3291,10 +3292,16 @@ def _gpu_preflight_bounded_call(call: Any, deadline: float) -> Any:
             results.put((False, exc))
 
     threading.Thread(target=invoke, daemon=True, name="gpu-preflight-bounded-call").start()
-    try:
-        succeeded, value = results.get(timeout=remaining)
-    except queue.Empty as exc:
-        raise TimeoutError("gpu_preflight_deadline") from exc
+    while True:
+        deadline_value = deadline() if callable(deadline) else deadline
+        remaining = deadline_value - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("gpu_preflight_deadline")
+        try:
+            succeeded, value = results.get(timeout=min(remaining, 0.05))
+            break
+        except queue.Empty:
+            continue
     if not succeeded:
         raise value
     return value
@@ -3341,6 +3348,7 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
     inference while exercising the actual subprocess worker and API-v1 generator.
     """
     started = time.monotonic()
+    total_deadline = started + GPU_COMPLETION_TOTAL_DEADLINE_MS / 1000
     evidence = _gpu_completion_evidence()
     runtime = None
     manager = None
@@ -3369,7 +3377,6 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             evidence["failure_code"] = "gpu_mode_required"
             return 2, evidence
 
-        total_deadline = started + GPU_COMPLETION_TOTAL_DEADLINE_MS / 1000
         phase_started = time.monotonic()
         active_phase_started = phase_started
         startup_deadline = min(
@@ -3461,20 +3468,28 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         generate = getattr(generation_client, "_generate_api_v1_response_with_runtime_model", None)
         completion_count = 0
         generation_elapsed_ms = 0
+        generation_deadline = None
         if not callable(generate):
             evidence["failure_code"] = "generation_boundary_missing"
             return 5, evidence
 
         def counted_generate(*call_args: Any, **call_kwargs: Any) -> Any:
             nonlocal completion_count, generation_elapsed_ms, active_phase, active_phase_started
+            nonlocal generation_deadline
             completion_count += 1
             if completion_count > 1:
                 raise RuntimeError("duplicate_qualification_completion")
             generation_started = time.monotonic()
+            generation_deadline = min(
+                total_deadline,
+                generation_started + GPU_COMPLETION_PHASE_DEADLINES_MS["generation"] / 1000,
+            )
             active_phase = "generation"
             active_phase_started = generation_started
             try:
-                return generate(*call_args, **call_kwargs)
+                return _gpu_preflight_bounded_call(
+                    lambda: generate(*call_args, **call_kwargs), generation_deadline
+                )
             finally:
                 generation_elapsed_ms += int((time.monotonic() - generation_started) * 1000)
 
@@ -3483,7 +3498,14 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         os.environ["TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS"] = "45"
         os.environ["TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS"] = "45"
 
-        ready = bool(_gpu_preflight_bounded_call(runtime.ensure_api_v1_runtime_ready, model_deadline))
+        # Readiness loads the model before it crosses the wrapped production
+        # generation boundary.  Switch from the load deadline to the fresh
+        # generation deadline at that exact boundary without resetting the
+        # invocation-wide total budget.
+        ready = bool(_gpu_preflight_bounded_call(
+            runtime.ensure_api_v1_runtime_ready,
+            lambda: generation_deadline or model_deadline,
+        ))
         load_elapsed = int((time.monotonic() - model_phase_started) * 1000)
         diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
         smoke_result = diagnostics.get("api_v1_readiness_completion_smoke_result")
@@ -3533,12 +3555,22 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             cancellation_started = time.monotonic()
             cancellation_ok = False
             try:
+                cancellation_deadline = min(
+                    total_deadline,
+                    cancellation_started
+                    + GPU_COMPLETION_PHASE_DEADLINES_MS["cancellation"] / 1000,
+                )
                 terminate = getattr(manager, "terminate_active_worker_for_cancellation", None)
                 if callable(terminate):
-                    cancellation_ok = bool(terminate(
-                        reason="gpu_preflight_generation_timeout", recreate=False
+                    cancellation_ok = bool(_gpu_preflight_bounded_call(
+                        lambda: terminate(
+                            reason="gpu_preflight_generation_timeout", recreate=False
+                        ),
+                        cancellation_deadline,
                     ))
-                status = manager.worker_lifecycle_status()
+                status = _gpu_preflight_bounded_call(
+                    manager.worker_lifecycle_status, cancellation_deadline
+                )
                 cancellation_ok = cancellation_ok and status.get("worker_alive") is not True
             except Exception:
                 cancellation_ok = False
@@ -3546,9 +3578,7 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
                 elapsed_ms=int((time.monotonic() - cancellation_started) * 1000),
                 outcome="passed" if cancellation_ok else "failed",
             )
-            if (not cancellation_ok or
-                    evidence["phases"]["cancellation"]["elapsed_ms"] >
-                    GPU_COMPLETION_PHASE_DEADLINES_MS["cancellation"]):
+            if not cancellation_ok:
                 evidence["failure_code"] = "generation_cancelled"
         return 7, evidence
     except concurrent.futures.CancelledError:
@@ -3566,6 +3596,7 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         evidence["cleanup"]["attempted"] = True
         cleanup_started = time.monotonic()
         cleanup_ok = True
+        cleanup_exhausted_total = False
         if runtime is not None:
             try:
                 cleanup_deadline = min(
@@ -3581,24 +3612,39 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
                 if loaded_runtime is not None:
                     manager.llm = None
                     close_runtime = getattr(manager, "_close_llm_proxy", None)
-                    if not callable(close_runtime) or close_runtime(loaded_runtime) is not True:
+                    if not callable(close_runtime) or _gpu_preflight_bounded_call(
+                        lambda: close_runtime(loaded_runtime), cleanup_deadline
+                    ) is not True:
                         raise RuntimeError("gpu_preflight_worker_cleanup_failed")
-                status = manager.worker_lifecycle_status() if callable(getattr(manager, "worker_lifecycle_status", None)) else {}
+                lifecycle_status = getattr(manager, "worker_lifecycle_status", None)
+                status = (_gpu_preflight_bounded_call(lifecycle_status, cleanup_deadline)
+                          if callable(lifecycle_status) else {})
                 cleanup_ok = status.get("worker_alive") is not True and getattr(manager, "llm", None) is None
             except Exception:
                 cleanup_ok = False
+                cleanup_exhausted_total = time.monotonic() >= total_deadline
         evidence["phases"]["cleanup"].update(
             elapsed_ms=int((time.monotonic() - cleanup_started) * 1000),
             outcome="passed" if cleanup_ok else "failed",
         )
         evidence["cleanup"].update(verified=cleanup_ok, owned_worker_alive=not cleanup_ok)
         evidence["total_elapsed_ms"] = int((time.monotonic() - started) * 1000)
-        if evidence["success"] and evidence["total_elapsed_ms"] > GPU_COMPLETION_TOTAL_DEADLINE_MS:
+        phase_success = all(
+            evidence["phases"][name]["outcome"] == "passed"
+            for name in ("runtime_startup", "model_load", "generation", "cleanup")
+        )
+        if not cleanup_ok:
+            evidence.update(
+                success=False,
+                failure_code=("total_deadline_exceeded"
+                              if cleanup_exhausted_total else "cleanup_failed"),
+            )
+            return (7 if cleanup_exhausted_total else 8), evidence
+        if evidence["success"] and (
+                time.monotonic() >= total_deadline or not phase_success
+                or evidence["completion"]["count"] != 1 or not cleanup_ok):
             evidence.update(success=False, failure_code="total_deadline_exceeded")
             return 7, evidence
-        if not cleanup_ok:
-            evidence.update(success=False, failure_code="cleanup_failed")
-            return 8, evidence
 
 
 def main() -> int:

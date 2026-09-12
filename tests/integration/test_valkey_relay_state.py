@@ -35,6 +35,7 @@ from valkey_relay_state import (
     CANCEL_REQUEST_SCRIPT,
     CLAIM_SCRIPT,
     CONTROL_CLAIM_SCRIPT,
+    NODE_TRANSITION_SCRIPT,
     PENDING_TRANSITION_READ_SCRIPT,
     RENEW_CLAIM_SCRIPT,
     RETRIEVE_RESPONSE_SCRIPT,
@@ -2790,10 +2791,13 @@ def test_expire_returns_the_records_removed_at_its_atomic_cutoff(valkey_server):
         store.close()
 
 
+@pytest.mark.parametrize("cache_state", ("warm", "noscript"))
 def test_unregister_lost_reply_redaction_is_ambiguous_without_replay(
-    valkey_server, caplog
+    valkey_server, caplog, cache_state
 ):
-    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
     node_id = "node-identity-marker"
     raw_credential = "raw-credential-marker"
     owner = _digest(raw_credential)
@@ -2807,23 +2811,39 @@ def test_unregister_lost_reply_redaction_is_ambiguous_without_replay(
         owner,
     )
     original_evalsha = store._foundation._client.evalsha
-    dispatches = 0
+    attempts = successful_dispatches = 0
+    loaded_sources = []
+    original_script_load = store._foundation._client.script_load
     try:
         store.register(node_id, _capabilities(), owner)
+        if cache_state == "warm":
+            assert original_script_load(NODE_TRANSITION_SCRIPT.source)
+        else:
+            store._foundation._client.script_flush()
 
         def lose_reply(*args):
-            nonlocal dispatches
-            dispatches += 1
+            nonlocal attempts, successful_dispatches
+            attempts += 1
             original_evalsha(*args)
+            successful_dispatches += 1
             raise redis.ConnectionError(" ".join(markers))
 
+        def record_load(source):
+            loaded_sources.append(source)
+            return original_script_load(source)
+
         store._foundation._client.evalsha = lose_reply
+        store._foundation._client.script_load = record_load
         with caplog.at_level(logging.DEBUG):
             with pytest.raises(
                 ValkeyUnavailableError, match="^state backend unavailable$"
             ) as caught:
                 store.unregister(node_id, owner)
-        assert dispatches in {1, 2}
+        assert attempts == (1 if cache_state == "warm" else 2)
+        assert successful_dispatches == 1
+        assert loaded_sources == (
+            [] if cache_state == "warm" else [NODE_TRANSITION_SCRIPT.source]
+        )
         assert caught.value.__cause__ is None
         rendered = "".join(
             (
@@ -2838,12 +2858,13 @@ def test_unregister_lost_reply_redaction_is_ambiguous_without_replay(
             )
         )
         assert all(marker not in rendered for marker in markers)
-        store._foundation._client.evalsha = original_evalsha
-        assert store.get(node_id) is None
+        assert observer.get(node_id) is None
     finally:
         store._foundation._client.evalsha = original_evalsha
+        store._foundation._client.script_load = original_script_load
         store._foundation._client.delete(*_registration_keys(store, node_id))
         store.close()
+        observer.close()
 
 
 def test_expire_lost_reply_does_not_consume_a_hidden_retry_batch(valkey_server):
@@ -9714,8 +9735,9 @@ def test_node_pending_recovery_orphan_index_fences_registration_and_renewal(
         store.close()
 
 
+@pytest.mark.parametrize("replacement_pending", (False, True))
 def test_node_pending_recovery_stale_discovery_does_not_remove_replacement(
-    valkey_server, monkeypatch
+    valkey_server, monkeypatch, replacement_pending
 ):
     namespace = uuid.uuid4().hex
     first = _registration_store(valkey_server, namespace, node_transition_batch_size=1)
@@ -9727,6 +9749,11 @@ def test_node_pending_recovery_stale_discovery_does_not_remove_replacement(
         _digest("pending-race-replacement"),
     )
     identities = (("pending-race-client-1", "request-1"), ("pending-race-client-2", "request-2"))
+    replacement_identities = (
+        ("replacement-race-client-1", "request-1"),
+        ("replacement-race-client-2", "request-2"),
+    )
+    replacement_snapshot = None
     try:
         first.register(node, _capabilities(), owner)
         seconds, micros = first._foundation.server_time()
@@ -9742,27 +9769,55 @@ def test_node_pending_recovery_stale_discovery_does_not_remove_replacement(
         ).continuation_required
         original = sweeper._foundation.execute
 
-        def complete_before_hydration(script_name, *args, **kwargs):
+        def complete_after_hydration(script_name, *args, **kwargs):
+            nonlocal replacement_snapshot
             if script_name == PENDING_TRANSITION_READ_SCRIPT.name:
+                saved = original(script_name, *args, **kwargs)
                 assert finisher.unregister_node_and_transition_work(node, owner).state == "complete"
-                finisher.register(node, _capabilities(), replacement)
+                finisher.register(node, _capabilities(concurrency=3), replacement)
+                seconds, micros = finisher._foundation.server_time()
+                for identity in replacement_identities:
+                    finisher.select_and_reserve(
+                        *identity,
+                        "qwen3-8b-instruct",
+                        "8k-fast",
+                        seconds + micros / 1_000_000 + 60,
+                    )
+                if replacement_pending:
+                    assert finisher.unregister_node_and_transition_work(
+                        node, replacement
+                    ).continuation_required
+                replacement_snapshot = _node_transition_authority_snapshot(
+                    finisher, node, replacement_identities
+                )
+                return saved
             return original(script_name, *args, **kwargs)
 
         monkeypatch.setattr(
-            sweeper._foundation, "execute", complete_before_hydration
+            sweeper._foundation, "execute", complete_after_hydration
         )
         assert sweeper.expire() == ()
+        assert replacement_snapshot is not None
+        assert _node_transition_authority_snapshot(
+            finisher, node, replacement_identities
+        ) == replacement_snapshot
         current = finisher.get(node)
-        assert current is not None
-        assert current.control_credential_digest == replacement
+        if replacement_pending:
+            assert current is None
+        else:
+            assert current is not None
+            assert current.control_credential_digest == replacement
     finally:
-        _delete_claim_fixture_state(finisher, (node,), identities)
+        _delete_claim_fixture_state(
+            finisher, (node,), identities + replacement_identities
+        )
         cfg, digest = finisher._foundation.config, finisher._node_digest(node)
         finisher._foundation._client.delete(
             cfg.key("node_work", digest),
             cfg.key("node_transition", digest),
             cfg.key("node_tombstone", digest),
             cfg.key("former_owner", digest, owner),
+            cfg.key("former_owner", digest, replacement),
             cfg.key("node_transitions:pending"),
             cfg.key("node_tombstones:expiry"),
             cfg.key("former_owners:expiry"),
@@ -11774,5 +11829,164 @@ def test_node_work_contract_round_trip_cleanup_and_fresh_registration(valkey_ser
         assert writer._foundation._client.exists(work) == 0
     finally:
         _delete_claim_fixture_state(observer, (node_id,), (identity,))
+        observer.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("corruption", ("orphan_member", "wrong_marker"))
+def test_node_work_contract_rejects_registration_and_admission_corruption(
+    valkey_server, corruption
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
+    node_id, owner = f"node-work-admission-{corruption}", _digest(
+        f"node-work-admission-owner-{corruption}"
+    )
+    cfg = writer._foundation.config
+    digest = writer._node_digest(node_id)
+    work = cfg.key("node_work", digest)
+    try:
+        if corruption == "orphan_member":
+            writer._foundation._client.zadd(work, {"orphan:work": 1})
+            before = writer._foundation._client.dump(work)
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                observer.register(node_id, _capabilities(), owner)
+            assert writer._foundation._client.dump(work) == before
+            assert writer._foundation._client.exists(cfg.key("node", digest)) == 0
+        else:
+            writer.register(node_id, _capabilities(), owner)
+            writer._foundation._client.zadd(work, {"!schema:1": 2}, xx=True)
+            keys = (work, cfg.key("node", digest), cfg.key("nodes:lease"))
+            before = tuple(writer._foundation._client.dump(key) for key in keys)
+            with pytest.raises(ValkeySchemaIncompatibleError):
+                observer.select_and_reserve(
+                    "node-work-admission-client",
+                    corruption,
+                    "qwen3-8b-instruct",
+                    "8k-fast",
+                    writer._foundation.server_time()[0] + 60,
+                )
+            assert tuple(writer._foundation._client.dump(key) for key in keys) == before
+    finally:
+        writer._foundation._client.delete(*_registration_keys(writer, node_id), work)
+        observer.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("member_corruption", ("missing", "wrong_score"))
+@pytest.mark.parametrize("operation", ("enqueue", "claim", "renew", "cancel", "cleanup"))
+def test_node_work_contract_rejects_active_writer_membership_corruption(
+    valkey_server, member_corruption, operation
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
+    node_id, owner = f"node-work-{operation}-{member_corruption}", _digest(
+        f"node-work-owner-{operation}-{member_corruption}"
+    )
+    identity = (f"node-work-client-{operation}", f"request-{member_corruption}")
+    cfg = writer._foundation.config
+    digest = writer._node_digest(node_id)
+    client, request = writer._identity(*identity)
+    work = cfg.key("node_work", digest)
+    member = f"{client}:{request}"
+    selection = claim = None
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        deadline = writer._foundation.server_time()[0] + 60
+        selection = writer.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        if operation not in {"enqueue", "cleanup"}:
+            writer.enqueue_encrypted_request(
+                *identity,
+                selection.reservation_token,
+                node_id,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                EncryptedRequestEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+                ),
+                "cancel",
+            )
+        if operation in {"renew"}:
+            claim = writer.claim_queued_request(node_id, owner, "consumer")
+        if operation == "cleanup":
+            token_digest = _digest(selection.reservation_token)
+            past = writer._foundation.server_time()[0] - 1
+            writer._foundation._client.hset(
+                cfg.key("reservation", token_digest), "reservation_expires", str(past)
+            )
+            writer._foundation._client.zadd(
+                cfg.key("reservations:expiry"), {token_digest: past}
+            )
+        if member_corruption == "missing":
+            writer._foundation._client.zrem(work, member)
+        else:
+            writer._foundation._client.zadd(work, {member: 2}, xx=True)
+
+        datastore = writer._foundation._client
+
+        def authority():
+            return (
+                tuple(
+                    datastore.zrange(key, 0, -1, withscores=True)
+                    for key in (
+                        work,
+                        cfg.key("nodes:lease"),
+                        cfg.key("requests:deadline"),
+                        cfg.key("reservations:expiry"),
+                        cfg.key("claims:expiry"),
+                    )
+                ),
+                datastore.hgetall(cfg.key("node", digest)),
+                datastore.hgetall(cfg.key("request", client, request)),
+                datastore.hgetall(
+                    cfg.key("reservation", _digest(selection.reservation_token))
+                ),
+                datastore.xrange(cfg.key("queue", digest)),
+            )
+
+        before = authority()
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            if operation == "enqueue":
+                observer.enqueue_encrypted_request(
+                    *identity,
+                    selection.reservation_token,
+                    node_id,
+                    "qwen3-8b-instruct",
+                    "8k-fast",
+                    deadline,
+                    EncryptedRequestEnvelope(
+                        "tokenplace_api_v1_relay_e2ee",
+                        1,
+                        "ciphertext",
+                        "cipherkey",
+                        "iv",
+                    ),
+                    "cancel",
+                )
+            elif operation == "claim":
+                observer.claim_queued_request(node_id, owner, "consumer")
+            elif operation == "renew":
+                observer.renew_claim(
+                    node_id, owner, "consumer", *identity, claim.generation
+                )
+            elif operation == "cancel":
+                observer.cancel_or_expire_request(*identity, "cancel")
+            else:
+                observer.select_and_reserve(
+                    f"{identity[0]}-next",
+                    f"{identity[1]}-next",
+                    "qwen3-8b-instruct",
+                    "8k-fast",
+                    deadline,
+                )
+        assert authority() == before
+    finally:
+        _delete_claim_fixture_state(writer, (node_id,), (identity,))
+        writer._foundation._client.delete(work)
         observer.close()
         writer.close()

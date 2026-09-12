@@ -197,7 +197,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "60ff30dd9990e3ea5a7da5dd670da5c58ecbac5e70db0e816a4bf9f6f6aba1a6"  # pragma: allowlist secret
+    expected_digest = "0cc5fabffcf2a547a60e062751d7a62b4cf87fbb1fbadd1210c2eed7ef55cd96"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -282,10 +282,10 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
 @pytest.mark.parametrize(
     ("script", "digest"),
     (
-        (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "8d119dd0fa0d018b21c228468c86903a9ec9be7c78cd1af74b3ff61370f0b90e"),  # pragma: allowlist secret
-        (valkey_relay_state.ENQUEUE_SCRIPT, "4874ac2612eecf044ed75efc7fdbd1ed8ca47944fbe437702be9d7119f3c40d7"),  # pragma: allowlist secret
-        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "1e56de3cc00a648f79257438009d40c2846e857fac6ce6ff6920f908b713cfeb"),  # pragma: allowlist secret
-        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "33b19e7589961b771656069bb64b3425aa055d8526628523a53b9c3a8c26f91f"),  # pragma: allowlist secret
+        (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947"),  # pragma: allowlist secret
+        (valkey_relay_state.ENQUEUE_SCRIPT, "b9230062be58f017bfb618a368e3fd0d498cadf29c2793201886f1f3e40b9fcb"),  # pragma: allowlist secret
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "673eee38ba27545169d832d19d7acf48729963132ca6f106d3f0b15eeb4be949"),  # pragma: allowlist secret
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "7a22355773765ee16a35c1fbf85cc34968ab4eb822baed7115ea04f33dae77d5"),  # pragma: allowlist secret
     ),
 )
 def test_control_transition_scripts_are_digest_pinned(script, digest):

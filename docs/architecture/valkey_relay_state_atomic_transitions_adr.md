@@ -201,7 +201,7 @@ health source, or terminal-state authority.
 Each registered node owns a namespaced `node_work:<node-digest>` sorted set.  A fixed
 `!schema:1` sentinel is created in the registration transition, so a missing set is
 distinguishable from an empty node and fails closed.  Reservation admission adds the
-canonical `<client-digest>:<request-digest>` member with its allocation sequence;
+canonical `<client-digest>:<request-digest>` member at the fixed lifecycle score `1`;
 enqueue and claim retain it, while every terminal or abandoned-reservation transition
 removes it atomically.  Node removal reads only the configured batch from this set and
 therefore never uses `SCAN`, Stream-wide discovery, or an unbounded lifecycle walk.

@@ -8207,9 +8207,7 @@ def test_node_transition_accepts_writer_epoch_during_claim_renewal_orderings(
         terminal, = remover.terminal_records()
         assert terminal.outcome == "cancelled"
         assert terminal.reason == "server_unregistered"
-        assert remover._foundation._client.zrange(
-            cfg.key("node_work", node), 0, -1
-        ) == [b"!schema:1"]
+        assert remover._foundation._client.exists(cfg.key("node_work", node)) == 0
     finally:
         _delete_claim_fixture_state(writer, (node_id,), (identity,))
         writer._foundation._client.delete(
@@ -11734,3 +11732,47 @@ def test_node_transition_capacity_rejects_inconsistent_retained_authority_withou
         )
         observer.close()
         store.close()
+
+
+def test_node_work_contract_round_trip_cleanup_and_fresh_registration(valkey_server):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
+    node_id, owner = "node-work-contract", _digest("node-work-owner")
+    identity = ("node-work-client", "node-work-request")
+    cfg = writer._foundation.config
+    node_digest = writer._node_digest(node_id)
+    client, request = writer._identity(*identity)
+    work = cfg.key("node_work", node_digest)
+    member = f"{client}:{request}"
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        assert writer._foundation._client.zrange(work, 0, -1, withscores=True) == [
+            (b"!schema:1", 0.0)
+        ]
+        _enqueue_claim_fixture(
+            writer, node_id, owner, *identity, writer._foundation.server_time()[0] + 60
+        )
+        assert writer._foundation._client.zscore(work, member) == 1.0
+        claim = writer.claim_queued_request(node_id, owner, "node-work-consumer")
+        assert observer.renew_claim(
+            node_id, owner, "node-work-consumer", *identity, claim.generation
+        ).state == "continued"
+        assert observer.unregister_node_and_transition_work(node_id, owner).state == "complete"
+        assert writer._foundation._client.exists(work) == 0
+        writer.register(node_id, _capabilities(), _digest("replacement-owner"))
+        assert writer._foundation._client.zrange(work, 0, -1, withscores=True) == [
+            (b"!schema:1", 0.0)
+        ]
+        replacement = _digest("replacement-owner")
+        writer._foundation._client.zrem(work, "!schema:1")
+        node_key = cfg.key("node", node_digest)
+        before = writer._foundation._client.dump(node_key)
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            observer.renew(node_id, replacement)
+        assert writer._foundation._client.dump(node_key) == before
+        assert writer._foundation._client.exists(work) == 0
+    finally:
+        _delete_claim_fixture_state(observer, (node_id,), (identity,))
+        observer.close()
+        writer.close()

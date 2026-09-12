@@ -11111,18 +11111,55 @@ def test_node_owner_retention_rejects_malformed_fence_pair_before_registration(
         store.close()
 
 
+@pytest.mark.parametrize(
+    ("original_cause", "replacement_cause"),
+    (
+        ("explicit_unregister", "explicit_unregister"),
+        ("explicit_unregister", "registration_lease_expired"),
+        ("registration_lease_expired", "explicit_unregister"),
+        ("registration_lease_expired", "registration_lease_expired"),
+    ),
+)
 def test_node_owner_retention_retry_precedes_replacement_pending_transition(
-    valkey_server,
+    valkey_server, original_cause, replacement_cause
 ):
+    namespace = uuid.uuid4().hex
     store = _registration_store(
-        valkey_server, uuid.uuid4().hex, node_transition_batch_size=1
+        valkey_server, namespace, node_transition_batch_size=1
+    )
+    retry_store = _registration_store(
+        valkey_server, namespace, node_transition_batch_size=1
+    )
+    continuation_store = _registration_store(
+        valkey_server, namespace, node_transition_batch_size=1
     )
     node = "retained-owner-pending-replacement"
     owner_a, owner_b = map(_digest, ("retained-owner-a", "retained-owner-b"))
     identities = (("retained-pending-client", "one"), ("retained-pending-client", "two"))
+
+    def remove(owner, cause, *, expected_epoch=""):
+        if cause == "registration_lease_expired":
+            seconds, micros = store._foundation.server_time()
+            cutoff = seconds + micros / 1_000_000
+            digest = store._node_digest(node)
+            node_key = store._foundation.config.key("node", digest)
+            if store._foundation._client.exists(node_key):
+                store._foundation._client.hset(
+                    node_key, "lease_expires_at_epoch", str(cutoff)
+                )
+                store._foundation._client.zadd(
+                    store._foundation.config.key("nodes:lease"), {digest: cutoff}
+                )
+        return continuation_store.unregister_node_and_transition_work(
+            node,
+            owner if cause == "explicit_unregister" else None,
+            cause=cause,
+            _expected_transition_epoch=expected_epoch,
+        )
+
     try:
         store.register(node, _capabilities(), owner_a)
-        original = store.unregister_node_and_transition_work(node, owner_a)
+        original = remove(owner_a, original_cause)
         assert original.state == "complete"
 
         store.register(node, _capabilities(), owner_b)
@@ -11130,27 +11167,42 @@ def test_node_owner_retention_retry_precedes_replacement_pending_transition(
             store.select_and_reserve(
                 *identity, "qwen3-8b-instruct", "8k-fast", time.time() + 60
             )
-        pending = store.unregister_node_and_transition_work(node, owner_b)
+        pending = remove(owner_b, replacement_cause)
         assert pending.state == "transitioning"
 
         cfg, digest = store._foundation.config, store._node_digest(node)
+        pending_epoch = store._foundation._client.hget(
+            cfg.key("node_transition", digest), "transition_epoch"
+        ).decode("ascii")
         extra = (
             cfg.key("former_owner", digest, owner_a),
             cfg.key("former_owner", digest, owner_b),
         )
         before = _node_transition_authority_snapshot(store, node, identities, extra)
-        retry = store.unregister_node_and_transition_work(node, owner_a)
+        stale = continuation_store.unregister_node_and_transition_work(
+            node,
+            owner_b if replacement_cause == "explicit_unregister" else None,
+            cause=replacement_cause,
+            _expected_transition_epoch="0",
+        )
+        assert stale.state == "stale"
+        assert _node_transition_authority_snapshot(store, node, identities, extra) == before
+
+        retry = retry_store.unregister_node_and_transition_work(node, owner_a)
         assert retry.state == "already_complete"
         assert retry.cause == original.cause
         assert retry.transition_epoch == original.transition_epoch
         assert _node_transition_authority_snapshot(store, node, identities, extra) == before
 
-        completed = store.unregister_node_and_transition_work(node, owner_b)
+        completed = remove(owner_b, replacement_cause, expected_epoch=pending_epoch)
         assert completed.state == "complete"
+        assert completed.cause == replacement_cause
         assert completed.transition_epoch == pending.transition_epoch
     finally:
         _delete_claim_fixture_state(store, (node,), identities)
         store.close()
+        retry_store.close()
+        continuation_store.close()
 
 
 @pytest.mark.parametrize("authority", ("fence_owner", "fence_index", "tomb_owner", "tomb_index"))

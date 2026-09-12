@@ -355,6 +355,9 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "reserved=rv[2]==od and rv[3]==fv[3] and rv[6]==fv[5]" in script.source
     assert "if redis.call('EXISTS',tomb)==1 then redis.call('HSET',tomb,'completed','1') end" in script.source
     assert "A completed owner's retained fence is distinct" in script.source
+    assert script.source.index("if cause=='explicit_unregister' and pv[3]~=supplied") < (
+        script.source.index("if pv[4]~=cause then return {'conflict'} end")
+    )
     assert "fv[5]~=epoch or finite(fv[6])~=fs" in script.source
     assert "tv[5]~=epoch" in script.source
 

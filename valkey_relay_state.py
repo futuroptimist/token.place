@@ -2183,10 +2183,10 @@ else
   if pv[1]~=node_id or pv[2]~=node_digest or not digest(pv[3]) or pv[5]~='cancelled' or pv[6]~='server_unregistered' or not finite(pv[7]) then return {'schema'} end
   if not finite(redis.call('ZSCORE',pending_index,node_digest)) then return {'schema'} end
   if expected_epoch~='' and pv[7]~=expected_epoch then return {'stale'} end
-  if pv[4]~=cause then return {'conflict'} end
   if cause=='explicit_unregister' and pv[3]~=supplied then
     -- A completed owner's retained fence is distinct from the fence reserved by
-    -- the replacement owner's current pending transition.
+    -- the replacement owner's current pending transition, regardless of why
+    -- that replacement is being removed.
     local fm=node_digest..':'..supplied; local fx=redis.call('EXISTS',fence)==1
     local fs=finite(redis.call('ZSCORE',fence_expiries,fm))
     if fx~=(fs~=nil) then return {'schema'} end
@@ -2199,6 +2199,7 @@ else
     end
     return {'credential_mismatch'}
   end
+  if pv[4]~=cause then return {'conflict'} end
   owner=pv[3]; epoch=pv[7]
   if redis.call('EXISTS',node)~=0 or redis.call('ZSCORE',leases,node_digest) then return {'schema'} end
   if redis.call('ZRANK',work,'!schema:1')~=0 or redis.call('ZSCORE',work,'!schema:1')~='0' then return {'schema'} end
@@ -2475,7 +2476,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "7127cd4d12f03c80864f68c54eb62b8b9e45e92b0ad7c25a0c028258d561729a",  # pragma: allowlist secret
+    "aea0313c3c06a01f996108094ee71a945c704bb3a0b99157d76890e1f5b39f0f",  # pragma: allowlist secret
     True,
 )
 

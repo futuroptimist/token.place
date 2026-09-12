@@ -47,6 +47,7 @@ const BENCHMARK_TOKENIZER_REQUEST_ARG_NAME: &str =
     "--token-place-long-context-benchmark-tokenizer-request";
 const BENCHMARK_TOKENIZER_EVIDENCE_ARG_NAME: &str =
     "--token-place-long-context-benchmark-tokenizer-evidence";
+const GPU_COMPLETION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(190);
 
 fn benchmark_stage_path(evidence: &Path) -> PathBuf {
     let mut stage = evidence.as_os_str().to_os_string();
@@ -2768,6 +2769,167 @@ pub(crate) fn operator_start_preflight_record(
         );
     }
     Ok(payload)
+}
+
+fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value> {
+    fn exact_keys(value: Option<&Value>, expected: &[&str]) -> bool {
+        value.and_then(Value::as_object).is_some_and(|map| {
+            map.len() == expected.len() && map.keys().all(|key| expected.contains(&key.as_str()))
+        })
+    }
+    let allowed_keys = [
+        "schema_version",
+        "qualification",
+        "success",
+        "failure_code",
+        "artifact",
+        "identity",
+        "backend",
+        "completion",
+        "phases",
+        "total_deadline_ms",
+        "total_elapsed_ms",
+        "cleanup",
+        "side_effects",
+    ];
+    let keys_are_allowlisted = event.as_object().is_some_and(|map| {
+        map.len() == allowed_keys.len()
+            && map.keys().all(|key| allowed_keys.contains(&key.as_str()))
+    }) && exact_keys(event.get("artifact"), &["filename", "size_bytes"])
+        && exact_keys(
+            event.get("identity"),
+            &[
+                "app_version",
+                "build_id",
+                "target_triple",
+                "bundled_runtime_id",
+                "runtime_id",
+            ],
+        )
+        && exact_keys(
+            event.get("backend"),
+            &["declared", "observed", "gpu_verified"],
+        )
+        && exact_keys(
+            event.get("completion"),
+            &["path", "count", "max_output_tokens", "result"],
+        )
+        && exact_keys(
+            event.get("cleanup"),
+            &["attempted", "verified", "owned_worker_alive"],
+        )
+        && exact_keys(
+            event.get("side_effects"),
+            &["relay_contacts", "registrations", "benchmark_attempts"],
+        )
+        && exact_keys(
+            event.get("phases"),
+            &[
+                "runtime_startup",
+                "model_load",
+                "generation",
+                "cancellation",
+                "cleanup",
+            ],
+        )
+        && event
+            .get("phases")
+            .and_then(Value::as_object)
+            .is_some_and(|phases| {
+                phases
+                    .values()
+                    .all(|phase| exact_keys(Some(phase), &["deadline_ms", "elapsed_ms", "outcome"]))
+            });
+    let success = event.get("success").and_then(Value::as_bool) == Some(true);
+    let accepted_success = !success
+        || (event.pointer("/completion/count").and_then(Value::as_u64) == Some(1)
+            && event.pointer("/completion/result").and_then(Value::as_str) == Some("passed")
+            && event
+                .pointer("/backend/gpu_verified")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && matches!(
+                event.pointer("/backend/observed").and_then(Value::as_str),
+                Some("cuda" | "metal")
+            )
+            && event.pointer("/cleanup/verified").and_then(Value::as_bool) == Some(true)
+            && event
+                .pointer("/cleanup/owned_worker_alive")
+                .and_then(Value::as_bool)
+                == Some(false));
+    let valid = keys_are_allowlisted
+        && event.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && event.get("qualification").and_then(Value::as_str)
+            == Some("installed_gpu_child_worker_completion")
+        && event.get("success").and_then(Value::as_bool).is_some()
+        && event.get("failure_code").and_then(Value::as_str).is_some()
+        && accepted_success
+        && event
+            .pointer("/side_effects/relay_contacts")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && event
+            .pointer("/side_effects/registrations")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && event
+            .pointer("/side_effects/benchmark_attempts")
+            .and_then(Value::as_u64)
+            == Some(0);
+    if !valid {
+        anyhow::bail!("gpu_completion_preflight_rejected")
+    }
+    Ok(event)
+}
+
+pub(crate) fn operator_gpu_completion_preflight_record(
+    config: &DesktopConfig,
+    app: &AppHandle,
+) -> anyhow::Result<Value> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let current_exe = std::env::current_exe().ok();
+    let resource_dir = app.path().resource_dir().ok();
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
+        manifest_dir,
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
+    let preparation = prepare_operator_bridge_launch(&context)?;
+    let launcher = preparation
+        .launcher
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("gpu_completion_preflight_bundled_runtime_missing"))?;
+    if !matches!(launcher.source, PythonLauncherSource::BundledRuntime) {
+        anyhow::bail!("gpu_completion_preflight_system_runtime_rejected");
+    }
+    let mut command = preparation.command()?;
+    configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
+    let identity = crate::build_identity::build_identity();
+    command
+        .env("TOKENPLACE_APP_VERSION", identity.app_version)
+        .env("TOKENPLACE_BUILD_ID", identity.build_id)
+        .env("TOKENPLACE_TARGET_TRIPLE", identity.target_triple)
+        .env("TOKENPLACE_BUNDLED_RUNTIME_ID", identity.bundled_runtime_id)
+        .env("TOKENPLACE_RUNTIME_ID", &launcher.runtime_id)
+        .arg("--installed-gpu-completion-preflight")
+        .arg("--model")
+        .arg(&config.model_path)
+        .arg("--mode")
+        .arg(format!("{:?}", config.preferred_mode).to_lowercase())
+        .arg("--context-tier")
+        .arg("8k-fast");
+    std::thread::spawn(move || -> anyhow::Result<Value> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_operator_preflight_child(
+                command,
+                GPU_COMPLETION_PREFLIGHT_TIMEOUT,
+                validate_gpu_completion_preflight_event,
+            ))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("gpu_completion_preflight_child_failed"))?
 }
 
 /// Structural-only smoke gate: confirms the packaged app launches, resolves
@@ -8895,6 +9057,46 @@ mod tests {
                 "rejected inspect payload should fail: {rejected}"
             );
         }
+    }
+
+    #[test]
+    fn gpu_completion_preflight_validator_requires_single_gpu_completion_and_cleanup() {
+        let accepted = serde_json::json!({
+            "schema_version": 1,
+            "qualification": "installed_gpu_child_worker_completion",
+            "success": true,
+            "failure_code": "none",
+            "artifact": {"filename": "Qwen3-8B-Q4_K_M.gguf", "size_bytes": 1},
+            "identity": {"app_version": "0.1.18", "build_id": "build", "target_triple": "target", "bundled_runtime_id": "runtime", "runtime_id": "runtime"},
+            "backend": {"declared": "cuda", "observed": "cuda", "gpu_verified": true},
+            "completion": {"path": "shared_api_v1_generation", "count": 1, "max_output_tokens": 64, "result": "passed"},
+            "phases": {
+                "runtime_startup": {"deadline_ms": 45000, "elapsed_ms": 1, "outcome": "passed"},
+                "model_load": {"deadline_ms": 120000, "elapsed_ms": 1, "outcome": "passed"},
+                "generation": {"deadline_ms": 45000, "elapsed_ms": 1, "outcome": "passed"},
+                "cancellation": {"deadline_ms": 5000, "elapsed_ms": 0, "outcome": "not_started"},
+                "cleanup": {"deadline_ms": 10000, "elapsed_ms": 1, "outcome": "passed"}
+            },
+            "total_deadline_ms": 180000,
+            "total_elapsed_ms": 1,
+            "cleanup": {"attempted": true, "verified": true, "owned_worker_alive": false},
+            "side_effects": {"relay_contacts": 0, "registrations": 0, "benchmark_attempts": 0}
+        });
+        assert!(validate_gpu_completion_preflight_event(accepted.clone()).is_ok());
+        for pointer in ["/backend/gpu_verified", "/cleanup/verified"] {
+            let mut rejected = accepted.clone();
+            *rejected.pointer_mut(pointer).expect("fixture pointer") = Value::Bool(false);
+            assert!(validate_gpu_completion_preflight_event(rejected).is_err());
+        }
+        let mut duplicate = accepted.clone();
+        duplicate["completion"]["count"] = Value::from(2);
+        assert!(validate_gpu_completion_preflight_event(duplicate).is_err());
+        let mut failed = accepted;
+        failed["success"] = Value::Bool(false);
+        failed["failure_code"] = Value::String("cleanup_failed".into());
+        assert!(validate_gpu_completion_preflight_event(failed.clone()).is_ok());
+        failed["secret"] = Value::String("must not pass".into());
+        assert!(validate_gpu_completion_preflight_event(failed).is_err());
     }
 
     #[test]

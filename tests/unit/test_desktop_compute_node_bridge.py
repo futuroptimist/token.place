@@ -68,6 +68,152 @@ def test_headless_boundary_rejects_non_cpu_before_runtime(monkeypatch, tmp_path,
     assert result["warm_load_result"] == "not_started"
 
 
+class _CompletionPreflightManager:
+    file_name = "Qwen3-8B-Q4_K_M.gguf"
+    use_mock_llm = False
+
+    def __init__(self):
+        self.llm = object()
+        self.last_compute_diagnostics = {}
+
+    def worker_lifecycle_status(self):
+        return {"worker_alive": self.llm is not None}
+
+    def _validate_existing_model_artifact(self, **_kwargs):
+        return True, "valid"
+
+
+class _CompletionPreflightRuntime:
+    def __init__(self, _config, *, outcome="success", duplicate=False, cleanup=True):
+        self.model_manager = _CompletionPreflightManager()
+        self.outcome = outcome
+        self.duplicate = duplicate
+        self.cleanup = cleanup
+        self.relay_client = SimpleNamespace(
+            _generate_api_v1_response_with_runtime_model=lambda **_kwargs: {
+                "api_v1_response": {"message": {"role": "assistant", "content": "private output"}}
+            }
+        )
+
+    def ensure_api_v1_runtime_ready(self):
+        self.relay_client._generate_api_v1_response_with_runtime_model()
+        if self.duplicate:
+            self.relay_client._generate_api_v1_response_with_runtime_model()
+        self.model_manager.last_compute_diagnostics = {
+            "api_v1_readiness_completion_smoke_result": "passed" if self.outcome == "success" else self.outcome,
+            "api_v1_readiness_backend_used": "cuda",
+        }
+        return self.outcome == "success"
+
+    def stop(self, **_kwargs):
+        if not self.cleanup:
+            raise RuntimeError("sensitive cleanup detail")
+        self.model_manager.llm = None
+
+
+def _completion_preflight_args(model):
+    return SimpleNamespace(model=str(model), mode="gpu", context_tier="8k-fast")
+
+
+def _completion_preflight_environment(monkeypatch):
+    for name, value in {
+        "TOKENPLACE_APP_VERSION": "0.1.18",
+        "TOKENPLACE_BUILD_ID": "build-test",
+        "TOKENPLACE_TARGET_TRIPLE": "x86_64-pc-windows-msvc",
+        "TOKENPLACE_BUNDLED_RUNTIME_ID": "runtime-test",
+        "TOKENPLACE_RUNTIME_ID": "runtime-test",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(compute_node_bridge, "ensure_desktop_python_dependencies", lambda: {"ok": "true"})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "_ensure_desktop_llama_runtime_for_context",
+        lambda *_args: {"selected_backend": "cuda", "runtime_action": "already_supported"},
+    )
+
+
+def test_installed_gpu_completion_preflight_success_is_single_and_private(monkeypatch, tmp_path):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), _CompletionPreflightRuntime
+    )
+
+    assert code == 0
+    assert evidence["success"] is True
+    assert evidence["completion"]["count"] == 1
+    assert evidence["backend"] == {"declared": "cuda", "observed": "cuda", "gpu_verified": True}
+    assert evidence["cleanup"] == {"attempted": True, "verified": True, "owned_worker_alive": False}
+    serialized = json.dumps(evidence)
+    assert "private output" not in serialized
+    assert str(model.parent) not in serialized
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("identity", "runtime_identity_mismatch"),
+        ("model", "model_identity_mismatch"),
+        ("fallback", "gpu_runtime_unavailable"),
+        ("observed_cpu", "cpu_fallback_or_unverified_gpu"),
+        ("malformed", "completion_failed"),
+        ("worker_exit", "worker_or_protocol_failure"),
+        ("deadline", "phase_deadline_exceeded"),
+        ("cancellation", "generation_cancelled"),
+        ("duplicate", "worker_or_protocol_failure"),
+        ("cleanup", "cleanup_failed"),
+    ],
+)
+def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, mutation, expected):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+    runtime_options = {}
+    if mutation == "identity":
+        monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "system-runtime")
+    elif mutation == "model":
+        model = tmp_path / "unapproved.gguf"
+        model.write_bytes(b"fixture")
+    elif mutation == "fallback":
+        monkeypatch.setattr(compute_node_bridge, "_ensure_desktop_llama_runtime_for_context", lambda *_args: {"selected_backend": "cpu"})
+    elif mutation == "duplicate":
+        runtime_options["duplicate"] = True
+    elif mutation == "cleanup":
+        runtime_options["cleanup"] = False
+
+    class Runtime(_CompletionPreflightRuntime):
+        def __init__(self, config):
+            super().__init__(config, **runtime_options)
+            if mutation == "observed_cpu":
+                original = self.ensure_api_v1_runtime_ready
+                def cpu_result():
+                    result = original()
+                    self.model_manager.last_compute_diagnostics["api_v1_readiness_backend_used"] = "cpu"
+                    return result
+                self.ensure_api_v1_runtime_ready = cpu_result
+            elif mutation == "malformed":
+                self.outcome = "invalid_api_v1_envelope"
+            elif mutation == "worker_exit":
+                self.ensure_api_v1_runtime_ready = lambda: (_ for _ in ()).throw(RuntimeError("secret child log"))
+            elif mutation == "deadline":
+                self.ensure_api_v1_runtime_ready = lambda: (_ for _ in ()).throw(TimeoutError("secret timeout detail"))
+            elif mutation == "cancellation":
+                self.ensure_api_v1_runtime_ready = lambda: (_ for _ in ()).throw(compute_node_bridge.concurrent.futures.CancelledError("secret cancellation detail"))
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), Runtime
+    )
+
+    assert code != 0 or evidence["success"] is False
+    assert evidence["success"] is False
+    assert evidence["failure_code"] == expected
+    serialized = json.dumps(evidence)
+    assert "secret child log" not in serialized
+    assert "fixture" not in serialized
+
+
 @pytest.mark.parametrize(
     ("ready", "diagnostics", "expected"),
     [

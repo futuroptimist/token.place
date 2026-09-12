@@ -3258,12 +3258,215 @@ def headless_cpu_admission(args: Any) -> int:
             return 8
 
 
+GPU_COMPLETION_EVIDENCE_VERSION = 1
+GPU_COMPLETION_OUTPUT_TOKENS = 64
+GPU_COMPLETION_PHASE_DEADLINES_MS = {
+    "runtime_startup": 45_000,
+    "model_load": 120_000,
+    "generation": 45_000,
+    "cancellation": 5_000,
+    "cleanup": 10_000,
+}
+GPU_COMPLETION_TOTAL_DEADLINE_MS = 180_000
+
+
+def _gpu_completion_evidence(*, success: bool = False, failure_code: str = "not_started") -> Dict[str, Any]:
+    """Return the fixed, privacy-safe installed qualification evidence schema."""
+    return {
+        "schema_version": GPU_COMPLETION_EVIDENCE_VERSION,
+        "qualification": "installed_gpu_child_worker_completion",
+        "success": success,
+        "failure_code": failure_code,
+        "artifact": {"filename": "unknown", "size_bytes": 0},
+        "identity": {
+            "app_version": os.environ.get("TOKENPLACE_APP_VERSION", "unknown"),
+            "build_id": os.environ.get("TOKENPLACE_BUILD_ID", "unknown"),
+            "target_triple": os.environ.get("TOKENPLACE_TARGET_TRIPLE", "unknown"),
+            "bundled_runtime_id": os.environ.get("TOKENPLACE_BUNDLED_RUNTIME_ID", "unknown"),
+            "runtime_id": os.environ.get("TOKENPLACE_RUNTIME_ID", "unknown"),
+        },
+        "backend": {"declared": "unknown", "observed": "unknown", "gpu_verified": False},
+        "completion": {
+            "path": "shared_api_v1_generation",
+            "count": 0,
+            "max_output_tokens": GPU_COMPLETION_OUTPUT_TOKENS,
+            "result": "not_started",
+        },
+        "phases": {
+            name: {"deadline_ms": deadline, "elapsed_ms": 0, "outcome": "not_started"}
+            for name, deadline in GPU_COMPLETION_PHASE_DEADLINES_MS.items()
+        },
+        "total_deadline_ms": GPU_COMPLETION_TOTAL_DEADLINE_MS,
+        "total_elapsed_ms": 0,
+        "cleanup": {"attempted": False, "verified": False, "owned_worker_alive": False},
+        "side_effects": {"relay_contacts": 0, "registrations": 0, "benchmark_attempts": 0},
+    }
+
+
+def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -> tuple[int, Dict[str, Any]]:
+    """Run exactly the production readiness completion, locally, then tear it down.
+
+    The production readiness path already performs one bounded, non-streaming
+    completion for Qwen. Reusing that completion avoids a second hidden warm-up
+    inference while exercising the actual subprocess worker and API-v1 generator.
+    """
+    started = time.monotonic()
+    evidence = _gpu_completion_evidence()
+    runtime = None
+    manager = None
+    code = 1
+    bounded_env_names = (
+        "TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION",
+        "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS",
+        "TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS",
+    )
+    previous_bounded_env = {name: os.environ.get(name) for name in bounded_env_names}
+    try:
+        identities = evidence["identity"]
+        if (not all(value != "unknown" for value in identities.values())
+                or identities["runtime_id"] != identities["bundled_runtime_id"]):
+            evidence["failure_code"] = "runtime_identity_mismatch"
+            return 3, evidence
+        model = Path(str(getattr(args, "model", ""))).resolve()
+        if not model.is_file():
+            evidence["failure_code"] = "model_missing"
+            return 3, evidence
+        mode = _normalize_compute_mode_local(str(getattr(args, "mode", "auto")))
+        if mode not in {"auto", "gpu", "hybrid"}:
+            evidence["failure_code"] = "gpu_mode_required"
+            return 2, evidence
+
+        phase_started = time.monotonic()
+        dependency = ensure_desktop_python_dependencies()
+        setup = _ensure_desktop_llama_runtime_for_context(mode, "8k-fast")
+        evidence["phases"]["runtime_startup"].update(
+            elapsed_ms=int((time.monotonic() - phase_started) * 1000),
+            outcome="passed" if dependency.get("ok") == "true" else "failed",
+        )
+        declared = setup.get("selected_backend", "unknown")
+        evidence["backend"]["declared"] = declared
+        if dependency.get("ok") != "true" or declared not in {"cuda", "metal"}:
+            evidence["failure_code"] = "gpu_runtime_unavailable"
+            return 4, evidence
+
+        from utils.compute_node_runtime import ComputeNodeRuntime, ComputeNodeRuntimeConfig, apply_compute_mode
+        factory = runtime_factory or ComputeNodeRuntime
+        runtime = factory(ComputeNodeRuntimeConfig(
+            relay_url="http://127.0.0.1:1", relay_port=1,
+            use_configured_relay_fallbacks=False,
+            relay_urls=("http://127.0.0.1:1",),
+        ))
+        manager = runtime.model_manager
+        if getattr(manager, "use_mock_llm", False):
+            evidence["failure_code"] = "mock_runtime_rejected"
+            return 4, evidence
+        expected_filename = str(getattr(manager, "file_name", ""))
+        if model.name != expected_filename or expected_filename != "Qwen3-8B-Q4_K_M.gguf":
+            evidence["failure_code"] = "model_identity_mismatch"
+            return 3, evidence
+        evidence["artifact"] = {"filename": model.name, "size_bytes": model.stat().st_size}
+        manager.model_path = str(model)
+        manager.parent_model_path_exists = True
+        manager.model_path_was_relative = False
+        validate_artifact = getattr(manager, "_validate_existing_model_artifact", None)
+        if not callable(validate_artifact):
+            evidence["failure_code"] = "model_identity_validation_unavailable"
+            return 3, evidence
+        artifact_valid, _artifact_reason = validate_artifact(hash_if_suspect=False)
+        if artifact_valid is not True:
+            evidence["failure_code"] = "model_identity_mismatch"
+            return 3, evidence
+
+        def reject_download(*_args: Any, **_kwargs: Any) -> bool:
+            raise RuntimeError("qualification_model_download_forbidden")
+
+        manager.download_file_in_chunks = reject_download
+        apply_compute_mode(manager, mode)
+        manager.desktop_runtime_probe = dict(setup)
+        generation_client = runtime.relay_client
+        generate = getattr(generation_client, "_generate_api_v1_response_with_runtime_model", None)
+        completion_count = 0
+        if not callable(generate):
+            evidence["failure_code"] = "generation_boundary_missing"
+            return 5, evidence
+
+        def counted_generate(*call_args: Any, **call_kwargs: Any) -> Any:
+            nonlocal completion_count
+            completion_count += 1
+            if completion_count > 1:
+                raise RuntimeError("duplicate_qualification_completion")
+            return generate(*call_args, **call_kwargs)
+
+        generation_client._generate_api_v1_response_with_runtime_model = counted_generate
+        os.environ["TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION"] = "1"
+        os.environ["TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS"] = "45"
+        os.environ["TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS"] = "45"
+
+        phase_started = time.monotonic()
+        ready = bool(runtime.ensure_api_v1_runtime_ready())
+        load_elapsed = int((time.monotonic() - phase_started) * 1000)
+        diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
+        smoke_result = diagnostics.get("api_v1_readiness_completion_smoke_result")
+        observed = diagnostics.get("api_v1_readiness_backend_used") or diagnostics.get("backend_used")
+        evidence["phases"]["model_load"].update(elapsed_ms=load_elapsed, outcome="passed" if ready else "failed")
+        evidence["phases"]["generation"].update(elapsed_ms=load_elapsed, outcome="passed" if smoke_result == "passed" else "failed")
+        evidence["backend"].update(observed=observed or "unknown", gpu_verified=observed == declared and observed in {"cuda", "metal"})
+        evidence["completion"].update(count=completion_count, result=smoke_result or "missing")
+        if completion_count != 1:
+            evidence["failure_code"] = "completion_count_invalid"
+            return 5, evidence
+        if not ready or smoke_result != "passed":
+            evidence["failure_code"] = "completion_failed"
+            return 5, evidence
+        if not evidence["backend"]["gpu_verified"]:
+            evidence["failure_code"] = "cpu_fallback_or_unverified_gpu"
+            return 6, evidence
+        evidence.update(success=True, failure_code="none")
+        code = 0
+        return code, evidence
+    except (TimeoutError, concurrent.futures.TimeoutError):
+        evidence["failure_code"] = "phase_deadline_exceeded"
+        return 7, evidence
+    except concurrent.futures.CancelledError:
+        evidence["failure_code"] = "generation_cancelled"
+        return 7, evidence
+    except Exception:
+        evidence["failure_code"] = "worker_or_protocol_failure"
+        return 7, evidence
+    finally:
+        for name, previous in previous_bounded_env.items():
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
+        evidence["cleanup"]["attempted"] = True
+        cleanup_started = time.monotonic()
+        cleanup_ok = True
+        if runtime is not None:
+            try:
+                runtime.stop(shutdown_deadline=time.monotonic() + 10.0)
+                status = manager.worker_lifecycle_status() if callable(getattr(manager, "worker_lifecycle_status", None)) else {}
+                cleanup_ok = status.get("worker_alive") is not True and getattr(manager, "llm", None) is None
+            except Exception:
+                cleanup_ok = False
+        evidence["phases"]["cleanup"].update(
+            elapsed_ms=int((time.monotonic() - cleanup_started) * 1000),
+            outcome="passed" if cleanup_ok else "failed",
+        )
+        evidence["cleanup"].update(verified=cleanup_ok, owned_worker_alive=not cleanup_ok)
+        evidence["total_elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        if not cleanup_ok:
+            evidence.update(success=False, failure_code="cleanup_failed")
+            return 8, evidence
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--installed-context-smoke", action="store_true")
     parser.add_argument("--operator-runtime-preflight", action="store_true")
     parser.add_argument("--operator-runtime-preflight-cpu-smoke", action="store_true")
     parser.add_argument("--headless-cpu-admission", action="store_true")
+    parser.add_argument("--installed-gpu-completion-preflight", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3281,6 +3484,11 @@ def main() -> int:
 
     if args.headless_cpu_admission:
         return headless_cpu_admission(args)
+
+    if args.installed_gpu_completion_preflight:
+        exit_code, evidence = installed_gpu_completion_preflight(args)
+        print(json.dumps(evidence, sort_keys=True, separators=(",", ":")), flush=True)
+        return 8 if not evidence["cleanup"]["verified"] else exit_code
 
     if args.installed_context_smoke:
         print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))

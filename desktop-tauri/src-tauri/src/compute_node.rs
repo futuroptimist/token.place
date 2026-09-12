@@ -4297,7 +4297,7 @@ mod tests {
         for (key, value) in [
             ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
             ("TOKENPLACE_BUILD_ID", "build-test"),
-            ("TOKENPLACE_APP_VERSION", "0.1.17"),
+            ("TOKENPLACE_APP_VERSION", "0.1.18"),
             ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
             ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
             ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),
@@ -4322,7 +4322,7 @@ mod tests {
         for (key, value) in [
             ("TOKENPLACE_COMPUTE_NODE_SESSION_ID", "session-test"),
             ("TOKENPLACE_BUILD_ID", "build-test"),
-            ("TOKENPLACE_APP_VERSION", "0.1.17"),
+            ("TOKENPLACE_APP_VERSION", "0.1.18"),
             ("TOKENPLACE_TARGET_TRIPLE", "target-test"),
             ("TOKENPLACE_LAUNCHER_SOURCE", "bundled_runtime"),
             ("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundled-runtime-test"),

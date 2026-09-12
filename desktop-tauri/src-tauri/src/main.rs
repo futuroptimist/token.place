@@ -288,6 +288,59 @@ fn run_model_bridge(app: &tauri::AppHandle, action: &str) -> Result<ModelArtifac
     }
 }
 
+fn run_installed_gpu_completion_preflight(app: &tauri::AppHandle) -> Result<i32, String> {
+    let model = run_model_bridge(app, "inspect")?;
+    if !model.exists {
+        return Err("approved packaged model is missing".into());
+    }
+    let exe_path = std::env::current_exe().ok();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let resource_dir = app.path().resource_dir().ok();
+    let context = python_runtime::BridgeResourceContext {
+        exe_path: exe_path.as_deref(),
+        manifest_dir,
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
+    let launcher = python_runtime::resolve_python_launcher_resource_aware(
+        context.launcher_options("TOKEN_PLACE_PYTHON"),
+    )
+    .map_err(|error| format!("unable to resolve packaged Python runtime: {error}"))?;
+    if launcher.source != python_runtime::PythonLauncherSource::BundledRuntime {
+        return Err("installed completion preflight requires the bundled Python runtime".into());
+    }
+    let bridge =
+        context.resolve_bridge_script_path("compute_node_bridge.py", Some(&launcher.program))?;
+    let mut command = launcher
+        .command_for_script_blocking(&bridge)
+        .map_err(|_| python_runtime::PACKAGED_PYTHON_ENVIRONMENT_INVALID.to_string())?;
+    configure_runtime_pythonpath_for(
+        &mut command,
+        &bridge,
+        exe_path.as_deref(),
+        manifest_dir,
+        resource_dir.as_deref(),
+    );
+    let identity = build_identity::build_identity();
+    command
+        .arg("--installed-gpu-completion-preflight")
+        .arg("--mode")
+        .arg("gpu")
+        .arg("--model")
+        .arg(&model.resolved_model_path)
+        .env("TOKENPLACE_APP_VERSION", identity.app_version)
+        .env("TOKENPLACE_BUILD_ID", identity.build_id)
+        .env("TOKENPLACE_TARGET_TRIPLE", identity.target_triple)
+        .env(
+            "TOKENPLACE_BUNDLED_RUNTIME_ID",
+            &identity.bundled_runtime_id,
+        )
+        .env("TOKENPLACE_RUNTIME_ID", identity.bundled_runtime_id);
+    let status = command
+        .status()
+        .map_err(|error| format!("unable to start completion preflight: {error}"))?;
+    Ok(status.code().unwrap_or(1))
+}
+
 fn resolve_config_dir(app: &tauri::AppHandle, state: &AppState) -> anyhow::Result<PathBuf> {
     if let Some(existing) = state.config_dir.blocking_lock().clone() {
         return Ok(existing);
@@ -671,6 +724,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .setup(|app| {
+            if std::env::args().any(|arg| arg == "--installed-gpu-completion-preflight") {
+                let code = run_installed_gpu_completion_preflight(&app.handle())
+                    .map_err(std::io::Error::other)?;
+                std::process::exit(code);
+            }
             if std::env::args().any(|arg| arg == "--operator-start-preflight") {
                 let config = load_config_from_path(&config_path(&cli_config_dir()))
                     .map_err(std::io::Error::other)?;

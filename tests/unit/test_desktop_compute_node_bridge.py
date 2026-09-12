@@ -32,6 +32,137 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(compute_node_bridge)
 
 
+class _CompletionPreflightManager:
+    use_mock_llm = False
+    llm = None
+
+    def get_llm_instance(self):
+        self.llm = SimpleNamespace()
+        return self.llm
+
+    def create_chat_completion_with_recovery(self, **_kwargs):
+        return {'choices': [{'message': {'content': 'ok'}}]}
+
+    def _close_llm_proxy(self, _runtime):
+        return True
+
+
+class _CompletionPreflightRuntime:
+    last = None
+
+    def __init__(self, _config):
+        self.model_manager = _CompletionPreflightManager()
+        self.stopped = False
+        type(self).last = self
+
+    def stop(self, **_kwargs):
+        self.stopped = True
+
+
+@pytest.fixture
+def completion_preflight(monkeypatch, tmp_path):
+    from utils.llm.model_profiles import get_default_model_profile
+    profile = get_default_model_profile()
+    model = tmp_path / profile['filename']
+    model.write_bytes(b'controlled model identity')
+    for name, value in {
+        'TOKENPLACE_APP_VERSION': '0.1.18', 'TOKENPLACE_BUILD_ID': 'a' * 40,
+        'TOKENPLACE_TARGET_TRIPLE': 'x86_64-pc-windows-msvc',
+        'TOKENPLACE_BUNDLED_RUNTIME_ID': 'runtime-1', 'TOKENPLACE_RUNTIME_ID': 'runtime-1',
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(compute_node_bridge, 'ensure_desktop_python_dependencies',
+                        lambda **_kwargs: {'ok': 'true'})
+    monkeypatch.setattr(compute_node_bridge, '_ensure_desktop_llama_runtime_for_context',
+                        lambda *_args: {'selected_backend': 'cuda', 'detected_device': 'cuda'})
+    monkeypatch.setattr(compute_node_runtime, 'ComputeNodeRuntime', _CompletionPreflightRuntime)
+    monkeypatch.setattr(compute_node_runtime, 'apply_compute_mode', lambda *_args: None)
+    monkeypatch.setattr(compute_node_bridge, '_load_context_profile_helpers',
+                        lambda: (lambda *_args: None, lambda tier: tier))
+    return SimpleNamespace(model=str(model), mode='gpu', context_tier='8k-fast')
+
+
+def test_installed_gpu_completion_preflight_success_is_private(completion_preflight, capsys):
+    assert compute_node_bridge.installed_gpu_completion_preflight(completion_preflight) == 0
+    evidence = json.loads(capsys.readouterr().out)
+    assert evidence['accepted'] is True
+    assert evidence['completion'] == {'count': 1, 'output_bytes': 2, 'validated': True}
+    assert evidence['backend'] == {'declared': 'gpu', 'observed': 'cuda', 'gpu_execution': True}
+    assert evidence['cleanup'] == {'attempted': True, 'verified': True}
+    serialized = json.dumps(evidence).lower()
+    assert 'reply with' not in serialized and '"content"' not in serialized
+
+
+@pytest.mark.parametrize(('mutation', 'failure'), [
+    ('runtime_identity', 'runtime_identity_mismatch'),
+    ('model_identity', 'model_identity_mismatch'),
+    ('fallback', 'cpu_fallback_rejected'),
+    ('malformed', 'malformed_completion'),
+    ('oversized', 'oversized_completion'),
+    ('worker_exit', 'worker_exit'),
+])
+def test_installed_gpu_completion_preflight_fail_closed(
+        completion_preflight, monkeypatch, capsys, tmp_path, mutation, failure):
+    if mutation == 'runtime_identity':
+        monkeypatch.setenv('TOKENPLACE_RUNTIME_ID', 'system-python')
+    elif mutation == 'model_identity':
+        wrong = tmp_path / 'wrong.gguf'
+        wrong.write_bytes(b'x')
+        completion_preflight.model = str(wrong)
+    elif mutation == 'fallback':
+        monkeypatch.setattr(compute_node_bridge, '_ensure_desktop_llama_runtime_for_context',
+                            lambda *_args: {'selected_backend': 'cpu'})
+    elif mutation == 'malformed':
+        monkeypatch.setattr(_CompletionPreflightManager, 'create_chat_completion_with_recovery',
+                            lambda *_args, **_kwargs: {'choices': []})
+    elif mutation == 'oversized':
+        monkeypatch.setattr(_CompletionPreflightManager, 'create_chat_completion_with_recovery',
+                            lambda *_args, **_kwargs: {'choices': [{'message': {'content': 's' * 4097}}]})
+    else:
+        class LlamaCppRestartableWorkerError(Exception):
+            pass
+        def fail(*_args, **_kwargs):
+            raise LlamaCppRestartableWorkerError('SECRET generated text')
+        monkeypatch.setattr(_CompletionPreflightManager, 'create_chat_completion_with_recovery', fail)
+    assert compute_node_bridge.installed_gpu_completion_preflight(completion_preflight) != 0
+    evidence = json.loads(capsys.readouterr().out)
+    assert evidence['accepted'] is False
+    assert evidence['failure_code'] == failure
+    assert 'secret' not in json.dumps(evidence).lower()
+
+
+def test_installed_gpu_completion_preflight_rejects_duplicate_and_cleanup_failure(
+        completion_preflight, monkeypatch, capsys):
+    evidence = compute_node_bridge._gpu_completion_evidence()
+    monkeypatch.setattr(compute_node_bridge, '_gpu_completion_evidence', lambda: evidence)
+    def duplicate(**_kwargs):
+        evidence['completion']['count'] += 1
+        return {'choices': [{'message': {'content': 'private'}}]}
+    monkeypatch.setattr(_CompletionPreflightManager, 'create_chat_completion_with_recovery', duplicate)
+    monkeypatch.setattr(_CompletionPreflightManager, '_close_llm_proxy', lambda *_args: False)
+    assert compute_node_bridge.installed_gpu_completion_preflight(completion_preflight) == 8
+    result = json.loads(capsys.readouterr().out)
+    assert result['failure_code'] == 'cleanup_failed'
+    assert result['accepted'] is False
+    assert 'private' not in json.dumps(result)
+
+
+def test_installed_gpu_completion_preflight_generation_timeout_cancels(
+        completion_preflight, monkeypatch, capsys):
+    calls = []
+    real_phase = compute_node_bridge._run_bounded_phase
+    def phase(name, deadline, operation, evidence):
+        if name == 'generation':
+            raise TimeoutError('generation_timeout')
+        return real_phase(name, deadline, operation, evidence)
+    monkeypatch.setattr(compute_node_bridge, '_run_bounded_phase', phase)
+    monkeypatch.setattr(_CompletionPreflightManager, 'terminate_active_worker_for_cancellation',
+                        lambda self: calls.append('cancel'), raising=False)
+    assert compute_node_bridge.installed_gpu_completion_preflight(completion_preflight) != 0
+    assert calls == ['cancel']
+    assert json.loads(capsys.readouterr().out)['failure_code'] == 'generation_timeout'
+
+
 def test_headless_boundary_result_contract_is_privacy_safe():
     result = compute_node_bridge._headless_result(
         success=False, phase="warm_load_completed",

@@ -3258,12 +3258,211 @@ def headless_cpu_admission(args: Any) -> int:
             return 8
 
 
+GPU_COMPLETION_PREFLIGHT_SCHEMA_VERSION = 1
+GPU_COMPLETION_PREFLIGHT_OUTPUT_BYTES = 4096
+GPU_COMPLETION_PREFLIGHT_DEADLINES = {
+    "startup": 15.0,
+    "model_load": 180.0,
+    "generation": 60.0,
+    "cancellation": 5.0,
+    "cleanup": 10.0,
+    "total": 240.0,
+}
+_GPU_COMPLETION_FIXTURE = ({"role": "user", "content": "Reply with one short word."},)
+
+
+def _gpu_completion_evidence() -> Dict[str, Any]:
+    return {
+        "schema_version": GPU_COMPLETION_PREFLIGHT_SCHEMA_VERSION,
+        "accepted": False,
+        "failure_code": "startup_failed",
+        "artifact": {
+            "app_version": os.environ.get("TOKENPLACE_APP_VERSION", "unknown"),
+            "build_id": os.environ.get("TOKENPLACE_BUILD_ID", "unknown"),
+            "target_triple": os.environ.get("TOKENPLACE_TARGET_TRIPLE", "unknown"),
+            "runtime_id": os.environ.get("TOKENPLACE_RUNTIME_ID", "unknown"),
+        },
+        "model": {"profile_id": "unknown", "filename": "unknown", "identity": "unverified"},
+        "backend": {"declared": "gpu", "observed": "unknown", "gpu_execution": False},
+        "completion": {"count": 0, "output_bytes": 0, "validated": False},
+        "phases": {},
+        "cleanup": {"attempted": False, "verified": False},
+        "limits": {
+            "output_bytes": GPU_COMPLETION_PREFLIGHT_OUTPUT_BYTES,
+            "deadlines_seconds": dict(GPU_COMPLETION_PREFLIGHT_DEADLINES),
+        },
+    }
+
+
+def _run_bounded_phase(name: str, deadline: float, operation: Any,
+                       evidence: Dict[str, Any]) -> Any:
+    started = time.monotonic()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(operation)
+    try:
+        value = future.result(timeout=deadline)
+    except concurrent.futures.TimeoutError as exc:
+        evidence["phases"][name] = {
+            "outcome": "timeout", "elapsed_ms": int((time.monotonic() - started) * 1000)
+        }
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise TimeoutError(f"{name}_timeout") from exc
+    except BaseException:
+        evidence["phases"][name] = {
+            "outcome": "failed", "elapsed_ms": int((time.monotonic() - started) * 1000)
+        }
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    executor.shutdown(wait=True, cancel_futures=True)
+    evidence["phases"][name] = {
+        "outcome": "passed", "elapsed_ms": int((time.monotonic() - started) * 1000)
+    }
+    return value
+
+
+def installed_gpu_completion_preflight(args: Any) -> int:
+    """Run one local production-worker completion and emit only allowlisted evidence."""
+    evidence = _gpu_completion_evidence()
+    runtime = None
+    manager = None
+    started = time.monotonic()
+    exit_code = 1
+    try:
+        identity_names = (
+            "TOKENPLACE_APP_VERSION", "TOKENPLACE_BUILD_ID", "TOKENPLACE_TARGET_TRIPLE",
+            "TOKENPLACE_BUNDLED_RUNTIME_ID", "TOKENPLACE_RUNTIME_ID",
+        )
+        identities = [os.environ.get(name, "") for name in identity_names]
+        if not all(identities) or identities[-1] != identities[-2]:
+            evidence["failure_code"] = "runtime_identity_mismatch"
+            return 3
+        if not args.model or not os.path.isfile(args.model):
+            evidence["failure_code"] = "model_missing"
+            return 4
+        from utils.llm.model_profiles import get_default_model_profile
+        profile = get_default_model_profile()
+        evidence["model"].update(profile_id=profile["profile_id"], filename=profile["filename"])
+        if Path(args.model).name != profile["filename"]:
+            evidence["failure_code"] = "model_identity_mismatch"
+            return 4
+        evidence["model"]["identity"] = "validated"
+
+        dependency = _run_bounded_phase(
+            "startup", GPU_COMPLETION_PREFLIGHT_DEADLINES["startup"],
+            lambda: ensure_desktop_python_dependencies(mutate=False), evidence,
+        )
+        if dependency.get("ok") != "true":
+            evidence["failure_code"] = "packaged_runtime_invalid"
+            return 3
+        setup = _ensure_desktop_llama_runtime_for_context("gpu", args.context_tier)
+        observed_backend = setup.get("selected_backend", "unknown")
+        evidence["backend"].update(observed=observed_backend,
+                                   gpu_execution=observed_backend in {"cuda", "metal"})
+        if observed_backend not in {"cuda", "metal"}:
+            evidence["failure_code"] = "cpu_fallback_rejected"
+            return 5
+
+        from utils.compute_node_runtime import ComputeNodeRuntime, ComputeNodeRuntimeConfig, apply_compute_mode
+        apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
+        runtime = ComputeNodeRuntime(ComputeNodeRuntimeConfig(
+            relay_url="http://127.0.0.1:1", relay_port=1,
+            use_configured_relay_fallbacks=False, relay_urls=("http://127.0.0.1:1",)))
+        manager = runtime.model_manager
+        if getattr(manager, "use_mock_llm", False):
+            evidence["failure_code"] = "mock_runtime_rejected"
+            return 5
+        manager.model_path = os.path.abspath(args.model)
+        manager.parent_model_path_exists = True
+        manager.model_path_was_relative = False
+        apply_context_profile(manager, normalize_context_tier(args.context_tier))
+        apply_compute_mode(manager, "gpu")
+        manager.desktop_runtime_probe = dict(setup)
+        _run_bounded_phase("model_load", GPU_COMPLETION_PREFLIGHT_DEADLINES["model_load"],
+                           manager.get_llm_instance, evidence)
+
+        def generate_once() -> Any:
+            evidence["completion"]["count"] += 1
+            return manager.create_chat_completion_with_recovery(
+                messages=list(_GPU_COMPLETION_FIXTURE), max_tokens=16,
+                temperature=0.0, stream=False,
+            )
+
+        completion = _run_bounded_phase(
+            "generation", GPU_COMPLETION_PREFLIGHT_DEADLINES["generation"], generate_once, evidence)
+        if evidence["completion"]["count"] != 1:
+            evidence["failure_code"] = "duplicate_completion"
+            return 6
+        try:
+            choices = completion["choices"]
+            content = choices[0]["message"]["content"]
+            output_bytes = len(content.encode("utf-8"))
+        except (KeyError, IndexError, TypeError, AttributeError):
+            evidence["failure_code"] = "malformed_completion"
+            return 6
+        evidence["completion"]["output_bytes"] = output_bytes
+        if not isinstance(content, str) or not content.strip() or output_bytes > GPU_COMPLETION_PREFLIGHT_OUTPUT_BYTES:
+            evidence["failure_code"] = "oversized_completion" if output_bytes > GPU_COMPLETION_PREFLIGHT_OUTPUT_BYTES else "empty_completion"
+            return 6
+        evidence["completion"]["validated"] = True
+        evidence["accepted"] = True
+        evidence["failure_code"] = "none"
+        exit_code = 0
+        return 0
+    except TimeoutError as exc:
+        phase = str(exc).removesuffix("_timeout")
+        evidence["failure_code"] = f"{phase}_timeout"
+        if manager is not None and phase == "generation":
+            cancel = getattr(manager, "terminate_active_worker_for_cancellation", None)
+            if callable(cancel):
+                try:
+                    _run_bounded_phase("cancellation", GPU_COMPLETION_PREFLIGHT_DEADLINES["cancellation"], cancel, evidence)
+                except BaseException:
+                    evidence["failure_code"] = "cancellation_failed"
+        return 7
+    except BaseException as exc:
+        evidence["failure_code"] = "worker_exit" if type(exc).__name__ in {
+            "LlamaCppRestartableWorkerError", "BrokenPipeError", "EOFError"
+        } else "preflight_failed"
+        return 7
+    finally:
+        evidence["cleanup"]["attempted"] = True
+        cleanup_ok = True
+        if runtime is not None:
+            try:
+                _run_bounded_phase(
+                    "cleanup", GPU_COMPLETION_PREFLIGHT_DEADLINES["cleanup"],
+                    lambda: runtime.stop(shutdown_deadline=time.monotonic() + GPU_COMPLETION_PREFLIGHT_DEADLINES["cleanup"]),
+                    evidence,
+                )
+                loaded = getattr(runtime.model_manager, "llm", None)
+                if loaded is not None:
+                    close = getattr(runtime.model_manager, "_close_llm_proxy", None)
+                    if not callable(close) or close(loaded) is not True:
+                        raise RuntimeError("owned_worker_cleanup_failed")
+                    runtime.model_manager.llm = None
+            except BaseException:
+                cleanup_ok = False
+        evidence["cleanup"]["verified"] = cleanup_ok
+        evidence["phases"]["total"] = {
+            "outcome": "passed" if time.monotonic() - started <= GPU_COMPLETION_PREFLIGHT_DEADLINES["total"] else "timeout",
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+        if not cleanup_ok or evidence["phases"]["total"]["outcome"] == "timeout":
+            evidence["accepted"] = False
+            evidence["failure_code"] = "cleanup_failed" if not cleanup_ok else "total_timeout"
+            exit_code = 8
+        print(json.dumps(evidence, sort_keys=True, separators=(",", ":")), flush=True)
+        if exit_code == 8:
+            return 8
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--installed-context-smoke", action="store_true")
     parser.add_argument("--operator-runtime-preflight", action="store_true")
     parser.add_argument("--operator-runtime-preflight-cpu-smoke", action="store_true")
     parser.add_argument("--headless-cpu-admission", action="store_true")
+    parser.add_argument("--installed-gpu-completion-preflight", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3281,6 +3480,9 @@ def main() -> int:
 
     if args.headless_cpu_admission:
         return headless_cpu_admission(args)
+
+    if args.installed_gpu_completion_preflight:
+        return installed_gpu_completion_preflight(args)
 
     if args.installed_context_smoke:
         print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))

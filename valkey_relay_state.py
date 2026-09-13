@@ -2011,7 +2011,7 @@ local function record(key,c,q,score)
   if redis.call('HLEN',key)~=9 then return false end
   local v=redis.call('HMGET',key,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','deadline','envelope')
   for i=1,#v do if not v[i] then return false end end
-  return v[1]==c and v[2]==q and digest(v[3]) and string.len(v[4])>=1 and string.len(v[4])<=max_node_id and
+  return v[1]==c and v[2]==q and digest(v[3]) and string.len(v[4])>=1 and string.len(v[4])<=max_node_id and valid_utf8(v[4]) and
     digest(v[5]) and digest(v[6]) and integer(v[7]) and finite(v[8])==score and canonical_progress(v[9])
 end
 if not digest(node_digest) or not digest(owner) or not digest(consumer) or not digest(client) or not digest(request_digest) or
@@ -2050,7 +2050,12 @@ if rv[1]~='claimed' or rv[2]~=client or rv[3]~=request_digest or rv[6]~=node_id 
 if redis.call('ZSCORE',work,'!schema:1')~='0' or redis.call('ZSCORE',work,member)~='1' then return {'schema'} end
 local stream=redis.call('XRANGE',queue,rv[11],rv[11],'COUNT',1)
 if #stream~=1 or stream[1][1]~=rv[11] or #stream[1][2]~=4 or stream[1][2][2]~=client or stream[1][2][4]~=request_digest then return {'schema'} end
-if progress_exists and not record(progress,client,request_digest,progress_score) then return {'schema'} end
+if progress_exists then
+  local pv=redis.call('HMGET',progress,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','deadline','envelope')
+  if not record(progress,client,request_digest,progress_score) or pv[3]~=cv[3] or pv[4]~=cv[4] or
+     pv[5]~=cv[5] or pv[6]~=cv[6] or integer(pv[7])~=current or finite(pv[8])~=deadline or
+     progress_score~=deadline then return {'schema'} end
+end
 redis.call('HSET',progress,'client',client,'request',request_digest,'node_digest',node_digest,'node_id',node_id,
   'owner_digest',owner,'consumer_digest',consumer,'generation',generation,'deadline',cv[7],'envelope',envelope)
 redis.call('ZADD',progress_expiries,deadline,member)
@@ -2060,7 +2065,7 @@ PROGRESS_TRANSITION_SOURCE = PROGRESS_TRANSITION_SOURCE.replace("__CANONICAL_PRO
 PROGRESS_TRANSITION_SCRIPT = ReviewedScript(
     "replace_encrypted_progress_v1",
     PROGRESS_TRANSITION_SOURCE,
-    "3f6fcc7888e734efc7aa513be5874f38cc3fa12caf9ce780bf5fe2cdbf87690b",  # pragma: allowlist secret
+    "922eaff7fd75709908378e82d5bb60af2a43eb65c950672623f8549e471202ab",  # pragma: allowlist secret
     True,
 )
 

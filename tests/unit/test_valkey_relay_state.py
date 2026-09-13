@@ -373,7 +373,7 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_progress_script_is_registered_digest_pinned_and_bounded():
-    expected = "3f6fcc7888e734efc7aa513be5874f38cc3fa12caf9ce780bf5fe2cdbf87690b"  # pragma: allowlist secret
+    expected = "922eaff7fd75709908378e82d5bb60af2a43eb65c950672623f8549e471202ab"  # pragma: allowlist secret
     assert PROGRESS_TRANSITION_SCRIPT.sha256 == expected
     assert SCRIPT_DIGESTS[PROGRESS_TRANSITION_SCRIPT.name] == expected
     assert "SCAN" not in PROGRESS_TRANSITION_SCRIPT.source.upper()
@@ -382,6 +382,11 @@ def test_progress_script_is_registered_digest_pinned_and_bounded():
     assert "redis.call('HLEN',key)~=9" in PROGRESS_TRANSITION_SCRIPT.source
     assert "not canonical_progress(envelope)" in PROGRESS_TRANSITION_SCRIPT.source
     assert "canonical_progress(v[9])" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "valid_utf8(v[4])" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "pv[3]~=cv[3]" in PROGRESS_TRANSITION_SCRIPT.source
+    assert PROGRESS_TRANSITION_SCRIPT.source.index("pv[3]~=cv[3]") < (
+        PROGRESS_TRANSITION_SCRIPT.source.index("redis.call('HSET',progress")
+    )
 
 
 @pytest.mark.parametrize(

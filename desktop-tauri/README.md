@@ -302,6 +302,45 @@ It prints:
 
 ### Regression and smoke tests
 
+#### Authorized installed GPU completion preflight
+
+The installed application exposes the opt-in `--operator-gpu-completion-preflight` command for
+release qualification. **It performs real GPU inference and therefore requires explicit operator
+qualification authorization before it is run.** It neither grants nor consumes a benchmark
+attempt, and it never registers capacity, contacts a relay, or participates in the benchmark
+handshake. Normal startup and installation never invoke it.
+
+Run it only against an installed, signed Windows CUDA or Apple Silicon Metal build whose desktop
+configuration already selects the approved `Qwen3-8B-Q4_K_M.gguf` artifact:
+
+```powershell
+& "$env:LOCALAPPDATA\token.place desktop\token-place-desktop-tauri.exe" `
+  --operator-gpu-completion-preflight
+```
+
+The executable resolves its bundled interpreter, packaged bridge, configured model, and build
+identity through the same production resource mechanisms as operator startup. It rejects a system
+Python, an identity/model mismatch, mocks, and CPU fallback. The bridge reuses the production
+API-v1 readiness completion (rather than adding a second post-warm-up request), fixes the
+qualification tier to `8k-fast`, and permits at most 64 output tokens. Runtime startup/import is
+bounded to 45 seconds, model loading to 120 seconds, the worker inference RPC to 45 seconds,
+cancellation to 5 seconds, cleanup to 10 seconds, and the installed parent enforces a 190-second
+watchdog around the child's 180-second total budget. The disposable bridge and its child worker are
+owned by this invocation; acceptance requires verified teardown.
+
+Stdout is one version-1, allowlisted JSON evidence object. It contains artifact basename/size,
+application/build/target/bundled-runtime identity, declared and observed backend, GPU verification,
+phase outcomes/timings/deadlines, completion count/result/limit, cleanup status, and zero-valued
+relay/registration/benchmark side-effect counters. It never contains the synthetic prompt,
+generated output, ciphertext, keys, credentials, model paths, environment dumps, or raw child logs.
+
+Keep these four gates distinct:
+
+1. Source-level Python/Rust tests prove deterministic orchestration and protocol validation only.
+2. Installed identity/preflight checks qualify an exact signed artifact/runtime pair.
+3. This separately authorized command proves one real CUDA/Metal child-worker completion.
+4. Benchmark authorization is a separate process; this command cannot grant or consume an attempt.
+
 The installed executable exposes a GUI-independent CPU admission boundary. It must be invoked
 from an installed package (development/source-tree Python is rejected), for example on Windows:
 

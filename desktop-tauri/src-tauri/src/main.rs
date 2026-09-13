@@ -693,6 +693,26 @@ pub fn run() {
                 println!("{}", payload);
                 std::process::exit(0);
             }
+            if std::env::args().any(|arg| arg == "--operator-gpu-completion-preflight") {
+                let payload = load_config_from_path(&config_path(&cli_config_dir()))
+                    .ok()
+                    .and_then(|config| {
+                        compute_node::operator_gpu_completion_preflight_record(
+                            &config,
+                            &app.handle(),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_else(compute_node::gpu_completion_preflight_native_failure);
+                println!("{}", payload);
+                std::process::exit(
+                    if payload.get("success").and_then(Value::as_bool) == Some(true) {
+                        0
+                    } else {
+                        1
+                    },
+                );
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

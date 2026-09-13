@@ -1,6 +1,7 @@
 """Unit tests for the desktop compute-node bridge."""
 
 import importlib.util
+import hashlib
 import json
 import os
 import queue
@@ -18,6 +19,7 @@ import requests
 import yaml
 
 from utils import compute_node_runtime
+from utils.llm import model_manager
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -66,6 +68,402 @@ def test_headless_boundary_rejects_non_cpu_before_runtime(monkeypatch, tmp_path,
     result = json.loads(capsys.readouterr().out)
     assert result["failure_code"] == "invalid_arguments"
     assert result["warm_load_result"] == "not_started"
+
+
+class _CompletionPreflightManager:
+    file_name = "Qwen3-8B-Q4_K_M.gguf"
+    use_mock_llm = False
+
+    def __init__(self, model_path):
+        self.llm = object()
+        self.model_path = str(model_path)
+        self.models_dir = str(model_path.parent)
+        self.last_compute_diagnostics = {}
+        self.worker_diagnostics = {
+            "observed_backend": "cuda",
+            "observed_offloaded_layers": "all_supported_layers",
+        }
+        fixture = b"fixture"
+        self.model_profile = {
+            "artifact_size_bytes": len(fixture),
+            "artifact_sha256": hashlib.sha256(fixture).hexdigest(),
+        }
+
+    def worker_lifecycle_status(self):
+        return {"worker_alive": self.llm is not None}
+
+    def worker_execution_diagnostics(self):
+        return dict(self.worker_diagnostics)
+
+    def _validate_existing_model_artifact(self, **_kwargs):
+        return True, "valid"
+
+    def _is_managed_canonical_model_path(self):
+        return Path(self.model_path).resolve() == Path(self.models_dir, self.file_name).resolve()
+
+    def _close_llm_proxy(self, _loaded):
+        return True
+
+    def terminate_active_worker_for_cancellation(self, **_kwargs):
+        self.llm = None
+        return True
+
+
+class _CompletionPreflightRuntime:
+    model_path = None
+
+    def __init__(self, _config, *, outcome="success", duplicate=False, cleanup=True):
+        self.model_manager = _CompletionPreflightManager(type(self).model_path)
+        self.outcome = outcome
+        self.duplicate = duplicate
+        self.cleanup = cleanup
+        self.stop_saw_loaded_worker = False
+        self.relay_client = SimpleNamespace(
+            _generate_api_v1_response_with_runtime_model=lambda **_kwargs: {
+                "api_v1_response": {"message": {"role": "assistant", "content": "private output"}}
+            }
+        )
+
+    def ensure_api_v1_runtime_ready(self):
+        self.relay_client._generate_api_v1_response_with_runtime_model()
+        if self.duplicate:
+            self.relay_client._generate_api_v1_response_with_runtime_model()
+        self.model_manager.last_compute_diagnostics = {
+            "api_v1_readiness_completion_smoke_result": "passed" if self.outcome == "success" else self.outcome,
+            "api_v1_readiness_backend_used": "cuda",
+        }
+        return self.outcome == "success"
+
+    def stop(self, **_kwargs):
+        self.stop_saw_loaded_worker = self.model_manager.llm is not None
+        if not self.cleanup:
+            raise RuntimeError("sensitive cleanup detail")
+
+
+def _completion_preflight_args(model):
+    _CompletionPreflightRuntime.model_path = model
+    return SimpleNamespace(model=str(model), mode="gpu", context_tier="8k-fast")
+
+
+def _completion_preflight_environment(monkeypatch):
+    for name, value in {
+        "TOKENPLACE_APP_VERSION": "0.1.19",
+        "TOKENPLACE_BUILD_ID": "build-test",
+        "TOKENPLACE_TARGET_TRIPLE": "x86_64-pc-windows-msvc",
+        "TOKENPLACE_BUNDLED_RUNTIME_ID": "runtime-test",
+        "TOKENPLACE_RUNTIME_ID": "runtime-test",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(compute_node_bridge, "ensure_desktop_python_dependencies", lambda: {"ok": "true"})
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "_ensure_desktop_llama_runtime_for_context",
+        lambda *_args: {"selected_backend": "cuda", "runtime_action": "already_supported"},
+    )
+
+
+def test_installed_gpu_completion_preflight_success_is_single_and_private(monkeypatch, tmp_path):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+
+    created = []
+    def runtime_factory(config):
+        runtime = _CompletionPreflightRuntime(config)
+        created.append(runtime)
+        return runtime
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), runtime_factory
+    )
+
+    assert code == 0
+    assert evidence["success"] is True
+    assert evidence["completion"]["count"] == 1
+    assert evidence["backend"] == {"declared": "cuda", "observed": "cuda", "gpu_verified": True}
+    assert evidence["cleanup"] == {"attempted": True, "verified": True, "owned_worker_alive": False}
+    assert created[0].stop_saw_loaded_worker is True
+    assert created[0].model_manager.llm is None
+    serialized = json.dumps(evidence)
+    assert "private output" not in serialized
+    assert str(model.parent) not in serialized
+
+
+@pytest.mark.parametrize(
+    ("backend", "offloaded_layers"),
+    [("cuda", 24), ("metal", "all_supported_layers")],
+)
+def test_installed_gpu_completion_preflight_uses_worker_attested_gpu(
+        monkeypatch, tmp_path, backend, offloaded_layers):
+    _completion_preflight_environment(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "_ensure_desktop_llama_runtime_for_context",
+        lambda *_args: {"selected_backend": backend, "runtime_action": "already_supported"},
+    )
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+
+    class Runtime(_CompletionPreflightRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.model_manager.worker_diagnostics = {
+                "observed_backend": backend,
+                "observed_offloaded_layers": offloaded_layers,
+            }
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), Runtime
+    )
+
+    assert code == 0
+    assert evidence["backend"] == {
+        "declared": backend, "observed": backend, "gpu_verified": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("lines", "expected"),
+    [
+        (["ggml_cuda_init: found CUDA0", "load_tensors: offloaded 33/33 layers to GPU"],
+         {"observed_backend": "cuda", "observed_offloaded_layers": "all_supported_layers"}),
+        (["ggml_metal_init: Metal GPU", "load_tensors: offloaded 12/33 layers to GPU"],
+         {"observed_backend": "metal", "observed_offloaded_layers": 12}),
+        (["load_tensors: offloaded 0/33 layers to GPU"],
+         {"observed_backend": "cpu", "observed_offloaded_layers": 0}),
+        (["worker initialized without an offload report"], {}),
+    ],
+)
+def test_subprocess_worker_execution_diagnostics_are_observed(lines, expected):
+    proxy = object.__new__(model_manager._SubprocessLlamaProxy)
+    proxy._completed_inference_count = 1
+    proxy.is_alive = lambda: True
+    proxy._stderr_since = lambda _cursor: lines
+
+    assert proxy.worker_execution_diagnostics() == expected
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("identity", "runtime_identity_mismatch"),
+        ("blank_identity", "runtime_identity_mismatch"),
+        ("missing_model", "model_missing"),
+        ("cpu_mode", "gpu_mode_required"),
+        ("model", "model_identity_mismatch"),
+        ("artifact_hash", "model_identity_mismatch"),
+        ("fallback", "gpu_runtime_unavailable"),
+        ("mock", "mock_runtime_rejected"),
+        ("unmanaged", "model_identity_mismatch"),
+        ("validator_missing", "model_identity_validation_unavailable"),
+        ("profile_missing", "model_identity_validation_unavailable"),
+        ("generation_missing", "generation_boundary_missing"),
+        ("completion_missing", "completion_count_invalid"),
+        ("observed_cpu", "cpu_fallback_or_unverified_gpu"),
+        ("missing_worker_telemetry", "cpu_fallback_or_unverified_gpu"),
+        ("mismatched_worker_backend", "cpu_fallback_or_unverified_gpu"),
+        ("zero_worker_offload", "cpu_fallback_or_unverified_gpu"),
+        ("missing_offload", "cpu_fallback_or_unverified_gpu"),
+        ("malformed", "completion_failed"),
+        ("worker_exit", "worker_or_protocol_failure"),
+        ("deadline", "phase_deadline_exceeded"),
+        ("cancellation", "generation_cancelled"),
+        ("duplicate", "worker_or_protocol_failure"),
+        ("cleanup", "cleanup_failed"),
+    ],
+)
+def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, mutation, expected):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+    runtime_options = {}
+    if mutation == "identity":
+        monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "system-runtime")
+    elif mutation == "blank_identity":
+        monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "  ")
+    elif mutation == "model":
+        model = tmp_path / "unapproved.gguf"
+        model.write_bytes(b"fixture")
+    elif mutation == "missing_model":
+        model.unlink()
+    elif mutation == "fallback":
+        monkeypatch.setattr(compute_node_bridge, "_ensure_desktop_llama_runtime_for_context", lambda *_args: {"selected_backend": "cpu"})
+    elif mutation == "duplicate":
+        runtime_options["duplicate"] = True
+    elif mutation == "cleanup":
+        runtime_options["cleanup"] = False
+
+    class Runtime(_CompletionPreflightRuntime):
+        def __init__(self, config):
+            super().__init__(config, **runtime_options)
+            if mutation == "observed_cpu":
+                original = self.ensure_api_v1_runtime_ready
+                def cpu_result():
+                    result = original()
+                    self.model_manager.last_compute_diagnostics["api_v1_readiness_backend_used"] = "cpu"
+                    self.model_manager.worker_diagnostics.update(
+                        observed_backend="cpu", observed_offloaded_layers=0
+                    )
+                    return result
+                self.ensure_api_v1_runtime_ready = cpu_result
+            elif mutation == "missing_worker_telemetry":
+                self.model_manager.worker_diagnostics = {}
+            elif mutation == "mismatched_worker_backend":
+                self.model_manager.worker_diagnostics["observed_backend"] = "metal"
+            elif mutation == "zero_worker_offload":
+                self.model_manager.worker_diagnostics["observed_offloaded_layers"] = 0
+            elif mutation == "artifact_hash":
+                self.model_manager.model_profile["artifact_sha256"] = "0" * 64
+            elif mutation == "mock":
+                self.model_manager.use_mock_llm = True
+            elif mutation == "unmanaged":
+                self.model_manager._is_managed_canonical_model_path = lambda: False
+            elif mutation == "validator_missing":
+                self.model_manager._validate_existing_model_artifact = None
+            elif mutation == "profile_missing":
+                self.model_manager.model_profile = {}
+            elif mutation == "generation_missing":
+                self.relay_client._generate_api_v1_response_with_runtime_model = None
+            elif mutation == "completion_missing":
+                self.ensure_api_v1_runtime_ready = lambda: True
+            elif mutation == "missing_offload":
+                original = self.ensure_api_v1_runtime_ready
+                def missing_offload_result():
+                    result = original()
+                    self.model_manager.worker_diagnostics.pop("observed_offloaded_layers")
+                    return result
+                self.ensure_api_v1_runtime_ready = missing_offload_result
+            elif mutation == "malformed":
+                self.outcome = "invalid_api_v1_envelope"
+            elif mutation == "worker_exit":
+                self.ensure_api_v1_runtime_ready = lambda: (_ for _ in ()).throw(RuntimeError("secret child log"))
+            elif mutation == "deadline":
+                self.relay_client._generate_api_v1_response_with_runtime_model = (
+                    lambda **_kwargs: (_ for _ in ()).throw(TimeoutError("secret timeout detail"))
+                )
+            elif mutation == "cancellation":
+                self.ensure_api_v1_runtime_ready = lambda: (_ for _ in ()).throw(compute_node_bridge.concurrent.futures.CancelledError("secret cancellation detail"))
+
+    args = _completion_preflight_args(model)
+    if mutation == "cpu_mode":
+        args.mode = "cpu"
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(args, Runtime)
+
+    assert code != 0 or evidence["success"] is False
+    assert evidence["success"] is False
+    assert evidence["failure_code"] == expected
+    serialized = json.dumps(evidence)
+    assert "secret child log" not in serialized
+    assert "fixture" not in serialized
+
+
+def test_gpu_preflight_bounded_call_enforces_deadline():
+    with pytest.raises(TimeoutError):
+        compute_node_bridge._gpu_preflight_bounded_call(
+            lambda: time.sleep(1), time.monotonic() + 0.01
+        )
+    with pytest.raises(TimeoutError):
+        compute_node_bridge._gpu_preflight_bounded_call(lambda: None, time.monotonic() - 1)
+
+
+def test_installed_gpu_completion_preflight_starts_independent_generation_deadline(
+        monkeypatch, tmp_path):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+    runtime = _CompletionPreflightRuntime(SimpleNamespace())
+    runtime.model_manager = _CompletionPreflightManager(model)
+    seen_deadlines = []
+    real_bounded_call = compute_node_bridge._gpu_preflight_bounded_call
+
+    def recording_bounded_call(call, deadline):
+        seen_deadlines.append(deadline)
+        return real_bounded_call(call, deadline)
+
+    monkeypatch.setattr(compute_node_bridge, "_gpu_preflight_bounded_call", recording_bounded_call)
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), lambda _config: runtime
+    )
+
+    assert code == 0 and evidence["success"] is True
+    assert any(callable(deadline) for deadline in seen_deadlines)
+    # Startup, artifact validation, generation, stop, close, and lifecycle all
+    # receive concrete independently capped deadlines; readiness alone follows
+    # the callable that switches from model-load to generation at the boundary.
+    assert sum(not callable(deadline) for deadline in seen_deadlines) >= 6
+
+
+@pytest.mark.parametrize(("termination_result", "worker_alive"), [(False, False), (True, True)])
+def test_generation_timeout_fails_closed_when_cancellation_is_not_verified(
+        monkeypatch, tmp_path, termination_result, worker_alive):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+    monkeypatch.setitem(compute_node_bridge.GPU_COMPLETION_PHASE_DEADLINES_MS,
+                        "generation", 5)
+
+    class Runtime(_CompletionPreflightRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.relay_client._generate_api_v1_response_with_runtime_model = (
+                lambda **_kwargs: threading.Event().wait(0.05)
+            )
+            self.model_manager.terminate_active_worker_for_cancellation = (
+                lambda **_kwargs: termination_result
+            )
+            self.model_manager.worker_lifecycle_status = lambda: {
+                "worker_alive": worker_alive
+            }
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), Runtime
+    )
+
+    assert code != 0
+    assert evidence["success"] is False
+    assert evidence["failure_code"] in {"generation_cancelled", "cleanup_failed"}
+    assert evidence["phases"]["cancellation"]["outcome"] == "failed"
+
+
+def test_worker_close_is_bounded_and_cannot_leave_success_evidence(monkeypatch, tmp_path):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+    monkeypatch.setitem(compute_node_bridge.GPU_COMPLETION_PHASE_DEADLINES_MS, "cleanup", 5)
+
+    class Runtime(_CompletionPreflightRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.model_manager._close_llm_proxy = lambda _loaded: threading.Event().wait(0.05)
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), Runtime
+    )
+
+    assert code == 8
+    assert evidence["success"] is False
+    assert evidence["failure_code"] == "cleanup_failed"
+    assert evidence["cleanup"]["verified"] is False
+
+
+def test_total_deadline_during_cleanup_cannot_leave_success_evidence(monkeypatch, tmp_path):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+    monkeypatch.setattr(compute_node_bridge, "GPU_COMPLETION_TOTAL_DEADLINE_MS", 100)
+
+    class Runtime(_CompletionPreflightRuntime):
+        def stop(self, **_kwargs):
+            threading.Event().wait(0.2)
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), Runtime
+    )
+
+    assert code == 7
+    assert evidence["success"] is False
+    assert evidence["failure_code"] == "total_deadline_exceeded"
+    assert evidence["cleanup"]["verified"] is False
 
 
 @pytest.mark.parametrize(

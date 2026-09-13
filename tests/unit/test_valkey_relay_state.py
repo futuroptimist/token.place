@@ -197,7 +197,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "22e8d35a6d98e57fbf59ed68e1d8434e05df5dfbb0fe02cedf35ea418cac715c"  # pragma: allowlist secret
+    expected_digest = "0cc5fabffcf2a547a60e062751d7a62b4cf87fbb1fbadd1210c2eed7ef55cd96"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -250,7 +250,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "d6d9c71ff70648b0ddba22be73d36ac6593d60628b4cc4810a25ff77b6e06a9c"  # pragma: allowlist secret
+    expected_digest = "82d25c377e3df42263b09540f18557a0579e270f25b2c811d0876c7a96e81e45"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -282,16 +282,327 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
 @pytest.mark.parametrize(
     ("script", "digest"),
     (
-        (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "9a12aeb8b536a59aede23c7fe0dae2aedc7d3e36828a8bb09fc7aec8264d0dbf"),
-        (valkey_relay_state.ENQUEUE_SCRIPT, "44053a611a055b6a26f1cf0f16af72f6dfa323d57cd1fa88433c254a768de5c1"),
-        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "1f946df7bc85f1282bc97b1dfcd01b926824d07cefeb029b894fc1d23d50e911"),
-        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "8e94a91717cf9f62e3151ec7a5aa20e29ab258ab57d9e179de3aee168714b4ad"),
+        (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947"),  # pragma: allowlist secret
+        (valkey_relay_state.ENQUEUE_SCRIPT, "b9230062be58f017bfb618a368e3fd0d498cadf29c2793201886f1f3e40b9fcb"),  # pragma: allowlist secret
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "673eee38ba27545169d832d19d7acf48729963132ca6f106d3f0b15eeb4be949"),  # pragma: allowlist secret
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "7a22355773765ee16a35c1fbf85cc34968ab4eb822baed7115ea04f33dae77d5"),  # pragma: allowlist secret
     ),
 )
 def test_control_transition_scripts_are_digest_pinned(script, digest):
     assert script.sha256 == digest
     assert SCRIPT_DIGESTS[script.name] == digest
     assert hashlib.sha256(script.source.encode()).hexdigest() == digest
+
+
+def test_cancel_retained_control_timeline_is_outcome_specific():
+    source = valkey_relay_state.CANCEL_REQUEST_SCRIPT.source
+    assert "v[9]=='server_unregistered'" in source
+    assert "v[8]=='expired' and deadline<=accepted" in source
+    assert "or accepted<=deadline" in source
+
+
+def test_node_transition_script_is_registered_digest_pinned_and_bounded():
+    script = valkey_relay_state.NODE_TRANSITION_SCRIPT
+    assert SCRIPT_DIGESTS[script.name] == script.sha256
+    assert hashlib.sha256(script.source.encode()).hexdigest() == script.sha256
+    assert "SCAN" not in script.source.upper()
+    assert "ZRANGE',work,1,tonumber(batch)" in script.source
+    assert "expected_epoch" in script.source
+    assert "redis.call('ZADD',pending_index,now,node_digest)" in script.source
+    assert "if redis.call('ZSCORE',pending_index,node_digest) then return {'schema'} end" in script.source
+    assert script.source.index("local expired_tombs=") < script.source.index(
+        "for _,m in ipairs(expired_tombs) do redis.call('DEL'"
+    )
+    assert script.source.index("local members=redis.call('ZRANGE',work") < (
+        script.source.index("if initial then")
+    )
+    assert "finite(redis.call('ZSCORE',deadlines,member))~=request_deadline" in script.source
+    assert "entries[1][2][2]~=client" in script.source
+    assert "redis.call('ZCARD',tomb_expiries)-#expired_tombs" in script.source
+    assert "redis.call('ZCARD',fence_expiries)-#deletable_fences" in script.source
+    assert "local accepted=canonical_number(tv[9],true)" in script.source
+    assert "string.len(response[8])>max_response_envelope" in script.source
+    assert "A generation-zero reservation terminal legitimately predates enqueue metadata" in script.source
+    assert "tomb_exists~=(tomb_score~=nil)" in script.source
+    assert "fence_exists~=(fence_score~=nil)" in script.source
+    assert "redis.call('ZSCORE',terminal_expiries,member)" in script.source
+    assert "n>9007199254740990" in script.source
+    assert "not request_deadline" in script.source
+    assert "reservation_expiry>request_deadline" in script.source
+    assert "claim_expiry>request_deadline" in script.source
+    assert "local function registration_epoch(v,zero)" in script.source
+    assert "registered=registration_epoch(nv[3],true)" in script.source
+    assert "lease=registration_epoch(nv[12],true)" in script.source
+    assert "utf8_length(value)>128" in script.source
+    assert "model_count>64" in script.source
+    assert script.source.index("registration_bytes>65536") < script.source.index(
+        "pcall(cjson.decode,nv[4])"
+    )
+    assert "ZRANGE',terminal_expiries,0,-1" not in script.source
+    assert "tonumber(max_client_terminals)" in script.source
+    assert "tonumber(max_node_controls)" in script.source
+    assert "local admitted={}" in script.source
+    assert "local due_terminals=redis.call('ZRANGEBYSCORE'" in script.source
+    assert "local due_controls=redis.call('ZRANGEBYSCORE'" in script.source
+    assert "local function lifecycle_valid(c,q,v,l,accepted)" in script.source
+    assert "tv[1]==v[8] and tv[2]==v[9]" in script.source
+    assert "if accepted>bounded_number(l[8],false)" in script.source
+    assert "v[9]=='server_unregistered' or accepted<=deadline" in script.source
+    assert "for slot=1,max_fingerprints do" in script.source
+    assert "if mapping==node_digest then table.insert(cursor_removals" in script.source
+    assert "redis.call('HSET',cursor,'_count',remaining_cursors)" in script.source
+    assert "local deletable_fences={}" in script.source
+    assert "reserved=rv[2]==od and rv[3]==fv[3] and rv[6]==fv[5]" in script.source
+    assert "if redis.call('EXISTS',tomb)==1 then redis.call('HSET',tomb,'completed','1') end" in script.source
+    assert "A completed owner's retained fence is distinct" in script.source
+    assert script.source.index("if cause=='explicit_unregister' and pv[3]~=supplied") < (
+        script.source.index("if pv[4]~=cause then return {'conflict'} end")
+    )
+    assert "fv[5]~=epoch or finite(fv[6])~=fs" in script.source
+    assert "tv[5]~=epoch" in script.source
+
+    reader = valkey_relay_state.PENDING_TRANSITION_READ_SCRIPT
+    assert SCRIPT_DIGESTS[reader.name] == reader.sha256
+    assert hashlib.sha256(reader.source.encode()).hexdigest() == reader.sha256
+    assert not reader.mutates
+
+
+def test_registration_transition_fences_both_pending_authorities():
+    source = REGISTRATION_TRANSITION_SCRIPT.source
+    assert "prefix .. 'node_transition:' .. digest" in source
+    assert "prefix .. 'node_transitions:pending', digest" in source
+    assert "if fence_exists~=(fence_score~=nil) then return {'schema'} end" in source
+    assert "if expiry>now then return {'credential_mismatch'} end" in source
+
+
+def test_node_removed_record_encoding_is_generation_and_timestamp_canonical():
+    source = valkey_relay_state.NODE_TRANSITION_SCRIPT.source
+    assert "'state','cancelled','claim_generation',generation" in source
+    assert "local generation=r[11] or '0'" in source
+    assert "local accepted=string.format('%.6f',now)" in source
+    assert "local replay=string.format('%.17g',tonumber(accepted))" in source
+
+
+def _node_transition_store_with_reply(reply):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.execute.return_value = reply
+    return registration_store_with_foundation(foundation)
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    (
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"credential_mismatch"], RelayStateCredentialMismatch),
+        ([b"conflict"], RelayStateConflict),
+        ([b"pending_capacity"], RelayStateCapacityExceeded),
+        ([b"transitioning", b"explicit_unregister", b"bad"], ValkeySchemaIncompatibleError),
+        (
+            [
+                b"transitioning",
+                b"explicit_unregister",
+                b"1.0",
+                b"not-an-integer",
+                0,
+                0,
+                0,
+                0,
+                1,
+            ],
+            ValkeySchemaIncompatibleError,
+        ),
+        (
+            [
+                b"transitioning",
+                b"explicit_unregister",
+                b"1.0",
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,
+            ],
+            ValkeySchemaIncompatibleError,
+        ),
+        ([b"unexpected"], ValkeySchemaIncompatibleError),
+        ([b"already_complete", b"unknown", b"1"], ValkeySchemaIncompatibleError),
+        ([b"already_complete", b"explicit_unregister", b"nan"], ValkeySchemaIncompatibleError),
+        ([b"complete", b"explicit_unregister", b"1", 2, 0, 1, 0, 2, 0], ValkeySchemaIncompatibleError),
+        ([b"complete", b"explicit_unregister", b"1", 0, 0, 0, 0, 0, 1], ValkeySchemaIncompatibleError),
+        ([b"transitioning", b"explicit_unregister", b"1", 0, 0, 0, 0, 0, 0], ValkeySchemaIncompatibleError),
+    ),
+)
+def test_node_transition_reply_rejects_typed_and_malformed_results(reply, error):
+    store = _node_transition_store_with_reply(reply)
+
+    with pytest.raises(error):
+        store.unregister_node_and_transition_work("node-a", "a" * 64)
+
+
+@pytest.mark.parametrize(
+    ("cause", "credential", "message"),
+    (
+        ("unsupported", "a" * 64, "cause is invalid"),
+        ("registration_lease_expired", "a" * 64, "does not accept credentials"),
+    ),
+)
+def test_node_transition_rejects_invalid_cause_inputs(cause, credential, message):
+    store = registration_store_with_foundation(Mock(spec=ValkeyFoundation))
+
+    with pytest.raises(RelayStateStoreError, match=message):
+        store.unregister_node_and_transition_work("node-a", credential, cause=cause)
+
+
+def test_node_transition_accepts_stale_pending_recovery_result():
+    store = _node_transition_store_with_reply([b"stale"])
+
+    result = store.unregister_node_and_transition_work(
+        "node-a",
+        cause="registration_lease_expired",
+        _expected_transition_epoch="1.0",
+    )
+
+    assert result.state == "stale"
+    assert not result.continuation_required
+
+
+def _node_tombstone_store(indexed, raw=None, *, field_count=7, current_score=...):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation._client = MagicMock()
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    calls = [indexed]
+    if raw is not None:
+        score = (
+            indexed[0][1]
+            if current_score is ... and isinstance(indexed, list) and indexed
+            else current_score
+        )
+        calls.append([raw, field_count, score])
+    foundation._call.side_effect = calls
+    return registration_store_with_foundation(foundation)
+
+
+def test_node_tombstones_decodes_a_valid_bounded_snapshot():
+    node_digest = b"a" * 64
+    owner_digest = b"b" * 64
+    store = _node_tombstone_store(
+        [(node_digest, 400.0)],
+        [
+            node_digest,
+            owner_digest,
+            b"explicit_unregister",
+            b"cancelled",
+            b"100",
+            b"1",
+            b"400",
+        ],
+    )
+
+    records = store.node_tombstones()
+
+    assert len(records) == 1
+    assert dataclasses.asdict(records[0]) == {
+        "node_identity_digest": node_digest.decode(),
+        "control_credential_digest": owner_digest.decode(),
+        "cause": "explicit_unregister",
+        "status": "cancelled",
+        "transition_epoch": 100.0,
+        "completed": True,
+        "expires_at_epoch": 400.0,
+    }
+
+
+def test_node_tombstones_accepts_additive_fields_and_writer_retention():
+    node_digest = b"a" * 64
+    store = _node_tombstone_store(
+        [(node_digest, 400.0)],
+        [
+            node_digest,
+            b"b" * 64,
+            b"explicit_unregister",
+            b"cancelled",
+            b"100",
+            b"1",
+            b"400",
+        ],
+        field_count=8,
+    )
+    store._config = dataclasses.replace(
+        store.config, node_tombstone_ttl_seconds=60
+    )
+
+    assert store.node_tombstones()[0].expires_at_epoch == 400.0
+
+
+@pytest.mark.parametrize(
+    ("indexed", "raw"),
+    (
+        ("not-a-list", None),
+        ([(b"invalid", 200.0)], None),
+        ([(b"a" * 64, 200.0)], [None] * 7),
+        (
+            [(b"a" * 64, 200.0)],
+            [
+                b"a" * 64,
+                b"b" * 64,
+                b"explicit_unregister",
+                b"cancelled",
+                b"invalid",
+                b"1",
+                b"200.0",
+            ],
+        ),
+        (
+            [(b"a" * 64, 200.0)],
+            [
+                b"a" * 64,
+                b"b" * 64,
+                b"explicit_unregister",
+                b"invalid-status",
+                b"100.0",
+                b"1",
+                b"200.0",
+            ],
+        ),
+    ),
+)
+def test_node_tombstones_rejects_malformed_authority(indexed, raw):
+    store = _node_tombstone_store(indexed, raw)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.node_tombstones()
+
+
+@pytest.mark.parametrize(
+    ("raw", "field_count", "current_score"),
+    (
+        ([b"a"] * 6, 7, 200.0),
+        ([b"a"] * 8, 8, 200.0),
+        ([None] * 7, 1, 200.0),
+        ([None] + [b"a"] * 6, 8, 200.0),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"200"], 7, None),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"200"], 7, 201.0),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"99"], 7, 99.0),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"401"], 7, 401.0),
+    ),
+)
+def test_node_tombstones_rejects_invalid_reply_or_timeline(
+    raw, field_count, current_score
+):
+    store = _node_tombstone_store(
+        [(b"a" * 64, 200.0)],
+        raw,
+        field_count=field_count,
+        current_score=current_score,
+    )
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.node_tombstones()
 
 
 @pytest.mark.parametrize(

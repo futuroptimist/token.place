@@ -3178,24 +3178,11 @@ pub(crate) fn operator_start_preflight_cpu_smoke_record(
     Ok(payload)
 }
 
-async fn cleanup_production_operator_preflight_child(child: &mut Child, pid: Option<u32>) -> bool {
-    let tree_terminated = match pid {
-        Some(pid) => terminate_bridge_process_tree(pid).await,
-        None => true,
-    };
-    let root_reaped =
-        match tokio::time::timeout(OPERATOR_PREFLIGHT_REAP_TIMEOUT, child.wait()).await {
-            Ok(Ok(_)) => true,
-            _ => {
-                let killed = child.kill().await.is_ok();
-                let reaped = matches!(
-                    tokio::time::timeout(Duration::from_secs(1), child.wait()).await,
-                    Ok(Ok(_))
-                );
-                killed && reaped
-            }
-        };
-    tree_terminated && root_reaped
+async fn cleanup_production_operator_preflight_child(
+    containment: &BridgeProcessContainment,
+    child: &mut Child,
+) -> bool {
+    containment.terminate_and_reap(child).await
 }
 
 fn require_operator_preflight_cleanup(
@@ -3416,11 +3403,16 @@ async fn run_operator_preflight_child(
     validate_success: fn(Value) -> anyhow::Result<Value>,
 ) -> anyhow::Result<Value> {
     command.stdout(Stdio::piped()).stderr(Stdio::null());
-    isolate_bridge_process_tree(&mut command);
+    let containment = BridgeProcessContainment::prepare(&mut command)
+        .map_err(|_| anyhow::anyhow!("operator_preflight_child_spawn_failed"))?;
     let mut child = command
         .spawn()
         .map_err(|_| anyhow::anyhow!("operator_preflight_child_spawn_failed"))?;
-    let pid = child.id();
+    if containment.assign_and_resume(&child).is_err() {
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(OPERATOR_PREFLIGHT_REAP_TIMEOUT, child.wait()).await;
+        anyhow::bail!("operator_preflight_child_spawn_failed");
+    }
     let result = async {
         let stdout = child
             .stdout
@@ -3445,7 +3437,8 @@ async fn run_operator_preflight_child(
         validate_success(event)
     }
     .await;
-    let cleanup_succeeded = cleanup_production_operator_preflight_child(&mut child, pid).await;
+    let cleanup_succeeded =
+        cleanup_production_operator_preflight_child(&containment, &mut child).await;
     require_operator_preflight_cleanup(result, cleanup_succeeded)
 }
 
@@ -5823,6 +5816,26 @@ mod tests {
         }
     }
 
+    fn exited_operator_preflight_test_command(output: &str) -> Command {
+        #[cfg(unix)]
+        {
+            let mut command = Command::new("sh");
+            command.args(["-c", &format!("printf '%s' '{output}'")]);
+            command
+        }
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("[Console]::Out.Write('{output}')"),
+            ]);
+            command
+        }
+    }
+
     fn oversized_unterminated_operator_preflight_test_command() -> Command {
         let byte_count = OPERATOR_PREFLIGHT_EVENT_MAX_BYTES + 2;
         #[cfg(unix)]
@@ -5855,6 +5868,18 @@ mod tests {
         assert_eq!(event["type"], "status");
         assert_eq!(event["production_runtime_preflight"], true);
         assert_eq!(event["network_actions"], 0);
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_accepts_valid_event_after_owned_tree_exits() {
+        let event = run_production_operator_preflight_child(
+            exited_operator_preflight_test_command(PRODUCTION_PREFLIGHT_VALIDATED_EVENT),
+            production_operator_preflight_event_test_timeout(),
+        )
+        .await
+        .expect("an exited, fully reaped owned process tree must pass cleanup");
+
+        assert_eq!(event["startup_result"], "runtime_validated");
     }
 
     #[tokio::test]

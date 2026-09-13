@@ -326,6 +326,8 @@ const OPERATOR_PREFLIGHT_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 const OPERATOR_PREFLIGHT_CPU_SMOKE_EVENT_TIMEOUT: Duration = Duration::from_secs(35);
 const OPERATOR_PREFLIGHT_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 const OPERATOR_PREFLIGHT_EVENT_MAX_BYTES: usize = 2048;
+const COMPLETION_PREFLIGHT_EVENT_TIMEOUT: Duration = Duration::from_secs(185);
+const COMPLETION_PREFLIGHT_EVENT_MAX_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -2439,6 +2441,142 @@ impl OperatorBridgeLaunchPreparation {
         self.configure_command(&mut command)?;
         Ok(command)
     }
+
+    fn installed_completion_preflight_command(&self) -> anyhow::Result<Command> {
+        let launcher = self.launcher.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("missing bundled Python launcher for completion preflight")
+        })?;
+        let script = Path::new(&self.bridge_script)
+            .parent()
+            .map(|parent| parent.join("installed_completion_preflight.py"))
+            .filter(|path| path.is_file())
+            .ok_or_else(|| anyhow::anyhow!("installed completion preflight resource missing"))?;
+        let mut command = launcher
+            .command_for_script(&script)
+            .map_err(|_| OperatorBridgeLaunchPreparationError::packaged_environment_invalid())?;
+        self.configure_command(&mut command)?;
+        Ok(command)
+    }
+}
+
+pub(crate) fn installed_completion_preflight_record(
+    config: &DesktopConfig,
+    app: &AppHandle,
+) -> anyhow::Result<Value> {
+    let current_exe = std::env::current_exe().ok();
+    let resource_dir = app.path().resource_dir().ok();
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
+        manifest_dir: Path::new(env!("CARGO_MANIFEST_DIR")),
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
+    let preparation = prepare_operator_bridge_launch(&context)?;
+    let launcher = preparation
+        .launcher
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bundled launcher missing"))?;
+    if !matches!(launcher.source, PythonLauncherSource::BundledRuntime) {
+        anyhow::bail!("completion_preflight_requires_bundled_runtime");
+    }
+    let identity = crate::build_identity::build_identity();
+    let mut command = preparation.installed_completion_preflight_command()?;
+    configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
+    command
+        .env("TOKEN_PLACE_DESKTOP_DISABLE_RUNTIME_BOOTSTRAP", "1")
+        .env("TOKENPLACE_APP_VERSION", identity.app_version)
+        .env("TOKENPLACE_BUILD_ID", identity.build_id)
+        .env("TOKENPLACE_TARGET_TRIPLE", identity.target_triple)
+        .env("TOKENPLACE_BUNDLED_RUNTIME_ID", identity.bundled_runtime_id)
+        .env("TOKENPLACE_RUNTIME_ID", &launcher.runtime_id)
+        .env("TOKENPLACE_LAUNCHER_SOURCE", "bundled")
+        .arg("--model")
+        .arg(&config.model_path)
+        .arg("--mode")
+        .arg(format!("{:?}", config.preferred_mode).to_lowercase())
+        .arg("--context-tier")
+        .arg(normalize_context_tier(&config.context_tier));
+    std::thread::spawn(move || -> anyhow::Result<Value> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_completion_preflight_child(command))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("completion_preflight_child_failed"))?
+}
+
+fn validate_completion_preflight_event(event: Value) -> anyhow::Result<Value> {
+    let object = event
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("completion_preflight_invalid_event"))?;
+    const KEYS: [&str; 12] = [
+        "schema",
+        "accepted",
+        "failure_code",
+        "identity",
+        "configuration",
+        "deadlines_ms",
+        "phases",
+        "timings_ms",
+        "observed_execution",
+        "completion_count",
+        "cleanup",
+        "side_effects",
+    ];
+    if object.len() != KEYS.len()
+        || !object.keys().all(|key| KEYS.contains(&key.as_str()))
+        || event["schema"] != "token.place/installed-gpu-completion-preflight/v1"
+        || event["accepted"] != true
+        || event["failure_code"] != "none"
+        || event["completion_count"] != 1
+        || event["cleanup"]["verified"] != true
+        || !matches!(
+            event["observed_execution"]["backend_used"].as_str(),
+            Some("cuda" | "metal")
+        )
+        || event["observed_execution"]["offloaded_layers"]
+            .as_i64()
+            .unwrap_or(0)
+            <= 0
+        || event["side_effects"]
+            != serde_json::json!({"relay_contacts":0,"registrations":0,"benchmark_attempts":0})
+    {
+        anyhow::bail!("completion_preflight_invalid_event");
+    }
+    Ok(event)
+}
+
+async fn run_completion_preflight_child(mut command: Command) -> anyhow::Result<Value> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    isolate_bridge_process_tree(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|_| anyhow::anyhow!("completion_preflight_child_spawn_failed"))?;
+    let pid = child.id();
+    let result = async {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("completion_preflight_stdout_unavailable"))?;
+        let mut reader =
+            BufReader::new(stdout).take((COMPLETION_PREFLIGHT_EVENT_MAX_BYTES + 1) as u64);
+        let mut line = String::new();
+        tokio::time::timeout(
+            COMPLETION_PREFLIGHT_EVENT_TIMEOUT,
+            reader.read_to_string(&mut line),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("completion_preflight_total_timeout"))??;
+        if line.len() > COMPLETION_PREFLIGHT_EVENT_MAX_BYTES {
+            anyhow::bail!("completion_preflight_event_oversized");
+        }
+        let event: Value = serde_json::from_str(line.trim())
+            .map_err(|_| anyhow::anyhow!("completion_preflight_event_malformed"))?;
+        validate_completion_preflight_event(event)
+    }
+    .await;
+    cleanup_production_operator_preflight_child(&mut child, pid).await;
+    result
 }
 
 #[derive(Debug)]
@@ -4273,6 +4411,56 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
     use tokio::process::Command;
+
+    fn valid_completion_preflight_event() -> Value {
+        serde_json::json!({
+            "schema":"token.place/installed-gpu-completion-preflight/v1",
+            "accepted":true,"failure_code":"none",
+            "identity":{"app_version":"0.1.18"},
+            "configuration":{"output_max_tokens":64},
+            "deadlines_ms":{"total":180000},
+            "phases":{"cleanup":"passed"},"timings_ms":{"total":1},
+            "observed_execution":{"backend_used":"cuda","offloaded_layers":33,"kv_cache_device":"cuda"},
+            "completion_count":1,"cleanup":{"requested":true,"verified":true},
+            "side_effects":{"relay_contacts":0,"registrations":0,"benchmark_attempts":0}
+        })
+    }
+
+    #[test]
+    fn installed_completion_preflight_protocol_accepts_only_one_clean_gpu_completion() {
+        assert!(validate_completion_preflight_event(valid_completion_preflight_event()).is_ok());
+        for (pointer, value) in [
+            ("/completion_count", serde_json::json!(2)),
+            ("/cleanup/verified", serde_json::json!(false)),
+            ("/observed_execution/backend_used", serde_json::json!("cpu")),
+            ("/side_effects/relay_contacts", serde_json::json!(1)),
+        ] {
+            let mut event = valid_completion_preflight_event();
+            *event.pointer_mut(pointer).expect("fixture pointer") = value;
+            assert!(
+                validate_completion_preflight_event(event).is_err(),
+                "accepted {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_completion_preflight_protocol_rejects_extra_privacy_fields() {
+        for forbidden in [
+            "prompt",
+            "response",
+            "ciphertext",
+            "environment",
+            "raw_logs",
+        ] {
+            let mut event = valid_completion_preflight_event();
+            event
+                .as_object_mut()
+                .expect("object")
+                .insert(forbidden.into(), Value::String("secret".into()));
+            assert!(validate_completion_preflight_event(event).is_err());
+        }
+    }
 
     #[test]
     fn benchmark_tokenizer_env_is_paired_validated_and_bridge_scoped() {

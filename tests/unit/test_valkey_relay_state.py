@@ -251,7 +251,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "4e0685ccaa2560b083a6c779a71c223da72a2712b6e2d382c1408be9fcdf9223"  # pragma: allowlist secret
+    expected_digest = "674964d7109d98dce068af6f169336d851a07dffcf8ceee4c18864d89d49e6e4"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -278,6 +278,10 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     assert "local canonical=string.format('%.6f',n)" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "string.format('%.17g',n)==value" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "local function lua_number(value)\n  return lua_float(value)" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "not canonical_progress(pv[9])" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert RETRIEVE_RESPONSE_SCRIPT.source.index(
+        "not canonical_progress(pv[9])"
+    ) < RETRIEVE_RESPONSE_SCRIPT.source.index("redis.call('DEL',progress)", 1)
 
 
 def test_progress_script_is_registered_digest_pinned_and_bounded():

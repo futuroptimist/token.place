@@ -2033,6 +2033,52 @@ end
 local function lua_number(value)
   return lua_float(value)
 end
+local function valid_utf8(value)
+  local i,n=1,string.len(value)
+  while i<=n do
+    local b=string.byte(value,i)
+    if b<128 then i=i+1
+    elseif b>=194 and b<=223 and i+1<=n and string.byte(value,i+1)>=128 and string.byte(value,i+1)<=191 then i=i+2
+    elseif b>=224 and b<=239 and i+2<=n then
+      local b2,b3=string.byte(value,i+1),string.byte(value,i+2)
+      if b2<128 or b2>191 or b3<128 or b3>191 or (b==224 and b2<160) or (b==237 and b2>159) then return false end
+      i=i+3
+    elseif b>=240 and b<=244 and i+3<=n then
+      local b2,b3,b4=string.byte(value,i+1),string.byte(value,i+2),string.byte(value,i+3)
+      if b2<128 or b2>191 or b3<128 or b3>191 or b4<128 or b4>191 or (b==240 and b2<144) or (b==244 and b2>143) then return false end
+      i=i+4
+    else return false end
+  end
+  return true
+end
+local function canonical_progress(value)
+  if not value or string.len(value)<1 or string.len(value)>max_progress_envelope or not valid_utf8(value) then return false end
+  local ok,envelope=pcall(cjson.decode,value)
+  if not ok or type(envelope)~='table' then return false end
+  local count=0
+  for key,_ in pairs(envelope) do
+    if key~='protocol' and key~='version' and key~='ciphertext' and key~='cipherkey' and key~='iv' then return false end
+    count=count+1
+  end
+  if count~=5 or envelope.protocol~='tokenplace_api_v1_relay_e2ee' or envelope.version~=1 or
+     type(envelope.ciphertext)~='string' or envelope.ciphertext=='' or type(envelope.cipherkey)~='string' or envelope.cipherkey=='' or
+     type(envelope.iv)~='string' or envelope.iv=='' then return false end
+  local function json_string(text)
+    local out={string.char(34)}
+    local escapes={[8]='b',[9]='t',[10]='n',[12]='f',[13]='r'}
+    for i=1,string.len(text) do
+      local byte=string.byte(text,i)
+      if byte==34 or byte==92 then out[#out+1]=string.char(92)..string.char(byte)
+      elseif escapes[byte] then out[#out+1]=string.char(92)..escapes[byte]
+      elseif byte<32 then out[#out+1]=string.format('\\u%04x',byte)
+      else out[#out+1]=string.char(byte) end
+    end
+    out[#out+1]=string.char(34)
+    return table.concat(out)
+  end
+  local canonical='{"cipherkey":'..json_string(envelope.cipherkey)..',"ciphertext":'..json_string(envelope.ciphertext)..',"iv":'..json_string(envelope.iv)..',"protocol":'..json_string(envelope.protocol)..',"version":1}'
+  return canonical==value
+end
 if not digest(client) or not digest(request_digest) or not digest(retrieval_digest) or
    (supplied_ack~='' and not digest(supplied_ack)) or
    string.len(client_public_key)<1 or string.len(client_public_key)>max_identity or
@@ -2060,10 +2106,6 @@ if redis.call('EXISTS',terminal)==0 and present==0 then
      not sequence or not generation or lv[11]~=lv[9]..'-0' or not digest(lv[12]) or not digest(lv[13]) or
      string.len(lv[14])<1 or string.len(lv[14])>max_request_envelope or
      finite(redis.call('ZSCORE',deadlines,member))~=deadline then return {'schema'} end
-  if deadline<=now then
-    redis.call('DEL',progress); redis.call('ZREM',progress_expiries,member)
-    return {'completed_unavailable'}
-  end
   local cv=redis.call('HMGET',claim,'client','request','node_digest','node_id','owner_digest','consumer_digest','deadline','sequence','generation','lease_expires')
   for i=1,#cv do if not cv[i] then return {'schema'} end end
   local claim_deadline,claim_sequence,claim_generation,claim_expiry=finite(cv[7]),integer(cv[8]),integer(cv[9]),finite(cv[10])
@@ -2077,10 +2119,14 @@ if redis.call('EXISTS',terminal)==0 and present==0 then
   local pp=0 for i=1,#pv do if pv[i] then pp=pp+1 end end
   local progress_hlen=redis.call('HLEN',progress)
   local progress_score=finite(redis.call('ZSCORE',progress_expiries,member))
-  if redis.call('EXISTS',progress)==0 and progress_hlen==0 and pp==0 and not progress_score then return {'pending',lv[8],''} end
+  if redis.call('EXISTS',progress)==0 and progress_hlen==0 and pp==0 and not progress_score then
+    if deadline<=now then return {'completed_unavailable'} end
+    return {'pending',lv[8],''}
+  end
   if redis.call('EXISTS',progress)~=1 or progress_hlen~=9 or pp~=#pv or not progress_score or progress_score~=deadline or
      pv[1]~=client or pv[2]~=request_digest or pv[3]~=lv[7] or pv[4]~=lv[6] or pv[5]~=cv[5] or pv[6]~=cv[6] or
-     integer(pv[7])~=generation or finite(pv[8])~=deadline or string.len(pv[9])<1 or string.len(pv[9])>max_progress_envelope then return {'schema'} end
+     integer(pv[7])~=generation or finite(pv[8])~=deadline or not canonical_progress(pv[9]) then return {'schema'} end
+  if deadline<=now then redis.call('DEL',progress); redis.call('ZREM',progress_expiries,member); return {'completed_unavailable'} end
   if claim_expiry<=now then redis.call('DEL',progress); redis.call('ZREM',progress_expiries,member); return {'pending',lv[8],''} end
   redis.call('DEL',progress); redis.call('ZREM',progress_expiries,member)
   return {'pending',lv[8],pv[9]}
@@ -2169,7 +2215,7 @@ return {'acknowledged',tv[9],tv[8],tv[13]}
 RETRIEVE_RESPONSE_SCRIPT = ReviewedScript(
     "retrieve_or_ack_response_v1",
     RETRIEVE_RESPONSE_SOURCE,
-    "4e0685ccaa2560b083a6c779a71c223da72a2712b6e2d382c1408be9fcdf9223",  # pragma: allowlist secret
+    "674964d7109d98dce068af6f169336d851a07dffcf8ceee4c18864d89d49e6e4",  # pragma: allowlist secret
     True,
 )
 

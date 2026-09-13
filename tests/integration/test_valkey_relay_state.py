@@ -18,6 +18,7 @@ import redis
 
 from relay_state_store import (
     ComputeNodeCapabilities,
+    EncryptedProgressEnvelope,
     EncryptedRequestEnvelope,
     EncryptedResponseEnvelope,
     InMemoryRelayStateStore,
@@ -3179,6 +3180,77 @@ def _enqueue_claim_fixture(
         "cancel",
     )
     return envelope
+
+
+def test_progress_replacement_and_authenticated_one_shot_pending_retrieval(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "progress-node", _digest("progress-owner"), "consumer"
+    identity = ("progress-client", "progress-request")
+    initial = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher-one", "key-one", "iv-one"
+    )
+    latest = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher-two", "key-two", "iv-two"
+    )
+    try:
+        first.register(node, _capabilities(), owner)
+        deadline = first._foundation.server_time()[0] + 30
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        first.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+            ),
+            "cancel",
+        )
+        claim = first.claim_queued_request(node, owner, consumer)
+        cfg = first._foundation.config
+        client_digest, request_digest = first._identity(*identity)
+        claim_key = cfg.key("claim", client_digest, request_digest)
+        before_claim = first._foundation._client.dump(claim_key)
+
+        assert (
+            first.replace_encrypted_progress_if_claimed(
+                node, owner, consumer, *identity, claim.generation, initial
+            ).state
+            == "accepted"
+        )
+        assert (
+            second.replace_encrypted_progress_if_claimed(
+                node, owner, consumer, *identity, claim.generation, latest
+            ).state
+            == "replaced"
+        )
+        assert first._foundation._client.dump(claim_key) == before_claim
+
+        pending = second.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert pending.state == "pending"
+        assert pending.request_deadline_epoch == deadline
+        assert pending.progress == latest
+        again = first.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert again.state == "pending"
+        assert again.request_deadline_epoch == deadline
+        assert again.progress is None
+        assert first._foundation._client.dump(claim_key) == before_claim
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()
 
 
 @pytest.mark.parametrize("stage", ("reserved", "queued", "claimed"))

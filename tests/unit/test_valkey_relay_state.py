@@ -14,6 +14,7 @@ import valkey_relay_state
 
 from valkey_relay_state import (
     ACCEPT_RESPONSE_SCRIPT,
+    REPLACE_PROGRESS_SCRIPT,
     RETRIEVE_RESPONSE_SCRIPT,
     DirectPrimary,
     ReviewedScript,
@@ -33,6 +34,7 @@ from valkey_relay_state import (
 )
 from relay_state_store import (
     EncryptedRequestEnvelope,
+    EncryptedProgressEnvelope,
     EncryptedResponseEnvelope,
     RelayStateCapacityExceeded,
     RelayStateConflict,
@@ -250,7 +252,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "82d25c377e3df42263b09540f18557a0579e270f25b2c811d0876c7a96e81e45"  # pragma: allowlist secret
+    expected_digest = "e78be63ec45162ecfdd085d0da38b180f078aada1132d771d3d9fd3a3148b867"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -277,6 +279,26 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     assert "local canonical=string.format('%.6f',n)" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "string.format('%.17g',n)==value" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "local function lua_number(value)\n  return lua_float(value)" in RETRIEVE_RESPONSE_SCRIPT.source
+
+
+def test_progress_script_is_registered_digest_pinned_and_bounded():
+    expected = "1961172e93d4399134701e477219ee7141f39adba77f14b04f7076b99754a2c0"  # pragma: allowlist secret
+    assert REPLACE_PROGRESS_SCRIPT.sha256 == expected
+    assert SCRIPT_DIGESTS[REPLACE_PROGRESS_SCRIPT.name] == expected
+    assert hashlib.sha256(REPLACE_PROGRESS_SCRIPT.source.encode()).hexdigest() == expected
+    assert "redis.call('TIME')" in REPLACE_PROGRESS_SCRIPT.source
+    assert "ZRANGE',deadlines,0,max_lifecycles" in REPLACE_PROGRESS_SCRIPT.source
+
+
+def test_progress_serialization_is_canonical_exact_utf8():
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher-☃", "key", "iv"
+    )
+    raw = ValkeyRegistrationStore._serialized_progress_envelope(envelope)
+    assert ValkeyRegistrationStore._decode_progress_envelope(raw) == envelope
+    assert b"\xe2\x98\x83" in raw
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        ValkeyRegistrationStore._decode_progress_envelope(raw[:-1] + b',"extra":1}')
 
 
 @pytest.mark.parametrize(

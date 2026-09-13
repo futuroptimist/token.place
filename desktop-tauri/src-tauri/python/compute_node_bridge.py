@@ -3101,6 +3101,133 @@ def _headless_result(*, success: bool, phase: str, failure_code: str,
     }
 
 
+GPU_COMPLETION_PREFLIGHT_SCHEMA = "installed-gpu-completion-preflight-v1"
+GPU_COMPLETION_MAX_TOKENS = 4
+
+
+def _gpu_completion_result(*, success: bool = False, phase: str = "not_started",
+                           failure_code: str = "invalid_arguments",
+                           backend: str = "unknown") -> Dict[str, Any]:
+    """Build the deliberately small, privacy-safe installed qualification receipt."""
+    return {
+        "schema_version": GPU_COMPLETION_PREFLIGHT_SCHEMA,
+        "success": success,
+        "last_completed_phase": phase,
+        "failure_code": failure_code,
+        "artifact_identity": "failed",
+        "model_identity": "failed",
+        "declared_backend": backend,
+        "observed_backend": "unknown",
+        "gpu_execution_observed": False,
+        "completion_count": 0,
+        "output_validation": "not_started",
+        "output_max_tokens": GPU_COMPLETION_MAX_TOKENS,
+        "phase_timings_ms": {},
+        "cleanup_status": "not_started",
+    }
+
+
+def installed_gpu_completion_preflight(args: Any) -> int:
+    """Run one local production API-v1 completion, without relay registration."""
+    backend = str(getattr(args, "mode", "unknown")).lower()
+    result = _gpu_completion_result(backend=backend)
+    runtime = None
+    started = time.monotonic()
+    phase_started = started
+
+    def finish_phase(name: str) -> None:
+        nonlocal phase_started
+        now = time.monotonic()
+        result["phase_timings_ms"][name] = max(0, int((now - phase_started) * 1000))
+        phase_started = now
+
+    try:
+        if backend not in {"cuda", "metal"} or not args.model or not os.path.isfile(args.model):
+            return 2
+        identities = [os.environ.get(name, "") for name in (
+            "TOKENPLACE_APP_VERSION", "TOKENPLACE_BUILD_ID", "TOKENPLACE_TARGET_TRIPLE",
+            "TOKENPLACE_BUNDLED_RUNTIME_ID", "TOKENPLACE_RUNTIME_ID")]
+        if not all(identities) or identities[-1] != identities[-2] or \
+                os.environ.get("TOKENPLACE_LAUNCHER_SOURCE") != "bundled_runtime":
+            result["failure_code"] = "packaged_runtime_identity_failed"
+            return 3
+        result["artifact_identity"] = "validated"
+        if ensure_desktop_python_dependencies().get("ok") != "true":
+            result["failure_code"] = "packaged_runtime_identity_failed"
+            return 3
+        setup = _ensure_desktop_llama_runtime_for_context("gpu", args.context_tier)
+        selected = str(setup.get("selected_backend", "unknown")).lower()
+        if selected != backend:
+            result["failure_code"] = "cpu_fallback_rejected"
+            return 4
+        finish_phase("startup")
+        from utils.compute_node_runtime import ComputeNodeRuntime, ComputeNodeRuntimeConfig, apply_compute_mode
+        apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
+        tier = normalize_context_tier(args.context_tier)
+        runtime = ComputeNodeRuntime(ComputeNodeRuntimeConfig(
+            relay_url="http://127.0.0.1:1", relay_port=1,
+            use_configured_relay_fallbacks=False, relay_urls=("http://127.0.0.1:1",)))
+        manager = runtime.model_manager
+        if getattr(manager, "use_mock_llm", False):
+            result["failure_code"] = "mock_runtime_rejected"
+            return 4
+        manager.model_path = os.path.abspath(args.model)
+        manager.parent_model_path_exists = True
+        manager.model_path_was_relative = False
+        apply_context_profile(manager, tier)
+        apply_compute_mode(manager, "gpu")
+        manager.desktop_runtime_probe = dict(setup)
+        result["model_identity"] = "production_resolver_validated"
+        result["last_completed_phase"] = "identity_validated"
+        print(json.dumps({"type": "headless_internal", "phase": "startup_ready"},
+                         sort_keys=True, separators=(",", ":")), flush=True)
+        old_smoke = os.environ.get("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION")
+        os.environ["TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION"] = "1"
+        try:
+            ready = runtime.ensure_api_v1_runtime_ready()
+        finally:
+            if old_smoke is None:
+                os.environ.pop("TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION", None)
+            else:
+                os.environ["TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION"] = old_smoke
+        finish_phase("model_load_and_generation")
+        diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
+        observed = str(diagnostics.get("backend_used") or diagnostics.get("selected_backend")
+                       or diagnostics.get("device_backend") or "unknown").lower()
+        smoke_ok = diagnostics.get("api_v1_readiness_completion_smoke_result") == "passed"
+        max_tokens = diagnostics.get("api_v1_readiness_completion_smoke_max_tokens")
+        if not ready or not smoke_ok or max_tokens != GPU_COMPLETION_MAX_TOKENS:
+            result["failure_code"] = "completion_failed"
+            return 5
+        if observed != backend:
+            result["failure_code"] = "cpu_fallback_rejected"
+            return 4
+        result.update(observed_backend=observed, gpu_execution_observed=True,
+                      completion_count=1, output_validation="nonempty_well_formed_bounded",
+                      last_completed_phase="completion_validated", failure_code="none")
+        return 0
+    except Exception:
+        result["failure_code"] = "worker_or_protocol_failure"
+        return 7
+    finally:
+        cleanup_ok = True
+        if runtime is not None:
+            try:
+                runtime.stop(shutdown_deadline=time.monotonic() + 10.5)
+            except Exception:
+                cleanup_ok = False
+        finish_phase("cleanup")
+        result["phase_timings_ms"]["total"] = max(0, int((time.monotonic() - started) * 1000))
+        result["cleanup_status"] = "verified" if cleanup_ok else "failed"
+        if not cleanup_ok:
+            result.update(success=False, failure_code="cleanup_failed")
+        elif result["failure_code"] == "none":
+            result.update(success=True, last_completed_phase="cleanup_completed")
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
+        if not cleanup_ok:
+            return 8
+
+
 def _headless_classify_readiness(ready: bool, diagnostics: Dict[str, Any],
                                  evidence: Any = None,
                                  fixture: Any = None) -> str:
@@ -3264,6 +3391,7 @@ def main() -> int:
     parser.add_argument("--operator-runtime-preflight", action="store_true")
     parser.add_argument("--operator-runtime-preflight-cpu-smoke", action="store_true")
     parser.add_argument("--headless-cpu-admission", action="store_true")
+    parser.add_argument("--installed-gpu-completion-preflight", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3281,6 +3409,8 @@ def main() -> int:
 
     if args.headless_cpu_admission:
         return headless_cpu_admission(args)
+    if args.installed_gpu_completion_preflight:
+        return installed_gpu_completion_preflight(args)
 
     if args.installed_context_smoke:
         print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))

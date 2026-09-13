@@ -5,6 +5,7 @@ mod config;
 mod context_profiles;
 pub mod forward;
 mod headless_cpu_boundary;
+mod installed_gpu_completion_boundary;
 pub mod keygen;
 mod logging;
 mod operator_logs;
@@ -750,6 +751,9 @@ fn print_operator_session_smoke_json() -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if installed_gpu_completion_boundary::requested(&args) {
+        std::process::exit(installed_gpu_completion_boundary::run(args));
+    }
     if headless_cpu_boundary::requested(&args) {
         std::process::exit(headless_cpu_boundary::run(args));
     }

@@ -393,3 +393,43 @@ and must not run pip, reinstall `llama-cpp-python`, require network access, or
 silently fall back from Metal to CPU. Repair packages, when explicitly needed,
 remain in the writable app-data dependency target and are installed by invoking
 pip through the bundled interpreter rather than modifying `Contents/Resources`.
+
+### Installed GPU completion preflight
+
+Issue #1854 adds a dedicated, opt-in qualification boundary which runs before Tauri or WebView
+startup. **This command performs real GPU inference and requires explicit operator qualification
+authorization.** It neither grants nor consumes a long-context benchmark attempt and is never run
+by installation or ordinary operator startup.
+
+```powershell
+& "$env:LOCALAPPDATA\token.place desktop\token-place-desktop-tauri.exe" `
+  --installed-gpu-completion-preflight --model "C:\models\Qwen3-8B-Q4_K_M.gguf" `
+  --backend cuda --context-tier 8k-fast `
+  --startup-timeout-seconds 300 --operation-timeout-seconds 600
+```
+
+On Apple Silicon use `--backend metal`. The installed executable resolves the production packaged
+bridge and bundled Python runtime, rejects source/system runtime substitution and CPU fallback, and
+starts an invocation-owned child process. The child enables the existing production API-v1
+readiness completion path for exactly one synthetic, non-reasoning, non-streaming completion. Its
+output limit is 4 tokens: enough to prove decode while minimizing work and evidence exposure. The
+Rust supervisor separately bounds startup (default operator value: 300 seconds) and the combined
+model-load/generation operation (600 seconds), permits only two protocol records, and mandates
+owned-process teardown. Child cleanup uses the existing 10.5-second operator cleanup budget; the
+supervisor adds a 2-second terminal-exit bound. These intentionally conservative defaults cover
+signed 8B-model cold starts while remaining finite; operators should lower them only with known
+hardware baselines.
+
+The sole stdout record uses schema `installed-gpu-completion-preflight-v1`. Its allowlist contains
+only success/failure and phase fields, packaged artifact/model identity states, declared versus
+observed backend, a GPU-observed boolean, completion count, bounded-output classification, phase
+milliseconds, and cleanup status. Prompt or generated text, ciphertext, keys, credentials, paths,
+environment dumps, and child logs are never included. Success requires one well-formed nonempty
+completion, observed CUDA/Metal matching the declaration, and verified cleanup; every other outcome
+is nonzero.
+
+Source tests and controlled protocol fixtures validate orchestration but are **not** signed-release
+qualification or physical CUDA/Metal evidence. After a signed patch is released, an authorized
+operator must run this installed command on each supported GPU platform. Benchmark authorization
+and counters remain a separate workflow. This repository change does not create a release, deploy,
+download weights, or claim physical qualification.

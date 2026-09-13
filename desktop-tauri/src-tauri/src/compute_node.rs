@@ -3178,16 +3178,34 @@ pub(crate) fn operator_start_preflight_cpu_smoke_record(
     Ok(payload)
 }
 
-async fn cleanup_production_operator_preflight_child(child: &mut Child, pid: Option<u32>) {
-    if let Some(pid) = pid {
-        terminate_bridge_process_tree(pid).await;
-    }
-    if tokio::time::timeout(OPERATOR_PREFLIGHT_REAP_TIMEOUT, child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.kill().await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+async fn cleanup_production_operator_preflight_child(child: &mut Child, pid: Option<u32>) -> bool {
+    let tree_terminated = match pid {
+        Some(pid) => terminate_bridge_process_tree(pid).await,
+        None => true,
+    };
+    let root_reaped =
+        match tokio::time::timeout(OPERATOR_PREFLIGHT_REAP_TIMEOUT, child.wait()).await {
+            Ok(Ok(_)) => true,
+            _ => {
+                let killed = child.kill().await.is_ok();
+                let reaped = matches!(
+                    tokio::time::timeout(Duration::from_secs(1), child.wait()).await,
+                    Ok(Ok(_))
+                );
+                killed && reaped
+            }
+        };
+    tree_terminated && root_reaped
+}
+
+fn require_operator_preflight_cleanup(
+    result: anyhow::Result<Value>,
+    cleanup_succeeded: bool,
+) -> anyhow::Result<Value> {
+    if cleanup_succeeded {
+        result
+    } else {
+        Err(anyhow::anyhow!("operator_preflight_child_cleanup_failed"))
     }
 }
 
@@ -3427,8 +3445,8 @@ async fn run_operator_preflight_child(
         validate_success(event)
     }
     .await;
-    cleanup_production_operator_preflight_child(&mut child, pid).await;
-    result
+    let cleanup_succeeded = cleanup_production_operator_preflight_child(&mut child, pid).await;
+    require_operator_preflight_cleanup(result, cleanup_succeeded)
 }
 
 async fn run_production_operator_preflight_child(
@@ -6075,6 +6093,17 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "wedged child was not terminated and boundedly reaped"
         );
+    }
+
+    #[test]
+    fn operator_preflight_rejects_validated_event_when_parent_cleanup_fails() {
+        let event = serde_json::from_str(PRODUCTION_PREFLIGHT_VALIDATED_EVENT)
+            .expect("valid production preflight event");
+
+        let error = require_operator_preflight_cleanup(Ok(event), false)
+            .expect_err("cleanup failure must override a validated child event");
+
+        assert_eq!(error.to_string(), "operator_preflight_child_cleanup_failed");
     }
 
     #[test]

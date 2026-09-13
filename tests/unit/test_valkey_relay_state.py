@@ -198,7 +198,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "a99cba7dbb7d606155ffa96990567502877f84a3157906fde5da5ec561ec50dc"  # pragma: allowlist secret
+    expected_digest = "be8be5ddad84b77b4bb37777587453029dd9ac36bc92027f3812ab5829e4e238"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -251,7 +251,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "ee62f5e172f0ecefdd0d75efcda969e0c982bd3234a58d6690a250b5e0035680"  # pragma: allowlist secret
+    expected_digest = "4e0685ccaa2560b083a6c779a71c223da72a2712b6e2d382c1408be9fcdf9223"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -281,12 +281,13 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_progress_script_is_registered_digest_pinned_and_bounded():
-    expected = "0b7c6916bd7a97680f5e138c5de7ae09600410fb42f92a5562275b1d9c1687dc"  # pragma: allowlist secret
+    expected = "b60574714d21e9df09c4d65230f8711061dbc093b552d9426eae96da74234ec3"  # pragma: allowlist secret
     assert PROGRESS_TRANSITION_SCRIPT.sha256 == expected
     assert SCRIPT_DIGESTS[PROGRESS_TRANSITION_SCRIPT.name] == expected
     assert "SCAN" not in PROGRESS_TRANSITION_SCRIPT.source.upper()
     assert "ZRANGE',progress_expiries,0,max_progress" in PROGRESS_TRANSITION_SCRIPT.source
     assert "redis.call('TIME')" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "redis.call('HLEN',key)~=9" in PROGRESS_TRANSITION_SCRIPT.source
 
 
 @pytest.mark.parametrize(
@@ -294,8 +295,8 @@ def test_progress_script_is_registered_digest_pinned_and_bounded():
     (
         (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947"),  # pragma: allowlist secret
         (valkey_relay_state.ENQUEUE_SCRIPT, "b9230062be58f017bfb618a368e3fd0d498cadf29c2793201886f1f3e40b9fcb"),  # pragma: allowlist secret
-        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "1c470b73eeab901af47264a80d6f8a10c6957f30a2da6b18d9127fb8d7dfa663"),  # pragma: allowlist secret
-        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "0485b8e9644ada8810eb8c7e4a799ca32d779597c4488d195082447d3fb091a4"),  # pragma: allowlist secret
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "0bebbd23cb2e55963be5f8f9c69b283d693e4cb64ebc43fcaade1290e25f2291"),  # pragma: allowlist secret
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "5eafc6023abb053d1e934db207bc95253019b493416a2bf4fea571d27b1a8058"),  # pragma: allowlist secret
     ),
 )
 def test_control_transition_scripts_are_digest_pinned(script, digest):

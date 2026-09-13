@@ -1191,8 +1191,8 @@ for _, entry in ipairs(entries) do
          (old_expiry > now and not indexed_expiry) or
          rv[1]~='claimed' then return {'schema'} end
       local pv=redis.call('HMGET',progress_key,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','deadline','envelope')
-      local pp=0 for i=1,#pv do if pv[i] then pp=pp+1 end end; local ps=finite(redis.call('ZSCORE',progress_index,member))
-      if (pp==0)~=(not ps) or (pp~=0 and (pp~=#pv or pv[1]~=client or pv[2]~=request or pv[3]~=old[3] or pv[4]~=old[4] or pv[5]~=old[5] or pv[6]~=old[6] or positive_integer(pv[7])~=old_generation or finite(pv[8])~=deadline or ps~=deadline or not pv[9] or string.len(pv[9])<1 or string.len(pv[9])>max_progress_envelope)) then return {'schema'} end
+      local pp=0 for i=1,#pv do if pv[i] then pp=pp+1 end end; local ps=finite(redis.call('ZSCORE',progress_index,member)); local ph=redis.call('HLEN',progress_key)
+      if (pp==0)~=(not ps) or (pp~=0 and (ph~=9 or pp~=#pv or pv[1]~=client or pv[2]~=request or pv[3]~=old[3] or pv[4]~=old[4] or pv[5]~=old[5] or pv[6]~=old[6] or positive_integer(pv[7])~=old_generation or finite(pv[8])~=deadline or ps~=deadline or not pv[9] or string.len(pv[9])<1 or string.len(pv[9])>max_progress_envelope)) then return {'schema'} end
       if old_expiry <= now then reclaim = true else reclaim = nil end
     end
     if reclaim ~= nil then
@@ -1250,7 +1250,7 @@ return {'empty'}
 CLAIM_SCRIPT = ReviewedScript(
     "claim_queued_request_v1",
     CLAIM_SOURCE,
-    "846d239ca11b2722bc60f2721ffc4404bb9e4a0a12bb0f6b49c8ecb85dda68e3",  # pragma: allowlist secret
+    "fef9c98f2a7711a93348732cebb512d08de1e98203169baff2463ce61e1ebe21",  # pragma: allowlist secret
     True,
 )
 
@@ -1371,8 +1371,8 @@ local r=redis.call('HMGET',request,'state','client','request','node_digest','nod
 for i=1,#r do if not r[i] then return {'schema'} end end
 local entry=redis.call('XRANGE',queue,r[9],r[9],'COUNT',1)
 local pv=redis.call('HMGET',progress,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','deadline','envelope')
-local pp=0 for i=1,#pv do if pv[i] then pp=pp+1 end end; local ps=finite(redis.call('ZSCORE',progress_expiries,client..':'..request_digest))
-local progress_valid=(pp==0 and not ps) or (pp==#pv and ps==deadline and pv[1]==client and pv[2]==request_digest and pv[3]==node_digest and pv[4]==node_id and pv[5]==owner and pv[6]==consumer and pv[7]==generation and canonical(pv[8])==deadline and pv[9]~='' and string.len(pv[9])<=max_progress_envelope)
+local pp=0 for i=1,#pv do if pv[i] then pp=pp+1 end end; local ps=finite(redis.call('ZSCORE',progress_expiries,client..':'..request_digest)); local ph=redis.call('HLEN',progress)
+local progress_valid=(pp==0 and ph==0 and not ps) or (ph==9 and pp==#pv and ps==deadline and pv[1]==client and pv[2]==request_digest and pv[3]==node_digest and pv[4]==node_id and pv[5]==owner and pv[6]==consumer and pv[7]==generation and canonical(pv[8])==deadline and pv[9]~='' and string.len(pv[9])<=max_progress_envelope)
 if redis.call('EXISTS',request)~=1 or r[1]~='claimed' or r[2]~=client or r[3]~=request_digest or r[4]~=node_digest or r[5]~=node_id or canonical(r[6])~=deadline or r[7]~=c[8] or r[8]~=generation or
    r[9]~=r[7]..'-0' or not digest(r[10]) or (r[11]~='' and not digest(r[11])) or r[12]=='' or r[13]=='' or r[14]=='' or
    #entry~=1 or #entry[1][2]~=4 or entry[1][2][1]~='client' or entry[1][2][2]~=client or entry[1][2][3]~='request' or entry[1][2][4]~=request_digest or
@@ -1387,14 +1387,14 @@ return {'continued',generation,value}
 CONTROL_CLAIM_SCRIPT = ReviewedScript(
     "renew_claim_or_read_control_v1",
     CONTROL_CLAIM_SOURCE,
-    "1c470b73eeab901af47264a80d6f8a10c6957f30a2da6b18d9127fb8d7dfa663",  # pragma: allowlist secret
+    "0bebbd23cb2e55963be5f8f9c69b283d693e4cb64ebc43fcaade1290e25f2291",  # pragma: allowlist secret
     True,
 )
 
 CANCEL_REQUEST_SOURCE = """\
 local request,reservation,queue,claim,claim_expiries,deadlines,response,terminal,terminal_expiries,progress,control,control_expiries,reservation_expiries,response_expiries,progress_expiries=unpack(KEYS)
-local prefix,client,request_digest,supplied,status,reason,terminal_ttl,control_ttl,max_terminals,max_client_terminals,max_controls,max_node_controls,node_digest,max_node_id,max_identity,max_request_envelope,max_response_envelope=unpack(ARGV)
-max_node_id,max_identity,max_request_envelope,max_response_envelope=tonumber(max_node_id),tonumber(max_identity),tonumber(max_request_envelope),tonumber(max_response_envelope)
+local prefix,client,request_digest,supplied,status,reason,terminal_ttl,control_ttl,max_terminals,max_client_terminals,max_controls,max_node_controls,node_digest,max_node_id,max_identity,max_request_envelope,max_response_envelope,max_progress_envelope=unpack(ARGV)
+max_node_id,max_identity,max_request_envelope,max_response_envelope,max_progress_envelope=tonumber(max_node_id),tonumber(max_identity),tonumber(max_request_envelope),tonumber(max_response_envelope),tonumber(ARGV[18])
 local member=client..':'..request_digest
 local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
 local function finite(value) local n=tonumber(value); return n and n==n and math.abs(n)~=math.huge and n end
@@ -1479,7 +1479,8 @@ if status=='cancelled' and (supplied=='' or r[8]~=supplied) then return {'invali
 local deadline=canonical(r[6]); local indexed_deadline=finite(redis.call('ZSCORE',deadlines,member));
 if not deadline or deadline<=0 or not indexed_deadline or deadline~=indexed_deadline or not digest(r[7]) or (r[8]~='' and not digest(r[8])) or r[5]=='' or string.len(r[5])>max_node_id then return {'schema'} end
 if status=='expired' and deadline>now then return {'not_expired','request_deadline_active'} end
-if redis.call('EXISTS',progress)~=0 then return {'schema'} end
+local progress_exists=redis.call('EXISTS',progress); local progress_score=finite(redis.call('ZSCORE',progress_expiries,member))
+if progress_exists~=(progress_score and 1 or 0) then return {'schema'} end
 local control_score=redis.call('ZSCORE',control_expiries,node_digest..':'..member)
 if redis.call('EXISTS',control)~=0 or control_score then return {'schema'} end
 local owner,consumer,generation,claim_expiry='','','0',nil
@@ -1489,19 +1490,23 @@ if r[1]=='reserved' then
   local reservation_expiry=finite(rv[8]); local reservation_score=finite(redis.call('ZSCORE',reservation_expiries,r[7]))
   if rv[1]~=client or rv[2]~=request_digest or rv[3]~=node_digest or rv[4]~=r[5] or finite(rv[5])~=deadline or rv[6]~=r[7] or rv[7]~=r[8] or
      not reservation_expiry or not reservation_score or reservation_score~=reservation_expiry or r[9] or r[10] or r[11] or r[12] or r[13] or r[14] or
-     redis.call('EXISTS',claim)~=0 or redis.call('ZSCORE',claim_expiries,member) then return {'schema'} end
+     redis.call('EXISTS',claim)~=0 or redis.call('ZSCORE',claim_expiries,member) or progress_exists~=0 then return {'schema'} end
 else
   if not r[9] or not r[10] or not r[12] or not r[13] or not r[14] or string.len(r[12])>max_identity or string.len(r[13])>max_identity or string.len(r[14])>max_request_envelope then return {'schema'} end
   if redis.call('EXISTS',reservation)~=0 or redis.call('ZSCORE',reservation_expiries,r[7]) then return {'schema'} end
   local entry=redis.call('XRANGE',queue,r[9],r[9],'COUNT',1)
   if #entry~=1 or entry[1][1]~=r[9] or #entry[1][2]~=4 or entry[1][2][1]~='client' or entry[1][2][2]~=client or entry[1][2][3]~='request' or entry[1][2][4]~=request_digest then return {'schema'} end
-  if r[1]=='queued' and (r[11] or not integer(r[10]) or integer(r[10])<1 or redis.call('EXISTS',claim)~=0 or redis.call('ZSCORE',claim_expiries,member)) then return {'schema'} end
+  if r[1]=='queued' and (r[11] or not integer(r[10]) or integer(r[10])<1 or redis.call('EXISTS',claim)~=0 or redis.call('ZSCORE',claim_expiries,member) or progress_exists~=0) then return {'schema'} end
   if r[1]=='claimed' then
     local c=redis.call('HMGET',claim,'client','request','node_digest','node_id','owner_digest','consumer_digest','deadline','sequence','generation','lease_expires')
     for i=1,#c do if not c[i] then return {'schema'} end end
     claim_expiry=finite(c[10]); local indexed=finite(redis.call('ZSCORE',claim_expiries,member))
     if c[1]~=client or c[2]~=request_digest or c[3]~=node_digest or c[4]~=r[5] or finite(c[7])~=deadline or c[8]~=r[10] or c[9]~=r[11] or
        not integer(c[8]) or not integer(c[9]) or not digest(c[5]) or not digest(c[6]) or not claim_expiry or claim_expiry>deadline or indexed~=claim_expiry then return {'schema'} end
+    if progress_exists==1 then
+      local pv=redis.call('HMGET',progress,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','deadline','envelope')
+      if redis.call('HLEN',progress)~=9 or pv[1]~=client or pv[2]~=request_digest or pv[3]~=node_digest or pv[4]~=r[5] or pv[5]~=c[5] or pv[6]~=c[6] or pv[7]~=c[9] or canonical(pv[8])~=deadline or progress_score~=deadline or not pv[9] or string.len(pv[9])<1 or string.len(pv[9])>max_progress_envelope then return {'schema'} end
+    end
     owner,consumer,generation=c[5],c[6],c[9]
   end
 end
@@ -1631,7 +1636,7 @@ return {'created',status,reason}
 CANCEL_REQUEST_SCRIPT = ReviewedScript(
     "cancel_or_expire_request_v1",
     CANCEL_REQUEST_SOURCE,
-    "0485b8e9644ada8810eb8c7e4a799ca32d779597c4488d195082447d3fb091a4",  # pragma: allowlist secret
+    "5eafc6023abb053d1e934db207bc95253019b493416a2bf4fea571d27b1a8058",  # pragma: allowlist secret
     True,
 )
 
@@ -1640,7 +1645,7 @@ local leases,node,queue,claim,request,claim_expiries,deadlines,response,response
 local prefix,node_digest,node_id,owner,consumer,client,request_digest,generation,envelope,response_digest,accepted_value,ack_digest=unpack(ARGV)
 local replay_ttl,terminal_ttl,max_responses,max_client_responses,max_terminals,max_client_terminals,cleanup_bound,max_envelope=tonumber(ARGV[13]),tonumber(ARGV[14]),tonumber(ARGV[15]),tonumber(ARGV[16]),tonumber(ARGV[17]),tonumber(ARGV[18]),tonumber(ARGV[19]),tonumber(ARGV[20])
 local client_public_key,request_id=ARGV[21],ARGV[22]
-local max_node_id,max_identity,max_request_envelope=tonumber(ARGV[24]),tonumber(ARGV[25]),tonumber(ARGV[26])
+local max_node_id,max_identity,max_request_envelope,max_progress_envelope=tonumber(ARGV[24]),tonumber(ARGV[25]),tonumber(ARGV[26]),tonumber(ARGV[27])
 local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
 local function finite(value) local n=tonumber(value); return n and n==n and math.abs(n)~=math.huge and n end
 local function digest(value) return value and string.len(value)==64 and not string.find(value,'[^0-9a-f]') end
@@ -1870,6 +1875,12 @@ local work=prefix..'node_work:'..node_digest
 if redis.call('ZSCORE',work,'!schema:1')~='0' or redis.call('ZSCORE',work,member)~='1' then return {'schema'} end
 local stream=redis.call('XRANGE',queue,rv[11],rv[11],'COUNT',1)
 if #stream~=1 or stream[1][1]~=rv[11] or #stream[1][2]~=4 or stream[1][2][1]~='client' or stream[1][2][2]~=client or stream[1][2][3]~='request' or stream[1][2][4]~=request_digest then return {'schema'} end
+local progress_score=finite(redis.call('ZSCORE',progress_expiries,member)); local progress_exists=redis.call('EXISTS',progress)
+if progress_exists~=(progress_score and 1 or 0) then return {'schema'} end
+if progress_exists==1 then
+  local pv=redis.call('HMGET',progress,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','deadline','envelope')
+  if redis.call('HLEN',progress)~=9 or pv[1]~=client or pv[2]~=request_digest or pv[3]~=node_digest or pv[4]~=node_id or pv[5]~=owner or pv[6]~=consumer or integer(pv[7])~=current or finite(pv[8])~=deadline or progress_score~=deadline or not pv[9] or string.len(pv[9])<1 or string.len(pv[9])>max_progress_envelope then return {'schema'} end
+end
 local function bounded(index,kind,limit,per_limit)
   local members=redis.call('ZRANGE',index,0,limit,'WITHSCORES')
   if #members%2~=0 then return nil end
@@ -1922,7 +1933,7 @@ return {'accepted',generation,accepted_value,replay_value}
 ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     "accept_encrypted_response_v1",
     ACCEPT_RESPONSE_SOURCE,
-    "a99cba7dbb7d606155ffa96990567502877f84a3157906fde5da5ec561ec50dc",  # pragma: allowlist secret
+    "be8be5ddad84b77b4bb37777587453029dd9ac36bc92027f3812ab5829e4e238",  # pragma: allowlist secret
     True,
 )
 
@@ -1938,6 +1949,7 @@ local function finite(v) local n=tonumber(v); return n and n==n and math.abs(n)~
 local function digest(v) return v and string.len(v)==64 and not string.find(v,'[^0-9a-f]') end
 local function integer(v) local n=finite(v); return n and n>=1 and n<=9007199254740990 and n%1==0 and tostring(n)==v and n end
 local function record(key,c,q,score)
+  if redis.call('HLEN',key)~=9 then return false end
   local v=redis.call('HMGET',key,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','deadline','envelope')
   for i=1,#v do if not v[i] then return false end end
   return v[1]==c and v[2]==q and digest(v[3]) and string.len(v[4])>=1 and string.len(v[4])<=max_node_id and
@@ -1989,7 +2001,7 @@ return {progress_exists and 'replaced' or 'accepted'}
 PROGRESS_TRANSITION_SCRIPT = ReviewedScript(
     "replace_encrypted_progress_v1",
     PROGRESS_TRANSITION_SOURCE,
-    "0b7c6916bd7a97680f5e138c5de7ae09600410fb42f92a5562275b1d9c1687dc",  # pragma: allowlist secret
+    "b60574714d21e9df09c4d65230f8711061dbc093b552d9426eae96da74234ec3",  # pragma: allowlist secret
     True,
 )
 
@@ -2056,18 +2068,20 @@ if redis.call('EXISTS',terminal)==0 and present==0 then
   for i=1,#cv do if not cv[i] then return {'schema'} end end
   local claim_deadline,claim_sequence,claim_generation,claim_expiry=finite(cv[7]),integer(cv[8]),integer(cv[9]),finite(cv[10])
   if cv[1]~=client or cv[2]~=request_digest or cv[3]~=lv[7] or cv[4]~=lv[6] or not digest(cv[5]) or not digest(cv[6]) or
-     claim_deadline~=deadline or claim_sequence~=sequence or claim_generation~=generation or not claim_expiry or claim_expiry<=now or
+     claim_deadline~=deadline or claim_sequence~=sequence or claim_generation~=generation or not claim_expiry or
      claim_expiry>deadline or finite(redis.call('ZSCORE',claim_expiries,member))~=claim_expiry or
      redis.call('ZSCORE',prefix..'node_work:'..lv[7],'!schema:1')~='0' or redis.call('ZSCORE',prefix..'node_work:'..lv[7],member)~='1' then return {'schema'} end
   local stream=redis.call('XRANGE',prefix..'queue:'..lv[7],lv[11],lv[11],'COUNT',1)
   if #stream~=1 or stream[1][1]~=lv[11] or #stream[1][2]~=4 or stream[1][2][2]~=client or stream[1][2][4]~=request_digest then return {'schema'} end
   local pv=redis.call('HMGET',progress,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','deadline','envelope')
   local pp=0 for i=1,#pv do if pv[i] then pp=pp+1 end end
+  local progress_hlen=redis.call('HLEN',progress)
   local progress_score=finite(redis.call('ZSCORE',progress_expiries,member))
-  if redis.call('EXISTS',progress)==0 and pp==0 and not progress_score then return {'pending',lv[8],''} end
-  if redis.call('EXISTS',progress)~=1 or pp~=#pv or not progress_score or progress_score~=deadline or
+  if redis.call('EXISTS',progress)==0 and progress_hlen==0 and pp==0 and not progress_score then return {'pending',lv[8],''} end
+  if redis.call('EXISTS',progress)~=1 or progress_hlen~=9 or pp~=#pv or not progress_score or progress_score~=deadline or
      pv[1]~=client or pv[2]~=request_digest or pv[3]~=lv[7] or pv[4]~=lv[6] or pv[5]~=cv[5] or pv[6]~=cv[6] or
      integer(pv[7])~=generation or finite(pv[8])~=deadline or string.len(pv[9])<1 or string.len(pv[9])>max_progress_envelope then return {'schema'} end
+  if claim_expiry<=now then redis.call('DEL',progress); redis.call('ZREM',progress_expiries,member); return {'pending',lv[8],''} end
   redis.call('DEL',progress); redis.call('ZREM',progress_expiries,member)
   return {'pending',lv[8],pv[9]}
 end
@@ -2155,7 +2169,7 @@ return {'acknowledged',tv[9],tv[8],tv[13]}
 RETRIEVE_RESPONSE_SCRIPT = ReviewedScript(
     "retrieve_or_ack_response_v1",
     RETRIEVE_RESPONSE_SOURCE,
-    "ee62f5e172f0ecefdd0d75efcda969e0c982bd3234a58d6690a250b5e0035680",  # pragma: allowlist secret
+    "4e0685ccaa2560b083a6c779a71c223da72a2712b6e2d382c1408be9fcdf9223",  # pragma: allowlist secret
     True,
 )
 
@@ -2387,7 +2401,7 @@ for _,member in ipairs(members) do
   if progress_exists==1 then
     local pv=redis.call('HMGET',progress_key,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','deadline','envelope')
     local pg=integer(pv[7]); local pd=canonical_number(pv[8],false)
-    if pv[1]~=client or pv[2]~=request or pv[3]~=node_digest or pv[4]~=node_id or pv[5]~=owner or not digest(pv[6]) or
+    if redis.call('HLEN',progress_key)~=9 or pv[1]~=client or pv[2]~=request or pv[3]~=node_digest or pv[4]~=node_id or pv[5]~=owner or not digest(pv[6]) or
        not pg or pg~=integer(r[11]) or not pd or pd~=request_deadline or pd~=progress_score or not pv[9] or string.len(pv[9])<1 or string.len(pv[9])>max_progress_envelope then return {'schema'} end
   end
   local terminal_key=prefix..'terminal:'..client..':'..request
@@ -2640,7 +2654,7 @@ return {'transitioning',cause,epoch,#validated,reservations,queued,claims,outcom
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "2f903ee4c61a30dddc9953ce014ba0390b43074b648ebfcd01a5b326474725fc",  # pragma: allowlist secret
+    "419900fe6c46e6f317e9d4ea53933770d5ff7307c4da4a3ab5c0380bd77b6043",  # pragma: allowlist secret
     True,
 )
 
@@ -4330,6 +4344,7 @@ class ValkeyRegistrationStore:
             str(self.config.max_identity_bytes).encode(),
             str(self.config.max_envelope_bytes).encode(),
             str(self.config.max_response_envelope_bytes).encode(),
+            str(self.config.max_progress_envelope_bytes).encode(),
         )
         result_status, values = self._ascii_status(
             self._foundation.execute(CANCEL_REQUEST_SCRIPT.name, keys, args)
@@ -4440,6 +4455,7 @@ class ValkeyRegistrationStore:
             str(self.config.max_node_id_bytes).encode(),
             str(self.config.max_identity_bytes).encode(),
             str(self.config.max_envelope_bytes).encode(),
+            str(self.config.max_progress_envelope_bytes).encode(),
         )
         status, values = self._ascii_status(
             self._foundation.execute(
@@ -4816,7 +4832,7 @@ class ValkeyRegistrationStore:
                 b"owner_digest", b"consumer_digest", b"generation",
                 b"deadline", b"envelope",
             }
-            if type(raw) is not dict or not expected.issubset(raw):
+            if type(raw) is not dict or set(raw) != expected:
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
             try:
                 generation = int(raw[b"generation"])

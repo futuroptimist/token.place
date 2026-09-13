@@ -6918,8 +6918,13 @@ def test_encrypted_response_first_transition_removes_exact_authority_once(
         for identity in identities:
             _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
             claims.append(first.claim_queued_request(node, owner, consumer))
-        datastore.hset(keys[11], mapping={"stage": "generating"})
-        datastore.hset(neighbor_keys[11], mapping={"stage": "neighbor"})
+        progress = EncryptedProgressEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+        )
+        for identity, claim in zip(identities, claims):
+            assert first.replace_encrypted_progress_if_claimed(
+                node, owner, consumer, *identity, claim.generation, progress
+            )
 
         queue_before = datastore.xrange(keys[2])
         addressed_entry = datastore.hget(keys[4], "queue_entry")

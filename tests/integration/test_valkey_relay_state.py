@@ -11874,8 +11874,16 @@ def test_node_work_contract_rejects_registration_and_admission_corruption(
         writer.close()
 
 
-@pytest.mark.parametrize("member_corruption", ("missing", "wrong_score"))
-@pytest.mark.parametrize("operation", ("enqueue", "claim", "renew", "cancel", "cleanup"))
+@pytest.mark.parametrize(
+    ("operation", "member_corruption"),
+    (
+        *((operation, corruption) for operation in ("enqueue", "claim", "renew", "cancel")
+          for corruption in ("missing", "wrong_score")),
+        ("cleanup", None),
+        ("cleanup", "missing"),
+        ("cleanup", "wrong_score"),
+    ),
+)
 def test_node_work_contract_rejects_active_writer_membership_corruption(
     valkey_server, member_corruption, operation
 ):
@@ -11917,6 +11925,9 @@ def test_node_work_contract_rejects_active_writer_membership_corruption(
             token_digest = _digest(selection.reservation_token)
             past = writer._foundation.server_time()[0] - 1
             writer._foundation._client.hset(
+                cfg.key("request", client, request), "reservation_expires", str(past)
+            )
+            writer._foundation._client.hset(
                 cfg.key("reservation", token_digest), "reservation_expires", str(past)
             )
             writer._foundation._client.zadd(
@@ -11924,32 +11935,39 @@ def test_node_work_contract_rejects_active_writer_membership_corruption(
             )
         if member_corruption == "missing":
             writer._foundation._client.zrem(work, member)
-        else:
+        elif member_corruption == "wrong_score":
             writer._foundation._client.zadd(work, {member: 2}, xx=True)
 
         datastore = writer._foundation._client
-
-        def authority():
-            return (
-                tuple(
-                    datastore.zrange(key, 0, -1, withscores=True)
-                    for key in (
-                        work,
-                        cfg.key("nodes:lease"),
-                        cfg.key("requests:deadline"),
-                        cfg.key("reservations:expiry"),
-                        cfg.key("claims:expiry"),
-                    )
-                ),
-                datastore.hgetall(cfg.key("node", digest)),
-                datastore.hgetall(cfg.key("request", client, request)),
-                datastore.hgetall(
-                    cfg.key("reservation", _digest(selection.reservation_token))
-                ),
-                datastore.xrange(cfg.key("queue", digest)),
+        old_reservation = cfg.key("reservation", _digest(selection.reservation_token))
+        before = _node_transition_authority_snapshot(
+            writer, node_id, (identity,), extra=(old_reservation,)
+        )
+        if operation == "cleanup" and member_corruption is None:
+            replacement = observer.select_and_reserve(
+                *identity,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
             )
-
-        before = authority()
+            replacement_digest = _digest(replacement.reservation_token)
+            request_authority = datastore.hgetall(cfg.key("request", client, request))
+            reservation_authority = datastore.hgetall(
+                cfg.key("reservation", replacement_digest)
+            )
+            assert replacement.reservation_token != selection.reservation_token
+            assert datastore.exists(old_reservation) == 0
+            assert datastore.zscore(cfg.key("reservations:expiry"), token_digest) is None
+            assert request_authority[b"state"] == b"reserved"
+            assert request_authority[b"token_digest"] == replacement_digest.encode()
+            assert reservation_authority[b"client"] == client.encode()
+            assert reservation_authority[b"request"] == request.encode()
+            assert reservation_authority[b"node_digest"] == digest.encode()
+            assert datastore.zscore(work, member) == 1.0
+            assert datastore.zscore(
+                cfg.key("reservations:expiry"), replacement_digest
+            ) == float(reservation_authority[b"reservation_expires"])
+            return
         with pytest.raises(ValkeySchemaIncompatibleError):
             if operation == "enqueue":
                 observer.enqueue_encrypted_request(
@@ -11978,13 +11996,14 @@ def test_node_work_contract_rejects_active_writer_membership_corruption(
                 observer.cancel_or_expire_request(*identity, "cancel")
             else:
                 observer.select_and_reserve(
-                    f"{identity[0]}-next",
-                    f"{identity[1]}-next",
+                    *identity,
                     "qwen3-8b-instruct",
                     "8k-fast",
                     deadline,
                 )
-        assert authority() == before
+        assert _node_transition_authority_snapshot(
+            writer, node_id, (identity,), extra=(old_reservation,)
+        ) == before
     finally:
         _delete_claim_fixture_state(writer, (node_id,), (identity,))
         writer._foundation._client.delete(work)

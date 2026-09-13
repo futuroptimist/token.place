@@ -4948,6 +4948,11 @@ class ValkeyRegistrationStore:
                     raw[b"client"] != client.encode()
                     or raw[b"request"] != request.encode()
                     or not _SHA256_RE.fullmatch(raw[b"node_digest"].decode("ascii"))
+                    or not 0
+                    < len(raw[b"node_id"])
+                    <= self.config.max_node_id_bytes
+                    or self._node_digest(raw[b"node_id"].decode("utf-8")).encode()
+                    != raw[b"node_digest"]
                     or not _SHA256_RE.fullmatch(raw[b"owner_digest"].decode("ascii"))
                     or not _SHA256_RE.fullmatch(raw[b"consumer_digest"].decode("ascii"))
                     or generation < 1

@@ -3240,6 +3240,65 @@ def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(
 
 
 @pytest.mark.parametrize(
+    "stored_node_id",
+    (b"", b"x" * 8193, b"invalid-\xff-node"),
+    ids=("empty", "oversized", "invalid-utf8"),
+)
+def test_progress_records_rejects_invalid_node_id_without_mutation(
+    valkey_server, stored_node_id
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node_id, owner, consumer = "progress-inspection-node", _digest(
+        "progress-inspection-owner"
+    ), "worker"
+    identity = ("progress-inspection-client", "progress-inspection-request")
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+    )
+    try:
+        store.register(node_id, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 60
+        selection = _enqueue_claim_fixture(
+            store, node_id, owner, *identity, deadline
+        )
+        claim = store.claim_queued_request(node_id, owner, consumer)
+        store.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, envelope
+        )
+        cfg = store._foundation.config
+        client, request = store._identity(*identity)
+        member = f"{client}:{request}"
+        progress_key = cfg.key("progress", client, request)
+        progress_index = cfg.key("progress:expiry")
+        store._foundation._client.hset(progress_key, "node_id", stored_node_id)
+
+        def snapshot():
+            return (
+                store._foundation._client.hgetall(progress_key),
+                store._foundation._client.zrange(
+                    progress_index, 0, -1, withscores=True
+                ),
+            )
+
+        before = snapshot()
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store.progress_records()
+        assert snapshot() == before
+
+        store._foundation._client.hset(progress_key, "node_id", node_id)
+        records = store.progress_records()
+        assert len(records) == 1
+        assert records[0].envelope == envelope
+        assert records[0].expires_at_epoch == deadline
+        assert store._foundation._client.zscore(progress_index, member) == deadline
+    finally:
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
     "stored_envelope",
     (
         b"{",

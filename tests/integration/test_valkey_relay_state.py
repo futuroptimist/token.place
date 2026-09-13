@@ -19,6 +19,7 @@ import redis
 from relay_state_store import (
     ComputeNodeCapabilities,
     EncryptedRequestEnvelope,
+    EncryptedProgressEnvelope,
     EncryptedResponseEnvelope,
     InMemoryRelayStateStore,
     RelayStateCapacityExceeded,
@@ -3181,6 +3182,182 @@ def _enqueue_claim_fixture(
     return envelope
 
 
+def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node_id, owner, consumer = "progress-node", _digest("progress-owner"), "worker"
+    identity = ("progress-client", "progress-request")
+    try:
+        first.register(node_id, _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 10
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        first.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+            ),
+            "cancel",
+        )
+        claim = second.claim_queued_request(node_id, owner, consumer)
+        initial = EncryptedProgressEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "first", "key", "iv"
+        )
+        latest = dataclasses.replace(initial, ciphertext="latest")
+        assert first.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, initial
+        ).state == "accepted"
+        assert second.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, latest
+        ).state == "replaced"
+        assert second.renew_claim_or_read_control(
+            node_id, owner, consumer, *identity, claim.generation
+        ).state == "continued"
+        pending = first.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert (pending.state, pending.request_deadline_epoch, pending.progress) == (
+            "pending", deadline, latest
+        )
+        assert second.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        ).progress is None
+        assert first.progress_records() == ()
+    finally:
+        _delete_claim_fixture_state(first, (node_id,), (identity,))
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
+    "stored_envelope",
+    (
+        b"{",
+        b'{"protocol":"tokenplace_api_v1_relay_e2ee","version":1,"ciphertext":"progress","cipherkey":"key","iv":"iv"}',
+        b'{"cipherkey":"key","ciphertext":"progress","extra":"field","iv":"iv","protocol":"tokenplace_api_v1_relay_e2ee","version":1}',
+        b'{"cipherkey":"key","ciphertext":"\xff","iv":"iv","protocol":"tokenplace_api_v1_relay_e2ee","version":1}',
+    ),
+    ids=("malformed", "noncanonical", "extra-field", "invalid-utf8"),
+)
+def test_progress_retrieval_rejects_invalid_envelope_without_mutation(
+    valkey_server, stored_envelope
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node_id, owner, consumer = (
+        "invalid-progress-node",
+        _digest("invalid-progress-owner"),
+        "worker",
+    )
+    identity = ("invalid-progress-client", "invalid-progress-request")
+    try:
+        store.register(node_id, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 10
+        selection = store.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        store.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+            ),
+            "cancel",
+        )
+        claim = store.claim_queued_request(node_id, owner, consumer)
+        store.replace_encrypted_progress_if_claimed(
+            node_id,
+            owner,
+            consumer,
+            *identity,
+            claim.generation,
+            EncryptedProgressEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+            ),
+        )
+
+        cfg = store._foundation.config
+        client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+        request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+        member = f"{client}:{request}"
+        node = store._node_digest(node_id)
+        progress_key = cfg.key("progress", client, request)
+        store._foundation._client.hset(progress_key, "envelope", stored_envelope)
+
+        def lifecycle_snapshot():
+            client_api = store._foundation._client
+            return (
+                client_api.hgetall(progress_key),
+                client_api.zscore(cfg.key("progress:expiry"), member),
+                client_api.hgetall(cfg.key("request", client, request)),
+                client_api.hgetall(cfg.key("claim", client, request)),
+                client_api.zscore(cfg.key("requests:deadline"), member),
+                client_api.zscore(cfg.key("claims:expiry"), member),
+                client_api.xrange(cfg.key("queue", node)),
+                client_api.zrange(cfg.key("node_work", node), 0, -1, withscores=True),
+            )
+
+        before = lifecycle_snapshot()
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store.retrieve_encrypted_response(*identity, selection.reservation_token)
+        assert lifecycle_snapshot() == before
+    finally:
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store.close()
+
+
+def test_queued_encrypted_request_retrieval_is_pending(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node_id, owner = "queued-progress-node", _digest("queued-progress-owner")
+    identity = ("queued-progress-client", "queued-progress-request")
+    try:
+        store.register(node_id, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 10
+        selection = store.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        store.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+            ),
+            "cancel",
+        )
+
+        pending = store.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert (pending.state, pending.request_deadline_epoch, pending.progress) == (
+            "pending",
+            deadline,
+            None,
+        )
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("stage", ("reserved", "queued", "claimed"))
 def test_cancellation_is_shared_retrievable_and_retains_only_live_control(
     valkey_server, stage
@@ -3770,6 +3947,7 @@ def test_control_paired_authority_corruption_fails_without_mutation(
             first._foundation._client.hset(terminal, "expires_at_epoch", float(control_expiry) - 1)
             first._foundation._client.zadd(
                 cfg.key("terminals:expiry"),
+        cfg.key("progress:expiry"),
                 {f"{client}:{request}": float(control_expiry) - 1},
             )
         elif corruption == "raw_client_identity":
@@ -6825,8 +7003,13 @@ def test_encrypted_response_first_transition_removes_exact_authority_once(
         for identity in identities:
             _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
             claims.append(first.claim_queued_request(node, owner, consumer))
-        datastore.hset(keys[11], mapping={"stage": "generating"})
-        datastore.hset(neighbor_keys[11], mapping={"stage": "neighbor"})
+        progress = EncryptedProgressEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+        )
+        for identity, claim in zip(identities, claims):
+            assert first.replace_encrypted_progress_if_claimed(
+                node, owner, consumer, *identity, claim.generation, progress
+            )
 
         queue_before = datastore.xrange(keys[2])
         addressed_entry = datastore.hget(keys[4], "queue_entry")

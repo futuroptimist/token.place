@@ -33,6 +33,7 @@ from valkey_relay_state import (
     SERVER_TIME_SCRIPT,
 )
 from relay_state_store import (
+    EncryptedProgressEnvelope,
     EncryptedRequestEnvelope,
     EncryptedResponseEnvelope,
     RelayStateCapacityExceeded,
@@ -81,6 +82,93 @@ def test_response_serialization_is_canonical_sorted_utf8():
         b'{"cipherkey":"key","ciphertext":"cipher-\xe2\x98\x83","iv":"iv",'
         b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}'
     )
+
+
+def test_progress_serialization_and_decoder_are_canonical_sorted_utf8():
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher-☃", "key", "iv"
+    )
+    encoded = ValkeyRegistrationStore._serialized_progress_envelope(envelope)
+
+    assert encoded == (
+        b'{"cipherkey":"key","ciphertext":"cipher-\xe2\x98\x83","iv":"iv",'
+        b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}'
+    )
+    assert ValkeyRegistrationStore._decode_progress_envelope(encoded) == envelope
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b"[]",
+        b'{"protocol":"tokenplace_api_v1_relay_e2ee"}',
+        b'{"cipherkey":"key", "ciphertext":"cipher","iv":"iv",'
+        b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}',
+    ),
+)
+def test_progress_envelope_decoder_rejects_malformed_or_noncanonical_bytes(raw):
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        ValkeyRegistrationStore._decode_progress_envelope(raw)
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected", "error"),
+    (
+        ([b"accepted"], "accepted", None),
+        ([b"replaced"], "replaced", None),
+        ([b"owner"], None, RelayStateCredentialMismatch),
+        ([b"missing"], None, RelayStateConflict),
+        ([b"stale"], None, RelayStateConflict),
+        ([b"capacity"], None, RelayStateCapacityExceeded),
+        ([b"schema"], None, ValkeySchemaIncompatibleError),
+        ([b"unexpected"], None, ValkeySchemaIncompatibleError),
+        ([b"accepted", b"extra"], None, ValkeySchemaIncompatibleError),
+    ),
+)
+def test_replace_progress_decodes_fixed_script_results(reply, expected, error):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher", "key", "iv"
+    )
+
+    if error is not None:
+        with pytest.raises(error):
+            store.replace_encrypted_progress_if_claimed(
+                "node", "a" * 64, "consumer", "client", "request", 1, envelope
+            )
+    else:
+        result = store.replace_encrypted_progress_if_claimed(
+            "node", "a" * 64, "consumer", "client", "request", 1, envelope
+        )
+        assert result.state == expected
+
+
+@pytest.mark.parametrize(
+    ("generation", "envelope", "max_bytes", "message"),
+    (
+        (0, EncryptedProgressEnvelope("tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"), 1024, "generation"),
+        (1, object(), 1024, "EncryptedProgressEnvelope"),
+        (1, EncryptedProgressEnvelope("tokenplace_api_v1_relay_e2ee", 1, "cipher", "key", "iv"), 1, "byte bound"),
+    ),
+)
+def test_replace_progress_rejects_invalid_inputs_before_dispatch(
+    generation, envelope, max_bytes, message
+):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(
+        store.config, max_progress_envelope_bytes=max_bytes
+    )
+
+    with pytest.raises(RelayStateStoreError, match=message):
+        store.replace_encrypted_progress_if_claimed(
+            "node", "a" * 64, "consumer", "client", "request", generation, envelope
+        )
+    foundation.execute.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -683,6 +771,37 @@ def _ready_retrieval_reply(store, *, acknowledgement_digest=None):
             or hashlib.sha256(token.encode()).hexdigest().encode()
         ),
     ], token
+
+
+def test_retrieve_response_decodes_pending_progress_and_empty_progress():
+    store = _retrieval_store_with_replies()
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher", "key", "iv"
+    )
+    store._foundation.execute.side_effect = [
+        [b"pending", b"10", store._serialized_progress_envelope(envelope)],
+        [b"pending", b"11", b""],
+    ]
+
+    with_progress = store.retrieve_encrypted_response(
+        "a" * 64, "b" * 64, "c" * 64
+    )
+    without_progress = store.retrieve_encrypted_response(
+        "a" * 64, "b" * 64, "c" * 64
+    )
+
+    assert with_progress.progress == envelope
+    assert with_progress.request_deadline_epoch == 10
+    assert without_progress.progress is None
+    assert without_progress.request_deadline_epoch == 11
+
+
+@pytest.mark.parametrize("deadline", (b"nan", b"-1"))
+def test_retrieve_response_rejects_invalid_pending_deadline(deadline):
+    store = _retrieval_store_with_replies([b"pending", deadline, b""])
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
 
 
 @pytest.mark.parametrize(

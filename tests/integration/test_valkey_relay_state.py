@@ -19,6 +19,7 @@ import redis
 from relay_state_store import (
     ComputeNodeCapabilities,
     EncryptedRequestEnvelope,
+    EncryptedProgressEnvelope,
     EncryptedResponseEnvelope,
     InMemoryRelayStateStore,
     RelayStateCapacityExceeded,
@@ -3179,6 +3180,59 @@ def _enqueue_claim_fixture(
         "cancel",
     )
     return envelope
+
+
+def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node_id, owner, consumer = "progress-node", _digest("progress-owner"), "worker"
+    identity = ("progress-client", "progress-request")
+    try:
+        first.register(node_id, _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 10
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        first.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+            ),
+            "cancel",
+        )
+        claim = second.claim_queued_request(node_id, owner, consumer)
+        initial = EncryptedProgressEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "first", "key", "iv"
+        )
+        latest = dataclasses.replace(initial, ciphertext="latest")
+        assert first.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, initial
+        ).state == "accepted"
+        assert second.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, latest
+        ).state == "replaced"
+        pending = first.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert (pending.state, pending.request_deadline_epoch, pending.progress) == (
+            "pending", deadline, latest
+        )
+        assert second.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        ).progress is None
+        assert first.progress_records() == ()
+    finally:
+        first.close()
+        second.close()
 
 
 @pytest.mark.parametrize("stage", ("reserved", "queued", "claimed"))

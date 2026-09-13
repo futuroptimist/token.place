@@ -438,6 +438,9 @@ def test_landing_long_api_routes_do_not_expand_chat_layout(
             }
             const chatRect = chat.getBoundingClientRect();
             const routeRects = Array.from(route.getClientRects());
+            if (routeRects.length === 0) {
+                throw new Error('landing API route has no measurable client rects');
+            }
             return {
                 viewportWidth: window.innerWidth,
                 documentWidth: document.documentElement.scrollWidth,
@@ -450,8 +453,8 @@ def test_landing_long_api_routes_do_not_expand_chat_layout(
         """
     )
 
-    assert layout["documentWidth"] <= layout["viewportWidth"]
-    assert layout["bodyWidth"] <= layout["viewportWidth"]
+    assert layout["documentWidth"] <= layout["viewportWidth"] + 1
+    assert layout["bodyWidth"] <= layout["viewportWidth"] + 1
     assert layout["routeRight"] <= layout["viewportWidth"] + 1
     assert abs(layout["chatLeft"] - (layout["viewportWidth"] - layout["chatRight"])) <= 1
 

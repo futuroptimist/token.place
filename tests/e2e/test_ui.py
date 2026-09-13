@@ -417,6 +417,45 @@ def test_landing_loads_without_observed_console_regressions(page: Page, base_url
     assert_no_landing_console_regressions(errors)
 
 
+@pytest.mark.parametrize("viewport_width", [320, 390, 768, 1024])
+def test_landing_long_api_routes_do_not_expand_chat_layout(
+    page: Page, base_url: str, setup_servers, viewport_width: int
+):
+    """Long documented routes must wrap instead of changing the page width."""
+    page.set_viewport_size({"width": viewport_width, "height": 900})
+    route_landing_relay_chat(page, diagnostics_count=1)
+
+    page.goto(base_url, wait_until="networkidle")
+    layout = page.evaluate(
+        """
+        () => {
+            const chat = document.querySelector('.chat-container');
+            const route = Array.from(document.querySelectorAll('.api-path')).find(
+                (node) => node.textContent.includes('/api/v1/community/contributions/summary')
+            );
+            if (!chat || !route) {
+                throw new Error('missing landing chat layout node');
+            }
+            const chatRect = chat.getBoundingClientRect();
+            const routeRects = Array.from(route.getClientRects());
+            return {
+                viewportWidth: window.innerWidth,
+                documentWidth: document.documentElement.scrollWidth,
+                bodyWidth: document.body.scrollWidth,
+                chatLeft: chatRect.left,
+                chatRight: chatRect.right,
+                routeRight: Math.max(...routeRects.map((rect) => rect.right)),
+            };
+        }
+        """
+    )
+
+    assert layout["documentWidth"] <= layout["viewportWidth"]
+    assert layout["bodyWidth"] <= layout["viewportWidth"]
+    assert layout["routeRight"] <= layout["viewportWidth"] + 1
+    assert abs(layout["chatLeft"] - (layout["viewportWidth"] - layout["chatRight"])) <= 1
+
+
 def test_landing_hydrates_compute_status_and_models_without_layout_jump(page: Page, base_url: str, setup_servers):
     errors = attach_landing_console_error_collector(page)
     route_landing_relay_chat(page, diagnostics_count=1)

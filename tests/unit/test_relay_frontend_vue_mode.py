@@ -238,6 +238,20 @@ def test_static_index_references_existing_compute_node_last_updated_computed():
         assert re.search(r'data:\s*{[\s\S]*modelsLoaded\s*:', chat_js)
 
 
+def test_landing_page_constrains_and_wraps_long_api_routes():
+    index_html = INDEX_HTML_PATH.read_text(encoding='utf-8')
+
+    assert re.search(r'\.container\s*{[\s\S]*?min-width:\s*0;', index_html)
+    assert re.search(r'\.container\s*{[\s\S]*?max-width:\s*100%;', index_html)
+    assert re.search(r'\.container\s*{[\s\S]*?overflow-wrap:\s*anywhere;', index_html)
+    assert re.search(r'\.chat-container\s*{[\s\S]*?min-width:\s*0;', index_html)
+    assert re.search(r'\.chat-container\s*{[\s\S]*?max-width:\s*100%;', index_html)
+    assert re.search(r'\.api-path\s*{[\s\S]*?overflow-wrap:\s*anywhere;', index_html)
+    assert re.search(r'\.api-path\s*{[\s\S]*?word-break:\s*break-word;', index_html)
+    assert re.search(r'table\s*{[\s\S]*?table-layout:\s*fixed;', index_html)
+    assert re.search(r'code\s*{[\s\S]*?overflow-wrap:\s*anywhere;', index_html)
+
+
 def test_static_index_has_no_raw_mustache_interpolation():
     index_html = Path('static/index.html').read_text(encoding='utf-8')
     assert '{{' not in index_html

@@ -1,6 +1,7 @@
 """Shared compute-node runtime used by server.py and future desktop bridge code."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -817,21 +818,25 @@ class ComputeNodeRuntime:
             model_profile_for_budget.get("provider") == "qwen"
             and getattr(self.model_manager, "context_tier", "8k-fast") == "64k-full"
         )
-        profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
+        # Three batch classes each permit Q8/F16, followed by Safe Q4.
+        # Bound readiness at the full seven-profile graph rather than cutting
+        # off a policy-authorized fallback before its smoke test.
+        qwen_64k_profile_attempt_limit = 7
+        profile_attempt_budget = qwen_64k_profile_attempt_limit if is_qwen_64k_for_budget else 1
         if callable(profile_budget_fn):
             try:
                 budget_result = profile_budget_fn()
             except Exception:
-                profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
+                profile_attempt_budget = qwen_64k_profile_attempt_limit if is_qwen_64k_for_budget else 1
             else:
                 if (
                     isinstance(budget_result, int)
                     and not isinstance(budget_result, bool)
                     and budget_result > 0
                 ):
-                    profile_attempt_budget = min(budget_result, 3)
+                    profile_attempt_budget = min(budget_result, qwen_64k_profile_attempt_limit)
                 else:
-                    profile_attempt_budget = 3 if is_qwen_64k_for_budget else 1
+                    profile_attempt_budget = qwen_64k_profile_attempt_limit if is_qwen_64k_for_budget else 1
         seen_runtime_ids: set[int] = set()
         seen_profile_ids: set[str] = set()
         pending_runtime = None
@@ -987,6 +992,11 @@ class ComputeNodeRuntime:
             })
             for _key in (
                 "qwen_64k_runtime_profile_id",
+                "qwen_64k_runtime_preferred_profile_id",
+                "qwen_64k_batch_profile_requested",
+                "qwen_64k_batch_profile_selected",
+                "qwen_64k_runtime_profile_kv_precision",
+                "qwen_64k_runtime_profile_fallback_reason",
                 "qwen_64k_runtime_profile_attempt_ids",
                 "qwen_64k_runtime_profile_recovery_count",
                 "qwen_64k_runtime_profile_flash_attn",
@@ -1034,11 +1044,12 @@ class ComputeNodeRuntime:
                 return False
 
             try:
+                readiness_content, _ = authoritative_readiness_fixture()
                 smoke_messages = [
                     {"role": "system", "content": "You are a concise assistant."},
-                    {"role": "user", "content": "Reply with exactly: ok"},
+                    {"role": "user", "content": readiness_content},
                 ]
-                admitted, admission_error, prompt_tokens = (
+                admitted, admission_error, output_budget = (
                     self.relay_client._api_v1_authoritative_context_admission(
                         llm_instance=llm_runtime,
                         messages=RelayClient._api_v1_prepare_qwen_non_thinking_messages(
@@ -1051,10 +1062,26 @@ class ComputeNodeRuntime:
             except Exception as exc:
                 admitted = False
                 admission_error = {"code": "compute_node_context_admission_unavailable"}
-                prompt_tokens = None
+                output_budget = None
                 diagnostics["api_v1_readiness_exception_type"] = type(exc).__name__
 
-            prompt_tokens_available = isinstance(prompt_tokens, int) and prompt_tokens > 0
+            prompt_tokens = None
+            if isinstance(output_budget, dict):
+                budget_prompt_tokens = output_budget.get("prompt_tokens")
+                if (
+                    isinstance(budget_prompt_tokens, int)
+                    and not isinstance(budget_prompt_tokens, bool)
+                    and budget_prompt_tokens > 0
+                ):
+                    prompt_tokens = budget_prompt_tokens
+            elif (
+                isinstance(output_budget, int)
+                and not isinstance(output_budget, bool)
+                and output_budget > 0
+            ):
+                # Compatibility for older relay clients and focused test doubles.
+                prompt_tokens = output_budget
+            prompt_tokens_available = prompt_tokens is not None
             diagnostics.update({
                 "api_v1_runtime_ready": bool(admitted),
                 "api_v1_readiness_result": "passed" if admitted else "failed",
@@ -1565,3 +1592,14 @@ class ComputeNodeRuntime:
                 "Relay unregister request raised during shutdown; continuing stop",
                 exc_info=False,
             )
+
+
+def authoritative_readiness_fixture() -> tuple[str, dict[str, Any]]:
+    """Return the bounded, non-secret fixture used to prove production tokenization."""
+
+    content = "Reply with exactly: ok"
+    encoded = content.encode("utf-8")
+    return content, {
+        "fixture_sha256": hashlib.sha256(encoded).hexdigest(),
+        "target_prefix_utf8_bytes": {"midpoint": len(encoded) // 2},
+    }

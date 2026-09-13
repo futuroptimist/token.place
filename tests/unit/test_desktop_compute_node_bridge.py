@@ -4,15 +4,20 @@ import importlib.util
 import json
 import os
 import queue
+import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
-
-import pytest
-import yaml
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+
+import pytest
+import requests
+import yaml
+
+from utils import compute_node_runtime
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -25,6 +30,295 @@ SPEC = importlib.util.spec_from_file_location('desktop_compute_node_bridge', MOD
 compute_node_bridge = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(compute_node_bridge)
+
+
+def test_headless_boundary_result_contract_is_privacy_safe():
+    result = compute_node_bridge._headless_result(
+        success=False, phase="warm_load_completed",
+        failure_code="authoritative_evidence_failed", identity=True,
+        warm_load="ready", evidence=False,
+    )
+
+    assert result == {
+        "schema_version": 1,
+        "success": False,
+        "last_completed_phase": "warm_load_completed",
+        "failure_code": "authoritative_evidence_failed",
+        "packaged_runtime_identity": "validated",
+        "selected_backend": "cpu",
+        "warm_load_result": "ready",
+        "authoritative_evidence_result": "failed",
+    }
+    assert not ({"model_path", "prompt", "tokens", "environment"} & result.keys())
+
+
+def test_headless_boundary_rejects_non_cpu_before_runtime(monkeypatch, tmp_path, capsys):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"fixture")
+    args = SimpleNamespace(mode="gpu", model=str(model), context_tier="8k-fast",
+                           startup_timeout_seconds=1)
+    monkeypatch.setattr(
+        compute_node_bridge, "ensure_desktop_python_dependencies",
+        lambda: pytest.fail("runtime must not start"),
+    )
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["failure_code"] == "invalid_arguments"
+    assert result["warm_load_result"] == "not_started"
+
+
+@pytest.mark.parametrize(
+    ("ready", "diagnostics", "expected"),
+    [
+        (False, {}, "warm_load_failed"),
+        (False, {"api_v1_readiness_result": "failed"}, "warm_load_failed"),
+        (True, {"api_v1_readiness_result": "passed"}, "authoritative_evidence_failed"),
+        (True, {
+            "api_v1_readiness_result": "passed",
+            "api_v1_readiness_tokenizer_render_bridge_available": True,
+            "api_v1_readiness_prompt_tokens": 7,
+        }, "authoritative_evidence_failed"),
+    ],
+)
+def test_headless_boundary_readiness_classification(ready, diagnostics, expected):
+    assert compute_node_bridge._headless_classify_readiness(ready, diagnostics) == expected
+
+
+def test_headless_boundary_requires_exact_authoritative_evidence(monkeypatch):
+    monkeypatch.setenv("TOKENPLACE_BUNDLED_RUNTIME_ID", "bundle-1")
+    diagnostics = {
+        "api_v1_readiness_result": "passed",
+        "api_v1_readiness_tokenizer_render_bridge_available": True,
+        "api_v1_readiness_prompt_tokens": 7,
+    }
+    fixture = {"fixture_sha256": "abc", "target_prefix_utf8_bytes": {"midpoint": 4}}
+    evidence = {
+        "method": "packaged_admission_render_and_tokenize_chat",
+        "runtime_identity": "bundle-1", "fixture_sha256": "abc",
+        "total_prompt_tokens": 7, "target_offsets_tokens": {"midpoint": 3},
+    }
+    assert compute_node_bridge._headless_classify_readiness(
+        True, diagnostics, evidence, fixture) == "success"
+    evidence["runtime_identity"] = "source-tree"
+    assert compute_node_bridge._headless_classify_readiness(
+        True, diagnostics, evidence, fixture) == "authoritative_evidence_failed"
+
+
+def _configure_headless_runtime(monkeypatch, tmp_path, *, ready=True,
+                                evidence_valid=True, mock_runtime=False,
+                                load_exception=None, cleanup_exception=None,
+                                report_readiness_failure=True):
+    """Install a minimal runtime double while retaining the real evidence validator."""
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"fixture")
+    for name, value in {
+        "TOKENPLACE_APP_VERSION": "1.0.0",
+        "TOKENPLACE_BUILD_ID": "build-1",
+        "TOKENPLACE_TARGET_TRIPLE": "test-target",
+        "TOKENPLACE_BUNDLED_RUNTIME_ID": "bundle-1",
+        "TOKENPLACE_RUNTIME_ID": "bundle-1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        compute_node_bridge, "ensure_desktop_python_dependencies",
+        lambda: {"ok": "true"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_ensure_desktop_llama_runtime_for_context",
+        lambda _mode, _tier: {"selected_backend": "cpu"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_load_context_profile_helpers",
+        lambda: (lambda manager, tier: setattr(manager, "context_tier", tier),
+                 lambda tier: tier),
+    )
+
+    class Manager:
+        use_mock_llm = mock_runtime
+        llm = None
+        last_compute_diagnostics = {}
+        last_runtime_init_error = "PRIVATE runtime path and raw exception"
+        model_profile = {"provider": "qwen", "chat_template_policy": "gguf-jinja"}
+
+        @staticmethod
+        def _close_llm_proxy(_loaded):
+            return True
+
+    class Runtime:
+        def __init__(self, _config):
+            self.model_manager = Manager()
+
+        def ensure_api_v1_runtime_ready(self):
+            manager = self.model_manager
+            assert manager.headless_admission_fixture is True
+            assert manager.model_path == os.path.abspath(model)
+            assert manager.model_profile["provider"] == "headless-admission-fixture"
+            assert manager.model_profile["chat_template_policy"] == "headless-plain-chat"
+            if load_exception:
+                raise load_exception
+            self.model_manager.last_compute_diagnostics = {
+                "api_v1_readiness_tokenizer_render_bridge_available": ready,
+                "api_v1_readiness_prompt_tokens": 7,
+            }
+            if ready or report_readiness_failure:
+                self.model_manager.last_compute_diagnostics[
+                    "api_v1_readiness_result"
+                ] = "passed" if ready else "failed"
+            if ready:
+                with open(os.environ[
+                    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"
+                ], encoding="utf-8") as handle:
+                    fixture = json.load(handle)
+                evidence = {
+                    "method": "packaged_admission_render_and_tokenize_chat",
+                    "runtime_identity": "bundle-1",
+                    "fixture_sha256": fixture["fixture_sha256"],
+                    "total_prompt_tokens": 7,
+                    "target_offsets_tokens": {"midpoint": 3},
+                }
+                if not evidence_valid:
+                    evidence["fixture_sha256"] = "wrong"
+                with open(os.environ[
+                    "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE"
+                ], "w", encoding="utf-8") as handle:
+                    json.dump(evidence, handle)
+            return ready
+
+        def stop(self, **_kwargs):
+            if cleanup_exception:
+                raise cleanup_exception
+
+    monkeypatch.setattr(compute_node_runtime, "ComputeNodeRuntime", Runtime)
+    return SimpleNamespace(mode="cpu", model=str(model), context_tier="8k-fast",
+                           startup_timeout_seconds=1)
+
+
+@pytest.mark.parametrize(
+    ("ready", "evidence_valid", "expected_code", "expected_exit"),
+    [
+        (True, True, "none", 0),
+        (False, True, "warm_load_failed", 5),
+        (True, False, "authoritative_evidence_failed", 6),
+    ],
+)
+def test_headless_cpu_admission_runtime_outcomes(
+        monkeypatch, tmp_path, capsys, ready, evidence_valid,
+        expected_code, expected_exit):
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, ready=ready, evidence_valid=evidence_valid)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == expected_exit
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[0] == {"type": "headless_internal", "phase": "startup_ready"}
+    assert records[-1]["failure_code"] == expected_code
+    assert records[-1]["success"] is (expected_exit == 0)
+    assert records[-1]["last_completed_phase"] == (
+        "cleanup_completed" if expected_exit == 0 else
+        "warm_load_completed" if expected_exit == 6 else
+        "runtime_identity_validated")
+
+
+def test_headless_cpu_admission_false_readiness_does_not_write_diag_sidecar(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, ready=False, report_readiness_failure=False)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 5
+
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[-1]["failure_code"] == "warm_load_failed"
+    assert not (tmp_path / "tokenplace-headless-diag.txt").exists()
+
+
+def test_headless_cpu_admission_uses_process_temp_storage(
+        monkeypatch, tmp_path, capsys):
+    """Readable model inputs do not require writable parent directories."""
+    args = _configure_headless_runtime(monkeypatch, tmp_path)
+    captured = {}
+    real_temporary_directory = compute_node_bridge.tempfile.TemporaryDirectory
+
+    def recording_temporary_directory(*args_, **kwargs):
+        captured.update(kwargs)
+        return real_temporary_directory(*args_, **kwargs)
+
+    monkeypatch.setattr(compute_node_bridge.tempfile, "TemporaryDirectory",
+                        recording_temporary_directory)
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 0
+    assert captured.get("prefix") == "tokenplace-headless-"
+    assert "dir" not in captured
+    assert captured.get("ignore_cleanup_errors") is True
+
+
+def test_headless_cpu_admission_fail_closed_paths(monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(monkeypatch, tmp_path)
+    monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "wrong")
+    assert compute_node_bridge.headless_cpu_admission(args) == 3
+    assert json.loads(capsys.readouterr().out)["failure_code"] == \
+        "packaged_runtime_identity_failed"
+
+    monkeypatch.setenv("TOKENPLACE_RUNTIME_ID", "bundle-1")
+    monkeypatch.setattr(compute_node_bridge, "ensure_desktop_python_dependencies",
+                        lambda: {"ok": "false"})
+    assert compute_node_bridge.headless_cpu_admission(args) == 3
+    capsys.readouterr()
+
+    monkeypatch.setattr(compute_node_bridge, "ensure_desktop_python_dependencies",
+                        lambda: {"ok": "true"})
+    monkeypatch.setattr(compute_node_bridge,
+                        "_ensure_desktop_llama_runtime_for_context",
+                        lambda *_args: {"selected_backend": "gpu"})
+    assert compute_node_bridge.headless_cpu_admission(args) == 2
+    assert json.loads(capsys.readouterr().out)["failure_code"] == "unsupported_backend"
+
+
+def test_headless_cpu_admission_rejects_mock_and_classifies_exceptions(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(monkeypatch, tmp_path, mock_runtime=True)
+    assert compute_node_bridge.headless_cpu_admission(args) == 4
+    assert json.loads(capsys.readouterr().out)["failure_code"] == "mock_runtime_rejected"
+
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, load_exception=RuntimeError("load failed"))
+    assert compute_node_bridge.headless_cpu_admission(args) == 7
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[-1]["failure_code"] == "warm_load_failed"
+
+
+def test_headless_cpu_admission_cleanup_failure_overrides_success(
+        monkeypatch, tmp_path, capsys):
+    args = _configure_headless_runtime(
+        monkeypatch, tmp_path, cleanup_exception=RuntimeError("stop failed"))
+
+    assert compute_node_bridge.headless_cpu_admission(args) == 8
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[-1]["failure_code"] == "cleanup_failed"
+    assert records[-1]["success"] is False
+    assert records[-1]["last_completed_phase"] == "warm_load_completed"
+
+
+def test_gpu_preflight_rejects_silent_cpu_fallback(monkeypatch, capsys):
+    monkeypatch.setattr(
+        compute_node_bridge, "ensure_desktop_python_dependencies",
+        lambda: {"ok": "true"},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_load_context_profile_helpers",
+        lambda: (None, lambda tier: tier),
+    )
+    monkeypatch.setattr(
+        compute_node_bridge, "_ensure_desktop_llama_runtime_for_context",
+        lambda mode, tier: {"selected_backend": "cpu", "runtime_action": "fallback"},
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "compute_node_bridge.py", "--operator-runtime-preflight", "--mode", "gpu",
+    ])
+
+    assert compute_node_bridge.main() == 1
+    event = json.loads(capsys.readouterr().out)
+    assert event["startup_result"] == "runtime_validation_failed"
+
 
 @pytest.fixture(autouse=True)
 def _default_desktop_runtime_arch(monkeypatch):
@@ -42,6 +336,8 @@ def test_structured_provisioning_payload_omits_unknown_deadline(monkeypatch):
     payload = compute_node_bridge._structured_provisioning_payload(args, phase='dependency_check', started_at=10.0)
 
     assert payload['runtime_provisioning_state'] == 'provisioning'
+    assert payload['type'] == 'started'
+    assert payload['running'] is False
     assert payload['startup_phase'] == 'dependency_check'
     assert payload['startup_elapsed_ms'] == 2500
     assert payload['startup_deadline_ms'] is None
@@ -494,6 +790,11 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
     monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
     monkeypatch.setattr(
         compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'true'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
         'ensure_desktop_llama_runtime',
         lambda _mode: {
             'selected_backend': 'cpu',
@@ -509,6 +810,49 @@ def _install_fake_runtime_module(monkeypatch, runtime_cls=FakeRuntime):
         'maybe_reexec_for_runtime_refresh',
         lambda _setup, *, allow_reexec=True: None,
     )
+
+
+def _install_custom_runtime_isolation(monkeypatch, module):
+    """Install a custom runtime double without allowing native bootstrap work."""
+    unexpected_attempts = []
+
+    def _unexpected(kind):
+        def fail(*_args, **_kwargs):
+            unexpected_attempts.append(kind)
+            raise AssertionError(f'unexpected test side effect: {kind}')
+
+        return fail
+
+    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'true'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_llama_runtime',
+        lambda _mode, **_kwargs: {
+            'selected_backend': 'cpu',
+            'detected_device': 'cpu',
+            'runtime_action': 'skipped',
+            'interpreter': sys.executable,
+            'llama_module_path': 'test-double',
+            'fallback_reason': '',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup, *, allow_reexec=True: None,
+    )
+    monkeypatch.setattr(subprocess, 'Popen', _unexpected('native process'))
+    monkeypatch.setattr(subprocess, 'run', _unexpected('native process'))
+    monkeypatch.setattr(requests.sessions.Session, 'request', _unexpected('network'))
+    monkeypatch.setattr(socket, 'create_connection', _unexpected('network: socket.create_connection'))
+    monkeypatch.setattr(os, 'execv', _unexpected('re-exec: os.execv'))
+    monkeypatch.setattr(os, 'execve', _unexpected('re-exec: os.execve'))
+    return unexpected_attempts
 
 
 def _reset_cancel_queue():
@@ -1507,7 +1851,7 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
 
     module.resolve_relay_url = _resolve_relay_url
     module.compute_mode_diagnostics = lambda _model_manager: {}
-    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    unexpected_attempts = _install_custom_runtime_isolation(monkeypatch, module)
     monkeypatch.setenv('TOKENPLACE_RELAY_URL', 'https://token.place')
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
 
@@ -1522,6 +1866,7 @@ def test_run_prefers_explicit_desktop_relay_url_and_disables_configured_fallback
     assert status == 0
     assert captured['config'].relay_url == 'http://127.0.0.1:5010'
     assert captured['config'].use_configured_relay_fallbacks is False
+    assert unexpected_attempts == []
 
 
 def test_run_supplies_stop_requested_as_runtime_cancellation_predicate(monkeypatch):
@@ -1589,7 +1934,7 @@ def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
     module.apply_compute_mode = lambda _model_manager, mode: mode
     module.SUPPORTED_COMPUTE_MODES = {'auto', 'cpu', 'cuda', 'metal'}
     module.compute_mode_diagnostics = lambda _model_manager: {}
-    monkeypatch.setitem(sys.modules, 'utils.compute_node_runtime', module)
+    unexpected_attempts = _install_custom_runtime_isolation(monkeypatch, module)
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
 
     args = SimpleNamespace(
@@ -1615,6 +1960,7 @@ def test_run_passes_desktop_relay_list_to_runtime(monkeypatch):
         ('http://127.0.0.1:5010',),
         ('https://staging.token.place',),
     ]
+    assert unexpected_attempts == []
 
 
 
@@ -1959,6 +2305,29 @@ def test_main_emits_structured_error_when_compute_runtime_missing(capsys, monkey
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr('builtins.__import__', fake_import)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'ensure_desktop_python_dependencies',
+        lambda **_kwargs: {'ok': 'true'},
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_ensure_desktop_llama_runtime_for_context',
+        lambda *_args, **_kwargs: {
+            'selected_backend': 'cpu',
+            'runtime_action': 'skipped',
+        },
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        '_load_context_profile_helpers',
+        lambda: (lambda _manager, _tier: None, lambda tier: tier),
+    )
+    monkeypatch.setattr(
+        compute_node_bridge,
+        'maybe_reexec_for_runtime_refresh',
+        lambda _setup: None,
+    )
     monkeypatch.setattr(
         sys,
         'argv',
@@ -2477,6 +2846,171 @@ def test_main_does_not_import_compute_runtime_for_mode_normalization(monkeypatch
     assert compute_node_bridge.main() == 0
 
 
+def _cleanup_packaged_bridge_process(proc):
+    """Terminate and reap a packaged bridge without any unbounded operations."""
+    failures = []
+
+    if proc.poll() is None:
+        if sys.platform == 'win32':
+            try:
+                taskkill_result = subprocess.run(
+                    ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+                if taskkill_result.returncode != 0:
+                    failures.append(f'taskkill exited with {taskkill_result.returncode}')
+                    try:
+                        proc.kill()
+                    except OSError as kill_exc:
+                        failures.append(f'parent kill failed: {kill_exc!r}')
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                failures.append(f'taskkill failed: {exc!r}')
+                try:
+                    proc.kill()
+                except OSError as kill_exc:
+                    failures.append(f'parent kill failed: {kill_exc!r}')
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError as exc:
+                failures.append(f'process-group kill failed: {exc!r}')
+                try:
+                    proc.kill()
+                except OSError as kill_exc:
+                    failures.append(f'parent kill failed: {kill_exc!r}')
+
+    for attempt in range(2):
+        try:
+            proc.communicate(timeout=5)
+            return failures
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            failures.append(f'pipe drain attempt {attempt + 1} failed: {exc!r}')
+            try:
+                proc.kill()
+            except OSError as kill_exc:
+                failures.append(f'parent kill attempt {attempt + 1} failed: {kill_exc!r}')
+
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError as exc:
+                failures.append(f'pipe close failed: {exc!r}')
+
+    try:
+        proc.communicate(timeout=5)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        failures.append(f'final reap failed: {exc!r}')
+    return failures
+
+
+def _communicate_with_packaged_bridge_cleanup(proc):
+    timeout_diagnostic = None
+    stdout = ''
+    stderr = ''
+    try:
+        stdout, stderr = proc.communicate(input='{"type":"cancel"}\n', timeout=10)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ''
+        stderr = exc.stderr or ''
+        timeout_diagnostic = (
+            'packaged bridge did not stop within 10 seconds'
+            f'\nstdout:\n{stdout}\nstderr:\n{stderr}'
+        )
+
+    cleanup_failures = _cleanup_packaged_bridge_process(proc)
+    if timeout_diagnostic is not None:
+        if cleanup_failures:
+            timeout_diagnostic += '\ncleanup failures:\n' + '\n'.join(cleanup_failures)
+        pytest.fail(timeout_diagnostic)
+    if cleanup_failures:
+        pytest.fail('packaged bridge cleanup failed:\n' + '\n'.join(cleanup_failures))
+    return stdout, stderr
+
+
+@pytest.mark.parametrize('platform', ['linux', 'win32'])
+def test_packaged_bridge_timeout_cleanup_is_bounded_and_preserves_diagnostic(
+    monkeypatch, platform,
+):
+    class _Pipe:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class _Process:
+        pid = 123
+        returncode = None
+        stdin = _Pipe()
+        stdout = _Pipe()
+        stderr = _Pipe()
+
+        def __init__(self):
+            self.communicate_calls = []
+            self.kill_calls = 0
+
+        def communicate(self, input=None, timeout=None):
+            self.communicate_calls.append((input, timeout))
+            if input is not None:
+                raise subprocess.TimeoutExpired('bridge', timeout, 'primary stdout', 'primary stderr')
+            raise subprocess.TimeoutExpired('bridge', timeout)
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.kill_calls += 1
+
+    proc = _Process()
+    monkeypatch.setattr(sys, 'platform', platform)
+    simulated_sigkill = 9
+    monkeypatch.setattr(signal, 'SIGKILL', simulated_sigkill, raising=False)
+    killpg_calls = []
+    taskkill_calls = []
+    monkeypatch.setattr(
+        os,
+        'killpg',
+        lambda pid, sig: killpg_calls.append((pid, sig)),
+        raising=False,
+    )
+
+    def fake_taskkill(command, **kwargs):
+        taskkill_calls.append((command, kwargs))
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(subprocess, 'run', fake_taskkill)
+
+    with pytest.raises(pytest.fail.Exception, match='(?s)primary stdout.*cleanup failures'):
+        _communicate_with_packaged_bridge_cleanup(proc)
+
+    assert proc.communicate_calls == [
+        ('{"type":"cancel"}\n', 10),
+        (None, 5),
+        (None, 5),
+        (None, 5),
+    ]
+    assert all(pipe.closed for pipe in (proc.stdin, proc.stdout, proc.stderr))
+    if platform == 'win32':
+        assert killpg_calls == []
+        assert taskkill_calls == [(
+            ['taskkill', '/PID', '123', '/T', '/F'],
+            {
+                'check': False,
+                'stdout': subprocess.DEVNULL,
+                'stderr': subprocess.DEVNULL,
+                'timeout': 5,
+            },
+        )]
+        assert proc.kill_calls == 3
+    else:
+        assert killpg_calls == [(123, simulated_sigkill)]
+        assert taskkill_calls == []
+        assert proc.kill_calls == 2
+
+
 def test_main_subprocess_succeeds_for_packaged_layout_without_pythonpath(tmp_path):
     python_dir = tmp_path / 'bin' / 'resources' / 'python'
     import_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'
@@ -2607,6 +3141,12 @@ class ComputeNodeRuntime:
 
     env = os.environ.copy()
     env.pop('PYTHONPATH', None)
+    env['TOKENPLACE_OPERATOR_LOG_FILE'] = str(tmp_path / 'operator.log')
+    popen_process_group = (
+        {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
+        if sys.platform == 'win32'
+        else {'start_new_session': True}
+    )
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -2625,16 +3165,12 @@ class ComputeNodeRuntime:
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        cwd=tmp_path,
+        **popen_process_group,
     )
-    assert proc.stdin is not None
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-    proc.stdin.write('{"type":"cancel"}\n')
-    proc.stdin.flush()
-    proc.stdin.close()
-    proc.wait(timeout=10)
-    stdout = proc.stdout.read()
-    stderr = proc.stderr.read()
+    # Drain both pipes while the bridge shuts down. Waiting before reading can
+    # deadlock on Windows once its smaller pipe buffer fills.
+    stdout, stderr = _communicate_with_packaged_bridge_cleanup(proc)
 
     assert proc.returncode == 0, stderr
     events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
@@ -2970,13 +3506,28 @@ def test_module_import_does_not_load_context_profiles_before_preflight(monkeypat
     assert 'model_path' not in payload
 
 
-def test_utils_package_keeps_lazy_convenience_exports():
+def test_utils_package_keeps_lazy_convenience_exports(monkeypatch):
     import utils
 
-    assert utils.get_temp_dir
-    assert utils.get_model_manager
-    assert utils.get_crypto_manager
-    assert utils.RelayClient
+    model_manager_module = ModuleType('utils.llm.model_manager')
+    crypto_manager_module = ModuleType('utils.crypto.crypto_manager')
+    relay_client_module = ModuleType('utils.networking.relay_client')
+    get_model_manager = object()
+    get_crypto_manager = object()
+    relay_client = object()
+    model_manager_module.get_model_manager = get_model_manager
+    crypto_manager_module.get_crypto_manager = get_crypto_manager
+    relay_client_module.RelayClient = relay_client
+    monkeypatch.setitem(sys.modules, model_manager_module.__name__, model_manager_module)
+    monkeypatch.setitem(sys.modules, crypto_manager_module.__name__, crypto_manager_module)
+    monkeypatch.setitem(sys.modules, relay_client_module.__name__, relay_client_module)
+    for name in ('get_model_manager', 'get_crypto_manager', 'RelayClient'):
+        monkeypatch.delitem(utils.__dict__, name, raising=False)
+
+    assert utils.get_temp_dir is utils.__dict__['get_temp_dir']
+    assert utils.get_model_manager is get_model_manager
+    assert utils.get_crypto_manager is get_crypto_manager
+    assert utils.RelayClient is relay_client
     assert {
         'get_model_manager',
         'get_crypto_manager',
@@ -3334,6 +3885,12 @@ def test_run_pre_registration_warmup_times_out_without_registering(capsys, monke
     assert "stop" not in events
     captured = capsys.readouterr()
     output_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+    assert not any(
+        event.get("type") == "started"
+        and event.get("running") is True
+        and event.get("runtime_provisioning_state") != "provisioning"
+        for event in output_events
+    )
     error_event = next(event for event in output_events if event.get("type") == "error")
     assert error_event["warm_load_state"] == "failed"
     assert error_event["relay_runtime_state"] == "failed"
@@ -3432,6 +3989,12 @@ def test_run_stops_when_pre_registration_runtime_warmup_fails(capsys, monkeypatc
     assert status == 1
     assert calls == ["warm"]
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert not any(
+        event.get("type") == "started"
+        and event.get("running") is True
+        and event.get("runtime_provisioning_state") != "provisioning"
+        for event in events
+    )
     payload = next(event for event in events if event.get("type") == "error")
     assert payload["type"] == "error"
 
@@ -3458,9 +4021,89 @@ def test_run_does_not_warm_when_disabled(capsys, monkeypatch):
     assert call_order == ["poll", "poll"]
     output = capsys.readouterr()
     events = [json.loads(line) for line in output.out.splitlines() if line.strip()]
+    started_index = next(i for i, event in enumerate(events) if event.get("type") == "started")
+    registered_index = next(
+        i for i, event in enumerate(events) if event.get("registered") is True
+    )
+    assert started_index < registered_index
     status_events = [event for event in events if event.get("type") == "status"]
     assert any(event.get("registered") is True for event in status_events)
     assert all(event.get("relay_runtime_state") == "ready" for event in status_events)
+
+
+def test_run_warm_load_success_starts_once_then_registers_and_keeps_polling(
+    capsys, monkeypatch
+):
+    _reset_cancel_queue()
+    timeline = []
+    original_emit = compute_node_bridge.emit
+
+    def record_operator_event(payload):
+        timeline.append(("event", dict(payload)))
+        original_emit(payload)
+
+    class WarmLoadRuntime(FakeRuntime):
+        def ensure_api_v1_runtime_ready(self):
+            timeline.append(("warm_load", "started"))
+            timeline.append(("warm_load", "completed"))
+            return True
+
+        def register_and_poll_once(self):
+            timeline.append(("relay_poll", None))
+            return {"next_ping_in_x_seconds": 0}
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=WarmLoadRuntime)
+    monkeypatch.setattr(compute_node_bridge, "emit", record_operator_event)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "stop_requested",
+        lambda: sum(kind == "relay_poll" for kind, _value in timeline) >= 2,
+    )
+    monkeypatch.setenv("TOKENPLACE_DESKTOP_WARM_LOAD", "1")
+    args = SimpleNamespace(
+        model="/tmp/model.gguf",
+        mode="cpu",
+        relay_url="https://token.place",
+        relay_port=None,
+    )
+
+    assert compute_node_bridge.run(args) == 0
+
+    runtime_started = [
+        (index, payload)
+        for index, (kind, payload) in enumerate(timeline)
+        if kind == "event"
+        and payload.get("type") == "started"
+        and payload.get("running") is True
+        and payload.get("runtime_provisioning_state") != "provisioning"
+    ]
+    assert len(runtime_started) == 1
+    started_index, started_payload = runtime_started[0]
+    pre_start_statuses = [
+        payload
+        for index, (kind, payload) in enumerate(timeline)
+        if index < started_index and kind == "event" and payload.get("type") == "status"
+    ]
+    assert pre_start_statuses
+    assert all(payload.get("running") is False for payload in pre_start_statuses)
+    warm_completed_index = timeline.index(("warm_load", "completed"))
+    first_poll_index = next(
+        index for index, (kind, _value) in enumerate(timeline) if kind == "relay_poll"
+    )
+    registered_index = next(
+        index
+        for index, (kind, payload) in enumerate(timeline)
+        if kind == "event" and payload.get("registered") is True
+    )
+
+    assert warm_completed_index < started_index < first_poll_index < registered_index
+    assert started_payload["warm_load_enabled"] is True
+    assert started_payload["warm_load_state"] == "ready"
+    assert sum(kind == "relay_poll" for kind, _value in timeline) == 2
+    assert any(
+        kind == "relay_poll" for kind, _value in timeline[registered_index + 1 :]
+    )
+    _ = capsys.readouterr()
 
 
 def test_run_sidecar_runtime_path_warms_bridge_before_registration_without_dual_opt_in(capsys, monkeypatch):
@@ -6066,6 +6709,11 @@ def test_qwen64k_init_failure_stderr_includes_safe_profile_diagnostics(capsys):
         last_compute_diagnostics={
             'api_v1_readiness_result': 'failed',
             'api_v1_readiness_qwen_64k_runtime_profile_id': 'qwen64k_kv_q4_fa_small_batch',
+            'api_v1_readiness_qwen_64k_runtime_preferred_profile_id': 'qwen64k_kv_q8_fa_small_batch',
+            'api_v1_readiness_qwen_64k_batch_profile_requested': 'experimental',
+            'api_v1_readiness_qwen_64k_batch_profile_selected': 'safe',
+            'api_v1_readiness_qwen_64k_runtime_profile_kv_precision': 'q4',
+            'api_v1_readiness_qwen_64k_runtime_profile_fallback_reason': 'memory_pressure',
             'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids': (
                 'qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
             ),
@@ -6095,6 +6743,11 @@ def test_qwen64k_init_failure_stderr_includes_safe_profile_diagnostics(capsys):
     assert 'desktop.compute_node_bridge.api_v1_readiness.safe_diagnostics' in err
     assert 'unavailable=true' not in err
     assert 'api_v1_readiness_qwen_64k_runtime_profile_id=qwen64k_kv_q4_fa_small_batch' in err
+    assert 'api_v1_readiness_qwen_64k_runtime_preferred_profile_id=qwen64k_kv_q8_fa_small_batch' in err
+    assert 'api_v1_readiness_qwen_64k_batch_profile_requested=experimental' in err
+    assert 'api_v1_readiness_qwen_64k_batch_profile_selected=safe' in err
+    assert 'api_v1_readiness_qwen_64k_runtime_profile_kv_precision=q4' in err
+    assert 'api_v1_readiness_qwen_64k_runtime_profile_fallback_reason=memory_pressure' in err
     assert 'api_v1_readiness_qwen_64k_runtime_profile_failure_category=runtime_context_create_cuda_memory' in err
     assert 'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids=qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch' in err
     for secret in (
@@ -6125,6 +6778,13 @@ def test_windows_packaged_e2e_sets_up_rust_before_cargo_regressions() -> None:
 def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsys, monkeypatch):
     calls = []
 
+    class ChildPathRuntime(FakeRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.model_manager.child_model_path_exists = True
+
+    _install_fake_runtime_module(monkeypatch, runtime_cls=ChildPathRuntime)
+
     monkeypatch.setattr(
         compute_node_bridge,
         'ensure_desktop_python_dependencies',
@@ -6141,13 +6801,6 @@ def test_run_provisions_dependencies_before_runtime_and_reports_child_path(capsy
     )
     monkeypatch.setattr(compute_node_bridge, 'maybe_reexec_for_runtime_refresh', lambda _setup: None)
     monkeypatch.setattr(compute_node_bridge, 'stop_requested', lambda: True)
-
-    class ChildPathRuntime(FakeRuntime):
-        def __init__(self, config):
-            super().__init__(config)
-            self.model_manager.child_model_path_exists = True
-
-    _install_fake_runtime_module(monkeypatch, runtime_cls=ChildPathRuntime)
 
     args = SimpleNamespace(
         model='/tmp/model.gguf',
@@ -6283,6 +6936,7 @@ def test_warm_load_status_interval_emits_before_slower_progress_log(capsys, monk
         if event.get('type') == 'status' and event.get('startup_phase') == 'warm_load'
     ]
     assert warming_status_events
+    assert all(event['running'] is False for event in warming_status_events)
     assert 'desktop.compute_node_bridge.model_init.still_warming' not in output.err
 
 
@@ -6371,6 +7025,7 @@ def test_warm_load_post_deadline_future_completion_treated_as_timeout(capsys, mo
         if e.get('type') == 'status' and e.get('startup_phase') == 'warm_load'
     ]
     assert timeout_status_events, "expected at least one warm_load status event from the timeout path"
+    assert all(event['running'] is False for event in timeout_status_events)
 
 
 def test_runtime_public_value_redacts_secret_path_diagnostics():
@@ -6699,6 +7354,8 @@ def test_bridge_fatal_composition_via_wire_fatal_teardown_exits_subprocess(tmp_p
     bridge_path = str(MODULE_PATH)
 
     child_script = tmp_path / 'child_bridge_fatal.py'
+    network_attempt = tmp_path / 'unexpected_network_attempt'
+    configuration_attempt = tmp_path / 'unexpected_configuration_attempt'
     child_script.write_text(
         f"""\
 import sys
@@ -6706,6 +7363,7 @@ import os
 import time
 import threading
 import importlib.util
+from types import ModuleType
 # Import repo modules FIRST so they are cached in sys.modules before
 # compute_node_bridge's path_bootstrap may reorder sys.path.
 sys.path.insert(0, {repo_root!r})
@@ -6714,19 +7372,43 @@ sys.path.insert(0, {repo_root!r})
 import utils.networking.relay_client as rcm
 rcm._API_V1_CLEANUP_BUDGET_SECONDS = 0.2
 
+# The child is a fresh interpreter, so install its transport tripwire here.
+# Any swallowed transport exception remains visible to the parent via the marker.
+network_attempt = {str(network_attempt)!r}
+def reject_network(*_args, **_kwargs):
+    with open(network_attempt, 'w', encoding='utf-8') as marker:
+        marker.write('unexpected relay HTTP')
+    raise AssertionError('fatal-child fixture attempted real relay HTTP')
+rcm.requests.post = reject_network
+
+# Keep configuration isolated for the child's entire supervisor lifetime.  The
+# sentinel module makes a fallback to the real lazy loader durable even though
+# relay logging catches configuration errors.
+configuration_attempt = {str(configuration_attempt)!r}
+def reject_configuration_initialization():
+    with open(configuration_attempt, 'w', encoding='utf-8') as marker:
+        marker.write('unexpected real configuration initialization')
+    raise AssertionError('fatal-child fixture attempted real configuration initialization')
+config_module = ModuleType('config')
+config_module.get_config = reject_configuration_initialization
+sys.modules['config'] = config_module
+
 # Create a minimal RelayClient.
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 crypto = MagicMock()
 crypto.public_key_b64 = 'testkey'
 model = MagicMock()
-config = MagicMock()
-config.is_production = False
-config.get.side_effect = lambda k, d=None: {{'relay.request_timeout': 15}}.get(k, d)
-with patch('utils.networking.relay_client.get_config_lazy', return_value=config):
-    client = rcm.RelayClient('http://relay.example', 443, crypto, model)
+fake_config = MagicMock()
+fake_config.is_production = False
+fake_config.get.side_effect = lambda k, d=None: {{'relay.request_timeout': 15}}.get(k, d)
+rcm.get_config_lazy = lambda: fake_config
+client = rcm.RelayClient('http://relay.example', 443, crypto, model)
 
 client._last_api_v1_work_relay_url = 'http://relay.example'
 client._polling_stopped_by_request = False
+client._post_api_v1_request_control = lambda **_kwargs: {{
+    'status': 'active', 'next_poll_seconds': 30,
+}}
 
 # Inference blocks forever so the quiescence check always times out.
 release_inference = threading.Event()
@@ -6778,8 +7460,8 @@ sys.exit(0)
         text=True,
     )
 
-    assert result.returncode != 0, (
-        f"Expected nonzero exit from bridge fatal_bridge_teardown, "
+    assert result.returncode == 1, (
+        f"Expected exit 1 from bridge fatal_bridge_teardown, "
         f"got {result.returncode}. stdout: {result.stdout!r} stderr: {result.stderr!r}"
     )
     assert 'MARKER_REACHED_AFTER_SUPERVISE' not in result.stdout, (
@@ -6787,6 +7469,11 @@ sys.exit(0)
     )
     assert 'fatal_teardown' in result.stderr, (
         f"Expected 'fatal_teardown' lifecycle log in stderr: {result.stderr!r}"
+    )
+    assert 'Traceback' not in result.stderr
+    assert not network_attempt.exists(), 'fatal-child fixture attempted real relay HTTP'
+    assert not configuration_attempt.exists(), (
+        'fatal-child fixture attempted real configuration initialization'
     )
 
 
@@ -6901,7 +7588,59 @@ def test_run_cancel_during_inference_starts_cleanup_without_waiting_for_inferenc
 
 
 
-def _load_desktop_relay_operator_parity_module():
+def _load_desktop_relay_operator_parity_module(monkeypatch):
+    unexpected_attempts = []
+
+    def _unexpected(kind):
+        def fail(*_args, **_kwargs):
+            unexpected_attempts.append(kind)
+            raise AssertionError(f'unexpected parity-helper side effect: {kind}')
+
+        return fail
+
+    requests_module = ModuleType('requests')
+    requests_module.get = _unexpected('network')
+    requests_module.post = _unexpected('network')
+    subprocess_module = ModuleType('subprocess')
+    subprocess_module.PIPE = subprocess.PIPE
+    subprocess_module.STDOUT = subprocess.STDOUT
+    subprocess_module.TimeoutExpired = subprocess.TimeoutExpired
+    subprocess_module.Popen = _unexpected('native process')
+
+    class UnexpectedEncryptionManager:
+        def __init__(self, *_args, **_kwargs):
+            unexpected_attempts.append('API/encryption bootstrap: EncryptionManager')
+            raise AssertionError('unexpected parity-helper side effect: API/encryption bootstrap')
+
+    encryption_module = ModuleType('api.v1.encryption')
+    encryption_module.EncryptionManager = UnexpectedEncryptionManager
+    api_module = ModuleType('api')
+    api_module.__path__ = []
+    api_v1_module = ModuleType('api.v1')
+    api_v1_module.__path__ = []
+    packaged_helpers = ModuleType('desktop_tauri_packaged_helpers')
+    for name in (
+        'create_macos_bundle_layout',
+        'create_packaged_layout',
+        'reserve_free_port',
+        'wait_for_livez',
+    ):
+        setattr(packaged_helpers, name, _unexpected(f'unused packaged helper: {name}'))
+
+    for name, module in {
+        'requests': requests_module,
+        'subprocess': subprocess_module,
+        'api': api_module,
+        'api.v1': api_v1_module,
+        'api.v1.encryption': encryption_module,
+        'desktop_tauri_packaged_helpers': packaged_helpers,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(sys, 'path', list(sys.path))
+    monkeypatch.setattr(socket, 'create_connection', _unexpected('network: socket.create_connection'))
+    monkeypatch.setattr(os, 'execv', _unexpected('re-exec: os.execv'))
+    monkeypatch.setattr(os, 'execve', _unexpected('re-exec: os.execve'))
+
     module_path = (
         Path(__file__).resolve().parents[2]
         / 'desktop-tauri'
@@ -6912,18 +7651,19 @@ def _load_desktop_relay_operator_parity_module():
     parity = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(parity)
-    return parity
+    return parity, unexpected_attempts
 
 
-def test_relay_operator_parity_uses_cpu_for_simulated_macos_bridge_mode():
-    parity = _load_desktop_relay_operator_parity_module()
+def test_relay_operator_parity_uses_cpu_for_simulated_macos_bridge_mode(monkeypatch):
+    parity, unexpected_attempts = _load_desktop_relay_operator_parity_module(monkeypatch)
 
     assert parity._bridge_compute_mode(simulated_platform='Darwin') == 'cpu'
     assert parity._bridge_compute_mode(simulated_platform='macOS') == 'cpu'
+    assert unexpected_attempts == []
 
 
-def test_relay_operator_parity_accepts_mock_llm_macos_fallback_reason():
-    parity = _load_desktop_relay_operator_parity_module()
+def test_relay_operator_parity_accepts_mock_llm_macos_fallback_reason(monkeypatch):
+    parity, unexpected_attempts = _load_desktop_relay_operator_parity_module(monkeypatch)
 
     parity._assert_ready_runtime_fields(
         {
@@ -6939,11 +7679,32 @@ def test_relay_operator_parity_accepts_mock_llm_macos_fallback_reason():
         },
         layout_label='macOS Contents/Resources',
     )
+    assert unexpected_attempts == []
 
 
 def test_relay_operator_start_bridge_passes_simulated_platform_to_compute_mode(monkeypatch, tmp_path):
-    parity = _load_desktop_relay_operator_parity_module()
+    parity, unexpected_attempts = _load_desktop_relay_operator_parity_module(monkeypatch)
     modes = []
+    log_destinations = []
+    accepted_log_destinations = []
+    temporary_log_dir = tmp_path / 'parity-logs'
+    original_log_dir = parity.LOG_DIR
+    real_write_log = parity._write_log
+
+    def checked_write_log(path, text):
+        log_destinations.append(path)
+        try:
+            path.resolve().relative_to(tmp_path.resolve())
+        except ValueError as exc:
+            raise AssertionError(f'log destination escapes test temporary directory: {path}') from exc
+        accepted_log_destinations.append(path)
+        real_write_log(path, text)
+
+    monkeypatch.setattr(parity, '_write_log', checked_write_log)
+    with pytest.raises(AssertionError, match='log destination escapes test temporary directory'):
+        checked_write_log(original_log_dir / 'boundary-check.log', 'must not be written')
+    assert accepted_log_destinations == []
+    monkeypatch.setattr(parity, 'LOG_DIR', temporary_log_dir)
 
     class Process:
         stdout = iter(())
@@ -6969,11 +7730,18 @@ def test_relay_operator_start_bridge_passes_simulated_platform_to_compute_mode(m
     )
     bridge._thread.join(timeout=1)
 
+    assert bridge.log_path.parent == temporary_log_dir
+    assert bridge.log_path.resolve().is_relative_to(tmp_path.resolve())
+    assert bridge.log_path.read_text(encoding='utf-8').startswith('# bridge layout=macOS Contents/Resources')
+    assert log_destinations == [original_log_dir / 'boundary-check.log', bridge.log_path]
+    assert accepted_log_destinations == [bridge.log_path]
+    assert not bridge._thread.is_alive()
     assert modes == ['cpu']
+    assert unexpected_attempts == []
 
 
 def test_relay_operator_layout_parity_preserves_simulated_platform_on_restart(monkeypatch, tmp_path):
-    parity = _load_desktop_relay_operator_parity_module()
+    parity, unexpected_attempts = _load_desktop_relay_operator_parity_module(monkeypatch)
 
     calls = []
 
@@ -7016,6 +7784,7 @@ def test_relay_operator_layout_parity_preserves_simulated_platform_on_restart(mo
     )
 
     assert [call['simulated_platform'] for call in calls] == ['Darwin', 'Darwin']
+    assert unexpected_attempts == []
 
 
 def _load_packaged_operator_e2e_module():

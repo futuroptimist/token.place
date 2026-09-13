@@ -1,0 +1,2169 @@
+import dataclasses
+import hashlib
+import json
+import logging
+import math
+import re
+import traceback
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+import redis
+from redis.sentinel import MasterNotFoundError
+import valkey_relay_state
+
+from valkey_relay_state import (
+    ACCEPT_RESPONSE_SCRIPT,
+    RETRIEVE_RESPONSE_SCRIPT,
+    DirectPrimary,
+    ReviewedScript,
+    SchemaManifest,
+    SentinelPrimary,
+    ValkeyConfig,
+    ValkeyConfigurationError,
+    ValkeyFoundation,
+    ValkeyRegistrationStore,
+    ValkeyReadOnlyError,
+    ValkeySchemaIncompatibleError,
+    ValkeyScriptError,
+    ValkeyUnavailableError,
+    REGISTRATION_TRANSITION_SCRIPT,
+    SCRIPT_DIGESTS,
+    SERVER_TIME_SCRIPT,
+)
+from relay_state_store import (
+    EncryptedRequestEnvelope,
+    EncryptedResponseEnvelope,
+    RelayStateCapacityExceeded,
+    RelayStateConflict,
+    RelayStateCredentialMismatch,
+    RelayStateInvalidReservation,
+    RelayStateNoCapacity,
+    RelayStateStoreConfig,
+    RelayStateStoreError,
+    SchedulerNodeState,
+)
+
+
+@pytest.mark.parametrize("key", [None, "x" * 32, bytearray(32), b"x" * 31])
+def test_acknowledgement_key_is_required_exact_bytes_and_redacted(key):
+    foundation = object.__new__(ValkeyFoundation)
+    with pytest.raises(
+        RelayStateStoreError, match="acknowledgement key is invalid"
+    ) as caught:
+        ValkeyRegistrationStore(
+            foundation,
+            RelayStateStoreConfig(namespace="testing.unit"),
+            acknowledgement_key=key,
+        )
+    assert repr(key) not in repr(caught.value)
+
+
+def test_acknowledgement_key_is_copied_and_never_represented():
+    foundation = object.__new__(ValkeyFoundation)
+    key = b"shared-test-acknowledgement-key-32"
+    store = ValkeyRegistrationStore(
+        foundation,
+        RelayStateStoreConfig(namespace="testing.unit"),
+        acknowledgement_key=key,
+    )
+    assert store._acknowledgement_key == key
+    assert store._acknowledgement_key is not key
+    assert key.decode() not in repr(store)
+
+
+def test_response_serialization_is_canonical_sorted_utf8():
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher-☃", "key", "iv"
+    )
+    assert ValkeyRegistrationStore._serialized_response_envelope(envelope) == (
+        b'{"cipherkey":"key","ciphertext":"cipher-\xe2\x98\x83","iv":"iv",'
+        b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}'
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b"[]",
+        b'{"protocol":"tokenplace_api_v1_relay_e2ee"}',
+        (
+            b'{"protocol":"tokenplace_api_v1_relay_e2ee", "version":1,'
+            b'"ciphertext":"cipher","cipherkey":"key","iv":"iv"}'
+        ),
+    ),
+)
+def test_response_envelope_decoder_rejects_malformed_or_noncanonical_bytes(raw):
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        ValkeyRegistrationStore._decode_response_envelope(raw)
+
+
+@pytest.mark.parametrize(
+    ("generation", "envelope", "maximum", "message"),
+    (
+        (
+            0,
+            EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"
+            ),
+            1024,
+            "generation",
+        ),
+        (1, object(), 1024, "response envelope"),
+        (
+            1,
+            EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"
+            ),
+            1,
+            "byte bound",
+        ),
+    ),
+)
+def test_accept_response_rejects_invalid_inputs_before_backend_access(
+    generation, envelope, maximum, message
+):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(
+        store.config, max_response_envelope_bytes=maximum
+    )
+
+    with pytest.raises(RelayStateStoreError, match=message):
+        store.accept_encrypted_response(
+            "node", "a" * 64, "consumer", "client", "request", generation, envelope
+        )
+
+    foundation.server_time.assert_not_called()
+    foundation.execute.assert_not_called()
+
+
+def test_completed_inspector_index_detects_overflow_and_malformed_shapes():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    store = registration_store_with_foundation(foundation)
+    member = b"a" * 64 + b":" + b"b" * 64
+    foundation._call.return_value = [(member, 2.0), (member, 3.0)]
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store._completed_index_members("index", 1.0, 1)
+    assert foundation._call.call_args.kwargs["num"] == 2
+
+    foundation._call.return_value = [(member,)]
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store._completed_index_members("index", 1.0, 1)
+
+
+def test_completed_inspector_rejects_raw_size_before_decode_or_hash():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.return_value = [b"oversized"]
+    store = registration_store_with_foundation(foundation)
+
+    with patch("valkey_relay_state.hashlib.sha256") as sha256:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store._completed_hash("key", (b"digest",), {b"digest": 2})
+    sha256.assert_not_called()
+
+
+def test_completed_inspector_distinguishes_disappearance_from_remaining_authority():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    store = registration_store_with_foundation(foundation)
+    member = b"a" * 64 + b":" + b"b" * 64
+
+    pipeline = MagicMock()
+    foundation._client.pipeline.return_value = pipeline
+    pipeline.__enter__.return_value = pipeline
+    foundation._call.return_value = [0, None]
+    assert store._completed_primary_authority("hash", "index", member) == (0, None)
+    pipeline.exists.assert_called_once_with("hash")
+    pipeline.zscore.assert_called_once_with("index", member)
+
+    foundation._call.return_value = [1, 2.0]
+    assert store._completed_primary_authority("hash", "index", member) == (1, 2.0)
+
+
+def test_accept_response_script_is_registered_digest_pinned_and_bounded():
+    expected_digest = "0cc5fabffcf2a547a60e062751d7a62b4cf87fbb1fbadd1210c2eed7ef55cd96"  # pragma: allowlist secret
+    assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
+    assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
+    assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
+    assert not re.search(
+        r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
+        ACCEPT_RESPONSE_SCRIPT.source,
+    )
+    stale_guard = (
+        "if not replay or not terminal_expiry or replay<=now or terminal_expiry<=now "
+        "then return {'malformed'} end"
+    )
+    assert stale_guard in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index(stale_guard) < (
+        ACCEPT_RESPONSE_SCRIPT.source.index("redis.call('HSET',response")
+    )
+    assert "if not accepted or accepted<0 or accepted>now then return {'malformed'} end" in ACCEPT_RESPONSE_SCRIPT.source
+    cleanup_offset = ACCEPT_RESPONSE_SCRIPT.source.index("local function cleanup()")
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_response_due(response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
+    assert "'client_public_key','request_id','node_id','consumer_digest','generation','envelope'" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "'retrieval_credential_digest','acknowledgement_digest','cancellation_token_digest','client','request'" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "local lv=redis.call('HMGET',lk,'state','client','request','client_public_key','request_id'" in ACCEPT_RESPONSE_SCRIPT.source
+    response_validator = ACCEPT_RESPONSE_SCRIPT.source.split(
+        "local function validate_response_due(due)", 1
+    )[1].split("local function contains", 1)[0]
+    terminal_validator = ACCEPT_RESPONSE_SCRIPT.source.split(
+        "local function validate_terminal_due(due,response_due)", 1
+    )[1].split("local function reap", 1)[0]
+    for validator in (response_validator, terminal_validator):
+        assert "tv[12]~=lv[12]" in validator
+        assert "tv[14]~=lv[13]" in validator
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("validate_terminal_due(terminal_due,response_due)", cleanup_offset) < ACCEPT_RESPONSE_SCRIPT.source.index("reap(response_due,terminal_due)", cleanup_offset)
+    assert "redis.call('EXISTS',response)~=0 or response_indexed or terminal_indexed" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "if entries>=limit then return false end" in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("for i=1,#members,2 do") < (
+        ACCEPT_RESPONSE_SCRIPT.source.index("if entries>=limit then return false end")
+    )
+    assert "local response_values=redis.call('HMGET',response,'client','request','client_public_key','request_id','node_id','consumer_digest','generation','envelope','accepted_at_epoch','response_digest','replay_expires_at_epoch','status')" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "local terminal_exists=redis.call('EXISTS',terminal)" in ACCEPT_RESPONSE_SCRIPT.source
+    assert "a<0 or a>now" in ACCEPT_RESPONSE_SCRIPT.source
+    assert ACCEPT_RESPONSE_SCRIPT.source.index("elseif response_exists~=0 or response_score") < ACCEPT_RESPONSE_SCRIPT.source.index("return {'existing',tostring(g),tv[9],tv[10]}")
+    expiry_guard = "if claim_expiry<=now or deadline<=now then return {'missing'} end"
+    assert expiry_guard in ACCEPT_RESPONSE_SCRIPT.source
+    expiry_guard_offset = ACCEPT_RESPONSE_SCRIPT.source.index(expiry_guard)
+    assert expiry_guard_offset < ACCEPT_RESPONSE_SCRIPT.source.index(
+        "redis.call('HSET',response"
+    )
+    assert expiry_guard_offset < ACCEPT_RESPONSE_SCRIPT.source.index(
+        "redis.call('XDEL',queue"
+    )
+
+
+def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
+    expected_digest = "82d25c377e3df42263b09540f18557a0579e270f25b2c811d0876c7a96e81e45"  # pragma: allowlist secret
+    assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
+    assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
+    assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
+    assert not re.search(
+        r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
+        RETRIEVE_RESPONSE_SCRIPT.source,
+    )
+    assert "local t=redis.call('TIME')" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "if replay<=now then" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert RETRIEVE_RESPONSE_SCRIPT.source.index("if replay<=now then") < (
+        RETRIEVE_RESPONSE_SCRIPT.source.index("if mode=='read' then")
+    )
+    assert "expected_envelope~=rv[8]" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "string.len(lv[14])>max_request_envelope" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "string.len(rv[8])>max_response_envelope" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "if terminal_expiry<=now then" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert RETRIEVE_RESPONSE_SCRIPT.source.index("local response_exists=") < (
+        RETRIEVE_RESPONSE_SCRIPT.source.rindex("if terminal_expiry<=now then")
+    )
+    assert "return {'completed_unavailable'}" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "rv[9]~=tv[9]" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "rv[11]~=tv[10]" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "return {'acknowledged',tv[9],tv[8],tv[13]}" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "local canonical=string.format('%.6f',n)" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "string.format('%.17g',n)==value" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "local function lua_number(value)\n  return lua_float(value)" in RETRIEVE_RESPONSE_SCRIPT.source
+
+
+@pytest.mark.parametrize(
+    ("script", "digest"),
+    (
+        (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947"),  # pragma: allowlist secret
+        (valkey_relay_state.ENQUEUE_SCRIPT, "b9230062be58f017bfb618a368e3fd0d498cadf29c2793201886f1f3e40b9fcb"),  # pragma: allowlist secret
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "673eee38ba27545169d832d19d7acf48729963132ca6f106d3f0b15eeb4be949"),  # pragma: allowlist secret
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "7a22355773765ee16a35c1fbf85cc34968ab4eb822baed7115ea04f33dae77d5"),  # pragma: allowlist secret
+    ),
+)
+def test_control_transition_scripts_are_digest_pinned(script, digest):
+    assert script.sha256 == digest
+    assert SCRIPT_DIGESTS[script.name] == digest
+    assert hashlib.sha256(script.source.encode()).hexdigest() == digest
+
+
+def test_cancel_retained_control_timeline_is_outcome_specific():
+    source = valkey_relay_state.CANCEL_REQUEST_SCRIPT.source
+    assert "v[9]=='server_unregistered'" in source
+    assert "v[8]=='expired' and deadline<=accepted" in source
+    assert "or accepted<=deadline" in source
+
+
+def test_node_transition_script_is_registered_digest_pinned_and_bounded():
+    script = valkey_relay_state.NODE_TRANSITION_SCRIPT
+    assert SCRIPT_DIGESTS[script.name] == script.sha256
+    assert hashlib.sha256(script.source.encode()).hexdigest() == script.sha256
+    assert "SCAN" not in script.source.upper()
+    assert "ZRANGE',work,1,tonumber(batch)" in script.source
+    assert "expected_epoch" in script.source
+    assert "redis.call('ZADD',pending_index,now,node_digest)" in script.source
+    assert "if redis.call('ZSCORE',pending_index,node_digest) then return {'schema'} end" in script.source
+    assert script.source.index("local expired_tombs=") < script.source.index(
+        "for _,m in ipairs(expired_tombs) do redis.call('DEL'"
+    )
+    assert script.source.index("local members=redis.call('ZRANGE',work") < (
+        script.source.index("if initial then")
+    )
+    assert "finite(redis.call('ZSCORE',deadlines,member))~=request_deadline" in script.source
+    assert "entries[1][2][2]~=client" in script.source
+    assert "redis.call('ZCARD',tomb_expiries)-#expired_tombs" in script.source
+    assert "redis.call('ZCARD',fence_expiries)-#deletable_fences" in script.source
+    assert "local accepted=canonical_number(tv[9],true)" in script.source
+    assert "string.len(response[8])>max_response_envelope" in script.source
+    assert "A generation-zero reservation terminal legitimately predates enqueue metadata" in script.source
+    assert "tomb_exists~=(tomb_score~=nil)" in script.source
+    assert "fence_exists~=(fence_score~=nil)" in script.source
+    assert "redis.call('ZSCORE',terminal_expiries,member)" in script.source
+    assert "n>9007199254740990" in script.source
+    assert "not request_deadline" in script.source
+    assert "reservation_expiry>request_deadline" in script.source
+    assert "claim_expiry>request_deadline" in script.source
+    assert "local function registration_epoch(v,zero)" in script.source
+    assert "registered=registration_epoch(nv[3],true)" in script.source
+    assert "lease=registration_epoch(nv[12],true)" in script.source
+    assert "utf8_length(value)>128" in script.source
+    assert "model_count>64" in script.source
+    assert script.source.index("registration_bytes>65536") < script.source.index(
+        "pcall(cjson.decode,nv[4])"
+    )
+    assert "ZRANGE',terminal_expiries,0,-1" not in script.source
+    assert "tonumber(max_client_terminals)" in script.source
+    assert "tonumber(max_node_controls)" in script.source
+    assert "local admitted={}" in script.source
+    assert "local due_terminals=redis.call('ZRANGEBYSCORE'" in script.source
+    assert "local due_controls=redis.call('ZRANGEBYSCORE'" in script.source
+    assert "local function lifecycle_valid(c,q,v,l,accepted)" in script.source
+    assert "tv[1]==v[8] and tv[2]==v[9]" in script.source
+    assert "if accepted>bounded_number(l[8],false)" in script.source
+    assert "v[9]=='server_unregistered' or accepted<=deadline" in script.source
+    assert "for slot=1,max_fingerprints do" in script.source
+    assert "if mapping==node_digest then table.insert(cursor_removals" in script.source
+    assert "redis.call('HSET',cursor,'_count',remaining_cursors)" in script.source
+    assert "local deletable_fences={}" in script.source
+    assert "reserved=rv[2]==od and rv[3]==fv[3] and rv[6]==fv[5]" in script.source
+    assert "if redis.call('EXISTS',tomb)==1 then redis.call('HSET',tomb,'completed','1') end" in script.source
+    assert "A completed owner's retained fence is distinct" in script.source
+    assert script.source.index("if cause=='explicit_unregister' and pv[3]~=supplied") < (
+        script.source.index("if pv[4]~=cause then return {'conflict'} end")
+    )
+    assert "fv[5]~=epoch or finite(fv[6])~=fs" in script.source
+    assert "tv[5]~=epoch" in script.source
+
+    reader = valkey_relay_state.PENDING_TRANSITION_READ_SCRIPT
+    assert SCRIPT_DIGESTS[reader.name] == reader.sha256
+    assert hashlib.sha256(reader.source.encode()).hexdigest() == reader.sha256
+    assert not reader.mutates
+
+
+def test_registration_transition_fences_both_pending_authorities():
+    source = REGISTRATION_TRANSITION_SCRIPT.source
+    assert "prefix .. 'node_transition:' .. digest" in source
+    assert "prefix .. 'node_transitions:pending', digest" in source
+    assert "if fence_exists~=(fence_score~=nil) then return {'schema'} end" in source
+    assert "if expiry>now then return {'credential_mismatch'} end" in source
+
+
+def test_node_removed_record_encoding_is_generation_and_timestamp_canonical():
+    source = valkey_relay_state.NODE_TRANSITION_SCRIPT.source
+    assert "'state','cancelled','claim_generation',generation" in source
+    assert "local generation=r[11] or '0'" in source
+    assert "local accepted=string.format('%.6f',now)" in source
+    assert "local replay=string.format('%.17g',tonumber(accepted))" in source
+
+
+def _node_transition_store_with_reply(reply):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.execute.return_value = reply
+    return registration_store_with_foundation(foundation)
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    (
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"credential_mismatch"], RelayStateCredentialMismatch),
+        ([b"conflict"], RelayStateConflict),
+        ([b"pending_capacity"], RelayStateCapacityExceeded),
+        ([b"transitioning", b"explicit_unregister", b"bad"], ValkeySchemaIncompatibleError),
+        (
+            [
+                b"transitioning",
+                b"explicit_unregister",
+                b"1.0",
+                b"not-an-integer",
+                0,
+                0,
+                0,
+                0,
+                1,
+            ],
+            ValkeySchemaIncompatibleError,
+        ),
+        (
+            [
+                b"transitioning",
+                b"explicit_unregister",
+                b"1.0",
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,
+            ],
+            ValkeySchemaIncompatibleError,
+        ),
+        ([b"unexpected"], ValkeySchemaIncompatibleError),
+        ([b"already_complete", b"unknown", b"1"], ValkeySchemaIncompatibleError),
+        ([b"already_complete", b"explicit_unregister", b"nan"], ValkeySchemaIncompatibleError),
+        ([b"complete", b"explicit_unregister", b"1", 2, 0, 1, 0, 2, 0], ValkeySchemaIncompatibleError),
+        ([b"complete", b"explicit_unregister", b"1", 0, 0, 0, 0, 0, 1], ValkeySchemaIncompatibleError),
+        ([b"transitioning", b"explicit_unregister", b"1", 0, 0, 0, 0, 0, 0], ValkeySchemaIncompatibleError),
+    ),
+)
+def test_node_transition_reply_rejects_typed_and_malformed_results(reply, error):
+    store = _node_transition_store_with_reply(reply)
+
+    with pytest.raises(error):
+        store.unregister_node_and_transition_work("node-a", "a" * 64)
+
+
+@pytest.mark.parametrize(
+    ("cause", "credential", "message"),
+    (
+        ("unsupported", "a" * 64, "cause is invalid"),
+        ("registration_lease_expired", "a" * 64, "does not accept credentials"),
+    ),
+)
+def test_node_transition_rejects_invalid_cause_inputs(cause, credential, message):
+    store = registration_store_with_foundation(Mock(spec=ValkeyFoundation))
+
+    with pytest.raises(RelayStateStoreError, match=message):
+        store.unregister_node_and_transition_work("node-a", credential, cause=cause)
+
+
+def test_node_transition_accepts_stale_pending_recovery_result():
+    store = _node_transition_store_with_reply([b"stale"])
+
+    result = store.unregister_node_and_transition_work(
+        "node-a",
+        cause="registration_lease_expired",
+        _expected_transition_epoch="1.0",
+    )
+
+    assert result.state == "stale"
+    assert not result.continuation_required
+
+
+def _node_tombstone_store(indexed, raw=None, *, field_count=7, current_score=...):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation._client = MagicMock()
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    calls = [indexed]
+    if raw is not None:
+        score = (
+            indexed[0][1]
+            if current_score is ... and isinstance(indexed, list) and indexed
+            else current_score
+        )
+        calls.append([raw, field_count, score])
+    foundation._call.side_effect = calls
+    return registration_store_with_foundation(foundation)
+
+
+def test_node_tombstones_decodes_a_valid_bounded_snapshot():
+    node_digest = b"a" * 64
+    owner_digest = b"b" * 64
+    store = _node_tombstone_store(
+        [(node_digest, 400.0)],
+        [
+            node_digest,
+            owner_digest,
+            b"explicit_unregister",
+            b"cancelled",
+            b"100",
+            b"1",
+            b"400",
+        ],
+    )
+
+    records = store.node_tombstones()
+
+    assert len(records) == 1
+    assert dataclasses.asdict(records[0]) == {
+        "node_identity_digest": node_digest.decode(),
+        "control_credential_digest": owner_digest.decode(),
+        "cause": "explicit_unregister",
+        "status": "cancelled",
+        "transition_epoch": 100.0,
+        "completed": True,
+        "expires_at_epoch": 400.0,
+    }
+
+
+def test_node_tombstones_accepts_additive_fields_and_writer_retention():
+    node_digest = b"a" * 64
+    store = _node_tombstone_store(
+        [(node_digest, 400.0)],
+        [
+            node_digest,
+            b"b" * 64,
+            b"explicit_unregister",
+            b"cancelled",
+            b"100",
+            b"1",
+            b"400",
+        ],
+        field_count=8,
+    )
+    store._config = dataclasses.replace(
+        store.config, node_tombstone_ttl_seconds=60
+    )
+
+    assert store.node_tombstones()[0].expires_at_epoch == 400.0
+
+
+@pytest.mark.parametrize(
+    ("indexed", "raw"),
+    (
+        ("not-a-list", None),
+        ([(b"invalid", 200.0)], None),
+        ([(b"a" * 64, 200.0)], [None] * 7),
+        (
+            [(b"a" * 64, 200.0)],
+            [
+                b"a" * 64,
+                b"b" * 64,
+                b"explicit_unregister",
+                b"cancelled",
+                b"invalid",
+                b"1",
+                b"200.0",
+            ],
+        ),
+        (
+            [(b"a" * 64, 200.0)],
+            [
+                b"a" * 64,
+                b"b" * 64,
+                b"explicit_unregister",
+                b"invalid-status",
+                b"100.0",
+                b"1",
+                b"200.0",
+            ],
+        ),
+    ),
+)
+def test_node_tombstones_rejects_malformed_authority(indexed, raw):
+    store = _node_tombstone_store(indexed, raw)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.node_tombstones()
+
+
+@pytest.mark.parametrize(
+    ("raw", "field_count", "current_score"),
+    (
+        ([b"a"] * 6, 7, 200.0),
+        ([b"a"] * 8, 8, 200.0),
+        ([None] * 7, 1, 200.0),
+        ([None] + [b"a"] * 6, 8, 200.0),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"200"], 7, None),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"200"], 7, 201.0),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"99"], 7, 99.0),
+        ([b"a" * 64, b"b" * 64, b"explicit_unregister", b"cancelled", b"100", b"1", b"401"], 7, 401.0),
+    ),
+)
+def test_node_tombstones_rejects_invalid_reply_or_timeline(
+    raw, field_count, current_score
+):
+    store = _node_tombstone_store(
+        [(b"a" * 64, 200.0)],
+        raw,
+        field_count=field_count,
+        current_score=current_score,
+    )
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.node_tombstones()
+
+
+@pytest.mark.parametrize(
+    ("client", "request_id"),
+    ((None, "request"), ("client", None), ("", "request"), ("client", "")),
+)
+def test_retrieve_response_rejects_invalid_identity_before_backend(client, request_id):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(RelayStateStoreError, match="request identity is invalid"):
+        store.retrieve_encrypted_response(client, request_id, "a" * 64)
+
+    foundation.execute.assert_not_called()
+
+
+def _retrieval_store_with_replies(*replies):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.side_effect = replies
+    return registration_store_with_foundation(foundation)
+
+
+def _ready_retrieval_reply(store, *, acknowledgement_digest=None):
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher", "key", "iv"
+    )
+    envelope_raw = store._serialized_response_envelope(envelope)
+    response_digest = hashlib.sha256(envelope_raw).hexdigest()
+    token = store._derive_acknowledgement_token(
+        store._identity("a" * 64, "b" * 64), 10.0, response_digest
+    )
+    return [
+        b"response_ready",
+        envelope_raw,
+        b"10",
+        b"20",
+        b"30",
+        response_digest.encode(),
+        (
+            acknowledgement_digest
+            or hashlib.sha256(token.encode()).hexdigest().encode()
+        ),
+    ], token
+
+
+@pytest.mark.parametrize(
+    "reply",
+    (
+        [b"invalid_ack"],
+        [b"schema"],
+        [b"unexpected"],
+        [b"response_ready", b"too", b"few"],
+        [b"response_ready", b"envelope", b"10", b"20", b"30", b"digest", 1],
+    ),
+)
+def test_retrieve_response_decodes_fixed_and_malformed_read_results(reply):
+    store = _retrieval_store_with_replies(reply)
+
+    if reply == [b"invalid_ack"]:
+        assert store.retrieve_encrypted_response(
+            "a" * 64, "b" * 64, "c" * 64
+        ).state == "invalid_acknowledgement"
+    else:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        [b"10", b"0" * 64, 1],
+        [b"nan", b"0" * 64, b"0" * 64],
+        [b"10", b"not-a-digest", b"0" * 64],
+    ),
+)
+def test_retrieve_response_rejects_malformed_acknowledged_metadata(metadata):
+    store = _retrieval_store_with_replies([b"acknowledged", *metadata])
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
+
+
+def test_retrieve_response_active_key_mismatch_is_typed_for_read_and_acknowledgement():
+    store = _retrieval_store_with_replies()
+    reply, token = _ready_retrieval_reply(store, acknowledgement_digest=b"0" * 64)
+    store._foundation.execute.side_effect = [reply, reply]
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
+    assert store.retrieve_encrypted_response(
+        "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+    ).state == "invalid_acknowledgement"
+
+
+@pytest.mark.parametrize(
+    ("ack_reply", "expected_status", "raises"),
+    (
+        ([b"invalid_ack"], "invalid_acknowledgement", False),
+        ([b"retrieval_expired"], "retrieval_expired", False),
+        ([b"invalid_credential"], "invalid_retrieval_credential", False),
+        ([b"unexpected"], None, True),
+    ),
+)
+def test_retrieve_response_decodes_fixed_ack_transition_results(
+    ack_reply, expected_status, raises
+):
+    store = _retrieval_store_with_replies()
+    ready, token = _ready_retrieval_reply(store)
+    store._foundation.execute.side_effect = [ready, ack_reply]
+
+    if raises:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="state schema incompatible"
+        ):
+            store.retrieve_encrypted_response(
+                "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+            )
+    else:
+        result = store.retrieve_encrypted_response(
+            "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+        )
+        assert result.state == expected_status
+
+
+def test_retrieve_response_rejects_mismatched_ack_transition_authority():
+    store = _retrieval_store_with_replies()
+    ready, token = _ready_retrieval_reply(store)
+    store._foundation.execute.side_effect = [
+        ready,
+        [b"acknowledged", b"11", ready[5], ready[6]],
+    ]
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        store.retrieve_encrypted_response(
+            "a" * 64, "b" * 64, "c" * 64, acknowledgement_token=token
+        )
+
+
+def config(**changes):
+    values = dict(
+        environment="test",
+        cluster="unit",
+        schema_major=1,
+        reader_revision=2,
+        writer_revision=2,
+        supported_schema_read_min=1,
+        supported_schema_read_max=3,
+        supported_writer_min=1,
+        supported_writer_max=3,
+        direct=DirectPrimary("127.0.0.1", 6379),
+    )
+    values.update(changes)
+    return ValkeyConfig(**values)
+
+
+def manifest(**changes):
+    values = dict(
+        schema_major=1,
+        active_schema_revision=2,
+        active_writer_revision=2,
+        reader_min=1,
+        reader_max=3,
+        writer_min=1,
+        writer_max=3,
+        script_digests=SCRIPT_DIGESTS,
+        migration_epoch=0,
+    )
+    values.update(changes)
+    return SchemaManifest(**values)
+
+
+def registration_store_with_foundation(foundation):
+    store = object.__new__(ValkeyRegistrationStore)
+    store._foundation = foundation
+    store._config = RelayStateStoreConfig(namespace="testing.unit")
+    store._acknowledgement_key = b"shared-test-acknowledgement-key-32"
+    return store
+
+
+def test_select_script_contains_no_scan_commands():
+    assert (
+        re.search(
+            r"redis\.call\(['\"](?:HSCAN|SCAN|KEYS)['\"]",
+            valkey_relay_state.SELECT_AND_RESERVE_SOURCE,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [None, [], [1], [b"unknown"], [b"ok", b"extra"], [b"not_found", b"extra"]],
+)
+def test_registration_transition_rejects_every_malformed_result(result):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store._transition("unregister", "node-a", "a" * 64, ())
+
+
+def test_registration_reads_use_server_time_and_never_mutating_transition():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    foundation._client = Mock()
+    foundation._client.zscore = Mock()
+    foundation._client.zrangebyscore = Mock()
+    foundation._client.hmget = Mock()
+    foundation._call.side_effect = [99, []]
+    store = registration_store_with_foundation(foundation)
+
+    assert store.get("node-a") is None
+    assert store.list() == ()
+    foundation.execute.assert_not_called()
+    foundation.check_write_compatible.assert_not_called()
+
+
+def _registration_values():
+    return (
+        b"node-a",
+        b"a" * 64,
+        b"100",
+        b'["model-a"]',
+        b"8k-fast",
+        b"8192",
+        b"1024",
+        b"2048",
+        b"1",
+        b"cpu",
+        b"v1",
+        b"200",
+    )
+
+
+def test_registration_read_uses_exact_bounded_fields():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.side_effect = [200.0, list(_registration_values())]
+    store = registration_store_with_foundation(foundation)
+
+    assert store._read("node-a", 100).node_id == "node-a"
+    hmget_call = foundation._call.call_args_list[1]
+    assert hmget_call.args[0] is foundation._client.hmget
+    assert hmget_call.args[2] == valkey_relay_state._REGISTRATION_FIELDS
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [([None] * 12, None), ([None, *(_registration_values()[1:])], "error")],
+)
+def test_registration_read_distinguishes_absent_and_partial_records(reply, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.side_effect = [200.0, reply]
+    store = registration_store_with_foundation(foundation)
+
+    if expected is None:
+        assert store._read("node-a", 100) is None
+    else:
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store._read("node-a", 100)
+
+
+def test_registration_read_rejects_over_byte_budget_without_value_leakage():
+    marker = b"private-marker"
+    reply = list(_registration_values())
+    reply[3] = marker + b"x" * valkey_relay_state._MAX_RESULT_BYTES
+    with pytest.raises(ValkeySchemaIncompatibleError) as caught:
+        ValkeyRegistrationStore._fixed_record(reply)
+    assert str(caught.value) == "state schema incompatible"
+    assert marker.decode() not in repr(caught.value)
+
+
+@pytest.mark.parametrize("member", [b"A" * 64, b"g" * 64, b"a" * 63, "a" * 64])
+def test_registration_list_translates_malformed_index_members(member):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    foundation._client = Mock()
+    foundation._call.return_value = [member]
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+    ) as caught:
+        store.list()
+    assert str(member) not in repr(caught.value)
+
+
+def test_registration_list_tolerates_concurrent_disappearance():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.read_manifest.return_value = manifest()
+    foundation.server_time.return_value = (100, 0)
+    foundation._client = Mock()
+    foundation._call.side_effect = [[b"a" * 64], [None] * 12]
+    store = registration_store_with_foundation(foundation)
+
+    assert store.list() == ()
+    assert foundation._call.call_count == 2
+    foundation.execute.assert_not_called()
+    foundation.check_write_compatible.assert_not_called()
+
+
+def test_exact_key_prefix_and_hash_tag():
+    cfg = config(environment="staging", cluster="relay-a", schema_major=4)
+    assert cfg.key_prefix == "tokenplace:{staging:relay-a}:relay:v4:"
+    assert cfg.key("schema") == "tokenplace:{staging:relay-a}:relay:v4:schema"
+    with pytest.raises(ValkeyConfigurationError):
+        cfg.key("bad:{tag}")
+
+
+def test_direct_and_sentinel_discovery_validation():
+    assert config().direct == DirectPrimary("127.0.0.1", 6379)
+    sentinel = SentinelPrimary(
+        (("sentinel.internal", 26379),), "relay-primary", "user", "secret"
+    )
+    cfg = config(direct=None, sentinel=sentinel)
+    assert cfg.sentinel is sentinel
+    assert "internal" not in repr(sentinel) and "secret" not in repr(sentinel)
+    with pytest.raises(ValkeyConfigurationError):
+        SentinelPrimary((), "relay-primary")
+    with pytest.raises(ValkeyConfigurationError):
+        SentinelPrimary((("host", 0),), "relay-primary")
+
+
+@pytest.mark.parametrize(
+    "sentinels",
+    [
+        [["host", 26379]],
+        [("host", 26379)],
+        (["host", 26379],),
+    ],
+)
+def test_mutable_sentinel_endpoint_collections_are_rejected(sentinels):
+    with pytest.raises(
+        ValkeyConfigurationError, match="^invalid Sentinel discovery$"
+    ) as caught:
+        SentinelPrimary(sentinels, "relay-primary")
+    assert "host" not in str(caught.value)
+
+
+def test_valid_sentinel_configuration_is_deeply_immutable():
+    sentinel = SentinelPrimary((("host", 26379),), "relay-primary")
+    cfg = config(direct=None, sentinel=sentinel)
+
+    with pytest.raises(TypeError):
+        sentinel.sentinels[0] = ("other", 26380)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.sentinel = SentinelPrimary((("other", 26380),), "relay-primary")
+
+
+class MaliciousDiscovery:
+    def __repr__(self):
+        return "secret-endpoint secret-password"
+
+
+@pytest.mark.parametrize("field", ["direct", "sentinel"])
+def test_invalid_runtime_discovery_objects_fail_closed_and_redacted(field):
+    changes = {field: MaliciousDiscovery()}
+    if field == "sentinel":
+        changes["direct"] = None
+    with pytest.raises(
+        ValkeyConfigurationError, match="^invalid discovery configuration$"
+    ) as caught:
+        config(**changes)
+    rendered = " ".join(
+        (
+            str(caught.value),
+            repr(caught.value),
+            "".join(traceback.format_exception(caught.value)),
+        )
+    )
+    assert "secret" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("config_value", "manifest_value", "error_type", "message"),
+    [
+        (
+            MaliciousDiscovery(),
+            None,
+            ValkeyConfigurationError,
+            "invalid Valkey configuration",
+        ),
+        (
+            None,
+            MaliciousDiscovery(),
+            ValkeySchemaIncompatibleError,
+            "state schema incompatible",
+        ),
+    ],
+)
+def test_invalid_foundation_arguments_fail_before_client_construction(
+    config_value, manifest_value, error_type, message
+):
+    config_value = config() if config_value is None else config_value
+    manifest_value = manifest() if manifest_value is None else manifest_value
+    with (
+        patch.object(ValkeyFoundation, "_create_client") as create,
+        patch("valkey_relay_state.redis.ConnectionPool") as pool,
+        patch("valkey_relay_state.redis.Redis") as redis_class,
+        patch("valkey_relay_state.Sentinel") as sentinel_class,
+    ):
+        with pytest.raises(error_type, match=f"^{message}$") as caught:
+            ValkeyFoundation(config_value, manifest_value)
+    create.assert_not_called()
+    pool.assert_not_called()
+    redis_class.assert_not_called()
+    sentinel_class.assert_not_called()
+    rendered = " ".join(
+        (
+            str(caught.value),
+            repr(caught.value),
+            "".join(traceback.format_exception(caught.value)),
+        )
+    )
+    assert "secret" not in rendered
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"direct": None},
+        {"sentinel": SentinelPrimary((("host", 26379),), "primary")},
+        {"connect_timeout_seconds": math.inf},
+        {"socket_timeout_seconds": 31},
+        {"command_timeout_seconds": 0},
+        {"retry_timeout_seconds": math.nan},
+        {"retry_attempts": 6},
+    ],
+)
+def test_discovery_and_timeout_configuration_fails_closed(changes):
+    with pytest.raises(ValkeyConfigurationError):
+        config(**changes)
+
+
+def test_tls_auth_and_all_representations_are_redacted():
+    cfg = config(
+        direct=DirectPrimary("secret-endpoint", 6380),
+        tls=True,
+        tls_ca_cert="secret-ca",
+        tls_client_cert="secret-cert",
+        tls_client_key="secret-key",  # pragma: allowlist secret
+        username="secret-user",
+        password="secret-password",  # pragma: allowlist secret
+    )
+    rendered = repr(cfg) + repr(cfg.direct)
+    for secret in (
+        "secret-endpoint",
+        "secret-ca",
+        "secret-cert",
+        "secret-key",
+        "secret-user",
+        "secret-password",
+    ):
+        assert secret not in rendered
+
+
+def test_sentinel_tls_applies_to_discovery_and_primary_connections():
+    sentinel = SentinelPrimary((("sentinel.internal", 26379),), "relay-primary")
+    cfg = config(
+        direct=None,
+        sentinel=sentinel,
+        tls=True,
+        tls_ca_cert="ca.pem",
+        tls_client_cert="client.pem",
+        tls_client_key="client-key.pem",  # pragma: allowlist secret
+    )
+    expected = manifest()
+    master = Mock()
+    with patch("valkey_relay_state.Sentinel") as sentinel_class:
+        sentinel_class.return_value.master_for.return_value = master
+        foundation = ValkeyFoundation(cfg, expected)
+
+    call = sentinel_class.call_args
+    assert call.kwargs["ssl"] is True
+    assert call.kwargs["sentinel_kwargs"]["ssl"] is True
+    assert call.kwargs["sentinel_kwargs"]["ssl_ca_certs"] == "ca.pem"
+    assert call.kwargs["max_connections"] == 32
+    assert call.kwargs["sentinel_kwargs"]["max_connections"] == 32
+    assert foundation._client is master
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"schema_major": 2},
+        {"active_schema_revision": 4},
+        {"reader_min": 3},
+        {"active_writer_revision": 4},
+        {"writer_min": 3},
+        {"script_digests": {SERVER_TIME_SCRIPT.name: "0" * 64}},
+        {"migration_epoch": 1},
+    ],
+)
+def test_schema_reader_writer_and_digest_gates(changed):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation.expected_manifest = manifest()
+    candidate = manifest(**changed)
+    with pytest.raises(
+        ValkeySchemaIncompatibleError, match="state schema incompatible"
+    ):
+        foundation.check_write_compatible(candidate)
+
+
+def test_read_gate_can_pass_when_writer_gate_rejects():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(writer_revision=3)
+    foundation.expected_manifest = manifest()
+    candidate = manifest(writer_max=2)
+    foundation.check_read_compatible(candidate)
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.check_write_compatible(candidate)
+
+
+def test_manifest_is_immutable_and_round_trips_canonically():
+    value = manifest()
+    assert SchemaManifest.decode(value.encode()) == value
+    with pytest.raises(TypeError):
+        value.script_digests["new"] = "0" * 64
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        value.migration_epoch = 1
+
+
+def test_arbitrary_and_digest_mismatched_scripts_are_rejected():
+    with pytest.raises(ValkeyScriptError):
+        ReviewedScript("bad", "return 1", "0" * 64, False)
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    with pytest.raises(ValkeyScriptError, match="unknown reviewed script"):
+        foundation.execute("caller_lua")
+
+
+def test_errors_do_not_disclose_backend_details():
+    error = ValkeyUnavailableError("state backend unavailable")
+    assert "host" not in repr(error)
+    assert "password" not in repr(error)
+
+
+def test_lazy_sentinel_discovery_error_is_bounded_and_redacted():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=0)
+
+    def unavailable():
+        raise MasterNotFoundError("No master at secret-sentinel:26379")
+
+    with pytest.raises(
+        ValkeyUnavailableError, match="state backend unavailable"
+    ) as caught:
+        foundation._call(unavailable)
+    assert "secret-sentinel" not in str(caught.value)
+
+
+def test_invalid_expected_manifest_is_rejected_before_connection_or_creation():
+    with patch.object(ValkeyFoundation, "_create_client") as create:
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            ValkeyFoundation(config(), manifest(schema_major=2))
+    create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "script_digests",
+    [
+        {},
+        {**SCRIPT_DIGESTS, "extra_v1": "a" * 64},
+        {SERVER_TIME_SCRIPT.name: "a" * 64},
+    ],
+)
+def test_expected_script_digests_must_exactly_match_registry_before_connection(
+    script_digests,
+):
+    expected = manifest(script_digests=script_digests)
+    with patch.object(ValkeyFoundation, "_create_client") as create:
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            ValkeyFoundation(config(), expected)
+    create.assert_not_called()
+
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation.expected_manifest = expected
+    candidate = manifest(script_digests=script_digests)
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.check_read_compatible(candidate)
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.check_write_compatible(candidate)
+
+
+def test_retry_budget_is_total_and_deterministic():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5, retry_timeout_seconds=0.1)
+    operation = Mock(side_effect=redis.ConnectionError("private endpoint"))
+    clock = Mock(side_effect=[0.0, 0.04, 0.11])
+    with (
+        patch("valkey_relay_state.time.monotonic", clock),
+        patch("valkey_relay_state.time.sleep") as sleep,
+    ):
+        with pytest.raises(ValkeyUnavailableError) as caught:
+            foundation._call(operation)
+    assert operation.call_count == 2
+    sleep.assert_called_once_with(0.05)
+    assert caught.value.__cause__ is None
+
+
+def test_mutating_script_transport_failure_is_not_retried():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.side_effect = redis.ConnectionError("private endpoint")
+
+    with pytest.raises(
+        ValkeyUnavailableError, match="^state backend unavailable$"
+    ) as caught:
+        foundation.execute(REGISTRATION_TRANSITION_SCRIPT.name)
+
+    foundation._client.evalsha.assert_called_once()
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("backend_error", "expected_error", "message"),
+    [
+        (
+            redis.ResponseError("READONLY private primary"),
+            ValkeyReadOnlyError,
+            "state backend is not writable",
+        ),
+        (
+            redis.ResponseError("private command failure"),
+            ValkeyUnavailableError,
+            "state backend command failed",
+        ),
+    ],
+)
+def test_mutating_script_response_failures_are_typed_redacted_and_not_retried(
+    backend_error, expected_error, message
+):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5)
+    operation = Mock(side_effect=backend_error)
+
+    with pytest.raises(expected_error, match=f"^{message}$") as caught:
+        foundation._call_mutating_script(operation)
+
+    operation.assert_called_once()
+    assert "private" not in str(caught.value)
+
+
+def test_read_only_script_transport_failure_retains_bounded_retry():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=2)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.side_effect = [
+        redis.ConnectionError("private endpoint"),
+        [b"1", b"2"],
+    ]
+
+    with patch("valkey_relay_state.time.sleep"):
+        assert foundation.server_time() == (1, 2)
+
+    assert foundation._client.evalsha.call_count == 2
+
+
+def test_mutating_noscript_recovery_dispatches_loaded_script_only_once():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.side_effect = [
+        redis.exceptions.NoScriptError("missing reviewed script"),
+        redis.ConnectionError("lost reply from private endpoint"),
+    ]
+    foundation._client.script_load.return_value = (
+        REGISTRATION_TRANSITION_SCRIPT.eval_sha1
+    )
+
+    with pytest.raises(ValkeyUnavailableError, match="^state backend unavailable$"):
+        foundation.execute(REGISTRATION_TRANSITION_SCRIPT.name)
+
+    assert foundation._client.evalsha.call_count == 2
+    foundation._client.script_load.assert_called_once_with(
+        REGISTRATION_TRANSITION_SCRIPT.source
+    )
+    assert foundation._client.get.call_count == 2
+
+
+def test_incompatible_execution_reads_only_manifest():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest(schema_major=2).encode()
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.server_time()
+    foundation._client.get.assert_called_once()
+    foundation._client.evalsha.assert_not_called()
+    foundation._client.script_load.assert_not_called()
+
+
+def test_second_noscript_is_a_bounded_typed_error_without_another_retry():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=5)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.side_effect = [manifest().encode(), manifest().encode()]
+    datastore_detail = "NOSCRIPT reply from secret-endpoint:6379"
+    foundation._client.evalsha.side_effect = [
+        redis.exceptions.NoScriptError(datastore_detail),
+        redis.exceptions.NoScriptError(datastore_detail),
+    ]
+    foundation._client.script_load.return_value = SERVER_TIME_SCRIPT.eval_sha1
+
+    with pytest.raises(
+        ValkeyScriptError, match="^reviewed script recovery failed$"
+    ) as caught:
+        foundation.server_time()
+
+    assert foundation._client.evalsha.call_count == 2
+    foundation._client.script_load.assert_called_once_with(SERVER_TIME_SCRIPT.source)
+    assert caught.value.__cause__ is None
+    rendered = (
+        repr(caught.value)
+        + str(caught.value)
+        + "".join(traceback.format_exception(caught.value))
+    )
+    assert datastore_detail not in rendered
+    assert "secret-endpoint" not in rendered
+
+
+@pytest.mark.parametrize("result", ["reply", {"raw": b"reply"}, [b"x"] * 1025])
+def test_script_result_decoder_rejects_unbounded_or_unsupported_values(result):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.return_value = result
+    with pytest.raises(ValkeyScriptError, match="invalid reviewed script result"):
+        foundation.server_time()
+
+
+def test_unrelated_reviewed_script_keeps_generic_result_byte_budget():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = manifest().encode()
+    foundation._client.evalsha.return_value = [
+        b"x" * (valkey_relay_state._MAX_RESULT_BYTES + 1)
+    ]
+
+    with pytest.raises(ValkeyScriptError, match="invalid reviewed script result"):
+        foundation.server_time()
+
+
+def test_false_ping_is_unavailable():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._client.ping.return_value = False
+    with pytest.raises(ValkeyUnavailableError):
+        foundation.readiness()
+    foundation._client.role.assert_not_called()
+
+
+def test_failure_rendering_traceback_and_logs_are_redacted(caplog):
+    secrets = ("host.internal", "user", "password", "/secret/ca", "raw:key", "reply")
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=0)
+
+    def fail():
+        raise redis.ConnectionError(" ".join(secrets))
+
+    with caplog.at_level(logging.DEBUG):
+        try:
+            foundation._call(fail)
+        except ValkeyUnavailableError as error:
+            rendered = (
+                repr(error)
+                + str(error)
+                + "".join(traceback.format_exception(error))
+                + caplog.text
+            )
+    assert all(secret not in rendered for secret in secrets)
+
+
+@pytest.mark.parametrize(
+    ("family", "components", "suffix"),
+    [
+        *(
+            (family, (), family)
+            for family in (
+                "schema",
+                "nodes:lease",
+                "cursor",
+                "reservations:expiry",
+                "requests:deadline",
+                "claims:expiry",
+                "responses:expiry",
+                "control:expiry",
+                "node_tombstones:expiry",
+                "terminals:expiry",
+            )
+        ),
+        *(
+            (family, ("a" * 64,), f"{family}:{'a' * 64}")
+            for family in ("node", "reservation", "queue", "node_tombstone")
+        ),
+        *(
+            (family, ("a" * 64, "b" * 64), f"{family}:{'a' * 64}:{'b' * 64}")
+            for family in ("request", "claim", "response", "progress", "terminal")
+        ),
+        (
+            "control",
+            ("a" * 64, "b" * 64, "c" * 64),
+            f"control:{'a' * 64}:{'b' * 64}:{'c' * 64}",
+        ),
+        (
+            "ratelimit",
+            ("public-api", "d" * 64, 123),
+            f"ratelimit:public-api:{'d' * 64}:123",
+        ),
+    ],
+)
+def test_complete_adr_key_families_have_exact_layout(family, components, suffix):
+    cfg = config(environment="staging", cluster="relay-a", schema_major=4)
+    assert cfg.key(family, *components) == (
+        "tokenplace:{staging:relay-a}:relay:v4:" + suffix
+    )
+
+
+@pytest.mark.parametrize(
+    ("family", "components"),
+    [
+        ("unknown", ()),
+        (None, ()),
+        ("lease", ("a" * 64,)),
+        ("worker", ("a" * 64,)),
+        ("schema", ("a" * 64,)),
+        ("request", ("a" * 64,)),
+        ("request", ("a" * 64, "b" * 64, "c" * 64)),
+        ("request", ("raw-client", "b" * 64)),
+        ("request", ("A" * 64, "b" * 64)),
+        ("request", ("{" + "a" * 63, "b" * 64)),
+        ("request", (123, "b" * 64)),
+        ("ratelimit", ("public:api", "d" * 64, 1)),
+        ("ratelimit", ("public api", "d" * 64, 1)),
+        ("ratelimit", ("{public}", "d" * 64, 1)),
+        ("ratelimit", ("public", "raw-identity", 1)),
+        ("ratelimit", ("public", "d" * 64, True)),
+        ("ratelimit", ("public", "d" * 64, -1)),
+        ("ratelimit", ("public", "d" * 64, 2**63)),
+        ("ratelimit", ("public", "d" * 64, "01")),
+    ],
+)
+def test_key_builder_rejects_invalid_family_components_and_extra_hash_tags(
+    family, components
+):
+    with pytest.raises(ValkeyConfigurationError, match="invalid key suffix"):
+        config().key(family, *components)
+
+
+@pytest.mark.parametrize(
+    "changes", [{"tls": 1}, {"username": ""}, {"password": 42}, {"tls_ca_cert": " "}]
+)
+def test_authentication_and_tls_types_are_strict(changes):
+    with pytest.raises(ValkeyConfigurationError):
+        config(**changes)
+    with pytest.raises(ValkeyConfigurationError):
+        SentinelPrimary((("host", 26379),), "relay-primary", "")
+
+
+def test_manifest_construction_bounds_scripts_and_encoded_bytes():
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        manifest(script_digests={f"s{i}": "a" * 64 for i in range(65)})
+    with patch("valkey_relay_state._MAX_RESULT_BYTES", 10):
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            manifest().encode()
+
+
+@pytest.mark.parametrize(
+    "constructor",
+    [
+        lambda: DirectPrimary("bad host"),
+        lambda: DirectPrimary("host", True),
+        lambda: SentinelPrimary((("host", 26379),), "bad service"),
+        lambda: config(environment="bad namespace"),
+        lambda: config(schema_major=True),
+        lambda: config(supported_schema_read_min=3, supported_schema_read_max=2),
+        lambda: config(tls=True, tls_client_cert="client.pem"),
+        lambda: manifest(schema_major=True),
+        lambda: manifest(reader_min=3, reader_max=2),
+        lambda: manifest(migration_epoch=True),
+        lambda: manifest(script_digests={"bad name": "a" * 64}),
+    ],
+)
+def test_invalid_configuration_and_manifest_branches_are_covered(constructor):
+    with pytest.raises((ValkeyConfigurationError, ValkeySchemaIncompatibleError)):
+        constructor()
+
+
+@pytest.mark.parametrize("raw", ["not-bytes", b"[]", b"not-json"])
+def test_manifest_decoder_rejects_invalid_encodings(raw):
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        SchemaManifest.decode(raw)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [None, True, 123, b"x" * 65_537, [[[[[[[[[b"too-deep"]]]]]]]]]],
+)
+def test_script_result_decoder_covers_scalar_and_bound_branches(result):
+    if result in (None, True, 123):
+        valkey_relay_state._validate_script_result(result)
+    else:
+        with pytest.raises(ValkeyScriptError):
+            valkey_relay_state._validate_script_result(result)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_error"),
+    [
+        (redis.ResponseError("READONLY private reply"), ValkeyReadOnlyError),
+        (redis.ResponseError("private reply"), ValkeyUnavailableError),
+    ],
+)
+def test_response_errors_are_classified_without_details(error, expected_error):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=0)
+    with pytest.raises(expected_error) as caught:
+        foundation._call(Mock(side_effect=error))
+    assert "private reply" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+def test_missing_manifest_results_are_typed():
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    foundation.config = config(retry_attempts=0)
+    foundation.expected_manifest = manifest()
+    foundation._client = Mock()
+    foundation._client.get.return_value = None
+
+    with pytest.raises(ValkeyUnavailableError):
+        foundation.initialize_manifest()
+    with pytest.raises(ValkeySchemaIncompatibleError):
+        foundation.read_manifest()
+
+
+@pytest.mark.parametrize("result", [[b"invalid"], [-1, 0], [0, 1_000_000]])
+def test_server_time_rejects_malformed_and_out_of_range_results(result):
+    foundation = ValkeyFoundation.__new__(ValkeyFoundation)
+    with patch.object(foundation, "execute", return_value=result):
+        with pytest.raises(ValkeyScriptError, match="invalid reviewed script result"):
+            foundation.server_time()
+
+
+def test_registration_deadline_failure_is_typed_before_record_decoding():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = [b"deadline"]
+    store = registration_store_with_foundation(foundation)
+    store._config = RelayStateStoreConfig(
+        namespace="testing.unit",
+        lease_ttl_seconds=float.fromhex("0x1.fffffffffffffp+1023"),
+    )
+
+    with pytest.raises(
+        RelayStateStoreError, match="^registration deadline must be finite$"
+    ):
+        store._transition(
+            "register", "node-a", "a" * 64, (b"node-a", *(b"" for _ in range(8)))
+        )
+
+    assert foundation.execute.call_args.args[2][4] == b"1.7976931348623157e+308"
+
+
+@pytest.mark.parametrize(
+    "result",
+    [None, [], [b"\xff"], [1]],
+)
+def test_scheduler_result_status_rejects_malformed_values(result):
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        ValkeyRegistrationStore._ascii_status(result)
+
+
+@pytest.mark.parametrize("value", ["text", b"x" * 65_537, b"\xff"])
+def test_scheduler_text_decoder_rejects_unbounded_or_invalid_values(value):
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        ValkeyRegistrationStore._decode_text(value)
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (("", "request"), "request identity is invalid"),
+        (("client", "x" * 8_193), "request identity is invalid"),
+    ],
+)
+def test_scheduler_identity_validation_is_typed(args, message):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    with pytest.raises(RelayStateStoreError, match=message):
+        store._identity(*args)
+
+
+@pytest.mark.parametrize(
+    ("model", "tier", "deadline", "message"),
+    [
+        ("", "8k-fast", 10, "requested model is invalid"),
+        ("model", "unknown", 10, "requested context tier is invalid"),
+        ("model", "8k-fast", math.inf, "request deadline must be finite"),
+    ],
+)
+def test_scheduler_request_validation_is_typed(model, tier, deadline, message):
+    store = registration_store_with_foundation(Mock(spec=ValkeyFoundation))
+    with pytest.raises(RelayStateStoreError, match=message):
+        store._model_tier_deadline(model, tier, deadline)
+
+
+@pytest.mark.parametrize("token", [None, "", "x" * 1_025])
+def test_scheduler_cancellation_proof_validation_is_typed(token):
+    store = registration_store_with_foundation(Mock(spec=ValkeyFoundation))
+    with pytest.raises(RelayStateStoreError, match="cancellation proof is invalid"):
+        store._cancellation_digest(token)
+
+
+def test_consumer_identity_uses_its_specific_byte_bound():
+    foundation = Mock(spec=ValkeyFoundation)
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(
+        store.config, max_identity_bytes=8, max_consumer_identity_bytes=4
+    )
+
+    with pytest.raises(RelayStateStoreError, match="consumer identity is invalid"):
+        store._consumer_digest("12345")
+
+
+def test_claimed_request_validates_identity_before_reading_state():
+    foundation = Mock(spec=ValkeyFoundation)
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(store.config, max_identity_bytes=4)
+
+    with pytest.raises(RelayStateStoreError, match="request identity is invalid"):
+        store.claimed_request("node-a", "12345")
+    foundation.read_manifest.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ([b"owner"], RelayStateCredentialMismatch),
+        ([b"capacity"], RelayStateCapacityExceeded),
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"claimed"], ValkeySchemaIncompatibleError),
+        (
+            [b"claimed", b"0", b"9", b"10", b"client", b"request", b"{}"],
+            ValkeySchemaIncompatibleError,
+        ),
+        (
+            [
+                b"claimed",
+                b"1",
+                b"11",
+                b"10",
+                b"client",
+                b"request",
+                b"{}",
+            ],
+            ValkeySchemaIncompatibleError,
+        ),
+        (
+            [
+                b"claimed",
+                b"1",
+                b"9",
+                b"10",
+                b"",
+                b"request",
+                b"{}",
+            ],
+            ValkeySchemaIncompatibleError,
+        ),
+    ],
+)
+def test_claim_translates_malformed_and_fixed_script_results(result, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(expected):
+        store.claim_queued_request("node-a", "a" * 64, "consumer")
+
+
+def test_claim_empty_and_valid_results_are_decoded():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    foundation.execute.return_value = [b"empty"]
+    assert store.claim_queued_request("node-a", "a" * 64, "consumer").state == "empty"
+
+    envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "ciphertext": "ciphertext",
+        "cipherkey": "cipherkey",
+        "iv": "iv",
+    }
+    foundation.execute.return_value = [
+        b"reclaimed",
+        b"2",
+        b"9",
+        b"10",
+        b"client",
+        b"request",
+        json.dumps(envelope).encode(),
+    ]
+    result = store.claim_queued_request("node-a", "a" * 64, "consumer")
+    assert (result.state, result.generation, result.client_public_key) == (
+        "reclaimed",
+        2,
+        "client",
+    )
+
+
+@pytest.mark.parametrize("raw", ["not-bytes", b"[]", b"{}", b"not-json"])
+def test_claim_envelope_decoder_rejects_malformed_values(raw):
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        ValkeyRegistrationStore._decode_request_envelope(raw)
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_status"),
+    [
+        ([b"missing_or_expired"], "missing_or_expired"),
+        ([b"owner_mismatch"], "owner_mismatch"),
+        ([b"stale_generation", b"2"], "stale_generation"),
+        ([b"continued", b"2", b"9.5"], "continued"),
+    ],
+)
+def test_renew_claim_decodes_each_fixed_result(result, expected_status):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    renewal = store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 2)
+    assert renewal.state == expected_status
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        [b"schema"],
+        [b"stale_generation", b"0"],
+        [b"continued", b"0", b"9"],
+        [b"continued", b"1", b"nan"],
+        [b"unknown"],
+    ],
+)
+def test_renew_claim_rejects_malformed_script_results(result):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 1)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        [b"cancelled", b"1", b"wrong", b"0"],
+        [b"cancelled", b"01", b"requester_cancelled", b"0"],
+        [b"cancelled", b"2", b"requester_cancelled", b"0"],
+        [b"cancelled", b"1", b"requester_cancelled", b"1"],
+        [b"expired", b"1", b"request_deadline_expired", b"2"],
+        [b"acknowledged", b"1", b"requester_cancelled", b"0"],
+        [b"acknowledged", b"1", b"arbitrary", b"1"],
+        [b"expired", b"1", b"request_deadline_expired", b"0", b"extra"],
+    ],
+)
+def test_control_result_decoder_rejects_noncanonical_fixed_shapes(result):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.renew_claim_or_read_control(
+            "node-a", "a" * 64, "consumer", "client", "request", 1
+        )
+
+
+def test_claim_input_and_acknowledgement_validation_precede_dispatch():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(RelayStateStoreError, match="consumer identity"):
+        store.claim_queued_request("node-a", "a" * 64, "")
+    with pytest.raises(RelayStateStoreError, match="request id is required"):
+        store.claimed_request("node-a", "")
+    with pytest.raises(RelayStateStoreError, match="claim generation"):
+        store.renew_claim("node-a", "a" * 64, "consumer", "client", "request", 0)
+    foundation.execute.return_value = [b"owner_mismatch"]
+    assert store.renew_claim_or_read_control(
+        "node-a", "a" * 64, "consumer", "client", "request", 1,
+        acknowledge=True,
+    ).state == "owner_mismatch"
+    foundation.execute.assert_called_once()
+
+
+def test_renew_or_read_control_delegates_when_not_acknowledging():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = [b"missing_or_expired"]
+    store = registration_store_with_foundation(foundation)
+
+    result = store.renew_claim_or_read_control(
+        "node-a", "a" * 64, "consumer", "client", "request", 1
+    )
+    assert result.state == "missing_or_expired"
+
+
+def test_renew_or_read_control_terminalizes_and_decodes_deadline_control():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.side_effect = [
+        [b"deadline_due"],
+        [b"expired", b"1", b"request_deadline_expired", b"0"],
+    ]
+    store = registration_store_with_foundation(foundation)
+    terminal = Mock(state="expired")
+
+    with patch.object(store, "cancel_or_expire_request", return_value=terminal) as expire:
+        result = store.renew_claim_or_read_control(
+            "node-a", "a" * 64, "consumer", "client", "request", 1
+        )
+
+    assert result.state == "expired"
+    assert result.generation == 1
+    assert result.reason == "request_deadline_expired"
+    assert result.acknowledged is False
+    expire.assert_called_once_with(
+        "client",
+        "request",
+        status="expired",
+        reason="request_deadline_expired",
+    )
+    assert foundation.execute.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected_state", "expected_created"),
+    [
+        ([b"invalid_cancellation_proof"], "invalid_cancellation_proof", False),
+        ([b"not_expired", b"request_deadline_active"], "not_expired", False),
+        ([b"created", b"cancelled", b"requester_cancelled"], "cancelled", True),
+        ([b"existing", b"expired", b"request_deadline_expired"], "expired", False),
+    ],
+)
+def test_cancel_or_expire_request_decodes_fixed_results(
+    reply, expected_state, expected_created
+):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.return_value = b"b" * 64
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+
+    result = store.cancel_or_expire_request("client", "request", "cancel-token")
+
+    assert result.state == expected_state
+    assert result.new_outcome is expected_created
+
+
+def test_cancel_or_expire_request_ignores_malformed_stored_node_digest():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.return_value = b"not-a-digest"
+    foundation.execute.return_value = [
+        b"existing",
+        b"expired",
+        b"request_deadline_expired",
+    ]
+    store = registration_store_with_foundation(foundation)
+
+    result = store.cancel_or_expire_request(
+        "client", "request", status="expired", reason="request_deadline_expired"
+    )
+
+    assert result.state == "expired"
+    keys = foundation.execute.call_args.args[1]
+    assert keys[2] == foundation.config.key("queue", "0" * 64)
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"terminal_capacity"], RelayStateCapacityExceeded),
+        ([b"control_capacity"], RelayStateCapacityExceeded),
+        ([b"unknown"], ValkeySchemaIncompatibleError),
+    ],
+)
+def test_cancel_or_expire_request_rejects_fixed_failures(reply, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation._call.return_value = None
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(expected):
+        store.cancel_or_expire_request("client", "request", "cancel-token")
+
+
+def test_cancel_or_expire_request_rejects_invalid_status_and_proof_locally():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(RelayStateStoreError, match="terminal status or reason"):
+        store.cancel_or_expire_request("client", "request", status="completed")
+    result = store.cancel_or_expire_request("", "request", "secret")
+    assert result.state == "invalid_cancellation_proof"
+    foundation.execute.assert_not_called()
+
+
+def test_control_tombstones_rejects_oversized_index_results():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation.server_time.return_value = (1, 0)
+    foundation._call.return_value = [(b"member", 1.0), (b"member-2", 2.0)]
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(store._config, max_control_tombstones=1)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.control_tombstones()
+
+
+def test_control_tombstones_rejects_malformed_index_member():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation.server_time.return_value = (1, 0)
+    foundation._call.return_value = [(b"member",)]
+    store = registration_store_with_foundation(foundation)
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.control_tombstones()
+
+
+def test_live_claims_tolerates_a_removed_registration_after_read_gate():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation._client = Mock()
+    foundation.server_time.return_value = (1, 0)
+    foundation._call.return_value = [None, None, None]
+    store = registration_store_with_foundation(foundation)
+
+    assert store.active_claims("node-a") == ()
+    foundation.check_read_compatible.assert_called_once_with(
+        foundation.read_manifest.return_value
+    )
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ([b"credential_mismatch"], RelayStateCredentialMismatch),
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"ok", b"extra"], ValkeySchemaIncompatibleError),
+    ],
+)
+def test_scheduler_state_translates_fixed_script_results(result, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+    with pytest.raises(expected):
+        store.set_scheduler_state("node-a", "a" * 64, SchedulerNodeState())
+
+
+def test_scheduler_state_rejects_wrong_state_type_before_dispatch():
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    with pytest.raises(RelayStateStoreError, match="scheduler state"):
+        store.set_scheduler_state("node-a", "a" * 64, object())
+    foundation.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ([b"invalid"], RelayStateInvalidReservation),
+        ([b"conflict"], RelayStateConflict),
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"created"], ValkeySchemaIncompatibleError),
+    ],
+)
+def test_enqueue_translates_fixed_script_results(result, expected):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = result
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+    with pytest.raises(expected):
+        store.enqueue_encrypted_request(
+            "client",
+            "request",
+            "a" * 64,
+            "node-a",
+            "model",
+            "8k-fast",
+            10,
+            envelope,
+            "cancel",
+        )
+
+
+@pytest.mark.parametrize("operation", ["select", "enqueue"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        [b"deadline_due"],
+        [b"deadline_due", b"not-a-digest", b"b" * 64],
+    ],
+)
+def test_deadline_cleanup_bridge_rejects_malformed_digest_results(operation, reply):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        if operation == "select":
+            store.select_and_reserve("client", "request", "model", "8k-fast", 10)
+        else:
+            store.enqueue_encrypted_request(
+                "client", "request", "a" * 64, "node-a", "model", "8k-fast", 10,
+                envelope, "cancel",
+            )
+
+
+@pytest.mark.parametrize("operation", ["select", "enqueue"])
+def test_deadline_cleanup_bridge_bounds_capacity_deferred_retries(operation):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = [b"deadline_due", b"a" * 64, b"b" * 64]
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(store.config, node_transition_batch_size=1)
+    envelope = EncryptedRequestEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+    )
+
+    with (
+        patch.object(
+            store,
+            "_cancel_or_expire_digests",
+            side_effect=RelayStateCapacityExceeded("retained terminal capacity exceeded"),
+        ),
+        pytest.raises(RelayStateNoCapacity, match="temporarily deferred"),
+    ):
+        if operation == "select":
+            store.select_and_reserve("client", "request", "model", "8k-fast", 10)
+        else:
+            store.enqueue_encrypted_request(
+                "client", "request", "a" * 64, "node-a", "model", "8k-fast", 10,
+                envelope, "cancel",
+            )
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    (
+        ([b"owner"], RelayStateCredentialMismatch),
+        ([b"missing"], RelayStateConflict),
+        ([b"stale", b"2"], RelayStateConflict),
+        ([b"conflict"], RelayStateConflict),
+        ([b"malformed"], RelayStateConflict),
+        ([b"capacity"], RelayStateCapacityExceeded),
+        ([b"schema"], ValkeySchemaIncompatibleError),
+        ([b"malformed", b"extra"], ValkeySchemaIncompatibleError),
+        ([b"stale"], ValkeySchemaIncompatibleError),
+        ([b"stale", b"01"], ValkeySchemaIncompatibleError),
+        ([b"accepted", b"1", b"nan", b"2"], ValkeySchemaIncompatibleError),
+        ([b"existing", b"1", b"-1", b"2"], ValkeySchemaIncompatibleError),
+        ([b"existing", b"1", b"2", b"1"], ValkeySchemaIncompatibleError),
+    ),
+)
+def test_accept_response_decodes_only_fixed_bounded_results(reply, error):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.server_time.return_value = (1, 0)
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+
+    with pytest.raises(error):
+        store.accept_encrypted_response(
+            "node", "a" * 64, "consumer", "client", "request", 1, envelope
+        )
+
+
+@pytest.mark.parametrize(("status", "new_outcome"), ((b"accepted", True), (b"existing", False)))
+def test_accept_response_decodes_fixed_success_results(status, new_outcome):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.server_time.return_value = (1, 0)
+    foundation.execute.return_value = [status, b"1", b"1.0", b"2.0"]
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "key", "iv"
+    )
+
+    result = store.accept_encrypted_response(
+        "node", "a" * 64, "consumer", "client", "request", 1, envelope
+    )
+
+    assert result.new_outcome is new_outcome
+    assert (result.generation, result.accepted_at_epoch, result.replay_expires_at_epoch) == (
+        1,
+        1.0,
+        2.0,
+    )

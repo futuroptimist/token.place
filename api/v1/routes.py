@@ -48,6 +48,7 @@ from api.v1.compute_provider import (
     reset_api_v1_generate_response_override,
     set_api_v1_generate_response_override,
     ComputeProviderError,
+    coerce_completion_result,
 )
 from api.v1.validation import (
     ValidationError, validate_required_fields, validate_field_type,
@@ -519,12 +520,13 @@ def _handle_chat_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = _call_provider_complete_chat(
+        completion_result = coerce_completion_result(_call_provider_complete_chat(
             provider,
             model_id=model_id,
             messages=messages,
             options=_extract_chat_completion_options(data),
-        )
+        ))
+        assistant_message = completion_result.message
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
 
@@ -538,14 +540,27 @@ def _handle_chat_completion_request(data):
         if tool_calls:
             message_payload["tool_calls"] = tool_calls
 
-        finish_reason = "tool_calls" if tool_calls else "stop"
+        finish_reason = completion_result.finish_reason or (
+            "tool_calls" if tool_calls else "stop"
+        )
 
         completion_segments = [_extract_message_content_for_usage(assistant_message)]
         if tool_calls:
             completion_segments.append(json.dumps(tool_calls, ensure_ascii=False))
 
-        prompt_tokens = sum(_estimate_token_length(text) for text in prompt_contents_for_usage)
-        completion_tokens = _estimate_token_length("\n".join(filter(None, completion_segments)))
+        authoritative_usage = completion_result.usage
+        if authoritative_usage and all(
+            isinstance(authoritative_usage.get(key), int)
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        ):
+            prompt_tokens = authoritative_usage["prompt_tokens"]
+            completion_tokens = authoritative_usage["completion_tokens"]
+            total_tokens = authoritative_usage["total_tokens"]
+        else:
+            # Compatibility estimator for legacy message-only providers.
+            prompt_tokens = sum(_estimate_token_length(text) for text in prompt_contents_for_usage)
+            completion_tokens = _estimate_token_length("\n".join(filter(None, completion_segments)))
+            total_tokens = prompt_tokens + completion_tokens
 
         response_data = {
             "id": f"chatcmpl-{uuid.uuid4()}",
@@ -562,7 +577,7 @@ def _handle_chat_completion_request(data):
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
+                "total_tokens": total_tokens,
             },
         }
 
@@ -722,14 +737,40 @@ def _handle_text_completion_request(data):
                     code="model_not_supported",
                     status_code=400,
                 )
-        assistant_message = _call_provider_complete_chat(
+        completion_result = coerce_completion_result(_call_provider_complete_chat(
             provider,
             model_id=model_id,
             messages=messages,
             options=_extract_chat_completion_options(data),
-        )
+        ))
+        assistant_message = completion_result.message
         execution_backend_path = get_api_v1_last_backend_path()
         log_info("Response generated successfully")
+
+        finish_reason = completion_result.finish_reason or "stop"
+        authoritative_usage = completion_result.usage
+        if authoritative_usage and all(
+            isinstance(authoritative_usage.get(key), int)
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        ):
+            usage = {
+                "prompt_tokens": authoritative_usage["prompt_tokens"],
+                "completion_tokens": authoritative_usage["completion_tokens"],
+                "total_tokens": authoritative_usage["total_tokens"],
+            }
+        else:
+            # Compatibility estimator for legacy message-only providers.
+            prompt_tokens = _estimate_token_length(
+                _extract_message_content_for_usage(messages[0])
+            )
+            completion_tokens = _estimate_token_length(
+                _extract_message_content_for_usage(assistant_message)
+            )
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
 
         response_data = {
             "id": f"cmpl-{uuid.uuid4().hex[:12]}",
@@ -740,14 +781,10 @@ def _handle_text_completion_request(data):
                 {
                     "index": 0,
                     "text": assistant_message.get("content", ""),
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
+            "usage": usage,
         }
 
         if is_encrypted_request and client_public_key:

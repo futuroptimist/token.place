@@ -23,7 +23,11 @@ def mock_server_responses():
         next_server_response = MagicMock()
         next_server_response.status_code = 200
         next_server_response.json.return_value = {
-            'server_public_key': base64.b64encode(b'mock_server_public_key').decode('utf-8')
+            'server_public_key': base64.b64encode(b'mock_server_public_key').decode('utf-8'),
+            'reservation_token': 'mock-reservation-token',
+            'requested_model': 'qwen3-8b-instruct',
+            'requested_context_tier': '8k-fast',
+            'request_deadline_epoch': 9999999999.0,
         }
 
         # Mock API v1 relay request endpoint
@@ -31,7 +35,8 @@ def mock_server_responses():
         faucet_response.status_code = 200
         faucet_response.json.return_value = {
             'success': True,
-            'message': 'Request received'
+            'message': 'Request received',
+            'retrieval_credential': 'mock-retrieval-credential',
         }
 
         # Mock API v1 relay response retrieval endpoint

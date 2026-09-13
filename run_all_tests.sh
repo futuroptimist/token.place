@@ -183,6 +183,10 @@ fi
 # 3. Run API tests
 run_test "API Tests" "$PYTHON_CMD -m pytest tests/test_api.py -v $COVERAGE_ARGS" "Testing API functionality and compatibility"
 
+# 3a. Run relay API v1 lifecycle tests (registration, queueing, polling,
+# progress, cancellation, control, and eviction contracts).
+run_test "Relay API v1 Lifecycle Tests" "$PYTHON_CMD -m pytest tests/test_relay.py -v $COVERAGE_ARGS" "Testing the relay's API v1 registration/queue/lifecycle contract"
+
 # 3b. Run security audits (Bandit)
 run_test "Security Audit (Bandit)" "$PYTHON_CMD -m pytest tests/test_security_bandit.py -v $COVERAGE_ARGS" "Scanning the codebase for medium/high Bandit findings"
 
@@ -207,6 +211,12 @@ if [ "${RUN_E2E:-0}" = "1" ]; then
 else
     echo "Skipping End-to-End Tests (set RUN_E2E=1 to enable)"
 fi
+
+# 8a. Always-on relay landing-page Markdown regression
+run_test \
+    "Relay Landing Page Markdown Rendering" \
+    "$PYTHON_CMD -m pytest -q tests/e2e/test_ui.py::test_markdown_rendering_stream_updates -x $COVERAGE_ARGS" \
+    "Verifying user and assistant fenced Markdown renders as safe code blocks"
 
 # 8b. Relay landing-page real desktop-bridge API v1 guardrail (requires local GGUF model path)
 if [ -n "${TOKENPLACE_REAL_E2E_MODEL_PATH:-}" ] && [ -f "${TOKENPLACE_REAL_E2E_MODEL_PATH}" ] && llama_cpp_runtime_available; then

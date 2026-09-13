@@ -76,6 +76,14 @@ def route_landing_relay_chat(
     retrieve_statuses: list[int] | None = None,
     diagnostics_count: int | None = None,
     diagnostics_counts: list[int] | None = None,
+    admission_payload: dict | None = None,
+    pending_payload: dict | None = None,
+    pending_payloads: list[dict] | None = None,
+    final_encrypted_response: dict | None = None,
+    retrieve_error_payload: dict | None = None,
+    cancel_status: int = 200,
+    cancel_payload: dict | None = None,
+    cancel_network_failure: bool = False,
 ):
     """Mock the direct API v1 relay routes used by the landing chat."""
     state = {
@@ -162,7 +170,7 @@ def route_landing_relay_chat(
         status = 200
         if request_statuses:
             status = request_statuses[min(len(state["relay_requests"]) - 1, len(request_statuses) - 1)]
-        body = {"message": "Request received"} if status == 200 else {"error": {"code": "server_unavailable"}}
+        body = (admission_payload or {"message": "Request received"}) if status == 200 else {"error": {"code": "server_unavailable"}}
         route.fulfill(
             status=status,
             headers={"Content-Type": "application/json"},
@@ -180,10 +188,23 @@ def route_landing_relay_chat(
         if retrieve_statuses:
             status = retrieve_statuses[min(len(state["retrieve_requests"]) - 1, len(retrieve_statuses) - 1)]
         if status != 200:
+            if status == 202:
+                pending_index = len(state["retrieve_requests"]) - 1
+                selected_pending_payload = pending_payload or {"status": "pending"}
+                if pending_payloads:
+                    selected_pending_payload = pending_payloads[
+                        min(pending_index, len(pending_payloads) - 1)
+                    ]
+                route.fulfill(
+                    status=202,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(selected_pending_payload),
+                )
+                return
             route.fulfill(
                 status=status,
                 headers={"Content-Type": "application/json"},
-                body=json.dumps({"error": {"code": "selected_server_terminal"}}),
+                body=json.dumps(retrieve_error_payload or {"error": {"code": "selected_server_terminal"}}),
             )
             return
         retrieve_index = len(state["retrieve_requests"]) - 1
@@ -196,34 +217,42 @@ def route_landing_relay_chat(
                     "content": assistant_content,
                 }
             }
+        response_body = final_encrypted_response or {
+            "chat_history": json.dumps(
+                {
+                    "protocol": "tokenplace_api_v1_relay_e2ee",
+                    "version": 1,
+                    "request_id": request_id,
+                    "client_public_key": client_public_key,
+                    "api_v1_response": api_v1_response,
+                }
+            ),
+            "cipherkey": "test-cipherkey",
+            "iv": "test-iv",
+        }
         route.fulfill(
             status=200,
             headers={"Content-Type": "application/json"},
-            body=json.dumps(
-                {
-                    "chat_history": json.dumps(
-                        {
-                            "protocol": "tokenplace_api_v1_relay_e2ee",
-                            "version": 1,
-                            "request_id": request_id,
-                            "client_public_key": client_public_key,
-                            "api_v1_response": api_v1_response,
-                        }
-                    ),
-                    "cipherkey": "test-cipherkey",
-                    "iv": "test-iv",
-                }
-            ),
+            body=json.dumps(response_body),
         )
 
     page.route("**/api/v1/relay/responses/retrieve", handle_retrieve)
-    page.route(
-        "**/api/v1/relay/requests/cancel",
-        lambda route: (
-            state["cancel_requests"].append(route.request.post_data_json),
-            route.fulfill(status=200, headers={"Content-Type": "application/json"}, body=json.dumps({"status": "cancelled"})),
-        ),
-    )
+    def handle_cancel(route):
+        request_payload = route.request.post_data_json
+        state["cancel_requests"].append(request_payload)
+        if cancel_network_failure:
+            route.abort("connectionfailed")
+        else:
+            route.fulfill(
+                status=cancel_status,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(cancel_payload or {
+                    "status": "cancelled",
+                    "request_id": request_payload["request_id"],
+                }),
+            )
+
+    page.route("**/api/v1/relay/requests/cancel", handle_cancel)
     page.route(
         "**/api/v1/chat/completions",
         lambda route: (
@@ -298,15 +327,16 @@ def measure_landing_chat_layout(page: Page):
         () => {
             const chat = document.querySelector('.chat-container');
             const select = document.querySelector('[data-testid=landing-model-select]');
+            const contextTierSelect = document.querySelector('[data-testid=landing-context-tier-select]');
             const textarea = document.querySelector('textarea.message-input');
-            if (!chat || !select || !textarea) {
+            if (!chat || !select || !contextTierSelect || !textarea) {
                 throw new Error('missing landing chat layout node');
             }
             const chatRect = chat.getBoundingClientRect();
-            const selectRect = select.getBoundingClientRect();
+            const contextTierSelectRect = contextTierSelect.getBoundingClientRect();
             const textareaRect = textarea.getBoundingClientRect();
             return {
-                modelToTextareaGap: textareaRect.top - selectRect.bottom,
+                contextTierToTextareaGap: textareaRect.top - contextTierSelectRect.bottom,
                 chatHeight: chatRect.height,
                 textareaTopRelativeToChat: textareaRect.top - chatRect.top,
             };
@@ -361,7 +391,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     expect(textarea).to_be_visible()
     assert message_nodes.count() == 0
     first_paint_layout = measure_landing_chat_layout(page)
-    assert 20 <= first_paint_layout["modelToTextareaGap"] <= 70
+    assert 20 <= first_paint_layout["contextTierToTextareaGap"] <= 70
     expect(send_button).to_be_visible()
     expect(send_button).to_be_disabled()
     expect(page.get_by_test_id("landing-model-select")).to_be_visible()
@@ -398,7 +428,7 @@ def test_landing_first_paint_hides_vue_variables_when_chat_js_is_delayed(
     )
     page.wait_for_load_state("networkidle")
     hydrated_layout = measure_landing_chat_layout(page)
-    assert abs(hydrated_layout["modelToTextareaGap"] - first_paint_layout["modelToTextareaGap"]) <= 4
+    assert abs(hydrated_layout["contextTierToTextareaGap"] - first_paint_layout["contextTierToTextareaGap"]) <= 4
     assert abs(hydrated_layout["textareaTopRelativeToChat"] - first_paint_layout["textareaTopRelativeToChat"]) <= 4
     assert abs(hydrated_layout["chatHeight"] - first_paint_layout["chatHeight"]) <= 4
     assert page.get_by_test_id("landing-model-select").input_value() == "llama-3.1-8b-instruct"
@@ -1053,10 +1083,538 @@ def wait_for_landing_send_enabled(page: Page):
     return send_button
 
 
-def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
-    """The chat UI should render markdown formatting returned by the assistant."""
+def encrypted_landing_progress(
+    page: Page,
+    *,
+    request_id: str,
+    client_public_key: str,
+    sequence: int = 1,
+    phase: str = "preparing",
+    inner_request_id: str | None = None,
+    inner_client_public_key: str | None = None,
+):
+    """Encrypt progress while allowing outer and decrypted identities to differ."""
+    envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": inner_request_id or request_id,
+        "client_public_key": inner_client_public_key or client_public_key,
+        "api_v1_progress": {
+            "schema_version": 1,
+            "sequence": sequence,
+            "phase": phase,
+            "total_prompt_tokens": 0,
+            "cached_prompt_tokens": 0,
+            "processed_prompt_tokens": 0,
+            "generated_tokens": 0,
+            "elapsed_ms": sequence * 100,
+        },
+    }
+    encrypted = page.evaluate(
+        """async plaintext => {
+            const vm = document.querySelector('#app').__vue__;
+            return vm.encrypt(plaintext, vm.clientPublicKey);
+        }""",
+        json.dumps(envelope),
+    )
+    return {
+        "client_public_key": client_public_key,
+        "request_id": request_id,
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        **encrypted,
+    }
 
-    markdown_reply = "**Bold** introduction\n\n- First item\n- Second item\n\nHere is `inline` code and:\n```\nblock example\n```"
+
+def assert_landing_progress_cleared(page: Page, *, assert_panel_hidden: bool = True):
+    if assert_panel_hidden:
+        expect(page.get_by_test_id("landing-inference-progress")).to_be_hidden()
+    state = page.evaluate(
+        """() => {
+            const vm = window.__progressLifecycleVm || document.querySelector('#app').__vue__;
+            return {
+                relayProgress: vm.relayProgress,
+                relayProgressAnnouncement: vm.relayProgressAnnouncement,
+                chatHistory: vm.chatHistory,
+                messages: vm.createApiV1Messages('subsequent request')
+            };
+        }"""
+    )
+    assert state["relayProgress"] is None
+    assert state["relayProgressAnnouncement"] == ""
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in state["chatHistory"])
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in state["messages"])
+
+
+def assert_cancel_payload_is_routing_metadata_only(payload: dict):
+    assert set(payload) == {
+        "client_public_key", "request_id", "cancel_token", "status", "reason"
+    }
+    assert payload["client_public_key"]
+    assert payload["request_id"]
+    assert payload["cancel_token"]
+    assert payload["status"] == "cancelled"
+    forbidden = {"messages", "prompt", "response", "chat_history", "ciphertext", "cipherkey", "iv"}
+    assert forbidden.isdisjoint(payload)
+
+
+@pytest.mark.e2e
+def test_landing_chat_timeout_cancels_relay_request_once(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page, retrieve_statuses=[202])
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+
+    page.locator("textarea").first.fill("wait beyond the deadline")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(486_000)
+    page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+
+    assert len(state["cancel_requests"]) == 1
+    payload = state["cancel_requests"][0]
+    assert_cancel_payload_is_routing_metadata_only(payload)
+    assert payload["reason"] == "client_timeout"
+    assert payload["request_id"] == state["relay_requests"][0]["request_id"]
+    assert payload["cancel_token"] == state["relay_requests"][0]["cancel_token"]
+
+
+@pytest.mark.e2e
+def test_landing_chat_abort_cancels_relay_request_once(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page, retrieve_statuses=[202])
+    page_errors = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.evaluate(
+        """
+        () => {
+            window.__landingUnhandledRejections = [];
+            window.__landingRetrieveCount = 0;
+            const originalFetch = window.fetch;
+            window.fetch = (...args) => {
+                const url = String(args[0]);
+                if (url.includes('/api/v1/relay/responses/retrieve')) {
+                    window.__landingRetrieveCount += 1;
+                }
+                return originalFetch(...args);
+            };
+            window.addEventListener('unhandledrejection', (event) => {
+                window.__landingUnhandledRejections.push(String(event.reason));
+            });
+        }
+        """
+    )
+
+    page.locator("textarea").first.fill("cancel when leaving")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.isGeneratingResponse")
+    page.clock.fast_forward(500)
+    page.wait_for_function("() => window.__landingRetrieveCount > 0")
+    page.evaluate("() => { window.dispatchEvent(new Event('pagehide')); window.dispatchEvent(new Event('pagehide')); }")
+    page.wait_for_function(
+        """() => {
+            const vm = document.querySelector('#app').__vue__;
+            return vm.activeRelayRequest === null && vm.isGeneratingResponse === false;
+        }"""
+    )
+    retrieve_count_after_pagehide = page.evaluate("() => window.__landingRetrieveCount")
+    page.clock.fast_forward(5_000)
+
+    assert len(state["cancel_requests"]) == 1
+    assert page.evaluate("() => window.__landingRetrieveCount") == retrieve_count_after_pagehide
+    payload = state["cancel_requests"][0]
+    assert_cancel_payload_is_routing_metadata_only(payload)
+    assert payload["reason"] == "requester_cancelled"
+    assistant_messages = page.evaluate(
+        "() => document.querySelector('#app').__vue__.chatHistory.filter((entry) => entry.role === 'assistant')"
+    )
+    assert assistant_messages == []
+    assert "cancellation could not be confirmed" not in page.locator("body").inner_text()
+    assert page_errors == []
+    assert page.evaluate("() => window.__landingUnhandledRejections") == []
+
+
+@pytest.mark.e2e
+def test_landing_chat_uses_relay_deadline_metadata(page: Page, base_url: str, setup_servers):
+    route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    deadlines = page.evaluate(
+        """
+        () => {
+            const vm = document.querySelector('#app').__vue__;
+            const admittedAt = 100000;
+            const valid = vm.relayResponseDeadlineFromAdmission({request_ttl_seconds: 480}, admittedAt);
+            const shortened = vm.shortenRelayResponseDeadline(valid, {request_deadline_remaining_seconds: 10}, admittedAt + 1000);
+            const expired = vm.shortenRelayResponseDeadline(valid, {request_deadline_remaining_seconds: 0}, admittedAt + 2000);
+            const notExtended = vm.shortenRelayResponseDeadline(shortened, {request_ttl_seconds: 999}, admittedAt + 2000);
+            const invalid = [true, false, 0, -1, NaN, Infinity, -Infinity, '480', 'bad', null, undefined]
+                .map((value) => vm.relayResponseDeadlineFromAdmission({request_ttl_seconds: value}, admittedAt));
+            const noActiveCancellation = vm.cancelRelayRequest();
+            return Promise.resolve(noActiveCancellation).then((result) => ({valid, shortened, expired, notExtended, invalid, noActiveCancellation: result}));
+        }
+        """
+    )
+
+    # Admission is the time origin: 480 seconds plus propagation grace exactly once.
+    assert deadlines["valid"] == 585000
+    assert deadlines["shortened"] == 116000
+    assert deadlines["expired"] == 107000
+    assert deadlines["notExtended"] == deadlines["shortened"]
+    assert deadlines["invalid"] == [585000] * 11
+    assert deadlines["noActiveCancellation"] == {"attempted": False, "confirmed": False, "failure": None}
+    # A completion after the legacy 300-second budget remains inside this deadline.
+    assert 100000 + 301000 < deadlines["valid"]
+
+
+@pytest.mark.e2e
+def test_landing_chat_pagehide_without_active_request_is_quiet(page: Page, base_url: str, setup_servers):
+    route_landing_relay_chat(page)
+    errors = attach_landing_console_error_collector(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+
+    assert_no_landing_console_regressions(errors)
+    assert page.locator(".assistant-message").count() == 0
+
+
+@pytest.mark.e2e
+def test_landing_chat_response_after_300_seconds_before_admitted_deadline_succeeds(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page, admission_payload={"message": "Request received", "request_ttl_seconds": 480}
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.evaluate(
+        """
+        () => {
+            const originalFetch = window.fetch.bind(window);
+            const startedAt = Date.now();
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : input.url;
+                if (url !== '/api/v1/relay/responses/retrieve') return originalFetch(input, init);
+                if (Date.now() - startedAt <= 300000) {
+                    return Promise.resolve(new Response(JSON.stringify({status: 'pending'}), {status: 202}));
+                }
+                const request = JSON.parse(init.body);
+                return Promise.resolve(new Response(JSON.stringify({
+                    chat_history: JSON.stringify({
+                        protocol: 'tokenplace_api_v1_relay_e2ee', version: 1,
+                        request_id: request.request_id, client_public_key: request.client_public_key,
+                        api_v1_response: {message: {role: 'assistant', content: 'finished after five minutes'}}
+                    }), cipherkey: 'test-cipherkey', iv: 'test-iv'
+                }), {status: 200}));
+            };
+        }
+        """
+    )
+
+    page.locator("textarea").first.fill("take longer than five minutes")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(301_000)
+    page.wait_for_function("() => document.body.textContent.includes('finished after five minutes')")
+
+    assert state["cancel_requests"] == []
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+@pytest.mark.e2e
+def test_landing_chat_malformed_completed_response_cancels_once_and_clears_state(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.evaluate(
+        """
+        () => {
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : input.url;
+                if (url !== '/api/v1/relay/responses/retrieve') return originalFetch(input, init);
+                return Promise.resolve({ok: true, status: 200, json: async () => {
+                    throw new SyntaxError('malformed completed response');
+                }});
+            };
+        }
+        """
+    )
+
+    page.locator("textarea").first.fill("malformed completion")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+    page.wait_for_function("() => document.body.textContent.includes('Sorry, I encountered an issue')")
+
+    assert len(state["cancel_requests"]) == 1
+    assert page.locator("body").inner_text().count("Sorry, I encountered an issue") == 1
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+@pytest.mark.e2e
+def test_landing_chat_pending_deadline_expires_and_successful_cancel_is_quiet(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"message": "Request received", "request_ttl_seconds": 100},
+        retrieve_statuses=[202],
+        pending_payload={"status": "pending", "request_deadline_remaining_seconds": 1},
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("shorten my deadline")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.clock.fast_forward(7_000)
+    page.wait_for_function("() => document.body.textContent.includes('took too long to respond')")
+
+    assert len(state["cancel_requests"]) == 1
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+@pytest.mark.e2e
+def test_landing_chat_tracks_admission_before_response_metadata_body(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.evaluate(
+        """
+        () => {
+            const originalFetch = window.fetch.bind(window);
+            window.admissionBodyResolve = null;
+            window.retrievalsAfterPagehide = 0;
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : input.url;
+                if (url === '/api/v1/relay/requests' && init && init.method === 'POST') {
+                    return Promise.resolve({
+                        ok: true,
+                        json: () => new Promise((resolve) => { window.admissionBodyResolve = resolve; })
+                    });
+                }
+                if (url === '/api/v1/relay/responses/retrieve') {
+                    window.retrievalsAfterPagehide += 1;
+                }
+                return originalFetch(input, init);
+            };
+        }
+        """
+    )
+
+    page.locator("textarea").first.fill("leave while admission metadata stalls")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+    page.evaluate("() => window.admissionBodyResolve({request_ttl_seconds: 480})")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.isGeneratingResponse === false")
+
+    assert len(state["cancel_requests"]) == 1
+    assert state["cancel_requests"][0]["reason"] == "requester_cancelled"
+    assert page.evaluate("() => window.retrievalsAfterPagehide") == 0
+    assert page.locator("body").inner_text().count("Sorry, I encountered an issue") == 0
+
+
+@pytest.mark.e2e
+def test_landing_chat_cancellation_contract_timeout_and_shared_promise(
+    page: Page, base_url: str, setup_servers
+):
+    route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    page.clock.install()
+    handle = page.evaluate_handle(
+        """
+        async () => {
+            const vm = document.querySelector('#app').__vue__;
+            let posts = 0;
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = (url, options) => {
+                if (url !== '/api/v1/relay/requests/cancel') return originalFetch(url, options);
+                posts += 1;
+                return new Promise((_resolve, reject) => {
+                    options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+                });
+            };
+            vm.activeRelayRequest = {
+                clientPublicKey: 'client', requestId: 'request', cancelToken: 'proof',
+                cancelled: false, cancellationAttempted: false,
+                cancellationConfirmed: false, cancellationPromise: null
+            };
+            const first = vm.cancelRelayRequest();
+            const second = vm.cancelRelayRequest();
+            const samePromise = first === second;
+            const values = await Promise.all([first, second]);
+            vm.clearActiveRelayRequest('request');
+            return {posts, samePromise, values, active: vm.activeRelayRequest};
+        }
+        """
+    )
+    page.clock.fast_forward(2_100)
+    result = handle.json_value()
+
+    assert result == {
+        "posts": 1,
+        "samePromise": True,
+        "values": [
+            {"attempted": True, "confirmed": False, "failure": "network_failure"},
+            {"attempted": True, "confirmed": False, "failure": "network_failure"},
+        ],
+        "active": None,
+    }
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "response_payload",
+    [None, {"status": "cancelled"}, {"status": "cancelled", "request_id": "other"}],
+)
+def test_landing_chat_malformed_or_mismatched_cancellation_is_unconfirmed(
+    page: Page, base_url: str, setup_servers, response_payload: dict | None
+):
+    route_landing_relay_chat(page)
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+
+    result = page.evaluate(
+        """
+        async (responsePayload) => {
+            const vm = document.querySelector('#app').__vue__;
+            window.fetch = async () => ({
+                ok: true,
+                json: async () => {
+                    if (responsePayload === null) throw new SyntaxError('missing JSON');
+                    return responsePayload;
+                }
+            });
+            vm.activeRelayRequest = {
+                clientPublicKey: 'client', requestId: 'request', cancelToken: 'proof',
+                cancelled: false, cancellationAttempted: false,
+                cancellationConfirmed: false, cancellationPromise: null
+            };
+            return vm.cancelRelayRequest();
+        }
+        """,
+        response_payload,
+    )
+
+    assert result == {"attempted": True, "confirmed": False, "failure": "unconfirmed_response"}
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("terminal_status", ["cancelled", "expired"])
+def test_landing_chat_terminal_retrieval_confirms_cancellation_without_cancel_request(
+    page: Page, base_url: str, setup_servers, terminal_status: str
+):
+    state = route_landing_relay_chat(
+        page,
+        retrieve_statuses=[410],
+        retrieve_error_payload={
+            "error": {"code": terminal_status, "status": terminal_status, "reason": terminal_status}
+        },
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.locator("textarea").first.fill("terminal relay response")
+    wait_for_landing_send_enabled(page).click()
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest === null")
+
+    assert state["cancel_requests"] == []
+    assert RELAY_CANCELLATION_WARNING not in page.locator("body").inner_text()
+
+
+RELAY_CANCELLATION_WARNING = (
+    "The request stopped waiting locally, but cancellation could not be confirmed. "
+    "Compute may continue briefly."
+)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("cancel_status", [500])
+def test_landing_chat_cancel_http_failure_is_one_coherent_error(
+    page: Page, base_url: str, setup_servers, cancel_status: int
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"request_ttl_seconds": 1},
+        retrieve_statuses=[202],
+        cancel_status=cancel_status,
+        cancel_payload={"error": {"code": "unavailable"}},
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("cancel failure")
+    wait_for_landing_send_enabled(page).click()
+    page.clock.fast_forward(7_000)
+    page.wait_for_function(f"() => document.body.textContent.includes({json.dumps(RELAY_CANCELLATION_WARNING)})")
+
+    body = page.locator("body").inner_text()
+    assert body.count(RELAY_CANCELLATION_WARNING) == 1
+    assert "took too long to respond" in body
+    assert len(state["cancel_requests"]) == 1
+    assert not page.evaluate("() => document.querySelector('#app').__vue__.activeRelayRequest")
+
+
+@pytest.mark.e2e
+def test_landing_chat_cancel_network_failure_is_visible(
+    page: Page, base_url: str, setup_servers
+):
+    state = route_landing_relay_chat(
+        page,
+        admission_payload={"request_ttl_seconds": 1},
+        retrieve_statuses=[202],
+        cancel_network_failure=True,
+    )
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    patch_landing_crypto_for_visible_envelopes(page)
+    page.clock.install()
+    page.locator("textarea").first.fill("network cancellation failure")
+    wait_for_landing_send_enabled(page).click()
+    page.clock.fast_forward(7_000)
+    page.wait_for_function(f"() => document.body.textContent.includes({json.dumps(RELAY_CANCELLATION_WARNING)})")
+
+    assert page.locator("body").inner_text().count(RELAY_CANCELLATION_WARNING) == 1
+    assert len(state["cancel_requests"]) == 1
+
+
+def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_servers):
+    """User and assistant fenced code should remain literal while Markdown renders."""
+
+    markdown_reply = (
+        "**Bold** introduction <script>outside()</script>\n\n"
+        "- First item\n- Second item\n\n"
+        "Here is `inline` code and two blocks:\n"
+        "```python\nfirst_value = **literal**\n```\n"
+        "```\n<script>inside()</script>\n_second_ *literal*\n```"
+    )
     route_landing_relay_chat(page, assistant_content=markdown_reply)
 
     page.goto(base_url)
@@ -1064,7 +1622,7 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     patch_landing_crypto_for_visible_envelopes(page)
 
     textarea = page.locator("textarea").first
-    textarea.fill("Show markdown please")
+    textarea.fill("**User bold** before\n```text\nuser_value = *literal*\n<script>user()</script>\n```\nafter")
     wait_for_landing_send_enabled(page).click()
 
     user_message = page.locator(".user-message").last
@@ -1074,6 +1632,7 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     expect(user_message).not_to_have_attribute("v-cloak", "")
     expect(assistant_message).not_to_have_attribute("v-cloak", "")
 
+    assert user_message.locator("strong").inner_text() == "User bold"
     assert assistant_message.locator("strong").inner_text() == "Bold"
 
     list_items = assistant_message.locator("li")
@@ -1084,10 +1643,23 @@ def test_markdown_rendering_stream_updates(page: Page, base_url: str, setup_serv
     inline_code = assistant_message.locator("code").first
     assert inline_code.inner_text() == "inline"
 
-    block_code = assistant_message.locator("pre code").first
-    assert "block example" in block_code.inner_text()
+    code_blocks = page.locator(".user-message pre code, .assistant-message pre code")
+    assert code_blocks.count() == 3
+    assert code_blocks.all_inner_texts() == [
+        "text\nuser_value = *literal*\n<script>user()</script>",
+        "python\nfirst_value = **literal**",
+        "\n<script>inside()</script>\n_second_ *literal*",
+    ]
+
+    rendered_messages = page.locator(".user-message, .assistant-message")
+    visible_text = rendered_messages.all_inner_texts()
+    rendered_html = rendered_messages.evaluate_all("elements => elements.map(element => element.innerHTML).join('')")
+    for leaked_marker in ("CODEBLOCK0", "CODEBLOCK1", "tokenplacecodeblock"):
+        assert all(leaked_marker not in text for text in visible_text)
+        assert leaked_marker not in rendered_html
 
     # Ensure raw HTML isn't rendered unsanitized
+    assert user_message.locator("script").count() == 0
     assert assistant_message.locator("script").count() == 0
 
 def test_landing_chat_uses_api_v1_only_non_streaming(
@@ -1652,13 +2224,18 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
         ),
     )
     page.route(
-        "**/api/v1/relay/servers/next",
+        "**/api/v1/relay/servers/next**",
         lambda route: (
             state.__setitem__("next_calls", state["next_calls"] + 1),
             route.fulfill(
                 status=200,
                 headers={"Content-Type": "application/json"},
-                body=json.dumps({"server_public_key": SERVER_PUBLIC_KEY_B64}),
+                body=json.dumps(
+                    {
+                        "server_public_key": SERVER_PUBLIC_KEY_B64,
+                        "selected_context_tier": "8k-fast",
+                    }
+                ),
             ),
         ),
     )
@@ -1706,17 +2283,19 @@ def test_landing_chat_model_catalog_failure_uses_api_v1_fallback(
 
     model_select = page.get_by_test_id("landing-model-select")
     model_select.wait_for(state="visible")
-    assert model_select.input_value() == "llama-3.1-8b-instruct"
-    assert "llama-3.1-8b-instruct (emergency fallback)" in model_select.locator("option").inner_text()
+    assert model_select.input_value() == "qwen3-8b-instruct"
+    assert "qwen3-8b-instruct (emergency fallback)" in model_select.locator("option").inner_text()
     assert "Could not load the API v1 model list" in page.locator(".model-error").inner_text()
 
     page.locator("textarea").first.fill("hello")
-    wait_for_landing_send_enabled(page).click()
+    with page.expect_request("**/api/v1/relay/requests") as request_info:
+        wait_for_landing_send_enabled(page).click()
 
-    page.locator(".assistant-message").last.wait_for(state="visible")
-    assert state["relay_requests"], "expected the landing chat to POST the API v1 fallback relay payload"
-    request_envelope = json.loads(state["relay_requests"][-1]["ciphertext"])
-    assert request_envelope["api_v1_request"]["model"] == "llama-3.1-8b-instruct"
+    assistant_message = page.locator(".assistant-message").filter(has_text="Fallback model acknowledged.")
+    assistant_message.wait_for(state="visible")
+    expect(assistant_message).to_have_text("Fallback model acknowledged.")
+    request_envelope = json.loads(request_info.value.post_data_json["ciphertext"])
+    assert request_envelope["api_v1_request"]["model"] == "qwen3-8b-instruct"
     assert state["chat_completions"] == []
     assert state["v2_requests"] == []
 
@@ -2166,6 +2745,37 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             }
             """
         )
+        page.evaluate(
+            """
+            () => {
+                const appEl = document.querySelector('#app');
+                const vm = appEl && appEl.__vue__;
+                const originalEncrypt = vm.encrypt.bind(vm);
+                window.__landingRequestedMaxTokens = null;
+                vm.encrypt = async (plaintext, publicKeyPem) => {
+                    let envelope;
+                    try {
+                        envelope = JSON.parse(plaintext);
+                    } catch (_error) {
+                        return originalEncrypt(plaintext, publicKeyPem);
+                    }
+                    if (
+                        envelope &&
+                        envelope.protocol === 'tokenplace_api_v1_relay_e2ee' &&
+                        envelope.version === 1 &&
+                        envelope.api_v1_request &&
+                        envelope.api_v1_request.options
+                    ) {
+                        window.__landingRequestedMaxTokens =
+                            envelope.api_v1_request.options.max_tokens;
+                        envelope.api_v1_request.options.max_tokens = 8;
+                        return originalEncrypt(JSON.stringify(envelope), publicKeyPem);
+                    }
+                    return originalEncrypt(plaintext, publicKeyPem);
+                };
+            }
+            """
+        )
 
         prompt_text = (
             "Reply with a short sentence confirming you received this message. "
@@ -2204,8 +2814,15 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             "Sorry, I encountered an issue generating a response. Please try again.",
             "Sorry, the relay returned an invalid response. Please try again.",
             "Sorry, an error occurred while sending your message. Please try again.",
+            "The relay is unavailable right now. Please try again later.",
         }
+        cancellation_failure_text = (
+            "The request stopped waiting locally, but cancellation could not be confirmed."
+        )
         max_attempts = 10
+        observed_max_tokens = None
+        relay_request_count = len(relay_requests)
+        accepted_attempt = False
         for attempt in range(max_attempts):
             relay_ready, relay_server_selection_body = wait_for_relay_ready(
                 required_consecutive=2,
@@ -2216,6 +2833,8 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 "relay lost active server selection while waiting to retry chat request. "
                 f"Last response body: {relay_server_selection_body!r}"
             )
+            relay_request_count_before = len(relay_requests)
+            page.evaluate("window.__landingRequestedMaxTokens = null")
             textarea.fill(prompt_text)
             wait_for_landing_send_enabled(page).click()
             user_message_count += 1
@@ -2240,18 +2859,29 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 },
             )
             assistant_text = assistant_message.inner_text().strip()
+            observed_max_tokens = page.evaluate("window.__landingRequestedMaxTokens")
+            relay_request_count = len(relay_requests)
             if (
                 assistant_text
                 and assistant_text not in transient_bridge_errors
                 and assistant_text not in disallowed_assistant_outputs
+                and cancellation_failure_text not in assistant_text
+                and observed_max_tokens == 8192
+                and relay_request_count > relay_request_count_before
             ):
+                accepted_attempt = True
                 break
 
             if attempt < max_attempts - 1:
                 # Give the relay/bridge path a brief backoff window before retrying.
                 page.wait_for_timeout(800 * (attempt + 1))
 
-        assert assistant_text, "assistant response should not be empty"
+        attempt_diagnostics = (
+            f"last assistant text={assistant_text!r}, observed max_tokens={observed_max_tokens!r}, "
+            f"relay request count={relay_request_count}"
+        )
+        assert accepted_attempt, f"no retry satisfied the API v1 request contract; {attempt_diagnostics}"
+        assert assistant_text, f"assistant response should not be empty; {attempt_diagnostics}"
         assert assistant_text.strip(), "assistant response should not be empty"
         assert assistant_text.lower() != "stub"
         assert assistant_text != "Sorry, I encountered an issue generating a response. Please try again."
@@ -2259,8 +2889,9 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
         assert assistant_text != "Sorry, the relay returned an invalid response. Please try again."
         assert assistant_text not in transient_bridge_errors
         assert "Unknown streaming error" not in assistant_text
+        assert observed_max_tokens == 8192, attempt_diagnostics
 
-        assert len(relay_requests) >= 1
+        assert relay_request_count >= 1, attempt_diagnostics
         assert chat_completion_requests == []
         assert v2_requests == []
 
@@ -2281,6 +2912,19 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                 const vm = appEl && appEl.__vue__;
                 const history = vm && Array.isArray(vm.chatHistory) ? vm.chatHistory : [];
                 const assistant = [...history].reverse().find((message) => message && message.role === 'assistant') || null;
+                const assistantNodes = document.querySelectorAll('.assistant-message');
+                const latestAssistant = assistantNodes.length
+                    ? assistantNodes[assistantNodes.length - 1]
+                    : null;
+                const assistantContentNode = latestAssistant
+                    ? latestAssistant.querySelector(':scope > span')
+                    : null;
+                const outputLimitNotices = latestAssistant
+                    ? latestAssistant.querySelectorAll(':scope > .output-limit-notice')
+                    : [];
+                const outputLimitNotice = outputLimitNotices.length
+                    ? outputLimitNotices[0]
+                    : null;
 
                 return {
                     snapshots,
@@ -2294,14 +2938,17 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
                     ),
                     assistantIsTyping: Boolean(assistant && assistant.isTyping),
                     assistantContent: assistant && typeof assistant.content === 'string' ? assistant.content : '',
-                    domAssistantText: (() => {
-                        const nodes = document.querySelectorAll('.assistant-message');
-                        if (!nodes.length) {
-                            return '';
-                        }
-                        const latest = nodes[nodes.length - 1];
-                        return (latest.textContent || '').trim();
-                    })(),
+                    assistantFinishReason: assistant ? assistant.finishReason : null,
+                    domAssistantContentText: assistantContentNode
+                        ? (assistantContentNode.textContent || '').trim()
+                        : '',
+                    outputLimitNoticeCount: outputLimitNotices.length,
+                    outputLimitNoticeText: outputLimitNotice
+                        ? (outputLimitNotice.textContent || '').trim()
+                        : '',
+                    outputLimitNoticeRole: outputLimitNotice
+                        ? outputLimitNotice.getAttribute('role')
+                        : null,
                 };
             }
             """
@@ -2314,18 +2961,28 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             f"snapshots={non_streaming_state['snapshots']}"
         )
         assistant_content = non_streaming_state["assistantContent"].strip()
-        dom_assistant_text = non_streaming_state["domAssistantText"].strip()
+        dom_assistant_content_text = non_streaming_state["domAssistantContentText"].strip()
+        output_limit_notice_text = "Response stopped at the output-token limit."
+        assert output_limit_notice_text not in assistant_content
 
         # DOM rendering can add/remove whitespace around punctuation and wrapped lines.
         # Compare lexical token sequences so punctuation-preserving whitespace differences pass,
         # while real word-boundary/content regressions still fail.
         token_pattern = r"\w+|[^\w\s]"
         assistant_content_tokens = re.findall(token_pattern, assistant_content, flags=re.UNICODE)
-        dom_assistant_text_tokens = re.findall(token_pattern, dom_assistant_text, flags=re.UNICODE)
-        assert assistant_content_tokens == dom_assistant_text_tokens, (
+        dom_assistant_content_tokens = re.findall(
+            token_pattern, dom_assistant_content_text, flags=re.UNICODE
+        )
+        assert assistant_content_tokens == dom_assistant_content_tokens, (
             "final assistant Vue state content must match rendered DOM text token-for-token "
             "(allowing formatting-only whitespace differences) to prove final non-streaming rendering path"
         )
+        if non_streaming_state["assistantFinishReason"] == "length":
+            assert non_streaming_state["outputLimitNoticeCount"] == 1
+            assert non_streaming_state["outputLimitNoticeText"] == output_limit_notice_text
+            assert non_streaming_state["outputLimitNoticeRole"] == "status"
+        else:
+            assert non_streaming_state["outputLimitNoticeCount"] == 0
 
         encrypted_request = relay_requests[0].post_data_json
         assert encrypted_request.get("protocol") == "tokenplace_api_v1_relay_e2ee"
@@ -2378,3 +3035,246 @@ def test_landing_chat_real_inference_with_desktop_bridge_api_v1(
             bridge_process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             bridge_process.kill()
+
+
+def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_native_ui_semantics(
+    page: Page, base_url: str, setup_servers
+):
+    request_id = "progress-browser-request"
+    page.goto(base_url)
+    page.wait_for_function("() => Boolean(document.querySelector('#app').__vue__?.clientPublicKey)")
+    page.clock.install()
+    client_key = page.evaluate("btoa(document.querySelector('#app').__vue__.clientPublicKey)")
+
+    def progress(phase, sequence, *, total=0, processed=0, generated=0, extra=None):
+        value = {
+            "schema_version": 1,
+            "sequence": sequence,
+            "phase": phase,
+            "total_prompt_tokens": total,
+            "cached_prompt_tokens": 0,
+            "processed_prompt_tokens": processed,
+            "generated_tokens": generated,
+            "elapsed_ms": sequence * 100,
+        }
+        if extra:
+            value.update(extra)
+        return value
+
+    def encrypt_envelope(
+        value,
+        *,
+        envelope_request=request_id,
+        envelope_client=client_key,
+        inner_request=None,
+        inner_client=None,
+    ):
+        envelope = {
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            "request_id": inner_request or envelope_request,
+            "client_public_key": inner_client or envelope_client,
+            "api_v1_progress": value,
+        }
+        encrypted = page.evaluate(
+            """async ({plaintext}) => {
+                const vm = document.querySelector('#app').__vue__;
+                return vm.encrypt(plaintext, vm.clientPublicKey);
+            }""",
+            {"plaintext": json.dumps(envelope)},
+        )
+        return {
+            "client_public_key": envelope_client,
+            "request_id": envelope_request,
+            "protocol": "tokenplace_api_v1_relay_e2ee",
+            "version": 1,
+            **encrypted,
+        }
+
+    preparing = encrypt_envelope(progress("preparing", 1))
+    determinate = encrypt_envelope(progress("prefill", 2, total=100, processed=25))
+    same_milestone = encrypt_envelope(progress("prefill", 3, total=100, processed=30))
+    zero_total = encrypt_envelope(progress("prefill", 4))
+    generating = encrypt_envelope(progress("generating", 5, generated=12))
+    unknown_field = encrypt_envelope(progress("generating", 6, generated=13, extra={"prompt": "forbidden"}))
+    valid_after_rejections = encrypt_envelope(progress("generating", 6, generated=14))
+    cross_request = encrypt_envelope(progress("generating", 7, generated=99), envelope_request="other-request")
+    cross_client = encrypt_envelope(progress("generating", 7, generated=99), envelope_client="other-client")
+    wrong_inner_request = encrypt_envelope(progress("generating", 7, generated=99), inner_request="other-request")
+    wrong_inner_client = encrypt_envelope(progress("generating", 7, generated=99), inner_client="other-client")
+    malformed = {**generating, "ciphertext": "not-valid-base64"}
+
+    final_envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": request_id,
+        "client_public_key": client_key,
+        "api_v1_response": {"message": {"role": "assistant", "content": "Atomic final answer."}},
+    }
+    final_cipher = page.evaluate(
+        """async ({plaintext}) => {
+            const vm = document.querySelector('#app').__vue__;
+            return vm.encrypt(plaintext, vm.clientPublicKey);
+        }""",
+        {"plaintext": json.dumps(final_envelope)},
+    )
+    pending = [
+        {"status": "pending"},
+        *({"status": "pending", "encrypted_progress": item} for item in [
+            preparing, determinate, same_milestone, zero_total, generating, malformed,
+            unknown_field, generating, zero_total, cross_request, cross_client,
+            wrong_inner_request, wrong_inner_client,
+            valid_after_rejections,
+        ]),
+    ]
+    state = route_landing_relay_chat(
+        page,
+        retrieve_statuses=[202] * len(pending) + [200],
+        pending_payloads=pending,
+        final_encrypted_response={"chat_history": final_cipher["ciphertext"], **{
+            key: final_cipher[key] for key in ("cipherkey", "iv")
+        }},
+    )
+    page.evaluate(
+        """requestId => {
+            const vm = document.querySelector('#app').__vue__;
+            const original = vm.createRequestId;
+            let calls = 0;
+            vm.createRequestId = () => calls++ === 0 ? requestId : original.call(vm);
+        }""",
+        request_id,
+    )
+    page.locator("textarea.message-input").fill("Show inference status")
+    wait_for_landing_send_enabled(page).click()
+
+    panel = page.get_by_test_id("landing-inference-progress")
+    progress_bar = page.get_by_test_id("landing-native-progress")
+    status = page.get_by_test_id("landing-progress-status")
+    page.wait_for_function("() => document.querySelector('#app').__vue__.activeRelayRequest !== null")
+    expect(status).to_have_text("Waiting for compute node…")
+    assert progress_bar.get_attribute("value") is None
+    assert progress_bar.get_attribute("role") is None
+    assert progress_bar.get_attribute("aria-labelledby") == "landing-progress-label"
+    assert progress_bar.get_attribute("aria-describedby") == "landing-progress-status"
+    live = panel.locator("[aria-live=polite]")
+    assert live.get_attribute("aria-atomic") == "true"
+
+    def advance(expected):
+        page.clock.fast_forward(500)
+        expect(status).to_have_text(expected)
+
+    advance("Preparing request…")
+    advance("Processing prompt: 25 of 100 tokens (25%)")
+    expect(progress_bar).to_have_attribute("max", "100")
+    expect(progress_bar).to_have_attribute("value", "25")
+    announced = live.text_content()
+    advance("Processing prompt: 30 of 100 tokens (30%)")
+    assert live.text_content() == announced
+    advance("Processing prompt…")
+    assert progress_bar.get_attribute("value") is None
+    advance("Generating response… 12 tokens generated")
+
+    for _ in range(8):
+        advance("Generating response… 12 tokens generated")
+    advance("Generating response… 14 tokens generated")
+    page.clock.fast_forward(500)
+    expect(panel).to_be_hidden()
+    expect(page.locator(".assistant-message")).to_have_count(1)
+    expect(page.locator(".assistant-message")).to_have_text("Atomic final answer.")
+    history = page.evaluate("document.querySelector('#app').__vue__.chatHistory")
+    assert [item["role"] for item in history] == ["user", "assistant"]
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in history)
+    next_messages = page.evaluate(
+        "document.querySelector('#app').__vue__.createApiV1Messages('next question')"
+    )
+    assert all("relayProgress" not in item and "api_v1_progress" not in item for item in next_messages)
+    assert state["relay_requests"][0]["request_id"] == request_id
+
+
+@pytest.mark.parametrize(
+    "exit_kind",
+    ["structured_failure", "cancellation", "timeout", "failover", "pagehide", "teardown"],
+)
+def test_landing_chat_uses_api_v1_only_non_streaming_encrypted_progress_terminal_lifecycle_cleanup(
+    page: Page, base_url: str, setup_servers, exit_kind: str
+):
+    """Every terminal browser lifecycle clears decrypted progress state."""
+    request_id = f"progress-{exit_kind}"
+    page.goto(base_url)
+    page.wait_for_function("() => Boolean(document.querySelector('#app').__vue__?.clientPublicKey)")
+    page.clock.install()
+    client_key = page.evaluate("btoa(document.querySelector('#app').__vue__.clientPublicKey)")
+    update = encrypted_landing_progress(
+        page, request_id=request_id, client_public_key=client_key
+    )
+    terminal_status = 404 if exit_kind == "failover" else 400
+    retrieve_statuses = [202] if exit_kind in {"cancellation", "timeout", "pagehide", "teardown"} else [202, terminal_status]
+    pending = {"status": "pending", "encrypted_progress": update}
+    if exit_kind == "timeout":
+        pending["request_deadline_remaining_seconds"] = 0
+    route_landing_relay_chat(
+        page,
+        retrieve_statuses=retrieve_statuses,
+        pending_payload=pending,
+        retrieve_error_payload={"error": {"code": "selected_server_terminal"}},
+    )
+    page.evaluate(
+        """({requestId, clientKey}) => {
+            const vm = document.querySelector('#app').__vue__;
+            let resolveTermination;
+            const active = {
+                clientPublicKey: clientKey, requestId, cancelToken: 'cancel-proof',
+                cancelled: false, cancellationAttempted: false,
+                cancellationConfirmed: false, cancellationPromise: null,
+                terminated: false, retrievalController: new AbortController(),
+                terminationPromise: new Promise(resolve => { resolveTermination = resolve; }),
+                resolveTermination: null, lastProgressSequence: 0
+            };
+            active.resolveTermination = resolveTermination;
+            vm.activeRelayRequest = active;
+            window.__progressLifecycleRequest = active;
+            vm.relayProgress = {phase: 'waiting'};
+            vm.relayProgressAnnouncement = 'Waiting for compute node…';
+            window.__progressLifecycleVm = vm;
+            window.__progressLifecyclePromise = vm.retrieveRelayResponse(
+                clientKey, requestId, Date.now() + 480000
+            );
+        }""",
+        {"requestId": request_id, "clientKey": client_key},
+    )
+    page.wait_for_function(
+        "() => window.__progressLifecycleVm.relayProgress?.phase === 'preparing'"
+    )
+
+    if exit_kind in {"structured_failure", "failover"}:
+        page.clock.fast_forward(500)
+    elif exit_kind == "timeout":
+        page.clock.fast_forward(6_000)
+    elif exit_kind == "cancellation":
+        page.evaluate(
+            """() => {
+                const vm = window.__progressLifecycleVm;
+                const active = vm.activeRelayRequest;
+                vm.terminateRelayRequestLocally(active);
+                vm.cancelRelayRequest('requester_cancelled');
+                vm.clearActiveRelayRequest(active.requestId);
+            }"""
+        )
+    elif exit_kind == "pagehide":
+        page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
+    else:
+        page.evaluate("() => window.__progressLifecycleVm.$destroy()")
+
+    page.wait_for_function("() => window.__progressLifecycleVm.relayProgress === null")
+    assert_landing_progress_cleared(page, assert_panel_hidden=exit_kind != "teardown")
+    if exit_kind == "teardown":
+        teardown_state = page.evaluate(
+            """() => ({
+                activeRelayRequest: window.__progressLifecycleVm.activeRelayRequest,
+                requestTerminated: window.__progressLifecycleRequest.terminated
+            })"""
+        )
+        assert teardown_state == {
+            "activeRelayRequest": None,
+            "requestTerminated": True,
+        }

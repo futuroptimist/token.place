@@ -1,11 +1,28 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 type UiState = 'idle' | 'starting' | 'streaming' | 'canceled' | 'completed' | 'failed';
 type BackendMode = 'auto' | 'cpu' | 'gpu' | 'hybrid';
 type ContextTier = '8k-fast' | '64k-full';
+type Qwen64kBatchProfile = 'safe' | 'balanced' | 'experimental';
+type ApplicationInitializationState = 'pending' | 'ready' | 'failed';
+type OperatorStartDiagnostic = {
+  handler: 'not_entered' | 'entered';
+  invocation: 'not_started' | 'pending' | 'resolved' | 'rejected';
+  nativeEvent: 'none' | 'running_received' | 'running_accepted' | 'running_rejected';
+  polling: 'none' | 'not_running' | 'running_accepted' | 'running_rejected' | 'command_failed';
+  render: 'not_running' | 'running' | 'running_regressed';
+};
+
+const initialOperatorStartDiagnostic: OperatorStartDiagnostic = {
+  handler: 'not_entered',
+  invocation: 'not_started',
+  nativeEvent: 'none',
+  polling: 'none',
+  render: 'not_running',
+};
 
 // Context tiers intentionally use static, duplicated profile constants instead of
 // runtime codegen/manifest loading. Keep these IDs and token counts
@@ -15,6 +32,7 @@ const CONTEXT_PROFILES: Array<{ id: ContextTier; displayLabel: string; totalCont
   { id: '64k-full', displayLabel: '64K Full', totalContextTokens: 65536, enabled: true },
 ];
 const DEFAULT_CONTEXT_TIER: ContextTier = '8k-fast';
+const DEFAULT_QWEN_64K_BATCH_PROFILE: Qwen64kBatchProfile = 'balanced';
 
 interface BackendInfo {
   platform_label: string;
@@ -29,6 +47,7 @@ interface DesktopConfig {
   relay_base_urls: string[];
   preferred_mode: BackendMode;
   context_tier: ContextTier;
+  qwen_64k_batch_profile: Qwen64kBatchProfile;
 }
 
 const DEFAULT_RELAY_BASE_URL = 'https://token.place';
@@ -40,6 +59,7 @@ type PartialDesktopConfig = Omit<Partial<DesktopConfig>, 'model_path' | 'relay_b
   relay_base_urls?: unknown;
   preferred_mode?: unknown;
   context_tier?: unknown;
+  qwen_64k_batch_profile?: unknown;
 };
 
 interface RelayStatus {
@@ -95,6 +115,18 @@ const SAFE_READINESS_DIAGNOSTIC_KEYS = new Set([
   'api_v1_readiness_qwen_64k_runtime_profile_n_ubatch',
   'api_v1_readiness_qwen_64k_runtime_profile_result',
   'api_v1_readiness_qwen_64k_runtime_profile_failure_category',
+  'api_v1_readiness_qwen_64k_runtime_preferred_profile_id',
+  'api_v1_readiness_qwen_64k_batch_profile_requested',
+  'api_v1_readiness_qwen_64k_batch_profile_selected',
+  'api_v1_readiness_qwen_64k_runtime_profile_kv_precision',
+  'api_v1_readiness_qwen_64k_runtime_profile_fallback_reason',
+  'api_v1_readiness_yarn_requested_context_tokens',
+  'api_v1_readiness_yarn_original_context_tokens',
+  'api_v1_readiness_yarn_context_multiplier',
+  'api_v1_readiness_yarn_rope_freq_scale',
+  'api_v1_readiness_yarn_ext_factor_overridden',
+  'api_v1_readiness_yarn_rope_scaling_type_source',
+  'api_v1_readiness_yarn_configuration_valid',
   'api_v1_readiness_completion_smoke_qwen_api_v1_non_thinking_template_fallback',
   'runtime_provisioning_state',
   'startup_phase',
@@ -127,6 +159,9 @@ function safeReadinessDiagnosticValue(value: unknown): string | number | boolean
 }
 
 interface ComputeNodeStatus {
+  native_startup_phase: string;
+  native_startup_outcome: string;
+  native_startup_failure_category: string;
   running: boolean;
   registered: boolean;
   active_relay_url: string;
@@ -196,6 +231,9 @@ interface SidecarEvent {
 }
 
 const defaultComputeStatus: ComputeNodeStatus = {
+  native_startup_phase: 'not_started',
+  native_startup_outcome: 'not_started',
+  native_startup_failure_category: 'none',
   running: false,
   registered: false,
   active_relay_url: '',
@@ -245,6 +283,24 @@ const defaultComputeStatus: ComputeNodeStatus = {
   launcher_source: null,
   interpreter_basename: null,
 };
+
+const nativeStartupDiagnosticAllowlists = {
+  phase: new Set(['not_started', 'session_reserved', 'bridge_launch_prepared', 'command_constructed', 'child_spawn_attempted', 'child_spawn_completed', 'stdio_acquired', 'bridge_attached', 'running_status_publication', 'startup_task_failed']),
+  outcome: new Set(['not_started', 'pending', 'accepted', 'launcher_validated', 'attempted', 'completed', 'running', 'stopping', 'superseded', 'publication_accepted', 'publication_suppressed', 'failed']),
+  failure: new Set(['none', 'bridge_preparation_failed', 'command_construction_failed', 'launcher_validation_failed', 'child_spawn_failed', 'stdio_acquisition_failed', 'bridge_attachment_failed', 'bridge_exited_before_startup_event', 'startup_task_failed']),
+};
+
+function boundedNativeStartupValue(value: string | null | undefined, allowed: Set<string>, fallback: string): string {
+  return value && allowed.has(value) ? value : fallback;
+}
+
+function authoritativeNativeStartupValue(
+  value: unknown,
+  allowed: Set<string>,
+  previous: string
+): string {
+  return typeof value === 'string' && allowed.has(value) ? value : previous;
+}
 
 type NormalizedDesktopError = { message: string; code: string | null; disablesPythonBridge: boolean };
 
@@ -416,6 +472,12 @@ function normalizeContextTier(contextTier: unknown): ContextTier {
   return contextTier === '64k-full' || contextTier === '8k-fast' ? contextTier : DEFAULT_CONTEXT_TIER;
 }
 
+export function normalizeQwen64kBatchProfile(value: unknown): Qwen64kBatchProfile {
+  return value === 'safe' || value === 'balanced' || value === 'experimental'
+    ? value
+    : DEFAULT_QWEN_64K_BATCH_PROFILE;
+}
+
 function normalizeBackendMode(preferredMode: unknown): BackendMode {
   return preferredMode === 'cpu' ||
     preferredMode === 'gpu' ||
@@ -434,6 +496,7 @@ export function normalizeDesktopConfig(config: PartialDesktopConfig): DesktopCon
     relay_base_urls: relayBaseUrls,
     preferred_mode: normalizeBackendMode(config.preferred_mode),
     context_tier: normalizeContextTier(config.context_tier),
+    qwen_64k_batch_profile: normalizeQwen64kBatchProfile(config.qwen_64k_batch_profile),
   };
 }
 
@@ -825,7 +888,166 @@ function mergeComputeStatusEvent(
         : typeof payload.interpreter_basename === 'string'
           ? payload.interpreter_basename
           : stoppedBase.interpreter_basename,
+    native_startup_phase: authoritativeNativeStartupValue(
+      payload.native_startup_phase,
+      nativeStartupDiagnosticAllowlists.phase,
+      stoppedBase.native_startup_phase
+    ),
+    native_startup_outcome: authoritativeNativeStartupValue(
+      payload.native_startup_outcome,
+      nativeStartupDiagnosticAllowlists.outcome,
+      stoppedBase.native_startup_outcome
+    ),
+    native_startup_failure_category: authoritativeNativeStartupValue(
+      payload.native_startup_failure_category,
+      nativeStartupDiagnosticAllowlists.failure,
+      stoppedBase.native_startup_failure_category
+    ),
   };
+}
+
+function mergeAuthoritativeNonRunningStatus(
+  prev: ComputeNodeStatus,
+  payload: Record<string, unknown>,
+  startSessionId: string | null,
+  payloadSession: string,
+  payloadSequence: number
+): ComputeNodeStatus {
+  // A non-running snapshot can establish attribution for the replacement
+  // session, but the session that preceded Start is never current-attempt data.
+  if (payloadSession === startSessionId) {
+    return prev;
+  }
+  const isReplacementSession = prev.operator_session_id === startSessionId;
+  if (!isReplacementSession && payloadSession !== prev.operator_session_id) {
+    return prev;
+  }
+  if (!isReplacementSession && prev.sequence !== null && payloadSequence < prev.sequence) {
+    return prev;
+  }
+
+  const terminalType = authoritativeTerminalNonRunningType(payload);
+  if (terminalType !== null) {
+    const mergeBase = isReplacementSession
+      ? { ...prev, operator_session_id: null, sequence: null }
+      : prev;
+    return mergeComputeStatusEvent(mergeBase, { ...payload, type: terminalType });
+  }
+
+  return {
+    ...prev,
+    operator_session_id: payloadSession,
+    sequence: payloadSequence,
+    native_startup_phase: authoritativeNativeStartupValue(
+      payload.native_startup_phase,
+      nativeStartupDiagnosticAllowlists.phase,
+      prev.native_startup_phase
+    ),
+    native_startup_outcome: authoritativeNativeStartupValue(
+      payload.native_startup_outcome,
+      nativeStartupDiagnosticAllowlists.outcome,
+      prev.native_startup_outcome
+    ),
+    native_startup_failure_category: authoritativeNativeStartupValue(
+      payload.native_startup_failure_category,
+      nativeStartupDiagnosticAllowlists.failure,
+      prev.native_startup_failure_category
+    ),
+  };
+}
+
+function authoritativeTerminalNonRunningType(
+  payload: Record<string, unknown>
+): 'error' | 'stopped' | null {
+  if (payload.running !== false) {
+    return null;
+  }
+  if (payload.worker_state === 'failed' && payload.relay_runtime_state === 'failed') {
+    return 'error';
+  }
+  if (
+    payload.worker_state === 'stopped' &&
+    payload.relay_runtime_state === 'stopped' &&
+    payload.warm_load_state === 'stopped'
+  ) {
+    return 'stopped';
+  }
+  return null;
+}
+
+function canStopOwnedComputeNodeStart(
+  status: ComputeNodeStatus,
+  isStarting: boolean,
+  priorSessionId: string | null
+): boolean {
+  if (status.running) {
+    return true;
+  }
+  if (
+    !isStarting ||
+    status.operator_session_id === null ||
+    status.operator_session_id === priorSessionId ||
+    authoritativeTerminalNonRunningType(status as unknown as Record<string, unknown>) !== null
+  ) {
+    return false;
+  }
+  return (
+    status.worker_state === 'starting' ||
+    status.worker_state === 'provisioning' ||
+    status.runtime_provisioning_state === 'provisioning' ||
+    status.warm_load_state === 'warming'
+  );
+}
+
+function mergeAuthoritativeComputeStatus(
+  prev: ComputeNodeStatus,
+  payload: Record<string, unknown>,
+  startSessionId: string | null
+): ComputeNodeStatus {
+  const payloadSession =
+    typeof payload.operator_session_id === 'string' ? payload.operator_session_id : null;
+  const payloadSequence = typeof payload.sequence === 'number' ? payload.sequence : null;
+  if (payloadSession === null || payloadSequence === null) {
+    return prev;
+  }
+  if (payload.running === false) {
+    return mergeAuthoritativeNonRunningStatus(
+      prev,
+      payload,
+      startSessionId,
+      payloadSession,
+      payloadSequence
+    );
+  }
+  if (payload.running !== true) {
+    return prev;
+  }
+
+  if (payloadSession === prev.operator_session_id) {
+    // Events can carry only a partial view of a native status transition. If
+    // the corresponding authoritative snapshot has the same sequence, allow
+    // it to promote the active session to Running exactly once. Older
+    // snapshots and duplicate events still use the normal monotonic merge.
+    if (payloadSequence === prev.sequence && !prev.running) {
+      return mergeComputeStatusEvent(
+        { ...prev, sequence: null },
+        { ...payload, type: 'status' }
+      );
+    }
+    return mergeComputeStatusEvent(prev, { ...payload, type: 'status' });
+  }
+
+  // A different session is authoritative for this start only while the UI is
+  // still on the session that was current when Start was clicked. Once an
+  // event has advanced the UI, a late snapshot cannot replace it.
+  if (prev.operator_session_id !== startSessionId || payloadSession === startSessionId) {
+    return prev;
+  }
+
+  return mergeComputeStatusEvent(
+    { ...prev, operator_session_id: null, sequence: null },
+    { ...payload, type: 'status' }
+  );
 }
 
 export function selectedModelPath(selection: string | string[] | null): string {
@@ -839,6 +1061,9 @@ export function selectedModelPath(selection: string | string[] | null): string {
 }
 
 export function App() {
+  const [applicationInitialization, setApplicationInitialization] =
+    useState<ApplicationInitializationState>('pending');
+  const [applicationInitializationLoaded, setApplicationInitializationLoaded] = useState(false);
   const [backend, setBackend] = useState<BackendInfo | null>(null);
   const [config, setConfig] = useState<DesktopConfig>({
     model_path: '',
@@ -846,6 +1071,7 @@ export function App() {
     relay_base_urls: [DEFAULT_RELAY_BASE_URL],
     preferred_mode: 'auto',
     context_tier: DEFAULT_CONTEXT_TIER,
+    qwen_64k_batch_profile: DEFAULT_QWEN_64K_BATCH_PROFILE,
   });
   const [computeStatus, setComputeStatus] = useState<ComputeNodeStatus>(defaultComputeStatus);
   const [prompt, setPrompt] = useState('');
@@ -860,6 +1086,8 @@ export function App() {
   const [isForwarding, setIsForwarding] = useState(false);
   const [isStartingComputeNode, setIsStartingComputeNode] = useState(false);
   const [isStoppingComputeNode, setIsStoppingComputeNode] = useState(false);
+  const [operatorStartDiagnostic, setOperatorStartDiagnostic] =
+    useState<OperatorStartDiagnostic>(initialOperatorStartDiagnostic);
   const [operatorLogText, setOperatorLogText] = useState('');
   const [isDebugConsoleOpen, setIsDebugConsoleOpen] = useState(false);
   const relayRuntimeState =
@@ -875,33 +1103,68 @@ export function App() {
   const requestIdRef = useRef('');
   const computeStatusRef = useRef<ComputeNodeStatus>(defaultComputeStatus);
   const computeNodeStartAttemptRef = useRef(0);
+  const computeNodeReconciliationTimerRef = useRef<number | null>(null);
+  const computeNodePriorSessionRef = useRef<string | null>(null);
+  const operatorRunningRenderedRef = useRef(false);
+
+  const updateOperatorStartDiagnostic = (update: Partial<OperatorStartDiagnostic>) => {
+    setOperatorStartDiagnostic((previous) => ({ ...previous, ...update }));
+  };
+
+  const cancelComputeNodeReconciliation = () => {
+    computeNodeStartAttemptRef.current += 1;
+    computeNodePriorSessionRef.current = null;
+    if (computeNodeReconciliationTimerRef.current !== null) {
+      window.clearTimeout(computeNodeReconciliationTimerRef.current);
+      computeNodeReconciliationTimerRef.current = null;
+    }
+  };
+
+  useLayoutEffect(() => {
+    if (applicationInitializationLoaded) {
+      setApplicationInitialization('ready');
+    }
+  }, [applicationInitializationLoaded]);
 
   useEffect(() => {
-    invoke<BackendInfo>('detect_backend')
-      .then(setBackend)
-      .catch((e) => setError(formatErrorMessage(e)));
+    if (computeStatus.running) {
+      operatorRunningRenderedRef.current = true;
+      updateOperatorStartDiagnostic({ render: 'running' });
+    } else if (operatorRunningRenderedRef.current) {
+      updateOperatorStartDiagnostic({ render: 'running_regressed' });
+    }
+  }, [computeStatus.running]);
 
-    const initializeConfigAndArtifact = async () => {
+  useEffect(() => {
+    const initializeApplication = async () => {
+      void invoke<ModelArtifactInfo>('inspect_model_artifact')
+        .then((info) => setArtifact(info))
+        .catch((e) => setError(formatErrorMessage(e)));
+
       try {
-        const loadedConfig = await invoke<PartialDesktopConfig>('load_config');
+        const [detectedBackend, loadedConfig, loadedNodeStatus] = await Promise.all([
+          invoke<BackendInfo>('detect_backend'),
+          invoke<PartialDesktopConfig>('load_config'),
+          invoke<Partial<ComputeNodeStatus>>('get_compute_node_status'),
+        ]);
         const normalizedConfig = normalizeDesktopConfig(loadedConfig);
+        const nodeStatus = { ...defaultComputeStatus, ...loadedNodeStatus };
+
+        setBackend(detectedBackend);
         setConfig(normalizedConfig);
         if (JSON.stringify(loadedConfig) !== JSON.stringify(normalizedConfig)) {
           invoke('save_config', { config: normalizedConfig }).catch((e) => setError(formatErrorMessage(e)));
         }
-        const nodeStatus = { ...defaultComputeStatus, ...(await invoke<Partial<ComputeNodeStatus>>('get_compute_node_status')) };
         computeStatusRef.current = nodeStatus;
         setComputeStatus(nodeStatus);
-
-        const info = await invoke<ModelArtifactInfo>('inspect_model_artifact');
-        setArtifact(info);
-
+        setApplicationInitializationLoaded(true);
       } catch (e) {
         setError(formatErrorMessage(e));
+        setApplicationInitialization('failed');
       }
     };
 
-    initializeConfigAndArtifact();
+    initializeApplication();
   }, []);
 
   useEffect(() => {
@@ -935,14 +1198,51 @@ export function App() {
   useEffect(() => {
     const unlisten = listen<Record<string, unknown>>('compute_node_event', (evt) => {
       const payload = evt.payload;
-      const previous = computeStatusRef.current;
-      const next = mergeComputeStatusEvent(previous, payload);
-      if (next === previous) {
+      // Native starts allocate a new session. Keep late events from the session
+      // that preceded this attempt from canceling or overwriting reconciliation.
+      if (
+        computeNodePriorSessionRef.current !== null &&
+        payload.operator_session_id === computeNodePriorSessionRef.current
+      ) {
         return;
+      }
+      const previous = computeStatusRef.current;
+      if (payload.running === true) {
+        updateOperatorStartDiagnostic({ nativeEvent: 'running_received' });
+      }
+      const next =
+        payload.type === 'status' &&
+        payload.running === true &&
+        computeNodePriorSessionRef.current !== null
+          ? mergeAuthoritativeComputeStatus(
+              previous,
+              payload,
+              computeNodePriorSessionRef.current
+            )
+          : mergeComputeStatusEvent(previous, payload);
+      if (next === previous) {
+        if (payload.running === true) {
+          updateOperatorStartDiagnostic({ nativeEvent: 'running_rejected' });
+        }
+        return;
+      }
+      if (payload.running === true) {
+        updateOperatorStartDiagnostic({
+          nativeEvent: next.running ? 'running_accepted' : 'running_rejected',
+        });
+      }
+      if (next.running || payload.type === 'error' || payload.type === 'stopped') {
+        cancelComputeNodeReconciliation();
       }
       computeStatusRef.current = next;
       setComputeStatus(next);
-      if (payload.type === 'started' || payload.type === 'error' || payload.type === 'stopped') {
+      // Provisioning progress uses `started` with running=false.  It belongs
+      // to the active attempt but is not the authoritative Running handshake.
+      if (
+        (payload.type === 'started' && payload.running === true) ||
+        payload.type === 'error' ||
+        payload.type === 'stopped'
+      ) {
         setIsStartingComputeNode(false);
       }
       if (payload.type === 'stopped') {
@@ -966,6 +1266,7 @@ export function App() {
 
   useEffect(() => {
     return () => {
+      cancelComputeNodeReconciliation();
       if (saveTimerRef.current !== null) {
         window.clearTimeout(saveTimerRef.current);
       }
@@ -1004,6 +1305,11 @@ export function App() {
     () => computeStatus.running || operatorControlsDisabled,
     [computeStatus.running, operatorControlsDisabled]
   );
+  const canStopComputeNode = canStopOwnedComputeNodeStart(
+    computeStatus,
+    isStartingComputeNode,
+    computeNodePriorSessionRef.current
+  ) && !isStoppingComputeNode;
   const canChangeContextTier = useMemo(
     () => isStoppedOrIdleOperatorStatus(computeStatus, isStartingComputeNode, isStoppingComputeNode),
     [computeStatus, isStartingComputeNode, isStoppingComputeNode]
@@ -1088,8 +1394,16 @@ export function App() {
   };
 
   const startComputeNode = async () => {
+    operatorRunningRenderedRef.current = false;
+    setOperatorStartDiagnostic({
+      ...initialOperatorStartDiagnostic,
+      handler: 'entered',
+    });
+    cancelComputeNodeReconciliation();
     const startAttempt = computeNodeStartAttemptRef.current + 1;
     computeNodeStartAttemptRef.current = startAttempt;
+    const startSessionId = computeStatusRef.current.operator_session_id;
+    computeNodePriorSessionRef.current = startSessionId;
     try {
       setIsStartingComputeNode(true);
       setError('');
@@ -1098,7 +1412,6 @@ export function App() {
         running: false,
         registered: false,
         relay_runtime_state: 'starting',
-        sequence: computeStatusRef.current.operator_session_id ? Number.MAX_SAFE_INTEGER : null,
         active_relay_url: primaryRelayUrl(config),
         configured_relay_urls: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url),
         relay_statuses: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url).map((relayUrl) => ({
@@ -1130,19 +1443,85 @@ export function App() {
       };
       computeStatusRef.current = optimisticStatus;
       setComputeStatus(optimisticStatus);
-      await invoke('start_compute_node', {
+      updateOperatorStartDiagnostic({ invocation: 'pending' });
+      const startPromise = invoke('start_compute_node', {
         request: {
           model_path: config.model_path,
           relay_base_url: primaryRelayUrl(config),
           relay_base_urls: normalizeRelayUrls(config.relay_base_urls, config.relay_base_url),
           mode: config.preferred_mode,
           context_tier: config.context_tier,
+          qwen_64k_batch_profile: config.qwen_64k_batch_profile,
         },
       });
+      void (async () => {
+        const reconcile = async (): Promise<void> => {
+          if (computeNodeStartAttemptRef.current !== startAttempt || computeStatusRef.current.running) {
+            computeNodeReconciliationTimerRef.current = null;
+            return;
+          }
+          try {
+            const snapshot = await invoke<Partial<ComputeNodeStatus>>('get_compute_node_status');
+            if (computeNodeStartAttemptRef.current !== startAttempt) {
+              return;
+            }
+            const previous = computeStatusRef.current;
+            const next = mergeAuthoritativeComputeStatus(previous, snapshot, startSessionId);
+            if (snapshot.running !== true) {
+              updateOperatorStartDiagnostic({ polling: 'not_running' });
+            } else {
+              updateOperatorStartDiagnostic({
+                polling: next !== previous && next.running
+                  ? 'running_accepted'
+                  : 'running_rejected',
+              });
+            }
+            if (next !== previous) {
+              computeStatusRef.current = next;
+              setComputeStatus(next);
+            }
+            const terminalType = authoritativeTerminalNonRunningType(
+              snapshot as Record<string, unknown>
+            );
+            if (next !== previous && terminalType !== null) {
+              cancelComputeNodeReconciliation();
+              setIsStartingComputeNode(false);
+              if (terminalType === 'error' && next.last_error) {
+                setError(next.last_error);
+              }
+              return;
+            }
+            if (next.running) {
+              computeNodePriorSessionRef.current = null;
+              computeNodeReconciliationTimerRef.current = null;
+              return;
+            }
+          } catch {
+            if (computeNodeStartAttemptRef.current === startAttempt) {
+              updateOperatorStartDiagnostic({ polling: 'command_failed' });
+            }
+            // The start command remains authoritative; a later lifecycle-bound
+            // poll can still reconcile a missed event without surfacing raw errors.
+          }
+          if (computeNodeStartAttemptRef.current === startAttempt) {
+            computeNodeReconciliationTimerRef.current = window.setTimeout(() => {
+              computeNodeReconciliationTimerRef.current = null;
+              void reconcile();
+            }, 250);
+          }
+        };
+        await reconcile();
+      })();
+      await startPromise;
+      if (computeNodeStartAttemptRef.current === startAttempt) {
+        updateOperatorStartDiagnostic({ invocation: 'resolved' });
+      }
     } catch (e) {
       if (computeNodeStartAttemptRef.current !== startAttempt) {
         return;
       }
+      cancelComputeNodeReconciliation();
+      updateOperatorStartDiagnostic({ invocation: 'rejected' });
       setIsStartingComputeNode(false);
       const message = formatErrorMessage(e);
       const failedStatus = {
@@ -1161,6 +1540,7 @@ export function App() {
   };
 
   const stopComputeNode = async () => {
+    cancelComputeNodeReconciliation();
     try {
       setIsStoppingComputeNode(true);
       setError('');
@@ -1238,7 +1618,18 @@ export function App() {
   };
 
   return (
-    <main style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}>
+    <main
+      data-application-initialization={applicationInitialization}
+      data-native-startup-phase={boundedNativeStartupValue(computeStatus.native_startup_phase, nativeStartupDiagnosticAllowlists.phase, 'not_started')}
+      data-native-startup-outcome={boundedNativeStartupValue(computeStatus.native_startup_outcome, nativeStartupDiagnosticAllowlists.outcome, 'not_started')}
+      data-native-startup-failure={boundedNativeStartupValue(computeStatus.native_startup_failure_category, nativeStartupDiagnosticAllowlists.failure, 'none')}
+      data-operator-start-handler={operatorStartDiagnostic.handler}
+      data-operator-start-invocation={operatorStartDiagnostic.invocation}
+      data-operator-start-native-event={operatorStartDiagnostic.nativeEvent}
+      data-operator-start-polling={operatorStartDiagnostic.polling}
+      data-operator-start-render={operatorStartDiagnostic.render}
+      style={{ maxWidth: 820, margin: '20px auto', fontFamily: 'sans-serif' }}
+    >
       <h1>token.place desktop compute node</h1>
       <p>Platform GPU availability: <strong>{backend?.availability_label ?? 'loading...'}</strong></p>
       <label htmlFor="model-path-input">Model GGUF path</label>
@@ -1356,10 +1747,28 @@ export function App() {
           </select>
         </label>
         <p style={{ marginTop: 0, fontSize: 12, color: '#555' }}>Changing tiers requires Stop Operator followed by Start Operator.</p>
+        <label style={{ display: 'block', marginBottom: 8 }}>
+          Qwen 64K batch profile
+          <select
+            aria-label="Qwen 64K batch profile"
+            aria-describedby="qwen-64k-batch-profile-help"
+            value={config.qwen_64k_batch_profile}
+            disabled={!canChangeContextTier || config.context_tier !== '64k-full'}
+            onChange={(event) => updateConfig({ ...config, qwen_64k_batch_profile: normalizeQwen64kBatchProfile(event.target.value) })}
+            style={{ display: 'block', marginTop: 4 }}
+          >
+            <option value="balanced">Balanced (Recommended)</option>
+            <option value="safe">Safe</option>
+            <option value="experimental">Experimental</option>
+          </select>
+        </label>
+        <p id="qwen-64k-batch-profile-help" style={{ marginTop: 0, fontSize: 12, color: '#555' }}>
+          64K only. Balanced: 512/256; Safe: 256/128; Experimental: 1024/512. Changing it requires stopping and restarting the operator. Experimental can increase memory use or instability.
+        </p>
         <div style={{ display: 'flex', gap: 8 }}>
           <button disabled={!canStartComputeNode} onClick={startComputeNode}>Start operator</button>
           <button
-            disabled={!computeStatus.running || operatorControlsDisabled}
+            disabled={!canStopComputeNode}
             onClick={stopComputeNode}
           >
             Stop operator

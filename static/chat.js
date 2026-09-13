@@ -1,8 +1,14 @@
 const ASSISTANT_GENERIC_FALLBACK_MESSAGE = 'Sorry, I encountered an issue generating a response. Please try again.';
+const RELAY_REQUEST_TERMINATED = Object.freeze({ relayRequestTerminated: true });
 const ASSISTANT_INVALID_RELAY_RESPONSE_MESSAGE = 'Sorry, the relay returned an invalid response. Please try again.';
 const COMPUTE_NODE_COUNT_POLL_INTERVAL_MS = 1000;
 const COMPUTE_NODE_COUNT_FETCH_TIMEOUT_MS = 1000;
-const RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000;
+// Legacy relays that omit valid deadline metadata retain the former 480-second
+// inference budget plus five seconds for ciphertext response propagation.
+const LEGACY_RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000;
+const RELAY_RESPONSE_PROPAGATION_GRACE_MS = 5000;
+const RELAY_CANCELLATION_CONFIRMATION_TIMEOUT_MS = 2000;
+const RELAY_CANCELLATION_UNCONFIRMED_MESSAGE = 'The request stopped waiting locally, but cancellation could not be confirmed. Compute may continue briefly.';
 const EMERGENCY_MODEL_FALLBACK_ID = 'qwen3-8b-instruct';
 const CONTEXT_TIER_STORAGE_KEY = 'token.place.landing.contextTier.v1';
 const DEFAULT_CONTEXT_TIER = 'auto';
@@ -10,6 +16,7 @@ const AUTO_CONTEXT_TIER = 'auto';
 const AUTO_OUTPUT_RESERVATION_TOKENS = 1024;
 const AUTO_CONTEXT_SAFETY_MARGIN_TOKENS = 1024;
 const AUTO_MESSAGE_OVERHEAD_TOKENS = 8;
+const API_V1_MAX_OUTPUT_TOKENS = 8192;
 const CONTEXT_TIER_ORDER = {
     '8k-fast': 8192,
     '64k-full': 65536
@@ -48,7 +55,10 @@ new Vue({
         computeNodeCountQueuedRefreshResolve: null,
         computeNodeCountQueuedRefreshActive: false,
         computeNodeCountFetchController: null,
-        computeNodeCountDestroyed: false
+        computeNodeCountDestroyed: false,
+        activeRelayRequest: null,
+        relayProgress: null,
+        relayProgressAnnouncement: ''
     },
     mounted() {
         this.detectTouchInput();
@@ -58,6 +68,9 @@ new Vue({
         this.refreshComputeNodeCount();
         if (typeof document !== 'undefined') {
             document.addEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
+        }
+        if (typeof window !== 'undefined') {
+            window.addEventListener('pagehide', this.handleRelayPageHide);
         }
         this.$nextTick(() => {
             this.adjustMessageInputHeight();
@@ -494,7 +507,10 @@ new Vue({
             try {
                 const params = new URLSearchParams({
                     model: this.selectedModelId,
-                    context_tier: requestedContextTier
+                    context_tier: requestedContextTier,
+                    ...(options.clientPublicKey ? { client_public_key: options.clientPublicKey } : {}),
+                    ...(options.requestId ? { request_id: options.requestId } : {}),
+                    ...(options.cancelToken ? { cancel_token: options.cancelToken } : {})
                 });
                 const response = await fetch(`/api/v1/relay/servers/next?${params.toString()}`, { cache: 'no-store' });
                 if (!response.ok) {
@@ -545,7 +561,11 @@ new Vue({
                     selected_context_window_tokens: Number.isInteger(data && data.selected_context_window_tokens)
                         ? data.selected_context_window_tokens
                         : null,
-                    selection_policy: data && typeof data.selection_policy === 'string' ? data.selection_policy : ''
+                    selection_policy: data && typeof data.selection_policy === 'string' ? data.selection_policy : '',
+                    reservation_token: data && typeof data.reservation_token === 'string' ? data.reservation_token : '',
+                    request_deadline_epoch: data && Number.isFinite(data.request_deadline_epoch) ? data.request_deadline_epoch : null,
+                    requested_model: data && typeof data.requested_model === 'string' ? data.requested_model : this.selectedModelId,
+                    requested_context_tier: data && typeof data.requested_context_tier === 'string' ? data.requested_context_tier : requestedContextTier
                 };
                 return true;
             } catch (error) {
@@ -693,7 +713,7 @@ new Vue({
             let escaped = this.escapeHtml(raw);
 
             escaped = escaped.replace(/```([\s\S]*?)```/g, (_, code) => {
-                const token = `__CODE_BLOCK_${codeBlocks.length}__`;
+                const token = `<!--tokenplacecodeblock${codeBlocks.length}-->`;
                 codeBlocks.push(`<pre><code>${code.replace(/\r?\n$/, '')}</code></pre>`);
                 return token;
             });
@@ -719,7 +739,7 @@ new Vue({
 
             for (const line of lines) {
                 const trimmed = line.trim();
-                const placeholderMatch = /^__CODE_BLOCK_(\d+)__$/.exec(trimmed);
+                const placeholderMatch = /^<!--tokenplacecodeblock(\d+)-->$/.exec(trimmed);
                 if (placeholderMatch) {
                     flushList();
                     const idx = Number(placeholderMatch[1]);
@@ -906,26 +926,125 @@ new Vue({
             return ASSISTANT_GENERIC_FALLBACK_MESSAGE;
         },
 
-        async cancelRelayRequest(clientPublicKeyB64, requestId, cancelToken) {
-            if (!clientPublicKeyB64 || !requestId || !cancelToken) {
-                return;
+        cancelRelayRequest(reason = 'requester_cancelled') {
+            const activeRequest = this.activeRelayRequest;
+            if (!activeRequest) {
+                return Promise.resolve({ attempted: false, confirmed: false, failure: null });
             }
+            if (activeRequest.cancellationAttempted) {
+                return activeRequest.cancellationPromise;
+            }
+            activeRequest.cancellationAttempted = true;
+            activeRequest.cancelled = true;
+            activeRequest.cancellationPromise = this.sendRelayCancellation(activeRequest, reason);
+            return activeRequest.cancellationPromise;
+        },
+
+        async sendRelayCancellation(activeRequest, reason) {
+            const controller = new AbortController();
+            const confirmationTimeout = setTimeout(
+                () => controller.abort(),
+                RELAY_CANCELLATION_CONFIRMATION_TIMEOUT_MS
+            );
             try {
-                await fetch('/api/v1/relay/requests/cancel', {
+                const response = await fetch('/api/v1/relay/requests/cancel', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({
-                        client_public_key: clientPublicKeyB64,
-                        request_id: requestId,
-                        cancel_token: cancelToken,
+                        client_public_key: activeRequest.clientPublicKey,
+                        request_id: activeRequest.requestId,
+                        cancel_token: activeRequest.cancelToken,
                         status: 'cancelled',
-                        reason: 'client_timeout'
-                    })
+                        reason
+                    }),
+                    keepalive: true,
+                    signal: controller.signal
                 });
-            } catch (error) {
-                console.warn('Unable to cancel timed-out API v1 relay request:', error);
+                let payload = null;
+                try {
+                    payload = await response.json();
+                } catch (_jsonError) {
+                    payload = null;
+                }
+                const terminalStatus = payload && typeof payload === 'object' ? payload.status : null;
+                const confirmed = response.ok
+                    && ['cancelled', 'expired'].includes(terminalStatus)
+                    && payload.request_id === activeRequest.requestId;
+                activeRequest.cancellationConfirmed = confirmed;
+                if (!confirmed) {
+                    console.warn('API v1 relay request cancellation was not confirmed.');
+                }
+                return { attempted: true, confirmed, failure: confirmed ? null : 'unconfirmed_response' };
+            } catch (_error) {
+                activeRequest.cancellationConfirmed = false;
+                console.warn('API v1 relay request cancellation was not confirmed.');
+                return { attempted: true, confirmed: false, failure: 'network_failure' };
+            } finally {
+                clearTimeout(confirmationTimeout);
+            }
+        },
+
+        handleRelayPageHide() {
+            const activeRequest = this.activeRelayRequest;
+            const requestId = activeRequest && activeRequest.requestId;
+            this.terminateRelayRequestLocally(activeRequest);
+            const cancellationPromise = this.cancelRelayRequest('requester_cancelled');
+            this.clearActiveRelayRequest(requestId);
+            Promise.resolve(cancellationPromise)
+                .catch(() => null)
+                .finally(() => this.clearActiveRelayRequest(requestId));
+        },
+
+        terminateRelayRequestLocally(activeRequest) {
+            if (!activeRequest || activeRequest.terminated) {
+                return;
+            }
+            activeRequest.terminated = true;
+            if (activeRequest.retrievalController) {
+                activeRequest.retrievalController.abort();
+            }
+            activeRequest.resolveTermination(RELAY_REQUEST_TERMINATED);
+        },
+
+        clearActiveRelayRequest(requestId) {
+            if (this.activeRelayRequest && this.activeRelayRequest.requestId === requestId) {
+                this.activeRelayRequest = null;
+                this.relayProgress = null;
+                this.relayProgressAnnouncement = '';
+            }
+        },
+
+        relayProgressText(progress = this.relayProgress) {
+            return window.TokenPlaceProgress.relayProgressText(progress);
+        },
+
+        async applyEncryptedRelayProgress(outer, activeRequest) {
+            try {
+                if (this.activeRelayRequest !== activeRequest || activeRequest.terminated || !outer
+                    || outer.client_public_key !== activeRequest.clientPublicKey
+                    || outer.request_id !== activeRequest.requestId
+                    || outer.protocol !== 'tokenplace_api_v1_relay_e2ee' || outer.version !== 1) return;
+                const plaintext = await this.decrypt(outer.ciphertext, outer.cipherkey, outer.iv);
+                if (this.activeRelayRequest !== activeRequest || activeRequest.terminated || !plaintext) return;
+                const envelope = JSON.parse(plaintext);
+                const progress = envelope && envelope.api_v1_progress;
+                if (!window.TokenPlaceProgress.validProgressEnvelope(envelope, activeRequest.requestId,
+                    activeRequest.clientPublicKey, activeRequest.lastProgressSequence)) return;
+                if (this.activeRelayRequest !== activeRequest || activeRequest.terminated) return;
+                const old = this.relayProgress;
+                const oldMilestone = old && old.total_prompt_tokens > 0
+                    ? Math.floor((old.processed_prompt_tokens / old.total_prompt_tokens) * 4) : -1;
+                const milestone = progress.total_prompt_tokens > 0
+                    ? Math.floor((progress.processed_prompt_tokens / progress.total_prompt_tokens) * 4) : -1;
+                activeRequest.lastProgressSequence = progress.sequence;
+                this.relayProgress = { ...progress };
+                if (!old || old.phase !== progress.phase || milestone !== oldMilestone) {
+                    this.relayProgressAnnouncement = this.relayProgressText(progress);
+                }
+            } catch (_error) {
+                // Progress is best-effort and never changes the completion lifecycle.
             }
         },
 
@@ -954,51 +1073,174 @@ new Vue({
             return 1;
         },
 
-        async retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken) {
-            const timeoutMs = RELAY_RESPONSE_POLL_TIMEOUT_MS;
+        validRelayDeadlineSeconds(value) {
+            return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+        },
+
+        validRelayDeadlineRemainingSeconds(value) {
+            return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+        },
+
+        relayResponseDeadlineFromAdmission(admissionPayload, admittedAtMs) {
+            const ttlSeconds = admissionPayload && typeof admissionPayload === 'object'
+                ? this.validRelayDeadlineSeconds(admissionPayload.request_ttl_seconds)
+                : null;
+            return ttlSeconds === null
+                ? admittedAtMs + LEGACY_RELAY_RESPONSE_POLL_TIMEOUT_MS
+                : admittedAtMs + (ttlSeconds * 1000) + RELAY_RESPONSE_PROPAGATION_GRACE_MS;
+        },
+
+        shortenRelayResponseDeadline(currentDeadlineMs, pendingPayload, observedAtMs) {
+            if (!pendingPayload || typeof pendingPayload !== 'object') {
+                return currentDeadlineMs;
+            }
+            const candidates = [
+                this.validRelayDeadlineRemainingSeconds(pendingPayload.request_deadline_remaining_seconds),
+                this.validRelayDeadlineSeconds(pendingPayload.request_ttl_seconds)
+            ].filter((value) => value !== null);
+            if (!candidates.length) {
+                return currentDeadlineMs;
+            }
+            const relayDeadlineMs = observedAtMs + (Math.min(...candidates) * 1000) + RELAY_RESPONSE_PROPAGATION_GRACE_MS;
+            return Math.min(currentDeadlineMs, relayDeadlineMs);
+        },
+
+        cancellationFailureUserMessage(baseMessage, cancellationResult) {
+            return cancellationResult && cancellationResult.attempted && !cancellationResult.confirmed
+                ? `${baseMessage} ${RELAY_CANCELLATION_UNCONFIRMED_MESSAGE}`
+                : baseMessage;
+        },
+
+        async retrieveRelayResponse(clientPublicKeyB64, requestId, responseDeadlineMs) {
             const pollIntervalMs = 500;
-            const deadline = Date.now() + timeoutMs;
+            let deadline = responseDeadlineMs;
+            const activeRequest = this.activeRelayRequest;
+            const waitForOperation = (operation) => Promise.race([
+                operation,
+                activeRequest.terminationPromise
+            ]);
 
             while (Date.now() < deadline) {
-                const response = await fetch('/api/v1/relay/responses/retrieve', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        client_public_key: clientPublicKeyB64,
-                        request_id: requestId
-                    })
-                });
+                if (activeRequest.terminated) {
+                    return RELAY_REQUEST_TERMINATED;
+                }
+                let response;
+                try {
+                    response = await waitForOperation(fetch('/api/v1/relay/responses/retrieve', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            client_public_key: clientPublicKeyB64,
+                            request_id: requestId,
+                            retrieval_credential: activeRequest.retrievalCredential
+                        }),
+                        signal: activeRequest.retrievalController.signal
+                    }));
+                } catch (error) {
+                    if (activeRequest.terminated) {
+                        return RELAY_REQUEST_TERMINATED;
+                    }
+                    const cancellation = await this.cancelRelayRequest('requester_cancelled');
+                    this.clearActiveRelayRequest(requestId);
+                    return { error: { userMessage: this.cancellationFailureUserMessage(ASSISTANT_GENERIC_FALLBACK_MESSAGE, cancellation) } };
+                }
+                if (response === RELAY_REQUEST_TERMINATED) {
+                    return response;
+                }
 
                 if (response.status === 202) {
-                    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+                    let pendingPayload = null;
+                    try {
+                        pendingPayload = await waitForOperation(response.json());
+                    } catch (_jsonError) {
+                        if (activeRequest.terminated) {
+                            return RELAY_REQUEST_TERMINATED;
+                        }
+                        pendingPayload = null;
+                    }
+                    if (pendingPayload === RELAY_REQUEST_TERMINATED) {
+                        return pendingPayload;
+                    }
+                    if (pendingPayload && pendingPayload.encrypted_progress) {
+                        await this.applyEncryptedRelayProgress(pendingPayload.encrypted_progress, activeRequest);
+                    }
+                    deadline = this.shortenRelayResponseDeadline(deadline, pendingPayload, Date.now());
+                    const pollDelay = await waitForOperation(
+                        new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+                    );
+                    if (pollDelay === RELAY_REQUEST_TERMINATED) {
+                        return pollDelay;
+                    }
                     continue;
                 }
 
                 if (!response.ok) {
                     let errorData = null;
                     try {
-                        errorData = await response.json();
+                        errorData = await waitForOperation(response.json());
                     } catch (_jsonError) {
+                        if (activeRequest.terminated) {
+                            return RELAY_REQUEST_TERMINATED;
+                        }
                         errorData = null;
                     }
+                    if (errorData === RELAY_REQUEST_TERMINATED) {
+                        return errorData;
+                    }
                     const userMessage = this.getUserFacingRelayRetrieveError(response.status);
+                    const terminalStatus = errorData && typeof errorData === 'object'
+                        && errorData.error && typeof errorData.error === 'object'
+                        ? errorData.error.status
+                        : null;
+                    const relayConfirmedTerminal = response.status === 410
+                        && ['cancelled', 'expired'].includes(terminalStatus);
+                    let cancellation;
+                    if (relayConfirmedTerminal) {
+                        const activeRequest = this.activeRelayRequest;
+                        if (activeRequest && activeRequest.requestId === requestId) {
+                            activeRequest.cancelled = true;
+                            activeRequest.cancellationConfirmed = true;
+                        }
+                        cancellation = { attempted: false, confirmed: true, failure: null };
+                    } else {
+                        cancellation = await this.cancelRelayRequest('requester_cancelled');
+                    }
+                    this.clearActiveRelayRequest(requestId);
                     return {
                         error: {
-                            userMessage,
+                            userMessage: this.cancellationFailureUserMessage(userMessage, cancellation),
                             terminalSelectedServer: this.isTerminalSelectedServerError(response.status, errorData)
                         }
                     };
                 }
 
-                return response.json();
+                try {
+                    return await waitForOperation(response.json());
+                } catch (_jsonError) {
+                    if (activeRequest.terminated) {
+                        return RELAY_REQUEST_TERMINATED;
+                    }
+                    const cancellation = await this.cancelRelayRequest('requester_cancelled');
+                    return {
+                        error: {
+                            userMessage: this.cancellationFailureUserMessage(
+                                ASSISTANT_GENERIC_FALLBACK_MESSAGE,
+                                cancellation
+                            )
+                        }
+                    };
+                } finally {
+                    this.clearActiveRelayRequest(requestId);
+                }
             }
 
-            await this.cancelRelayRequest(clientPublicKeyB64, requestId, cancelToken);
+            const cancellation = await this.cancelRelayRequest('client_timeout');
+            this.clearActiveRelayRequest(requestId);
             return {
                 error: {
-                    userMessage: 'The LLM server took too long to respond. Please try again.'
+                    userMessage: this.cancellationFailureUserMessage('The LLM server took too long to respond. Please try again.', cancellation)
                 }
             };
         },
@@ -1012,6 +1254,9 @@ new Vue({
 
             const apiV1Messages = options.apiV1Messages || this.createApiV1Messages(messageContent);
             const tierResolution = options.tierResolution || this.resolveContextTierForRequest(apiV1Messages, this.selectedContextTier);
+            const requestId = this.createRequestId();
+            const cancelToken = this.createRequestId();
+            const clientPublicKeyB64 = this.encodeClientPublicKeyForApi();
             const selectedServerContextTierForRequest = this.selectedProfileMetadata && this.selectedProfileMetadata.selected_context_tier
                 ? this.selectedProfileMetadata.selected_context_tier
                 : '';
@@ -1029,7 +1274,10 @@ new Vue({
                 );
             const selectedServer = await this.ensureSelectedServer({
                 requestedContextTier: tierResolution.requestedContextTier,
-                forceReselect
+                forceReselect: true,
+                clientPublicKey: clientPublicKeyB64,
+                requestId,
+                cancelToken
             });
             if (selectedServer !== true) {
                 return selectedServer;
@@ -1038,9 +1286,6 @@ new Vue({
                 ? this.selectedProfileMetadata.selected_context_tier
                 : '';
 
-            const requestId = this.createRequestId();
-            const cancelToken = this.createRequestId();
-            const clientPublicKeyB64 = this.encodeClientPublicKeyForApi();
             const plaintextEnvelope = {
                 protocol: 'tokenplace_api_v1_relay_e2ee',
                 version: 1,
@@ -1049,7 +1294,7 @@ new Vue({
                 api_v1_request: {
                     model: this.selectedModelId,
                     messages: apiV1Messages,
-                    options: {},
+                    options: { max_tokens: API_V1_MAX_OUTPUT_TOKENS },
                     routing: {
                         context_tier: tierResolution.requestedContextTier
                     }
@@ -1075,7 +1320,11 @@ new Vue({
                     ciphertext: encryptedData.ciphertext,
                     cipherkey: encryptedData.cipherkey,
                     iv: encryptedData.iv,
-                    cancel_token: cancelToken
+                    cancel_token: cancelToken,
+                    reservation_token: this.selectedProfileMetadata.reservation_token,
+                    requested_model: this.selectedProfileMetadata.requested_model,
+                    requested_context_tier: this.selectedProfileMetadata.requested_context_tier,
+                    request_deadline_epoch: this.selectedProfileMetadata.request_deadline_epoch
                 };
 
                 const dispatchResponse = await fetch('/api/v1/relay/requests', {
@@ -1105,7 +1354,47 @@ new Vue({
                     };
                 }
 
-                const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, cancelToken);
+                const admittedAtMs = Date.now();
+                const activeRelayRequest = {
+                    clientPublicKey: clientPublicKeyB64,
+                    requestId,
+                    cancelToken,
+                    retrievalCredential: this.selectedProfileMetadata.reservation_token,
+                    cancelled: false,
+                    cancellationAttempted: false,
+                    cancellationConfirmed: false,
+                    cancellationPromise: null,
+                    terminated: false,
+                    retrievalController: new AbortController(),
+                    terminationPromise: null,
+                    resolveTermination: null,
+                    lastProgressSequence: 0
+                };
+                activeRelayRequest.terminationPromise = new Promise((resolve) => {
+                    activeRelayRequest.resolveTermination = resolve;
+                });
+                this.activeRelayRequest = activeRelayRequest;
+                this.relayProgress = { phase: 'waiting' };
+                this.relayProgressAnnouncement = 'Waiting for compute node…';
+
+                let admissionPayload = null;
+                try {
+                    admissionPayload = await dispatchResponse.json();
+                } catch (_jsonError) {
+                    admissionPayload = null;
+                }
+                if (admissionPayload && typeof admissionPayload.retrieval_credential === 'string') {
+                    activeRelayRequest.retrievalCredential = admissionPayload.retrieval_credential;
+                }
+                if (this.activeRelayRequest !== activeRelayRequest || activeRelayRequest.cancelled) {
+                    return RELAY_REQUEST_TERMINATED;
+                }
+                const responseDeadlineMs = this.relayResponseDeadlineFromAdmission(admissionPayload, admittedAtMs);
+
+                const encryptedResponse = await this.retrieveRelayResponse(clientPublicKeyB64, requestId, responseDeadlineMs);
+                if (encryptedResponse === RELAY_REQUEST_TERMINATED) {
+                    return encryptedResponse;
+                }
                 if (encryptedResponse && encryptedResponse.error) {
                     return encryptedResponse;
                 }
@@ -1178,6 +1467,9 @@ new Vue({
                     });
                     preserveSelectedServerForDispatch = false;
                     forceReselectForDispatch = false;
+                    if (response === RELAY_REQUEST_TERMINATED) {
+                        return response;
+                    }
                     if (response && response.error && response.error.terminalSelectedServer === true && this.selectedServerPublicKeyB64) {
                         terminallyFailedServerPublicKeysB64.add(this.selectedServerPublicKeyB64);
                     }
@@ -1267,7 +1559,7 @@ new Vue({
             return Math.min(6, Math.ceil(length / 48));
         },
 
-        appendAssistantMessage(message) {
+        appendAssistantMessage(message, finishReason = null) {
             if (!message || typeof message !== 'object') {
                 return;
             }
@@ -1279,7 +1571,10 @@ new Vue({
                 console.warn('relayApiV1NonStreaming is disabled; forcing atomic render fallback.');
             }
 
-            const entry = Object.assign({}, message, { isTyping: false });
+            const entry = Object.assign({}, message, {
+                isTyping: false,
+                finishReason: finishReason === 'length' ? 'length' : null
+            });
             this.chatHistory.push(entry);
         },
 
@@ -1411,6 +1706,10 @@ new Vue({
                 // Relay-path landing chat in v0.1.0 is API v1-only and non-streaming.
                 let response = await this.sendMessageApi(messageContent);
 
+                if (response === RELAY_REQUEST_TERMINATED) {
+                    return;
+                }
+
                 // Process the response
                 if (response) {
                     const normalizedError = this.normalizeApiV1ResponseError(response);
@@ -1429,7 +1728,7 @@ new Vue({
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
                             throw new Error('invalid_assistant_response_content');
                         }
-                        this.appendAssistantMessage(assistantMessage);
+                        this.appendAssistantMessage(assistantMessage, response.finish_reason);
                     }
                     // OpenAI-compatible API v1 choices envelope.
                     else if (response.choices && response.choices.length > 0) {
@@ -1437,7 +1736,7 @@ new Vue({
                         if (this.isInvalidAssistantResponseContent(assistantMessage && assistantMessage.content)) {
                             throw new Error('invalid_assistant_response_content');
                         }
-                        this.appendAssistantMessage(assistantMessage);
+                        this.appendAssistantMessage(assistantMessage, response.choices[0].finish_reason);
                     }
                     else {
                         throw new Error('Unexpected response format');
@@ -1478,6 +1777,16 @@ new Vue({
         if (typeof document !== 'undefined') {
             document.removeEventListener('visibilitychange', this.handleComputeNodeCountVisibilityChange);
         }
+        if (typeof window !== 'undefined') {
+            window.removeEventListener('pagehide', this.handleRelayPageHide);
+        }
+        const activeRequest = this.activeRelayRequest;
+        const activeRequestId = activeRequest && activeRequest.requestId;
+        this.terminateRelayRequestLocally(activeRequest);
+        this.cancelRelayRequest('requester_cancelled');
+        this.clearActiveRelayRequest(activeRequestId);
+        this.relayProgress = null;
+        this.relayProgressAnnouncement = '';
         if (!Array.isArray(this.chatHistory)) {
             return;
         }

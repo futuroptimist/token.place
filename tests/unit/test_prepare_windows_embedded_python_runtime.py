@@ -233,7 +233,18 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
     monkeypatch.setattr(prep, 'safe_extract_tar', fake_extract)
     monkeypatch.setattr(prep, 'run', fake_run)
     monkeypatch.setattr(prep, 'validate_runtime_payload', lambda runtime, data: [])
-    monkeypatch.setattr(prep, 'validate_staged_native_import', lambda runtime, data, closure: None)
+    native_import_events = []
+    monkeypatch.setattr(
+        prep,
+        'validate_staged_native_import',
+        lambda runtime, data, closure: native_import_events.append('validate')
+        or prep.STAGED_NATIVE_IMPORT_VALID,
+    )
+    monkeypatch.setattr(
+        prep,
+        'write_provenance',
+        lambda runtime, data, closure: native_import_events.append('provenance'),
+    )
     monkeypatch.setattr(prep.platform, 'machine', lambda: 'AMD64')
 
     prep.prepare(m)
@@ -247,6 +258,41 @@ def test_prepare_installs_baseline_packages_binary_only(tmp_path, monkeypatch):
     assert '--require-hashes' in baseline_cmd
     assert '--find-links' in baseline_cmd
     assert requirement_texts == ['alpha==1.0 --hash=sha256:23456789abcdeffedcba98765432100123456789abcdeffedcba987654321012' + '\n']
+    assert native_import_events == ['validate', 'provenance']
+
+
+@pytest.mark.parametrize(
+    ('state', 'expected'),
+    [
+        (
+            prep.STAGED_NATIVE_IMPORT_VALID,
+            '{"record":"windows_runtime.staged_native_import","schema_version":1,'
+            '"state":"native_import_valid"}\n',
+        ),
+        (
+            prep.STAGED_NATIVE_IMPORT_EXTERNAL_DRIVER_UNAVAILABLE,
+            '{"record":"windows_runtime.staged_native_import","schema_version":1,'
+            '"state":"external_driver_unavailable"}\n',
+        ),
+    ],
+)
+def test_log_staged_native_import_state_is_bounded(state, expected, capsys):
+    prep.log_staged_native_import_state(state)
+
+    assert capsys.readouterr().out == expected
+
+
+def test_log_staged_native_import_state_rejects_unexpected_value_without_disclosure(capsys):
+    unexpected = 'private-host-dependent-value'
+
+    with pytest.raises(
+        prep.RuntimePrepError,
+        match='^staged native import returned unexpected state$',
+    ) as excinfo:
+        prep.log_staged_native_import_state(unexpected)
+
+    assert unexpected not in str(excinfo.value)
+    assert capsys.readouterr().out == ''
 
 
 def test_sha256_file_and_fetch_rejects_unpinned_or_mismatched_artifacts(tmp_path):
@@ -749,7 +795,11 @@ def test_prepare_restores_previous_runtime_when_promotion_fails(tmp_path, monkey
     monkeypatch.setattr(prep, 'validate_wheel', lambda whl, data: None)
     monkeypatch.setattr(prep, 'validate_installed_inventory', lambda py, data: None)
     monkeypatch.setattr(prep, 'validate_runtime_payload', lambda runtime, data: [])
-    monkeypatch.setattr(prep, 'validate_staged_native_import', lambda runtime, data, closure: None)
+    monkeypatch.setattr(
+        prep,
+        'validate_staged_native_import',
+        lambda runtime, data, closure: prep.STAGED_NATIVE_IMPORT_VALID,
+    )
 
     def fake_extract(_archive, dest):
         staged = dest / 'cpython'

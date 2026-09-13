@@ -34,8 +34,10 @@ from copy import deepcopy
 from typing import Dict, Tuple, Any, List, Optional, Union, Iterator
 import time
 import uuid
+import secrets
 
 DEFAULT_API_V1_MODEL_ID = "qwen3-8b-instruct"
+DEFAULT_API_V1_CONTEXT_TIER = "8k-fast"
 
 # Import encryption functions
 from encrypt import (
@@ -166,6 +168,14 @@ class CryptoClient:
         """
         if self.server_public_key is None:
             raise ValueError("Server public key not available. Call fetch_server_public_key() first.")
+        return self._encrypt_message_for_key(message, self.server_public_key)
+
+    def _encrypt_message_for_key(
+        self,
+        message: Union[Dict, List, str, bytes],
+        server_public_key: bytes,
+    ) -> Dict[str, str]:
+        """Encrypt a message with request-local server key material."""
         if message is None:
             raise ValueError("message cannot be None")
         if not isinstance(message, (dict, list, str, bytes)):
@@ -182,7 +192,7 @@ class CryptoClient:
         logger.debug("Encrypting message of length %d bytes", len(plaintext))
 
         # Encrypt the message
-        encrypted_dict, cipherkey, iv = encrypt(plaintext, self.server_public_key)
+        encrypted_dict, cipherkey, iv = encrypt(plaintext, server_public_key)
 
         # Convert to Base64 for transmission
         return {
@@ -304,14 +314,57 @@ class CryptoClient:
                 return None
             chat_history = message
 
-        # Ensure we have the server's public key
-        if not self.server_public_key and not self.fetch_server_public_key():
-            logger.error("Failed to get server public key")
-            return None
-
         logger.debug("Sending chat message with %d entries", len(chat_history))
 
         request_id = f"crypto-client-{uuid.uuid4().hex}"
+        cancel_token = secrets.token_hex(32)
+        selection_params = {
+            "client_public_key": self.client_public_key_b64,
+            "request_id": request_id,
+            "cancel_token": cancel_token,
+            "model": DEFAULT_API_V1_MODEL_ID,
+            "context_tier": DEFAULT_API_V1_CONTEXT_TIER,
+        }
+        try:
+            selection_response = requests.get(
+                f"{self.base_url}/api/v1/relay/servers/next",
+                params=selection_params,
+                timeout=10,
+            )
+            if selection_response.status_code != 200:
+                logger.error("Failed to select relay server: %s", selection_response.status_code)
+                return None
+            selection = selection_response.json()
+        except Exception as e:
+            logger.error(
+                "Exception while selecting relay server: %s",
+                e.__class__.__name__,
+                exc_info=self.debug,
+            )
+            return None
+
+        server_public_key = selection.get("server_public_key")
+        reservation_token = selection.get("reservation_token")
+        selected_model = selection.get("requested_model")
+        selected_tier = selection.get("requested_context_tier")
+        request_deadline_epoch = selection.get("request_deadline_epoch")
+        if not (
+            isinstance(server_public_key, str)
+            and server_public_key
+            and isinstance(reservation_token, str)
+            and reservation_token
+            and selected_model == DEFAULT_API_V1_MODEL_ID
+            and selected_tier == DEFAULT_API_V1_CONTEXT_TIER
+            and isinstance(request_deadline_epoch, (int, float))
+            and not isinstance(request_deadline_epoch, bool)
+        ):
+            logger.error("Relay server selection returned invalid reservation metadata")
+            return None
+        try:
+            selected_server_key = base64.b64decode(server_public_key, validate=True)
+        except (TypeError, ValueError):
+            logger.error("Relay server selection returned an invalid public key")
+            return None
 
         plaintext_envelope = {
             "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -326,7 +379,7 @@ class CryptoClient:
         }
 
         try:
-            encrypted_data = self.encrypt_message(plaintext_envelope)
+            encrypted_data = self._encrypt_message_for_key(plaintext_envelope, selected_server_key)
         except Exception as e:
             logger.error(
                 "Failed to encrypt API v1 relay envelope: %s",
@@ -340,7 +393,12 @@ class CryptoClient:
             'protocol': 'tokenplace_api_v1_relay_e2ee',
             'version': 1,
             'client_public_key': self.client_public_key_b64,
-            'server_public_key': self.server_public_key_b64,
+            'server_public_key': server_public_key,
+            'cancel_token': cancel_token,
+            'reservation_token': reservation_token,
+            'requested_model': selected_model,
+            'requested_context_tier': selected_tier,
+            'request_deadline_epoch': request_deadline_epoch,
             'chat_history': encrypted_data['ciphertext'],
             'cipherkey': encrypted_data['cipherkey'],
             'iv': encrypted_data['iv']
@@ -355,6 +413,11 @@ class CryptoClient:
             logger.error("Unexpected response from API v1 relay requests")
             return None
 
+        retrieval_credential = response.get("retrieval_credential")
+        if not isinstance(retrieval_credential, str) or not retrieval_credential:
+            logger.error("API v1 relay request returned invalid retrieval metadata")
+            return None
+
         logger.debug("Message sent successfully, waiting for processing")
 
         # Wait for processing
@@ -366,6 +429,7 @@ class CryptoClient:
             max_retries,
             expected_request_id=request_id,
             chat_history=chat_history,
+            retrieval_credential=retrieval_credential,
         )
 
     def retrieve_chat_response(
@@ -374,6 +438,7 @@ class CryptoClient:
         retry_delay: int = 2,
         expected_request_id: Optional[str] = None,
         chat_history: Optional[List[Dict]] = None,
+        retrieval_credential: Optional[str] = None,
     ) -> Optional[List[Dict]]:
         """
         Retrieve and decrypt a chat response from the server
@@ -383,6 +448,7 @@ class CryptoClient:
             retry_delay: Delay between retries in seconds
             expected_request_id: Optional API v1 relay request id to retrieve.
             chat_history: Original chat history for the matching request.
+            retrieval_credential: Request-local credential returned by enqueue.
 
         Returns:
             Decrypted chat history or None if failed
@@ -392,6 +458,8 @@ class CryptoClient:
         }
         if expected_request_id:
             payload['request_id'] = expected_request_id
+        if retrieval_credential:
+            payload['retrieval_credential'] = retrieval_credential
 
         max_attempts = max(int(max_retries), 1)
         logger.debug(f"Attempting to retrieve response, max retries: {max_retries}")

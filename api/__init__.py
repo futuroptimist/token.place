@@ -10,21 +10,36 @@ import sys
 import time
 from typing import Any
 
-from flask import Response, jsonify, request
+from flask import Response, g, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
-from flask_limiter.util import get_remote_address
 from limits.storage import storage_from_string
 from limits.strategies import FixedWindowRateLimiter
 from limits.util import parse
+from prometheus_client import Counter
 from prometheus_flask_exporter import PrometheusMetrics
 
+from api.client_identity import (
+    ClientIdentityPolicy, current_client_address, current_limiter_key,
+)
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 from config import get_config
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
 LOGGER = logging.getLogger("tokenplace.api")
+
+PUBLIC_QUOTA_ROUTE_CLASSES = (
+    "root", "public_metadata", "public_version", "api_v1", "api_v2",
+    "operational", "static", "control_plane", "other_known", "unmatched",
+)
+PUBLIC_QUOTA_METHODS = (
+    "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "other",
+)
+PUBLIC_QUOTA_OUTCOMES = ("accepted", "exempt", "rejected")
+PUBLIC_QUOTA_REASONS = (
+    "none", "hourly_limit", "daily_limit", "other_limit", "other_rejection",
+)
 
 CONTROL_PLANE_ROUTE_CLASS = "compute_node_control_plane"
 CONTROL_PLANE_DEFAULT_LIMIT_ENV = "API_RELAY_CONTROL_PLANE_RATE_LIMIT"
@@ -35,6 +50,7 @@ CONTROL_PLANE_ROUTE_LIMIT_ENVS = {
     "/api/v1/relay/servers/poll": "API_RELAY_CONTROL_PLANE_POLL_RATE_LIMIT",
     "/api/v1/relay/servers/control": "API_RELAY_CONTROL_PLANE_CONTROL_RATE_LIMIT",
     "/api/v1/relay/responses": "API_RELAY_CONTROL_PLANE_RESPONSE_RATE_LIMIT",
+    "/api/v1/relay/progress": "API_RELAY_CONTROL_PLANE_PROGRESS_RATE_LIMIT",
 }
 CONTROL_PLANE_ROUTE_DEFAULT_LIMITS = {
     "/api/v1/relay/servers/register": "240/hour",
@@ -42,6 +58,7 @@ CONTROL_PLANE_ROUTE_DEFAULT_LIMITS = {
     "/api/v1/relay/servers/poll": "1200/hour",
     "/api/v1/relay/servers/control": "1200/hour",
     "/api/v1/relay/responses": "1200/hour",
+    "/api/v1/relay/progress": "7200/hour",
 }
 CONTROL_PLANE_IP_DEFAULT_LIMIT = "10000/hour"
 
@@ -75,6 +92,7 @@ PUBLIC_API_V1_CORS_EXCLUDED_PATHS = frozenset(
     {
         "/api/v1/public-key/rotate",
         "/api/v1/relay/responses",
+        "/api/v1/relay/progress",
         "/api/v1/relay/servers/control",
         "/api/v1/relay/servers/poll",
         "/api/v1/relay/servers/register",
@@ -415,13 +433,13 @@ def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]
         identity = _response_envelope_identity_for_rate_limit(data)
         if identity is not None:
             return identity
-        return "client_ip", get_remote_address()
+        return "client_ip", current_client_address()
 
-    if path in {"/api/v1/relay/servers/control", "/api/v1/relay/servers/unregister"}:
+    if path in {"/api/v1/relay/servers/control", "/api/v1/relay/servers/unregister", "/api/v1/relay/progress"}:
         identity = _control_server_owner_identity(data)
         if identity is not None:
             return identity
-        return "client_ip", get_remote_address()
+        return "client_ip", current_client_address()
 
     if isinstance(data, dict) and path in {
         "/api/v1/relay/servers/register",
@@ -431,7 +449,7 @@ def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]
         server_public_key = data.get("server_public_key")
         if isinstance(server_public_key, str) and server_public_key.strip():
             return "server_public_key", server_public_key.strip()
-    return "client_ip", get_remote_address()
+    return "client_ip", current_client_address()
 
 
 def _control_plane_bucket_identifier(
@@ -462,7 +480,6 @@ def _control_plane_storage_decr(
     if decr is None:
         LOGGER.warning(
             "rate_limit.control_plane_rollback_unavailable",
-            extra={"limiter_bucket_fingerprint": _fingerprint(":".join(identifiers))},
         )
         return
     decr(limit_item.key_for(*identifiers))
@@ -563,7 +580,21 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         if route_limit is None or request.method != "POST":
             return None
 
-        remote_address = get_remote_address()
+        # Progress is the only control-plane request carrying a comparatively
+        # large opaque envelope.  Bound it before JSON parsing (including when
+        # a chunked request has no Content-Length), otherwise get_json() below
+        # would buffer an attacker-controlled body before the route can reject
+        # it.  Cache only the bounded bytes so the route sees the same body.
+        if route == "/api/v1/relay/progress":
+            body_limit = 16 * 1024
+            if request.content_length is not None and request.content_length > body_limit:
+                return jsonify({"error": {"message": "Progress envelope too large", "code": 413}}), 413
+            raw_body = request.stream.read(body_limit + 1)
+            if len(raw_body) > body_limit:
+                return jsonify({"error": {"message": "Progress envelope too large", "code": 413}}), 413
+            request._cached_data = raw_body
+
+        remote_address = current_client_address()
         checks: list[tuple[str, str, Any]] = [
             ("client_ip", remote_address, route_limit["ip"])
         ]
@@ -576,7 +607,7 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         identity_kind, identity_value = _control_plane_identity_for_request(route, data)
         allow_identity_bucket = _relay_server_token_boundary_has_configured_token()
         if (
-            route == "/api/v1/relay/servers/control"
+            route in {"/api/v1/relay/servers/control", "/api/v1/relay/progress"}
             and identity_kind != "client_ip"
             and identity_value != remote_address
         ):
@@ -586,7 +617,7 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         ):
             checks.append((identity_kind, identity_value, route_limit["identity"]))
 
-        allowed, retry_after, bucket_kind, bucket_key, limit_item = (
+        allowed, retry_after, bucket_kind, _bucket_key, limit_item = (
             _check_control_plane_limits(
                 control_plane_rate_limiter,
                 checks,
@@ -596,17 +627,16 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         if allowed:
             return None
 
-        bucket_fingerprint = _fingerprint(bucket_key)
         LOGGER.warning(
             "relay_control_plane_rate_limited",
             extra={
                 "route": route,
                 "route_class": CONTROL_PLANE_ROUTE_CLASS,
                 "limiter_bucket_kind": bucket_kind,
-                "limiter_bucket_fingerprint": bucket_fingerprint,
                 "retry_after": retry_after,
             },
         )
+        g.tokenplace_public_quota_reason = "other_limit"
         return _build_control_plane_rate_limit_response(limit_item, retry_after)
 
 
@@ -636,7 +666,92 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
     return response
 
 
-def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metrics_path="/metrics"):
+def _public_quota_method(method: str | None) -> str:
+    normalized = method.upper() if isinstance(method, str) else ""
+    return normalized if normalized in PUBLIC_QUOTA_METHODS[:-1] else "other"
+
+
+def _public_quota_route_class() -> str:
+    """Classify the matched Flask rule without exporting request path data."""
+
+    if request.url_rule is None:
+        return "unmatched"
+    endpoint = request.endpoint or ""
+    exact_endpoints = {
+        "index": "root",
+        "api_v1_meta": "public_metadata",
+        "api_v1_version": "public_version",
+        "healthz": "operational",
+        "livez": "operational",
+        "metrics": "operational",
+        "relay_diagnostics": "operational",
+        "serve_static": "static",
+    }
+    if endpoint in exact_endpoints:
+        return exact_endpoints[endpoint]
+    rule = request.url_rule.rule
+    if _normalized_path(rule) in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS:
+        return "control_plane"
+    if endpoint.startswith(("v1.", "openai_v1.")) or rule.startswith(("/api/v1/", "/v1/")):
+        return "api_v1"
+    if endpoint.startswith(("v2.", "openai_v2.")) or rule.startswith(("/api/v2/", "/v2/")):
+        return "api_v2"
+    return "other_known"
+
+
+def _public_quota_limit_reason(exc: RateLimitExceeded) -> str:
+    """Map Flask-Limiter metadata to a reviewed reason without exporting it."""
+
+    granularity = getattr(getattr(exc.limit.limit, "GRANULARITY", None), "name", "")
+    normalized = str(granularity).lower()
+    if normalized == "day":
+        return "daily_limit"
+    if normalized == "hour":
+        return "hourly_limit"
+    return "other_limit"
+
+
+def _install_public_quota_metrics(app, registry) -> None:
+    """Install the bounded public HTTP quota-outcome counter when configured."""
+
+    if registry is None:
+        return
+    counter = Counter(
+        "tokenplace_public_http_quota_outcomes_total",
+        "Public HTTP quota decisions using only fixed application-owned classes.",
+        ("route_class", "method", "outcome", "reason"),
+        registry=registry,
+    )
+    app.extensions["tokenplace_public_quota_counter"] = counter
+
+    @app.after_request
+    def _record_public_quota_outcome(response):
+        # The relay owns this endpoint and serializes the registry before
+        # after-request callbacks run.  Do not let observing quota telemetry
+        # change the counter exposed by the following scrape.
+        if request.endpoint == "metrics":
+            return response
+        reason = getattr(g, "tokenplace_public_quota_reason", None)
+        if response.status_code == 429:
+            outcome = "rejected"
+            rejection_reasons = {
+                "hourly_limit", "daily_limit", "other_limit", "other_rejection",
+            }
+            reason = reason if reason in rejection_reasons else "other_rejection"
+        elif _is_public_api_rate_limit_exempt_path(request.path):
+            outcome = "exempt"
+            reason = "none"
+        else:
+            outcome = "accepted"
+            reason = "none"
+        counter.labels(
+            _public_quota_route_class(), _public_quota_method(request.method), outcome, reason,
+        ).inc()
+        return response
+
+
+def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metrics_path="/metrics",
+             metrics_instrumentation_enabled=True):
     """Initialize the API with the Flask app.
 
     Relay callers may pass a dedicated Prometheus registry and disable the
@@ -644,7 +759,13 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     contract. Defaults preserve the historical API behavior for other callers.
     """
 
+    app.extensions["tokenplace_client_identity_policy"] = ClientIdentityPolicy.from_environment()
+    # Flask-Limiter's INFO rejection message includes its derived storage key.
+    # Responses and bounded application telemetry provide the needed signal.
+    logging.getLogger("flask-limiter").setLevel(logging.WARNING)
     _install_public_api_v1_cors(app)
+    if metrics_instrumentation_enabled:
+        _install_public_quota_metrics(app, metrics_registry)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
     limiter_kwargs = {
@@ -660,23 +781,25 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
         limiter_kwargs["storage_uri"] = limiter_storage_uri
 
     limiter = Limiter(
-        get_remote_address,
+        current_limiter_key,
         app=app,
         **limiter_kwargs,
     )
 
     @app.errorhandler(RateLimitExceeded)
     def _handle_rate_limit(exc: RateLimitExceeded):
+        g.tokenplace_public_quota_reason = _public_quota_limit_reason(exc)
         return _build_rate_limit_response(exc)
 
     _install_control_plane_rate_limiter(app, limiter_storage_uri)
 
-    PrometheusMetrics(
-        app,
-        path=metrics_path,
-        export_defaults=metrics_export_defaults,
-        registry=metrics_registry,
-    )
+    if metrics_instrumentation_enabled:
+        PrometheusMetrics(
+            app,
+            path=metrics_path,
+            export_defaults=metrics_export_defaults,
+            registry=metrics_registry,
+        )
     app.register_blueprint(v1_routes.v1_bp)
     app.register_blueprint(v1_routes.openai_v1_bp)
     app.register_blueprint(v2_routes.v2_bp)

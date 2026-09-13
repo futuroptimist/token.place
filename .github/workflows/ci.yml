@@ -9,6 +9,7 @@ jobs:
   test:
     name: Run tests + relay landing-page real desktop-bridge API v1 guardrail
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
@@ -51,9 +52,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+      - name: Install Valkey integration-test server
+        if: steps.prep.outputs.rc != '2'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes valkey-server
       - name: Install Playwright browsers and system dependencies
         if: steps.prep.outputs.rc != '2'
-        run: python -m playwright install --with-deps chromium
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          python scripts/run_with_timeout_retry.py \
+            --timeout 240 --grace 15 --attempts 2 --delay 15 -- \
+            python -m playwright install --with-deps chromium
       - name: Install Node.js dependencies
         if: steps.prep.outputs.rc != '2'
         run: npm ci
@@ -74,6 +85,11 @@ jobs:
           TOKENPLACE_REAL_E2E_MODEL_PATH: ${{ github.workspace }}/.ci-models/stories15M-q4_0.gguf
           RUN_RELAY_REGISTRATION_TESTS: '1'
         run: python -m pytest -q tests/e2e/test_ui.py -k 'landing_chat_real_inference_with_desktop_bridge_api_v1'
+      - name: Verify encrypted progress landing-page lifecycle
+        if: steps.prep.outputs.rc != '2'
+        env:
+          RUN_E2E: '1'
+        run: python -m pytest -q tests/e2e/test_ui.py -k 'landing_chat_uses_api_v1_only_non_streaming' -x
       - name: Run tests
         if: steps.prep.outputs.rc != '2'
         run: ./run_all_tests.sh

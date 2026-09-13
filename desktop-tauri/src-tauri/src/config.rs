@@ -5,6 +5,14 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_RELAY_BASE_URL: &str = "https://token.place";
 pub const MAX_RELAY_BASE_URLS: usize = 10;
+pub const DEFAULT_QWEN_64K_BATCH_PROFILE: &str = "balanced";
+
+pub fn normalize_qwen_64k_batch_profile(value: &str) -> String {
+    match value {
+        "safe" | "balanced" | "experimental" => value.to_string(),
+        _ => DEFAULT_QWEN_64K_BATCH_PROFILE.to_string(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopConfig {
@@ -18,6 +26,8 @@ pub struct DesktopConfig {
     pub preferred_mode: ComputeMode,
     #[serde(default = "default_context_tier")]
     pub context_tier: String,
+    #[serde(default = "default_qwen_64k_batch_profile")]
+    pub qwen_64k_batch_profile: String,
 }
 
 fn default_relay_base_url() -> String {
@@ -26,6 +36,10 @@ fn default_relay_base_url() -> String {
 
 fn default_compute_mode() -> ComputeMode {
     ComputeMode::Auto
+}
+
+fn default_qwen_64k_batch_profile() -> String {
+    DEFAULT_QWEN_64K_BATCH_PROFILE.into()
 }
 
 pub fn normalize_relay_base_urls(
@@ -67,6 +81,8 @@ impl DesktopConfig {
             .cloned()
             .unwrap_or_else(default_relay_base_url);
         self.context_tier = normalize_context_tier(&self.context_tier);
+        self.qwen_64k_batch_profile =
+            normalize_qwen_64k_batch_profile(&self.qwen_64k_batch_profile);
         self
     }
 }
@@ -79,6 +95,7 @@ impl Default for DesktopConfig {
             relay_base_urls: vec![DEFAULT_RELAY_BASE_URL.into()],
             preferred_mode: ComputeMode::Auto,
             context_tier: default_context_tier(),
+            qwen_64k_batch_profile: default_qwen_64k_batch_profile(),
         }
     }
 }

@@ -20,6 +20,10 @@ import requests
 
 from api.v1.models import CANONICAL_LAUNCH_MODEL_ID, generate_response
 from utils.crypto.crypto_manager import CryptoManager
+from utils.inference_timeout import (
+    DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS,
+    INFERENCE_RESPONSE_GRACE_SECONDS,
+)
 
 logger = logging.getLogger("api.v1.compute_provider")
 _last_backend_path: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -49,6 +53,16 @@ _RELAY_PUBLIC_URL_ENVS = (
 )
 
 
+def _coerce_admitted_ttl(value: object) -> float:
+    """Return a numeric relay TTL, rejecting booleans as invalid metadata."""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass(frozen=True)
 class DistributedTargetSelection:
     """Resolved distributed relay target and diagnostics for provider logs."""
@@ -75,6 +89,51 @@ class ComputeProviderError(Exception):
         self.error_type = error_type
         self.public_message = public_message or "Unable to generate a response right now."
         self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class CompletionResult:
+    """Internal completion contract; metadata is never mixed into the message."""
+
+    message: dict[str, Any]
+    finish_reason: str | None = None
+    usage: dict[str, int] | None = None
+    output_budget: dict[str, int] | None = None
+
+    # Transitional message access keeps direct provider callers source-compatible
+    # while the route boundary consumes the richer contract.
+    def __getitem__(self, key: str) -> Any:
+        return self.message[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.message.get(key, default)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, dict):
+            return self.message == other
+        if isinstance(other, CompletionResult):
+            return (
+                self.message,
+                self.finish_reason,
+                self.usage,
+                self.output_budget,
+            ) == (
+                other.message,
+                other.finish_reason,
+                other.usage,
+                other.output_budget,
+            )
+        return NotImplemented
+
+
+def coerce_completion_result(value: Any) -> CompletionResult:
+    """Isolated compatibility path for legacy/test providers returning a message."""
+
+    if isinstance(value, CompletionResult):
+        return value
+    if isinstance(value, dict):
+        return CompletionResult(message=value)
+    raise ComputeProviderError("assistant response must be a message object")
 
 
 _RELAY_ERROR_MAP: dict[str, dict[str, Any]] = {
@@ -154,8 +213,8 @@ class ApiV1ComputeProvider(Protocol):
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Return an assistant message payload compatible with OpenAI chat responses."""
+    ) -> CompletionResult:
+        """Return an assistant message and completion metadata."""
 
 
 @dataclass(frozen=True)
@@ -168,7 +227,7 @@ class LocalApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> CompletionResult:
         updated_messages = _active_generate_response()(model_id, messages, **(options or {}))
         if not updated_messages:
             raise ComputeProviderError("model returned an empty message list")
@@ -176,7 +235,7 @@ class LocalApiV1ComputeProvider:
         if not isinstance(assistant_message, dict):
             raise ComputeProviderError("assistant response must be a message object")
         _last_backend_path.set("local_in_process")
-        return assistant_message
+        return CompletionResult(message=assistant_message)
 
 
 @dataclass(frozen=True)
@@ -184,7 +243,7 @@ class DistributedApiV1ComputeProvider:
     """Provider that dispatches API v1 requests via relay-blind E2EE envelopes."""
 
     base_url: str
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
 
     def _relay_url(self, path: str) -> str:
         base_url = self.base_url.rstrip("/")
@@ -205,7 +264,7 @@ class DistributedApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> CompletionResult:
         _last_backend_path.set("distributed_relay_e2ee_pending")
         crypto_manager = self._build_request_crypto_manager()
         relay_timeout = max(float(self.timeout_seconds), 1.0)
@@ -261,6 +320,9 @@ class DistributedApiV1ComputeProvider:
                 params={
                     "model": model_id or CANONICAL_LAUNCH_MODEL_ID,
                     "context_tier": "8k-fast",
+                    "client_public_key": crypto_manager.public_key_b64,
+                    "request_id": relay_request_id,
+                    "cancel_token": relay_cancel_token,
                 },
                 timeout=_remaining_timeout(),
             )
@@ -313,6 +375,7 @@ class DistributedApiV1ComputeProvider:
             )
 
         server_public_key = next_server_payload.get("server_public_key")
+        reservation_token = next_server_payload.get("reservation_token")
         if not isinstance(server_public_key, str) or not server_public_key.strip():
             raise _error_from_code(
                 "no_registered_compute_nodes",
@@ -345,6 +408,10 @@ class DistributedApiV1ComputeProvider:
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
             "cancel_token": relay_cancel_token,
+            "reservation_token": reservation_token,
+            "requested_model": next_server_payload.get("requested_model"),
+            "requested_context_tier": next_server_payload.get("requested_context_tier"),
+            "request_deadline_epoch": next_server_payload.get("request_deadline_epoch"),
             **encrypted_envelope,
         }
 
@@ -376,6 +443,25 @@ class DistributedApiV1ComputeProvider:
             )
 
         relay_request_enqueued = True
+        # Admission is where the relay-owned inference clock starts. Reset the
+        # outer transport clock from its returned relative TTL so server
+        # selection and enqueue latency cannot consume response grace. Explicit
+        # shorter provider overrides remain an upper bound.
+        try:
+            admission_payload = faucet_response.json()
+        except ValueError:
+            admission_payload = None
+        retrieval_credential = reservation_token
+        if isinstance(admission_payload, dict):
+            retrieval_credential = admission_payload.get("retrieval_credential") or reservation_token
+            admitted_ttl = _coerce_admitted_ttl(
+                admission_payload.get("request_ttl_seconds")
+            )
+            if admitted_ttl > 0:
+                deadline = time.time() + min(
+                    relay_timeout,
+                    admitted_ttl + INFERENCE_RESPONSE_GRACE_SECONDS,
+                )
         poll_interval = self._poll_interval_seconds()
         while time.time() < deadline:
             try:
@@ -390,6 +476,7 @@ class DistributedApiV1ComputeProvider:
                     json={
                         "client_public_key": crypto_manager.public_key_b64,
                         "request_id": relay_request_id,
+                        "retrieval_credential": retrieval_credential,
                     },
                     timeout=retrieve_timeout,
                 )
@@ -486,8 +573,16 @@ class DistributedApiV1ComputeProvider:
                     message="compute node response missing assistant message",
                 )
 
+            usage = api_v1_response.get("usage")
+            output_budget = api_v1_response.get("output_budget")
+            finish_reason = api_v1_response.get("finish_reason")
             _last_backend_path.set("distributed_relay_e2ee")
-            return assistant_message
+            return CompletionResult(
+                message=assistant_message,
+                finish_reason=finish_reason if isinstance(finish_reason, str) else None,
+                usage=usage if isinstance(usage, dict) else None,
+                output_budget=output_budget if isinstance(output_budget, dict) else None,
+            )
 
         timeout_error = _error_from_code(
             "compute_node_timeout",
@@ -510,14 +605,14 @@ class FallbackApiV1ComputeProvider:
         model_id: str,
         messages: list[dict[str, Any]],
         options: Optional[Dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> CompletionResult:
         try:
             message = self.primary.complete_chat(
                 model_id=model_id,
                 messages=messages,
                 options=options,
             )
-            return message
+            return coerce_completion_result(message)
         except ComputeProviderError as exc:
             logger.warning("distributed compute fallback triggered: %s", exc)
             message = self.fallback.complete_chat(
@@ -526,7 +621,7 @@ class FallbackApiV1ComputeProvider:
                 options=options,
             )
             _last_backend_path.set("fallback_local_in_process")
-            return message
+            return coerce_completion_result(message)
 
 
 def _normalise_target_url(value: str | None) -> str:
@@ -706,11 +801,14 @@ def _build_api_v1_compute_provider(
         return local_provider
 
     selected_target = distributed_url.rstrip("/")
-    timeout_raw = os.environ.get("TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS", "120")
+    timeout_raw = os.environ.get(
+        "TOKENPLACE_API_V1_DISTRIBUTED_TIMEOUT_SECONDS",
+        str(DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS),
+    )
     try:
         timeout_seconds = max(float(timeout_raw), 1.0)
     except (TypeError, ValueError):
-        timeout_seconds = 120.0
+        timeout_seconds = DEFAULT_INFERENCE_TRANSPORT_TIMEOUT_SECONDS
     distributed_provider = DistributedApiV1ComputeProvider(
         base_url=selected_target,
         timeout_seconds=timeout_seconds,

@@ -6,6 +6,7 @@ import ntpath
 import time
 import logging
 import math
+import struct
 import hashlib
 import uuid
 from utils.llm.llama_module_identity import (
@@ -52,12 +53,38 @@ QWEN_64K_KV_CACHE_TYPE_NAMES = {
     'q8': ('GGML_TYPE_Q8_0', 'LLAMA_TYPE_Q8_0'),
     'q4': ('GGML_TYPE_Q4_0', 'LLAMA_TYPE_Q4_0'),
 }
-QWEN_64K_BATCH_TOKENS = 256
-QWEN_64K_UBATCH_TOKENS = 128
-QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_f16_fa_small_batch'
+QWEN_64K_BATCH_PROFILES = {
+    'safe': {'n_batch': 256, 'n_ubatch': 128},
+    'balanced': {'n_batch': 512, 'n_ubatch': 256},
+    'experimental': {'n_batch': 1024, 'n_ubatch': 512},
+}
+QWEN_64K_BATCH_PROFILE_DEFAULT = 'balanced'
+# Backwards-compatible names describe the conservative P4/Q4 fallback.
+QWEN_64K_BATCH_TOKENS = QWEN_64K_BATCH_PROFILES['safe']['n_batch']
+QWEN_64K_UBATCH_TOKENS = QWEN_64K_BATCH_PROFILES['safe']['n_ubatch']
+QWEN_64K_RUNTIME_PROFILE_F16 = 'qwen64k_f16_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q8 = 'qwen64k_kv_q8_fa_small_batch'
 QWEN_64K_RUNTIME_PROFILE_Q4 = 'qwen64k_kv_q4_fa_small_batch'
+# The named default follows the preferred profile. Keep the precision-specific
+# constants above for compatibility code that must distinguish F16 from Q8.
+QWEN_64K_RUNTIME_PROFILE_DEFAULT = 'qwen64k_kv_q8_fa_balanced_batch'
 GGUF_MAGIC = b'GGUF'
+
+
+def normalize_qwen_64k_batch_profile(value: Any) -> str:
+    """Normalize persisted/operator input without ever implicitly opting into experimental."""
+    return value if isinstance(value, str) and value in QWEN_64K_BATCH_PROFILES else QWEN_64K_BATCH_PROFILE_DEFAULT
+
+
+def _qwen_64k_profile_id(kv_precision: str, batch_profile: str) -> str:
+    if batch_profile == 'safe':
+        return {
+            'q8': QWEN_64K_RUNTIME_PROFILE_Q8,
+            'f16': QWEN_64K_RUNTIME_PROFILE_F16,
+            'q4': QWEN_64K_RUNTIME_PROFILE_Q4,
+        }[kv_precision]
+    prefix = 'qwen64k_f16' if kv_precision == 'f16' else f'qwen64k_kv_{kv_precision}'
+    return f'{prefix}_fa_{batch_profile}_batch'
 
 LLAMA_CPP_CONSTRUCTOR_CAPABILITY_KWARGS = (
     'type_k', 'type_v', 'flash_attn', 'offload_kqv', 'n_batch', 'n_ubatch',
@@ -76,7 +103,20 @@ QWEN_64K_CONTEXT_CREATE_RETRY_CATEGORIES = {
     'runtime_context_create_metal_buffer_limit',
     'runtime_context_create_cuda_memory',
     'runtime_context_create_cuda_buffer_limit',
+    'runtime_context_create_unsupported_kwarg',
     'runtime_context_create_failed',
+}
+
+QWEN_64K_MEMORY_PRESSURE_FAILURE_CATEGORIES = {
+    'runtime_context_create_metal_memory',
+    'runtime_context_create_kv_cache_allocation',
+    'runtime_context_create_metal_buffer_limit',
+    'runtime_context_create_cuda_memory',
+    'runtime_context_create_cuda_buffer_limit',
+    'backend_allocation_failure',
+    'kv_slot_unavailable',
+    'metal_command_buffer_out_of_memory',
+    'cuda_memory_allocation',
 }
 
 _INIT_SAFE_CATEGORY_ALIASES = {
@@ -430,22 +470,453 @@ def _qwen_64k_runtime_capabilities(llama_cpp_module: Any, llama_cls: Any) -> Dic
     }
 
 
-def _qwen_64k_memory_estimate(model_path: Any, n_ctx: int, kv_precision: str, backend: str) -> Dict[str, Any]:
+GGML_KV_TYPE_LAYOUTS = {
+    # llama.cpp/GGML storage type sizes are block payload sizes, not nominal
+    # bytes-per-element. Q8_0 stores 32 quants plus a 16-bit scale (34 bytes),
+    # and Q4_0 stores 32 4-bit quants plus a 16-bit scale (18 bytes).
+    'f16': {'block_size': 1, 'type_size': 2, 'ggml_type': 'F16'},
+    'q8': {'block_size': 32, 'type_size': 34, 'ggml_type': 'Q8_0'},
+    'q4': {'block_size': 32, 'type_size': 18, 'ggml_type': 'Q4_0'},
+}
+GGML_KV_TENSOR_ALIGNMENT_BYTES = 32
+GGML_KV_BACKEND_ALIGNMENT_BYTES = {'cpu': 32, 'metal': 32, 'cuda': 128}
+GGML_KV_CONTEXT_ALLOCATION_ALIGNMENT_TOKENS = 256
+GGML_CUDA_QUANTIZED_MATRIX_ROW_PADDING = 512
+LLAMA_CPP_KV_DIAGNOSTIC_MAX_BYTES = 1 << 63
+_LLAMA_CPP_KV_BUFFER_RE = re.compile(
+    r"^llama_kv_cache(?:_init|_unified)?:\s+(?P<device>[A-Za-z0-9_-]+)\s+KV buffer size =\s+"
+    r"(?P<value>[0-9]+(?:\.[0-9]{1,2})?)\s+(?P<unit>MiB)$"
+)
+
+
+def parse_llama_cpp_kv_allocation_diagnostics(lines: Iterable[str]) -> Dict[str, Any]:
+    """Parse the pinned llama.cpp KV-buffer diagnostic without retaining raw text."""
+    records = []
+    for raw in lines:
+        match = _LLAMA_CPP_KV_BUFFER_RE.fullmatch(str(raw).strip())
+        if not match:
+            continue
+        value = match.group('value')
+        decimals = len(value.partition('.')[2])
+        scale = 10 ** decimals
+        units = int(value.replace('.', ''))
+        numerator = _checked_mul(units, 1024 * 1024, 'kv_diagnostic_bytes', maximum=LLAMA_CPP_KV_DIAGNOSTIC_MAX_BYTES * scale)
+        center = numerator // scale
+        precision = max(1, math.ceil((1024 * 1024) / (2 * scale)))
+        records.append((match.group('device').lower(), center, precision, decimals))
+    if not records:
+        raise ValueError('kv_runtime_diagnostic_missing')
+    devices = [record[0] for record in records]
+    if len(devices) != len(set(devices)):
+        raise ValueError('kv_runtime_diagnostic_ambiguous')
+    decimals = {record[3] for record in records}
+    if len(decimals) != 1:
+        raise ValueError('kv_runtime_diagnostic_mixed_precision')
+    observed = sum(record[1] for record in records)
+    precision = sum(record[2] for record in records)
+    if observed <= 0 or observed >= LLAMA_CPP_KV_DIAGNOSTIC_MAX_BYTES:
+        raise ValueError('kv_runtime_diagnostic_out_of_range')
+    return {
+        'method': 'pinned_llama_cpp_kv_buffer_diagnostic',
+        'llama_cpp_python_version': '0.3.32',
+        'llama_cpp_commit': 'b3fed31b99f9bd37725833674252bccb429bb183',
+        'observed_bytes': observed,
+        'precision_bytes': precision,
+        'record_count': len(records),
+        'unit': 'MiB',
+        'decimal_places': decimals.pop(),
+    }
+SUPPORTED_STANDARD_KV_ARCHITECTURES = {'qwen3'}
+UNSUPPORTED_KV_LAYOUT_SUFFIXES = (
+    'attention.sliding_window', 'attention.layer_types', 'attention.recurrent',
+    'attention.mla', 'attention.no_v', 'attention.shared_layers',
+)
+GGUF_METADATA_CACHE: Dict[tuple[str, int, int, int], Dict[str, Any]] = {}
+QWEN_64K_LEGACY_BYTES_PER_TOKEN = {'f16': 524288, 'q8': 262144, 'q4': 131072}
+
+
+def _checked_positive_int(value: Any, name: str, *, maximum: int = 1 << 40) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f'{name}_invalid')
+    result = value
+    if result <= 0 or result > maximum:
+        raise ValueError(f'{name}_invalid')
+    return result
+
+
+def _checked_add(left: int, right: int, name: str, *, maximum: int = (1 << 63) - 1) -> int:
+    result = int(left) + int(right)
+    if result > maximum:
+        raise OverflowError(f'{name}_overflow')
+    return result
+
+
+def _checked_mul(left: int, right: int, name: str, *, maximum: int = (1 << 63) - 1) -> int:
+    result = int(left) * int(right)
+    if result > maximum:
+        raise OverflowError(f'{name}_overflow')
+    return result
+
+
+def _align_up(value: int, alignment: int = GGML_KV_TENSOR_ALIGNMENT_BYTES, *, maximum: int = (1 << 63) - 1) -> int:
+    value = _checked_positive_int(value, 'value', maximum=maximum)
+    alignment = _checked_positive_int(alignment, 'alignment', maximum=1 << 20)
+    padded = _checked_add(value, alignment - 1, 'aligned_value', maximum=maximum)
+    return (padded // alignment) * alignment
+
+
+def _ggml_row_size_bytes(element_count: int, ggml_type: str) -> int:
+    element_count = _checked_positive_int(element_count, 'element_count')
+    layout = GGML_KV_TYPE_LAYOUTS.get(str(ggml_type).lower())
+    if layout is None:
+        raise ValueError('ggml_type_unsupported')
+    block_size = layout['block_size']
+    if element_count % block_size != 0:
+        raise ValueError('ggml_row_width_not_block_divisible')
+    blocks = element_count // block_size
+    return _checked_mul(blocks, layout['type_size'], 'ggml_row_size_bytes')
+
+
+def _normalize_kv_backend(backend: Any) -> Optional[str]:
+    normalized = str(backend or '').strip().lower()
+    if normalized in ('cpu', 'metal', 'cuda'):
+        return normalized
+    return None
+
+
+def _allocated_context_tokens(n_ctx: int) -> int:
+    return _align_up(n_ctx, GGML_KV_CONTEXT_ALLOCATION_ALIGNMENT_TOKENS)
+
+
+def _ggml_tensor_2d_allocation_breakdown(rows: int, columns: int, ggml_type: str, backend: str = 'cpu') -> Dict[str, int]:
+    # Source-derived from llama-cpp-python==0.3.32's pinned llama.cpp b3fed31b9:
+    # src/llama-context.cpp pads requested n_ctx to 256 before KV allocation;
+    # src/llama-kv-cache.cpp creates per-layer standard K and V tensors;
+    # ggml/src/ggml-alloc.c aligns each tensor allocation independently;
+    # ggml/src/ggml-backend.cpp and ggml/src/ggml-metal/ggml-metal.cpp use
+    # 32-byte alignment, while ggml/src/ggml-cuda/ggml-cuda.cu uses 128-byte
+    # alignment and pads quantized matrix tails to MATRIX_ROW_PADDING=512.
+    # Matches the llama.cpp KV-cache tensor shape per layer: one 2-D K tensor
+    # [n_embd_k_gqa, n_ctx] and one V tensor [n_embd_v_gqa, n_ctx]. Quantized
+    # GGML rows must be full quantization blocks; allocator starts each tensor
+    # on GGML_MEM_ALIGN-compatible boundaries. The legacy compatibility formula
+    # is fixed as ``n_ctx * {f16:524288,q8:262144,q4:131072}``: 524288 is
+    # ``32 layers * 2 tensors * 4096 elements * 2 F16 bytes`` per token, with
+    # Q8/Q4 floors derived by halving/quartering that fixed F16 heuristic. These
+    # estimates are currently attached to runtime profile/failure diagnostics;
+    # profile selection and recovery are driven by runtime capability checks and
+    # initialization-failure categories, not by this estimate as an admission gate.
+    normalized_backend = _normalize_kv_backend(backend)
+    if normalized_backend is None:
+        raise ValueError('kv_backend_unsupported')
+    checked_rows = _checked_positive_int(rows, 'rows')
+    row_size = _ggml_row_size_bytes(checked_rows, ggml_type)
+    payload = _checked_mul(row_size, _checked_positive_int(columns, 'columns'), 'ggml_tensor_payload_bytes')
+    backend_tail_padding = 0
+    layout = GGML_KV_TYPE_LAYOUTS[str(ggml_type).lower()]
+    if normalized_backend == 'cuda' and layout['block_size'] > 1 and checked_rows % GGML_CUDA_QUANTIZED_MATRIX_ROW_PADDING:
+        tail_elements = GGML_CUDA_QUANTIZED_MATRIX_ROW_PADDING - (checked_rows % GGML_CUDA_QUANTIZED_MATRIX_ROW_PADDING)
+        backend_tail_padding = _ggml_row_size_bytes(tail_elements, ggml_type)
+    logical_plus_tail = _checked_add(payload, backend_tail_padding, 'ggml_tensor_backend_payload_bytes')
+    allocation = _align_up(logical_plus_tail, GGML_KV_BACKEND_ALIGNMENT_BYTES[normalized_backend])
+    return {
+        'row_payload_bytes': row_size,
+        'logical_payload_bytes': payload,
+        'backend_tail_padding_bytes': backend_tail_padding,
+        'allocator_alignment_padding_bytes': allocation - logical_plus_tail,
+        'allocation_bytes': allocation,
+    }
+
+
+def _ggml_tensor_2d_allocation_bytes(rows: int, columns: int, ggml_type: str, backend: str = 'cpu') -> int:
+    return _ggml_tensor_2d_allocation_breakdown(rows, columns, ggml_type, backend)['allocation_bytes']
+
+
+def _read_gguf_metadata(model_path: Any, *, max_kv: int = 4096) -> Dict[str, Any]:
+    scalar_formats = {
+        0: ('<B', 1), 1: ('<b', 1), 2: ('<H', 2), 3: ('<h', 2),
+        4: ('<I', 4), 5: ('<i', 4), 6: ('<f', 4), 7: ('?', 1),
+        10: ('<Q', 8), 11: ('<q', 8), 12: ('<d', 8),
+    }
+    required_suffixes = {
+        'block_count', 'attention.head_count', 'attention.head_count_kv',
+        'attention.key_length', 'attention.value_length', 'embedding_length',
+    }
+    path = Path(model_path)
+    stat = path.stat()
+    cache_key = (str(path.resolve()), int(stat.st_size), int(stat.st_mtime_ns), int(max_kv))
+    cached = GGUF_METADATA_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    def read_exact(f, length: int) -> bytes:
+        data = f.read(length)
+        if len(data) != length:
+            raise ValueError('gguf_metadata_truncated')
+        return data
+
+    def read_string(f):
+        length = int.from_bytes(read_exact(f, 8), 'little', signed=False)
+        if length > (1 << 20):
+            raise ValueError('gguf_string_too_large')
+        return read_exact(f, length).decode('utf-8', errors='replace')
+
+    def skip_bytes(f, length: int) -> None:
+        if length < 0 or length > (1 << 34):
+            raise ValueError('gguf_metadata_value_too_large')
+        if f.seekable():
+            current = f.tell()
+            end = f.seek(0, os.SEEK_END)
+            target = current + length
+            if target > end:
+                raise ValueError('gguf_metadata_truncated')
+            f.seek(target, os.SEEK_SET)
+            return
+        read_exact(f, length)
+
+    def read_scalar(f, value_type: int) -> Any:
+        fmt, size = scalar_formats[value_type]
+        return struct.unpack(fmt, read_exact(f, size))[0]
+
+    def read_or_skip_value(f, value_type: int, *, store: bool) -> Any:
+        if value_type in scalar_formats:
+            value = read_scalar(f, value_type)
+            return value if store else None
+        if value_type == 8:
+            value = read_string(f)
+            return value if store else None
+        if value_type == 9:
+            array_type = int.from_bytes(read_exact(f, 4), 'little', signed=False)
+            array_length = int.from_bytes(read_exact(f, 8), 'little', signed=False)
+            if array_length > (1 << 24):
+                raise ValueError('gguf_array_too_large')
+            if array_type in scalar_formats:
+                skip_bytes(f, scalar_formats[array_type][1] * array_length)
+            elif array_type == 8:
+                for _ in range(array_length):
+                    _ = read_string(f)
+            else:
+                raise ValueError('gguf_metadata_type_unsupported')
+            if store:
+                raise ValueError('gguf_required_metadata_array_unsupported')
+            return None
+        raise ValueError('gguf_metadata_type_unsupported')
+
+    with open(path, 'rb') as f:
+        if read_exact(f, 4) != GGUF_MAGIC:
+            raise ValueError('gguf_magic_missing')
+        version = int.from_bytes(read_exact(f, 4), 'little', signed=False)
+        if version not in (2, 3):
+            raise ValueError('gguf_version_unsupported')
+        _tensor_count = int.from_bytes(read_exact(f, 8), 'little', signed=False)
+        kv_count = int.from_bytes(read_exact(f, 8), 'little', signed=False)
+        if kv_count > max_kv:
+            raise ValueError('gguf_kv_count_too_large')
+        metadata: Dict[str, Any] = {}
+        for _ in range(kv_count):
+            key = read_string(f)
+            value_type = int.from_bytes(read_exact(f, 4), 'little', signed=False)
+            suffix = key.split('.', 1)[1] if '.' in key else key
+            should_store = key == 'general.architecture' or suffix in required_suffixes or suffix in UNSUPPORTED_KV_LAYOUT_SUFFIXES
+            value = read_or_skip_value(f, value_type, store=should_store)
+            if should_store and value is not None:
+                metadata[key] = value
+        GGUF_METADATA_CACHE.clear()
+        GGUF_METADATA_CACHE[cache_key] = dict(metadata)
+        return metadata
+
+
+def _derive_kv_cache_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    arch = str(metadata.get('general.architecture') or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}', arch):
+        raise ValueError('architecture_missing_or_invalid')
+    prefix = arch
+    if arch not in SUPPORTED_STANDARD_KV_ARCHITECTURES:
+        raise ValueError('kv_layout_architecture_unsupported')
+    for suffix in UNSUPPORTED_KV_LAYOUT_SUFFIXES:
+        if f'{prefix}.{suffix}' in metadata:
+            raise ValueError('kv_layout_unsupported')
+
+    def meta_int(suffixes: tuple[str, ...], name: str, default: Optional[int] = None) -> int:
+        for suffix in suffixes:
+            key = f'{prefix}.{suffix}'
+            if key in metadata:
+                return _checked_positive_int(metadata[key], name, maximum=1 << 30)
+        if default is not None:
+            return default
+        raise ValueError(f'{name}_missing')
+
+    layers = meta_int(('block_count',), 'layer_count')
+    head_count = meta_int(('attention.head_count',), 'attention_head_count')
+    kv_heads = meta_int(('attention.head_count_kv',), 'attention_head_count_kv', head_count)
+    key_dim = meta_int(('attention.key_length',), 'key_length', None) if f'{prefix}.attention.key_length' in metadata else None
+    value_dim = meta_int(('attention.value_length',), 'value_length', None) if f'{prefix}.attention.value_length' in metadata else None
+    if head_count % kv_heads != 0:
+        raise ValueError('attention_head_count_not_divisible_by_kv_heads')
+    if key_dim is None or value_dim is None:
+        embd = meta_int(('embedding_length',), 'embedding_length')
+        if embd % head_count != 0:
+            raise ValueError('embedding_length_not_divisible_by_head_count')
+        key_dim = key_dim or embd // head_count
+        value_dim = value_dim or embd // head_count
+    return {
+        'architecture': arch,
+        'layer_count': layers,
+        'attention_head_count': head_count,
+        'attention_head_count_kv': kv_heads,
+        'gqa_groups': head_count // kv_heads,
+        'key_length': key_dim,
+        'value_length': value_dim,
+        'n_embd_k_gqa': kv_heads * key_dim,
+        'n_embd_v_gqa': kv_heads * value_dim,
+    }
+
+
+def _estimate_kv_cache_bytes_from_metadata(metadata: Dict[str, Any], n_ctx: int, type_k: str, type_v: str, backend: str = 'cpu') -> Dict[str, Any]:
+    requested_n_ctx = _checked_positive_int(n_ctx, 'context_size_tokens', maximum=1 << 30)
+    n_ctx = _allocated_context_tokens(requested_n_ctx)
+    normalized_backend = _normalize_kv_backend(backend)
+    if normalized_backend is None:
+        candidates = [_estimate_kv_cache_bytes_from_metadata(metadata, requested_n_ctx, type_k, type_v, known) for known in ('cpu', 'metal', 'cuda')]
+        conservative = max(candidates, key=lambda item: item['kv_cache_bytes'])
+        return {**conservative, 'backend': 'unknown', 'backend_allocation_mode': 'conservative_max_supported_backend', 'exact_allocation_available': False}
+    arch = _derive_kv_cache_metadata(metadata)
+    k_rows = arch['n_embd_k_gqa']
+    v_rows = arch['n_embd_v_gqa']
+    layers = arch['layer_count']
+    k_row_payload = _ggml_row_size_bytes(k_rows, type_k)
+    v_row_payload = _ggml_row_size_bytes(v_rows, type_v)
+    k_payload_per_layer = _checked_mul(k_row_payload, n_ctx, 'k_tensor_payload_bytes')
+    v_payload_per_layer = _checked_mul(v_row_payload, n_ctx, 'v_tensor_payload_bytes')
+    k_tensor = _ggml_tensor_2d_allocation_breakdown(k_rows, n_ctx, type_k, normalized_backend)
+    v_tensor = _ggml_tensor_2d_allocation_breakdown(v_rows, n_ctx, type_v, normalized_backend)
+    k_per_layer = k_tensor['allocation_bytes']
+    v_per_layer = v_tensor['allocation_bytes']
+    kv_per_layer = _checked_add(k_per_layer, v_per_layer, 'kv_cache_bytes_per_layer')
+    kv_bytes = _checked_mul(kv_per_layer, layers, 'kv_cache_bytes')
+    if kv_bytes > (1 << 63) - 1:
+        raise OverflowError('kv_cache_bytes_overflow')
+    return {
+        **arch,
+        'requested_context_size_tokens': requested_n_ctx,
+        'context_size_tokens': n_ctx,
+        'allocated_context_size_tokens': n_ctx,
+        'backend': normalized_backend,
+        'backend_allocation_mode': 'exact',
+        'exact_allocation_available': True,
+        'type_k': type_k,
+        'type_v': type_v,
+        'k_row_size_bytes': k_row_payload,
+        'v_row_size_bytes': v_row_payload,
+        'k_tensor_payload_bytes_per_layer': k_payload_per_layer,
+        'v_tensor_payload_bytes_per_layer': v_payload_per_layer,
+        'k_tensor_payload_bytes_total': _checked_mul(k_payload_per_layer, layers, 'k_tensor_payload_bytes_total'),
+        'v_tensor_payload_bytes_total': _checked_mul(v_payload_per_layer, layers, 'v_tensor_payload_bytes_total'),
+        'k_backend_tail_padding_bytes_per_layer': k_tensor['backend_tail_padding_bytes'],
+        'v_backend_tail_padding_bytes_per_layer': v_tensor['backend_tail_padding_bytes'],
+        'k_allocator_alignment_padding_bytes_per_layer': k_tensor['allocator_alignment_padding_bytes'],
+        'v_allocator_alignment_padding_bytes_per_layer': v_tensor['allocator_alignment_padding_bytes'],
+        'k_bytes_per_layer': k_per_layer,
+        'v_bytes_per_layer': v_per_layer,
+        'kv_cache_bytes': kv_bytes,
+        'ggml_tensor_alignment_bytes': GGML_KV_BACKEND_ALIGNMENT_BYTES[normalized_backend],
+    }
+
+
+def _fallback_qwen3_8b_kv_metadata() -> Dict[str, Any]:
+    return {
+        'general.architecture': 'qwen3',
+        'qwen3.block_count': 36,
+        'qwen3.attention.head_count': 32,
+        'qwen3.attention.head_count_kv': 8,
+        'qwen3.attention.key_length': 128,
+        'qwen3.attention.value_length': 128,
+        'qwen3.embedding_length': 4096,
+    }
+
+
+def _qwen_64k_memory_estimate(
+    model_path: Any, n_ctx: int, kv_precision: str, backend: str, batch_profile: str = QWEN_64K_BATCH_PROFILE_DEFAULT
+) -> Dict[str, Any]:
     model_size = None
     try:
         model_size = os.path.getsize(str(model_path))
     except OSError:
         pass
-    bytes_per_token_by_precision = {'f16': 524288, 'q8': 262144, 'q4': 131072}
-    kv_bytes = int(n_ctx) * bytes_per_token_by_precision.get(kv_precision, bytes_per_token_by_precision['f16'])
-    total = (model_size or 0) + kv_bytes
+    fallback_used = False
+    metadata_source = 'gguf_header'
+    fallback_reason = None
+    try:
+        metadata = _read_gguf_metadata(model_path)
+    except Exception as exc:
+        metadata = _fallback_qwen3_8b_kv_metadata()
+        fallback_used = True
+        metadata_source = 'conservative_qwen3_8b_compatibility_fallback'
+        fallback_reason = type(exc).__name__
+    try:
+        kv_breakdown = _estimate_kv_cache_bytes_from_metadata(metadata, n_ctx, kv_precision, kv_precision, backend)
+    except Exception as exc:
+        metadata = _fallback_qwen3_8b_kv_metadata()
+        fallback_used = True
+        metadata_source = 'conservative_qwen3_8b_compatibility_fallback'
+        fallback_reason = type(exc).__name__
+        kv_breakdown = _estimate_kv_cache_bytes_from_metadata(metadata, n_ctx, kv_precision, kv_precision, backend)
+    exact_allocation_available = bool(kv_breakdown.get('exact_allocation_available', True)) and not fallback_used
+    assumed_shape_kv_bytes = kv_breakdown['kv_cache_bytes']
+    legacy_floor = _checked_mul(
+        _checked_positive_int(n_ctx, 'context_size_tokens', maximum=1 << 30),
+        QWEN_64K_LEGACY_BYTES_PER_TOKEN[kv_precision],
+        'legacy_kv_cache_floor_bytes',
+    )
+    kv_bytes = max(assumed_shape_kv_bytes, legacy_floor) if fallback_used else assumed_shape_kv_bytes
+    if fallback_used:
+        kv_breakdown = {
+            **kv_breakdown,
+            'kv_cache_bytes': kv_bytes,
+            'assumed_shape_kv_cache_bytes': assumed_shape_kv_bytes,
+            'legacy_compatibility_floor_bytes': legacy_floor,
+            'exact_allocation_available': False,
+        }
+    selected_batch = normalize_qwen_64k_batch_profile(batch_profile)
+    batch_values = QWEN_64K_BATCH_PROFILES[selected_batch]
+    batch_dependent_buffer_bytes = int(batch_values['n_batch']) * int(batch_values['n_ubatch']) * 2048
+    compute_scratch_estimate_bytes = max(256 * 1024 * 1024, batch_dependent_buffer_bytes)
+    allocator_headroom_bytes = max(256 * 1024 * 1024, int(kv_bytes * 0.04))
+    non_kv_runtime_bytes = (
+        max(512 * 1024 * 1024, int((model_size or 0) * 0.08)) + batch_dependent_buffer_bytes
+        if model_size is not None else None
+    )
+    safety_reserve_bytes = max(1024 * 1024 * 1024, int(kv_bytes * 0.10))
+    total = None
+    if model_size is not None:
+        total = model_size + kv_bytes + int(non_kv_runtime_bytes or 0) + compute_scratch_estimate_bytes + allocator_headroom_bytes + safety_reserve_bytes
     return {
         'model_file_size_bytes': model_size,
         'estimated_kv_cache_bytes': kv_bytes,
-        'estimated_total_model_plus_kv_bytes': total if model_size is not None else None,
+        'exact_kv_cache_bytes': kv_bytes if exact_allocation_available else None,
+        'model_weights_bytes': model_size,
+        'exact_kv_payload_bytes': (kv_breakdown['k_tensor_payload_bytes_total'] + kv_breakdown['v_tensor_payload_bytes_total']) if exact_allocation_available else None,
+        'exact_kv_allocation_bytes': kv_bytes if exact_allocation_available else None,
+        'fallback_assumed_shape_kv_cache_bytes': assumed_shape_kv_bytes if fallback_used else None,
+        'legacy_compatibility_floor_bytes': legacy_floor if fallback_used else None,
+        'estimated_non_kv_runtime_bytes': non_kv_runtime_bytes,
+        'compute_scratch_estimate_bytes': compute_scratch_estimate_bytes,
+        'batch_dependent_buffer_bytes': batch_dependent_buffer_bytes,
+        'allocator_headroom_bytes': allocator_headroom_bytes,
+        'safety_reserve_bytes': safety_reserve_bytes,
+        'batch_profile': selected_batch,
+        'estimated_total_runtime_bytes': total,
+        'estimated_total_model_plus_kv_bytes': (model_size + kv_bytes) if model_size is not None else None,
         'context_size_tokens': int(n_ctx),
         'backend': backend or 'unknown',
         'kv_precision': kv_precision,
+        'type_k': kv_precision,
+        'type_v': kv_precision,
+        'metadata_source': metadata_source,
+        'conservative_fallback_used': fallback_used,
+        'conservative_fallback_reason': fallback_reason,
+        'kv_cache_breakdown': kv_breakdown,
+        'legacy_effective_formula': 'n_ctx * {f16:524288,q8:262144,q4:131072}',
     }
 
 
@@ -456,6 +927,7 @@ def _build_qwen_64k_runtime_profiles(
     model_path: Any,
     n_ctx: int,
     enable_kqv_offload: bool = True,
+    batch_profile: str = QWEN_64K_BATCH_PROFILE_DEFAULT,
 ) -> list[Dict[str, Any]]:
     """Build ordered Qwen 64K Metal-safe generation profiles.
 
@@ -465,11 +937,15 @@ def _build_qwen_64k_runtime_profiles(
     capabilities = _qwen_64k_runtime_capabilities(llama_cpp_module, llama_cls)
     support = capabilities['constructor_kwarg_support']
     backend = str(capabilities.get('backend') or '').lower()
+    requested_batch_profile = normalize_qwen_64k_batch_profile(batch_profile)
+    batch_order = ['experimental', 'balanced', 'safe']
+    batch_order = batch_order[batch_order.index(requested_batch_profile):]
 
-    def _base_kwargs() -> tuple[Dict[str, Any], Dict[str, str]]:
+    def _base_kwargs(selected_batch_profile: str) -> tuple[Dict[str, Any], Dict[str, str]]:
         kwargs: Dict[str, Any] = {}
         omitted: Dict[str, str] = {}
-        for key, value in (('flash_attn', True), ('offload_kqv', True), ('n_batch', QWEN_64K_BATCH_TOKENS), ('n_ubatch', QWEN_64K_UBATCH_TOKENS)):
+        batch_values = QWEN_64K_BATCH_PROFILES[selected_batch_profile]
+        for key, value in (('flash_attn', True), ('offload_kqv', True), ('n_batch', batch_values['n_batch']), ('n_ubatch', batch_values['n_ubatch'])):
             if support.get(key):
                 kwargs[key] = value
             else:
@@ -482,12 +958,11 @@ def _build_qwen_64k_runtime_profiles(
     profiles: list[Dict[str, Any]] = []
     skipped_profiles: list[Dict[str, Any]] = []
 
-    for precision, profile_id in (
-        ('f16', QWEN_64K_RUNTIME_PROFILE_DEFAULT),
-        ('q8', QWEN_64K_RUNTIME_PROFILE_Q8),
-        ('q4', QWEN_64K_RUNTIME_PROFILE_Q4),
-    ):
-        kwargs, omitted = _base_kwargs()
+    combinations = [(precision, selected) for selected in batch_order for precision in ('q8', 'f16')]
+    combinations.append(('q4', 'safe'))
+    for precision, selected_batch_profile in combinations:
+        profile_id = _qwen_64k_profile_id(precision, selected_batch_profile)
+        kwargs, omitted = _base_kwargs(selected_batch_profile)
         kv_info = capabilities['kv_constants'].get(precision) or {}
         kv_value = kv_info.get('value')
         if precision != 'f16':
@@ -511,15 +986,20 @@ def _build_qwen_64k_runtime_profiles(
             enabled = False
         diagnostics = {
             'profile_id': profile_id,
+            'preferred_profile_id': _qwen_64k_profile_id('q8', requested_batch_profile),
             'enabled': bool(enabled),
             'applied': dict(kwargs),
             'omitted': omitted,
             'kv_precision': precision,
+            'batch_profile': selected_batch_profile,
+            'qwen_64k_batch_profile_requested': requested_batch_profile,
             'kv_cache_type': kv_info,
             'constructor_kwarg_support': support,
             'capability_source': capabilities['capability_source'],
             'llama_cpp_python_version': capabilities.get('llama_cpp_python_version'),
-            'memory_estimate': _qwen_64k_memory_estimate(model_path, n_ctx, precision, capabilities.get('backend') or ''),
+            'memory_estimate': _qwen_64k_memory_estimate(
+                model_path, n_ctx, precision, capabilities.get('backend') or '', selected_batch_profile
+            ),
             'kqv_offload_allowed': bool(enable_kqv_offload),
             'backend': backend or 'unknown',
         }
@@ -529,7 +1009,45 @@ def _build_qwen_64k_runtime_profiles(
             skipped_profiles.append(diagnostics)
     if profiles and skipped_profiles:
         profiles[0]['diagnostics'].setdefault('skipped_profiles', []).extend(skipped_profiles)
+        if profiles[0]['diagnostics'].get('kv_precision') == 'f16':
+            profiles[0]['diagnostics']['fallback_reason'] = 'capability_incompatibility'
     return profiles
+
+
+def is_qwen_64k_memory_pressure_failure_category(category: Any) -> bool:
+    """Return whether a sanitized failure positively identifies memory pressure."""
+
+    return str(category or '') in QWEN_64K_MEMORY_PRESSURE_FAILURE_CATEGORIES
+
+
+def _next_qwen_64k_runtime_profile_index(
+    profiles: list[Dict[str, Any]],
+    active_profile_id: Any,
+    failure_category: Any,
+) -> Optional[int]:
+    """Select the policy-authorized next profile without relying on list order."""
+
+    profile_ids = [profile.get('profile_id') for profile in profiles if isinstance(profile, dict)]
+    active = str(active_profile_id or '')
+    active_profile = next((p for p in profiles if p.get('profile_id') == active), None)
+    if not active_profile:
+        return None
+    diagnostics = active_profile.get('diagnostics') or {}
+    precision = diagnostics.get('kv_precision')
+    batch_profile = diagnostics.get('batch_profile')
+    if is_qwen_64k_memory_pressure_failure_category(failure_category):
+        downshift = {'experimental': 'balanced', 'balanced': 'safe'}
+        if batch_profile in downshift:
+            target = _qwen_64k_profile_id(str(precision), downshift[batch_profile])
+        else:
+            target = QWEN_64K_RUNTIME_PROFILE_Q4
+    elif precision == 'q8':
+        target = _qwen_64k_profile_id('f16', str(batch_profile))
+    else:
+        return None
+    if target == active or target not in profile_ids:
+        return None
+    return profile_ids.index(target)
 
 def _classify_runtime_context_create_error(error: Any, child_stderr: str = '') -> str:
     if isinstance(error, LlamaCppRuntimeInitError):
@@ -805,7 +1323,7 @@ def _qwen_64k_memory_profile_kwargs(
     *,
     enable_kqv_offload: bool = True,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Backward-compatible helper returning the first quantized Qwen 64K profile."""
+    """Backward-compatible helper returning the preferred Q8 Qwen 64K profile."""
     profiles = _build_qwen_64k_runtime_profiles(
         llama_cpp_module,
         llama_cls,
@@ -814,7 +1332,7 @@ def _qwen_64k_memory_profile_kwargs(
         enable_kqv_offload=enable_kqv_offload,
     )
     for profile in profiles:
-        if profile.get('profile_id') != QWEN_64K_RUNTIME_PROFILE_DEFAULT:
+        if profile.get('profile_id') == QWEN_64K_RUNTIME_PROFILE_Q8:
             return dict(profile.get('kwargs') or {}), dict(profile.get('diagnostics') or {})
     default_diag = dict(profiles[0].get('diagnostics') or {}) if profiles else {'enabled': False, 'applied': {}}
     skipped = default_diag.get('skipped_profiles')
@@ -1895,6 +2413,25 @@ def _read_llama_subprocess_message(
     timeout_seconds: Optional[float],
     stage: str,
 ) -> Dict[str, Any]:
+    demux_queue = getattr(process, '_token_place_unclaimed_frames', None)
+    if isinstance(demux_queue, queue.Queue):
+        legacy_queue = getattr(process, '_token_place_legacy_frames', None)
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        while True:
+            try:
+                message = demux_queue.get_nowait()
+                break
+            except queue.Empty:
+                try:
+                    message = legacy_queue.get_nowait() if isinstance(legacy_queue, queue.Queue) else None
+                    if message is not None:
+                        break
+                except queue.Empty:
+                    pass
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise LlamaCppRuntimeStageTimeout(stage, timeout_seconds)
+                time.sleep(0.001)
+        return _validate_llama_subprocess_message(message, process=process, stage=stage)
     result_queue: queue.Queue[str] = queue.Queue(maxsize=1)
 
     def _reader() -> None:
@@ -1932,6 +2469,11 @@ def _read_llama_subprocess_message(
         message = json.loads(raw_message)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f'{stage} returned malformed JSON') from exc
+    return _validate_llama_subprocess_message(message, process=process, stage=stage)
+
+
+def _validate_llama_subprocess_message(message: Any, *, process: subprocess.Popen, stage: str) -> Dict[str, Any]:
+    """Validate a terminal worker frame without exposing child payload data."""
     if not isinstance(message, dict):
         raise RuntimeError(f'{stage} returned non-object JSON')
     if message.get('status') == 'transport_error':
@@ -1984,8 +2526,217 @@ def _safe_worker_error_code(value: Any) -> str:
         return text.replace('-', '_')
     return type(value).__name__ if isinstance(value, BaseException) else 'worker_error'
 
+
+# Total budget for the hard (tree-kill) phase's external `taskkill`
+# invocation on Windows, shared across a single cleanup cycle rather than
+# an independent timeout stacked on top of the caller's own waits.
+_WORKER_TREE_CLEANUP_BUDGET_SECONDS = 5.0
+
+
+def _signal_worker_process_tree(
+    process: Any, *, hard: bool, cleanup_started_at: Optional[float] = None
+) -> None:
+    """Best-effort signal to a worker's whole process/session group.
+
+    The llama.cpp worker subprocess is started in its own session/process
+    group (`start_new_session=True` on POSIX, `CREATE_NEW_PROCESS_GROUP` on
+    Windows) specifically so any helper processes the pinned backend spawns
+    into that same group can be reached here too - the direct-process-only
+    `terminate()`/`kill()` calls the caller performs cannot reach them.
+    This is always a supplement to, never a replacement for, that direct
+    signal: any failure here (permission, platform quirk, the process
+    already gone) is silently ignored, leaving behavior no worse than
+    before this existed.
+
+    Windows has a genuine graceful/hard distinction, unlike a bare
+    `terminate()`/`taskkill /F`, which are both forceful there:
+    - Graceful (`hard=False`): `CTRL_BREAK_EVENT` to the process group
+      (requires `CREATE_NEW_PROCESS_GROUP`, which the worker always uses).
+      Never `taskkill /F` or `Popen.terminate()` here - both kill
+      immediately on Windows and would defeat the graceful attempt.
+    - Hard (`hard=True`): `taskkill /F /T` to kill the whole tree, bounded
+      by whatever remains of `cleanup_started_at`'s budget so this can
+      never independently block longer than the shutdown lifecycle allows.
+    """
+    pid = getattr(process, 'pid', None)
+    # Must be a genuine positive PID greater than 1: a non-int (e.g. a test
+    # double's auto-generated Mock attribute) or a bare truthy-but-fake value
+    # must never reach getpgid/killpg/taskkill below. In particular, `int()`
+    # coercion of an unconfigured MagicMock's `.pid` silently yields `1` -
+    # sending SIGTERM/SIGKILL to process group 1 (init) has, in at least one
+    # sandboxed CI environment, taken down the entire runner rather than
+    # merely failing with a permission error, since PID 1 is not always
+    # unreachable to the caller there.
+    if not isinstance(pid, int) or pid <= 1:
+        return
+    if os.name == 'nt':
+        if not hard:
+            send_signal = getattr(process, 'send_signal', None)
+            if callable(send_signal):
+                try:
+                    send_signal(getattr(signal, 'CTRL_BREAK_EVENT', 1))
+                except Exception:
+                    pass
+            return
+        if cleanup_started_at is None:
+            remaining = _WORKER_TREE_CLEANUP_BUDGET_SECONDS
+        else:
+            elapsed = time.monotonic() - cleanup_started_at
+            remaining = max(0.05, _WORKER_TREE_CLEANUP_BUDGET_SECONDS - elapsed)
+        try:
+            subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(pid)],
+                capture_output=True,
+                timeout=remaining,
+            )
+        except Exception:
+            pass
+        return
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGKILL if hard else signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def _safe_call(fn: Optional[Callable], *args: Any, **kwargs: Any) -> Any:
+    """Call `fn` if callable, swallowing any exception it raises."""
+    if not callable(fn):
+        return None
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _teardown_worker_process(
+    process: Any,
+    *,
+    cleanup_started_at: float,
+    log_info: Optional[Callable[[str], None]] = None,
+    recheck_before_hard: bool = True,
+    wait_after_kill: bool = True,
+    wait_timeout: float = 1.0,
+) -> bool:
+    """Shared soft-signal -> terminate() -> wait() -> hard-signal -> kill()
+    sequence used by both `_SubprocessLlamaProxy.close()` and
+    `ModelManager._close_llm_proxy()`. The caller owns the entry gate
+    (whether the process is worth tearing down at all) and everything after
+    this returns (stream/tmpfile cleanup, etc).
+
+    `close()` and `_close_llm_proxy()` differ in exactly the ways controlled
+    by these keyword-only parameters:
+
+    - `recheck_before_hard`: `close()` passes False - it escalates to the
+      hard phase only if the soft `wait()` call itself raised.
+      `_close_llm_proxy()` passes True - it re-checks `poll()` immediately
+      before the hard phase regardless of whether `wait()` raised (a
+      `wait()` that returns cleanly while `poll()` still reports the
+      process alive must still escalate).
+    - `wait_after_kill`: whether a second, best-effort `wait()` follows
+      `kill()`. `close()` passes False (no second wait); `_close_llm_proxy()`
+      passes True.
+    - `log_info`: only `_close_llm_proxy()` supplies a logger (via
+      `self.log_info`); `close()` has none available and passes `None`, in
+      which case nothing is logged.
+
+    Returns True if the process is confirmed dead (via `poll()`) once the
+    sequence completes.
+    """
+
+    def _poll_dead() -> bool:
+        poll = getattr(process, 'poll', None)
+        if not callable(poll):
+            return False
+        try:
+            return poll() is not None
+        except Exception:
+            return False
+
+    # Supplement the direct-process signal by also reaching the worker's
+    # whole process/session group, since a llama.cpp backend could spawn
+    # helper processes the direct-process terminate()/kill() below can
+    # never reach.
+    _signal_worker_process_tree(process, hard=False)
+
+    # On Windows, terminate() is TerminateProcess(): already forceful,
+    # single-process, and would defeat the graceful CTRL_BREAK_EVENT just
+    # sent above. POSIX terminate() (SIGTERM) is a harmless, redundant echo
+    # of the group SIGTERM already sent to the whole process/session group.
+    if os.name != 'nt':
+        terminate = getattr(process, 'terminate', None)
+        if callable(terminate):
+            # Not _safe_call: the log line must fire only when terminate()
+            # did NOT raise, and a successful terminate() legitimately
+            # returns None - indistinguishable from _safe_call's failure
+            # return via return value alone. The log call itself still goes
+            # through _safe_call so a raising logger can't abort teardown
+            # (matches the pre-extraction behavior, where terminate() and
+            # the log call shared one try/except).
+            try:
+                terminate()
+            except Exception:
+                pass
+            else:
+                if log_info is not None:
+                    _safe_call(
+                        log_info,
+                        "desktop.llama_cpp_worker.terminate_signal elapsed_ms=%s"
+                        % max(0, int((time.monotonic() - cleanup_started_at) * 1000)),
+                    )
+
+    # Not _safe_call: close()'s escalation decision (recheck_before_hard
+    # False) depends on whether THIS call raised, which _safe_call's return
+    # value cannot distinguish from a legitimate None result.
+    wait_raised = False
+    wait = getattr(process, 'wait', None)
+    if callable(wait):
+        try:
+            wait(timeout=wait_timeout)
+        except Exception:
+            wait_raised = True
+
+    escalate = (not _poll_dead()) if recheck_before_hard else wait_raised
+
+    if escalate:
+        _signal_worker_process_tree(process, hard=True, cleanup_started_at=cleanup_started_at)
+        kill = getattr(process, 'kill', None)
+        if callable(kill):
+            # Same reasoning as terminate() above: success-gated logging via
+            # _safe_call so a raising logger can't abort teardown.
+            try:
+                kill()
+            except Exception:
+                pass
+            else:
+                if log_info is not None:
+                    _safe_call(
+                        log_info,
+                        "desktop.llama_cpp_worker.hard_kill_signal elapsed_ms=%s"
+                        % max(0, int((time.monotonic() - cleanup_started_at) * 1000)),
+                    )
+        if wait_after_kill:
+            # Fire-and-forget: close() never reaches here (wait_after_kill
+            # always False for it); _close_llm_proxy() recomputes
+            # _poll_dead() below instead of trusting this wait()'s result.
+            _safe_call(getattr(process, 'wait', None), timeout=wait_timeout)
+
+    return _poll_dead()
+
+
 class _SubprocessLlamaProxy:
     """Minimal llama_cpp.Llama proxy for no-SIGALRM runtimes."""
+
+    # Class-level default (not set per-instance in __init__): a genuinely
+    # explicit, race-free opt-out for deterministic test fixtures with a
+    # finite stdout iterator that simulates a still-alive worker. Overriding
+    # it at the class level (e.g. via monkeypatch, before constructing an
+    # instance) takes effect immediately, closing the window a same-thread
+    # background reader could otherwise race through before an instance
+    # attribute assignment made after construction would apply. Real
+    # versioned production workers must never override this: stdout EOF
+    # always means the process is gone.
+    _legacy_fixture_transport = False
 
     def __init__(
         self,
@@ -2005,26 +2756,71 @@ class _SubprocessLlamaProxy:
         self._expected_llama_module_identity = _valid_llama_module_identity(expected_llama_module_identity)
         self._worker_capabilities_ref = worker_capabilities if isinstance(worker_capabilities, dict) else None
         self._lock = Lock()
+        # stdout has exactly one owner for the lifetime of the worker.  Commands
+        # are still serialized because llama.cpp contexts are not re-entrant,
+        # but cancellation never needs this lock: the manager can signal the
+        # process while this thread is waiting on its command queue.
+        self._pending_lock = Lock()
+        self._pending: Dict[str, queue.Queue] = {}
+        self._completed_commands: set[str] = set()
+        self._command_sequence = 0
+        self._legacy_frames: queue.Queue = queue.Queue(maxsize=32)
+        self._unclaimed_frames: queue.Queue = queue.Queue(maxsize=32)
+        # Per-command progress identity/observer, bound atomically at command
+        # creation time from the caller's own explicit arguments (never from
+        # mutable proxy-global state), so two concurrent callers on the same
+        # proxy can never interleave and mislabel each other's command.
+        self._command_progress: Dict[str, Dict[str, Any]] = {}
+        # Coalesced latest-progress-per-command, populated by the stdout
+        # reader and drained/dispatched by each command's own waiting caller
+        # thread so a slow or raising observer can never delay stdout
+        # drainage or another command's authoritative frames.
+        self._latest_progress: Dict[str, Dict[str, Any]] = {}
         self._closed = False
         self._worker_tmpfile: Optional[str] = None
         code = _llama_cpp_runtime_worker_code(_LLAMA_CPP_RUNTIME_WORKER_CODE)
         # Write worker code to a temp file to avoid Windows command-line length
         # limit (CreateProcess caps at 32767 chars; the code is ~36KB).
+        def write_worker_script(*, directory: Optional[str] = None) -> str:
+            fd: Optional[int] = None
+            tmppath: Optional[str] = None
+            try:
+                fd, tmppath = tempfile.mkstemp(
+                    suffix='.py', prefix='_token_place_worker_', dir=directory
+                )
+                stream = os.fdopen(fd, 'w', encoding='utf-8')
+                fd = None
+                with stream:
+                    stream.write(code)
+                return tmppath
+            except Exception:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                if tmppath is not None:
+                    try:
+                        os.unlink(tmppath)
+                    except OSError:
+                        pass
+                raise
+
         try:
-            fd, tmppath = tempfile.mkstemp(suffix='.py', prefix='_token_place_worker_')
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(code)
+            tmppath = write_worker_script()
             self._worker_tmpfile = tmppath
             command = [sys.executable, '-u', tmppath]
         except OSError:
-            # Temp file creation failed (e.g. disk full, permissions); fall back
-            # to the -c form which may exceed Windows' 32767-char limit but is
-            # better than not launching at all.
             self._worker_tmpfile = None
             command = [sys.executable, '-u', '-c', code]
         env = _llama_cpp_runtime_worker_env()
         cwd = _llama_cpp_probe_subprocess_cwd()
         try:
+            popen_platform: Dict[str, Any] = {}
+            if os.name == 'nt':
+                popen_platform['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+            else:
+                popen_platform['start_new_session'] = True
             self._process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
@@ -2034,6 +2830,7 @@ class _SubprocessLlamaProxy:
                 env=env,
                 cwd=cwd,
                 bufsize=1,
+                **popen_platform,
             )
         except OSError:
             # Popen failed; clean up the temp file if one was created (when
@@ -2052,15 +2849,14 @@ class _SubprocessLlamaProxy:
         self._process._token_place_stdout_tail = []  # type: ignore[attr-defined]
         self._process._token_place_stderr_tail = []  # type: ignore[attr-defined]
         self._process._token_place_stderr_sequence = 0  # type: ignore[attr-defined]
+        self._stderr_activity = threading.Event()
+        self._process._token_place_unclaimed_frames = self._unclaimed_frames  # type: ignore[attr-defined]
+        self._process._token_place_legacy_frames = self._legacy_frames  # type: ignore[attr-defined]
         self._stderr_reader_thread: Optional[threading.Thread] = None
+        self._stdout_reader_thread: Optional[threading.Thread] = None
         self._start_stderr_tail_reader()
         try:
-            self._send({'method': '__import__'}, check_health=False)
-            import_message = _read_llama_subprocess_message(
-                self._process,
-                timeout_seconds=self._timeout_seconds,
-                stage='llama_cpp_import',
-            )
+            import_message = self._rpc({'method': '__import__'}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_import', check_health=False)
             imported_worker_module_path = import_message.get('module_path')
             imported_worker_identity = llama_module_identity_from_path(imported_worker_module_path)
             expected_identity = self._expected_llama_module_identity
@@ -2083,27 +2879,35 @@ class _SubprocessLlamaProxy:
                 raise RuntimeError(safe_exc) from exc
             raise
         try:
-            self._send({'method': '__init__', 'args': args, 'kwargs': kwargs}, check_health=False)
-        except (LlamaCppWorkerBrokenPipeError, BrokenPipeError, OSError) as exc:
-            self.close()
-            raise RuntimeError(
-                _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_model_initialization')
-            ) from exc
-        try:
-            init_message = _read_llama_subprocess_message(
-                self._process,
-                timeout_seconds=self._timeout_seconds,
-                stage='llama_cpp_model_initialization',
-            )
+            init_stderr_sequence = int(getattr(self._process, '_token_place_stderr_sequence', 0) or 0)
+            init_message = self._rpc({'method': '__init__', 'args': args, 'kwargs': kwargs}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_model_initialization', check_health=False)
             self.child_model_path_exists = bool(init_message.get('child_model_path_exists'))
+            # The RPC response and stderr are drained by different readers.  Wait
+            # for a bounded quiet period after the completed init RPC so a slow
+            # stderr reader cannot make current-attempt diagnostics disappear.
+            self._wait_for_initialization_stderr()
+            tail = getattr(self._process, '_token_place_stderr_tail', [])
+            scoped_lines = [line for sequence, line in tail
+                if isinstance(sequence, int) and sequence > init_stderr_sequence]
+            try:
+                self.kv_runtime_diagnostic = parse_llama_cpp_kv_allocation_diagnostics(scoped_lines)
+            except ValueError as exc:
+                self.kv_runtime_diagnostic = {'error': str(exc)}
         except LlamaCppRuntimeStageTimeout:
             self.close()
             raise
         except Exception as exc:
             self._drain_stderr_reader_bounded()
-            stderr_tail = _sanitize_child_diagnostic_text(_llama_subprocess_tail(self._process, '_token_place_stderr_tail'))
+            # Some platform stream adapters publish their final sanitized
+            # backend diagnostic only as wait() observes process exit.
+            try:
+                self._process.wait(timeout=0.05)
+            except Exception:
+                pass
+            raw_stderr_tail = _llama_subprocess_tail(self._process, '_token_place_stderr_tail')
+            stderr_tail = _sanitize_child_diagnostic_text(raw_stderr_tail)
             if isinstance(exc, LlamaCppRuntimeInitError):
-                category = _refine_init_category(exc.safe_error_category, error=exc, child_stderr=stderr_tail)
+                category = _refine_init_category(exc.safe_error_category, error=exc, child_stderr=raw_stderr_tail)
                 child_exception_type = exc.child_exception_type
                 safe_exc = 'llama_cpp_model_initialization failed'
             elif isinstance(exc, LlamaCppWorkerEOFError):
@@ -2134,9 +2938,295 @@ class _SubprocessLlamaProxy:
                     self._process._token_place_stderr_sequence = seq  # type: ignore[attr-defined]
                     tail.append((seq, line))
                     del tail[:-100]
+                    self._stderr_activity.set()
 
         self._stderr_reader_thread = threading.Thread(target=_reader, name='llama_cpp_stderr_reader', daemon=True)
         self._stderr_reader_thread.start()
+
+    def _wait_for_initialization_stderr(self) -> None:
+        """Wait for a bounded post-init minimum and then one quiet interval."""
+        deadline = time.monotonic() + 0.5
+        not_before = time.monotonic() + 0.1
+        while time.monotonic() < deadline:
+            self._stderr_activity.clear()
+            active = self._stderr_activity.wait(timeout=min(0.05, deadline - time.monotonic()))
+            if not active and time.monotonic() >= not_before:
+                return
+
+    def _start_stdout_demultiplexer(self) -> None:
+        """Continuously drain and route the versioned private worker protocol."""
+        def _reader() -> None:
+            stdout = self._process.stdout
+            if stdout is None:
+                self._fail_pending(LlamaCppWorkerEOFError('llama_cpp worker stdout unavailable'))
+                return
+            try:
+                for line in stdout:
+                    if not line.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:'):
+                        sanitized_line = _sanitize_child_diagnostic_line(line)
+                        if sanitized_line:
+                            tail = getattr(self._process, '_token_place_stdout_tail', None)
+                            if isinstance(tail, list):
+                                tail.append(sanitized_line)
+                                del tail[:-100]
+                        continue
+                    try:
+                        frame = json.loads(line.split(':', 1)[1].strip())
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(frame, dict):
+                        continue
+                    if frame.get('protocol_version') != 2:
+                        try:
+                            self._legacy_frames.put_nowait(frame)
+                        except queue.Full:
+                            pass
+                        continue
+                    command_id = frame.get('command_id')
+                    if not isinstance(command_id, str):
+                        try:
+                            self._unclaimed_frames.put_nowait(frame)
+                        except queue.Full:
+                            pass
+                        continue
+                    with self._pending_lock:
+                        target = self._pending.get(command_id)
+                    if target is None:
+                        try:
+                            self._unclaimed_frames.put_nowait(frame)
+                        except queue.Full:
+                            pass
+                        continue
+                    if frame.get('type') == 'inference_progress':
+                        # Progress is coalesced (latest value wins) and never
+                        # dispatched from this thread: a slow or raising
+                        # observer must never delay stdout drainage or another
+                        # command's authoritative frames. The command's own
+                        # waiting caller thread dispatches it.
+                        with self._pending_lock:
+                            context = self._command_progress.get(command_id)
+                            if context is not None:
+                                context['sequence'] += 1
+                                event = {
+                                    key: frame[key] for key in (
+                                        'type', 'phase', 'total_prompt_tokens',
+                                        'cached_prompt_tokens', 'processed_prompt_tokens',
+                                        'generated_tokens', 'elapsed_ms'
+                                    ) if key in frame
+                                }
+                                event.update({
+                                    'request_id': context['request_id'] or 'local',
+                                    'worker_generation': context['worker_generation'],
+                                    'sequence': context['sequence'],
+                                })
+                                self._latest_progress[command_id] = event
+                        continue
+                    with self._pending_lock:
+                        if command_id in self._completed_commands:
+                            continue
+                    # Per-command queues are unbounded, so this cannot raise
+                    # queue.Full under normal operation. If delivery still
+                    # fails for any reason, the transport can no longer be
+                    # trusted: fail every pending command with a typed
+                    # transport error and stop reading, rather than silently
+                    # dropping the frame and leaving a waiter hanging forever.
+                    # Deliberately marked completed only *after* a successful
+                    # put: a failed delivery must never be mistaken for one
+                    # that succeeded, or _fail_pending would wrongly skip it.
+                    try:
+                        target.put_nowait(frame)
+                    except Exception:
+                        self._closed = True
+                        self._fail_pending(
+                            LlamaCppWorkerEOFError('llama_cpp worker transport frame delivery failed')
+                        )
+                        return
+                    if frame.get('done') is not False:
+                        with self._pending_lock:
+                            self._completed_commands.add(command_id)
+            finally:
+                # Real versioned production workers only ever reach EOF when
+                # the process has actually died, so this must always close
+                # the transport and fail every still-pending command. The
+                # sole exception is a deterministic test fixture that opts in
+                # explicitly via _legacy_fixture_transport (never inferred
+                # from queue contents).
+                if not getattr(self, '_legacy_fixture_transport', False):
+                    self._closed = True
+                    self._fail_pending(LlamaCppWorkerEOFError('llama_cpp worker transport reached unexpected EOF'))
+
+        self._stdout_reader_thread = threading.Thread(
+            target=_reader, name='llama_cpp_stdout_demultiplexer', daemon=True
+        )
+        self._stdout_reader_thread.start()
+
+    def _fail_pending(self, error: BaseException) -> None:
+        with self._pending_lock:
+            # Commands whose terminal frame was already delivered don't need
+            # (and shouldn't receive) a spurious failure behind it.
+            targets = [
+                target
+                for command_id, target in self._pending.items()
+                if command_id not in self._completed_commands
+            ]
+        for target in targets:
+            # Unbounded per-command queues: this must never be silently
+            # dropped under normal operation (deliberately no `except
+            # queue.Full`). The broad except here exists only so one
+            # unexpectedly broken queue can't prevent this fatal failure from
+            # reaching every *other* still-pending command.
+            try:
+                target.put_nowait(error)
+            except Exception:
+                continue
+
+    def _dispatch_pending_progress(self, command_id: str) -> None:
+        """Fire the observer for the latest coalesced progress, if any.
+
+        Runs on the *caller's* thread (the one waiting on this command's
+        result), never on the stdout reader thread, so a slow or raising
+        observer cannot delay stdout drainage or another command's frames.
+        Once this proxy is closed (detached, cancelled, replaced), any
+        progress still queued for it is stale by definition and must be
+        discarded rather than delivered under what would look like a live
+        generation to the observer.
+        """
+        if self._closed:
+            with self._pending_lock:
+                self._latest_progress.pop(command_id, None)
+            return
+        with self._pending_lock:
+            event = self._latest_progress.pop(command_id, None)
+            context = self._command_progress.get(command_id)
+        if event is None or context is None:
+            return
+        observer = context.get('observer')
+        if callable(observer):
+            try:
+                observer(event)
+            except Exception:
+                pass
+
+    def _wait_with_progress(
+        self, command_id: str, target: queue.Queue, timeout_seconds: Optional[float]
+    ) -> Any:
+        """Block for the next frame on `target` in short slices.
+
+        Dispatches coalesced progress for `command_id` between slices so a
+        long wait (e.g. prefill on a large prompt) still surfaces progress
+        promptly instead of only once the awaited frame finally arrives.
+        Raises `queue.Empty` once `timeout_seconds` elapses with nothing
+        delivered, matching a plain bounded `target.get(timeout=...)`.
+        """
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        while True:
+            self._dispatch_pending_progress(command_id)
+            if deadline is None:
+                wait_seconds = 0.05
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty()
+                wait_seconds = min(remaining, 0.05)
+            try:
+                return target.get(timeout=wait_seconds)
+            except queue.Empty:
+                continue
+
+    def _register_command_progress_context(
+        self,
+        command_id: str,
+        *,
+        observer: Optional[Callable[[Dict[str, Any]], None]],
+        request_id: Optional[str],
+        worker_generation: int,
+    ) -> None:
+        """Atomically bind one command's progress identity at creation time.
+
+        Identity is supplied directly by the immediate caller for this one
+        command_id - never read back from mutable proxy-global state - and
+        must be called only from within the same `_pending_lock`-protected
+        block that creates `command_id`. This is the entire binding
+        operation: there is no separate "stage now, consume later" step, so
+        two concurrent callers on the same proxy can never interleave and
+        mislabel each other's command, and a later, unbound internal command
+        can never inherit a previous request's identity or observer.
+        """
+        self._command_progress[command_id] = {
+            'observer': observer,
+            'request_id': request_id,
+            'worker_generation': max(0, int(worker_generation)),
+            'sequence': 0,
+        }
+
+    def _forget_command_progress_context(self, command_id: str) -> None:
+        self._command_progress.pop(command_id, None)
+        self._latest_progress.pop(command_id, None)
+
+    def _rpc(
+        self,
+        payload: Dict[str, Any],
+        *,
+        timeout_seconds: Optional[float],
+        stage: str,
+        check_health: bool = True,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+    ) -> Dict[str, Any]:
+        if not hasattr(self, '_pending_lock') or self._process.stdout is None:
+            if check_health:
+                self._send(payload)
+            else:
+                self._send(payload, check_health=False)
+            return _read_llama_subprocess_message(self._process, timeout_seconds=timeout_seconds, stage=stage)
+        with self._pending_lock:
+            self._command_sequence += 1
+            command_id = f'c{self._command_sequence}'
+            # Unbounded: an authoritative result/error frame must never be
+            # silently dropped under backpressure.
+            result_queue: queue.Queue = queue.Queue()
+            self._pending[command_id] = result_queue
+            self._register_command_progress_context(
+                command_id,
+                observer=progress_observer,
+                request_id=progress_request_id,
+                worker_generation=progress_worker_generation,
+            )
+        outbound = dict(payload)
+        outbound['protocol_version'] = 2
+        outbound['command_id'] = command_id
+        try:
+            if self._stdout_reader_thread is None:
+                self._start_stdout_demultiplexer()
+            self._send(outbound, check_health=check_health)
+            deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+            while True:
+                self._dispatch_pending_progress(command_id)
+                try:
+                    message = self._legacy_frames.get_nowait()
+                    break
+                except queue.Empty:
+                    if deadline is None:
+                        wait_seconds = 0.05
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise LlamaCppRuntimeStageTimeout(stage, timeout_seconds)
+                        wait_seconds = min(remaining, 0.05)
+                    try:
+                        message = result_queue.get(timeout=wait_seconds)
+                        break
+                    except queue.Empty:
+                        continue
+            if isinstance(message, BaseException):
+                raise message
+            return _validate_llama_subprocess_message(message, process=self._process, stage=stage)
+        finally:
+            with self._pending_lock:
+                self._pending.pop(command_id, None)
+                self._completed_commands.discard(command_id)
+                self._forget_command_progress_context(command_id)
 
     def _drain_stderr_reader_bounded(self) -> None:
         deadline = time.monotonic() + 0.5
@@ -2190,19 +3280,38 @@ class _SubprocessLlamaProxy:
                 _format_llama_subprocess_early_exit_detail(self._process, stage='llama_cpp_liveness')
             )
 
-    def create_chat_completion(self, *args, **kwargs):
+    def create_chat_completion(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+        **kwargs,
+    ):
+        """`progress_request_id`/`progress_observer`/`progress_worker_generation`
+        are internal, keyword-only, and bind local progress telemetry to
+        exactly this one call - never forwarded into `kwargs`, so they can
+        never reach the child worker's generation payload."""
         stream = bool(kwargs.get('stream', False))
         if stream:
-            return self._stream_chat_completion(*args, **kwargs)
+            return self._stream_chat_completion(
+                *args,
+                progress_request_id=progress_request_id,
+                progress_observer=progress_observer,
+                progress_worker_generation=progress_worker_generation,
+                **kwargs,
+            )
         stderr_cursor = 0
         try:
             with self._lock:
                 stderr_cursor = self._stderr_cursor()
-                self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
-                message = _read_llama_subprocess_message(
-                    self._process,
+                message = self._rpc(
+                    {'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs},
                     timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
                     stage='llama_cpp_inference',
+                    progress_request_id=progress_request_id,
+                    progress_observer=progress_observer,
+                    progress_worker_generation=progress_worker_generation,
                 )
         except LlamaCppInferenceRequestError as exc:
             time.sleep(0.1)
@@ -2216,16 +3325,35 @@ class _SubprocessLlamaProxy:
         return message.get('result')
 
 
-    def create_chat_completion_from_rendered_prompt(self, *args, **kwargs):
+    def create_chat_completion_from_rendered_prompt(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+        **kwargs,
+    ):
+        """Complete a rendered prompt with command-local progress telemetry.
+
+        The progress arguments are parent-only context.  Keeping them as
+        explicit keyword-only parameters ensures they are registered with the
+        RPC command but never included in the child worker's generation kwargs.
+        """
         stderr_cursor = 0
         try:
             with self._lock:
                 stderr_cursor = self._stderr_cursor()
-                self._send({'method': 'create_chat_completion_from_rendered_prompt', 'args': args, 'kwargs': kwargs})
-                message = _read_llama_subprocess_message(
-                    self._process,
+                message = self._rpc(
+                    {
+                        'method': 'create_chat_completion_from_rendered_prompt',
+                        'args': args,
+                        'kwargs': kwargs,
+                    },
                     timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
                     stage='llama_cpp_inference',
+                    progress_request_id=progress_request_id,
+                    progress_observer=progress_observer,
+                    progress_worker_generation=progress_worker_generation,
                 )
         except LlamaCppInferenceRequestError as exc:
             time.sleep(0.1)
@@ -2241,27 +3369,21 @@ class _SubprocessLlamaProxy:
 
     def apply_chat_template(self, *args, **kwargs):
         with self._lock:
-            self._send({'method': 'apply_chat_template', 'args': args, 'kwargs': kwargs})
             try:
-                message = _read_llama_subprocess_message(
-                    self._process,
-                    timeout_seconds=self._timeout_seconds,
-                    stage='llama_cpp_prompt_render',
-                )
+                message = self._rpc({'method': 'apply_chat_template', 'args': args, 'kwargs': kwargs}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_prompt_render')
             except LlamaCppWorkerEOFError:
                 self._closed = True
                 raise
         return message.get('result')
 
     def render_and_tokenize_chat(self, *args, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs.pop('token_place_headless_admission_fixture', None)
+        if getattr(self, '_headless_admission_fixture', False):
+            kwargs['token_place_headless_admission_fixture'] = True
         with self._lock:
-            self._send({'method': 'render_and_tokenize_chat', 'args': args, 'kwargs': kwargs})
             try:
-                message = _read_llama_subprocess_message(
-                    self._process,
-                    timeout_seconds=self._timeout_seconds,
-                    stage='llama_cpp_prompt_render_tokenize',
-                )
+                message = self._rpc({'method': 'render_and_tokenize_chat', 'args': args, 'kwargs': kwargs}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_prompt_render_tokenize')
             except LlamaCppWorkerEOFError:
                 self._closed = True
                 raise
@@ -2275,34 +3397,87 @@ class _SubprocessLlamaProxy:
             for arg in args
         )
         with self._lock:
-            self._send({'method': 'tokenize', 'args': serializable_args, 'kwargs': kwargs})
             try:
-                message = _read_llama_subprocess_message(
-                    self._process,
-                    timeout_seconds=self._timeout_seconds,
-                    stage='llama_cpp_prompt_tokenize',
-                )
+                message = self._rpc({'method': 'tokenize', 'args': serializable_args, 'kwargs': kwargs}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_prompt_tokenize')
             except LlamaCppWorkerEOFError:
                 self._closed = True
                 raise
         return message.get('result')
 
-    def _stream_chat_completion(self, *args, **kwargs):
+    def _stream_chat_completion(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        progress_worker_generation: int = 0,
+        **kwargs,
+    ):
         with self._lock:
-            self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
-            while True:
-                try:
-                    message = _read_llama_subprocess_message(
-                        self._process,
-                        timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(),
-                        stage='llama_cpp_inference',
-                    )
-                except LlamaCppWorkerEOFError:
-                    self._closed = True
-                    raise
-                if message.get('done'):
-                    return
-                yield message.get('chunk')
+            if not hasattr(self, '_pending_lock'):
+                self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs})
+                while True:
+                    try:
+                        message = _read_llama_subprocess_message(self._process, timeout_seconds=_llama_cpp_subprocess_inference_timeout_seconds(), stage='llama_cpp_inference')
+                    except LlamaCppWorkerEOFError:
+                        self._closed = True
+                        raise
+                    if message.get('done'):
+                        return
+                    yield message.get('chunk')
+                return
+            with self._pending_lock:
+                self._command_sequence += 1
+                command_id = f'c{self._command_sequence}'
+                # Unbounded: stream chunks and the terminal `done` frame are
+                # authoritative and must never be silently dropped under backpressure.
+                frames: queue.Queue = queue.Queue()
+                self._pending[command_id] = frames
+                self._register_command_progress_context(
+                    command_id,
+                    observer=progress_observer,
+                    request_id=progress_request_id,
+                    worker_generation=progress_worker_generation,
+                )
+            if self._stdout_reader_thread is None:
+                self._start_stdout_demultiplexer()
+            self._send({'method': 'create_chat_completion', 'args': args, 'kwargs': kwargs, 'protocol_version': 2, 'command_id': command_id})
+            try:
+                while True:
+                    self._dispatch_pending_progress(command_id)
+                    try:
+                        try:
+                            message = self._legacy_frames.get_nowait()
+                        except queue.Empty:
+                            message = self._wait_with_progress(
+                                command_id, frames, _llama_cpp_subprocess_inference_timeout_seconds()
+                            )
+                        if isinstance(message, BaseException):
+                            raise message
+                        message = _validate_llama_subprocess_message(message, process=self._process, stage='llama_cpp_inference')
+                    except queue.Empty:
+                        try:
+                            self._process.terminate()
+                            self._process.wait(timeout=1)
+                        except Exception:
+                            try:
+                                self._process.kill()
+                            except Exception:
+                                pass
+                        self._closed = True
+                        raise LlamaCppRuntimeStageTimeout(
+                            'llama_cpp_inference', _llama_cpp_subprocess_inference_timeout_seconds()
+                        ) from None
+                    except LlamaCppWorkerEOFError:
+                        self._closed = True
+                        raise
+                    if message.get('done'):
+                        return
+                    yield message.get('chunk')
+            finally:
+                with self._pending_lock:
+                    self._pending.pop(command_id, None)
+                    self._completed_commands.discard(command_id)
+                    self._forget_command_progress_context(command_id)
 
     def close(self) -> None:
         if self._closed:
@@ -2314,14 +3489,12 @@ class _SubprocessLlamaProxy:
         except Exception:
             pass
         if self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=1)
-            except Exception:
-                try:
-                    self._process.kill()
-                except Exception:
-                    pass
+            _teardown_worker_process(
+                self._process,
+                cleanup_started_at=time.monotonic(),
+                recheck_before_hard=False,
+                wait_after_kill=False,
+            )
         tmpfile = getattr(self, '_worker_tmpfile', None)
         if tmpfile:
             try:
@@ -2416,7 +3589,10 @@ class _SubprocessLlamaCppModule:
 
 
 _LLAMA_CPP_RUNTIME_WORKER_CODE = """
-import importlib, inspect, json, os, re, sys
+import importlib, inspect, json, os, re, sys, time
+
+_active_command_id = None
+_active_protocol_version = None
 
 def _jsonable(value):
     if hasattr(value, 'model_dump'):
@@ -2430,7 +3606,11 @@ def _jsonable(value):
     return value
 
 def _emit(payload):
-    print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(payload)), flush=True)
+    frame = dict(payload)
+    if _active_protocol_version == 2:
+        frame['protocol_version'] = 2
+        frame['command_id'] = _active_command_id
+    print('TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(_jsonable(frame)), flush=True)
 
 
 
@@ -2777,7 +3957,30 @@ def _normalize_plain_completion_result(result):
         cleaned = cleaned[:-len('<|im_end|>')].rstrip()
     if not cleaned:
         return None, 'empty_completion_output'
-    return {'choices': [{'message': {'role': 'assistant', 'content': cleaned}}]}, None
+    choice_result = {'message': {'role': 'assistant', 'content': cleaned}}
+    if isinstance(result, dict):
+        choices = result.get('choices')
+        choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+        finish_reason = choice.get('finish_reason')
+        if isinstance(finish_reason, str) and finish_reason:
+            choice_result['finish_reason'] = finish_reason
+        usage = result.get('usage')
+        if isinstance(usage, dict):
+            # This result crosses the subprocess JSON boundary unchanged. Keep
+            # authoritative backend accounting beside, never inside, the message.
+            normalized_usage = {
+                key: usage[key]
+                for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+                if isinstance(usage.get(key), int) and usage[key] >= 0
+            }
+        else:
+            normalized_usage = {}
+    else:
+        normalized_usage = {}
+    normalized = {'choices': [choice_result]}
+    if normalized_usage:
+        normalized['usage'] = normalized_usage
+    return normalized, None
 
 
 class _RuntimeTemplateRenderError(RuntimeError):
@@ -3183,6 +4386,7 @@ def _type_error_is_unexpected_keyword(exc, keyword):
 
 def _render_chat_with_runtime_template(llama, args, kwargs):
     kwargs = dict(kwargs)
+    headless_fixture = kwargs.pop('token_place_headless_admission_fixture', False) is True
 
     def _rejection_diagnostics(rejected_kwarg, *, include_generation_category=True):
         diagnostics = {
@@ -3252,6 +4456,14 @@ def _render_chat_with_runtime_template(llama, args, kwargs):
             except Exception:
                 tokenizer = None
         render = getattr(tokenizer, 'apply_chat_template', None) if tokenizer is not None else None
+    if headless_fixture:
+        return _render_testing_chat_template_fallback(args, kwargs), {
+            'direct_apply_chat_template': direct_apply_available,
+            'metadata_template': False,
+            'jinja_renderer': False,
+        }
+    template = None
+    metadata_qwen_evidence = False
     render_exc = None
     rejected_render_kwarg = None
     if callable(render):
@@ -3363,6 +4575,8 @@ try:
     if not init_line:
         raise RuntimeError('llama_cpp subprocess missing init payload')
     init_payload = json.loads(init_line)
+    _active_command_id = init_payload.get('command_id')
+    _active_protocol_version = init_payload.get('protocol_version')
     emit_import_handshake = isinstance(init_payload, dict) and init_payload.get('method') == '__import__'
     llama_cpp = importlib.import_module('llama_cpp')
     if emit_import_handshake:
@@ -3371,6 +4585,8 @@ try:
         if not init_line:
             raise RuntimeError('llama_cpp subprocess missing init payload')
         init_payload = json.loads(init_line)
+        _active_command_id = init_payload.get('command_id')
+        _active_protocol_version = init_payload.get('protocol_version')
     init_args = init_payload.get('args', [])
     init_kwargs = init_payload.get('kwargs', {})
 except Exception as exc:
@@ -3402,10 +4618,132 @@ except Exception as exc:
     })
     raise SystemExit(1)
 
+_progress = None
+_original_eval = getattr(llama, 'eval', None)
+if callable(_original_eval):
+    def _progress_eval(tokens):
+        state = _progress
+        if not isinstance(state, dict) or state['generating']:
+            return _original_eval(tokens)
+
+        # generate() has now completed its cache reuse/reset decision.  Its
+        # current token count is therefore authoritative (unlike a common
+        # prefix computed before generate() runs).
+        if not state['cached_recorded']:
+            retained = min(state['total'], max(0, int(getattr(llama, 'n_tokens', 0) or 0)))
+            state['cached'] = retained
+            state['processed'] = retained
+            state['cached_recorded'] = True
+        if not tokens:
+            result = _original_eval(tokens)
+            if not state['prefill_complete']:
+                state['processed'] = state['total']
+                state['prefill_complete'] = True
+                state['last_emit'] = time.monotonic()
+                _emit_progress(state, 'prefill')
+            return result
+
+        # Llama.eval owns batching.  Observe its decode boundary rather than
+        # duplicating that implementation so progress advances only after an
+        # actual batch has completed successfully.
+        context = getattr(llama, '_ctx', None)
+        original_decode = getattr(context, 'decode', None)
+        if not callable(original_decode):
+            return _original_eval(tokens)
+        completed = 0
+
+        def _progress_decode(batch):
+            nonlocal completed
+            result = original_decode(batch)
+            batch_size = min(
+                max(0, len(tokens) - completed),
+                max(1, int(getattr(llama, 'n_batch', len(tokens)) or len(tokens) or 1)),
+            )
+            completed += batch_size
+            state['processed'] = min(state['total'], state['processed'] + batch_size)
+            now = time.monotonic()
+            final = state['processed'] == state['total'] and not state['prefill_complete']
+            if final or now - state['last_emit'] >= 0.25:
+                state['prefill_complete'] = state['prefill_complete'] or final
+                state['last_emit'] = now
+                _emit_progress(state, 'prefill')
+            return result
+
+        context.decode = _progress_decode
+        try:
+            return _original_eval(tokens)
+        finally:
+            context.decode = original_decode
+    llama.eval = _progress_eval
+
+_original_sample = getattr(llama, 'sample', None)
+if callable(_original_sample):
+    def _progress_sample(*args, **kwargs):
+        result = _original_sample(*args, **kwargs)
+        state = _progress
+        if isinstance(state, dict):
+            if not state['prefill_complete']:
+                state['processed'] = state['total']
+                state['prefill_complete'] = True
+                state['last_emit'] = time.monotonic()
+                _emit_progress(state, 'prefill')
+            state['generated'] += 1
+            now = time.monotonic()
+            if not state['generating'] or now - state['last_emit'] >= 0.25:
+                state['generating'] = True
+                state['last_emit'] = now
+                _emit_progress(state, 'generating')
+        return result
+    llama.sample = _progress_sample
+
+def _emit_progress(state, phase):
+    _emit({
+        'type': 'inference_progress',
+        'phase': phase,
+        'total_prompt_tokens': state['total'],
+        'cached_prompt_tokens': state['cached'],
+        'processed_prompt_tokens': state['processed'],
+        'generated_tokens': state['generated'],
+        'elapsed_ms': max(0, int((time.monotonic() - state['started']) * 1000)),
+    })
+
+def _start_progress(request):
+    global _progress
+    started = time.monotonic()
+    _progress = {'started': started, 'last_emit': started, 'total': 0, 'cached': 0, 'processed': 0, 'generated': 0, 'generating': False, 'prefill_complete': False, 'cached_recorded': False}
+    _emit_progress(_progress, 'preparing')
+    try:
+        kwargs = request.get('kwargs', {})
+        if not isinstance(kwargs, dict):
+            kwargs = {}
+        # Mirror the render-only kwargs assembled by the real
+        # create_chat_completion_from_rendered_prompt path (below): passing
+        # generation-only options (max_tokens, temperature, stream, ...) into
+        # apply_chat_template can make runtimes reject the call and leave
+        # progress totals at zero.
+        render_kwargs = {
+            'tokenize': False,
+            'add_generation_prompt': True,
+            'enable_thinking': kwargs.get('enable_thinking'),
+            'token_place_provider': kwargs.get('token_place_provider'),
+            'token_place_template_policy': kwargs.get('token_place_template_policy'),
+        }
+        render_kwargs = {key: value for key, value in render_kwargs.items() if value is not None}
+        rendered, _ = _render_chat_with_runtime_template(llama, request.get('args', []), render_kwargs)
+        tokens = llama.tokenize(rendered.encode('utf-8'), add_bos=False)
+        total = len(tokens)
+        _progress['total'] = total
+    except Exception:
+        # Inference remains authoritative.  If preparation cannot be inspected,
+        # retain privacy-safe zero counters rather than estimating progress.
+        pass
+
 for line in sys.stdin:
     request = None
     try:
         request = json.loads(line)
+        _active_command_id = request.get('command_id') if isinstance(request, dict) else None
+        _active_protocol_version = request.get('protocol_version') if isinstance(request, dict) else None
         if not isinstance(request, dict):
             _emit(_safe_request_error('malformed_request'))
             continue
@@ -3417,6 +4755,8 @@ for line in sys.stdin:
         if not isinstance(kwargs, dict):
             _emit(_safe_request_error('malformed_kwargs', request=request))
             continue
+        if method in {'create_chat_completion', 'create_chat_completion_from_rendered_prompt'}:
+            _start_progress(request)
         if method in {'apply_chat_template', 'render_and_tokenize_chat'}:
             if method == 'render_and_tokenize_chat':
                 _render_diagnostics = None
@@ -4476,8 +5816,12 @@ class ModelManager:
         self._qwen_64k_runtime_profiles: list[Dict[str, Any]] = []
         self._qwen_64k_selected_profile_index = 0
         self._qwen_64k_selected_profile_id: Optional[str] = None
+        self._qwen_64k_selected_profile_fallback_reason: Optional[str] = None
         self._qwen_64k_profile_attempt_ids: list[str] = []
         self._qwen_64k_profile_recovery_count = 0
+        self.qwen_64k_batch_profile = normalize_qwen_64k_batch_profile(
+            config.get('model.qwen_64k_batch_profile', QWEN_64K_BATCH_PROFILE_DEFAULT)
+        )
         # Preserved across profile advances: the first recoverable failure
         # category from the initial readiness smoke, so later profile failures
         # do not overwrite it and the first Metal failure remains observable.
@@ -4775,7 +6119,9 @@ class ModelManager:
             'n_ctx': n_ctx,
             'verbose': llama_cpp_verbose_logging_enabled(),
         }
-        if self.model_profile.get('provider') == 'qwen':
+        if getattr(self, 'headless_admission_fixture', False) is True:
+            pass
+        elif self.model_profile.get('provider') == 'qwen':
             if self._chat_template_mode() != 'gguf-jinja':
                 raise RuntimeError('Qwen runtime requires GGUF/Jinja chat template policy')
         else:
@@ -4900,18 +6246,37 @@ class ModelManager:
                     model_path=self.model_path,
                     n_ctx=n_ctx,
                     enable_kqv_offload=n_gpu_layers != 0,
+                    batch_profile=self.qwen_64k_batch_profile,
                 )
                 runtime_profile = built_profiles[0] if built_profiles else {
-                    'profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT,
+                    'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
                     'kwargs': {},
-                    'diagnostics': {'profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT, 'enabled': False, 'applied': {}},
+                    'diagnostics': {
+                        'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
+                        'preferred_profile_id': _qwen_64k_profile_id(
+                            'q8', self.qwen_64k_batch_profile
+                        ),
+                        'fallback_reason': 'capability_incompatibility',
+                        'kv_precision': 'f16',
+                        'batch_profile': self.qwen_64k_batch_profile,
+                        'qwen_64k_batch_profile_requested': self.qwen_64k_batch_profile,
+                        'enabled': False,
+                        'applied': {},
+                    },
                 }
             profile_kwargs = runtime_profile.get('kwargs') if isinstance(runtime_profile, dict) else {}
             if isinstance(profile_kwargs, dict):
                 kwargs.update(profile_kwargs)
             profile_diagnostics = runtime_profile.get('diagnostics') if isinstance(runtime_profile, dict) else None
             self.last_qwen_64k_memory_profile_diagnostics = dict(profile_diagnostics) if isinstance(profile_diagnostics, dict) else {
-                'profile_id': QWEN_64K_RUNTIME_PROFILE_DEFAULT,
+                'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
+                'preferred_profile_id': _qwen_64k_profile_id(
+                    'q8', self.qwen_64k_batch_profile
+                ),
+                'fallback_reason': 'capability_incompatibility',
+                'kv_precision': 'f16',
+                'batch_profile': self.qwen_64k_batch_profile,
+                'qwen_64k_batch_profile_requested': self.qwen_64k_batch_profile,
                 'enabled': True,
                 'applied': {},
             }
@@ -5274,6 +6639,23 @@ class ModelManager:
             attempted_kwargs = {}
         memory_profile = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', None)
         applied_memory = memory_profile.get('applied') if isinstance(memory_profile, dict) and isinstance(memory_profile.get('applied'), dict) else {}
+        kv_precision = memory_profile.get('kv_precision') if isinstance(memory_profile, dict) else None
+        requested_batch_profile = normalize_qwen_64k_batch_profile(
+            memory_profile.get(
+                'qwen_64k_batch_profile_requested',
+                getattr(self, 'qwen_64k_batch_profile', None),
+            )
+            if isinstance(memory_profile, dict)
+            else getattr(self, 'qwen_64k_batch_profile', None)
+        )
+        selected_batch_profile = (
+            memory_profile.get('batch_profile') if isinstance(memory_profile, dict) else None
+        )
+        selected_fallback_reason = getattr(
+            self, '_qwen_64k_selected_profile_fallback_reason', None
+        )
+        if selected_fallback_reason is None and isinstance(memory_profile, dict):
+            selected_fallback_reason = memory_profile.get('fallback_reason')
         profile_id = current_profile_id or latest_failure.get('profile_id')
         attempted_profile_ids = [
             str(failure.get('profile_id'))
@@ -5288,6 +6670,12 @@ class ModelManager:
             'api_v1_readiness_error_code': 'compute_node_runtime_init_failed',
             'api_v1_readiness_error_reason': 'qwen_64k_runtime_profile_initialization_failed',
             'api_v1_readiness_qwen_64k_runtime_profile_id': profile_id,
+            'api_v1_readiness_qwen_64k_runtime_preferred_profile_id': _qwen_64k_profile_id(
+                'q8', requested_batch_profile
+            ),
+            'api_v1_readiness_qwen_64k_batch_profile_requested': requested_batch_profile,
+            'api_v1_readiness_qwen_64k_batch_profile_selected': selected_batch_profile,
+            'api_v1_readiness_qwen_64k_runtime_profile_kv_precision': kv_precision,
             'api_v1_readiness_qwen_64k_runtime_profile_attempt_ids': ','.join(attempted_profile_ids),
             'api_v1_readiness_qwen_64k_runtime_profile_recovery_count': max(0, len(attempted_profile_ids) - 1),
             'api_v1_readiness_qwen_64k_runtime_profile_flash_attn': attempted_kwargs.get('flash_attn', applied_memory.get('flash_attn')),
@@ -5298,6 +6686,13 @@ class ModelManager:
             'api_v1_readiness_qwen_64k_runtime_profile_n_ubatch': attempted_kwargs.get('n_ubatch', applied_memory.get('n_ubatch')),
             'api_v1_readiness_qwen_64k_runtime_profile_result': 'failed',
             'api_v1_readiness_qwen_64k_runtime_profile_failure_category': latest_failure.get('safe_error_category'),
+            'api_v1_readiness_qwen_64k_runtime_profile_fallback_reason': (
+                selected_fallback_reason or (
+                    'memory_pressure'
+                    if is_qwen_64k_memory_pressure_failure_category(latest_failure.get('safe_error_category'))
+                    else 'compatibility_failure'
+                )
+            ),
         })
         n_ctx = attempted_kwargs.get('n_ctx') or latest_failure.get('n_ctx')
         if n_ctx is not None:
@@ -5480,7 +6875,27 @@ class ModelManager:
                                         model_path=self.model_path,
                                         n_ctx=int(self.config.get('model.context_size', 65536)),
                                         enable_kqv_offload=n_gpu_layers != 0,
+                                        batch_profile=self.qwen_64k_batch_profile,
                                     )
+                                    if not runtime_profiles:
+                                        runtime_profiles = [{
+                                            'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
+                                            'kwargs': {},
+                                            'diagnostics': {
+                                                'profile_id': QWEN_64K_RUNTIME_PROFILE_F16,
+                                                'preferred_profile_id': _qwen_64k_profile_id(
+                                                    'q8', self.qwen_64k_batch_profile
+                                                ),
+                                                'fallback_reason': 'capability_incompatibility',
+                                                'kv_precision': 'f16',
+                                                'batch_profile': self.qwen_64k_batch_profile,
+                                                'qwen_64k_batch_profile_requested': self.qwen_64k_batch_profile,
+                                                'enabled': True,
+                                                'applied': {},
+                                                'backend': str(compute_plan.get('backend_used') or '').lower(),
+                                            },
+                                        }]
+                                        self._qwen_64k_selected_profile_fallback_reason = 'capability_incompatibility'
                                     self._qwen_64k_runtime_profiles = list(runtime_profiles)
                                     start_index = max(0, min(int(getattr(self, '_qwen_64k_selected_profile_index', 0) or 0), len(runtime_profiles)))
                                     runtime_profiles = runtime_profiles[start_index:]
@@ -5490,7 +6905,9 @@ class ModelManager:
                             first_context_create_init_exc = None
                             llm_instance = None
                             runtime_kwargs = {}
-                            for runtime_profile in runtime_profiles:
+                            runtime_profile_cursor = 0
+                            while runtime_profile_cursor < len(runtime_profiles):
+                                runtime_profile = runtime_profiles[runtime_profile_cursor]
                                 runtime_kwargs = self._runtime_init_kwargs(Llama, n_gpu_layers, llama_cpp, runtime_profile)
                                 profile_diag = getattr(self, 'last_qwen_64k_memory_profile_diagnostics', {})
                                 profile_id = profile_diag.get('profile_id') if isinstance(profile_diag, dict) else 'default'
@@ -5505,6 +6922,8 @@ class ModelManager:
                                             self._qwen_64k_profile_attempt_ids.append(profile_id)
                                 try:
                                     llm_instance = Llama(**runtime_kwargs)
+                                    if getattr(self, 'headless_admission_fixture', False) is True:
+                                        setattr(llm_instance, '_headless_admission_fixture', True)
                                     if is_qwen_64k and isinstance(profile_id, str):
                                         ids = [p.get('profile_id') for p in self._qwen_64k_runtime_profiles]
                                         self._qwen_64k_selected_profile_index = ids.index(profile_id) if profile_id in ids else 0
@@ -5512,6 +6931,34 @@ class ModelManager:
                                     if isinstance(profile_diag, dict):
                                         profile_diag['selected'] = True
                                         self.last_qwen_64k_memory_profile_diagnostics = profile_diag
+                                        setattr(llm_instance, '_token_place_benchmark_kv_estimate', {
+                                            'profile_id': profile_diag.get('profile_id'),
+                                            'backend': profile_diag.get('backend'),
+                                            'kv_precision': profile_diag.get('kv_precision'),
+                                            'memory_estimate': profile_diag.get('memory_estimate'),
+                                        })
+                                    provider = str(self.model_profile.get('provider') or '').lower()
+                                    context_size = int(self.config.get('model.context_size', 8192))
+                                    context_tier = str(getattr(self, 'context_tier', '8k-fast'))
+                                    selected_profile = profile_id if isinstance(profile_id, str) and profile_id else str(self.profile_id)
+                                    if provider == 'qwen' and context_tier == '64k-full' and context_size == 65536:
+                                        applicability = 'qwen_64k_full'
+                                        architecture = 'qwen3'
+                                    elif provider and provider != 'qwen':
+                                        applicability = 'not_applicable_verified_non_qwen'
+                                        architecture = provider
+                                    else:
+                                        applicability = 'not_applicable_context_tier'
+                                        architecture = 'qwen3' if provider == 'qwen' else provider
+                                    setattr(llm_instance, '_token_place_benchmark_kv_applicability', {
+                                        'method': 'active_runtime_selected_profile',
+                                        'applicability': applicability,
+                                        'architecture': architecture,
+                                        'profile_id': selected_profile,
+                                        'backend': str(compute_plan.get('backend_used') or '').lower(),
+                                        'context_tier': context_tier,
+                                        'context_size_tokens': context_size,
+                                    })
                                     break
                                 except Exception as init_exc:
                                     category = _classify_runtime_initialization_error(init_exc)
@@ -5559,6 +7006,28 @@ class ModelManager:
                                     close = getattr(init_exc, 'close', None)
                                     if callable(close):
                                         close()
+                                    next_index = _next_qwen_64k_runtime_profile_index(
+                                        self._qwen_64k_runtime_profiles,
+                                        profile_id,
+                                        category,
+                                    )
+                                    if next_index is None:
+                                        break
+                                    next_profile_id = self._qwen_64k_runtime_profiles[next_index].get('profile_id')
+                                    if next_profile_id in self._qwen_64k_profile_attempt_ids:
+                                        break
+                                    runtime_profiles = self._qwen_64k_runtime_profiles
+                                    runtime_profile_cursor = next_index
+                                    self._qwen_64k_selected_profile_index = next_index
+                                    fallback_reason = (
+                                        'memory_pressure'
+                                        if is_qwen_64k_memory_pressure_failure_category(category)
+                                        else 'compatibility_failure'
+                                    )
+                                    self._qwen_64k_selected_profile_fallback_reason = fallback_reason
+                                    next_diagnostics = runtime_profiles[next_index].get('diagnostics')
+                                    if isinstance(next_diagnostics, dict):
+                                        next_diagnostics['fallback_reason'] = fallback_reason
                                     continue
                             if llm_instance is None:
                                 self.last_qwen_64k_init_failures = profile_failures
@@ -5631,6 +7100,14 @@ class ModelManager:
                                 }
                                 compute_plan.update({
                                     'qwen_64k_runtime_profile_id': memory_profile.get('profile_id'),
+                                    'qwen_64k_batch_profile_requested': self.qwen_64k_batch_profile,
+                                    'qwen_64k_batch_profile_selected': memory_profile.get('batch_profile'),
+                                    'qwen_64k_runtime_preferred_profile_id': memory_profile.get('preferred_profile_id', QWEN_64K_RUNTIME_PROFILE_Q8),
+                                    'qwen_64k_runtime_profile_kv_precision': memory_profile.get('kv_precision', 'f16'),
+                                    'qwen_64k_runtime_profile_fallback_reason': (
+                                        self._qwen_64k_selected_profile_fallback_reason
+                                        or memory_profile.get('fallback_reason')
+                                    ),
                                     'qwen_64k_runtime_profile_attempt_ids': ','.join(self._qwen_64k_profile_attempt_ids),
                                     'qwen_64k_runtime_profile_recovery_count': self._qwen_64k_profile_recovery_count,
                                     'qwen_64k_runtime_profile_flash_attn': applied_memory.get('flash_attn'),
@@ -5715,13 +7192,13 @@ class ModelManager:
         profiles = list(self._qwen_64k_runtime_profiles or [])
         profile_ids = [
             profile.get('profile_id')
-            for profile in profiles[:3]
+            for profile in profiles
             if isinstance(profile, dict) and profile.get('profile_id')
         ]
         if not profile_ids:
             profile_ids = [
-                QWEN_64K_RUNTIME_PROFILE_DEFAULT,
                 QWEN_64K_RUNTIME_PROFILE_Q8,
+                QWEN_64K_RUNTIME_PROFILE_F16,
                 QWEN_64K_RUNTIME_PROFILE_Q4,
             ]
         current_index = max(0, int(getattr(self, '_qwen_64k_selected_profile_index', 0) or 0))
@@ -5787,9 +7264,27 @@ class ModelManager:
                 self._qwen_64k_first_readiness_failure_diagnostics.setdefault('category', category)
                 if decode_return_code is not None:
                     self._qwen_64k_first_readiness_failure_diagnostics.setdefault('eval_return_code', decode_return_code)
-            next_index = int(self._qwen_64k_selected_profile_index or 0) + 1
-            self._qwen_64k_selected_profile_index = next_index
-            exhausted = next_index >= len(profiles)
+            next_index = _next_qwen_64k_runtime_profile_index(
+                profiles,
+                active_profile_id,
+                category,
+            )
+            exhausted = next_index is None
+            if next_index is not None:
+                next_profile_id = profiles[next_index].get('profile_id')
+                if next_profile_id in (getattr(self, '_qwen_64k_profile_attempt_ids', []) or []):
+                    exhausted = True
+                else:
+                    self._qwen_64k_selected_profile_index = next_index
+                    fallback_reason = (
+                        'memory_pressure'
+                        if is_qwen_64k_memory_pressure_failure_category(category)
+                        else 'compatibility_failure'
+                    )
+                    self._qwen_64k_selected_profile_fallback_reason = fallback_reason
+                    next_diagnostics = profiles[next_index].get('diagnostics')
+                    if isinstance(next_diagnostics, dict):
+                        next_diagnostics['fallback_reason'] = fallback_reason
         self._close_llm_proxy(failed_runtime)
         if exhausted:
             return None
@@ -5917,21 +7412,12 @@ class ModelManager:
             return False
 
     def _close_llm_proxy(self, llm: Any, *, terminate_process: bool = False, fatal_callback: Optional[Callable] = None) -> bool:
+        cleanup_started_at = time.monotonic()
         process = getattr(llm, '_process', None)
 
         def _close_or_join_resource(resource: Any) -> None:
-            closer = getattr(resource, 'close', None)
-            if callable(closer):
-                try:
-                    closer()
-                except Exception:
-                    pass
-            join = getattr(resource, 'join', None)
-            if callable(join):
-                try:
-                    join(timeout=0.25)
-                except Exception:
-                    pass
+            _safe_call(getattr(resource, 'close', None))
+            _safe_call(getattr(resource, 'join', None), timeout=0.25)
 
         def _dead() -> bool:
             if process is None:
@@ -5949,35 +7435,22 @@ class ModelManager:
             # Subprocess-backed workers are cleaned up with process primitives before
             # any proxy close so third-party close() cannot block cancellation or
             # ordinary invalidation while holding up recovery.
-            for attr in ('stdin', 'stdout', 'stderr'):
-                _close_or_join_resource(getattr(process, attr, None))
             if not _dead():
-                terminate = getattr(process, 'terminate', None)
-                if callable(terminate):
-                    try:
-                        terminate()
-                    except Exception:
-                        pass
-                wait = getattr(process, 'wait', None)
-                if callable(wait):
-                    try:
-                        wait(timeout=1.0)
-                    except Exception:
-                        pass
-            if not _dead():
-                kill = getattr(process, 'kill', None)
-                if callable(kill):
-                    try:
-                        kill()
-                    except Exception:
-                        pass
-                wait = getattr(process, 'wait', None)
-                if callable(wait):
-                    try:
-                        wait(timeout=1.0)
-                    except Exception:
-                        pass
-            process_stopped = _dead()
+                process_stopped = _teardown_worker_process(
+                    process,
+                    cleanup_started_at=cleanup_started_at,
+                    log_info=self.log_info,
+                    recheck_before_hard=True,
+                    wait_after_kill=True,
+                )
+            else:
+                process_stopped = True
+            # A live stdout iterator can own TextIOWrapper's internal lock.
+            # Streams are therefore disposed only after verified process death,
+            # when EOF has released the persistent reader.
+            if process_stopped:
+                for attr in ('stdin', 'stdout', 'stderr'):
+                    _close_or_join_resource(getattr(process, attr, None))
 
         close = getattr(llm, 'close', None)
         if callable(close) and process is None:
@@ -6201,13 +7674,123 @@ class ModelManager:
             observed_generation = self._llm_generation
         return self._ensure_replacement_llm(observed_generation)
 
-    def create_chat_completion_with_recovery(self, *args, **kwargs):
+    def _guard_progress_observer(
+        self,
+        observer: Optional[Callable[[Dict[str, Any]], None]],
+        *,
+        llm_instance: Any,
+        worker_generation: int,
+    ) -> Optional[Callable[[Dict[str, Any]], None]]:
+        """Wrap `observer` so delivery is suppressed once this exact worker
+        instance/generation is no longer the manager's current one.
+
+        Cancellation (`terminate_active_worker_for_cancellation`) and
+        ordinary invalidation (`_invalidate_llm_if_current`) both detach the
+        serving worker (`self.llm = None`, `_llm_generation` incremented)
+        and release `llm_lock` *before* `_close_llm_proxy` actually
+        terminates the process - the proxy's own `_closed` flag only
+        becomes true much later, once the process has actually exited.
+        Progress already coalesced on the reader thread for an in-flight
+        command can still be dispatched by the caller's own polling loop
+        during that window, so staleness must be checked here, fresh,
+        against current manager state at delivery time - not inferred from
+        the proxy being closed, and not deferred until process EOF.
+        """
+        if observer is None:
+            return None
+
+        def _guarded(event: Dict[str, Any]) -> None:
+            with self.llm_lock:
+                if self.llm is not llm_instance or self._llm_generation != worker_generation:
+                    return
+            observer(event)
+
+        return _guarded
+
+    @staticmethod
+    def _progress_call_kwargs(
+        create_chat_completion: Callable[..., Any],
+        *,
+        request_id: Optional[str],
+        observer: Optional[Callable[[Dict[str, Any]], None]],
+        worker_generation: int,
+    ) -> Dict[str, Any]:
+        """Build this call's one-shot progress-identity kwargs, if supported.
+
+        Identity is passed as dedicated call arguments to
+        `create_chat_completion` itself - atomically bound to that single
+        invocation, never staged on mutable shared state - so it's returned
+        empty unless the caller supplied a real `request_id` AND the target
+        callable actually declares these parameters (checked by signature,
+        not a fixed type, so both the subprocess proxy and a compatible test
+        double work; a direct in-process Llama's real signature does not
+        declare them and is safely never passed anything extra).
+        """
+        if request_id is None:
+            return {}
+        try:
+            params = inspect.signature(create_chat_completion).parameters
+        except (TypeError, ValueError):
+            return {}
+        if 'progress_request_id' not in params:
+            return {}
+        return {
+            'progress_request_id': request_id,
+            'progress_observer': observer,
+            'progress_worker_generation': worker_generation,
+        }
+
+    def local_progress_call_kwargs_for_runtime(
+        self,
+        runtime_callable: Callable[..., Any],
+        *,
+        llm_instance: Any,
+        request_id: Optional[str],
+        observer: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> Dict[str, Any]:
+        """Bind local telemetry to the current runtime instance/generation.
+
+        This is used by direct runtime paths, such as Qwen's rendered-prompt
+        completion, which intentionally do not pass through completion
+        recovery.  The guarded observer drops events as soon as cancellation
+        or replacement makes this worker generation stale.
+        """
+        with self.llm_lock:
+            if self.llm is not llm_instance:
+                return {}
+            worker_generation = self._llm_generation
+        return self._progress_call_kwargs(
+            runtime_callable,
+            request_id=request_id,
+            observer=self._guard_progress_observer(
+                observer,
+                llm_instance=llm_instance,
+                worker_generation=worker_generation,
+            ),
+            worker_generation=worker_generation,
+        )
+
+    def create_chat_completion_with_recovery(
+        self,
+        *args,
+        progress_request_id: Optional[str] = None,
+        progress_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+        **kwargs,
+    ):
         """Create a completion, replacing a dead subprocess worker at most once.
 
         Recovery is only supported for non-streaming completions. Passing
         ``stream=True`` returns a generator before transport IO can raise
         restartable worker errors, so callers that need recovery must use
         ``stream=False``.
+
+        ``progress_request_id``/``progress_observer`` are internal, keyword-only:
+        when supplied, they bind this call's local progress telemetry to the
+        caller's real external request_id and the worker generation actually
+        used to serve it (including the post-recovery generation, if a
+        replacement worker is used), so recovery can never deliver progress
+        for a stale generation to the wrong request. Neither is part of the
+        public API v1 request/response schema.
         """
         if kwargs.get('stream', False):
             raise ValueError(
@@ -6231,8 +7814,16 @@ class ModelManager:
         create_chat_completion = getattr(llm_instance, 'create_chat_completion', None)
         if not callable(create_chat_completion):
             raise RuntimeError('LLM runtime missing create_chat_completion')
+        progress_kwargs = self._progress_call_kwargs(
+            create_chat_completion,
+            request_id=progress_request_id,
+            observer=self._guard_progress_observer(
+                progress_observer, llm_instance=llm_instance, worker_generation=observed_generation,
+            ),
+            worker_generation=observed_generation,
+        )
         try:
-            return create_chat_completion(*args, **kwargs)
+            return create_chat_completion(*args, **kwargs, **progress_kwargs)
         except LlamaCppInferenceRequestError as exc:
             safe_error_code = _safe_worker_error_code(exc)
             diagnostics = getattr(exc, 'diagnostics', {}) or {}
@@ -6272,8 +7863,20 @@ class ModelManager:
                 self._llm_generation != observed_generation and observed_cancel_event.is_set()
             ):
                 raise RuntimeError('LLM inference request cancelled before worker retry')
+            replacement_generation = self._llm_generation
+        # Rebind against the replacement's own generation: a caller must never
+        # receive progress that appears to come from the stale, pre-recovery
+        # worker generation it started with.
+        replacement_progress_kwargs = self._progress_call_kwargs(
+            replacement_create,
+            request_id=progress_request_id,
+            observer=self._guard_progress_observer(
+                progress_observer, llm_instance=replacement, worker_generation=replacement_generation,
+            ),
+            worker_generation=replacement_generation,
+        )
         try:
-            result = replacement_create(*args, **kwargs)
+            result = replacement_create(*args, **kwargs, **replacement_progress_kwargs)
             with self.llm_lock:
                 self.worker_state = 'ready'
                 self.last_worker_error_code = None

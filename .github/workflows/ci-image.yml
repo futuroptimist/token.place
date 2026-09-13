@@ -15,6 +15,10 @@ on:
         description: Branch, tag, or SHA to build
         required: false
         default: main
+      base:
+        description: Reviewed release base branch or tag
+        required: false
+        default: main
 
 jobs:
   build-and-smoke:
@@ -32,12 +36,16 @@ jobs:
       semver_tag: ${{ steps.tags.outputs.semver_tag }}
       deploy_tag: ${{ steps.tags.outputs.deploy_tag }}
       publish: ${{ steps.tags.outputs.publish }}
+      full_sha: ${{ steps.tags.outputs.full_sha }}
+      selected_ref: ${{ steps.tags.outputs.selected_ref }}
+      release_base: ${{ steps.tags.outputs.release_base }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          fetch-depth: 0
 
       - name: Compute image metadata and tags
         id: tags
@@ -52,6 +60,13 @@ jobs:
           deploy_tag=""
 
           short_sha="$(git rev-parse --short=7 HEAD)"
+          full_sha="$(git rev-parse HEAD)"
+          selected_ref="${GITHUB_REF}"
+          release_base="${{ github.base_ref || github.event.repository.default_branch }}"
+          if [[ "${event_name}" == "workflow_dispatch" ]]; then
+            selected_ref="${{ inputs.ref }}"
+            release_base="${{ inputs.base }}"
+          fi
           created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           repository="ghcr.io/futuroptimist/tokenplace-relay"
           sha_tag="${repository}:sha-${short_sha}"
@@ -83,6 +98,9 @@ jobs:
           fi
 
           echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "full_sha=${full_sha}" >> "$GITHUB_OUTPUT"
+          echo "selected_ref=${selected_ref}" >> "$GITHUB_OUTPUT"
+          echo "release_base=${release_base}" >> "$GITHUB_OUTPUT"
           echo "created=${created}" >> "$GITHUB_OUTPUT"
           echo "repository=${repository}" >> "$GITHUB_OUTPUT"
           echo "sha_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
@@ -109,11 +127,35 @@ jobs:
           tags: tokenplace-relay:smoke
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ steps.tags.outputs.short_sha }}
+            org.opencontainers.image.revision=${{ steps.tags.outputs.full_sha }}
             org.opencontainers.image.created=${{ steps.tags.outputs.created }}
             org.opencontainers.image.licenses=MIT
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
+
+      - name: Enforce relay release safety contract
+        run: |
+          python scripts/relay_release_safety_gate.py \
+            --image tokenplace-relay:smoke \
+            --platform linux/amd64 \
+            --source-commit "$(git rev-parse HEAD)" \
+            --release-ref "${{ steps.tags.outputs.selected_ref }}" \
+            --release-base "${{ steps.tags.outputs.release_base }}" \
+            --evidence relay-release-safety-evidence.json
+
+      - name: Upload relay release safety evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-release-safety-${{ steps.tags.outputs.short_sha }}
+          path: relay-release-safety-evidence.json
+          if-no-files-found: error
+
+      - name: Prove canonical recovered and historical artifacts
+        run: |
+          python -m pip install -r config/requirements_codex_verification.txt
+          docker info >/dev/null
+          python -m pytest -q tests/artifact/test_relay_release_safety_artifacts.py
 
       - name: Smoke test relay container
         run: |
@@ -229,7 +271,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push multi-arch relay image
+      - name: Build immutable multi-arch candidate
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -237,14 +280,64 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
-          tags: ${{ needs.build-and-smoke.outputs.publish_tags }}
+          tags: ${{ needs.build-and-smoke.outputs.repository }}:candidate-${{ needs.build-and-smoke.outputs.short_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ needs.build-and-smoke.outputs.short_sha }}
+            org.opencontainers.image.revision=${{ needs.build-and-smoke.outputs.full_sha }}
             org.opencontainers.image.created=${{ needs.build-and-smoke.outputs.created }}
             org.opencontainers.image.licenses=MIT
           cache-from: type=gha,scope=relay-image
           cache-to: type=gha,mode=max,scope=relay-image
+
+      - name: Pull and qualify every candidate platform
+        run: |
+          set -euo pipefail
+          candidate="${{ needs.build-and-smoke.outputs.repository }}@${{ steps.push.outputs.digest }}"
+          docker buildx imagetools inspect --raw "${candidate}" > candidate-index.json
+          mapfile -t advertised < <(jq -r '.manifests[] | select(.platform.os == "linux") | "\(.platform.os)/\(.platform.architecture)"' candidate-index.json | sort)
+          [[ "${advertised[*]}" == "linux/amd64 linux/arm64" ]]
+          for platform in linux/amd64 linux/arm64; do
+            platform_tag="${platform//\//-}"
+            image="tokenplace-relay:publish-candidate-${platform_tag}"
+            arch="${platform#linux/}"
+            platform_digest="$(jq -er --arg arch "${arch}" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' candidate-index.json)"
+            [[ "${platform_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+            platform_coordinate="${{ needs.build-and-smoke.outputs.repository }}@${platform_digest}"
+            docker pull --platform "${platform}" "${platform_coordinate}"
+            docker tag "${platform_coordinate}" "${image}"
+            python scripts/relay_release_safety_gate.py \
+              --image "${image}" \
+              --platform "${platform}" \
+              --source-commit "${{ needs.build-and-smoke.outputs.full_sha }}" \
+              --release-ref "${{ needs.build-and-smoke.outputs.selected_ref }}" \
+              --release-base "${{ needs.build-and-smoke.outputs.release_base }}" \
+              --registry-coordinate "${platform_coordinate}" \
+              --index-digest "${{ steps.push.outputs.digest }}" \
+              --platform-digest "${platform_digest}" \
+              --evidence "relay-release-safety-publish-${platform_tag}-evidence.json"
+          done
+
+      - name: Upload publication safety evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-release-safety-publish-${{ needs.build-and-smoke.outputs.short_sha }}
+          path: relay-release-safety-publish-*-evidence.json
+          if-no-files-found: error
+
+      - name: Promote qualified candidate to release tags
+        env:
+          PUBLISH_TAGS: ${{ needs.build-and-smoke.outputs.publish_tags }}
+          CANDIDATE: ${{ needs.build-and-smoke.outputs.repository }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          while IFS= read -r tag; do
+            test -n "${tag}"
+            tag_args+=(--tag "${tag}")
+          done <<< "${PUBLISH_TAGS}"
+          test "${#tag_args[@]}" -gt 0
+          docker buildx imagetools create "${tag_args[@]}" "${CANDIDATE}"
 
       - name: Publish workflow summary
         run: |
@@ -260,6 +353,8 @@ jobs:
               echo "Sugarkube deploy tag: \`${{ needs.build-and-smoke.outputs.semver_tag }}\`"
             fi
             echo "SHA tag: \`${{ needs.build-and-smoke.outputs.sha_tag }}\`"
+            echo "Immutable OCI index digest: \`${{ steps.push.outputs.digest }}\`"
+            echo "Safety contract: passed against the built candidate before publication."
             echo ""
             echo "Pushed: true"
           } >> "$GITHUB_STEP_SUMMARY"

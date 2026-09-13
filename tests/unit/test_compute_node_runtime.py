@@ -7,6 +7,7 @@ import pytest
 
 from utils.compute_node_runtime import (
     ApiV1RelayRequestAdapter,
+    authoritative_readiness_fixture,
     apply_compute_mode,
     ComputeNodeRuntime,
     ComputeNodeRuntimeConfig,
@@ -27,9 +28,27 @@ from utils.compute_node_runtime import (
 )
 
 
+def test_authoritative_readiness_fixture_is_stable_and_privacy_safe():
+    content, fixture = authoritative_readiness_fixture()
+
+    assert content == "Reply with exactly: ok"
+    assert set(fixture) == {"fixture_sha256", "target_prefix_utf8_bytes"}
+    assert fixture["target_prefix_utf8_bytes"] == {"midpoint": 11}
+
+
 def _ready_relay_client():
     return SimpleNamespace(
-        _api_v1_authoritative_context_admission=lambda **_kwargs: (True, None, 3)
+        _api_v1_authoritative_context_admission=lambda **_kwargs: (
+            True,
+            None,
+            {
+                "prompt_tokens": 3,
+                "active_context_tokens": 8192,
+                "requested_output_tokens": 1,
+                "available_output_tokens": 8189,
+                "effective_output_tokens": 1,
+            },
+        )
     )
 
 
@@ -560,6 +579,13 @@ def test_compute_node_runtime_ensure_api_v1_runtime_ready_success():
     )
     assert runtime.ensure_api_v1_runtime_ready() is True
     assert model_manager.last_compute_diagnostics["api_v1_readiness_result"] == "passed"
+    assert model_manager.last_compute_diagnostics["api_v1_readiness_prompt_tokens"] == 3
+    assert (
+        model_manager.last_compute_diagnostics[
+            "api_v1_readiness_tokenizer_render_bridge_available"
+        ]
+        is True
+    )
 
 
 def test_compute_node_runtime_readiness_admission_exception_is_generic_not_bridge_missing():
@@ -2589,7 +2615,7 @@ def _real_qwen_64k_model_manager(runtimes):
     manager.download_model_if_needed = MagicMock(return_value=True)
     manager.last_compute_diagnostics = {
         "active_profile_id": "qwen3-8b-q4-k-m",
-        "qwen_64k_runtime_profile_id": "qwen64k_f16_fa_small_batch",
+        "qwen_64k_runtime_profile_id": "qwen64k_kv_q8_fa_small_batch",
         "n_ctx": 65536,
         "native_context_tokens": 32768,
         "kv_cache_mode": {"type_k": 8, "type_v": 8, "flash_attn": True},
@@ -2605,13 +2631,22 @@ def _real_qwen_64k_model_manager(runtimes):
     manager._qwen_64k_profile_recovery_count = 0
     manager._qwen_64k_first_readiness_failure_category = None
     manager._qwen_64k_first_readiness_failure_diagnostics = {}
-    manager._qwen_64k_profile_attempt_ids = ["qwen64k_f16_fa_small_batch"]
+    manager._qwen_64k_profile_attempt_ids = ["qwen64k_kv_q8_fa_small_batch"]
     manager._qwen_64k_selected_profile_index = 0
-    manager._qwen_64k_selected_profile_id = "qwen64k_f16_fa_small_batch"
+    manager._qwen_64k_selected_profile_id = "qwen64k_kv_q8_fa_small_batch"
     manager._qwen_64k_runtime_profiles = [
-        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
-        {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
-        {"profile_id": "qwen64k_kv_q4_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {
+            "profile_id": "qwen64k_kv_q8_fa_small_batch",
+            "diagnostics": {"backend": "metal", "kv_precision": "q8", "batch_profile": "safe"},
+        },
+        {
+            "profile_id": "qwen64k_f16_fa_small_batch",
+            "diagnostics": {"backend": "metal", "kv_precision": "f16", "batch_profile": "safe"},
+        },
+        {
+            "profile_id": "qwen64k_kv_q4_fa_small_batch",
+            "diagnostics": {"backend": "metal", "kv_precision": "q4", "batch_profile": "safe"},
+        },
     ]
     close_calls = []
     manager._close_llm_proxy = MagicMock(side_effect=lambda runtime: close_calls.append(runtime))
@@ -2709,7 +2744,7 @@ def test_qwen_64k_readiness_recovery_prefers_recoverable_backend_diagnostic():
 
     assert runtime.ensure_api_v1_runtime_ready() is True
     assert model_manager._test_close_calls == [failed_runtime]
-    assert model_manager._qwen_64k_selected_profile_index == 1
+    assert model_manager._qwen_64k_selected_profile_index == 2
     assert model_manager._qwen_64k_profile_recovery_count == 1
     assert model_manager.llm is recovered_runtime
     assert model_manager._qwen_64k_first_readiness_failure_category == "metal_command_buffer_out_of_memory"
@@ -2848,11 +2883,12 @@ def test_qwen_64k_readiness_decode_recovery_honors_cancellation():
 @pytest.mark.parametrize(
     ("budget_value", "expected_attempts"),
     [
-        (None, 3),
-        (0, 3),
-        (False, 3),
-        ("3", 3),
-        (99, 3),
+        (None, 2),
+        (RuntimeError("budget unavailable"), 2),
+        (0, 2),
+        (False, 2),
+        ("3", 2),
+        (99, 2),
         (2, 2),
     ],
 )
@@ -2861,6 +2897,10 @@ def test_qwen_64k_readiness_profile_budget_validation_is_bounded(budget_value, e
     model_manager = _real_qwen_64k_model_manager(runtimes)
     if budget_value is None:
         model_manager.qwen_64k_readiness_profile_attempt_budget = None
+    elif isinstance(budget_value, Exception):
+        model_manager.qwen_64k_readiness_profile_attempt_budget = MagicMock(
+            side_effect=budget_value
+        )
     else:
         model_manager.qwen_64k_readiness_profile_attempt_budget = MagicMock(return_value=budget_value)
     relay_client = MagicMock()
@@ -3267,11 +3307,11 @@ def test_compute_node_runtime_has_single_authoritative_yarn_original_context_ass
     assert all(count == 1 for count in matching_dicts)
 
 
-def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
-    """F16 smoke raises backend_graph_compute_failure; Q8 runtime passes; recovery count is 1."""
-    f16_runtime = _Qwen64kRuntime()
+def test_qwen_64k_profile_recovery_q8_fail_then_f16_success():
+    """Q8 compatibility failure retries F16, never Q4, and then succeeds."""
     q8_runtime = _Qwen64kRuntime()
-    model_manager = _real_qwen_64k_model_manager([f16_runtime, q8_runtime])
+    f16_runtime = _Qwen64kRuntime()
+    model_manager = _real_qwen_64k_model_manager([q8_runtime, f16_runtime])
 
     # First generate_api_v1 call fails; second (Q8) passes
     model_manager._relay_client = MagicMock()
@@ -3305,8 +3345,8 @@ def test_qwen_64k_profile_recovery_f16_fail_then_q8_success():
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is True
-    assert model_manager._test_close_calls == [f16_runtime]
-    assert model_manager.llm is q8_runtime
+    assert model_manager._test_close_calls == [q8_runtime]
+    assert model_manager.llm is f16_runtime
     assert f16_runtime is not q8_runtime
     assert relay_client._api_v1_authoritative_context_admission.call_count == 2
     assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 2
@@ -3321,7 +3361,7 @@ def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
     q8_runtime = _Qwen64kRuntime()
     q4_runtime = _Qwen64kRuntime()
 
-    model_manager = _real_qwen_64k_model_manager([f16_runtime, q8_runtime, q4_runtime])
+    model_manager = _real_qwen_64k_model_manager([q8_runtime, f16_runtime, q4_runtime])
 
     relay_client = MagicMock()
     relay_client._api_v1_authoritative_context_admission.return_value = (True, None, 42)
@@ -3350,13 +3390,13 @@ def test_qwen_64k_profile_recovery_three_profile_exhaustion_fails_closed():
     )
 
     assert runtime.ensure_api_v1_runtime_ready() is False
-    assert model_manager._test_close_calls == [f16_runtime, q8_runtime, q4_runtime]
-    assert relay_client._api_v1_authoritative_context_admission.call_count == 3
-    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 3
+    assert model_manager._test_close_calls == [q8_runtime, f16_runtime]
+    assert relay_client._api_v1_authoritative_context_admission.call_count == 2
+    assert relay_client._generate_api_v1_response_with_runtime_model.call_count == 2
     assert model_manager.download_model_if_needed.call_count == 1
-    assert model_manager.get_llm_instance.call_count == 3
+    assert model_manager.get_llm_instance.call_count == 2
     assert model_manager._qwen_64k_first_readiness_failure_category == "backend_graph_compute_failure"
-    assert model_manager._qwen_64k_profile_recovery_count == 3
+    assert model_manager._qwen_64k_profile_recovery_count == 2
 
 
 def test_completion_smoke_cuda_oom_classification_is_qwen64k_recoverable():

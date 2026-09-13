@@ -73,6 +73,9 @@ RunTest -TestName "JavaScript Tests" -Command "npm run test:js" -Description "Te
 # 8. Run E2E tests
 RunTest -TestName "End-to-End Tests" -Command "python -m pytest tests/test_e2e_*.py -v" -Description "Testing complete workflows"
 
+# 8a. Always-on relay landing-page Markdown regression
+RunTest -TestName "Relay Landing Page Markdown Rendering" -Command "python -m pytest -q tests/e2e/test_ui.py::test_markdown_rendering_stream_updates -x" -Description "Verifying user and assistant fenced Markdown renders as safe code blocks"
+
 # 9. Run failure recovery tests
 RunTest -TestName "Failure Recovery Tests" -Command "python -m pytest tests/test_failure_recovery.py -v" -Description "Testing system resilience against errors"
 

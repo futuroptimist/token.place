@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import importlib
 import ipaddress
 import json
@@ -14,8 +15,10 @@ import re
 import sys
 import threading
 import time
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from pathlib import Path
 
 from utils.processing_result import RelayProcessingResult
 from urllib.parse import urlparse, urlunparse
@@ -27,6 +30,7 @@ from utils.llm.model_profiles import build_model_aliases
 # Configure logging
 logger = logging.getLogger('relay_client')
 DEFAULT_API_V1_LEASE_SECONDS = 30.0
+# Only legacy relays that omit valid deadline metadata use this compatibility cap.
 _API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS = 300.0
 _API_V1_CONTROL_MIN_POLL_SECONDS = 1.0
 _API_V1_CONTROL_MAX_POLL_SECONDS = 10.0
@@ -41,6 +45,11 @@ _API_V1_CLEANUP_BUDGET_SECONDS = 5.0
 # No daemon thread or interrupt mechanism is needed: the bounded timeout ensures
 # the control executor thread completes before executor.shutdown(wait=True).
 _API_V1_MAX_CONTROL_TIMEOUT_SECONDS = _API_V1_CLEANUP_BUDGET_SECONDS - 1.0
+_API_V1_PROGRESS_INTERVAL_SECONDS = 1.0
+_API_V1_PROGRESS_FIELDS = (
+    "phase", "total_prompt_tokens", "cached_prompt_tokens",
+    "processed_prompt_tokens", "generated_tokens", "elapsed_ms",
+)
 # Mapping from relay-side control status strings to internal terminal reason codes.
 # Used in both the normal control-result observation path and the concurrent
 # inference-failure + terminal-control race resolution.
@@ -74,6 +83,166 @@ class _ApiV1SupervisorOutcome(NamedTuple):
     recovery_attempted: bool = False
     recovery_succeeded: bool = False
     submission_allowed: bool = True
+
+
+class _ApiV1ProgressPublisher:
+    """Request-scoped handle for the process-wide progress service."""
+
+    def __init__(self, owner, relay_url: str, client_key: str, request_id: str):
+        self.owner, self.relay_url, self.client_key, self.request_id = owner, relay_url, client_key, request_id
+        self._lock = threading.Lock()
+        self._stopped = False
+        self._sequence = 0
+        self._last_phase = None
+        self._active = threading.Event()
+        self._active.set()
+
+    def submit(self, event: Dict[str, Any]) -> None:
+        try:
+            phase = event.get("phase")
+            values = {key: event.get(key, 0) for key in _API_V1_PROGRESS_FIELDS if key != "phase"}
+            if phase not in {"preparing", "prefill", "generating"}:
+                return
+            if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > 2**53 - 1 for v in values.values()):
+                return
+            total, cached, processed = values["total_prompt_tokens"], values["cached_prompt_tokens"], values["processed_prompt_tokens"]
+            if total > 0 and not (cached <= processed <= total):
+                return
+            with self._lock:
+                if self._stopped:
+                    return
+                phase_changed = phase != self._last_phase
+                self._last_phase = phase
+            _API_V1_PROGRESS_HTTP_WORKER.submit(
+                self, {"phase": phase, **values}, urgent=phase_changed
+            )
+        except Exception:
+            return
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+            self._active.clear()
+        _API_V1_PROGRESS_HTTP_WORKER.invalidate(self)
+
+    def stop_from_worker(self) -> None:
+        with self._lock:
+            self._stopped = True
+            self._active.clear()
+
+    def _prepare(self, event: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Prepare one update on the bounded service worker, never the caller."""
+        with self._lock:
+            if self._stopped:
+                return None
+            self._sequence += 1
+            sequence = self._sequence
+        inner = {
+            "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+            "request_id": self.request_id, "client_public_key": self.client_key,
+            "api_v1_progress": {"schema_version": 1, "sequence": sequence, **event},
+        }
+        encrypted = self.owner.crypto_manager.encrypt_message(inner, self.client_key)
+        credential = self.owner._api_v1_control_credential_for_relay(self.relay_url)
+        payload = {
+            "server_public_key": self.owner.crypto_manager.public_key_b64,
+            "client_public_key": self.client_key, "request_id": self.request_id,
+            "control_credential": credential, "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+            "ciphertext": encrypted["chat_history"], "cipherkey": encrypted["cipherkey"], "iv": encrypted["iv"],
+        }
+        kwargs = {"json": payload, "timeout": 2.0}
+        headers = self.owner._auth_headers()
+        if headers:
+            kwargs["headers"] = headers
+        return self.owner._build_api_v1_url(self.relay_url, "/relay/progress"), kwargs
+
+
+class _ApiV1ProgressHttpWorker:
+    """One reusable, bounded worker isolates best-effort progress transport.
+
+    Requests timeouts are not wall-clock guarantees.  A singleton daemon and a
+    one-item handoff ensure a wedged adapter can retain neither an unbounded set
+    of request threads nor their RelayClient owners.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._pending = None
+        self._shutdown = False
+        self._thread = threading.Thread(
+            target=self._run, name="tokenplace-api-v1-progress-http", daemon=True
+        )
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        """Stop this worker after any in-flight operation returns.
+
+        Production uses the module singleton for the process lifetime.  This
+        hook exists so independently constructed test workers can be quiesced
+        without changing that lifecycle.
+        """
+        with self._condition:
+            self._pending = None
+            self._shutdown = True
+            self._condition.notify_all()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        """Join a worker that has first been shut down."""
+        self._thread.join(timeout)
+
+    def submit(
+        self, publisher: _ApiV1ProgressPublisher, event: Dict[str, Any], *, urgent: bool = False
+    ) -> bool:
+        with self._condition:
+            if getattr(self, "_shutdown", False):
+                return False
+            # Globally retain at most the newest not-yet-started update. This is
+            # bounded even when encryption, credential lookup, or HTTP wedges.
+            if self._pending is not None and self._pending[0] is publisher:
+                urgent = urgent or self._pending[2]
+            self._pending = (publisher, event, urgent)
+            self._condition.notify()
+        return True
+
+    def invalidate(self, publisher: _ApiV1ProgressPublisher) -> None:
+        with self._condition:
+            if self._pending is not None and self._pending[0] is publisher:
+                self._pending = None
+            self._condition.notify()
+
+    def _run(self) -> None:
+        next_allowed = 0.0
+        while True:
+            with self._condition:
+                while not self._shutdown and (self._pending is None or (
+                    not self._pending[2] and time.monotonic() < next_allowed
+                )):
+                    delay = max(0.0, next_allowed - time.monotonic())
+                    self._condition.wait(delay if self._pending is not None else None)
+                if self._shutdown:
+                    return
+                publisher, event, _urgent = self._pending
+                self._pending = None
+            self._publish(publisher, event)
+            # Cadence belongs to the one service worker, so it cannot create a
+            # timer or sleeping thread per completed request.
+            next_allowed = time.monotonic() + _API_V1_PROGRESS_INTERVAL_SECONDS
+
+    @staticmethod
+    def _publish(publisher: _ApiV1ProgressPublisher, event: Dict[str, Any]) -> None:
+        """Prepare and send one best-effort update on the service thread."""
+        try:
+            prepared = publisher._prepare(event) if publisher._active.is_set() else None
+            if prepared is not None and publisher._active.is_set():
+                url, kwargs = prepared
+                response = requests.post(url, **kwargs)
+                if response.status_code in {400, 401, 403, 404, 405, 410, 413, 422}:
+                    publisher.stop_from_worker()
+        except Exception as exc:
+            logger.warning("API v1 progress publish failed; exc_type=%s", type(exc).__name__)
+
+
+_API_V1_PROGRESS_HTTP_WORKER = _ApiV1ProgressHttpWorker()
 
 
 class _PostApiV1Outcome(NamedTuple):
@@ -988,6 +1157,7 @@ class RelayClient:
         self._polling_stopped_by_request = False
         self._api_v1_control_wakeup = threading.Event()
         self._registration_token: Optional[str] = None
+        self._api_v1_write_benchmark_stage("python_handoff_received")
         configured_servers: List[Any] = []
         self._cluster_only = False
 
@@ -1088,6 +1258,7 @@ class RelayClient:
         self._api_v1_last_heartbeat_at: Dict[str, float] = {}
         self._api_v1_relay_wait_hints: Dict[str, Dict[str, Any]] = {}
         self._api_v1_control_credentials_by_relay: Dict[str, str] = {}
+        self._api_v1_relay_capabilities: Dict[str, Dict[str, bool]] = {}
         self._api_v1_control_credentials_lock = threading.Lock()
         self._unregister_attempted = False
         self._unregister_complete = False
@@ -1803,12 +1974,14 @@ class RelayClient:
 
         with self._api_v1_control_credentials_lock:
             self._api_v1_control_credentials_by_relay.pop(relay_url, None)
+            self._api_v1_relay_capabilities.pop(relay_url, None)
 
     def _clear_api_v1_control_credentials(self) -> None:
         """Clear all relay control credentials under the dedicated credential-map lock."""
 
         with self._api_v1_control_credentials_lock:
             self._api_v1_control_credentials_by_relay.clear()
+            self._api_v1_relay_capabilities.clear()
 
     def _api_v1_non_200_diagnostic(
         self,
@@ -1959,6 +2132,9 @@ class RelayClient:
             'server_public_key': self.crypto_manager.public_key_b64,
             'capabilities': self._api_v1_compute_node_capabilities(),
         }
+        control_credential = self._api_v1_control_credential_for_relay(target_url)
+        if control_credential:
+            payload['control_credential'] = control_credential
         request_kwargs: Dict[str, Any] = {'json': payload, 'timeout': self._request_timeout}
         headers = self._auth_headers()
         if headers:
@@ -1983,6 +2159,13 @@ class RelayClient:
             control_credential = payload.get('control_credential')
             if isinstance(control_credential, str) and control_credential:
                 self._store_api_v1_control_credential(target_url, control_credential)
+            capabilities = payload.get('relay_capabilities')
+            with self._api_v1_control_credentials_lock:
+                self._api_v1_relay_capabilities[target_url] = {
+                    'encrypted_progress_v1': bool(
+                        isinstance(capabilities, dict) and capabilities.get('encrypted_progress_v1') is True
+                    )
+                }
         return payload
 
     @staticmethod
@@ -2207,11 +2390,15 @@ class RelayClient:
                         self._api_v1_public_key_fingerprint(current_public_key),
                     )
 
+                poll_payload = {
+                    'server_public_key': self.crypto_manager.public_key_b64,
+                    'capabilities': self._api_v1_compute_node_capabilities(),
+                }
+                control_credential = self._api_v1_control_credential_for_relay(candidate_url)
+                if control_credential:
+                    poll_payload['control_credential'] = control_credential
                 request_kwargs: Dict[str, Any] = {
-                    'json': {
-                        'server_public_key': self.crypto_manager.public_key_b64,
-                        'capabilities': self._api_v1_compute_node_capabilities(),
-                    },
+                    'json': poll_payload,
                     'timeout': self._api_v1_poll_timeout_seconds(poll_wait),
                 }
                 log_info(
@@ -2391,7 +2578,7 @@ class RelayClient:
             return None
         if not math.isfinite(seconds):
             return None
-        return max(0.0, seconds)
+        return seconds if seconds > 0 else None
 
     @classmethod
     def _api_v1_initial_deadline_from_metadata(cls, request_payload: Dict[str, Any], *, now: Optional[float] = None) -> float:
@@ -2400,8 +2587,7 @@ class RelayClient:
             cls._api_v1_initial_relative_seconds(request_payload.get('request_ttl_seconds')),
         ]
         valid = [value for value in candidates if value is not None]
-        # Legacy relays may omit deadline metadata; cap such requests at the
-        # documented 300-second compatibility deadline rather than running forever.
+        # Legacy relays may omit deadline metadata and expire work after 300s.
         remaining = min(valid) if valid else _API_V1_COMPATIBILITY_REQUEST_DEADLINE_SECONDS
         return (time.monotonic() if now is None else now) + remaining
 
@@ -2494,7 +2680,8 @@ class RelayClient:
         except Exception:
             log_info('api_v1.control_ack_failed request_id={}', request_id)
 
-    def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any], *, local_deadline: Optional[float] = None) -> _ApiV1SupervisorOutcome:
+    def _supervise_api_v1_inference(self, api_v1_request_payload: Dict[str, Any], *, local_deadline: Optional[float] = None, progress_observer=None) -> _ApiV1SupervisorOutcome:
+        supervisor_started_at = time.monotonic()
         request_id = api_v1_request_payload['request_id']
         relay_url = self._api_v1_response_relay_url()
         control_available = relay_url in getattr(self, '_api_v1_registered_relays', set())
@@ -2509,6 +2696,10 @@ class RelayClient:
             )
         if local_deadline is None:
             local_deadline = self._api_v1_initial_deadline_from_metadata(api_v1_request_payload, now=time.monotonic())
+        log_info(
+            'api_v1.inference_supervision_started initial_deadline_budget_ms={}',
+            max(0, int((local_deadline - supervisor_started_at) * 1000)),
+        )
         terminal_status: Optional[str] = None
         terminal_reason = 'unknown'
         future_result: Optional[Dict[str, Any]] = None
@@ -2539,6 +2730,7 @@ class RelayClient:
                 messages=api_v1_request_payload['messages'],
                 options=dict(api_v1_request_payload['options']),
                 requested_context_tier=api_v1_request_payload['routing']['context_tier'],
+                progress_observer=progress_observer,
             )
 
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='api_v1_inference')
@@ -2705,10 +2897,30 @@ class RelayClient:
                     terminal_reason = 'inference_failure'
                     break
             if terminal_status is not None:
+                terminal_observed_at = time.monotonic()
+                log_info(
+                    'api_v1.inference_terminal_observed terminal_source={} elapsed_ms={}',
+                    terminal_reason,
+                    max(0, int((terminal_observed_at - supervisor_started_at) * 1000)),
+                )
                 recovery_succeeded = False
                 try:
+                    terminate_started_at = time.monotonic()
+                    log_info(
+                        'api_v1.worker_terminate_signal elapsed_ms={}',
+                        max(0, int((terminate_started_at - supervisor_started_at) * 1000)),
+                    )
                     recovery_succeeded = self._terminate_current_llama_worker(
                         terminal_reason, recreate=terminal_status != 'operator_stop'
+                    )
+                    # `_terminate_current_llama_worker` may recreate a replacement
+                    # worker (recreate=True), so this timestamp reflects full
+                    # recovery completion, not just OS process exit.
+                    recovery_completed_at = time.monotonic()
+                    log_info(
+                        'api_v1.worker_recovery_complete elapsed_ms={} cancellation_to_recovery_complete_ms={}',
+                        max(0, int((recovery_completed_at - supervisor_started_at) * 1000)),
+                        max(0, int((recovery_completed_at - terminal_observed_at) * 1000)),
                     )
                 except Exception:
                     log_error('api_v1.worker_termination_failed reason={}', terminal_reason)
@@ -2809,6 +3021,9 @@ class RelayClient:
         *,
         message: Optional[Dict[str, Any]] = None,
         error: Optional[Dict[str, Any]] = None,
+        finish_reason: Optional[str] = None,
+        usage: Optional[Dict[str, int]] = None,
+        output_budget: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """Build an encrypted API v1 relay response envelope body."""
 
@@ -2817,6 +3032,12 @@ class RelayClient:
             api_v1_response = {"error": error}
         else:
             api_v1_response = {"message": message}
+            if finish_reason is not None:
+                api_v1_response["finish_reason"] = finish_reason
+            if usage is not None:
+                api_v1_response["usage"] = usage
+            if output_budget is not None:
+                api_v1_response["output_budget"] = output_budget
         return {
             "protocol": "tokenplace_api_v1_relay_e2ee",
             "version": 1,
@@ -2861,8 +3082,14 @@ class RelayClient:
             )
 
         try:
+            server_public_key = response_envelope.get("server_public_key")
+            claim_generation = response_envelope.get("claim_generation")
             bound_response_envelope = {
-                **response_envelope,
+                **{
+                    key: value
+                    for key, value in response_envelope.items()
+                    if key not in {"server_public_key", "claim_generation"}
+                },
                 "client_public_key": client_pub_key_b64,
             }
             encrypted_response = self.crypto_manager.encrypt_message(
@@ -2870,6 +3097,12 @@ class RelayClient:
                 client_pub_key,
             )
             source_payload = {
+                "server_public_key": server_public_key
+                or getattr(self.crypto_manager, "public_key_b64", ""),
+                "control_credential": self._api_v1_control_credential_for_relay(
+                    self._api_v1_response_relay_url()
+                ),
+                "claim_generation": claim_generation,
                 "client_public_key": client_pub_key_b64,
                 "request_id": response_envelope["request_id"],
                 "protocol": "tokenplace_api_v1_relay_e2ee",
@@ -3734,6 +3967,175 @@ class RelayClient:
             return prompt_tokens
         return None
 
+    @classmethod
+    def _api_v1_write_benchmark_stage(cls, category: str, stage: int = 30) -> bool:
+        """Atomically publish only a bounded, privacy-safe benchmark stage."""
+        allowed = {
+            "python_handoff_received", "request_validation_failure",
+            "fixture_hash_validation_failure", "active_runtime_tokenizer_unavailable",
+            "runtime_identity_unavailable", "tokenization_failure",
+            "evidence_publication_failure", "authoritative_evidence_published",
+        }
+        evidence_name = os.getenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
+        if category not in allowed or not evidence_name:
+            return False
+        output = Path(f"{evidence_name}.stage.json")
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=".tokenizer-stage-", suffix=".tmp",
+                dir=output.parent)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump({"version": 1, "stage": stage, "category": category}, handle,
+                        sort_keys=True, separators=(",", ":"))
+                os.replace(temporary, output)
+                return True
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return False
+
+    @classmethod
+    def _api_v1_record_benchmark_tokenizer_observation(
+        cls,
+        llm_instance: Any,
+        messages: List[Dict[str, Any]],
+        *,
+        full_prompt_tokens: int,
+        enable_thinking: Optional[bool],
+        model_profile: Dict[str, Any],
+    ) -> None:
+        """Record bounded local long-context benchmark prefix counts through the admission bridge."""
+        config_name = os.getenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST")
+        evidence_name = os.getenv("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
+        if not config_name or not evidence_name:
+            return
+        failure_category = "request_validation_failure"
+        try:
+            raw = Path(config_name).read_text(encoding="utf-8")
+            if len(raw.encode("utf-8")) > 16384:
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                return
+            try:
+                config = json.loads(raw)
+            except json.JSONDecodeError:
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                return
+            if not isinstance(config, dict):
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                return
+            target_offsets = config.get("target_prefix_utf8_bytes")
+            if (not isinstance(target_offsets, dict)
+                    or not target_offsets or not all(isinstance(k, str) and isinstance(v, int)
+                    for k, v in target_offsets.items())):
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                return
+            user_indexes = [index for index, message in enumerate(messages)
+                if isinstance(message, dict) and message.get("role") == "user"]
+            if not user_indexes:
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                return
+            user_index = user_indexes[-1]
+            content = messages[user_index].get("content")
+            if not isinstance(content, str):
+                cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                return
+            content_bytes = content.encode("utf-8")
+            if hashlib.sha256(content_bytes).hexdigest() != config.get("fixture_sha256"):
+                cls._api_v1_write_benchmark_stage("fixture_hash_validation_failure", 50)
+                return
+            counts: Dict[str, int] = {}
+            failure_category = "tokenization_failure"
+            for key, offset in sorted(target_offsets.items(), key=lambda item: item[1]):
+                if isinstance(offset, bool) or offset <= 0 or offset >= len(content_bytes):
+                    cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                    return
+                try:
+                    prefix = content_bytes[:offset].decode("utf-8")
+                except UnicodeDecodeError:
+                    cls._api_v1_write_benchmark_stage("request_validation_failure", 40)
+                    return
+                prefix_messages = [dict(message) for message in messages]
+                prefix_messages[user_index]["content"] = prefix
+                count = cls._api_v1_render_and_tokenize_chat_prompt(
+                    llm_instance, prefix_messages, enable_thinking=enable_thinking,
+                    model_profile=model_profile)
+                if count is None:
+                    rendered_prefix = cls._api_v1_render_chat_prompt(
+                        llm_instance,
+                        prefix_messages,
+                        enable_thinking=enable_thinking,
+                        allow_chat_format_fallback=True,
+                    )
+                    count = (
+                        cls._api_v1_tokenize_rendered_prompt(llm_instance, rendered_prefix)
+                        if rendered_prefix is not None
+                        else None
+                    )
+                if count is None:
+                    tokenizers_present = (callable(getattr(llm_instance,
+                        "render_and_tokenize_chat", None))
+                        or callable(getattr(llm_instance, "tokenize", None)))
+                    cls._api_v1_write_benchmark_stage(
+                        "tokenization_failure" if tokenizers_present
+                        else "active_runtime_tokenizer_unavailable",
+                        65 if tokenizers_present else 60)
+                    return
+                if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                    cls._api_v1_write_benchmark_stage("tokenization_failure", 65)
+                    return
+                counts[key] = count
+            failure_category = "runtime_identity_unavailable"
+            runtime_identity = os.getenv("TOKENPLACE_RUNTIME_ID", "")
+            if not runtime_identity:
+                cls._api_v1_write_benchmark_stage("runtime_identity_unavailable", 70)
+                return
+            evidence = {"method": "packaged_admission_render_and_tokenize_chat",
+                "runtime_identity": runtime_identity,
+                "fixture_sha256": config["fixture_sha256"],
+                "total_prompt_tokens": full_prompt_tokens,
+                "target_offsets_tokens": counts}
+            applicability = getattr(llm_instance, "_token_place_benchmark_kv_applicability", None)
+            if isinstance(applicability, dict):
+                evidence["kv_applicability"] = dict(applicability)
+            estimate = getattr(llm_instance, "_token_place_benchmark_kv_estimate", None)
+            runtime_diagnostic = getattr(llm_instance, "kv_runtime_diagnostic", None)
+            if isinstance(estimate, dict) and isinstance(runtime_diagnostic, dict):
+                memory = estimate.get("memory_estimate")
+                if isinstance(memory, dict):
+                    evidence["kv_estimator"] = {
+                        "profile_id": estimate.get("profile_id"),
+                        "backend": estimate.get("backend"),
+                        "context_size_tokens": memory.get("context_size_tokens"),
+                        "type_k": memory.get("type_k"),
+                        "type_v": memory.get("type_v"),
+                        "exact_kv_allocation_bytes": memory.get("exact_kv_allocation_bytes"),
+                        "metadata_source": memory.get("metadata_source"),
+                        "conservative_fallback_used": memory.get("conservative_fallback_used"),
+                    }
+                    evidence["kv_runtime"] = dict(runtime_diagnostic)
+            output = Path(evidence_name)
+            failure_category = "evidence_publication_failure"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=".long-context-tokenizer-", dir=output.parent)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(evidence, handle, sort_keys=True, separators=(",", ":"))
+                os.replace(temporary, output)
+                cls._api_v1_write_benchmark_stage("authoritative_evidence_published", 100)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+            stages = {"request_validation_failure": 40, "tokenization_failure": 65,
+                "runtime_identity_unavailable": 70,
+                "evidence_publication_failure": 90}
+            cls._api_v1_write_benchmark_stage(failure_category, stages[failure_category])
+            return
+
     @staticmethod
     def _api_v1_tokenize_rendered_prompt(llm_instance: Any, rendered_prompt: str) -> Optional[int]:
         """Count prompt tokens with the active llama.cpp runtime tokenizer."""
@@ -4012,7 +4414,7 @@ class RelayClient:
         messages: List[Dict[str, Any]],
         requested_output_tokens: int,
         requested_context_tier: str,
-    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[int]]:
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
         active_context_tier = normalize_context_tier(
             getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER)
         )
@@ -4052,6 +4454,10 @@ class RelayClient:
                 if rendered_prompt is not None
                 else None
             )
+        if prompt_tokens is not None:
+            self._api_v1_record_benchmark_tokenizer_observation(
+                llm_instance, messages, full_prompt_tokens=prompt_tokens,
+                enable_thinking=admission_enable_thinking, model_profile=model_profile)
         if prompt_tokens is None:
             worker_diagnostics = getattr(llm_instance, "_token_place_last_render_tokenize_error", None)
             internal_reason = "runtime_template_tokenizer_bridge_unavailable"
@@ -4122,13 +4528,22 @@ class RelayClient:
                 ),
                 None,
             )
+        available_output_tokens = max(configured_context_tokens - prompt_tokens, 0)
+        effective_output_tokens = min(requested_output_tokens, available_output_tokens)
+        budget = {
+            "prompt_tokens": prompt_tokens,
+            "active_context_tokens": configured_context_tokens,
+            "requested_output_tokens": requested_output_tokens,
+            "available_output_tokens": available_output_tokens,
+            "effective_output_tokens": effective_output_tokens,
+        }
         required_total = prompt_tokens + requested_output_tokens
         tier_supported = self._active_context_tier_can_satisfy(requested_context_tier)
-        admitted = tier_supported and required_total <= configured_context_tokens
+        admitted = tier_supported and effective_output_tokens > 0
         if admitted:
             safe_error_code = "none"
             admission_error = None
-        elif not tier_supported and required_total <= configured_context_tokens:
+        elif not tier_supported:
             safe_error_code = "compute_node_context_tier_unsupported"
             admission_error = self._api_v1_context_tier_unsupported_error(
                 active_context_tier=active_context_tier,
@@ -4147,16 +4562,18 @@ class RelayClient:
                 requested_context_tier=requested_context_tier,
             )
         log_info(
-            "api_v1.context_admission active_tier={} prompt_tokens={} output_reservation={} result={} duration_ms=0 safe_error_code={}",
+            "api_v1.context_admission active_tier={} prompt_tokens={} requested_output_tokens={} available_output_tokens={} effective_output_tokens={} result={} duration_ms=0 safe_error_code={}",
             active_context_tier,
             prompt_tokens,
             requested_output_tokens,
+            available_output_tokens,
+            effective_output_tokens,
             "admitted" if admitted else "rejected",
             safe_error_code,
         )
         if admitted:
-            return True, None, prompt_tokens
-        return False, admission_error, prompt_tokens
+            return True, None, budget
+        return False, admission_error, budget
 
     def _api_v1_runtime_completion_kwargs(
         self, safe_options: Dict[str, Any]
@@ -4542,6 +4959,32 @@ class RelayClient:
                         shape["text_type"] = type(choice.get("text")).__name__
         return shape
 
+    def _api_v1_local_progress_observer(self, event: Dict[str, Any]) -> None:
+        """Log local-only preparing/prefill/generating progress, privacy-safe.
+
+        `event` is bound to a real request_id and worker generation by
+        ModelManager.create_chat_completion_with_recovery. Never forwarded to
+        the relay: this is a local log line only, matching the relay-blind
+        E2EE guardrail (relay sees ciphertext + safe metadata only).
+        """
+        try:
+            log_info(
+                "api_v1.local_progress request_id={} worker_generation={} sequence={} phase={} "
+                "total_prompt_tokens={} cached_prompt_tokens={} processed_prompt_tokens={} "
+                "generated_tokens={} elapsed_ms={}",
+                event.get("request_id", "local"),
+                event.get("worker_generation", 0),
+                event.get("sequence", 0),
+                event.get("phase", "unknown"),
+                event.get("total_prompt_tokens", 0),
+                event.get("cached_prompt_tokens", 0),
+                event.get("processed_prompt_tokens", 0),
+                event.get("generated_tokens", 0),
+                event.get("elapsed_ms", 0),
+            )
+        except Exception:
+            pass
+
     def _generate_api_v1_response_with_runtime_model(
         self,
         *,
@@ -4550,6 +4993,7 @@ class RelayClient:
         messages: List[Dict[str, Any]],
         options: Dict[str, Any],
         requested_context_tier: str = DEFAULT_CONTEXT_TIER,
+        progress_observer=None,
     ) -> Dict[str, Any]:
         """Generate an API v1 assistant message with the desktop runtime model."""
 
@@ -4704,12 +5148,28 @@ class RelayClient:
 
             completion_kwargs = self._api_v1_runtime_completion_kwargs(safe_options)
             requested_output_tokens = int(completion_kwargs["max_tokens"])
-            admitted, admission_error, prompt_tokens = self._api_v1_authoritative_context_admission(
+            admitted, admission_error, output_budget = self._api_v1_authoritative_context_admission(
                 llm_instance=llm_instance,
                 messages=runtime_messages,
                 requested_output_tokens=requested_output_tokens,
                 requested_context_tier=requested_context_tier,
             )
+            if isinstance(output_budget, int):
+                # Compatibility for test/extension admission hooks using the
+                # pre-#1560 third return value (prompt token count).
+                active_profile = get_context_profile(
+                    normalize_context_tier(getattr(self.model_manager, "context_tier", DEFAULT_CONTEXT_TIER))
+                )
+                active_tokens = int(getattr(self.model_manager, "context_window_tokens", active_profile.total_context_tokens))
+                available_tokens = max(active_tokens - output_budget, 0)
+                output_budget = {
+                    "prompt_tokens": output_budget,
+                    "active_context_tokens": active_tokens,
+                    "requested_output_tokens": requested_output_tokens,
+                    "available_output_tokens": available_tokens,
+                    "effective_output_tokens": min(requested_output_tokens, available_tokens),
+                }
+            prompt_tokens = output_budget.get("prompt_tokens") if output_budget else None
             if not admitted:
                 return self._api_v1_response_envelope(
                     request_id,
@@ -4724,6 +5184,12 @@ class RelayClient:
                         requested_output_tokens=requested_output_tokens,
                     ),
                 )
+            # A positive effective cap is guaranteed by admission. Override the
+            # configured/caller request only for this inference invocation.
+            safe_options = {
+                **safe_options,
+                "max_tokens": output_budget["effective_output_tokens"],
+            }
 
             qwen_render_complete = None
             if self._api_v1_qwen_non_thinking_required(model_profile) and llm_instance is not None:
@@ -4738,10 +5204,41 @@ class RelayClient:
                     not in getattr(llm_instance, "__dict__", {})
                 ):
                     qwen_render_complete = None
+                elif callable(qwen_render_complete):
+                    progress_call_kwargs = getattr(
+                        self.model_manager,
+                        "local_progress_call_kwargs_for_runtime",
+                        None,
+                    )
+                    if callable(progress_call_kwargs):
+                        qwen_render_complete = functools.partial(
+                            qwen_render_complete,
+                            **progress_call_kwargs(
+                                qwen_render_complete,
+                                llm_instance=llm_instance,
+                                request_id=request_id,
+                                observer=progress_observer or self._api_v1_local_progress_observer,
+                            ),
+                        )
 
             create_chat_completion = recovery_completion
             if not callable(create_chat_completion) and llm_instance is not None:
                 create_chat_completion = getattr(llm_instance, "create_chat_completion", None)
+            elif callable(create_chat_completion):
+                # Bind this call's real external request_id + a local,
+                # privacy-safe progress observer. create_chat_completion_with_recovery
+                # accepts these as internal keyword-only arguments and rebinds
+                # them against whichever worker generation actually serves the
+                # request (including a post-recovery replacement), so recovery
+                # can never deliver progress for a stale generation to the
+                # wrong request. Not part of the public API v1 schema, and
+                # invisible to the runtime-completion-kwargs filtering below
+                # since they're bound here rather than passed through it.
+                create_chat_completion = functools.partial(
+                    create_chat_completion,
+                    progress_request_id=request_id,
+                    progress_observer=progress_observer or self._api_v1_local_progress_observer,
+                )
 
             if self._api_v1_qwen_non_thinking_required(model_profile) and not callable(qwen_render_complete):
                 return self._api_v1_response_envelope(
@@ -4863,7 +5360,31 @@ class RelayClient:
                     ),
                 )
 
-            return self._api_v1_response_envelope(request_id, message=assistant_message)
+            choice = completion["choices"][0] if isinstance(completion, dict) else {}
+            finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+            usage = completion.get("usage") if isinstance(completion, dict) else None
+            if not isinstance(usage, dict):
+                usage = None
+            if not isinstance(finish_reason, str) or not finish_reason:
+                completion_count = usage.get("completion_tokens") if usage else None
+                if isinstance(completion_count, int) and completion_count >= output_budget["effective_output_tokens"]:
+                    finish_reason = "length"
+                elif assistant_message.get("tool_calls"):
+                    finish_reason = "tool_calls"
+                else:
+                    # Compatibility for runtimes that predate finish metadata.
+                    finish_reason = "stop"
+            return self._api_v1_response_envelope(
+                request_id,
+                message=assistant_message,
+                finish_reason=finish_reason,
+                usage=usage,
+                output_budget={
+                    "requested_tokens": output_budget["requested_output_tokens"],
+                    "available_tokens": output_budget["available_output_tokens"],
+                    "effective_tokens": output_budget["effective_output_tokens"],
+                },
+            )
         except Exception as exc:
             if _is_llama_cpp_inference_request_error(exc):
                 diagnostics = getattr(exc, "diagnostics", {})
@@ -5107,7 +5628,31 @@ class RelayClient:
                             cancel_snapshot = candidate_snapshot
                     if getattr(self, "_api_v1_registered_relays", set()):
                         self._api_v1_start_heartbeat_worker()
-                    supervisor_outcome = self._supervise_api_v1_inference(api_v1_request_payload, local_deadline=outer_api_v1_deadline)
+                    progress_publisher = None
+                    progress_relay_url = self._api_v1_response_relay_url()
+                    with self._api_v1_control_credentials_lock:
+                        progress_supported = self._api_v1_relay_capabilities.get(progress_relay_url, {}).get(
+                            'encrypted_progress_v1', False
+                        )
+                    if progress_supported:
+                        progress_publisher = _ApiV1ProgressPublisher(
+                            self, progress_relay_url, client_pub_key_b64, api_v1_request_payload['request_id']
+                        )
+
+                    def request_progress_observer(event):
+                        self._api_v1_local_progress_observer(event)
+                        if progress_publisher is not None:
+                            progress_publisher.submit(event)
+
+                    try:
+                        supervisor_outcome = self._supervise_api_v1_inference(
+                            api_v1_request_payload,
+                            local_deadline=outer_api_v1_deadline,
+                            progress_observer=request_progress_observer,
+                        )
+                    finally:
+                        if progress_publisher is not None:
+                            progress_publisher.stop()
                     response_envelope = supervisor_outcome.response_envelope
                     if response_envelope is None:
                         return RelayProcessingResult(
@@ -5168,8 +5713,13 @@ class RelayClient:
                             recovery_succeeded=recovery_succeeded,
                             submission_allowed=False,
                         )
+                    response_routing_metadata = {
+                        key: request_data[key]
+                        for key in ("server_public_key", "claim_generation")
+                        if key in request_data
+                    }
                     post_outcome = self._post_api_v1_response(
-                        response_envelope,
+                        {**response_envelope, **response_routing_metadata},
                         client_pub_key_b64=client_pub_key_b64,
                         client_pub_key=client_pub_key,
                         cancel_snapshot=cancel_snapshot,

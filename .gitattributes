@@ -1,1 +1,6 @@
 *.txt text diff
+
+# Tauri's CLI rewrites this file's [package] version on every build with LF
+# endings; without a pinned eol, that rewrite alone makes git see the whole
+# file as modified on machines checking it out with CRLF (core.autocrlf).
+desktop-tauri/src-tauri/Cargo.toml text eol=lf

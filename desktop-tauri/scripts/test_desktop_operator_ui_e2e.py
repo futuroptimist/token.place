@@ -5,21 +5,36 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
+import hashlib
 import json
+import math
 import os
+import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+import psutil
+from urllib3.exceptions import (
+    ConnectTimeoutError,
+    NewConnectionError,
+    ProtocolError,
+    ReadTimeoutError,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPO_ROOT / "desktop-tauri"
 TAURI_ROOT = DESKTOP_ROOT / "src-tauri"
 WEBDRIVER_URL = "http://127.0.0.1:4444"
+NATIVE_WEBDRIVER_URL = "http://127.0.0.1:4445"
 LOGS_DIR = REPO_ROOT / ".desktop-e2e-logs"
 BOOTSTRAP_LOG = LOGS_DIR / "bootstrap.log"
 
@@ -33,16 +48,34 @@ if str(REPO_ROOT) not in sys.path:
 try:
     from selenium import webdriver
     from selenium.common.exceptions import (
+        InvalidArgumentException,
         NoSuchElementException,
         NoSuchFrameException,
+        SessionNotCreatedException,
         StaleElementReferenceException,
         TimeoutException,
         WebDriverException,
     )
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.action_chains import ActionChains  # pragma: no cover
+    from selenium.webdriver.common.keys import Keys  # pragma: no cover
     from selenium.webdriver.support.ui import WebDriverWait
-
     from utils.crypto_helpers import CryptoClient
+    from scripts.long_context_benchmark.benchmark_harness import (
+        apply_benchmark_context_tier,
+        classify_benchmark_landing_state,
+        observe_post_terminal,
+        benchmark_operator_mode,
+        OwnedProcessTreeMemorySampler,
+        PACKAGED_FAILURE_REASONS,
+        PACKAGED_PHASES,
+        generate_fixture,
+        invoke_packaged_runtime_adapter,
+        parse_packaged_local_telemetry,
+        packaged_phase_remaining,
+        prefill_cancellation_trigger_state,
+        start_phase_after,
+    )
 except Exception as exc:
     BOOTSTRAP_LOG.write_text(
         "desktop ui e2e bootstrap failure\n"
@@ -74,10 +107,220 @@ def wait_for_http_200(url: str, timeout_seconds: float = 30.0) -> None:
 
 
 
+RELAY_DIAGNOSTICS_USER_AGENT = "token.place-relay-baseline-diagnostic/1.0"
+RELAY_BASELINE_FAILURE_CATEGORIES = frozenset({
+    "none", "http_status", "dns", "connection", "tls", "timeout",
+    "response_read", "response_utf8", "response_json", "response_schema",
+    "response_count", "unknown",
+})
+_MAX_DIAGNOSTIC_COUNTER = 1_000_000
+_RELAY_CONNECTION_ERRNOS = frozenset({
+    errno.ECONNABORTED, errno.ECONNREFUSED, errno.ECONNRESET,
+    errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EPIPE,
+})
+
+
+def _relay_probe_error(category: object, *, http_status: object = None) -> ValueError:
+    """Create a bounded relay-probe error without retaining private details."""
+    error = ValueError("relay diagnostics probe failed")
+    error.relay_failure_category = (category
+        if isinstance(category, str) and category != "none"
+        and category in RELAY_BASELINE_FAILURE_CATEGORIES else "unknown")
+    error.relay_http_status = (http_status
+        if isinstance(http_status, int) and not isinstance(http_status, bool)
+        and 100 <= http_status <= 599 else None)
+    return error
+
+
+def _relay_transport_failure_category(exc: BaseException) -> str:
+    """Classify transport failures using types and explicit errno values only."""
+    if isinstance(exc, socket.gaierror):
+        return "dns"
+    if isinstance(exc, ssl.SSLError):
+        return "tls"
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(exc, ConnectionError):
+        return "connection"
+    if isinstance(exc, OSError) and exc.errno in _RELAY_CONNECTION_ERRNOS:
+        return "connection"
+    return "unknown"
+
+
+def _relay_diagnostics_payload(relay_url: str, *, timeout_seconds: float) -> object:
+    request = Request(f"{relay_url}/relay/diagnostics", method="GET", headers={
+        "User-Agent": RELAY_DIAGNOSTICS_USER_AGENT,
+    })
+    try:
+        response_context = urlopen(request, timeout=timeout_seconds)  # nosec B310
+    except HTTPError as exc:
+        try:
+            exc.close()
+        except Exception:
+            pass
+        raise _relay_probe_error("http_status", http_status=exc.code) from None
+    except URLError as exc:
+        raise _relay_probe_error(_relay_transport_failure_category(exc.reason)) from None
+    except (OSError, TimeoutError) as exc:
+        raise _relay_probe_error(_relay_transport_failure_category(exc)) from None
+    except Exception:
+        raise _relay_probe_error("unknown") from None
+    try:
+        with response_context as response:
+            body = response.read()
+    except Exception as exc:
+        category = _relay_transport_failure_category(exc)
+        raise _relay_probe_error(
+            category if category != "unknown" else "response_read") from None
+    try:
+        text = body.decode("utf-8")
+    except (UnicodeDecodeError, AttributeError):
+        raise _relay_probe_error("response_utf8") from None
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        raise _relay_probe_error("response_json") from None
+
+
 def fetch_relay_diagnostics_count(relay_url: str, *, timeout_seconds: float) -> int:
-    with urlopen(f"{relay_url}/relay/diagnostics", timeout=timeout_seconds) as response:  # nosec B310
-        payload = json.loads(response.read().decode("utf-8"))
-    return int(payload["total_api_v1_registered_compute_nodes"])
+    payload = _relay_diagnostics_payload(relay_url, timeout_seconds=timeout_seconds)
+    if not isinstance(payload, dict):
+        raise _relay_probe_error("response_schema")
+    count = payload.get("total_api_v1_registered_compute_nodes")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise _relay_probe_error("response_count")
+    return count
+
+
+def fetch_api_v1_registered_node_fingerprints(
+        relay_url: str, *, timeout_seconds: float) -> list[str]:
+    """Return validated API-v1 node fingerprints without retaining public keys."""
+    payload = _relay_diagnostics_payload(relay_url, timeout_seconds=timeout_seconds)
+    if not isinstance(payload, dict):
+        raise _relay_probe_error("response_schema")
+    nodes = payload.get("api_v1_registered_compute_nodes")
+    if not isinstance(nodes, list):
+        raise _relay_probe_error("response_schema")
+    declared_count = payload.get("total_api_v1_registered_compute_nodes")
+    if (isinstance(declared_count, bool)
+            or not isinstance(declared_count, int)
+            or declared_count < 0
+            or declared_count != len(nodes)):
+        raise _relay_probe_error("response_count")
+    fingerprints = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise _relay_probe_error("response_schema")
+        public_key = node.get("server_public_key")
+        if not isinstance(public_key, str) or not public_key:
+            raise _relay_probe_error("response_schema")
+        fingerprints.append(hashlib.sha256(
+            public_key.encode("utf-8", errors="ignore")).hexdigest()[:12])
+    return fingerprints
+
+
+_BRIDGE_RESET_PATTERN = re.compile(
+    r"\bdesktop\.compute_node_bridge\.relay_client\.reset\s+"
+    r"operator_session_id=([^\s]+).*?\bkey_fingerprint=([0-9a-f]{12})\b")
+_MAX_FRESH_BRIDGE_LOG_BYTES = 65_536
+
+
+def _bridge_reset_observations(handle) -> list[tuple[str, str]]:
+    """Scan reset records chunkwise without accumulating the log suffix."""
+    observations: list[tuple[str, str]] = []
+    pending = ""
+    while chunk := handle.read(_MAX_FRESH_BRIDGE_LOG_BYTES):
+        text = pending + chunk.decode("utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        pending = ""
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            pending = lines.pop()[-_MAX_FRESH_BRIDGE_LOG_BYTES:]
+        for line in lines:
+            observations.extend(
+                (match.group(1), match.group(2))
+                for match in _BRIDGE_RESET_PATTERN.finditer(line)
+            )
+    if pending:
+        observations.extend(
+            (match.group(1), match.group(2))
+            for match in _BRIDGE_RESET_PATTERN.finditer(pending)
+        )
+    return observations
+
+
+def fresh_bridge_key_fingerprint(log_path: Path, start_offset: int) -> str | None:
+    """Find exactly one session-bound reset emitted after the Start boundary."""
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(start_offset)
+            observations = _bridge_reset_observations(handle)
+    except (OSError, ValueError):
+        return None
+    if len(observations) != 1:
+        return None
+    return observations[0][1]
+
+
+def authoritative_registration_matches(relay_url: str, *, timeout_seconds: float,
+        bridge_log: Path, bridge_log_start_offset: int) -> bool:
+    """Require relay exclusivity and identity equality for this Start operation."""
+    local_fingerprint = fresh_bridge_key_fingerprint(
+        bridge_log, bridge_log_start_offset)
+    registered_nodes = fetch_api_v1_registered_node_fingerprints(
+        relay_url, timeout_seconds=timeout_seconds)
+    return (local_fingerprint is not None
+        and registered_nodes == [local_fingerprint])
+
+
+def require_clean_relay_registration_baseline(
+        relay_url: str, *, timeout_seconds: float, fail_closed,
+        record_relay_observation, record_pre_start_state=lambda **_changes: None) -> list[str]:
+    """Require an authoritative empty relay before starting this attempt."""
+    attempts = 0
+    transient_failures = 0
+    failure_counts = {category: 0 for category in RELAY_BASELINE_FAILURE_CATEGORIES
+        if category != "none"}
+    record_pre_start_state(baseline_outcome="polling",
+        baseline_poll_attempt_count=attempts,
+        baseline_transient_failure_count=transient_failures,
+        baseline_failure_counts=failure_counts)
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            record_pre_start_state(
+                baseline_outcome=("probe_failures_exhausted"
+                    if transient_failures else "deadline_exhausted"))
+            fail_closed("operator_registration_not_reached")
+        attempts += 1
+        record_pre_start_state(baseline_poll_attempt_count=attempts)
+        record_relay_observation("polled")
+        try:
+            registered = fetch_api_v1_registered_node_fingerprints(
+                relay_url, timeout_seconds=max(0.05, min(remaining, 0.5)))
+        except Exception as exc:
+            transient_failures += 1
+            category = getattr(exc, "relay_failure_category", "unknown")
+            if not isinstance(category, str) or category not in failure_counts:
+                category = "unknown"
+            failure_counts[category] = min(
+                _MAX_DIAGNOSTIC_COUNTER, failure_counts[category] + 1)
+            record_pre_start_state(
+                baseline_transient_failure_count=transient_failures,
+                baseline_last_failure_category=category,
+                baseline_last_http_status=getattr(exc, "relay_http_status", None),
+                baseline_failure_counts=failure_counts.copy())
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            continue
+        count = len(registered)
+        record_pre_start_state(last_authoritative_registered_node_count=count)
+        if registered:
+            record_pre_start_state(baseline_outcome="rejected_nonzero")
+            record_relay_observation("not_reached")
+            fail_closed("operator_registration_not_reached")
+        record_pre_start_state(baseline_outcome=("accepted_zero_after_recovery"
+            if transient_failures else "accepted_zero"))
+        return registered
 
 
 def wait_for_relay_diagnostics_count(relay_url: str, expected_count: int, timeout_seconds: float) -> float:
@@ -139,6 +382,33 @@ def wait_for_port(
     raise RuntimeError(f"timeout waiting for {host}:{port}")
 
 
+def wait_for_webdriver_ready(
+    process: subprocess.Popen[str], timeout_seconds: float,
+) -> None:
+    """Wait for the native WebDriver behind tauri-driver to report readiness."""
+    status_url = NATIVE_WEBDRIVER_URL if os.name == "nt" else WEBDRIVER_URL
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("tauri_driver_exited") from None
+        remaining = deadline - time.monotonic()
+        try:
+            with urlopen(  # nosec B310 - fixed loopback WebDriver endpoint
+                    f"{status_url}/status",
+                    timeout=max(0.05, min(remaining, 0.5))) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if (isinstance(payload, dict)
+                    and isinstance(payload.get("value"), dict)
+                    and payload["value"].get("ready") is True):
+                return
+        except Exception:
+            pass
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if process.poll() is not None:
+        raise RuntimeError("tauri_driver_exited") from None
+    raise RuntimeError("webdriver_transport_failure") from None
+
+
 def ensure_alive(process: subprocess.Popen[str], label: str) -> None:
     if process.poll() is None:
         return
@@ -196,10 +466,11 @@ def resolve_real_e2e_model_path() -> Path:
 
 
 def wait_for_running_stability(
-    driver: webdriver.Remote, expected: str, stable_seconds: float = 2.0
+    driver: webdriver.Remote, expected: str, stable_seconds: float = 2.0,
+    timeout_seconds: float = 45,
 ) -> None:
     status_xpath = "//p[contains(.,'Running:')]//strong"
-    wait = WebDriverWait(driver, 45, poll_frequency=0.25)
+    wait = WebDriverWait(driver, timeout_seconds, poll_frequency=0.25)
     wait.until(
         lambda d: d.find_element(By.XPATH, status_xpath).text.strip().lower() == expected.lower()
     )
@@ -215,6 +486,83 @@ def wait_for_running_stability(
                 f"Running state became unstable: expected {expected!r}, observed {current!r}"
             )
         time.sleep(0.2)
+
+
+def wait_for_post_start_operator_state(driver: webdriver.Remote, setup_remaining,
+        record_progress, fail_closed, relay_url: str, record_relay_observation,
+        bridge_log: Path, bridge_log_start_offset: int) -> None:
+    """Require the two ordered post-click operator boundaries fail closed."""
+    active_attempt_ready = True
+    try:
+        WebDriverWait(driver, setup_remaining(), poll_frequency=0.25).until(
+            lambda d: (
+                (diagnostic := _read_operator_start_diagnostic(d))["start_handler_state"]
+                == "entered"
+                and diagnostic["invocation_state"] in {"pending", "resolved"}
+            )
+        )
+    except Exception:
+        active_attempt_ready = False
+    if not active_attempt_ready:
+        fail_closed("operator_running_not_reached")
+    running_stable = True
+    try:
+        wait_for_running_stability(driver, "yes", stable_seconds=3,
+            timeout_seconds=setup_remaining())
+    except Exception:
+        running_stable = False
+    if not running_stable:
+        fail_closed("operator_running_not_reached")
+    record_progress("operator_running")
+
+    registration_deadline = time.monotonic() + setup_remaining()
+    terminal_allowance = min(0.5, max(0.0, registration_deadline - time.monotonic()))
+    ordinary_polling_deadline = registration_deadline - terminal_allowance
+
+    def authoritative_registration_observed(_driver) -> bool:
+        remaining = ordinary_polling_deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        record_relay_observation("polled")
+        try:
+            registered = authoritative_registration_matches(
+                relay_url, timeout_seconds=min(remaining, 0.5),
+                bridge_log=bridge_log,
+                bridge_log_start_offset=bridge_log_start_offset)
+        except Exception:
+            return False
+        if registered:
+            record_relay_observation("registered")
+        return registered
+
+    try:
+        WebDriverWait(driver, max(0.0, ordinary_polling_deadline - time.monotonic()),
+            poll_frequency=0.25).until(authoritative_registration_observed)
+    except Exception:
+        remaining = registration_deadline - time.monotonic()
+        terminal_registered = False
+        if remaining > 0:
+            record_relay_observation("polled")
+            try:
+                terminal_registered = authoritative_registration_matches(
+                    relay_url, timeout_seconds=min(remaining, 0.5),
+                    bridge_log=bridge_log,
+                    bridge_log_start_offset=bridge_log_start_offset)
+            except Exception:
+                terminal_registered = False
+        if not terminal_registered:
+            record_relay_observation("not_reached")
+            fail_closed("operator_registration_not_reached")
+        record_relay_observation("registered")
+    record_progress("operator_registered")
+
+
+def landing_compute_node_status_matches(driver: webdriver.Remote, expected: str) -> bool:
+    try:
+        status = driver.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
+        return status.text.strip() == expected
+    except (NoSuchElementException, StaleElementReferenceException):
+        return False
 
 
 def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -> None:
@@ -261,60 +609,64 @@ def fill_input_by_label(driver: webdriver.Remote, label_text: str, value: str) -
 
 
 def wait_for_ui_ready(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> None:
-    recovery_attempts = 0
-    last_recovery_at = 0.0
+    """Select the application WebView and wait for its required operator controls."""
+    last_category = "no_window_handle"
 
     def _ready(d: webdriver.Remote) -> bool:
-        nonlocal recovery_attempts
-        nonlocal last_recovery_at
+        nonlocal last_category
         try:
-            with contextlib.suppress(WebDriverException):
-                d.switch_to.default_content()
-            state = d.execute_script("return document.readyState")
-            if state != "complete":
+            handles = list(d.window_handles)
+            if not handles:
+                last_category = "no_window_handle"
                 return False
-            model_label_ready = bool(
-                d.find_elements(By.XPATH, "//label[normalize-space()='Model GGUF path']")
-            )
-            relay_input_ready = bool(
-                d.find_elements(
-                    By.XPATH,
-                    "(//label[normalize-space()='Relay URL 1']/following::input[1])[1]",
-                )
-            )
-            runtime_path_ready = bool(
-                d.find_elements(
-                    By.XPATH,
-                    "//div[contains(normalize-space(),'Runtime resolved path:')]/code",
-                )
-            )
-            if model_label_ready and relay_input_ready and runtime_path_ready:
-                return True
-
-            page_source = ""
-            with contextlib.suppress(WebDriverException):
-                page_source = d.page_source
-            if (
-                recovery_attempts < 4
-                and "could not connect to localhost" in page_source.lower()
-                and (time.time() - last_recovery_at) >= 1.0
-            ):
-                recovery_attempts += 1
-                last_recovery_at = time.time()
-                with contextlib.suppress(WebDriverException):
-                    d.get("tauri://localhost/")
-                with contextlib.suppress(WebDriverException):
-                    d.get("tauri://localhost/index.html")
+            last_category = "wrong_handle"
+            for handle in handles:
+                try:
+                    d.switch_to.window(handle)
+                    d.switch_to.default_content()
+                    if d.execute_script("return document.readyState") != "complete":
+                        continue
+                    title = d.execute_script("return document.title")
+                    if not isinstance(title, str) or "token.place" not in title.lower():
+                        continue
+                    if not d.find_elements(
+                            By.XPATH,
+                            "//h1[normalize-space()='token.place desktop compute node']"):
+                        last_category = "missing_shell"
+                        continue
+                    initialization = d.execute_script(
+                        "return document.querySelector('main')?.dataset.applicationInitialization")
+                    if initialization == "failed":
+                        raise RuntimeError("application_initialization_failed")
+                    if initialization != "ready":
+                        last_category = "initialization_pending"
+                        continue
+                    model_input_ready = bool(d.find_elements(
+                        By.XPATH,
+                        "(//label[normalize-space()='Model GGUF path']/following::input[1])[1]"))
+                    relay_input_ready = bool(d.find_elements(
+                        By.XPATH,
+                        "(//label[normalize-space()='Relay URL 1']/following::input[1])[1]"))
+                    if model_input_ready and relay_input_ready:
+                        return True
+                    last_category = "missing_required_controls"
+                except (
+                    NoSuchFrameException,
+                    StaleElementReferenceException,
+                    WebDriverException,
+                ):
+                    last_category = "webdriver_failure"
             return False
         except (
             NoSuchFrameException,
             StaleElementReferenceException,
             WebDriverException,
         ):
+            last_category = "webdriver_failure"
             return False
 
     if not WebDriverWait(driver, timeout_seconds, poll_frequency=0.25).until(_ready):
-        raise RuntimeError("desktop UI never became ready")
+        raise RuntimeError(last_category) from None
 
 
 def wait_for_inference_result(driver: webdriver.Remote, timeout_seconds: float = 45.0) -> str:
@@ -474,17 +826,253 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
             pass
 
 
-def start_driver(app_binary: Path) -> webdriver.Remote:
-    options = webdriver.ChromeOptions()
-    options.set_capability("browserName", "wry")
-    options.set_capability(
-        "tauri:options",
+def tokenizer_handoff_args(request_path: Path | None = None,
+        evidence_path: Path | None = None) -> list[str]:
+    """Carry the paired handoff on the application command line on Windows.
+
+    The owned Windows launch and the non-Windows Tauri launch both pass these
+    values directly to the packaged application.
+    """
+    if request_path is None and evidence_path is None:
+        return []
+    if request_path is None or evidence_path is None:
+        raise ValueError("tokenizer request and evidence paths must be paired")
+    return [
+        f"--token-place-long-context-benchmark-tokenizer-request={request_path}",
+        f"--token-place-long-context-benchmark-tokenizer-evidence={evidence_path}",
+    ]
+
+
+def tokenizer_stage_path(evidence_path: Path) -> Path:
+    return Path(f"{evidence_path}.stage.json")
+
+
+def _write_tokenizer_stage(evidence_path: Path, category: str, stage: int) -> None:
+    """Publish a bounded stage marker without copying any application data."""
+    allowed = {"application_arguments_absent": 0, "python_producer_not_invoked": 35}
+    if allowed.get(category) != stage or isinstance(stage, bool):
+        raise ValueError("invalid tokenizer stage category")
+    output = tokenizer_stage_path(evidence_path)
+    fd, temporary = tempfile.mkstemp(prefix=".tokenizer-runner-stage-", suffix=".tmp",
+        dir=output.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "stage": stage, "category": category}, handle,
+                sort_keys=True, separators=(",", ":"))
+        os.replace(temporary, output)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _read_tokenizer_stage(evidence_path: Path) -> str:
+    pairings = {
+        "application_arguments_absent": 0, "application_arguments_malformed": 10,
+        "application_arguments_accepted": 10, "rust_python_handoff_failed": 20,
+        "rust_python_handoff_accepted": 20, "python_handoff_received": 30,
+        "python_producer_not_invoked": 35, "request_validation_failure": 40,
+        "fixture_hash_validation_failure": 50,
+        "active_runtime_tokenizer_unavailable": 60, "tokenization_failure": 65,
+        "runtime_identity_unavailable": 70, "evidence_publication_failure": 90,
+        "authoritative_evidence_published": 100,
+    }
+    try:
+        value = json.loads(tokenizer_stage_path(evidence_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("application_arguments_absent") from exc
+    if (not isinstance(value, dict) or set(value) != {"version", "stage", "category"}
+            or value.get("version") != 1 or not isinstance(value.get("stage"), int)
+            or isinstance(value.get("stage"), bool)
+            or value.get("category") not in pairings
+            or pairings[value["category"]] != value["stage"]):
+        raise RuntimeError("application_arguments_malformed")
+    return value["category"]
+
+
+def _validate_operator_tokenizer_handoff(evidence_path: Path,
+        fail_closed: Callable[[str], None]) -> None:
+    try:
+        category = _read_tokenizer_stage(evidence_path)
+    except RuntimeError as exc:
+        fail_closed(str(exc))
+        return
+    if category in {"application_arguments_absent", "application_arguments_malformed"}:
+        fail_closed(category)
+    elif category != "python_handoff_received":
+        fail_closed("rust_python_handoff_failed")
+
+
+def _rearm_tokenizer_stage(evidence_path: Path, driver_log: Path) -> int:
+    _write_tokenizer_stage(evidence_path, "python_producer_not_invoked", 35)
+    return driver_log.stat().st_size
+
+
+def _validate_final_tokenizer_stage(evidence_path: Path,
+        fail_closed: Callable[[str], None]) -> None:
+    try:
+        category = _read_tokenizer_stage(evidence_path)
+    except RuntimeError as exc:
+        fail_closed(str(exc))
+        return
+    if category != "authoritative_evidence_published":
+        fail_closed(category if category in PACKAGED_FAILURE_REASONS
+            else "python_producer_not_invoked")
+
+
+def tauri_driver_environment(isolated_home: Path) -> dict[str, str]:
+    # WebView2 and the packaged sidecar resolve state beneath these directories
+    # during session creation. Create them before EdgeDriver launches the app so
+    # a fresh isolated profile cannot make the application exit before attach.
+    for directory in (
+        isolated_home,
+        isolated_home / ".config",
+        isolated_home / ".local/share",
+        isolated_home / "AppData/Roaming",
+        isolated_home / "WebView2",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    for key in (
+        "USE_MOCK_LLM",
+        "TOKEN_PLACE_PYTHON",
+        "TOKEN_PLACE_SIDECAR_PYTHON",
+        "PYTHONPATH",
+        "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST",
+        "TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE",
+    ):
+        env.pop(key, None)
+    env.update(
         {
-            "application": str(app_binary),
-            "args": [],
-        },
+            "HOME": str(isolated_home),
+            "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+            "XDG_DATA_HOME": str(isolated_home / ".local/share"),
+            "APPDATA": str(isolated_home / "AppData/Roaming"),
+            # Chromium remote debugging must not reuse the default profile.
+            # WebView2 consumes this before its environment is created.
+            "WEBVIEW2_USER_DATA_FOLDER": str(
+                (isolated_home / "WebView2").resolve(strict=True)),
+        }
     )
+    return env
+
+
+def start_driver(app_binary: Path, *, application_args: list[str] | None = None,
+        debugger_address: str | None = None
+        ) -> webdriver.Remote:
+    if os.name == "nt":
+        class NativeWebView2Options:
+            """Capabilities equivalent to tauri-driver's Windows mapping."""
+
+            _ignore_local_proxy = False
+
+            def to_capabilities(self) -> dict[str, object]:
+                if not debugger_address:
+                    raise RuntimeError("webdriver_application_startup_failed")
+                return {
+                    "browserName": "webview2",
+                    "ms:edgeChromium": True,
+                    "ms:edgeOptions": {"debuggerAddress": debugger_address},
+                }
+
+        return webdriver.Remote(
+            command_executor=NATIVE_WEBDRIVER_URL,
+            options=NativeWebView2Options(),
+        )
+
+    class TauriOptions:
+        """Minimal Selenium options without browser-vendor capabilities."""
+
+        _ignore_local_proxy = False
+
+        def to_capabilities(self) -> dict[str, object]:
+            return {
+                "browserName": "wry",
+                "tauri:options": {
+                    "application": str(app_binary.resolve()),
+                    "args": list(application_args or []),
+                },
+            }
+
+    options = TauriOptions()
     return webdriver.Remote(command_executor=WEBDRIVER_URL, options=options)
+
+
+def wait_for_webview2_devtools(
+        application_process: subprocess.Popen[str], port: int,
+        timeout_seconds: float) -> None:
+    """Wait for an attachable page/WebView target, not merely a browser endpoint."""
+    deadline = time.monotonic() + timeout_seconds
+    url = f"http://127.0.0.1:{port}/json/list"
+    while time.monotonic() < deadline:
+        if application_process.poll() is not None:
+            raise RuntimeError("webdriver_application_startup_failed") from None
+        remaining = deadline - time.monotonic()
+        try:
+            with urlopen(  # nosec B310 - reserved loopback DevTools endpoint
+                    url, timeout=max(0.05, min(remaining, 0.5))) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            attachable = isinstance(payload, list) and any(
+                isinstance(target, dict)
+                and target.get("type") in {"page", "webview"}
+                and isinstance(target.get("webSocketDebuggerUrl"), str)
+                and bool(target["webSocketDebuggerUrl"].strip())
+                for target in payload)
+            if attachable:
+                return
+        except Exception:
+            pass
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if application_process.poll() is not None:
+        raise RuntimeError("webdriver_application_startup_failed") from None
+    raise RuntimeError("webdriver_transport_failure") from None
+
+
+@contextlib.contextmanager
+def packaged_windows_webview2_session(
+        app_binary: Path, env: dict[str, str], log_handle,
+        timeout_seconds: float = 90.0, *, platform_name: str | None = None):
+    """Launch, attach to, and always stop an installed native WebView2 app."""
+    if (os.name if platform_name is None else platform_name) != "nt":
+        raise RuntimeError("webdriver_application_startup_failed")
+    devtools_port = reserve_free_port()
+    application_env = env.copy()
+    application_env.update({
+        "TAURI_AUTOMATION": "true",
+        "TAURI_WEBVIEW_AUTOMATION": "true",
+    })
+    webview2_automation_arg = (
+        "--edge-webview-switches="
+        f"--remote-debugging-port={devtools_port}")
+    application_process: subprocess.Popen[str] | None = None
+    try:
+        try:
+            application_process = subprocess.Popen(
+                [str(app_binary.resolve(strict=True)), webview2_automation_arg],
+                cwd=app_binary.resolve(strict=True).parent,
+                env=application_env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )  # noqa: S603
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("webdriver_application_startup_failed") from exc
+        wait_for_webview2_devtools(
+            application_process, devtools_port, timeout_seconds)
+        try:
+            driver = start_driver(
+                app_binary, debugger_address=f"127.0.0.1:{devtools_port}")
+        except Exception as exc:
+            category, _, _ = _classify_webdriver_session_failure(
+                exc, application_process)
+            raise RuntimeError(category) from exc
+        yield application_process, driver
+    finally:
+        if application_process is not None:
+            with contextlib.suppress(Exception):
+                cleanup_deadline = time.monotonic() + 10.0
+                _cleanup_owned_process_tree(
+                    application_process,
+                    lambda: max(0.0, cleanup_deadline - time.monotonic()),
+                )
 
 
 def start_landing_driver() -> webdriver.Chrome:
@@ -533,6 +1121,25 @@ def wait_for_operator_log_stop_markers(
 
 def tauri_driver_command() -> list[str]:
     tauri_driver_bin = shutil.which("tauri-driver")
+    if os.name == "nt":
+        if os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY") != "match":
+            raise RuntimeError("native_driver_unavailable")
+        edge_location = os.environ.get("EDGEWEBDRIVER")
+        edge_driver = None
+        if edge_location:
+            candidate = Path(edge_location)
+            if candidate.is_dir():
+                candidate = candidate / "msedgedriver.exe"
+            if candidate.is_file():
+                edge_driver = str(candidate.resolve())
+        if edge_driver is None:
+            raise RuntimeError("native_driver_unavailable")
+        if tauri_driver_bin is not None:
+            return [tauri_driver_bin, "--port", "4444", "--native-port", "4445",
+                "--native-driver", edge_driver]
+        raise RuntimeError(
+            "tauri-driver binary not found on PATH; install it with `cargo install tauri-driver`"
+        )
     webkit_driver_bin = shutil.which("WebKitWebDriver") or shutil.which("webkit2gtk-driver")
     if webkit_driver_bin is None:
         for candidate in (
@@ -554,6 +1161,487 @@ def tauri_driver_command() -> list[str]:
     )
 
 
+WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION = "packaged-webdriver-diagnostic-v9"
+WEBDRIVER_COMPATIBILITY_RESULTS = frozenset({"match", "mismatch", "unknown"})
+WEBDRIVER_EXCEPTION_FAMILIES = frozenset({
+    "read_timeout", "connection_failure", "capability_rejection",
+    "driver_version_mismatch", "application_startup_failure",
+    "tauri_driver_exit", "unknown",
+})
+WEBDRIVER_PROCESS_POSTURES = frozenset({
+    "tauri_driver_exited", "native_driver_only", "application_present",
+    "webview_descendants_present", "unknown",
+})
+WEBDRIVER_SESSION_ELAPSED_BUCKETS = frozenset({
+    "under_5_seconds", "5_to_29_seconds", "30_to_89_seconds",
+    "90_seconds_or_more", "unknown",
+})
+WEBDRIVER_TARGET_CATEGORIES = frozenset({"attachable_target", "no_target", "unknown"})
+WEBDRIVER_READINESS_CATEGORIES = frozenset({
+    "ready", "no_window_handle", "wrong_handle", "missing_shell",
+    "missing_required_controls", "initialization_pending",
+    "application_initialization_failed", "webdriver_failure", "unknown"})
+OPERATOR_START_DIAGNOSTIC_ALLOWLISTS = {
+    "start_handler_state": frozenset({"not_entered", "entered"}),
+    "invocation_state": frozenset({"not_started", "pending", "resolved", "rejected"}),
+    "native_event_observation": frozenset({
+        "none", "running_received", "running_accepted", "running_rejected"}),
+    "polling_observation": frozenset({
+        "none", "not_running", "running_accepted", "running_rejected", "command_failed"}),
+    "render_state": frozenset({"not_running", "running", "running_regressed"}),
+}
+OPERATOR_START_DIAGNOSTIC_DEFAULTS = {
+    "start_handler_state": "not_entered",
+    "invocation_state": "not_started",
+    "native_event_observation": "none",
+    "polling_observation": "none",
+    "render_state": "not_running",
+}
+
+NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS = {
+    "native_startup_phase": frozenset({
+        "not_started", "session_reserved", "bridge_launch_prepared",
+        "command_constructed", "child_spawn_attempted", "child_spawn_completed",
+        "stdio_acquired", "bridge_attached", "running_status_publication",
+        "startup_task_failed",
+    }),
+    "native_startup_outcome": frozenset({
+        "not_started", "pending", "accepted", "launcher_validated", "attempted",
+        "completed", "running", "stopping", "superseded",
+        "publication_accepted", "publication_suppressed", "failed",
+    }),
+    "native_startup_failure_category": frozenset({
+        "none", "bridge_preparation_failed", "command_construction_failed",
+        "launcher_validation_failed", "child_spawn_failed",
+        "stdio_acquisition_failed", "bridge_attachment_failed",
+        "bridge_exited_before_startup_event", "startup_task_failed",
+    }),
+}
+NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS = {
+    "native_startup_phase": "not_started",
+    "native_startup_outcome": "not_started",
+    "native_startup_failure_category": "none",
+}
+
+PRE_START_DIAGNOSTIC_ALLOWLISTS = {
+    "baseline_outcome": frozenset({
+        "not_entered", "polling", "accepted_zero", "accepted_zero_after_recovery",
+        "rejected_nonzero", "probe_failures_exhausted", "deadline_exhausted",
+    }),
+    "start_click_state": frozenset({
+        "not_reached", "about_to_attempt", "returned", "raised",
+    }),
+    "start_click_exception_category": frozenset({
+        "none", "no_such_element", "stale_element", "timeout", "webdriver", "other",
+    }),
+    "baseline_last_failure_category": RELAY_BASELINE_FAILURE_CATEGORIES,
+}
+PRE_START_DIAGNOSTIC_DEFAULTS = {
+    "baseline_outcome": "not_entered",
+    "baseline_poll_attempt_count": 0,
+    "baseline_transient_failure_count": 0,
+    "last_authoritative_registered_node_count": None,
+    "baseline_last_failure_category": "none",
+    "baseline_last_http_status": None,
+    "baseline_failure_counts": {
+        "http_status": 0, "dns": 0, "connection": 0, "tls": 0, "timeout": 0,
+        "response_read": 0, "response_utf8": 0, "response_json": 0,
+        "response_schema": 0, "response_count": 0, "unknown": 0,
+    },
+    "start_click_state": "not_reached",
+    "start_click_exception_category": "none",
+}
+
+
+def _start_click_exception_category(exc: Exception) -> str:
+    if isinstance(exc, NoSuchElementException):
+        return "no_such_element"
+    if isinstance(exc, StaleElementReferenceException):
+        return "stale_element"
+    if isinstance(exc, TimeoutException):
+        return "timeout"
+    if isinstance(exc, WebDriverException):
+        return "webdriver"
+    return "other"
+
+PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS = {
+    "startup_boundary": frozenset({
+        "not_observed", "handler_not_entered", "invocation_pending",
+        "invocation_resolved", "invocation_rejected", "native_not_reached",
+        "native_preparation_not_reached", "bridge_launch_not_reached",
+        "warm_load_pending", "warm_load_ready",
+        "warm_load_timed_out", "warm_load_failed", "readiness_rejected",
+        "bridge_exited_clean", "bridge_exited_nonzero", "relay_polling_started",
+        "registration_not_reached", "registered",
+    }),
+    "startup_phase": frozenset({
+        "none", "starting", "starting_worker", "hardware_model_boundary",
+        "model_manager_get_llm_instance", "warm_load", "ready", "unknown",
+    }),
+    "runtime_provisioning_state": frozenset({
+        "idle", "provisioning", "ready", "failed", "unknown",
+    }),
+    "warm_load_state": frozenset({
+        "not_started", "pending", "ready", "timed_out", "failed", "unknown",
+    }),
+    "worker_state": frozenset({
+        "stopped", "starting", "provisioning", "ready", "recovering", "failed",
+        "unknown",
+    }),
+    "worker_error_code": frozenset({
+        "none", "worker_exit_nonzero", "stale_worker_failure", "worker_dead",
+        "runtime_recovery", "recovery_exhausted", "warm_load_timeout", "unknown",
+    }),
+    "bridge_exit_posture": frozenset({
+        "not_observed", "clean_exit", "nonzero_exit", "unknown",
+    }),
+    "relay_polling_state": frozenset({"not_started", "started", "unknown"}),
+    "registration_state": frozenset({"not_reached", "registered", "unknown"}),
+}
+PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS = {
+    "startup_boundary": "not_observed",
+    "startup_phase": "unknown",
+    "runtime_provisioning_state": "unknown",
+    "warm_load_state": "unknown",
+    "worker_state": "unknown",
+    "worker_error_code": "unknown",
+    "bridge_exit_posture": "not_observed",
+    "relay_polling_state": "not_started",
+    "registration_state": "not_reached",
+}
+
+
+def _read_operator_start_diagnostic(driver: webdriver.Remote | None) -> dict[str, str]:
+    defaults = OPERATOR_START_DIAGNOSTIC_DEFAULTS.copy()
+    if driver is None:
+        return defaults
+    attributes = {
+        "start_handler_state": "data-operator-start-handler",
+        "invocation_state": "data-operator-start-invocation",
+        "native_event_observation": "data-operator-start-native-event",
+        "polling_observation": "data-operator-start-polling",
+        "render_state": "data-operator-start-render",
+    }
+    try:
+        shell = driver.find_element(By.CSS_SELECTOR, "main[data-operator-start-handler]")
+        return {
+            field: (value if (value := shell.get_attribute(attribute))
+                    in OPERATOR_START_DIAGNOSTIC_ALLOWLISTS[field] else defaults[field])
+            for field, attribute in attributes.items()
+        }
+    except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+        return defaults
+
+
+def _read_native_startup_diagnostic(driver: webdriver.Remote | None) -> dict[str, str]:
+    defaults = NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS.copy()
+    if driver is None:
+        return defaults
+    attributes = {
+        "native_startup_phase": "data-native-startup-phase",
+        "native_startup_outcome": "data-native-startup-outcome",
+        "native_startup_failure_category": "data-native-startup-failure",
+    }
+    try:
+        shell = driver.find_element(By.CSS_SELECTOR, "main[data-native-startup-phase]")
+        return {
+            field: (value if (value := shell.get_attribute(attribute))
+                    in NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS[field] else defaults[field])
+            for field, attribute in attributes.items()
+        }
+    except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+        return defaults
+
+
+def _read_packaged_startup_diagnostic(driver: webdriver.Remote | None,
+        operator_start: dict[str, str], native_startup: dict[str, str],
+        readiness_category: str = "unknown", relay_observation: str = "not_started") -> dict[str, str]:
+    """Project only bounded status labels into the durable startup diagnostic."""
+    result = PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS.copy()
+    if driver is None:
+        return result
+
+    def status(label: str, allowed: frozenset[str], default: str) -> str:
+        try:
+            value = _status_value(driver, label).strip().lower()
+        except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+            return default
+        return value if value in allowed else default
+
+    def raw_status(label: str) -> str | None:
+        try:
+            return _status_value(driver, label).strip().lower()
+        except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+            return None
+
+    result["startup_phase"] = status(
+        "Startup phase", PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS["startup_phase"], "unknown")
+    result["runtime_provisioning_state"] = status(
+        "Provisioning state",
+        PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS["runtime_provisioning_state"], "unknown")
+    relay_runtime = status("Relay runtime state", frozenset({
+        "idle", "provisioning", "starting", "warming", "ready", "processing",
+        "recovering", "failed", "stopped"}), "unknown")
+    result["worker_state"] = status(
+        "Worker state", PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS["worker_state"], "unknown")
+    result["worker_error_code"] = status(
+        "Last worker error code",
+        PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS["worker_error_code"], "unknown")
+    exit_code = raw_status("Last worker exit code")
+    result["bridge_exit_posture"] = (
+        "not_observed" if exit_code == "none" else
+        "clean_exit" if exit_code == "0" else
+        "nonzero_exit" if exit_code is not None
+            and exit_code.lstrip("-").isdigit() else "unknown")
+    registered_label = raw_status("Registered")
+    registered = (
+        "yes" if registered_label is not None and registered_label.startswith("yes") else
+        "no" if registered_label is not None and registered_label.startswith("no") else "unknown")
+    result["registration_state"] = (
+        "registered" if registered == "yes" else
+        "not_reached" if registered == "no" else "unknown")
+    result["warm_load_state"] = (
+        "ready" if relay_runtime in {"ready", "processing"} else
+        "timed_out" if result["worker_error_code"] == "warm_load_timeout" else
+        "failed" if relay_runtime == "failed" else
+        "pending" if relay_runtime in {"provisioning", "starting", "warming", "recovering"}
+        else "not_started" if relay_runtime in {"idle", "stopped"} else "unknown")
+    result["relay_polling_state"] = (
+        "started" if relay_observation in {"polled", "registered", "not_reached"}
+        or registered == "yes" or relay_runtime in {"processing", "recovering"}
+        else "not_started" if relay_runtime != "unknown" else "unknown")
+    if relay_observation == "registered":
+        result["registration_state"] = "registered"
+    elif relay_observation == "not_reached":
+        result["registration_state"] = "not_reached"
+
+    handler = operator_start.get("start_handler_state")
+    invocation = operator_start.get("invocation_state")
+    native_phase = native_startup.get("native_startup_phase")
+    native_failure = native_startup.get("native_startup_failure_category")
+    if readiness_category == "application_initialization_failed":
+        boundary = "readiness_rejected"
+    elif handler != "entered":
+        boundary = "handler_not_entered"
+    elif invocation == "pending":
+        boundary = "invocation_pending"
+    elif invocation == "rejected":
+        boundary = "invocation_rejected"
+    elif native_phase == "not_started":
+        boundary = "native_not_reached"
+    elif native_phase == "session_reserved":
+        boundary = "native_preparation_not_reached"
+    elif native_phase in {"bridge_launch_prepared", "command_constructed"}:
+        boundary = "bridge_launch_not_reached"
+    elif result["bridge_exit_posture"] == "clean_exit" and native_failure == "bridge_exited_before_startup_event":
+        boundary = "bridge_exited_clean"
+    elif result["bridge_exit_posture"] == "nonzero_exit" and native_failure == "bridge_exited_before_startup_event":
+        boundary = "bridge_exited_nonzero"
+    elif result["warm_load_state"] == "timed_out":
+        boundary = "warm_load_timed_out"
+    elif result["warm_load_state"] == "failed":
+        boundary = "warm_load_failed"
+    elif result["warm_load_state"] == "pending":
+        boundary = "warm_load_pending"
+    elif result["warm_load_state"] == "ready" and result["relay_polling_state"] == "not_started":
+        boundary = "warm_load_ready"
+    elif result["relay_polling_state"] == "started" and result["registration_state"] != "registered":
+        boundary = "registration_not_reached"
+    elif result["registration_state"] == "registered":
+        boundary = "registered"
+    elif invocation == "resolved":
+        boundary = "invocation_resolved"
+    else:
+        boundary = "not_observed"
+    result["startup_boundary"] = boundary
+    return result
+
+
+def _classify_webdriver_session_failure(exc: Exception, process: object) -> tuple[str, str, str]:
+    """Return only low-cardinality evidence about WebDriver session creation."""
+    poll = getattr(process, "poll", None)
+    if callable(poll) and poll() is not None:
+        return "tauri_driver_exited", "exited", "tauri_driver_exit"
+    if isinstance(exc, ReadTimeoutError):
+        return "webdriver_transport_failure", "running", "read_timeout"
+    if isinstance(exc, (ConnectTimeoutError, NewConnectionError, ProtocolError)):
+        return "webdriver_transport_failure", "running", "connection_failure"
+    message_value = getattr(exc, "msg", None)
+    message = (message_value if isinstance(message_value, str) else str(exc)).lower()
+    if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
+            "only supports microsoft edge version", "this version of msedgedriver")):
+        return "webdriver_driver_version_mismatch", "running", "driver_version_mismatch"
+    if isinstance(exc, InvalidArgumentException) or any(pattern in message for pattern in (
+            "unrecognized capability", "invalid capabilities", "invalid argument: capability")):
+        return "webdriver_capabilities_rejected", "running", "capability_rejection"
+    if any(pattern in message for pattern in ("read timed out", "read timeout")):
+        return "webdriver_transport_failure", "running", "read_timeout"
+    if any(pattern in message for pattern in (
+            "connection refused", "failed to establish a new connection", "connection aborted")):
+        return "webdriver_transport_failure", "running", "connection_failure"
+    if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
+            "failed to launch", "failed to start", "application failed")):
+        return "webdriver_application_startup_failed", "running", "application_startup_failure"
+    if isinstance(exc, SessionNotCreatedException) and any(pattern in message for pattern in (
+            "cannot find microsoft edge", "no edge binary", "executable needs to be available")):
+        return "webdriver_application_startup_failed", "running", "application_startup_failure"
+    return "webdriver_session_creation_failed", "running", "unknown"
+
+
+def _webdriver_process_posture(process: object, app_binary: Path,
+        application_process: object | None = None) -> str:
+    """Inspect process identity in memory and return only an allowlisted posture."""
+    poll = getattr(process, "poll", None)
+    if callable(poll) and poll() is not None:
+        return "tauri_driver_exited"
+    try:
+        if (application_process is not None
+                and getattr(application_process, "poll", lambda: 1)() is None):
+            application = psutil.Process(application_process.pid)
+            try:
+                return ("webview_descendants_present"
+                    if application.children(recursive=True) else "application_present")
+            except (psutil.Error, OSError):
+                return "application_present"
+        descendants = psutil.Process(process.pid).children(recursive=True)
+        application = None
+        expected = app_binary.resolve()
+        for descendant in descendants:
+            try:
+                if Path(descendant.exe()).resolve() == expected:
+                    application = descendant
+                    break
+            except (OSError, psutil.Error):
+                continue
+        if application is not None:
+            try:
+                if application.children(recursive=True):
+                    return "webview_descendants_present"
+            except (psutil.Error, OSError):
+                pass
+            return "application_present"
+        return "native_driver_only" if descendants else "unknown"
+    except (AttributeError, OSError, psutil.Error):
+        return "unknown"
+
+
+def _webdriver_session_elapsed_bucket(elapsed_seconds: object) -> str:
+    if not isinstance(elapsed_seconds, (int, float)) or isinstance(elapsed_seconds, bool):
+        return "unknown"
+    if elapsed_seconds < 5:
+        return "under_5_seconds"
+    if elapsed_seconds < 30:
+        return "5_to_29_seconds"
+    if elapsed_seconds < 90:
+        return "30_to_89_seconds"
+    return "90_seconds_or_more"
+
+
+def _write_webdriver_diagnostic(
+        compatibility: str, process_state: str, failure_category: str,
+        exception_family: str = "unknown", process_posture: str = "unknown",
+        session_elapsed_bucket: str = "unknown", target_category: str = "unknown",
+        readiness_category: str = "unknown", operator_progress: str = "not_started",
+        operator_start_diagnostic: dict[str, str] | None = None,
+        native_startup_diagnostic: dict[str, str] | None = None,
+        packaged_startup_diagnostic: dict[str, str] | None = None,
+        pre_start_diagnostic: dict[str, object] | None = None) -> None:
+    """Atomically retain the bounded session diagnostic while raw logs are discarded."""
+    if compatibility not in WEBDRIVER_COMPATIBILITY_RESULTS:
+        compatibility = "unknown"
+    if process_state not in {"running", "exited", "unknown"}:
+        process_state = "unknown"
+    if failure_category not in PACKAGED_FAILURE_REASONS | {"none"}:
+        failure_category = "webdriver_session_creation_failed"
+    if exception_family not in WEBDRIVER_EXCEPTION_FAMILIES:
+        exception_family = "unknown"
+    if process_posture not in WEBDRIVER_PROCESS_POSTURES:
+        process_posture = "unknown"
+    if session_elapsed_bucket not in WEBDRIVER_SESSION_ELAPSED_BUCKETS:
+        session_elapsed_bucket = "unknown"
+    if target_category not in WEBDRIVER_TARGET_CATEGORIES:
+        target_category = "unknown"
+    if readiness_category not in WEBDRIVER_READINESS_CATEGORIES:
+        readiness_category = "unknown"
+    if operator_progress not in {
+            "not_started", "model_input_set", "relay_input_set", "operator_enabled",
+            "operator_started", "operator_running", "operator_registered"}:
+        operator_progress = "not_started"
+    supplied_start_diagnostic = operator_start_diagnostic or {}
+    safe_start_diagnostic = {
+        field: (value if (value := supplied_start_diagnostic.get(field)) in allowed
+                else OPERATOR_START_DIAGNOSTIC_DEFAULTS[field])
+        for field, allowed in OPERATOR_START_DIAGNOSTIC_ALLOWLISTS.items()
+    }
+    supplied_native_diagnostic = native_startup_diagnostic or {}
+    safe_native_diagnostic = {
+        field: (value if (value := supplied_native_diagnostic.get(field)) in allowed
+                else NATIVE_STARTUP_DIAGNOSTIC_DEFAULTS[field])
+        for field, allowed in NATIVE_STARTUP_DIAGNOSTIC_ALLOWLISTS.items()
+    }
+    supplied_packaged_diagnostic = packaged_startup_diagnostic or {}
+    safe_packaged_diagnostic = {
+        field: (value if (value := supplied_packaged_diagnostic.get(field)) in allowed
+                else PACKAGED_STARTUP_DIAGNOSTIC_DEFAULTS[field])
+        for field, allowed in PACKAGED_STARTUP_DIAGNOSTIC_ALLOWLISTS.items()
+    }
+    supplied_pre_start = pre_start_diagnostic or {}
+    safe_pre_start = {
+        field: (value if isinstance(value := supplied_pre_start.get(field), str)
+                and value in allowed
+                else PRE_START_DIAGNOSTIC_DEFAULTS[field])
+        for field, allowed in PRE_START_DIAGNOSTIC_ALLOWLISTS.items()
+    }
+    for field in ("baseline_poll_attempt_count", "baseline_transient_failure_count"):
+        value = supplied_pre_start.get(field)
+        safe_pre_start[field] = (min(value, _MAX_DIAGNOSTIC_COUNTER)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0)
+    value = supplied_pre_start.get("last_authoritative_registered_node_count")
+    safe_pre_start["last_authoritative_registered_node_count"] = (
+        min(value, _MAX_DIAGNOSTIC_COUNTER)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        else None)
+    value = supplied_pre_start.get("baseline_last_http_status")
+    safe_pre_start["baseline_last_http_status"] = (value
+        if isinstance(value, int) and not isinstance(value, bool)
+        and 100 <= value <= 599 else None)
+    supplied_counts = supplied_pre_start.get("baseline_failure_counts")
+    if not isinstance(supplied_counts, dict):
+        supplied_counts = {}
+    safe_pre_start["baseline_failure_counts"] = {
+        category: (min(value, _MAX_DIAGNOSTIC_COUNTER)
+            if isinstance(value := supplied_counts.get(category), int)
+            and not isinstance(value, bool) and value >= 0 else 0)
+        for category in RELAY_BASELINE_FAILURE_CATEGORIES if category != "none"
+    }
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    destination = LOGS_DIR / "packaged-webdriver-diagnostic.json"
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=".packaged-webdriver-diagnostic-", suffix=".tmp", dir=LOGS_DIR)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({
+                "schema_version": WEBDRIVER_DIAGNOSTIC_SCHEMA_VERSION,
+                "browser_driver_compatibility": compatibility,
+                "tauri_driver_state": process_state,
+                "webdriver_failure_category": failure_category,
+                "exception_family": exception_family,
+                "process_posture": process_posture,
+                "session_elapsed_bucket": session_elapsed_bucket,
+                "target_category": target_category,
+                "readiness_category": readiness_category,
+                "operator_progress": operator_progress,
+                **safe_pre_start,
+                **safe_start_diagnostic,
+                **safe_native_diagnostic,
+                **safe_packaged_diagnostic,
+            }, handle, sort_keys=True)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _status_value(driver: webdriver.Remote, label: str) -> str:
     return driver.find_element(
         By.XPATH, f"//p[contains(.,'{label}:')]//*[self::code or self::strong][1]"
@@ -563,6 +1651,101 @@ def _status_value(driver: webdriver.Remote, label: str) -> str:
 def _readiness_diagnostics_map(driver: webdriver.Remote) -> dict[str, str]:
     text = _status_value(driver, "Readiness diagnostics")
     return dict(item.split("=", 1) for item in text.split() if "=" in item)
+
+
+def _diagnostic_bool(diagnostics: dict[str, str], key: str) -> bool:
+    value = diagnostics.get(key, "").lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError("runtime_configuration_invalid")
+    return value == "true"
+
+
+def _diagnostic_int(diagnostics: dict[str, str], key: str) -> int:
+    value = diagnostics.get(key, "")
+    if not value.isdigit():
+        raise RuntimeError("runtime_configuration_invalid")
+    return int(value)
+
+
+def _diagnostic_float(diagnostics: dict[str, str], key: str) -> float:
+    try:
+        value = float(diagnostics[key])
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError("runtime_configuration_invalid") from exc
+    if not math.isfinite(value):
+        raise RuntimeError("runtime_configuration_invalid")
+    return value
+
+
+def _normalize_profile_fallback_reason(value: str | None) -> str:
+    return "none" if value in {None, "", "null"} else value
+
+
+def packaged_runtime_configuration(runtime: dict[str, str], diagnostics: dict[str, str],
+        requested_backend: str) -> dict[str, object]:
+    """Build bounded current-worker configuration evidence from UI-safe fields only."""
+    profile_key = "api_v1_readiness_qwen_64k_runtime_profile_id"
+    profile_id = diagnostics.get(profile_key)
+    profile_applicable = profile_id not in {None, "", "null"}
+    if profile_applicable:
+        attempts = diagnostics.get(
+            "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids", "").split(",")
+        fallback_reason = _normalize_profile_fallback_reason(diagnostics.get(
+            "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason"))
+        profile = {"selected": profile_id,
+            "preferred": diagnostics["api_v1_readiness_qwen_64k_runtime_preferred_profile_id"],
+            "attempted": attempts,
+            "recovery_count": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_recovery_count"),
+            "result": diagnostics["api_v1_readiness_qwen_64k_runtime_profile_result"],
+            "fallback_reason": fallback_reason}
+        batch = {"requested": diagnostics["api_v1_readiness_qwen_64k_batch_profile_requested"],
+            "selected": diagnostics["api_v1_readiness_qwen_64k_batch_profile_selected"],
+            "n_batch": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_n_batch"),
+            "n_ubatch": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_n_ubatch")}
+        kv_cache = {"precision": diagnostics["api_v1_readiness_qwen_64k_runtime_profile_kv_precision"],
+            "type_k": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_type_k"),
+            "type_v": _diagnostic_int(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_type_v"),
+            "device": diagnostics["kv_cache_device"]}
+        offloaded = diagnostics["offloaded_layers"]
+        acceleration = {"flash_attention": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_flash_attn"),
+            "kqv_offload": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_qwen_64k_runtime_profile_offload_kqv"),
+            "offloaded_layers": int(offloaded) if offloaded.isdigit() else offloaded}
+    else:
+        profile = batch = kv_cache = acceleration = yarn = {
+            "status": "not_applicable", "reason": "not_qwen_64k_profile"}
+    if profile_applicable:
+        yarn = {
+            "requested_context_tokens": _diagnostic_int(diagnostics,
+                "api_v1_readiness_yarn_requested_context_tokens"),
+            "original_context_tokens": _diagnostic_int(diagnostics,
+                "api_v1_readiness_yarn_original_context_tokens"),
+            "context_multiplier": _diagnostic_float(diagnostics,
+                "api_v1_readiness_yarn_context_multiplier"),
+            "rope_frequency_scale": _diagnostic_float(diagnostics,
+                "api_v1_readiness_yarn_rope_freq_scale"),
+            "extension_factor_overridden": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_yarn_ext_factor_overridden"),
+            "scaling_source": diagnostics["api_v1_readiness_yarn_rope_scaling_type_source"],
+            "configuration_valid": _diagnostic_bool(diagnostics,
+                "api_v1_readiness_yarn_configuration_valid")}
+    return {"mode": {"requested": runtime["Requested mode"].lower(),
+            "effective": runtime["Effective mode"].lower()},
+        "backend": {"requested": requested_backend,
+            "available": runtime["Backend available"].lower(),
+            "selected": runtime["Backend selected"].lower(),
+            "used": runtime["Backend used"].lower(),
+            "fallback_reason": runtime["Fallback reason"].lower()},
+        "context": {"tier": runtime["Context tier"],
+            "effective_window_tokens": int(runtime["Context window"].split()[0])},
+        "runtime_profile": profile, "batch_profile": batch, "kv_cache": kv_cache,
+        "acceleration": acceleration, "yarn_rope": yarn}
 
 
 def assert_packaged_windows_nvidia_status(
@@ -640,13 +1823,871 @@ def assert_packaged_windows_nvidia_status(
         raise AssertionError(f"hardware status reports KV cache device is not CUDA: {kv_cache_device!r}")
 
 
+def _write_benchmark_phase(path: Path, phase: str, started: float,
+        schema_version: str, phases: tuple[str, ...], *, last_safe_phase: str,
+        failure_reason: str | None = None, cleanup_succeeded: bool | None = None,
+        retry_timeout_s: float = 1.0, clock=time.monotonic,
+        sleeper=time.sleep, platform_name: str | None = None) -> None:
+    """Atomically checkpoint an allowlisted phase without identifiers or payload data."""
+    payload = {"schema_version": schema_version, "phase": phase,
+        "sequence": phases.index(phase) + 1,
+        "last_safe_phase": last_safe_phase, "failure_reason": failure_reason,
+        "elapsed_s": round(max(0.0, clock() - started), 3),
+        "cleanup_succeeded": cleanup_succeeded}
+    temporary_fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    deadline = clock() + max(0.0, retry_timeout_s)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(temporary_fd, 0o600)
+        with os.fdopen(temporary_fd, "w", encoding="utf-8") as handle:
+            temporary_fd = -1
+            json.dump(payload, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        while True:
+            try:
+                temporary.replace(path)
+                return
+            except OSError as exc:
+                if not _is_windows_checkpoint_contention(exc, platform_name):
+                    raise
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    raise RuntimeError("phase checkpoint publication failed") from None
+                sleeper(min(0.01, remaining))
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        while True:
+            try:
+                temporary.unlink(missing_ok=True)
+                break
+            except OSError as exc:
+                if not _is_windows_checkpoint_contention(exc, platform_name):
+                    raise
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    break
+                sleeper(min(0.01, remaining))
+
+
+def _is_windows_sharing_violation(exc: BaseException) -> bool:
+    """Recognize only Windows sharing/lock violations, not generic access denial."""
+    return isinstance(exc, OSError) and getattr(exc, "winerror", None) in {32, 33}
+
+
+def _is_windows_checkpoint_contention(exc: BaseException,
+        platform_name: str | None = None) -> bool:
+    """Recognize contention only for the checkpoint's owned atomic operation."""
+    platform_name = os.name if platform_name is None else platform_name
+    return (_is_windows_sharing_violation(exc)
+        or (platform_name == "nt" and isinstance(exc, PermissionError)))
+
+
+def _remove_owned_path(path: Path, deadline: float, *, directory: bool = False,
+        clock=time.monotonic, sleeper=time.sleep) -> bool:
+    """Remove one owner-created path, retrying only transient sharing denials."""
+    while True:
+        try:
+            if directory:
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if not _is_windows_sharing_violation(exc):
+                raise
+            remaining = deadline - clock()
+            if remaining <= 0:
+                return False
+            sleeper(min(0.01, remaining))
+
+
+def _cleanup_owned_process_tree(process: subprocess.Popen, remaining: Callable[[], float]) -> bool:
+    """Boundedly stop and observe the exact PID-owned descendant tree."""
+    cleanup_ok = True
+    try:
+        root = psutil.Process(process.pid)
+        owned_processes = [*root.children(recursive=True), root]
+    except psutil.NoSuchProcess:
+        owned_processes = []
+    except (psutil.AccessDenied, psutil.ZombieProcess):
+        owned_processes = []
+        cleanup_ok = False
+    for owned in owned_processes:
+        if remaining() <= 0:
+            cleanup_ok = False
+            break
+        try:
+            owned.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except Exception:
+            cleanup_ok = False
+    alive = owned_processes
+    allowance = remaining()
+    if allowance <= 0 and alive:
+        cleanup_ok = False
+    elif alive:
+        try:
+            _, alive = psutil.wait_procs(alive, timeout=allowance)
+        except Exception:
+            cleanup_ok = False
+    for owned in alive:
+        if remaining() <= 0:
+            cleanup_ok = False
+            break
+        try:
+            owned.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except Exception:
+            cleanup_ok = False
+    allowance = remaining()
+    if allowance <= 0 and alive:
+        cleanup_ok = False
+    elif alive:
+        try:
+            _, alive = psutil.wait_procs(alive, timeout=allowance)
+        except Exception:
+            cleanup_ok = False
+    cleanup_ok = cleanup_ok and not alive
+    allowance = remaining()
+    if allowance <= 0:
+        cleanup_ok = False
+    else:
+        try:
+            process.wait(timeout=allowance)
+        except Exception:
+            cleanup_ok = False
+    return cleanup_ok
+
+
+def _quit_webdriver(session, timeout_s: float) -> bool:
+    """Attempt to release a WebDriver even when configuring its timeout fails."""
+    succeeded = True
+    try:
+        session.set_script_timeout(timeout_s)
+    except Exception:
+        succeeded = False
+    try:
+        session.quit()
+    except Exception:
+        succeeded = False
+    return succeeded
+
+
+def _wait_for_packaged_setup_condition(browser: webdriver.Chrome, setup_remaining,
+        predicate, failure_reason: str, fail_closed):
+    """Wait within setup and preserve the readiness-specific failure category."""
+    try:
+        return WebDriverWait(browser, setup_remaining(), poll_frequency=0.05).until(predicate)
+    except (TimeoutException, RuntimeError):
+        fail_closed(failure_reason)
+
+
+def _prepare_packaged_landing_page(browser: webdriver.Chrome, setup_remaining,
+        fail_closed, context_tier: str) -> None:
+    """Verify the landing-page prerequisites within the setup allowance."""
+    checks = (
+        ("return Boolean(document.querySelector('#app').__vue__)", "vue_not_ready"),
+        ("const v=document.querySelector('#app').__vue__; return Boolean(v.hasClientKeypair);",
+            "client_keypair_not_ready"),
+        ("const v=document.querySelector('#app').__vue__; return Boolean(v.modelsLoaded && v.selectedModel);",
+            "model_selection_not_ready"),
+    )
+    for script, reason in checks:
+        _wait_for_packaged_setup_condition(browser, setup_remaining,
+            lambda d, probe=script: d.execute_script(probe), reason, fail_closed)
+    setup_remaining()
+    if apply_benchmark_context_tier(browser, context_tier) != context_tier:
+        fail_closed("requested_context_tier_not_applied")
+
+
+def _validate_packaged_failure_reason(reason: str) -> str:
+    if reason not in PACKAGED_FAILURE_REASONS:
+        raise RuntimeError("invalid packaged failure reason")
+    return reason
+
+
+def _enter_packaged_prompt(field, prompt: str, *, action_factory=ActionChains) -> None:
+    """Type through the textarea, encoding embedded newlines as Shift+Enter."""
+    lines = prompt.split("\n")
+    for index, line in enumerate(lines):
+        if line:
+            field.send_keys(line)
+        if index < len(lines) - 1:
+            (action_factory(field.parent).key_down(Keys.SHIFT).send_keys(Keys.ENTER)
+                .key_up(Keys.SHIFT).perform())
+
+
+def _populate_and_submit_packaged_prompt(browser: webdriver.Chrome, prompt: str,
+        setup_remaining, fail_closed, write_phase, *, clock=time.monotonic,
+        action_factory=ActionChains, before_submit=None) -> float:
+    """Populate exactly, then check eligibility and explicitly submit."""
+    setup_remaining()
+    field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+    setup_remaining()
+    _enter_packaged_prompt(field, prompt, action_factory=action_factory)
+    setup_remaining()
+    populated = browser.execute_script(
+        "return document.querySelector('#app').__vue__.newMessage;")
+    if populated != prompt:
+        fail_closed("message_input_not_populated")
+    send_button = _wait_for_packaged_setup_condition(
+        browser, setup_remaining,
+        lambda d: (button if (button := d.find_element(
+            By.CSS_SELECTOR, ".send-button")).is_enabled() else False),
+        "send_button_not_enabled", fail_closed)
+    write_phase("landing_page_ready")
+    setup_remaining()
+    if before_submit is not None:
+        before_submit()
+    started = clock()
+    send_button.click()
+    write_phase("request_active")
+    return started
+
+
+def _read_primary_tokenizer_observation(evidence_path: Path, runtime_identity: str,
+        fixture_sha256: str) -> dict[str, object]:
+    try:
+        observation = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("authoritative_target_depth_unavailable") from exc
+    if (not isinstance(observation, dict)
+            or observation.get("runtime_identity") != runtime_identity
+            or observation.get("fixture_sha256") != fixture_sha256):
+        raise RuntimeError("authoritative_target_depth_mismatched")
+    return observation
+
+
+def run_long_context_packaged_mode(request_path: Path, evidence_path: Path,
+        phase_status_path: Path, app_binary: Path) -> int:
+    """Drive a packaged app and the existing landing-page API v1 E2EE client."""
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    phase_schema_version = request["phase_status_version"]
+    phase_values = request["phase_status_phases"]
+    if (not isinstance(phase_schema_version, str) or not phase_schema_version
+            or not isinstance(phase_values, list) or not phase_values
+            or any(not isinstance(value, str) or not value for value in phase_values)
+            or len(set(phase_values)) != len(phase_values)):
+        raise RuntimeError("packaged phase contract malformed")
+    phases = tuple(phase_values)
+    runner_started = time.monotonic()
+    last_safe_phase = "runner_startup"
+    failure_reason: str | None = None
+    def write_phase(phase: str) -> None:
+        nonlocal last_safe_phase
+        last_safe_phase = phase
+        _write_benchmark_phase(phase_status_path, phase, runner_started,
+            phase_schema_version, phases, last_safe_phase=last_safe_phase)
+    def fail_closed(reason: str) -> None:
+        nonlocal failure_reason
+        failure_reason = _validate_packaged_failure_reason(reason)
+        raise RuntimeError(reason) from None
+    setup_deadline = runner_started + float(request["setup_timeout_s"])
+    def setup_remaining() -> float:
+        remaining = setup_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("packaged setup timeout")
+        return remaining
+    write_phase("runner_startup")
+    cleanup_timeout = float(request["cleanup_timeout_s"])
+    driver_log_fd, driver_log_name = tempfile.mkstemp(prefix="long-context-tauri-driver-", suffix=".log")
+    os.close(driver_log_fd)
+    driver_log = Path(driver_log_name)
+    isolated_home = Path(tempfile.mkdtemp(prefix="long-context-desktop-home-"))
+    tokenizer_dir = Path(tempfile.mkdtemp(prefix="long-context-tokenizer-observation-"))
+    tokenizer_request = tokenizer_dir / "request.json"
+    tokenizer_evidence = tokenizer_dir / "evidence.json"
+    _write_tokenizer_stage(tokenizer_evidence, "application_arguments_absent", 0)
+    tokenizer_request.write_text(json.dumps({
+        "fixture_sha256": request["manifest"]["fixture_sha256"],
+        "target_prefix_utf8_bytes": {name: target["target_prefix_utf8_bytes"]
+            for name, target in request["manifest"]["targets"].items()},
+    }), encoding="utf-8")
+    if hasattr(os, "chmod"):
+        os.chmod(tokenizer_request, 0o600)
+    env = tauri_driver_environment(isolated_home)
+    driver_log_handle = driver_log.open("w", encoding="utf-8")
+    process: subprocess.Popen[str] | None = None
+    application_process: subprocess.Popen[str] | None = None
+    driver: webdriver.Remote | None = None
+    browser: webdriver.Chrome | None = None
+    cleanup_ok = True
+    primary_failed = False
+    webdriver_failure_category = "none"
+    tauri_driver_state = "unknown"
+    webdriver_exception_family = "unknown"
+    webdriver_process_posture = "unknown"
+    webdriver_session_elapsed_bucket = "unknown"
+    webdriver_target_category = "unknown"
+    webdriver_readiness_category = "unknown"
+    operator_progress = "not_started"
+    relay_observation = "not_started"
+    # Keep a mutable local copy so even failures during the earliest packaged bootstrap
+    # can serialize a complete diagnostic without requiring any UI state.
+    pre_start_diagnostic: dict[str, object] = PRE_START_DIAGNOSTIC_DEFAULTS.copy()
+    def record_operator_progress(progress: str) -> None:
+        nonlocal operator_progress
+        operator_progress = progress
+    def record_relay_observation(observation: str) -> None:
+        nonlocal relay_observation
+        relay_observation = observation
+    def record_pre_start_state(**changes: object) -> None:
+        pre_start_diagnostic.update(changes)
+    def write_pre_start_snapshot() -> None:
+        _write_webdriver_diagnostic(
+            os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
+            tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
+            webdriver_process_posture, webdriver_session_elapsed_bucket,
+            webdriver_target_category, webdriver_readiness_category, operator_progress,
+            {}, {}, {}, pre_start_diagnostic)
+    try:
+        setup_remaining()
+        try:
+            driver_command = tauri_driver_command()
+        except RuntimeError as exc:
+            if str(exc) == "native_driver_unavailable":
+                fail_closed("native_driver_unavailable")
+            raise
+        process = subprocess.Popen(driver_command, cwd=TAURI_ROOT, env=env,
+            stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
+        try:
+            wait_for_webdriver_ready(process, min(90, setup_remaining()))
+        except RuntimeError as exc:
+            reason = str(exc)
+            if reason in {"tauri_driver_exited", "webdriver_transport_failure"}:
+                webdriver_failure_category = reason
+                tauri_driver_state = (
+                    "exited" if reason == "tauri_driver_exited" else "running")
+                fail_closed(reason)
+            raise
+        tauri_driver_state = "running"
+        write_phase("webdriver_ready")
+        setup_remaining()
+        application_args = tokenizer_handoff_args(tokenizer_request, tokenizer_evidence)
+        debugger_address = None
+        if os.name == "nt":
+            devtools_port = reserve_free_port()
+            application_env = env.copy()
+            application_env.update({
+                "TAURI_AUTOMATION": "true",
+                "TAURI_WEBVIEW_AUTOMATION": "true",
+            })
+            webview2_automation_arg = (
+                "--edge-webview-switches="
+                f"--remote-debugging-port={devtools_port}")
+            try:
+                application_process = subprocess.Popen(
+                    [str(app_binary.resolve(strict=True)), webview2_automation_arg,
+                        *application_args],
+                    cwd=app_binary.resolve(strict=True).parent, env=application_env,
+                    stdout=driver_log_handle, stderr=subprocess.STDOUT, text=True)  # noqa: S603
+            except (OSError, ValueError):
+                webdriver_failure_category = "webdriver_application_startup_failed"
+                webdriver_exception_family = "application_startup_failure"
+                fail_closed(webdriver_failure_category)
+            memory_sampler = OwnedProcessTreeMemorySampler(application_process.pid)
+            try:
+                wait_for_webview2_devtools(
+                    application_process, devtools_port, setup_remaining())
+                webdriver_target_category = "attachable_target"
+            except RuntimeError as exc:
+                reason = str(exc)
+                webdriver_target_category = "no_target"
+                webdriver_failure_category = reason
+                webdriver_exception_family = (
+                    "application_startup_failure"
+                    if reason == "webdriver_application_startup_failed"
+                    else "connection_failure")
+                webdriver_process_posture = _webdriver_process_posture(
+                    process, app_binary, application_process)
+                fail_closed(reason)
+            debugger_address = f"127.0.0.1:{devtools_port}"
+        else:
+            memory_sampler = OwnedProcessTreeMemorySampler(process.pid)
+        session_started = time.monotonic()
+        try:
+            driver = start_driver(
+                app_binary.resolve(strict=True),
+                application_args=application_args,
+                debugger_address=debugger_address,
+            )
+        except Exception as exc:
+            webdriver_session_elapsed_bucket = _webdriver_session_elapsed_bucket(
+                time.monotonic() - session_started)
+            webdriver_process_posture = _webdriver_process_posture(
+                process, app_binary, application_process)
+            webdriver_failure_category, tauri_driver_state, webdriver_exception_family = (
+                _classify_webdriver_session_failure(exc, process))
+            fail_closed(webdriver_failure_category)
+        write_phase("desktop_session_started")
+        try:
+            wait_for_ui_ready(driver, timeout_seconds=setup_remaining())
+            webdriver_readiness_category = "ready"
+        except Exception as exc:
+            category = str(exc)
+            webdriver_readiness_category = (category
+                if category in WEBDRIVER_READINESS_CATEGORIES else "webdriver_failure")
+            fail_closed("desktop_ui_not_ready")
+        write_phase("desktop_ready")
+        setup_remaining()
+        fill_input_by_label(driver, "Model GGUF path", str(Path(request["model"]).resolve(strict=True)))
+        operator_progress = "model_input_set"
+        setup_remaining()
+        fill_input_by_label(driver, "Relay URL 1", request["relay_url"])
+        operator_progress = "relay_input_set"
+        setup_remaining()
+        mode = driver.find_element(By.XPATH, "//label[normalize-space()='Compute mode']/following::select[1]")
+        compute_mode = benchmark_operator_mode(request["backend"])
+        driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", mode, compute_mode)
+        tier = driver.find_element(By.XPATH, "//select[@aria-label='Context tier']")
+        driver.execute_script("arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", tier, request["context_tier"])
+        wait_for_start_operator_enabled(driver, driver_log, driver_log,
+            timeout_seconds=setup_remaining())
+        operator_progress = "operator_enabled"
+        setup_remaining()
+        require_clean_relay_registration_baseline(
+            request["relay_url"], timeout_seconds=setup_remaining(),
+            fail_closed=fail_closed, record_relay_observation=record_relay_observation,
+            record_pre_start_state=record_pre_start_state)
+        driver_log_handle.flush()
+        bridge_log_start_offset = driver_log.stat().st_size
+        pre_start_diagnostic["start_click_state"] = "about_to_attempt"
+        write_pre_start_snapshot()
+        try:
+            driver.find_element(By.XPATH, "//button[.='Start operator']").click()
+        except Exception as exc:
+            pre_start_diagnostic["start_click_state"] = "raised"
+            pre_start_diagnostic["start_click_exception_category"] = \
+                _start_click_exception_category(exc)
+            write_pre_start_snapshot()
+            fail_closed("packaged_runner_failure")
+        pre_start_diagnostic["start_click_state"] = "returned"
+        write_pre_start_snapshot()
+        operator_progress = "operator_started"
+        wait_for_post_start_operator_state(
+            driver, setup_remaining, record_operator_progress, fail_closed,
+            request["relay_url"], record_relay_observation, driver_log,
+            bridge_log_start_offset)
+        write_phase("operator_ready")
+
+        _validate_operator_tokenizer_handoff(tokenizer_evidence, fail_closed)
+
+        runtime = {label: _status_value(driver, label) for label in
+            ("App version", "Build ID", "Runtime ID", "Bundled runtime ID", "Launcher source",
+             "Requested mode", "Effective mode", "Backend available", "Backend selected",
+             "Backend used", "Fallback reason", "Context tier", "Context window")}
+        diagnostics = _readiness_diagnostics_map(driver)
+        runtime_configuration = packaged_runtime_configuration(runtime, diagnostics, request["backend"])
+        if (runtime["Launcher source"].lower() != "bundled"):
+            raise RuntimeError("packaged launcher attestation failed")
+        if runtime["Backend selected"].lower() != request["backend"] or runtime["Backend used"].lower() != request["backend"]:
+            raise RuntimeError("packaged backend attestation failed")
+
+        setup_remaining()
+        browser = start_landing_driver()
+        browser.set_page_load_timeout(setup_remaining())
+        browser.set_script_timeout(setup_remaining())
+        browser.get(request["relay_url"])
+        _prepare_packaged_landing_page(
+            browser, setup_remaining, fail_closed, request["context_tier"])
+        if not memory_sampler.sample():
+            raise RuntimeError("memory_sample_unavailable")
+        browser.set_script_timeout(setup_remaining())
+        browser.execute_script("""
+            const v = document.querySelector('#app').__vue__;
+            const original = v.encrypt.bind(v);
+            v.encrypt = async function(plaintext, ...args) {
+                const envelope = JSON.parse(plaintext);
+                if (envelope.protocol === 'tokenplace_api_v1_relay_e2ee') {
+                    const options = envelope.api_v1_request?.options;
+                    const allowed = ['max_tokens', 'temperature', 'top_p', 'seed'];
+                    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+                        this.__longContextBenchmarkGenerationSettings = null;
+                    } else {
+                        const supplied = {};
+                        for (const key of Object.keys(options)) {
+                            if (allowed.includes(key)) supplied[key] = options[key];
+                            else supplied.__unsupported__ = key;
+                        }
+                        this.__longContextBenchmarkGenerationSettings = {
+                            supplied,
+                            omitted_runtime_default: allowed.filter(key => !(key in options)).sort()
+                        };
+                    }
+                }
+                return original(plaintext, ...args);
+            };
+            const originalDecrypt = v.decrypt.bind(v);
+            v.decrypt = async function(...args) {
+                const plaintext = await originalDecrypt(...args);
+                try {
+                    const envelope = JSON.parse(plaintext);
+                    const response = envelope?.api_v1_response;
+                    if (envelope?.protocol === 'tokenplace_api_v1_relay_e2ee' &&
+                            response && typeof response === 'object' && !Array.isArray(response)) {
+                        const usage = response.usage;
+                        const choice = Array.isArray(response.choices) ? response.choices[0] : null;
+                        this.__longContextBenchmarkFinalMetadata = {
+                            prompt_tokens: usage?.prompt_tokens,
+                            completion_tokens: usage?.completion_tokens,
+                            finish_reason: response.finish_reason ?? choice?.finish_reason
+                        };
+                    }
+                } catch (_error) {
+                    // Progress envelopes and non-JSON plaintext are intentionally ignored.
+                }
+                return plaintext;
+            };
+        """)
+        # The child writes directly to this file descriptor. Capture the exact byte
+        # boundary immediately before submission.
+        driver_log_boundary = 0
+        def capture_driver_log_boundary() -> None:
+            nonlocal driver_log_boundary
+            driver_log_boundary = _rearm_tokenizer_stage(tokenizer_evidence, driver_log)
+        started = _populate_and_submit_packaged_prompt(browser, request["prompt"],
+            setup_remaining, fail_closed, write_phase,
+            before_submit=capture_driver_log_boundary)
+        progress: list[dict[str, object]] = []
+        while time.monotonic() - started < float(request["request_timeout_s"]):
+            memory_sampler.sample()
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,"
+                "b:v.isGeneratingResponse,t:v.selectedContextTier};")
+            event = state.get("p")
+            if isinstance(event, dict) and (not progress or event.get("sequence") != progress[-1].get("sequence")):
+                progress.append(event)
+            lifecycle, response_text = classify_benchmark_landing_state(state)
+            if lifecycle == "completed":
+                break
+            if lifecycle == "failed":
+                raise RuntimeError("packaged_response_error")
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("packaged request timeout")
+        ended = time.monotonic()
+        write_phase("response_received")
+        with driver_log.open("rb") as telemetry_handle:
+            telemetry_handle.seek(driver_log_boundary)
+            primary_log_slice = telemetry_handle.read().decode("utf-8", errors="replace")
+        local_telemetry = parse_packaged_local_telemetry(primary_log_slice)
+        # Retain only allowlisted final metadata at the decryption boundary.
+        response_metadata = browser.execute_script(
+            "return document.querySelector('#app').__vue__.__longContextBenchmarkFinalMetadata;")
+        cancellation_recovery = None
+        finalization_deadline = time.monotonic() + float(request["finalization_timeout_s"])
+        def finalization_remaining() -> float:
+            remaining = finalization_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("packaged evidence finalization timeout")
+            return remaining
+        finalization_remaining()
+        if not progress or not isinstance(response_text, str):
+            raise RuntimeError("required encrypted progress or response evidence missing")
+        browser.set_script_timeout(finalization_remaining())
+        generation_settings = browser.execute_script(
+            "return document.querySelector('#app').__vue__.__longContextBenchmarkGenerationSettings;")
+        if not isinstance(generation_settings, dict):
+            raise RuntimeError("generation_settings_unavailable")
+        known_sequence = int(progress[-1]["sequence"])
+        def post_terminal_poll() -> dict[str, object] | None:
+            nonlocal known_sequence
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,b:v.isGeneratingResponse};")
+            event = state.get("p")
+            if isinstance(event, dict) and isinstance(event.get("sequence"), int) and event["sequence"] > known_sequence:
+                known_sequence = event["sequence"]
+                return event
+            lifecycle, later_response = classify_benchmark_landing_state(state)
+            if lifecycle == "completed" and later_response != response_text:
+                return {"kind": "unexpected_result"}
+            if lifecycle == "failed":
+                return {"kind": "unexpected_failure"}
+            return None
+        finalization_remaining()
+        post_terminal = [item for item in observe_post_terminal(post_terminal_poll,
+            window_s=min(0.1, finalization_remaining())) if item is not None]
+        finalization_remaining()
+        _validate_final_tokenizer_stage(tokenizer_evidence, fail_closed)
+        tokenizer_observation = _read_primary_tokenizer_observation(
+            tokenizer_evidence, runtime["Runtime ID"], request["manifest"]["fixture_sha256"])
+        finalization_remaining()
+        memory_sampler.sample()
+        memory_evidence = memory_sampler.summary()
+        finalization_remaining()
+        # All packaged requests share this evidence path, so freeze the primary
+        # snapshots before cancellation/recovery traffic can overwrite them.
+        if request.get("cancellation_validation"):
+            write_phase("cancellation_validation")
+            cancellation_deadline = time.monotonic() + float(request["cancellation_timeout_s"])
+            cancellation_recovery, finalization_deadline = start_phase_after(
+                lambda: run_long_context_cancellation_recovery(
+                    browser, driver, request, cancellation_deadline),
+                float(request["finalization_timeout_s"]))
+        finalization_remaining()
+        write_phase("evidence_finalization")
+        digest = hashlib.sha256()
+        with Path(request["model"]).open("rb") as model_handle:
+            for chunk in iter(lambda: model_handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                finalization_remaining()
+        evidence = {"app_identity": runtime["App version"], "build_identity": runtime["Build ID"],
+            "runtime_identity": runtime["Runtime ID"], "bundled_runtime_identity": runtime["Bundled runtime ID"],
+            "backend_requested": request["backend"],
+            "backend_selected": runtime["Backend selected"].lower(),
+            "backend_used": runtime["Backend used"].lower(), "model_fingerprint": digest.hexdigest(),
+            "authoritative_prompt_tokens": tokenizer_observation["total_prompt_tokens"],
+            "local_telemetry": local_telemetry, "progress_events": progress,
+            "response_metadata": response_metadata,
+            "authoritative_tokenizer_evidence": tokenizer_observation,
+            "kv_applicability": tokenizer_observation.get("kv_applicability"),
+            "kv_estimate": tokenizer_observation.get("kv_estimator"),
+            "kv_runtime": tokenizer_observation.get("kv_runtime"),
+            "atomic_response_completed": True,
+            "post_terminal_observations": post_terminal, "response_text": response_text,
+            "generation_settings": generation_settings,
+            "memory": memory_evidence,
+            "runtime_configuration": runtime_configuration,
+            "request_duration_s": ended - started}
+        if cancellation_recovery is not None:
+            evidence["cancellation_recovery"] = cancellation_recovery
+        finalization_remaining()
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        finalization_remaining()
+        os.chmod(evidence_path, 0o600)
+        return 0
+    except Exception:
+        primary_failed = True
+        if failure_reason is None:
+            failure_reason = "packaged_runner_failure"
+        raise
+    finally:
+        operator_start_diagnostic = _read_operator_start_diagnostic(driver)
+        native_startup_diagnostic = _read_native_startup_diagnostic(driver)
+        packaged_startup_diagnostic = _read_packaged_startup_diagnostic(
+            driver, operator_start_diagnostic, native_startup_diagnostic,
+            webdriver_readiness_category, relay_observation)
+        _write_webdriver_diagnostic(
+            os.environ.get("TOKEN_PLACE_BROWSER_DRIVER_COMPATIBILITY", "unknown"),
+            tauri_driver_state, webdriver_failure_category, webdriver_exception_family,
+            webdriver_process_posture, webdriver_session_elapsed_bucket,
+            webdriver_target_category, webdriver_readiness_category, operator_progress,
+            operator_start_diagnostic, native_startup_diagnostic,
+            packaged_startup_diagnostic, pre_start_diagnostic)
+        cleanup_deadline = time.monotonic() + cleanup_timeout
+        def cleanup_remaining() -> float:
+            return max(0.0, cleanup_deadline - time.monotonic())
+        def cleanup_allowance() -> float | None:
+            remaining = cleanup_remaining()
+            return remaining if remaining > 0 else None
+        checkpoint_error = None
+        try:
+            _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
+                phase_schema_version, phases, last_safe_phase=last_safe_phase,
+                failure_reason=failure_reason, cleanup_succeeded=False,
+                retry_timeout_s=min(cleanup_remaining(), 1.0))
+        except Exception as exc:
+            checkpoint_error = exc
+        if browser is not None:
+            allowance = cleanup_allowance()
+            cleanup_ok = (allowance is not None
+                and _quit_webdriver(browser, allowance) and cleanup_ok)
+        if driver is not None:
+            allowance = cleanup_allowance()
+            cleanup_ok = (allowance is not None
+                and _quit_webdriver(driver, allowance) and cleanup_ok)
+        if application_process is not None:
+            cleanup_ok = (_cleanup_owned_process_tree(application_process, cleanup_remaining)
+                and cleanup_ok)
+        if process is not None:
+            cleanup_ok = (_cleanup_owned_process_tree(process, cleanup_remaining)
+                and cleanup_ok)
+        try:
+            driver_log_handle.close()
+        except Exception:
+            cleanup_ok = False
+        for owned_path, is_directory in (
+                (isolated_home, True), (tokenizer_dir, True), (driver_log, False)):
+            try:
+                cleanup_ok = (_remove_owned_path(owned_path, cleanup_deadline,
+                    directory=is_directory) and cleanup_ok)
+            except OSError:
+                cleanup_ok = False
+        cleanup_ok = cleanup_ok and checkpoint_error is None
+        if not cleanup_ok and not primary_failed:
+            failure_reason = "cleanup_failure"
+        final_checkpoint_error = None
+        try:
+            _write_benchmark_phase(phase_status_path, "cleanup", runner_started,
+                phase_schema_version, phases, last_safe_phase=last_safe_phase,
+                failure_reason=failure_reason, cleanup_succeeded=cleanup_ok,
+                retry_timeout_s=max(0.0, cleanup_deadline - time.monotonic()))
+        except Exception as exc:
+            final_checkpoint_error = exc
+        cleanup_failure = (not cleanup_ok or checkpoint_error is not None
+            or final_checkpoint_error is not None)
+        if final_checkpoint_error is not None:
+            print("cleanup phase checkpoint failed", file=sys.stderr)
+        if cleanup_failure and not primary_failed:
+            raise RuntimeError("cleanup_failure")
+
+
+def _long_context_followup_request(browser: webdriver.Chrome, timeout_s: float,
+        remaining: Callable[[], float]) -> tuple[bool, float]:
+    """Exercise the ordinary encrypted request lifecycle without retaining its plaintext result."""
+    browser.execute_script("const v=document.querySelector('#app').__vue__; v.chatHistory=[];")
+    field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+    field.clear()
+    field.send_keys("Reply with exactly OK")
+    started = time.monotonic()
+    browser.find_element(By.CSS_SELECTOR, ".send-button").click()
+    wait = WebDriverWait(browser, min(timeout_s, remaining()), poll_frequency=0.05)
+    state = wait.until(lambda d: (lambda s: s if classify_benchmark_landing_state(s)[0] != "running" else False)(
+        d.execute_script("const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,h:v.chatHistory,b:v.isGeneratingResponse};")))
+    lifecycle, _response = classify_benchmark_landing_state(state)
+    return lifecycle == "completed", time.monotonic() - started
+
+
+def run_long_context_cancellation_recovery(browser: webdriver.Chrome, driver: webdriver.Remote,
+        request: dict[str, object], cancellation_deadline: float) -> dict[str, object]:
+    """Physically cancel prefill/generation requests, recover, then restart the operator."""
+    config = request["cancellation"]
+    assert isinstance(config, dict)
+    timeout_s = float(request["request_timeout_s"])
+    observation_s = float(config["observation_window_s"])
+    recovery_s = float(config["recovery_timeout_s"])
+    def cancellation_remaining(cap: float | None = None) -> float:
+        return packaged_phase_remaining(cancellation_deadline,
+            "packaged cancellation validation timeout", cap=cap)
+    scenarios: list[dict[str, object]] = []
+    for phase in ("prefill", "generating"):
+        cancellation_remaining()
+        browser.execute_script("const v=document.querySelector('#app').__vue__; v.chatHistory=[];")
+        field = browser.find_element(By.CSS_SELECTOR, ".message-input")
+        field.clear()
+        field.send_keys(str(request["prompt"]))
+        browser.find_element(By.CSS_SELECTOR, ".send-button").click()
+        deadline = time.monotonic() + min(timeout_s, cancellation_remaining())
+        threshold = int(config["generation_tokens"]) if phase == "generating" else config.get("prefill_tokens")
+        trigger_count = -1
+        last_sequence = -1
+        authoritative_total = None
+        while time.monotonic() < deadline:
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,b:v.isGeneratingResponse};")
+            event = state.get("p") if isinstance(state, dict) else None
+            if isinstance(event, dict):
+                total = event.get("total_prompt_tokens")
+                if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
+                    raise RuntimeError("cancellation_trigger_missed")
+                if authoritative_total is None:
+                    authoritative_total = total
+                elif total != authoritative_total:
+                    raise RuntimeError("cancellation_trigger_missed")
+                if phase == "prefill" and threshold is None and isinstance(total, int):
+                    threshold = max(1, int(total * float(config["prefill_fraction"])))
+                count = event.get("processed_prompt_tokens") if phase == "prefill" else event.get("generated_tokens")
+                trigger_state = (prefill_cancellation_trigger_state(count, threshold, total)
+                    if phase == "prefill" and event.get("phase") == phase else None)
+                if trigger_state in {"completed", "invalid"}:
+                    raise RuntimeError("cancellation_trigger_missed")
+                if event.get("phase") == phase and isinstance(count, int) and isinstance(threshold, int) and (
+                        trigger_state == "trigger" if phase == "prefill" else count >= threshold):
+                    trigger_count = count
+                    last_sequence = int(event.get("sequence", -1))
+                    break
+                if (phase == "prefill" and event.get("phase") == "generating") or state.get("b") is False:
+                    raise RuntimeError("cancellation_trigger_missed")
+            time.sleep(min(0.01, cancellation_remaining()))
+        if trigger_count < 0 or not isinstance(threshold, int) or authoritative_total is None:
+            raise RuntimeError("cancellation_trigger_missed")
+        triggered = time.monotonic()
+        browser.set_script_timeout(cancellation_remaining(recovery_s))
+        acknowledgement = browser.execute_async_script("""
+            const done=arguments[arguments.length-1]; const v=document.querySelector('#app').__vue__;
+            const active=v.activeRelayRequest; const pending=v.cancelRelayRequest('requester_cancelled');
+            v.terminateRelayRequestLocally(active);
+            Promise.resolve(pending).then((result) => { v.clearActiveRelayRequest(active?.requestId); done(result); })
+                .catch(() => { v.clearActiveRelayRequest(active?.requestId); done(null); });
+        """)
+        attempted = isinstance(acknowledgement, dict) and acknowledgement.get("attempted") is True
+        acknowledged = isinstance(acknowledgement, dict) and acknowledgement.get("confirmed") is True
+        stale = late = 0
+        active_after = False
+        quiet_started = time.monotonic()
+        quiet_deadline = quiet_started + min(observation_s, cancellation_remaining())
+        while time.monotonic() < quiet_deadline:
+            state = browser.execute_script(
+                "const v=document.querySelector('#app').__vue__; return {p:v.relayProgress,b:v.isGeneratingResponse,a:Boolean(v.activeRelayRequest),h:v.chatHistory};")
+            event = state.get("p") if isinstance(state, dict) else None
+            if isinstance(event, dict) and int(event.get("sequence", -1)) > last_sequence:
+                stale += 1
+            lifecycle, _response = classify_benchmark_landing_state(state)
+            if lifecycle == "completed": late += 1
+            active_after = bool(state.get("a") or state.get("b"))
+            time.sleep(min(0.01, cancellation_remaining()))
+        quiescence_s = time.monotonic() - quiet_started
+        cleanup_s = time.monotonic() - triggered
+        followup_ok, followup_s = _long_context_followup_request(
+            browser, recovery_s, cancellation_remaining)
+        scenarios.append({"phase": phase, "trigger_observed": True, "trigger_count": trigger_count,
+            "threshold": threshold, "total_prompt_tokens": authoritative_total,
+            "attempted": attempted, "acknowledged": acknowledged,
+            "cleanup_s": cleanup_s, "quiescence_s": quiescence_s,
+            "stale_progress_count": stale, "late_result_count": late,
+            "active_after_quiescence": active_after, "followup_ok": followup_ok,
+            "followup_s": followup_s})
+    old_session = _status_value(driver, "Operator session ID")
+    restarted = time.monotonic()
+    driver.find_element(By.XPATH, "//button[.='Stop operator']").click()
+    WebDriverWait(driver, cancellation_remaining(recovery_s)).until(
+        lambda d: d.find_element(By.XPATH, "//button[.='Start operator']").is_enabled())
+    stop_confirmed = _status_value(driver, "Worker alive").lower() != "yes"
+    driver.find_element(By.XPATH, "//button[.='Start operator']").click()
+    wait_for_running_stability(driver, "yes", stable_seconds=1,
+        timeout_seconds=cancellation_remaining(recovery_s))
+    WebDriverWait(driver, cancellation_remaining(recovery_s)).until(
+        lambda d: _status_value(d, "Registered").lower().startswith("yes"))
+    new_session = _status_value(driver, "Operator session ID")
+    restart_s = time.monotonic() - restarted
+    followup_ok, followup_s = _long_context_followup_request(
+        browser, recovery_s, cancellation_remaining)
+    return {"scenarios": scenarios, "operator_lifecycle": {"stop_confirmed": stop_confirmed,
+        "restart_ready": True, "session_changed": bool(old_session and new_session != old_session),
+        "restart_s": restart_s, "post_restart_followup_ok": followup_ok,
+        "post_restart_followup_s": followup_s}}
+
+
+
+
+
+
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packaged-windows-nvidia-hardware", action="store_true")
     parser.add_argument("--app-binary", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--context-tier", choices=("8k-fast", "64k-full"), default="8k-fast")
+    parser.add_argument("--benchmark-request", type=Path)
+    parser.add_argument("--benchmark-evidence", type=Path)
+    parser.add_argument("--benchmark-phase-status", type=Path)
     args = parser.parse_args(argv)
+    if args.benchmark_request or args.benchmark_evidence or args.benchmark_phase_status:
+        if not (args.benchmark_request and args.benchmark_evidence
+                and args.benchmark_phase_status and args.app_binary):
+            parser.error("long-context benchmark mode requires request, evidence, phase status, and app binary")
+        return run_long_context_packaged_mode(args.benchmark_request, args.benchmark_evidence,
+            args.benchmark_phase_status, args.app_binary)
     hardware_mode = args.packaged_windows_nvidia_hardware
     if hardware_mode and (args.app_binary is None or args.model is None):
         parser.error("packaged Windows NVIDIA mode requires --app-binary and --model")
@@ -686,6 +2727,9 @@ def main(argv: list[str] | None = None) -> int:
     Path(env["XDG_CONFIG_HOME"]).mkdir(parents=True, exist_ok=True)
     Path(env["XDG_DATA_HOME"]).mkdir(parents=True, exist_ok=True)
     Path(env["APPDATA"]).mkdir(parents=True, exist_ok=True)
+    webview2_user_data = isolated_home / "WebView2"
+    webview2_user_data.mkdir(parents=True, exist_ok=True)
+    env["WEBVIEW2_USER_DATA_FOLDER"] = str(webview2_user_data.resolve(strict=True))
 
     relay = subprocess.Popen(  # noqa: S603
         [
@@ -704,19 +2748,21 @@ def main(argv: list[str] | None = None) -> int:
         text=True,
     )
 
+    driver_log_handle = driver_log.open("w", encoding="utf-8")
     tauri_driver = subprocess.Popen(  # noqa: S603
         tauri_driver_command(),
         # Keep cwd aligned with src-tauri so runtime asset resolution for ../dist works
         # when the app starts under tauri-driver in CI.
         cwd=TAURI_ROOT,
         env=env,
-        stdout=driver_log.open("w", encoding="utf-8"),
+        stdout=driver_log_handle,
         stderr=subprocess.STDOUT,
         text=True,
     )
 
     driver: webdriver.Remote | None = None
     landing_driver: webdriver.Chrome | None = None
+    application_stack = contextlib.ExitStack()
     model_path = args.model.resolve(strict=True) if hardware_mode else resolve_real_e2e_model_path()
     try:
         wait_for_http_200(f"{relay_url}/livez")
@@ -739,7 +2785,12 @@ def main(argv: list[str] | None = None) -> int:
         if not app_binary.exists():
             raise RuntimeError(f"missing desktop binary: {app_binary}")
 
-        driver = start_driver(app_binary)
+        if hardware_mode:
+            _, driver = application_stack.enter_context(
+                packaged_windows_webview2_session(
+                    app_binary, env, driver_log_handle))
+        else:
+            driver = start_driver(app_binary)
         wait = WebDriverWait(driver, 45)
         wait_for_ui_ready(driver)
 
@@ -797,9 +2848,7 @@ def main(argv: list[str] | None = None) -> int:
         landing_driver = start_landing_driver()
         landing_driver.get(relay_url)
         WebDriverWait(landing_driver, 4).until(
-            lambda d: d.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
-            .text.strip()
-            == "Live compute nodes: 1"
+            lambda d: landing_compute_node_status_matches(d, "Live compute nodes: 1")
         )
 
         prompt = driver.find_element(
@@ -859,9 +2908,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         WebDriverWait(landing_driver, 2.5).until(
-            lambda d: d.find_element(By.CSS_SELECTOR, ".compute-node-status-label")
-            .text.strip()
-            == "Live compute nodes: 0"
+            lambda d: landing_compute_node_status_matches(d, "Live compute nodes: 0")
         )
         widget_zero_at = time.monotonic()
         diagnostics_to_widget_seconds = widget_zero_at - diagnostics_zero_observed_at
@@ -898,7 +2945,11 @@ def main(argv: list[str] | None = None) -> int:
             with contextlib.suppress(Exception):
                 driver.quit()
         with contextlib.suppress(Exception):
+            application_stack.close()
+        with contextlib.suppress(Exception):
             terminate_process(tauri_driver)
+        with contextlib.suppress(Exception):
+            driver_log_handle.close()
         with contextlib.suppress(Exception):
             terminate_process(relay)
         shutil.rmtree(isolated_home, ignore_errors=True)

@@ -2,6 +2,13 @@
 
 This folder contains the forward-looking Tauri desktop MVP for token.place.
 
+Functional changes included in a rebuilt desktop installer normally require a patch-version bump;
+major/minor bumps remain maintainer-directed. Update all synchronized package, Tauri, Cargo,
+installer-validation, and fixture versions, then validate consistency with
+`python -m pytest -q tests/unit/test_desktop_release_artifacts.py` from the repository root. See the
+canonical [desktop versioning policy](../AGENTS.md#desktop-versioning-policy). A bump does not create
+a tag or publish a release.
+
 ## Scope of this MVP
 
 - Single-screen UI with a background compute-node operator mode plus a local prompt smoke-test panel.
@@ -160,6 +167,15 @@ The operator also has a stopped-only **Context tier** selector. Choose **8K Fast
 The selected tier is saved in the desktop config and is applied during warm-load before relay
 registration; changing it requires **Stop operator** followed by **Start operator** so only one
 context profile is warm in each operator process.
+
+On a capable Metal or CUDA runtime, **64K Full** normally uses symmetric Q8_0 for both the K and V
+KV caches, with Flash Attention and KQV offload enabled. F16 is retained as the compatibility
+fallback, while symmetric Q4_0 is attempted only for a positively classified memory or GPU-buffer
+pressure failure and may have a larger quality tradeoff. This cache precision is independent of
+the Q4_K_M quantization of the model weights. Quantized V cache is never enabled without confirmed
+Flash Attention and matching K/V type support. Batch values remain `n_batch=256` and
+`n_ubatch=128`; later batch tuning and packaged performance/quality benchmarking are separate work,
+so this change does not claim an unmeasured speedup.
 This context tier selector only chooses and warm-loads the operator runtime context window. It intentionally
 does not change API v1 request admission, relay request-size policy, relay scheduling, or registration
 capabilities; long-context admission and tier-aware selection remain follow-up work so the API v1
@@ -285,6 +301,25 @@ It prints:
   `fallback_reason`, `interpreter`, `llama_module_path`)
 
 ### Regression and smoke tests
+
+The installed executable exposes a GUI-independent CPU admission boundary. It must be invoked
+from an installed package (development/source-tree Python is rejected), for example on Windows:
+
+```powershell
+& "$env:LOCALAPPDATA\token.place desktop\token-place-desktop-tauri.exe" `
+  --headless-cpu-admission --model "C:\models\Qwen3-8B-Q4_K_M.gguf" `
+  --backend cpu --context-tier 8k-fast `
+  --startup-timeout-seconds 300 --operation-timeout-seconds 600
+```
+
+The command runs before Tauri, WebView2, plugins, or window creation and emits exactly one JSON
+result on stdout. Schema version `1` includes `success`, `last_completed_phase`, `failure_code`,
+`packaged_runtime_identity`, `selected_backend`, `warm_load_result`, and
+`authoritative_evidence_result`. Exit code zero requires a real bundled-runtime CPU warm load and
+positive production API-v1 render/tokenize admission evidence. Results never contain model paths,
+fixture text, rendered prompts, tokens, or environment values. The command does not contact or
+register with a relay. Windows installed-package execution is intentionally deferred to the
+follow-up workflow task; this documentation does not claim that hosted-Windows validation passed.
 
 - Shared local desktop parity entry point (packaged resources + API v1 E2EE relay lifecycle):
   ```bash

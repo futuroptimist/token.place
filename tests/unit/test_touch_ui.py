@@ -192,13 +192,41 @@ def test_landing_chat_js_rejects_raw_array_chat_responses():
     assert "const assistantMessage = response.message;" in chat_js
     assert "else if (response.choices && response.choices.length > 0)" in chat_js
     assert "const assistantMessage = response.choices[0].message;" in chat_js
-    assert "this.appendAssistantMessage(assistantMessage);" in chat_js
+    assert "this.appendAssistantMessage(assistantMessage, response.finish_reason);" in chat_js
     assert "throw new Error('Unexpected response format');" in chat_js
+
+
+def test_landing_chat_requests_full_api_budget_and_renders_length_notice():
+    chat_js = Path("static/chat.js").read_text(encoding="utf-8")
+    index_html = Path("static/index.html").read_text(encoding="utf-8")
+    assert "API_V1_MAX_OUTPUT_TOKENS = 8192" in chat_js
+    assert "options: { max_tokens: API_V1_MAX_OUTPUT_TOKENS }" in chat_js
+    assert "finishReason: finishReason === 'length' ? 'length' : null" in chat_js
+    assert "message.finishReason === 'length'" in index_html
+    assert 'role="status"' in index_html
+    assert "Response stopped at the output-token limit." in index_html
+    # createApiV1Messages deliberately copies only role/content, excluding UI metadata.
+    assert "finishReason" not in chat_js[chat_js.index("createApiV1Messages(messageContent)"):chat_js.index("generateClientKeys()")]
 
 
 def test_landing_chat_js_reselects_or_cancels_on_terminal_relay_states():
     chat_js = Path("static/chat.js").read_text(encoding="utf-8")
-    assert "RELAY_RESPONSE_POLL_TIMEOUT_MS = 300000" in chat_js
+    assert "LEGACY_RELAY_RESPONSE_POLL_TIMEOUT_MS = 485000" in chat_js
+    assert "RELAY_RESPONSE_PROPAGATION_GRACE_MS = 5000" in chat_js
+    assert "RELAY_CANCELLATION_CONFIRMATION_TIMEOUT_MS = 2000" in chat_js
+    assert "admissionPayload.request_ttl_seconds" in chat_js
+    assert "pendingPayload.request_deadline_remaining_seconds" in chat_js
+    assert "validRelayDeadlineRemainingSeconds" in chat_js
+    assert "value >= 0 ? value : null" in chat_js
+    assert "failure: 'no_active_request'" not in chat_js
+    assert "response.status === 410" in chat_js
+    assert "['cancelled', 'expired'].includes(terminalStatus)" in chat_js
+    assert "payload.request_id === activeRequest.requestId" in chat_js
+    admission_tracking = chat_js.index("const admittedAtMs = Date.now();")
+    admission_body_parse = chat_js.index("admissionPayload = await dispatchResponse.json();")
+    active_request_assignment = chat_js.index("this.activeRelayRequest = activeRelayRequest;", admission_tracking)
+    assert admission_tracking < active_request_assignment < admission_body_parse
+    assert "this.activeRelayRequest !== activeRelayRequest || activeRelayRequest.cancelled" in chat_js
     assert "cancelRelayRequest" in chat_js
     assert "/api/v1/relay/requests/cancel" in chat_js
     assert "cancel_token: cancelToken" in chat_js

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-EXPECTED_VERSION = "0.1.6"
+EXPECTED_VERSION = "0.1.17"
 EXPECTED_MODEL_ARTIFACT_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
 EXPECTED_RUNTIME_ID = "bundled-cpython-3.11-win-x86_64-cu124"
 EXPECTED_TARGET_TRIPLE = "x86_64-pc-windows-msvc"
@@ -31,6 +31,42 @@ CONFIG_NAME = "desktop_tauri_config.json"
 TAURI_IDENTIFIER = "place.token.desktop"
 APP_PROCESS_NAMES = ("token.place", "tokenplace", "token-place")
 ACCEPTABLE_UNINSTALL_EXIT_CODES = frozenset({0, 1605, 1614, 3010})
+WINDOWS_UNINSTALL_CLEANUP_TIMEOUT_SECONDS = 90.0
+WINDOWS_UNINSTALL_REINVENTORY_PASSES = 3
+HEADLESS_CPU_STARTUP_TIMEOUT_SECONDS = 300
+HEADLESS_CPU_OPERATION_TIMEOUT_SECONDS = 600
+HEADLESS_CPU_OUTER_ALLOWANCE_SECONDS = 30
+HEADLESS_CPU_RESULT_KEYS = frozenset({
+    "schema_version",
+    "success",
+    "last_completed_phase",
+    "failure_code",
+    "packaged_runtime_identity",
+    "selected_backend",
+    "warm_load_result",
+    "authoritative_evidence_result",
+})
+HEADLESS_CPU_FAILURE_CODES = frozenset({
+    "none",
+    "command_not_first",
+    "invalid_arguments",
+    "unknown_argument",
+    "duplicate_argument",
+    "packaged_runtime_identity_failed",
+    "unsupported_backend",
+    "unsupported_context_tier",
+    "invalid_timeout",
+    "unusable_model_path",
+    "installed_package_required",
+    "mock_runtime_rejected",
+    "bridge_exited_before_startup_event",
+    "startup_timeout",
+    "operation_timeout",
+    "bridge_protocol_failed",
+    "warm_load_failed",
+    "authoritative_evidence_failed",
+    "cleanup_failed",
+})
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 EXPECTED_LLAMA_CPP_VERSION = "0.3.32"
 EXPECTED_LLAMA_CPP_WHEEL = "llama_cpp_python-0.3.32-py3-none-win_amd64.whl"
@@ -551,18 +587,83 @@ def build_uninstall_invocation(entry: RegistryEntry) -> list[str]:
     return [exe, *args]
 
 
+def _uninstaller_identity(entry: RegistryEntry) -> str:
+    value = entry.product_code or entry.key_path or entry.uninstall_string or entry.display_name
+    return hashlib.sha256(value.casefold().encode("utf-8")).hexdigest()[:12]
+
+
+def _uninstaller_kind(entry: RegistryEntry) -> str:
+    command = (entry.quiet_uninstall_string or entry.uninstall_string).casefold()
+    return "msi" if entry.windows_installer or "msiexec" in command else "nsis"
+
+
+def _write_uninstall_log(path: Path, entry: RegistryEntry, invocation: list[str], result: subprocess.CompletedProcess[str]) -> None:
+    """Write useful uninstall evidence without leaking machine-specific command paths."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    safe_invocation = [Path(invocation[0]).name, *invocation[1:]]
+    path.write_text(
+        f"kind={_uninstaller_kind(entry)}\nidentity={_uninstaller_identity(entry)}\n"
+        f"invocation={json.dumps(safe_invocation)}\nexit={result.returncode}\noutput:\n{result.stdout}",
+        encoding="utf-8",
+    )
+
+
+def _snapshot_payload(snapshot: AuthoritySnapshot) -> dict[str, object]:
+    return {
+        "shortcuts": [
+            {"path": str(item.path), "target": str(item.target), "target_exists": item.target.exists()}
+            for item in snapshot.shortcuts.shortcuts
+        ],
+        "registry": [
+            {
+                "kind": _uninstaller_kind(item),
+                "identity": _uninstaller_identity(item),
+                "display_name": item.display_name,
+            }
+            for item in snapshot.registry
+        ],
+    }
+
+
+def _persist_snapshot(directory: Path | None, name: str, snapshot: AuthoritySnapshot) -> None:
+    if directory is not None:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"authority-{name}.json").write_text(
+            json.dumps(_snapshot_payload(snapshot), indent=2, sort_keys=True), encoding="utf-8"
+        )
+
+
 def uninstall_best_effort(log_path: Path | None = None) -> None:
     if sys.platform != "win32":
         return
     snapshot = capture_authority_snapshot()
-    for entry in snapshot.registry:
-        invocation = build_uninstall_invocation(entry)
-        result = _run(invocation, timeout=180, check=False, log_path=log_path)
-        if result.returncode not in ACCEPTABLE_UNINSTALL_EXIT_CODES:
-            raise InstallerIdentityError(
-                f"uninstaller exit {result.returncode} for {entry.display_name!r}: {result.stdout[-1000:]}"
-            )
-    wait_for_cleanup_convergence(snapshot)
+    artifact_directory = log_path.parent if log_path is not None else None
+    _persist_snapshot(artifact_directory, "before", snapshot)
+    invoked: set[str] = set()
+    invocation_number = 0
+    for _pass in range(WINDOWS_UNINSTALL_REINVENTORY_PASSES):
+        entries = sorted(inventory_registry_entries(), key=lambda item: (_uninstaller_kind(item), _uninstaller_identity(item)))
+        pending = [entry for entry in entries if _uninstaller_identity(entry) not in invoked]
+        if not pending:
+            break
+        for entry in pending:
+            identity = _uninstaller_identity(entry)
+            invoked.add(identity)
+            invocation_number += 1
+            invocation = build_uninstall_invocation(entry)
+            result = _run(invocation, timeout=180, check=False)
+            if artifact_directory is not None:
+                invocation_log = artifact_directory / (
+                    f"{log_path.stem}-invocation-{invocation_number:02d}-{_uninstaller_kind(entry)}-{identity}.log"
+                )
+                _write_uninstall_log(invocation_log, entry, invocation, result)
+            if result.returncode not in ACCEPTABLE_UNINSTALL_EXIT_CODES:
+                raise InstallerIdentityError(
+                    f"uninstaller exit {result.returncode} for {entry.display_name!r}: {result.stdout[-1000:]}"
+                )
+    after = capture_authority_snapshot()
+    _persist_snapshot(artifact_directory, "after", after)
+    wait_for_cleanup_convergence(snapshot, artifact_directory=artifact_directory)
 
 
 def _parse_process_inventory(raw: str) -> list[dict[str, str]]:
@@ -641,22 +742,83 @@ def verify_authority_removed(before: AuthoritySnapshot) -> None:
         raise InstallerIdentityError(f"authority remains after uninstall: {', '.join(categories)}")
 
 
+def remediate_captured_stale_shortcuts(before: AuthoritySnapshot, current: AuthoritySnapshot) -> bool:
+    """Remove only unchanged, captured shortcuts whose installed targets are gone."""
+    captured_targets = {_canonical_path(target) for target in before.canonical_targets}
+    captured_pairs = {
+        (_canonical_path(shortcut.path), _canonical_path(shortcut.target))
+        for shortcut in before.shortcuts.shortcuts
+    }
+    if not captured_targets or not captured_pairs:
+        return False
+    if any(_canonical_path(shortcut.target) not in captured_targets for shortcut in before.shortcuts.shortcuts):
+        return False
+    if current.registry or not current.shortcuts.shortcuts:
+        return False
+    if any(target.exists() for target in before.canonical_targets):
+        return False
+    if _processes_running_targets(before.canonical_targets):
+        return False
+
+    for shortcut in current.shortcuts.shortcuts:
+        pair = (_canonical_path(shortcut.path), _canonical_path(shortcut.target))
+        if not shortcut.path.exists() or shortcut.target.exists() or pair not in captured_pairs:
+            return False
+
+    for shortcut in current.shortcuts.shortcuts:
+        try:
+            shortcut.path.unlink()
+        except OSError as exc:
+            raise InstallerIdentityError(f"failed to remove captured stale shortcut: {shortcut.path}") from exc
+        if shortcut.path.exists():
+            raise InstallerIdentityError(f"captured stale shortcut remains after unlink: {shortcut.path}")
+    return True
+
+
 def wait_for_cleanup_convergence(
     before: AuthoritySnapshot,
     *,
-    deadline_seconds: float = 20.0,
+    deadline_seconds: float = WINDOWS_UNINSTALL_CLEANUP_TIMEOUT_SECONDS,
     poll_seconds: float = 0.5,
     monotonic: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
+    artifact_directory: Path | None = None,
 ) -> None:
-    deadline = monotonic() + deadline_seconds
+    started = monotonic()
+    deadline = started + deadline_seconds
     last_categories: list[str] = []
+    reported_milestones: set[int] = set()
     while True:
         last_categories = residual_authority_categories(before)
         if not last_categories:
+            if artifact_directory is not None:
+                _persist_snapshot(artifact_directory, "final", capture_authority_snapshot())
+            print(f"cleanup converged after {monotonic() - started:.1f}s; residual authority: none")
             return
-        if monotonic() >= deadline:
-            raise InstallerIdentityError(f"cleanup did not converge; residual authority: {', '.join(last_categories)}")
+        if last_categories == ["shortcuts"]:
+            current = capture_authority_snapshot()
+            if remediate_captured_stale_shortcuts(before, current):
+                continue
+        now = monotonic()
+        elapsed = now - started
+        for milestone in (0, 20, 60, 90):
+            if elapsed >= milestone and milestone not in reported_milestones:
+                reported_milestones.add(milestone)
+                print(f"cleanup elapsed {elapsed:.1f}s; residual authority: {', '.join(last_categories)}")
+        if now >= deadline:
+            final = capture_authority_snapshot()
+            _persist_snapshot(artifact_directory, "final", final)
+            before_paths = {_canonical_path(item.path) for item in before.shortcuts.shortcuts}
+            shortcut_details = [
+                f"path={item.path}; target={item.target}; target_exists={item.target.exists()}; "
+                f"present_before_uninstall={_canonical_path(item.path) in before_paths}"
+                for item in final.shortcuts.shortcuts
+            ]
+            detail = " | ".join(shortcut_details) if shortcut_details else "none"
+            raise InstallerIdentityError(
+                f"cleanup did not converge after {elapsed:.1f}s; residual authority: {', '.join(last_categories)}; "
+                f"remaining shortcuts: {detail}"
+            )
         sleeper(poll_seconds)
 
 
@@ -694,7 +856,7 @@ def assert_no_probe_attempt_counters(data: dict[str, object]) -> None:
         raise InstallerIdentityError(f"installed-context smoke attempted forbidden provisioning/network work: {nonzero}")
 
 
-def _assert_runtime(exe: Path) -> None:
+def _installed_python_executable(exe: Path) -> Path:
     roots = [exe.parent, exe.parent.parent]
     candidates = [root / "python-runtime" / "python.exe" for root in roots]
     python_exe = next((candidate for candidate in candidates if candidate.exists()), None)
@@ -703,6 +865,11 @@ def _assert_runtime(exe: Path) -> None:
         if not found:
             raise InstallerIdentityError("expected installed resources to contain python-runtime/python.exe")
         python_exe = found[0]
+    return python_exe
+
+
+def _assert_runtime(exe: Path) -> None:
+    python_exe = _installed_python_executable(exe)
     provenance = python_exe.parent / RUNTIME_PROVENANCE_NAME
     if not provenance.exists():
         raise InstallerIdentityError(f"expected runtime provenance file at {provenance.name}, but it is missing")
@@ -778,6 +945,117 @@ def _assert_runtime(exe: Path) -> None:
         raise InstallerIdentityError("installed bundled interpreter llama_cpp module origin is missing")
 
 
+def run_native_load_probe(exe: Path, model: Path, artifact_path: Path | None = None) -> dict[str, object]:
+    python_exe = _installed_python_executable(exe)
+    code = (
+        "import json,re,sys\n"
+        "phase='import'\n"
+        "record={'schema_version':1,'phase':phase,'success':False,'exception_class':None}\n"
+        "try:\n"
+        " import llama_cpp\n"
+        " phase='construct';record['phase']=phase\n"
+        " llama=llama_cpp.Llama(model_path=sys.argv[1],n_ctx=8192,n_gpu_layers=0,verbose=False)\n"
+        " phase='close';record['phase']=phase\n"
+        " llama.close()\n"
+        " record['success']=True\n"
+        "except BaseException as exc:\n"
+        " name=type(exc).__name__\n"
+        " record['exception_class']=name if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}',name) else 'native_exception'\n"
+        "print(json.dumps(record,separators=(',',':')))\n"
+    )
+    command = [str(python_exe), "-I", "-c", code, str(model)]
+    env = {key: os.environ[key] for key in ("SystemRoot", "TEMP", "TMP") if key in os.environ}
+    system_root = env.get("SystemRoot", r"C:\Windows")
+    env.update(
+        {
+            "PATH": ";".join(
+                (
+                    str(python_exe.parent),
+                    str(python_exe.parent / "Lib" / "site-packages" / "llama_cpp" / "lib"),
+                    str(Path(system_root) / "System32"),
+                )
+            ),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    result: subprocess.CompletedProcess[str] | None = None
+    try:
+        result = _run(command, env=env, timeout=60, check=False, separate_stderr=True)
+        try:
+            child = json.loads(result.stdout.strip())
+        except json.JSONDecodeError:
+            child = None
+        phase = child.get("phase") if isinstance(child, dict) else None
+        exception_class = child.get("exception_class") if isinstance(child, dict) else None
+        valid_exception_class = (
+            isinstance(exception_class, str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", exception_class) is not None
+        )
+        valid = (
+            isinstance(child, dict)
+            and set(child) == {"schema_version", "phase", "success", "exception_class"}
+            and type(child["schema_version"]) is int
+            and child["schema_version"] == 1
+            and type(child["success"]) is bool
+            and isinstance(phase, str)
+            and phase in {"import", "construct", "close"}
+            and (
+                (child["success"] is True and phase == "close" and exception_class is None)
+                or (child["success"] is False and valid_exception_class)
+            )
+        )
+        if valid and result.returncode == 0:
+            record = {
+                **child,
+                "exit_code": result.returncode,
+                "stderr_present": bool(result.stderr),
+                "timed_out": False,
+            }
+        else:
+            record = {
+                "schema_version": 1,
+                "phase": "launch",
+                "success": False,
+                "exception_class": "process_nonzero" if result.returncode else "malformed_output",
+                "exit_code": result.returncode,
+                "stderr_present": bool(result.stderr),
+                "timed_out": False,
+            }
+    except subprocess.TimeoutExpired:
+        record = {
+            "schema_version": 1,
+            "phase": "launch",
+            "success": False,
+            "exception_class": "timeout",
+            "exit_code": None,
+            "stderr_present": False,
+            "timed_out": True,
+        }
+    except OSError:
+        record = {
+            "schema_version": 1,
+            "phase": "launch",
+            "success": False,
+            "exception_class": "launch_failure",
+            "exit_code": None,
+            "stderr_present": False,
+            "timed_out": False,
+        }
+    if artifact_path is not None:
+        try:
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError:
+            print("native_load_probe artifact_write_failure", flush=True)
+    print(
+        f"native_load_probe phase={record['phase']} success={str(record['success']).lower()} "
+        f"category={record['exception_class'] or 'none'}",
+        flush=True,
+    )
+    return record
+
+
 def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expected_build_id: str) -> dict[str, object]:
     probes = ([str(exe), "--build-identity-json"], [str(exe), "--build-identity"], [str(exe), "--diagnostics-json"])
     last = ""
@@ -793,6 +1071,123 @@ def probe_identity(exe: Path, env: dict[str, str], expected_version: str, expect
             if expected_version in text and expected_build_id in text:
                 return data
     raise InstallerIdentityError(f"installed executable did not report expected version/build identity through an automation-safe probe: {last[-1000:]}")
+
+
+def headless_cpu_admission_command(exe: Path, model: Path) -> list[str]:
+    return [
+        str(exe),
+        "--headless-cpu-admission",
+        "--model",
+        str(model),
+        "--backend",
+        "cpu",
+        "--context-tier",
+        "8k-fast",
+        "--startup-timeout-seconds",
+        str(HEADLESS_CPU_STARTUP_TIMEOUT_SECONDS),
+        "--operation-timeout-seconds",
+        str(HEADLESS_CPU_OPERATION_TIMEOUT_SECONDS),
+    ]
+
+
+def validate_headless_cpu_admission_result(stdout: str, returncode: int) -> dict[str, object]:
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise InstallerIdentityError("installed headless CPU admission emitted malformed or extra stdout") from exc
+    if not isinstance(result, dict) or set(result) != HEADLESS_CPU_RESULT_KEYS:
+        raise InstallerIdentityError("installed headless CPU admission emitted an incomplete or unsupported schema")
+    expected_types = {
+        "schema_version": int,
+        "success": bool,
+        "last_completed_phase": str,
+        "failure_code": str,
+        "packaged_runtime_identity": str,
+        "selected_backend": str,
+        "warm_load_result": str,
+        "authoritative_evidence_result": str,
+    }
+    if any(type(result[key]) is not value_type for key, value_type in expected_types.items()):
+        raise InstallerIdentityError("installed headless CPU admission emitted invalid schema field types")
+    success = (
+        result["schema_version"] == 1
+        and result["success"] is True
+        and result["last_completed_phase"] == "cleanup_completed"
+        and result["failure_code"] == "none"
+        and result["packaged_runtime_identity"] == "validated"
+        and result["selected_backend"] == "cpu"
+        and result["warm_load_result"] == "ready"
+        and result["authoritative_evidence_result"] == "validated"
+    )
+    if returncode != 0 or not success:
+        raise InstallerIdentityError("installed headless CPU admission result did not agree with exit code 0")
+    return result
+
+
+def _privacy_safe_headless_terminal(stdout: str) -> dict[str, object] | None:
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(result, dict) or set(result) != HEADLESS_CPU_RESULT_KEYS:
+        return None
+    if (
+        type(result["schema_version"]) is not int
+        or type(result["success"]) is not bool
+        or any(type(result[key]) is not str for key in HEADLESS_CPU_RESULT_KEYS - {"schema_version", "success"})
+        or result["schema_version"] != 1
+        or result["last_completed_phase"] not in {
+            "not_started", "arguments_validated", "runtime_identity_validated", "warm_load_completed", "cleanup_completed"
+        }
+        or result["failure_code"] not in HEADLESS_CPU_FAILURE_CODES
+        or result["packaged_runtime_identity"] not in {"failed", "validated"}
+        or result["selected_backend"] != "cpu"
+        or result["warm_load_result"] not in {"not_started", "ready"}
+        or result["authoritative_evidence_result"] not in {"failed", "validated"}
+    ):
+        return None
+    return result
+
+
+def run_headless_cpu_admission(
+    exe: Path,
+    model: Path,
+    env: dict[str, str],
+    artifact_path: Path | None = None,
+) -> dict[str, object]:
+    command = headless_cpu_admission_command(exe, model)
+    timeout = (
+        HEADLESS_CPU_STARTUP_TIMEOUT_SECONDS
+        + HEADLESS_CPU_OPERATION_TIMEOUT_SECONDS
+        + HEADLESS_CPU_OUTER_ALLOWANCE_SECONDS
+    )
+    result: subprocess.CompletedProcess[str] | None = None
+    terminal: dict[str, object] | None = None
+    error: InstallerIdentityError | None = None
+    try:
+        result = _run(command, env=env, timeout=timeout, check=False, separate_stderr=True)
+        terminal = _privacy_safe_headless_terminal(result.stdout)
+        try:
+            validate_headless_cpu_admission_result(result.stdout, result.returncode)
+        except InstallerIdentityError as exc:
+            error = exc
+    except subprocess.TimeoutExpired:
+        error = InstallerIdentityError("installed headless CPU admission exceeded its bounded outer timeout")
+    if artifact_path is not None:
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence: dict[str, object] = {
+            "command": "headless-cpu-admission",
+            "exit_code": result.returncode if result is not None else None,
+            "stderr_present": bool(result and result.stderr),
+            "timed_out": result is None,
+        }
+        if terminal is not None:
+            evidence["terminal_result"] = terminal
+        artifact_path.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+    if error is not None:
+        raise error
+    assert terminal is not None
+    return terminal
 
 
 def launch_for_operator_record(exe: Path, env: dict[str, str], log_path: Path | None = None) -> str:
@@ -952,7 +1347,12 @@ def is_actionable_competing_installer_rejection(result: subprocess.CompletedProc
     return result.returncode != 0 and ("competing" in text or "existing installation" in text or "remove" in text) and ("token.place" in text or "token place" in text or "token-place" in text)
 
 
-def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: ScenarioArtifactDir | None = None) -> None:
+def run_scenario(
+    scenario: Scenario,
+    expected_build_id: str,
+    artifact_dir: ScenarioArtifactDir | None = None,
+    tokenizer_boundary_model: Path | None = None,
+) -> None:
     _terminate_processes()
     uninstall_best_effort()
     config_path: Path | None = None
@@ -990,6 +1390,24 @@ def run_scenario(scenario: Scenario, expected_build_id: str, artifact_dir: Scena
                     if str(record.get(key)) != str(seeded[key]):
                         raise InstallerIdentityError(f"operator smoke did not preserve seeded config field {key}")
             validate_installed_context_tiers(shortcut.target, env, artifact_dir, scenario.name)
+            if tokenizer_boundary_model is not None:
+                try:
+                    run_headless_cpu_admission(
+                        shortcut.target,
+                        tokenizer_boundary_model,
+                        env,
+                        artifact_dir.path(scenario.name, "headless-cpu-admission") if artifact_dir else None,
+                    )
+                except InstallerIdentityError:
+                    try:
+                        run_native_load_probe(
+                            shortcut.target,
+                            tokenizer_boundary_model,
+                            artifact_dir.path(scenario.name, "native-load-probe") if artifact_dir else None,
+                        )
+                    except Exception:
+                        print("native_load_probe probe_internal_error", flush=True)
+                    raise
             if sentinel_log.exists() and sentinel_log.read_text(encoding="utf-8").strip():
                 raise InstallerIdentityError("host tool/Python sentinel was invoked during installed-app validation")
         finally:
@@ -1036,20 +1454,31 @@ def main() -> int:
     parser.add_argument("--expected-version", default=EXPECTED_VERSION)
     parser.add_argument("--expected-build-id", required=True)
     parser.add_argument("--artifact-dir", type=Path, default=None)
+    parser.add_argument(
+        "--tokenizer-boundary-model",
+        type=Path,
+        default=None,
+        help="Optional tiny checksum-pinned GGUF for explicit current-package headless CPU admission.",
+    )
     args = parser.parse_args()
     if len(args.expected_build_id) != 12:
         raise InstallerIdentityError("--expected-build-id must be the 12-character current head build ID")
     if args.pr_current_windows_nsis is not None:
         if any((args.windows_nsis, args.windows_msi, args.previous_windows_nsis, args.previous_windows_msi, args.previous_version)):
             raise InstallerIdentityError("--pr-current-windows-nsis cannot be combined with full release scenario arguments")
+        if args.tokenizer_boundary_model is not None and not args.tokenizer_boundary_model.is_file():
+            raise InstallerIdentityError("--tokenizer-boundary-model must name an existing model file")
         scenario = build_current_package_scenario(args.pr_current_windows_nsis, args.expected_version)
         if sys.platform != "win32":
             print("validated current-package Windows NSIS PR-gate contract; real install runs only on hosted Windows")
             return 0
         artifacts = ScenarioArtifactDir(args.artifact_dir) if args.artifact_dir else None
-        run_scenario(scenario, args.expected_build_id, artifacts)
+        model = args.tokenizer_boundary_model.resolve() if args.tokenizer_boundary_model is not None else None
+        run_scenario(scenario, args.expected_build_id, artifacts, model)
         print(f"validated current-package Windows NSIS for {args.expected_version} build {args.expected_build_id}")
         return 0
+    if args.tokenizer_boundary_model is not None:
+        raise InstallerIdentityError("--tokenizer-boundary-model is only valid with --pr-current-windows-nsis")
     required = {
         "--windows-nsis": args.windows_nsis,
         "--windows-msi": args.windows_msi,

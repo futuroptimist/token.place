@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -24,6 +25,50 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Import the module to test
 from utils.llm.model_manager import ModelManager
+
+
+class _FakeNamedOS:
+    """Delegates to the real `os` module except for `.name` and any
+    explicitly overridden attributes.
+
+    Swapping model_manager's own `os` reference (via
+    ``monkeypatch.setattr(model_manager_module, 'os', ...)``) rather than
+    mutating the real global `os` module means pathlib's internal
+    WindowsPath/PosixPath dispatch - which imports `os` itself - is
+    unaffected. Mutating the real `os.name` directly is dangerous: if the
+    simulated platform doesn't match the CI runner's actual platform,
+    pytest's own failure-reporting machinery can crash trying to build a
+    `Path` while the patch is still live (e.g. `NotImplementedError: cannot
+    instantiate 'PosixPath'/'WindowsPath' on your system`).
+    """
+
+    def __init__(self, name: str, **overrides):
+        self._name = name
+        self._overrides = overrides
+
+    def __getattr__(self, item):
+        if item in self._overrides:
+            return self._overrides[item]
+        return getattr(os, item)
+
+    @property
+    def name(self):
+        return self._name
+
+
+@pytest.fixture
+def posix_os(monkeypatch):
+    """Forces the POSIX branch of model_manager's own `os` reference (see
+    _FakeNamedOS above for why the real os module is never mutated)."""
+    from utils.llm import model_manager as model_manager_module
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix'))
+
+
+@pytest.fixture
+def windows_os(monkeypatch):
+    """Forces the Windows branch - see posix_os / _FakeNamedOS above."""
+    from utils.llm import model_manager as model_manager_module
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
 
 
 class _ToDictOnly:
@@ -3164,7 +3209,8 @@ def test_subprocess_llama_proxy_initial_write_early_exit_reports_diagnostic(monk
     assert created
 
 
-def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch):
+def test_subprocess_llama_proxy_timeout_kills_hung_worker(monkeypatch, posix_os):
+    _ = posix_os
     from utils.llm import model_manager as model_manager_module
 
     stop_stdout = threading.Event()
@@ -3337,12 +3383,1467 @@ def test_subprocess_llama_proxy_streams_chunks_without_json_serializing_iterator
         return process
 
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
+    # This fixture's FakeStdout is a finite, pre-scripted iterator covering
+    # the whole exchange (handshake + stream), not a real blocking pipe, so
+    # its real background reader thread can race ahead and hit EOF before
+    # this test even finishes constructing the proxy. Opt out of the
+    # always-fatal EOF semantics explicitly, at the class level so it takes
+    # effect before that race window opens.
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_legacy_fixture_transport', True)
 
     proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
     chunks = list(proxy.create_chat_completion(messages=[], stream=True))
 
     assert [chunk['choices'][0]['delta']['content'] for chunk in chunks] == ['Hi', 'lo']
     assert created[0].stdin.writes[2]['kwargs']['stream'] is True
+
+
+class _SynchronousFakeThread:
+    """threading.Thread stand-in that runs its target immediately, in-line.
+
+    Lets tests drive `_start_stdout_demultiplexer`'s reader loop
+    deterministically against a crafted, finite stdout iterator instead of
+    racing a real background thread.
+    """
+
+    def __init__(self, target=None, name=None, daemon=None):
+        self._target = target
+
+    def start(self):
+        if self._target is not None:
+            self._target()
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        return None
+
+
+def _bare_subprocess_proxy(stdout_lines):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue(maxsize=32)
+    proxy._unclaimed_frames = queue.Queue(maxsize=32)
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    # Default to real production EOF semantics (always closes); tests that
+    # specifically exercise the deterministic-fixture opt-out set this True.
+    proxy._legacy_fixture_transport = False
+    proxy._closed = False
+    proxy._process = SimpleNamespace(stdout=iter(stdout_lines), _token_place_stdout_tail=[])
+    proxy._stdout_reader_thread = None
+    return proxy
+
+
+def test_demux_reader_stdout_none_fails_all_pending(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    proxy = _bare_subprocess_proxy([])
+    proxy._process = SimpleNamespace(stdout=None)
+    pending_queue = queue.Queue()
+    proxy._pending = {'c1': pending_queue}
+
+    proxy._start_stdout_demultiplexer()
+
+    message = pending_queue.get_nowait()
+    assert isinstance(message, model_manager_module.LlamaCppWorkerEOFError)
+
+
+def test_demux_reader_routes_and_recovers_from_malformed_frames(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'a plain, non-diagnostic non-prefixed line\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:not-json\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps([1, 2, 3]) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'legacy': True}) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'protocol_version': 2, 'command_id': 123}) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'unknown-cmd', 'status': 'ok'}
+        ) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({
+            'protocol_version': 2, 'command_id': 'c1', 'type': 'inference_progress',
+            'phase': 'prefill', 'total_prompt_tokens': 10, 'cached_prompt_tokens': 0,
+            'processed_prompt_tokens': 5, 'generated_tokens': 0, 'elapsed_ms': 12,
+        }) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n',
+        # Duplicate terminal frame for an already-completed command_id is dropped.
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n',
+    ]
+
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    target_queue = queue.Queue()
+    proxy._pending = {'c1': target_queue}
+    proxy._command_progress['c1'] = {
+        'observer': None,
+        'request_id': 'req-1',
+        'worker_generation': 3,
+        'sequence': 0,
+    }
+
+    proxy._start_stdout_demultiplexer()
+
+    # Non-diagnostic stdout content (no llama/ggml/memory keywords) is
+    # dropped entirely rather than retained; see the dedicated sanitization
+    # test below for retention + redaction of genuine diagnostic content.
+    assert proxy._process._token_place_stdout_tail == []
+    assert proxy._legacy_frames.get_nowait() == {'status': 'ok', 'legacy': True}
+    assert proxy._unclaimed_frames.get_nowait()['command_id'] == 123
+    assert proxy._unclaimed_frames.get_nowait()['command_id'] == 'unknown-cmd'
+
+    # Progress is coalesced into per-command state, not dispatched from the
+    # reader thread; the command's own caller dispatches it (see the
+    # dedicated dispatch test below).
+    assert proxy._latest_progress['c1']['phase'] == 'prefill'
+    context = proxy._command_progress.get('c1')
+    assert context is not None and context['sequence'] == 1
+
+    delivered = target_queue.get_nowait()
+    assert delivered['done'] is True
+    assert target_queue.empty()
+
+    # Real versioned-protocol EOF always closes the transport, even though a
+    # legacy frame was left undrained above.
+    assert proxy._closed is True
+    # The terminal frame for 'c1' was already delivered, so _fail_pending
+    # must not also push a spurious error behind it.
+    assert target_queue.empty()
+
+
+def test_demux_reader_dispatches_coalesced_progress_on_caller_thread():
+    from utils.llm import model_manager as model_manager_module
+
+    observer_events = []
+
+    def _observer(event):
+        observer_events.append(event)
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._command_progress = {
+        'c1': {'observer': _observer, 'request_id': 'req-1', 'worker_generation': 3, 'sequence': 2},
+    }
+    proxy._latest_progress = {'c1': {'phase': 'prefill', 'sequence': 2}}
+
+    proxy._dispatch_pending_progress('c1')
+
+    assert observer_events == [{'phase': 'prefill', 'sequence': 2}]
+    # Coalesced: consumed exactly once, not redelivered on the next dispatch.
+    proxy._dispatch_pending_progress('c1')
+    assert observer_events == [{'phase': 'prefill', 'sequence': 2}]
+
+
+def test_demux_reader_discards_stale_progress_after_proxy_closed():
+    """Once this proxy is closed (detached/cancelled/invalidated), any
+    progress still queued for it must be discarded, not delivered under
+    what would look like a still-live generation."""
+    from utils.llm import model_manager as model_manager_module
+
+    observer_events = []
+
+    def _observer(event):
+        observer_events.append(event)
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = True
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._command_progress = {
+        'c1': {'observer': _observer, 'request_id': 'req-1', 'worker_generation': 3, 'sequence': 2},
+    }
+    proxy._latest_progress = {'c1': {'phase': 'prefill', 'sequence': 2}}
+
+    proxy._dispatch_pending_progress('c1')
+
+    assert observer_events == []
+    assert 'c1' not in proxy._latest_progress
+
+
+def test_demux_reader_eof_preserves_legacy_fixture_when_explicitly_opted_in():
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = _bare_subprocess_proxy([
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'legacy': True}) + '\n',
+    ])
+    # Explicit, test-only opt-out: a deterministic fixture with a finite
+    # iterator, simulating a still-alive worker. Never inferred from queue
+    # contents.
+    proxy._legacy_fixture_transport = True
+
+    with patch.object(model_manager_module.threading, 'Thread', _SynchronousFakeThread):
+        proxy._start_stdout_demultiplexer()
+
+    assert proxy._legacy_frames.get_nowait() == {'status': 'ok', 'legacy': True}
+    assert proxy._closed is False
+
+
+def test_demux_reader_eof_always_closes_by_default_even_with_queued_legacy_data(monkeypatch):
+    """The corrected-behavior counterpart to the opt-in test above.
+
+    Without the explicit fixture opt-out, real versioned-protocol EOF must
+    always close the transport and fail pending commands, even when there
+    happens to be unconsumed legacy data still sitting in the queue -
+    never inferred from queue contents.
+    """
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    proxy = _bare_subprocess_proxy([
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'legacy': True}) + '\n',
+    ])
+    pending_queue = queue.Queue()
+    proxy._pending = {'c1': pending_queue}
+    assert proxy._legacy_fixture_transport is False
+
+    proxy._start_stdout_demultiplexer()
+
+    # The legacy frame is still sitting there, undrained...
+    assert not proxy._legacy_frames.empty()
+    # ...but the transport still closed and failed the pending command.
+    assert proxy._closed is True
+    assert isinstance(pending_queue.get_nowait(), model_manager_module.LlamaCppWorkerEOFError)
+
+
+def test_demux_reader_slow_observer_never_blocks_the_reader_thread(monkeypatch):
+    """The reader must never invoke the observer at all, slow or not.
+
+    An observer that would block forever is registered; if the reader ever
+    called it directly, this test would hang instead of completing.
+    """
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    def _observer_that_blocks_forever(_event):
+        threading.Event().wait()  # never set: would hang if ever called here
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({
+            'protocol_version': 2, 'command_id': 'c1', 'type': 'inference_progress',
+            'phase': 'prefill',
+        }) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    target_queue = queue.Queue()
+    proxy._pending = {'c1': target_queue}
+    proxy._command_progress['c1'] = {
+        'observer': _observer_that_blocks_forever,
+        'request_id': 'req-1',
+        'worker_generation': 1,
+        'sequence': 0,
+    }
+
+    proxy._start_stdout_demultiplexer()  # must return promptly, not hang
+
+    assert target_queue.get_nowait()['done'] is True
+
+
+def test_demux_reader_isolates_progress_sequence_across_two_successive_requests(monkeypatch):
+    """Two successive requests/generations on the same proxy must not leak
+    identity, sequence numbers, or events into each other."""
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    proxy = _bare_subprocess_proxy([])
+    proxy._register_command_progress_context(
+        'c1', observer=lambda _event: None, request_id='request-a', worker_generation=1,
+    )
+    proxy._register_command_progress_context(
+        'c2', observer=lambda _event: None, request_id='request-b', worker_generation=2,
+    )
+
+    for _ in range(3):
+        proxy._latest_progress['c1'] = {'phase': 'prefill'}
+        with proxy._pending_lock:
+            context = proxy._command_progress['c1']
+            context['sequence'] += 1
+            proxy._latest_progress['c1']['sequence'] = context['sequence']
+
+    proxy._latest_progress['c2'] = {'phase': 'prefill'}
+    with proxy._pending_lock:
+        context = proxy._command_progress['c2']
+        context['sequence'] += 1
+        proxy._latest_progress['c2']['sequence'] = context['sequence']
+
+    assert proxy._command_progress['c1']['request_id'] == 'request-a'
+    assert proxy._command_progress['c1']['worker_generation'] == 1
+    assert proxy._command_progress['c1']['sequence'] == 3
+    assert proxy._command_progress['c2']['request_id'] == 'request-b'
+    assert proxy._command_progress['c2']['worker_generation'] == 2
+    # A later command's own sequence starts fresh at 1, unaffected by the
+    # earlier command's count.
+    assert proxy._latest_progress['c2']['sequence'] == 1
+
+    proxy._forget_command_progress_context('c1')
+    proxy._forget_command_progress_context('c2')
+    assert proxy._command_progress == {}
+    assert proxy._latest_progress == {}
+
+
+def test_sanitize_stdout_diagnostic_tail_redacts_sentinel_secrets(monkeypatch):
+    """Non-protocol stdout must be sanitized before retention: sentinel
+    prompt/output/token/credential material must never survive into the
+    bounded diagnostic tail."""
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        # Matches the diagnostic allowlist (mentions ggml/memory) but also
+        # carries sentinel secret-shaped material that must be redacted.
+        'ggml_metal: buffer allocation failed prompt="SENTINEL_SECRET_PROMPT" '
+        'token=SENTINEL_SECRET_TOKEN api_key=SENTINEL_SECRET_APIKEY\n',
+        # Does not match the allowlist at all: dropped entirely, regardless
+        # of any secret-shaped content it might also carry.
+        'plain output line mentioning SENTINEL_SECRET_OUTPUT with no keyword\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+
+    proxy._start_stdout_demultiplexer()
+
+    tail_text = '\n'.join(proxy._process._token_place_stdout_tail)
+    for sentinel in (
+        'SENTINEL_SECRET_PROMPT',
+        'SENTINEL_SECRET_TOKEN',
+        'SENTINEL_SECRET_APIKEY',
+        'SENTINEL_SECRET_OUTPUT',
+    ):
+        assert sentinel not in tail_text
+    assert 'ggml_metal' in tail_text
+    assert '<redacted>' in tail_text
+
+
+def test_demux_reader_progress_observer_exception_is_swallowed(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    def _raising_observer(_event):
+        raise RuntimeError('observer boom')
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({
+            'protocol_version': 2, 'command_id': 'c1', 'type': 'inference_progress',
+            'phase': 'prefill',
+        }) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    proxy._pending = {'c1': queue.Queue()}
+    proxy._command_progress['c1'] = {
+        'observer': _raising_observer,
+        'request_id': 'req-1',
+        'worker_generation': 1,
+        'sequence': 0,
+    }
+
+    # The reader thread itself must never see the observer at all.
+    proxy._start_stdout_demultiplexer()
+    assert 'c1' in proxy._latest_progress
+
+    # Dispatch happens on the caller's own thread and must not raise, even
+    # though the observer itself blows up.
+    proxy._dispatch_pending_progress('c1')
+    assert 'c1' not in proxy._latest_progress
+
+
+def test_demux_reader_drops_legacy_frame_when_queue_full(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'seq': 1}) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'seq': 2}) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    proxy._legacy_frames = queue.Queue(maxsize=1)
+
+    proxy._start_stdout_demultiplexer()
+
+    assert proxy._legacy_frames.get_nowait() == {'status': 'ok', 'seq': 1}
+    assert proxy._legacy_frames.empty()
+
+
+def test_demux_reader_drops_non_str_command_id_frame_when_unclaimed_full(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'protocol_version': 2, 'command_id': 1}) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'protocol_version': 2, 'command_id': 2}) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    proxy._unclaimed_frames = queue.Queue(maxsize=1)
+
+    proxy._start_stdout_demultiplexer()
+
+    assert proxy._unclaimed_frames.get_nowait()['command_id'] == 1
+    assert proxy._unclaimed_frames.empty()
+
+
+def test_demux_reader_drops_unregistered_command_frame_when_unclaimed_full(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'unregistered-a'}
+        ) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'unregistered-b'}
+        ) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    proxy._unclaimed_frames = queue.Queue(maxsize=1)
+
+    proxy._start_stdout_demultiplexer()
+
+    assert proxy._unclaimed_frames.get_nowait()['command_id'] == 'unregistered-a'
+    assert proxy._unclaimed_frames.empty()
+
+
+def test_demux_reader_delivers_every_authoritative_frame_under_burst(monkeypatch):
+    """Contract: the waiter must receive every authoritative frame it's owed.
+
+    Replaces the old test asserting that a bounded per-command queue could
+    silently drop chunks under backpressure. Per-command queues are now
+    unbounded, so a burst of chunks (far more than the old maxsize=32) must
+    all be observable, in order, ending with the terminal frame.
+    """
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    chunk_count = 200
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'chunk': i, 'done': False}
+        ) + '\n'
+        for i in range(chunk_count)
+    ]
+    stdout_lines.append(
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n'
+    )
+
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    target_queue = queue.Queue()
+    proxy._pending = {'c1': target_queue}
+
+    proxy._start_stdout_demultiplexer()
+
+    delivered = [target_queue.get_nowait() for _ in range(chunk_count)]
+    assert [frame['chunk'] for frame in delivered] == list(range(chunk_count))
+    terminal = target_queue.get_nowait()
+    assert terminal['done'] is True
+    assert target_queue.empty()
+
+
+def test_demux_reader_escalates_to_typed_failure_when_delivery_itself_fails(monkeypatch):
+    """Contract: if delivery is ever impossible, fail the transport, don't drop.
+
+    Uses a queue-like double whose `put_nowait` always raises, simulating an
+    unbounded queue somehow still failing to accept an item, to prove the
+    reader treats that as fatal instead of silently continuing.
+    """
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    class _AlwaysFullQueue:
+        def put_nowait(self, _item):
+            raise queue.Full('simulated unrecoverable delivery failure')
+
+        def get_nowait(self):
+            raise queue.Empty()
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    broken_target = _AlwaysFullQueue()
+    other_target = queue.Queue()
+    proxy._pending = {'c1': broken_target, 'c2': other_target}
+
+    proxy._start_stdout_demultiplexer()
+
+    # The command whose delivery failed AND every other still-pending
+    # command receive a typed transport failure; nothing hangs silently.
+    other_message = other_target.get_nowait()
+    assert isinstance(other_message, model_manager_module.LlamaCppWorkerEOFError)
+    assert proxy._closed is True
+
+
+def test_fail_pending_skips_completed_and_survives_a_broken_target():
+    from utils.llm import model_manager as model_manager_module
+
+    class _BrokenQueue:
+        def put_nowait(self, _item):
+            raise RuntimeError('this queue never accepts anything')
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._pending_lock = model_manager_module.Lock()
+    completed_queue = queue.Queue()
+    still_pending_queue = queue.Queue()
+    proxy._pending = {
+        'completed': completed_queue,
+        'broken': _BrokenQueue(),
+        'still-pending': still_pending_queue,
+    }
+    proxy._completed_commands = {'completed'}
+
+    # Must not raise, and must still reach every other still-pending target
+    # even though one queue is broken and one command already finished.
+    proxy._fail_pending(model_manager_module.LlamaCppWorkerEOFError('eof'))
+
+    assert completed_queue.empty()
+    assert isinstance(still_pending_queue.get_nowait(), model_manager_module.LlamaCppWorkerEOFError)
+
+
+def test_register_command_progress_context_binds_atomically_with_no_inheritance():
+    """Progress identity is bound as one atomic, per-command operation with
+    explicit arguments - there is deliberately no shared staged proxy state
+    for a later, unbound command to inherit from."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._command_progress = {}
+
+    def _observer(_event):
+        return None
+
+    proxy._register_command_progress_context(
+        'c1', observer=_observer, request_id='abc', worker_generation=5,
+    )
+    assert proxy._command_progress['c1'] == {
+        'observer': _observer,
+        'request_id': 'abc',
+        'worker_generation': 5,
+        'sequence': 0,
+    }
+
+    # An unbound internal command (no request_id/observer supplied) gets
+    # exactly that - never the previous command's identity or observer.
+    proxy._register_command_progress_context(
+        'c2', observer=None, request_id=None, worker_generation=0,
+    )
+    assert proxy._command_progress['c2'] == {
+        'observer': None,
+        'request_id': None,
+        'worker_generation': 0,
+        'sequence': 0,
+    }
+    # 'c1' is completely unaffected by 'c2's registration.
+    assert proxy._command_progress['c1']['request_id'] == 'abc'
+    assert proxy._command_progress['c1']['observer'] is _observer
+
+
+def test_two_interleaved_command_registrations_cannot_swap_identities():
+    """Simulates two concurrent callers on the same proxy interleaving their
+    binding calls; each command_id must end up with exactly its own caller's
+    identity, never the other's - proving there's no shared mutable window
+    for a race to swap them, unlike the old stage-then-snapshot design."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._command_progress = {}
+
+    def _observer_a(_event):
+        return None
+
+    def _observer_b(_event):
+        return None
+
+    # Interleaved as two concurrent callers might race: A stages, B stages,
+    # A registers, B registers - each call is now self-contained, so
+    # interleaving order can't matter.
+    proxy._register_command_progress_context(
+        'from-a', observer=_observer_a, request_id='request-a', worker_generation=1,
+    )
+    proxy._register_command_progress_context(
+        'from-b', observer=_observer_b, request_id='request-b', worker_generation=2,
+    )
+
+    assert proxy._command_progress['from-a'] == {
+        'observer': _observer_a, 'request_id': 'request-a', 'worker_generation': 1, 'sequence': 0,
+    }
+    assert proxy._command_progress['from-b'] == {
+        'observer': _observer_b, 'request_id': 'request-b', 'worker_generation': 2, 'sequence': 0,
+    }
+
+
+def test_concurrent_rpc_calls_never_swap_progress_identity_under_real_threads():
+    """Barrier-synchronized real-thread regression for the exact race the
+    old stage-then-snapshot design was vulnerable to: two concurrent callers
+    issuing commands on the same proxy at the same instant must each end up
+    bound to their own identity, never the other caller's."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue(maxsize=32)
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    proxy._stdout_reader_thread = SimpleNamespace()  # already "running"
+    proxy._process = SimpleNamespace(stdout=object())
+
+    barrier = threading.Barrier(2)
+    captured = {}
+
+    def _send(outbound, *, check_health=True):
+        command_id = outbound['command_id']
+        barrier.wait(timeout=5)  # force both threads to be mid-registration together
+        with proxy._pending_lock:
+            captured[command_id] = dict(proxy._command_progress[command_id])
+        proxy._pending[command_id].put_nowait({'status': 'ok', 'result': command_id, 'done': True})
+
+    proxy._send = _send
+
+    def _observer_a(_event):
+        return None
+
+    def _observer_b(_event):
+        return None
+
+    errors = []
+
+    def _worker(request_id, observer, generation):
+        try:
+            proxy._rpc(
+                {'method': 'create_chat_completion', 'args': (), 'kwargs': {}},
+                timeout_seconds=5.0, stage='llama_cpp_inference',
+                progress_request_id=request_id, progress_observer=observer,
+                progress_worker_generation=generation,
+            )
+        except Exception as exc:  # pragma: no cover - surfaced via errors list
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=_worker, args=('request-a', _observer_a, 1))
+    thread_b = threading.Thread(target=_worker, args=('request-b', _observer_b, 2))
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=5)
+    thread_b.join(timeout=5)
+
+    assert not errors
+    assert len(captured) == 2
+    by_request_id = {snapshot['request_id']: snapshot for snapshot in captured.values()}
+    assert by_request_id['request-a']['observer'] is _observer_a
+    assert by_request_id['request-a']['worker_generation'] == 1
+    assert by_request_id['request-b']['observer'] is _observer_b
+    assert by_request_id['request-b']['worker_generation'] == 2
+
+
+def test_progress_arguments_never_appear_in_child_generation_kwargs(monkeypatch):
+    """Internal progress-binding arguments must never leak into the payload
+    sent to the child worker process."""
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'protocol_version': 2, 'command_id': 'c1', 'status': 'ok', 'done': True}
+        ) + '\n',
+    ]
+    proxy = _bare_subprocess_proxy(stdout_lines)
+    sent_payloads = []
+    proxy._send = lambda payload, **_kw: sent_payloads.append(payload)
+    proxy._stdout_reader_thread = SimpleNamespace()  # avoid starting a real reader
+
+    def _observer(_event):
+        return None
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        # Our fake _send never actually delivers a response; we only care
+        # what was sent before the (short) timeout fires.
+        proxy._rpc(
+            {'method': 'create_chat_completion', 'args': (), 'kwargs': {'messages': [{'role': 'user', 'content': 'hi'}]}},
+            timeout_seconds=0.01, stage='llama_cpp_inference',
+            progress_request_id='req-1', progress_observer=_observer, progress_worker_generation=4,
+        )
+
+    assert sent_payloads
+    outbound = sent_payloads[0]
+    assert 'progress_request_id' not in outbound
+    assert 'progress_observer' not in outbound
+    assert 'progress_worker_generation' not in outbound
+    assert 'progress_request_id' not in outbound['kwargs']
+    assert 'progress_observer' not in outbound['kwargs']
+    assert 'progress_worker_generation' not in outbound['kwargs']
+
+
+def test_rendered_prompt_progress_context_is_registered_but_not_serialized():
+    """The rendered-prompt proxy must bind progress exactly like chat completion."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = _bare_subprocess_proxy([])
+    proxy._lock = model_manager_module.Lock()
+    captured = {}
+
+    def _observer(_event):
+        return None
+
+    def _rpc(payload, **context):
+        captured["payload"] = payload
+        captured["context"] = context
+        return {"result": {"choices": []}}
+
+    proxy._rpc = _rpc
+    result = proxy.create_chat_completion_from_rendered_prompt(
+        [{"role": "user", "content": "private"}],
+        max_tokens=3,
+        progress_request_id="req-rendered",
+        progress_observer=_observer,
+        progress_worker_generation=9,
+    )
+
+    assert result == {"choices": []}
+    assert captured["context"]["progress_request_id"] == "req-rendered"
+    assert captured["context"]["progress_observer"] is _observer
+    assert captured["context"]["progress_worker_generation"] == 9
+    outbound_kwargs = captured["payload"]["kwargs"]
+    assert outbound_kwargs == {"max_tokens": 3}
+    assert not {
+        "progress_request_id", "progress_observer", "progress_worker_generation"
+    } & set(outbound_kwargs)
+
+
+def test_rendered_prompt_rpc_delivers_bound_privacy_safe_progress(monkeypatch):
+    """Rendered-prompt calls deliver worker progress through their real RPC binding."""
+    from utils.llm import model_manager as model_manager_module
+
+    private_prompt = "SENTINEL_PRIVATE_PROMPT"
+    private_output = "SENTINEL_PRIVATE_OUTPUT"
+    private_token = "SENTINEL_PRIVATE_TOKEN"
+    request_id = "opaque-request-7"
+    worker_generation = 12
+    delivered = []
+    serialized_outbound = []
+
+    class _DeferredThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            return None
+
+        def run(self):
+            self._target()
+
+    monkeypatch.setattr(model_manager_module.threading, "Thread", _DeferredThread)
+    proxy = _bare_subprocess_proxy([])
+    proxy._lock = model_manager_module.Lock()
+    proxy._legacy_fixture_transport = True
+
+    frames = []
+    for phase, processed, generated in [
+        ("preparing", 0, 0), ("prefill", 2, 0),
+        ("prefill", 4, 0), ("generating", 4, 1),
+    ]:
+        frames.append(
+            {
+                "protocol_version": 2,
+                "command_id": "c1",
+                "type": "inference_progress",
+                "phase": phase,
+                "total_prompt_tokens": 4,
+                "cached_prompt_tokens": 0,
+                "processed_prompt_tokens": processed,
+                "generated_tokens": generated,
+                "elapsed_ms": len(frames) * 10,
+            }
+        )
+    frames.append(
+        {
+            "protocol_version": 2,
+            "command_id": "c1",
+            "status": "ok",
+            "result": {"choices": [{"text": private_output}]},
+            "done": True,
+        }
+    )
+
+    def _stdout_lines():
+        for frame in frames:
+            yield "TOKEN_PLACE_LLAMA_CPP_JSON:" + json.dumps(frame) + "\n"
+            # Resume only after the real demultiplexer has processed the
+            # yielded frame, then let the real caller-thread dispatcher run.
+            proxy._dispatch_pending_progress("c1")
+
+    proxy._process.stdout = _stdout_lines()
+
+    def _send(outbound, *, check_health=True):
+        serialized_outbound.append(json.loads(json.dumps(outbound)))
+        proxy._stdout_reader_thread.run()
+
+    proxy._send = _send
+    result = proxy.create_chat_completion_from_rendered_prompt(
+        [{"role": "user", "content": private_prompt}],
+        max_tokens=3,
+        progress_request_id=request_id,
+        progress_observer=delivered.append,
+        progress_worker_generation=worker_generation,
+    )
+
+    assert result == {"choices": [{"text": private_output}]}
+    assert [event["phase"] for event in delivered] == [
+        "preparing", "prefill", "prefill", "generating",
+    ]
+    assert [event["sequence"] for event in delivered] == [1, 2, 3, 4]
+    expected_keys = {
+        "type", "phase", "total_prompt_tokens", "cached_prompt_tokens",
+        "processed_prompt_tokens", "generated_tokens", "elapsed_ms",
+        "request_id", "worker_generation", "sequence",
+    }
+    assert all(set(event) == expected_keys for event in delivered)
+    assert all(event["request_id"] == request_id for event in delivered)
+    assert all(event["worker_generation"] == worker_generation for event in delivered)
+    assert [event["processed_prompt_tokens"] for event in delivered] == [0, 2, 4, 4]
+    assert [event["generated_tokens"] for event in delivered] == [0, 0, 0, 1]
+    assert all(
+        0 <= event["cached_prompt_tokens"] <= event["processed_prompt_tokens"]
+        <= event["total_prompt_tokens"]
+        for event in delivered
+    )
+
+    assert len(serialized_outbound) == 1
+    worker_kwargs = serialized_outbound[0]["kwargs"]
+    assert worker_kwargs == {"max_tokens": 3}
+    privacy_surface = json.dumps({"events": delivered, "worker_kwargs": worker_kwargs})
+    for private_value in (private_prompt, private_output, private_token):
+        assert private_value not in privacy_surface
+    assert "progress_observer" not in privacy_surface
+
+
+def test_rendered_prompt_progress_guard_drops_replaced_worker_events():
+    """A rendered-path callback from an old generation cannot reach a new request."""
+    from utils.llm import model_manager as model_manager_module
+
+    manager = object.__new__(model_manager_module.ModelManager)
+    manager.llm_lock = model_manager_module.Lock()
+    old_runtime = object()
+    manager.llm = old_runtime
+    manager._llm_generation = 4
+    observed = []
+
+    def _rendered(
+        _messages,
+        *,
+        progress_request_id=None,
+        progress_observer=None,
+        progress_worker_generation=0,
+    ):
+        return None
+
+    progress_kwargs = manager.local_progress_call_kwargs_for_runtime(
+        _rendered,
+        llm_instance=old_runtime,
+        request_id="req-old",
+        observer=observed.append,
+    )
+    assert progress_kwargs["progress_request_id"] == "req-old"
+    assert progress_kwargs["progress_worker_generation"] == 4
+
+    progress_kwargs["progress_observer"]({"phase": "preparing"})
+    manager.llm = object()
+    manager._llm_generation = 5
+    progress_kwargs["progress_observer"]({"phase": "generating"})
+
+    assert observed == [{"phase": "preparing"}]
+    assert manager.local_progress_call_kwargs_for_runtime(
+        _rendered,
+        llm_instance=old_runtime,
+        request_id="req-stale",
+        observer=observed.append,
+    ) == {}
+
+
+def test_rpc_clears_progress_binding_when_send_itself_fails():
+    """Binding must be cleared even when _send raises before anything is
+    ever written to the transport."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = _bare_subprocess_proxy([])
+
+    def _failing_send(_payload, **_kw):
+        raise model_manager_module.LlamaCppWorkerBrokenPipeError('pipe gone')
+
+    proxy._send = _failing_send
+    proxy._stdout_reader_thread = SimpleNamespace()
+
+    def _observer(_event):
+        return None
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerBrokenPipeError):
+        proxy._rpc(
+            {'method': 'create_chat_completion', 'args': (), 'kwargs': {}},
+            timeout_seconds=1.0, stage='llama_cpp_inference',
+            progress_request_id='req-1', progress_observer=_observer, progress_worker_generation=2,
+        )
+
+    assert proxy._command_progress == {}
+    assert proxy._latest_progress == {}
+    assert proxy._pending == {}
+
+
+def test_repeated_command_cycles_leave_no_resource_accumulation(monkeypatch):
+    """P3 regression-matrix gap (resource-accumulation check): across many
+    sequential success and timeout cycles on the same long-lived proxy,
+    _pending/_command_progress/_latest_progress/_completed_commands must
+    all return to empty every time - no leak accumulates over the worker's
+    lifetime."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue(maxsize=32)
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    proxy._stdout_reader_thread = SimpleNamespace()  # already "running"
+    proxy._process = SimpleNamespace(stdout=object())
+
+    modes = []
+
+    def _send(outbound, *, check_health=True):
+        command_id = outbound['command_id']
+        if modes.pop(0) == 'success':
+            proxy._pending[command_id].put_nowait({'status': 'ok', 'result': {'ok': True}})
+        # else 'timeout': deliver nothing, let the deadline fire.
+
+    proxy._send = _send
+
+    for _ in range(25):
+        modes.append('success')
+        result = proxy._rpc(
+            {'method': 'create_chat_completion', 'args': (), 'kwargs': {}},
+            timeout_seconds=None, stage='llama_cpp_inference',
+        )
+        assert result == {'status': 'ok', 'result': {'ok': True}}
+        assert proxy._pending == {}
+        assert proxy._command_progress == {}
+        assert proxy._latest_progress == {}
+        assert proxy._completed_commands == set()
+
+    for _ in range(25):
+        modes.append('timeout')
+        with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+            proxy._rpc(
+                {'method': 'create_chat_completion', 'args': (), 'kwargs': {}},
+                timeout_seconds=0.01, stage='llama_cpp_inference',
+            )
+        assert proxy._pending == {}
+        assert proxy._command_progress == {}
+        assert proxy._latest_progress == {}
+        assert proxy._completed_commands == set()
+
+
+def test_close_signals_stdin_eof_before_terminating_the_process(posix_os):
+    """P3 regression-matrix gap (terminate-before-close ordering): stdin is
+    closed - signalling EOF to the child - before the process is
+    terminated/killed. This is the ordering the whole PR is built around
+    (never close stdout/stderr while a reader may hold their lock; here we
+    lock in the stdin/terminate/wait ordering deterministically via a
+    recorded call order, not timing).
+    """
+    _ = posix_os
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._worker_tmpfile = None
+
+    call_order = []
+
+    class FakeStdin:
+        def close(self):
+            call_order.append('stdin_close')
+
+    class FakeProcess:
+        stdin = FakeStdin()
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            call_order.append('terminate')
+
+        def wait(self, timeout=None):
+            call_order.append('wait')
+            return None
+
+        def kill(self):
+            call_order.append('kill')
+
+    proxy._process = FakeProcess()
+
+    # FakeProcess deliberately has no stdout/stderr attributes at all: if
+    # close() ever touched them, this call would raise AttributeError
+    # instead of completing normally, proving they're never closed here -
+    # the reader thread alone owns them until it observes EOF on its own.
+    proxy.close()
+
+    assert call_order == ['stdin_close', 'terminate', 'wait']
+
+
+def test_signal_worker_process_tree_posix_sends_group_signal(monkeypatch):
+    """Forces the POSIX branch via a delegating `os` proxy (not the real
+    `os` module) so this is safe to simulate on a real Windows CI runner.
+    Real Windows also lacks `signal.SIGKILL` entirely, so that constant is
+    patched too rather than read from the (possibly Windows) real module."""
+    from utils.llm import model_manager as model_manager_module
+
+    killpg_calls = []
+    monkeypatch.setattr(
+        model_manager_module,
+        'os',
+        _FakeNamedOS(
+            'posix',
+            getpgid=lambda pid: pid + 1000,
+            killpg=lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        ),
+    )
+    monkeypatch.setattr(model_manager_module.signal, 'SIGTERM', 15, raising=False)
+    monkeypatch.setattr(model_manager_module.signal, 'SIGKILL', 9, raising=False)
+
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=42), hard=False)
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=42), hard=True)
+
+    assert killpg_calls == [(1042, 15), (1042, 9)]
+
+
+def test_signal_worker_process_tree_rejects_non_positive_or_non_int_pids(monkeypatch):
+    """A fake/unconfigured `.pid` must never reach getpgid/killpg/taskkill.
+
+    `int(MagicMock())` silently coerces to `1`: an unconfigured test double
+    passed here without an explicit `.pid` (e.g. `MagicMock()`) would
+    otherwise resolve to PID 1 (init) and send it SIGTERM/SIGKILL. In at
+    least one sandboxed CI environment this actually succeeded and took
+    down the entire runner, rather than merely raising PermissionError as
+    it does on an ordinary unprivileged POSIX machine - this is a real,
+    not merely theoretical, danger.
+    """
+    from utils.llm import model_manager as model_manager_module
+
+    getpgid_calls = []
+    killpg_calls = []
+    run_calls = []
+    monkeypatch.setattr(
+        model_manager_module,
+        'os',
+        _FakeNamedOS(
+            'posix',
+            getpgid=lambda pid: getpgid_calls.append(pid) or pid,
+            killpg=lambda pgid, sig: killpg_calls.append((pgid, sig)),
+        ),
+    )
+    monkeypatch.setattr(
+        model_manager_module.subprocess, 'run',
+        lambda *args, **kwargs: run_calls.append((args, kwargs)),
+    )
+
+    for bad_pid in (1, 0, -1, MagicMock()):
+        model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=bad_pid), hard=False)
+        model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=bad_pid), hard=True)
+
+    assert getpgid_calls == []
+    assert killpg_calls == []
+    assert run_calls == []
+
+    # A genuine positive int PID > 1 still works normally (sanity check the
+    # guard isn't overbroad).
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=2), hard=False)
+    assert getpgid_calls == [2]
+
+
+def test_signal_worker_process_tree_windows_soft_uses_ctrl_break_event(monkeypatch, windows_os):
+    """Windows graceful phase: CTRL_BREAK_EVENT to the process group, never
+    taskkill /F (that's forceful, hard-phase only)."""
+    _ = windows_os
+    from utils.llm import model_manager as model_manager_module
+
+    run_calls = []
+    monkeypatch.setattr(
+        model_manager_module.subprocess, 'run',
+        lambda *args, **kwargs: run_calls.append((args, kwargs)),
+    )
+    signal_calls = []
+    process = SimpleNamespace(pid=99, send_signal=lambda sig: signal_calls.append(sig))
+
+    model_manager_module._signal_worker_process_tree(process, hard=False)
+
+    assert signal_calls == [getattr(model_manager_module.signal, 'CTRL_BREAK_EVENT', 1)]
+    assert run_calls == []
+
+
+def test_signal_worker_process_tree_windows_hard_uses_taskkill_bounded_by_remaining_budget(monkeypatch, windows_os):
+    """Windows hard phase: taskkill /F /T, bounded by whatever remains of
+    the caller's own cleanup budget - not an independent five-second
+    timeout stacked on top of it."""
+    _ = windows_os
+    from utils.llm import model_manager as model_manager_module
+
+    run_calls = []
+    monkeypatch.setattr(
+        model_manager_module.subprocess, 'run',
+        lambda *args, **kwargs: run_calls.append((args, kwargs)),
+    )
+
+    # No cleanup_started_at supplied: falls back to the full budget.
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=99), hard=True)
+    assert len(run_calls) == 1
+    (command,), kwargs = run_calls[0]
+    assert command == ['taskkill', '/F', '/T', '/PID', '99']
+    assert kwargs.get('timeout') == pytest.approx(
+        model_manager_module._WORKER_TREE_CLEANUP_BUDGET_SECONDS, abs=0.01
+    )
+
+    # With cleanup_started_at supplied, the remaining budget shrinks by
+    # however much of it has already elapsed.
+    run_calls.clear()
+    started_at = time.monotonic() - 3.0
+    model_manager_module._signal_worker_process_tree(
+        SimpleNamespace(pid=99), hard=True, cleanup_started_at=started_at,
+    )
+    assert len(run_calls) == 1
+    (_command,), kwargs = run_calls[0]
+    remaining = kwargs.get('timeout')
+    assert 0.05 <= remaining <= model_manager_module._WORKER_TREE_CLEANUP_BUDGET_SECONDS - 2.9
+
+
+def test_signal_worker_process_tree_swallows_all_errors(monkeypatch):
+    """Never worse than the pre-existing single-process signal: any failure
+    here (missing pid, dead process, permission error, missing taskkill)
+    must be silently absorbed."""
+    from utils.llm import model_manager as model_manager_module
+
+    # No pid attribute at all.
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(), hard=False)
+
+    # POSIX: getpgid/killpg both raise.
+    def _raise_lookup(*_args, **_kwargs):
+        raise ProcessLookupError('already gone')
+
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('posix', getpgid=_raise_lookup))
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=2), hard=True)
+
+    # Windows: subprocess.run raises (e.g. taskkill missing).
+    monkeypatch.setattr(model_manager_module, 'os', _FakeNamedOS('nt'))
+
+    def _raise_oserror(*_args, **_kwargs):
+        raise OSError('taskkill not found')
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'run', _raise_oserror)
+    model_manager_module._signal_worker_process_tree(SimpleNamespace(pid=2), hard=False)
+
+
+@pytest.mark.skipif(
+    os.name != 'posix',
+    reason='real process-tree survival test targets the POSIX session/group path; '
+    'Windows CTRL_BREAK_EVENT/taskkill behavior is covered separately via mocks above',
+)
+def test_real_process_tree_survives_soft_signal_but_dies_on_hard_escalation(tmp_path):
+    """Bounded, real-subprocess regression using the production
+    start_new_session=True setup (see _SubprocessLlamaProxy.__init__):
+    spawn a worker with a heartbeat-producing descendant that ignores the
+    graceful signal, prove the whole tree survives the soft phase, then
+    verify hard escalation kills every process and heartbeats stop.
+    Strict deadlines and a `finally` cleanup ensure a test failure can
+    never orphan real processes on the machine running this suite."""
+    from utils.llm import model_manager as model_manager_module
+
+    heartbeat_path = tmp_path / 'heartbeat.txt'
+    # The descendant is spawned by the "worker" (parent) without its own
+    # start_new_session, so it inherits the parent's process group - the
+    # same relationship a real llama.cpp backend's helper processes would
+    # have to the worker this whole mechanism is built to reach.
+    descendant_script = (
+        "import sys, time\n"
+        "path = sys.argv[1]\n"
+        "while True:\n"
+        "    with open(path, 'a') as fh:\n"
+        "        fh.write(str(time.time()) + chr(10))\n"
+        "    time.sleep(0.05)\n"
+    )
+    parent_script = (
+        "import signal, subprocess, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]])\n"
+        "while True:\n"
+        "    time.sleep(0.05)\n"
+    )
+
+    process = subprocess.Popen(
+        [sys.executable, '-c', parent_script, str(heartbeat_path), descendant_script],
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while not heartbeat_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert heartbeat_path.exists(), 'descendant never started heartbeating'
+
+        def _heartbeat_line_count() -> int:
+            return len(heartbeat_path.read_text().splitlines())
+
+        deadline = time.monotonic() + 5.0
+        before_soft = _heartbeat_line_count()
+        while _heartbeat_line_count() <= before_soft and time.monotonic() < deadline:
+            time.sleep(0.02)
+        before_soft = _heartbeat_line_count()
+
+        # Graceful phase: the descendant's parent ignores SIGTERM, so the
+        # whole tree must survive it.
+        model_manager_module._signal_worker_process_tree(process, hard=False)
+        time.sleep(0.3)
+        assert process.poll() is None, 'parent must survive the graceful (soft) signal'
+        assert _heartbeat_line_count() > before_soft, 'descendant must keep heartbeating past the soft signal'
+
+        # Hard phase: SIGKILL to the whole group must kill both the parent
+        # and the descendant within a bounded deadline.
+        model_manager_module._signal_worker_process_tree(process, hard=True)
+        deadline = time.monotonic() + 5.0
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert process.poll() is not None, 'parent must not survive hard tree-kill'
+
+        stopped_count = _heartbeat_line_count()
+        time.sleep(0.3)
+        assert _heartbeat_line_count() == stopped_count, 'descendant must not survive hard tree-kill'
+    finally:
+        try:
+            if process.poll() is None:
+                pgid = os.getpgid(process.pid)
+                os.killpg(pgid, signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def test_close_graceful_exit_never_reaches_hard_tree_kill(monkeypatch):
+    """A worker that exits cleanly during the graceful wait must never
+    reach the hard (taskkill /F / SIGKILL) phase at all."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._worker_tmpfile = None
+    signal_calls = []
+    monkeypatch.setattr(
+        model_manager_module, '_signal_worker_process_tree',
+        lambda process, *, hard, cleanup_started_at=None: signal_calls.append(hard),
+    )
+
+    class FakeProcess:
+        pid = 123
+        stdin = None
+
+        def __init__(self):
+            self._polls = iter([None, 0])
+
+        def poll(self):
+            return next(self._polls, 0)
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0  # exits cleanly, no exception
+
+        def kill(self):
+            raise AssertionError('kill() must never be reached on a graceful exit')
+
+    proxy._process = FakeProcess()
+
+    proxy.close()
+
+    assert signal_calls == [False]
+
+
+def test_close_signals_process_tree_before_terminate_and_before_hard_kill(monkeypatch):
+    """close() must reach for the whole process/session group at both the
+    soft (terminate) and hard (kill-fallback) stages, not just the direct
+    process."""
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._worker_tmpfile = None
+    signal_calls = []
+    monkeypatch.setattr(
+        model_manager_module, '_signal_worker_process_tree',
+        lambda process, *, hard, cleanup_started_at=None: signal_calls.append(hard),
+    )
+
+    class FakeProcess:
+        pid = 123
+        stdin = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise TimeoutError('still running')
+
+        def kill(self):
+            return None
+
+    proxy._process = FakeProcess()
+
+    proxy.close()
+
+    assert signal_calls == [False, True]
+
+
+def test_close_llm_proxy_signals_process_tree_before_terminate_and_before_hard_kill(monkeypatch, tmp_path):
+    """_close_llm_proxy (the cancellation/recovery cleanup path) must also
+    reach for the whole process/session group, not just the direct
+    process."""
+    from utils.llm import model_manager as model_manager_module
+
+    manager = model_manager_module.ModelManager.__new__(model_manager_module.ModelManager)
+    manager.log_info = lambda *_a, **_k: None
+    manager.log_warning = lambda *_a, **_k: None
+    manager.log_error = lambda *_a, **_k: None
+
+    signal_calls = []
+    monkeypatch.setattr(
+        model_manager_module, '_signal_worker_process_tree',
+        lambda process, *, hard, cleanup_started_at=None: signal_calls.append(hard),
+    )
+
+    class FakeProcess:
+        pid = 456
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def __init__(self):
+            self._polls = iter([None, None, 1])
+
+        def poll(self):
+            return next(self._polls, 1)
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise TimeoutError('still running')
+
+        def kill(self):
+            return None
+
+    llm = SimpleNamespace(_process=FakeProcess())
+
+    manager._close_llm_proxy(llm)
+
+    assert signal_calls == [False, True]
+
+
+def test_read_llama_subprocess_message_demux_aware_timeout():
+    from utils.llm import model_manager as model_manager_module
+
+    process = SimpleNamespace(
+        _token_place_unclaimed_frames=queue.Queue(),
+        _token_place_legacy_frames=queue.Queue(),
+    )
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        model_manager_module._read_llama_subprocess_message(
+            process, timeout_seconds=0.01, stage='llama_cpp_test'
+        )
+
+
+def test_subprocess_proxy_uses_windows_process_group_creationflags(monkeypatch, windows_os):
+    _ = windows_os
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeStdin:
+        def write(self, _data):
+            return None
+
+        def flush(self):
+            return None
+
+    class FakeStdout:
+        def __init__(self):
+            self._lines = iter([
+                'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+                    {'status': 'ok', 'module_path': '/runtime/llama_cpp/__init__.py'}
+                ) + '\n',
+                'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+                    {'status': 'ok', 'module_path': '/runtime/llama_cpp/__init__.py', 'child_model_path_exists': True}
+                ) + '\n',
+            ])
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._lines)
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = None
+
+        def poll(self):
+            return None
+
+    captured_kwargs = {}
+
+    def _fake_popen(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return FakeProcess(*args, **kwargs)
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', _fake_popen)
+    monkeypatch.setattr(model_manager_module.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200, raising=False)
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_legacy_fixture_transport', True)
+
+    model_manager_module._SubprocessLlamaProxy(model_path='model.gguf', timeout_seconds=0.01)
+
+    assert captured_kwargs.get('creationflags') == 0x00000200
+    assert 'start_new_session' not in captured_kwargs
 
 
 def test_subprocess_llama_proxy_inference_does_not_use_runtime_stage_timeout(monkeypatch):
@@ -3741,6 +5242,7 @@ def test_empty_stderr_cuda_category_survives_proxy_and_advances_qwen64k_profile(
         Llama=FakeLlama,
         LLAMA_ROPE_SCALING_TYPE_YARN=2,
         GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=2,
         __file__='/opt/token.place/llama_cpp/__init__.py',
         __version__='0.3.32',
     )
@@ -3749,8 +5251,9 @@ def test_empty_stderr_cuda_category_survives_proxy_and_advances_qwen64k_profile(
         assert manager.get_llm_instance() is not None
 
     assert len(attempts) == 2
-    assert 'type_k' not in attempts[0]
-    assert attempts[1]['type_k'] == 8
+    assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 8
+    assert (attempts[1]['n_batch'], attempts[1]['n_ubatch']) == (256, 128)
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
     assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
 
@@ -3828,6 +5331,66 @@ def test_proxy_drains_delayed_stderr_before_refining_generic_context_create(monk
     assert FakeThread.joins and 0 <= FakeThread.joins[-1] <= 0.5
 
 
+def test_proxy_swallows_wait_failure_while_refining_generic_context_create_error(monkeypatch, tmp_path):
+    from io import StringIO
+
+    from utils.llm import model_manager as model_manager_module
+
+    class FakeStdin:
+        def write(self, _data):
+            return None
+
+        def flush(self):
+            return None
+
+    class FakeThread:
+        def __init__(self, target=None, name=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdin = FakeStdin()
+            self.stdout = StringIO(
+                'TOKEN_PLACE_LLAMA_CPP_JSON:{"status":"ok","module_path":"/runtime/llama_cpp/__init__.py"}\n'
+                'TOKEN_PLACE_LLAMA_CPP_JSON:'
+                '{"status":"error","error":"Failed to create llama_context",'
+                '"exception_type":"RuntimeError","safe_error_category":"runtime_context_create_failed"}\n'
+            )
+            self.stderr = StringIO('')
+            self.returncode = 1
+            self._token_place_stderr_tail = []
+
+        def wait(self, timeout=None):
+            # Some platforms raise here (e.g. the process already reaped);
+            # this must not prevent the generic-error refinement from
+            # completing and surfacing the underlying init error.
+            raise OSError('wait unavailable')
+
+        def poll(self):
+            return self.returncode
+
+    def fake_popen(*args, **kwargs):
+        return FakeProcess(*args, **kwargs)
+
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', FakeThread)
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeInitError) as exc_info:
+        model_manager_module._SubprocessLlamaProxy(model_path=str(tmp_path / 'secret-model.gguf'), timeout_seconds=1)
+
+    assert exc_info.value.safe_error_category == 'runtime_context_create_failed'
+
+
 def test_bounded_stderr_drain_joins_reader_when_process_wait_raises():
     from utils.llm import model_manager as model_manager_module
 
@@ -3892,6 +5455,7 @@ def test_qwen_64k_generic_context_create_sentinel_retries_bounded_gpu_profiles(t
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -3904,7 +5468,7 @@ def test_qwen_64k_generic_context_create_sentinel_retries_bounded_gpu_profiles(t
     class FakeLlama:
         def __init__(self, **kwargs):
             attempts.append(dict(kwargs))
-            if len(attempts) < 3:
+            if len(attempts) == 1:
                 raise ValueError('Failed to create llama_context')
 
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
@@ -3923,10 +5487,11 @@ def test_qwen_64k_generic_context_create_sentinel_retries_bounded_gpu_profiles(t
         llm = manager.get_llm_instance()
 
     assert llm is not None
-    assert len(attempts) == 3
-    assert attempts[2]['type_k'] == 2
+    assert len(attempts) == 2
+    assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
+    assert 'type_k' not in attempts[1]
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_failed'
-    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
+    assert manager.last_qwen_64k_memory_profile_diagnostics['profile_id'] == 'qwen64k_f16_fa_small_batch'
 
 
 def test_qwen_64k_retry_closes_retryable_init_exception_before_next_profile(tmp_path):
@@ -3942,6 +5507,7 @@ def test_qwen_64k_retry_closes_retryable_init_exception_before_next_profile(tmp_
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -3978,7 +5544,8 @@ def test_qwen_64k_retry_closes_retryable_init_exception_before_next_profile(tmp_
 
     assert len(attempts) == 2
     assert closed == ['closed']
-    assert attempts[1]['type_k'] == 8
+    assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
+    assert attempts[1]['type_k'] == attempts[1]['type_v'] == 2
 
 
 def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp_path):
@@ -3993,6 +5560,7 @@ def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -4019,11 +5587,10 @@ def test_qwen_64k_generic_context_create_exhaustion_preserves_original_error(tmp
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
         assert manager.get_llm_instance() is None
 
-    assert len(attempts) == 3
+    assert len(attempts) == 2
     assert 'Failed to create llama_context' in manager.last_runtime_init_error
     assert 'profile exhaustion' not in manager.last_runtime_init_error
     assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
-        'runtime_context_create_failed',
         'runtime_context_create_failed',
         'runtime_context_create_failed',
     ]
@@ -4042,6 +5609,7 @@ def test_qwen_64k_generic_context_create_exhaustion_after_short_profile_list_pre
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -4066,18 +5634,20 @@ def test_qwen_64k_generic_context_create_exhaustion_after_short_profile_list_pre
     )
     short_profiles = [
         {
-            'profile_id': 'qwen64k_f16_fa_small_batch',
-            'runtime_kwargs': {},
-            'diagnostics': {'profile_id': 'qwen64k_f16_fa_small_batch', 'applied': {}, 'backend': 'cuda'},
-        },
-        {
             'profile_id': 'qwen64k_kv_q8_fa_small_batch',
-            'runtime_kwargs': {'type_k': 8, 'type_v': 8},
+            'kwargs': {'type_k': 8, 'type_v': 8},
             'diagnostics': {
                 'profile_id': 'qwen64k_kv_q8_fa_small_batch',
                 'applied': {'type_k': 8, 'type_v': 8},
                 'backend': 'cuda',
+                'kv_precision': 'q8',
+                'batch_profile': 'safe',
             },
+        },
+        {
+            'profile_id': 'qwen64k_f16_fa_small_batch',
+            'kwargs': {},
+            'diagnostics': {'profile_id': 'qwen64k_f16_fa_small_batch', 'applied': {}, 'backend': 'cuda', 'kv_precision': 'f16', 'batch_profile': 'safe'},
         },
     ]
     with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
@@ -4106,6 +5676,7 @@ def test_qwen_64k_mixed_terminal_generic_context_create_preserves_original_error
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -4134,12 +5705,11 @@ def test_qwen_64k_mixed_terminal_generic_context_create_preserves_original_error
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
         assert manager.get_llm_instance() is None
 
-    assert len(attempts) == 3
+    assert len(attempts) == 2
     assert 'Failed to create llama_context' in manager.last_runtime_init_error
     assert 'profile exhaustion' not in manager.last_runtime_init_error
     assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
         'runtime_context_create_cuda_memory',
-        'runtime_context_create_failed',
         'runtime_context_create_failed',
     ]
 
@@ -4531,6 +6101,8 @@ class _RestartableFakeWorker:
         self.closed = False
         self.calls = 0
         self.pid = id(self)
+        self.progress_observer_calls = []
+        self.progress_context_calls = []
 
     def is_alive(self):
         return not self.closed and self.fail != 'dead'
@@ -4538,7 +6110,16 @@ class _RestartableFakeWorker:
     def close(self):
         self.closed = True
 
-    def create_chat_completion(self, **_kwargs):
+    def create_chat_completion(
+        self, *, progress_request_id=None, progress_observer=None, progress_worker_generation=0, **_kwargs
+    ):
+        # Declaring these as explicit parameters (not swept into **_kwargs)
+        # mirrors _SubprocessLlamaProxy.create_chat_completion's real
+        # signature closely enough for ModelManager._progress_call_kwargs's
+        # signature-introspection check to recognize this fake as supporting
+        # progress binding, the same way it recognizes the real proxy.
+        self.progress_observer_calls.append(progress_observer)
+        self.progress_context_calls.append((progress_request_id, progress_worker_generation))
         self.calls += 1
         from utils.llm import model_manager as model_manager_module
         if self.fail == 'dead':
@@ -4617,6 +6198,241 @@ def test_model_manager_restart_broken_pipe_or_eof_once(tmp_path, monkeypatch):
     assert fourth_result['choices'][0]['message']['content'] == 'fourth'
     assert eof.closed is True
     assert created == [eof, fourth]
+
+
+def test_create_chat_completion_with_recovery_binds_progress_context_before_call(tmp_path, monkeypatch):
+    worker = _RestartableFakeWorker('only')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [worker])
+
+    received = []
+
+    def _observer(event):
+        received.append(event)
+
+    manager.create_chat_completion_with_recovery(
+        messages=[], progress_request_id='req-external-1', progress_observer=_observer,
+    )
+
+    assert worker.progress_context_calls == [('req-external-1', manager._llm_generation)]
+    assert len(worker.progress_observer_calls) == 1
+    guarded_observer = worker.progress_observer_calls[0]
+    # Wrapped for stale-generation guarding, not the raw observer function.
+    assert guarded_observer is not _observer
+    # The worker/generation is still the manager's current one: delivery
+    # passes through to the real observer unchanged.
+    guarded_observer({'phase': 'prefill'})
+    assert received == [{'phase': 'prefill'}]
+
+
+def test_create_chat_completion_with_recovery_omits_binding_without_a_request_id(tmp_path, monkeypatch):
+    worker = _RestartableFakeWorker('only')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [worker])
+
+    # No progress_request_id supplied (e.g. an internal/non-API-v1 caller):
+    # no real identity/observer must be bound - the call still reaches the
+    # worker (recorded as None/default), it's just never bound to anything.
+    manager.create_chat_completion_with_recovery(messages=[])
+
+    assert worker.progress_observer_calls == [None]
+    assert worker.progress_context_calls == [(None, 0)]
+
+
+def test_unbound_internal_call_after_api_request_does_not_inherit_prior_identity(tmp_path, monkeypatch):
+    """An API v1 request followed by a later, unbound internal call on the
+    same worker must never let the internal call inherit the previous
+    request's identity or observer - there is no shared staged state left
+    for it to leak through."""
+    worker = _RestartableFakeWorker('only')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [worker])
+
+    received = []
+
+    def _api_observer(event):
+        received.append(event)
+
+    manager.create_chat_completion_with_recovery(
+        messages=[], progress_request_id='req-external-1', progress_observer=_api_observer,
+    )
+    manager.create_chat_completion_with_recovery(messages=[])
+
+    assert len(worker.progress_observer_calls) == 2
+    first_guarded, second = worker.progress_observer_calls
+    assert first_guarded is not _api_observer
+    first_guarded({'phase': 'prefill'})
+    assert received == [{'phase': 'prefill'}]
+    assert second is None
+    assert worker.progress_context_calls == [('req-external-1', 0), (None, 0)]
+
+
+def test_create_chat_completion_with_recovery_rebinds_progress_context_for_replacement_generation(
+    tmp_path, monkeypatch
+):
+    """Recovery must never let progress appear to come from the stale,
+    pre-recovery worker generation the caller originally started with."""
+    first = _RestartableFakeWorker('first')
+    second = _RestartableFakeWorker('second')
+    manager, _created = _restart_manager(tmp_path, monkeypatch, [first, second])
+
+    received = []
+
+    def _observer(event):
+        received.append(event)
+
+    initial_generation = manager._llm_generation
+    first_result = manager.create_chat_completion_with_recovery(
+        messages=[], progress_request_id='req-a', progress_observer=_observer,
+    )
+    assert first_result['choices'][0]['message']['content'] == 'first'
+    assert first.progress_context_calls == [('req-a', initial_generation)]
+
+    first.fail = 'dead'
+    second_result = manager.create_chat_completion_with_recovery(
+        messages=[], progress_request_id='req-b', progress_observer=_observer,
+    )
+    assert second_result['choices'][0]['message']['content'] == 'second'
+
+    # The replacement worker is bound to the *new* generation, not the one
+    # the caller observed before recovery replaced the dead worker.
+    assert second.progress_context_calls == [('req-b', manager._llm_generation)]
+    assert manager._llm_generation != initial_generation
+
+    # Replacement-generation progress is delivered normally: the manager's
+    # current worker/generation still match what the replacement call bound.
+    replacement_guarded_observer = second.progress_observer_calls[0]
+    replacement_guarded_observer({'phase': 'generating'})
+    assert received == [{'phase': 'generating'}]
+
+
+def test_progress_suppressed_immediately_on_cancellation_while_close_llm_proxy_blocked():
+    """The core contract this task fixes: terminate_active_worker_for_cancellation
+    detaches the worker (self.llm = None, generation advanced) *before*
+    calling _close_llm_proxy - not after it returns. Progress already
+    queued for the old worker must be suppressed the moment detachment
+    happens, proven here by deliberately blocking _close_llm_proxy (via a
+    real Event, no sleep) and dispatching from inside that blocked window.
+    """
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.worker_state = 'ready'
+    manager._llm_generation = 5
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 0
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.log_warning = MagicMock()
+    manager.get_llm_instance = lambda: manager.llm
+
+    worker = _RestartableFakeWorker('active')
+    manager.llm = worker
+
+    received = []
+
+    def _observer(event):
+        received.append(event)
+
+    manager.create_chat_completion_with_recovery(
+        messages=[], progress_request_id='req-1', progress_observer=_observer,
+    )
+    assert len(worker.progress_observer_calls) == 1
+    guarded_observer = worker.progress_observer_calls[0]
+
+    close_entered = threading.Event()
+    release_close = threading.Event()
+
+    def _blocked_close_llm_proxy(_llm, terminate_process=False, fatal_callback=None):
+        close_entered.set()
+        assert release_close.wait(timeout=5), 'test setup error: never released'
+        return True
+
+    manager._close_llm_proxy = _blocked_close_llm_proxy
+
+    cancel_thread = threading.Thread(
+        target=manager.terminate_active_worker_for_cancellation,
+        kwargs={'reason': 'cancelled'},
+    )
+    cancel_thread.start()
+    try:
+        assert close_entered.wait(timeout=5), 'terminate_active_worker_for_cancellation never reached _close_llm_proxy'
+
+        # Detachment has already happened (self.llm is None, generation
+        # advanced) even though _close_llm_proxy is deliberately still
+        # blocked and has not returned.
+        assert manager.llm is None
+        assert manager._llm_generation == 6
+
+        guarded_observer({'phase': 'prefill'})
+        assert received == []
+    finally:
+        release_close.set()
+        cancel_thread.join(timeout=5)
+    assert not cancel_thread.is_alive()
+
+
+def test_progress_suppressed_immediately_on_ordinary_invalidation_while_close_llm_proxy_blocked():
+    """Same contract as the cancellation test above, but for the ordinary
+    invalidation path (_invalidate_llm_if_current), triggered the way
+    production code triggers it: a LlamaCppRestartableWorkerError raised
+    from create_chat_completion_with_recovery's own call."""
+    manager = object.__new__(ModelManager)
+    manager.llm_lock = threading.RLock()
+    manager.worker_state = 'ready'
+    manager._llm_generation = 9
+    manager._llm_cancel_generation_event = threading.Event()
+    manager.worker_restart_count = 0
+    manager.last_worker_error_code = None
+    manager.last_worker_exit_code = None
+    manager.last_worker_restart_at_ms = None
+    manager.log_warning = MagicMock()
+
+    dying_worker = _RestartableFakeWorker('dying', fail='dead')
+    manager.llm = dying_worker
+    manager.get_llm_instance = lambda: manager.llm
+
+    received = []
+
+    def _observer(event):
+        received.append(event)
+
+    close_entered = threading.Event()
+    release_close = threading.Event()
+
+    def _blocked_close_llm_proxy(_llm, terminate_process=False, fatal_callback=None):
+        close_entered.set()
+        assert release_close.wait(timeout=5), 'test setup error: never released'
+        return True
+
+    manager._close_llm_proxy = _blocked_close_llm_proxy
+
+    def _run() -> None:
+        try:
+            manager.create_chat_completion_with_recovery(
+                messages=[], progress_request_id='req-1', progress_observer=_observer,
+            )
+        except Exception:
+            # We only care about the state during the blocked detachment
+            # window below, not the eventual replacement outcome (there is
+            # no replacement worker in this test).
+            pass
+
+    call_thread = threading.Thread(target=_run)
+    call_thread.start()
+    try:
+        assert close_entered.wait(timeout=5), '_invalidate_llm_if_current never reached _close_llm_proxy'
+
+        assert manager.llm is None
+        assert manager._llm_generation == 10
+
+        # The guarded observer was captured on the *dying* worker's own
+        # create_chat_completion call before it raised.
+        assert len(dying_worker.progress_observer_calls) == 1
+        guarded_observer = dying_worker.progress_observer_calls[0]
+        guarded_observer({'phase': 'prefill'})
+        assert received == []
+    finally:
+        release_close.set()
+        call_thread.join(timeout=5)
+    assert not call_thread.is_alive()
 
 
 def test_model_manager_request_scoped_inference_error_not_retried(tmp_path, monkeypatch):
@@ -4818,7 +6634,8 @@ def test_llama_subprocess_transport_error_omits_unsafely_unallowlisted_secret():
     assert 'SECRET_TOKEN' not in error
     assert 'authorization' not in error
 
-def test_subprocess_llama_proxy_liveness_and_close_edge_cases():
+def test_subprocess_llama_proxy_liveness_and_close_edge_cases(monkeypatch, posix_os):
+    _ = posix_os
     from utils.llm import model_manager as model_manager_module
 
     proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
@@ -4974,7 +6791,8 @@ def test_model_manager_cancellation_recreates_outside_non_reentrant_lock(monkeyp
     manager.log_warning.assert_not_called()
 
 
-def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_path, monkeypatch):
+def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_path, monkeypatch, posix_os):
+    _ = posix_os
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
 
     already_dead = SimpleNamespace(
@@ -4999,9 +6817,12 @@ def test_close_llm_proxy_terminates_kills_and_ignores_process_edge_cases(tmp_pat
     terminate_fails_process.terminate.assert_called_once_with()
     terminate_fails_process.kill.assert_called_once_with()
     assert terminate_fails_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
-    terminate_fails_process.stdin.close.assert_called_once_with()
-    terminate_fails_process.stdout.close.assert_called_once_with()
-    terminate_fails_process.stderr.close.assert_called_once_with()
+    # A wait() return is not authoritative when poll() still reports alive.
+    # Pipe close must remain deferred rather than risk blocking on the reader's
+    # stream lock before process death is verified.
+    terminate_fails_process.stdin.close.assert_not_called()
+    terminate_fails_process.stdout.close.assert_not_called()
+    terminate_fails_process.stderr.close.assert_not_called()
 
     stubborn_process = SimpleNamespace(
         poll=MagicMock(return_value=None),
@@ -5061,7 +6882,8 @@ def test_model_manager_cancellation_without_active_worker_recreate_false_and_fai
     assert manager.last_worker_error_code == "expired"
 
 
-def test_close_llm_proxy_wait_failure_after_kill_is_bounded(tmp_path, monkeypatch):
+def test_close_llm_proxy_wait_failure_after_kill_is_bounded(tmp_path, monkeypatch, posix_os):
+    _ = posix_os
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
     process = SimpleNamespace(
         poll=MagicMock(return_value=None),
@@ -5168,7 +6990,8 @@ def test_model_manager_cancellation_active_worker_skip_recreation_and_close_with
     processless_worker.close.assert_called_once_with()
 
 
-def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch):
+def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch, posix_os):
+    _ = posix_os
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
     close_fails = SimpleNamespace(close=MagicMock(side_effect=RuntimeError("close failed")))
 
@@ -5190,7 +7013,8 @@ def test_close_llm_proxy_ignores_close_and_kill_failures(tmp_path, monkeypatch):
     assert kill_fails_process.wait.mock_calls == [call(timeout=1.0), call(timeout=1.0)]
 
 
-def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, monkeypatch):
+def test_close_llm_proxy_blocking_close_does_not_prevent_process_kill(tmp_path, monkeypatch, posix_os):
+    _ = posix_os
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
     close_entered = threading.Event()
     close_release = threading.Event()
@@ -5322,7 +7146,8 @@ sys.exit(0)
 
 
 
-def test_invalidate_llm_detaches_before_bounded_subprocess_cleanup(tmp_path, monkeypatch):
+def test_invalidate_llm_detaches_before_bounded_subprocess_cleanup(tmp_path, monkeypatch, posix_os):
+    _ = posix_os
     manager, _created = _restart_manager(tmp_path, monkeypatch, [])
     poll_values = iter([None, None, None, 0])
     process = SimpleNamespace(
@@ -6126,7 +7951,7 @@ def test_subprocess_llama_proxy_prompt_helpers_mark_closed_on_eof(monkeypatch):
     assert proxy._closed is True
 
 
-def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_format_body=None):
+def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_format_body=None, init_kwargs=None):
     package_dir = tmp_path / 'llama_cpp'
     package_dir.mkdir()
     (package_dir / '__init__.py').write_text(llama_body)
@@ -6145,7 +7970,7 @@ def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_forma
     )
     assert process.stdin is not None
     assert process.stdout is not None
-    process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+    process.stdin.write(json.dumps({'args': [], 'kwargs': init_kwargs or {}}) + '\n')
     process.stdin.flush()
     init = process.stdout.readline()
     assert init.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:')
@@ -6157,6 +7982,222 @@ def _run_llama_worker_request(tmp_path, request, *, llama_body, llama_chat_forma
     process.wait(timeout=5)
     assert response.startswith('TOKEN_PLACE_LLAMA_CPP_JSON:')
     return json.loads(response.split(':', 1)[1])
+
+
+def _start_bounded_frame_reader(stream):
+    frames = queue.Queue()
+
+    def _read():
+        for line in stream:
+            frames.put(json.loads(line.split(':', 1)[1]))
+
+    threading.Thread(target=_read, daemon=True).start()
+    return lambda timeout=2: frames.get(timeout=timeout)
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["create_chat_completion", "create_chat_completion_from_rendered_prompt"],
+)
+def test_llama_worker_progress_eval_batches_cached_prefix_and_phase_are_exact(tmp_path, method):
+    """Exercise the worker adapter while its second real decode is blocked."""
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    (package_dir / '__init__.py').write_text(r'''
+import time
+
+_ticks = iter(i * 0.3 for i in range(100))
+time.monotonic = lambda: next(_ticks)
+
+class Context:
+    def __init__(self):
+        self.calls = 0
+    def decode(self, batch):
+        self.calls += 1
+        if self.calls == 2:
+            open('second-batch-blocked', 'w').close()
+            while not __import__('os').path.exists('release-second-batch'):
+                time.sleep(0.01)
+
+class Llama:
+    def __init__(self, *args, **kwargs):
+        self.n_batch = 2
+        self.n_tokens = 3
+        self._input_ids = [11, 12, 99]
+        self._ctx = Context()
+    def apply_chat_template(self, messages, **kwargs):
+        return 'rendered'
+    def tokenize(self, prompt, add_bos=False):
+        return [11, 12, 13, 14, 15]
+    def eval(self, tokens):
+        for offset in range(0, len(tokens), self.n_batch):
+            batch = tokens[offset:offset + self.n_batch]
+            self._ctx.decode(batch)
+            self.n_tokens += len(batch)
+    def sample(self):
+        return 42
+    def _complete(self):
+        # Match pinned generate reuse: the two-token common prefix is retained.
+        self.n_tokens = 2
+        self.eval([13, 14, 15])
+        self.sample()
+        # Decode-token evaluation must not regress the emitted phase.
+        self.eval([42])
+        return {'choices': [{'message': {'content': 'ok'}}]}
+    def create_chat_completion(self, *args, **kwargs):
+        return self._complete()
+    def create_completion(self, *args, **kwargs):
+        return self._complete()
+''')
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
+    process = subprocess.Popen(
+        [sys.executable, '-c', 'from utils.llm.model_manager import _LLAMA_CPP_RUNTIME_WORKER_CODE; exec(_LLAMA_CPP_RUNTIME_WORKER_CODE)'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, cwd=tmp_path,
+    )
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        read_frame = _start_bounded_frame_reader(process.stdout)
+        process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+        process.stdin.flush()
+        assert read_frame()['status'] == 'ok'
+        process.stdin.write(json.dumps({
+            'method': method,
+            'args': [[{'role': 'user', 'content': 'private prompt'}]],
+            'kwargs': {},
+        }) + '\n')
+        process.stdin.flush()
+
+        frames = []
+        while len(frames) < 2:
+            frames.append(read_frame())
+        # The marker file is created by the *subprocess* immediately after it
+        # emits this frame, not by the *parent* observing it - these are two
+        # separate processes, so there is no happens-before guarantee that
+        # the file already exists the instant this side finishes reading the
+        # frame off the pipe. Poll briefly for it instead of asserting
+        # instantaneous availability (this raced on a CI runner where
+        # scheduling margins differ from a local dev machine).
+        deadline = time.monotonic() + 2.0
+        while not (tmp_path / 'second-batch-blocked').exists():
+            assert time.monotonic() < deadline, "second batch's decode() never started"
+            time.sleep(0.01)
+        assert [frame['phase'] for frame in frames] == ['preparing', 'prefill']
+        first_batch = frames[-1]
+        assert (first_batch['cached_prompt_tokens'], first_batch['processed_prompt_tokens']) == (2, 4)
+
+        (tmp_path / 'release-second-batch').touch()
+        while True:
+            frame = read_frame()
+            frames.append(frame)
+            if frame.get('status') == 'ok' and 'result' in frame:
+                break
+
+        progress = [frame for frame in frames if frame.get('type') == 'inference_progress']
+        phases = [frame['phase'] for frame in progress]
+        assert phases.count('prefill') == 2  # one batch and exactly one final
+        assert phases[-1] == 'generating'
+        assert progress[-2]['processed_prompt_tokens'] == progress[-2]['total_prompt_tokens'] == 5
+        assert progress[-1]['generated_tokens'] == 1
+        assert all(set(frame) == {
+            'type', 'phase', 'total_prompt_tokens', 'cached_prompt_tokens',
+            'processed_prompt_tokens', 'generated_tokens', 'elapsed_ms',
+        } for frame in progress)
+        assert 'private prompt' not in json.dumps(progress)
+        assert all(0 <= frame['cached_prompt_tokens'] <= frame['processed_prompt_tokens'] <= 5 for frame in progress)
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ('branch', 'cached'),
+    [('exact', 5), ('replay', 4), ('partial', 2), ('reset', 0)],
+)
+def test_llama_worker_progress_cached_count_uses_generator_decision(tmp_path, branch, cached):
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    (package_dir / '__init__.py').write_text(f'''
+class Context:
+    def decode(self, batch):
+        pass
+    def kv_cache_seq_rm(self, *args):
+        return False
+
+class Llama:
+    def __init__(self, *args, **kwargs):
+        self.n_batch = 2
+        self.n_tokens = 5
+        self._ctx = Context()
+    def apply_chat_template(self, messages, **kwargs):
+        return 'rendered'
+    def tokenize(self, prompt, add_bos=False):
+        return [11, 12, 13, 14, 15]
+    def eval(self, tokens):
+        for offset in range(0, len(tokens), self.n_batch):
+            batch = tokens[offset:offset + self.n_batch]
+            self._ctx.decode(batch)
+            self.n_tokens += len(batch)
+    def sample(self):
+        return 42
+    def create_chat_completion(self, *args, **kwargs):
+        branch = {branch!r}
+        if branch == 'exact':
+            self.n_tokens = 5
+            self.eval([])
+        elif branch == 'replay':
+            self.n_tokens = 4
+            self.eval([15])
+        elif branch == 'partial':
+            self.n_tokens = 2
+            self.eval([13, 14, 15])
+        else:
+            assert self._ctx.kv_cache_seq_rm(0, 0, -1) is False
+            self.n_tokens = 0
+            self.eval([11, 12, 13, 14, 15])
+        self.sample()
+        self.eval([42])
+        return {{'choices': [{{'message': {{'content': 'ok'}}}}]}}
+''')
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join([str(tmp_path), str(Path(__file__).parent.parent.parent)])
+    process = subprocess.Popen(
+        [sys.executable, '-c', 'from utils.llm.model_manager import _LLAMA_CPP_RUNTIME_WORKER_CODE; exec(_LLAMA_CPP_RUNTIME_WORKER_CODE)'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, cwd=tmp_path,
+    )
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        read_frame = _start_bounded_frame_reader(process.stdout)
+        process.stdin.write(json.dumps({'args': [], 'kwargs': {}}) + '\n')
+        process.stdin.flush()
+        assert read_frame()['status'] == 'ok'
+        process.stdin.write(json.dumps({
+            'method': 'create_chat_completion', 'args': [[]], 'kwargs': {},
+        }) + '\n')
+        process.stdin.flush()
+        frames = []
+        while True:
+            frame = read_frame()
+            frames.append(frame)
+            if frame.get('status') == 'ok' and 'result' in frame:
+                break
+        progress = [frame for frame in frames if frame.get('type') == 'inference_progress']
+        prefill = [frame for frame in progress if frame['phase'] == 'prefill']
+        assert prefill
+        assert all(frame['cached_prompt_tokens'] == cached for frame in prefill)
+        assert [frame['processed_prompt_tokens'] for frame in prefill] == sorted(
+            frame['processed_prompt_tokens'] for frame in prefill
+        )
+        assert prefill[-1]['processed_prompt_tokens'] == prefill[-1]['total_prompt_tokens'] == 5
+        assert progress[-1]['phase'] == 'generating'
+        generating_index = next(i for i, frame in enumerate(progress) if frame['phase'] == 'generating')
+        assert all(frame['phase'] != 'prefill' for frame in progress[generating_index:])
+    finally:
+        process.kill()
+        process.wait(timeout=5)
 
 
 def test_llama_worker_render_and_tokenize_chat_returns_only_token_count(tmp_path):
@@ -6260,6 +8301,81 @@ class Llama:
     )
 
     assert response == {'status': 'ok', 'result': {'prompt_tokens': 4}}
+    assert 'secret prompt' not in json.dumps(response)
+
+
+def test_llama_worker_render_and_tokenize_chat_uses_marked_headless_fallback(tmp_path):
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'fixture prompt'}]],
+            'kwargs': {
+                'tokenize': False,
+                'add_generation_prompt': True,
+                'token_place_headless_admission_fixture': True,
+            },
+        },
+        llama_body=r"""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def apply_chat_template(self, messages, **kwargs):
+        raise AssertionError('apply_chat_template must not be invoked without metadata')
+    def tokenizer(self):
+        return object()
+    def tokenize(self, prompt, add_bos=False):
+        assert prompt.decode('utf-8') == '<|im_start|>user\nfixture prompt<|im_end|>\n<|im_start|>assistant\n'
+        return [10, 20, 30]
+""",
+    )
+
+    assert response == {'status': 'ok', 'result': {'prompt_tokens': 3}}
+    assert 'fixture prompt' not in json.dumps(response)
+
+
+def test_subprocess_proxy_controls_headless_worker_marker():
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._lock = model_manager_module.Lock()
+    proxy._timeout_seconds = 1
+    proxy._closed = False
+    proxy._rpc = MagicMock(return_value={'result': {'prompt_tokens': 2}})
+
+    proxy.render_and_tokenize_chat([], token_place_headless_admission_fixture=True)
+    assert 'token_place_headless_admission_fixture' not in proxy._rpc.call_args.args[0]['kwargs']
+
+    proxy._headless_admission_fixture = True
+    proxy.render_and_tokenize_chat([], token_place_headless_admission_fixture=False)
+    assert proxy._rpc.call_args.args[0]['kwargs']['token_place_headless_admission_fixture'] is True
+
+
+def test_llama_worker_headless_fallback_ignores_environment_and_filename(monkeypatch, tmp_path):
+    monkeypatch.setenv('TOKEN_PLACE_HEADLESS_ADMISSION_FIXTURE', '1')
+    response = _run_llama_worker_request(
+        tmp_path,
+        {
+            'method': 'render_and_tokenize_chat',
+            'args': [[{'role': 'user', 'content': 'secret prompt'}]],
+            'kwargs': {'tokenize': False, 'add_generation_prompt': True},
+        },
+        init_kwargs={'model_path': str(tmp_path / 'stories15M-q4_0.gguf')},
+        llama_body="""
+class Llama:
+    def __init__(self, *args, **kwargs):
+        pass
+    def apply_chat_template(self, messages, **kwargs):
+        raise RuntimeError('missing chat template metadata')
+    def tokenizer(self):
+        return object()
+    def tokenize(self, prompt, add_bos=False):
+        return [1]
+""",
+    )
+
+    assert response['status'] == 'error'
+    assert response['diagnostics']['reason'] == 'runtime_chat_template_render_exception'
     assert 'secret prompt' not in json.dumps(response)
 
 
@@ -6799,6 +8915,138 @@ def test_qwen_8k_runtime_omits_llama_chat_format_and_yarn(tmp_path):
     assert manager.last_compute_diagnostics['rope_yarn_enabled'] is False
     assert manager.last_yarn_rope_diagnostics['active'] is False
     assert manager.last_yarn_rope_diagnostics['required'] is False
+
+
+def test_headless_admission_fixture_omits_legacy_chat_format(tmp_path):
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'llama-3.1-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.chat_format': 'llama-3',
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }.get(key, default)
+    manager = ModelManager(config)
+    manager.headless_admission_fixture = True
+    Path(manager.model_path).write_text('fake')
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            return '<fixture>'
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, verbose):
+            self.kwargs = dict(model_path=model_path, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=verbose)
+
+        def tokenizer(self):
+            assert self._headless_admission_fixture is True
+            return FakeTokenizer()
+
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=SimpleNamespace(Llama=FakeLlama)), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None}):
+        llm = manager.get_llm_instance()
+
+    assert llm is not None
+    assert llm._headless_admission_fixture is True
+    assert 'chat_format' not in llm.kwargs
+
+
+def test_headless_admission_fixture_uses_configured_subprocess_render_contract(
+    monkeypatch, tmp_path
+):
+    from utils.compute_node_runtime import authoritative_readiness_fixture
+    from utils.llm import model_manager as model_manager_module
+    from utils.networking.relay_client import RelayClient
+
+    package_dir = tmp_path / 'llama_cpp'
+    package_dir.mkdir()
+    module_path = package_dir / '__init__.py'
+    module_path.write_text(
+        "class Llama:\n"
+        "    metadata = {'tokenizer.chat_template': '{{ messages }}'}\n"
+        "    def __init__(self, **kwargs):\n"
+        "        assert 'chat_format' not in kwargs\n"
+        "    def apply_chat_template(self, *args, **kwargs):\n"
+        "        raise AssertionError('marked fixture must use stable fallback')\n"
+        "    def create_chat_completion(self, **kwargs):\n"
+        "        return {'choices': [{'message': {'content': 'ok'}}]}\n"
+        "    def tokenize(self, prompt, add_bos=False):\n"
+        "        return list(prompt)\n",
+        encoding='utf-8',
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    config = MagicMock(is_production=False)
+    config.get.side_effect = lambda key, default=None: {
+        'model.profile_id': 'llama-3.1-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.chat_format': 'llama-3',
+        'model.use_mock': False,
+        'model.n_gpu_layers': 0,
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }.get(key, default)
+    manager = ModelManager(config)
+    manager.headless_admission_fixture = True
+    manager.model_profile = dict(manager.model_profile)
+    manager.model_profile.update({
+        'provider': 'headless-admission-fixture',
+        'chat_template_policy': 'headless-plain-chat',
+    })
+    Path(manager.model_path).write_text('fake')
+    facade = model_manager_module._SubprocessLlamaCppModule(str(module_path))
+
+    with patch(
+        'utils.llm.model_manager._import_llama_cpp_runtime', return_value=facade
+    ), patch.object(
+        manager,
+        '_runtime_capabilities',
+        return_value={'backend': 'cpu', 'gpu_offload_supported': False, 'error': None},
+    ):
+        llm = manager.get_llm_instance()
+
+    try:
+        assert isinstance(llm, model_manager_module._SubprocessLlamaProxy)
+        assert llm is manager.llm
+        assert llm._headless_admission_fixture is True
+        content, fixture = authoritative_readiness_fixture()
+        messages = [{'role': 'user', 'content': content}]
+        count = RelayClient._api_v1_render_and_tokenize_chat_prompt(
+            llm, messages, model_profile=manager.model_profile
+        )
+        assert isinstance(count, int) and count > 0, getattr(
+            llm, '_token_place_last_render_tokenize_error', None
+        )
+
+        request_path = tmp_path / 'request.json'
+        evidence_path = tmp_path / 'evidence.json'
+        request_path.write_text(json.dumps(fixture), encoding='utf-8')
+        monkeypatch.setenv(
+            'TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST', str(request_path)
+        )
+        monkeypatch.setenv(
+            'TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE', str(evidence_path)
+        )
+        monkeypatch.setenv('TOKENPLACE_RUNTIME_ID', 'test-runtime')
+        RelayClient._api_v1_record_benchmark_tokenizer_observation(
+            llm,
+            messages,
+            full_prompt_tokens=count,
+            enable_thinking=None,
+            model_profile=manager.model_profile,
+        )
+        evidence = json.loads(evidence_path.read_text(encoding='utf-8'))
+        assert evidence['method'] == 'packaged_admission_render_and_tokenize_chat'
+        assert evidence['total_prompt_tokens'] == count
+        assert set(evidence['target_offsets_tokens']) == set(
+            fixture['target_prefix_utf8_bytes']
+        )
+        assert all(value > 0 for value in evidence['target_offsets_tokens'].values())
+    finally:
+        if llm is not None:
+            llm.close()
 
 
 def test_qwen_64k_runtime_enables_yarn_kwargs(tmp_path):
@@ -7743,6 +9991,7 @@ def test_qwen_64k_memory_profiles_skip_missing_kv_constants_without_noop_profile
         NoKvEnumLlama,
         model_path='model.gguf',
         n_ctx=65536,
+        batch_profile='safe',
     )
 
     assert [profile['profile_id'] for profile in profiles] == ['qwen64k_f16_fa_small_batch']
@@ -7888,6 +10137,13 @@ def test_subprocess_worker_plain_completion_helpers_cover_safe_shapes():
     normalized, invalid_reason = normalize({'choices': [{'message': {'content': 'message ok'}}]})
     assert invalid_reason is None
     assert normalized['choices'][0]['message']['content'] == 'message ok'
+    normalized, invalid_reason = normalize({
+        'choices': [{'text': 'partial', 'finish_reason': 'length'}],
+        'usage': {'prompt_tokens': 11, 'completion_tokens': 4, 'total_tokens': 15},
+    })
+    assert invalid_reason is None
+    assert normalized['choices'][0]['finish_reason'] == 'length'
+    assert normalized['usage'] == {'prompt_tokens': 11, 'completion_tokens': 4, 'total_tokens': 15}
     assert normalize({'choices': [{'message': {'content': 'visible', 'reasoning_content': 'hidden'}}]}) == (
         None,
         'thinking_leaked',
@@ -8302,7 +10558,8 @@ def test_subprocess_proxy_reports_actual_child_model_path_exists_with_relative_s
         proxy.close()
 
 
-def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
+def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch, posix_os):
+    _ = posix_os
     from utils.llm import model_manager as model_manager_module
 
     popen_calls = []
@@ -8373,7 +10630,7 @@ def test_subprocess_proxy_uses_temp_worker_script_and_cleans_up(monkeypatch):
     assert proxy._worker_tmpfile is None
 
 
-def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(monkeypatch):
+def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(monkeypatch, tmp_path):
     from utils.llm import model_manager as model_manager_module
 
     popen_commands = []
@@ -8401,7 +10658,13 @@ def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(mo
         popen_commands.append(command)
         return process
 
-    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', lambda *args, **kwargs: (_ for _ in ()).throw(OSError('no tmp')))
+    mkstemp_calls = []
+
+    def unavailable_mkstemp(*args, **kwargs):
+        mkstemp_calls.append((args, kwargs))
+        raise OSError('no tmp')
+
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', unavailable_mkstemp)
     monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
     monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
     monkeypatch.setattr(
@@ -8410,11 +10673,142 @@ def test_subprocess_proxy_falls_back_to_inline_code_when_tempfile_unavailable(mo
         lambda *args, **kwargs: {'status': 'ok'},
     )
 
-    proxy = model_manager_module._SubprocessLlamaProxy(model_path='model.gguf')
+    model_path = tmp_path / 'missing' / 'model.gguf'
+    proxy = model_manager_module._SubprocessLlamaProxy(str(model_path))
 
     assert proxy._worker_tmpfile is None
+    assert len(mkstemp_calls) == 1
     assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
     assert proxy._process._token_place_command == [sys.executable, '<runtime-worker-code>']
+
+
+@pytest.mark.parametrize('cleanup_raises', [False, True])
+def test_subprocess_proxy_cleans_partial_worker_script_when_fdopen_fails(
+    monkeypatch, tmp_path, cleanup_raises
+):
+    from utils.llm import model_manager as model_manager_module
+
+    descriptor = 123
+    partial_script = str(tmp_path / 'partial-worker.py')
+    cleanup_calls = []
+    popen_commands = []
+
+    def fake_close(fd):
+        cleanup_calls.append(('close', fd))
+        if cleanup_raises:
+            raise OSError('close unavailable')
+
+    def fake_unlink(path):
+        cleanup_calls.append(('unlink', path))
+        if cleanup_raises:
+            raise OSError('unlink unavailable')
+
+    class FakeStdin:
+        def write(self, value):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+        stdout = None
+        stderr = []
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        popen_commands.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        model_manager_module.tempfile,
+        'mkstemp',
+        lambda *args, **kwargs: (descriptor, partial_script),
+    )
+    monkeypatch.setattr(
+        model_manager_module.os,
+        'fdopen',
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError('fdopen unavailable')),
+    )
+    monkeypatch.setattr(model_manager_module.os, 'close', fake_close)
+    monkeypatch.setattr(model_manager_module.os, 'unlink', fake_unlink)
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(
+        model_manager_module._SubprocessLlamaProxy,
+        '_start_stderr_tail_reader',
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        model_manager_module,
+        '_read_llama_subprocess_message',
+        lambda *args, **kwargs: {'status': 'ok'},
+    )
+
+    model_path = tmp_path / 'missing' / 'model.gguf'
+    proxy = model_manager_module._SubprocessLlamaProxy(str(model_path))
+
+    assert cleanup_calls == [('close', descriptor), ('unlink', partial_script)]
+    assert proxy._worker_tmpfile is None
+    assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
+
+
+def test_subprocess_proxy_uses_inline_code_without_writing_in_model_dir(monkeypatch, tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model_path = tmp_path / 'models' / 'model.gguf'
+    model_path.parent.mkdir()
+    model_path.write_bytes(b'GGUF')
+    mkstemp_calls = []
+    popen_commands = []
+
+    def unavailable_mkstemp(*args, **kwargs):
+        mkstemp_calls.append(kwargs.copy())
+        raise OSError('ambient temp unavailable')
+
+    class FakeStdin:
+        def write(self, value):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+        stdout = None
+        stderr = []
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        popen_commands.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(model_manager_module.tempfile, 'mkstemp', unavailable_mkstemp)
+    monkeypatch.setattr(model_manager_module.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(model_manager_module._SubprocessLlamaProxy, '_start_stderr_tail_reader', lambda self: None)
+    monkeypatch.setattr(
+        model_manager_module,
+        '_read_llama_subprocess_message',
+        lambda *args, **kwargs: {'status': 'ok'},
+    )
+
+    proxy = model_manager_module._SubprocessLlamaProxy(model_path=str(model_path))
+
+    assert proxy._worker_tmpfile is None
+    assert mkstemp_calls == [{'suffix': '.py', 'prefix': '_token_place_worker_', 'dir': None}]
+    assert not list(model_path.parent.glob('_token_place_worker_*.py'))
+    assert popen_commands[0][:3] == [sys.executable, '-u', '-c']
+
+    proxy.close()
 
 
 def test_subprocess_proxy_removes_temp_worker_script_when_popen_fails(monkeypatch):
@@ -8467,6 +10861,213 @@ def test_subprocess_proxy_stream_marks_closed_on_eof(monkeypatch):
 
     assert proxy._closed is True
     assert sent_payloads[0]["method"] == "create_chat_completion"
+
+
+def test_subprocess_proxy_demux_stream_timeout_kills_worker_and_cleans_pending(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS', '0.01')
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue()
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    # Non-None sentinel: demux reader is treated as already running so the
+    # test doesn't need a real stdout pipe.
+    proxy._stdout_reader_thread = SimpleNamespace()
+    proxy._send = MagicMock()
+
+    terminate_calls = []
+    wait_calls = []
+    kill_calls = []
+
+    class FakeProcess:
+        def terminate(self):
+            terminate_calls.append(True)
+
+        def wait(self, timeout=None):
+            wait_calls.append(timeout)
+
+        def kill(self):
+            kill_calls.append(True)
+
+    proxy._process = FakeProcess()
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        next(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert terminate_calls == [True]
+    assert wait_calls == [1]
+    assert kill_calls == []
+    assert proxy._closed is True
+    assert proxy._pending == {}
+    assert proxy._completed_commands == set()
+
+
+def test_subprocess_proxy_demux_stream_timeout_falls_back_to_kill_when_terminate_fails(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS', '0.01')
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue()
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    proxy._stdout_reader_thread = SimpleNamespace()
+    proxy._send = MagicMock()
+
+    kill_calls = []
+
+    class FakeProcess:
+        def terminate(self):
+            raise OSError('already gone')
+
+        def wait(self, timeout=None):
+            raise AssertionError('wait should not be reached when terminate fails')
+
+        def kill(self):
+            kill_calls.append(True)
+
+    proxy._process = FakeProcess()
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        next(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert kill_calls == [True]
+    assert proxy._closed is True
+    assert proxy._pending == {}
+
+
+def test_subprocess_proxy_demux_stream_timeout_survives_kill_also_failing(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setenv('TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS', '0.01')
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue()
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    proxy._stdout_reader_thread = SimpleNamespace()
+    proxy._send = MagicMock()
+
+    class FakeProcess:
+        def terminate(self):
+            raise OSError('already gone')
+
+        def wait(self, timeout=None):
+            raise AssertionError('wait should not be reached when terminate fails')
+
+        def kill(self):
+            raise OSError('kill also unavailable')
+
+    proxy._process = FakeProcess()
+
+    with pytest.raises(model_manager_module.LlamaCppRuntimeStageTimeout):
+        next(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert proxy._closed is True
+    assert proxy._pending == {}
+
+
+def test_subprocess_proxy_demux_stream_eof_cleans_pending(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue()
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    proxy._stdout_reader_thread = SimpleNamespace()
+
+    def _fake_send(payload, *, check_health=True):
+        # Simulate the demultiplexer routing a worker-transport EOF error to
+        # this command's pending queue after the request was sent.
+        proxy._pending[payload['command_id']].put_nowait(
+            model_manager_module.LlamaCppWorkerEOFError('worker eof')
+        )
+
+    proxy._send = _fake_send
+    proxy._process = SimpleNamespace()
+
+    with pytest.raises(model_manager_module.LlamaCppWorkerEOFError):
+        next(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert proxy._closed is True
+    assert proxy._pending == {}
+    assert proxy._completed_commands == set()
+
+
+def test_subprocess_proxy_stream_starts_demux_reader_when_not_already_running(monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    monkeypatch.setattr(model_manager_module.threading, 'Thread', _SynchronousFakeThread)
+
+    stdout_lines = [
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps(
+            {'status': 'ok', 'chunk': {'content': 'hi'}, 'done': False}
+        ) + '\n',
+        'TOKEN_PLACE_LLAMA_CPP_JSON:' + json.dumps({'status': 'ok', 'done': True}) + '\n',
+    ]
+
+    proxy = object.__new__(model_manager_module._SubprocessLlamaProxy)
+    proxy._closed = False
+    proxy._lock = model_manager_module.Lock()
+    proxy._pending_lock = model_manager_module.Lock()
+    proxy._pending = {}
+    proxy._completed_commands = set()
+    proxy._command_sequence = 0
+    proxy._legacy_frames = queue.Queue(maxsize=32)
+    proxy._unclaimed_frames = queue.Queue(maxsize=32)
+    proxy._progress_observer = None
+    proxy._progress_request_id = None
+    proxy._progress_worker_generation = 0
+    proxy._command_progress = {}
+    proxy._latest_progress = {}
+    proxy._process = SimpleNamespace(stdout=iter(stdout_lines), _token_place_stdout_tail=[])
+    # The reader is not started yet: this is the first command on this proxy.
+    proxy._stdout_reader_thread = None
+    proxy._send = MagicMock()
+
+    chunks = list(proxy._stream_chat_completion([{"role": "user", "content": "hi"}]))
+
+    assert chunks == [{'content': 'hi'}]
+    assert proxy._stdout_reader_thread is not None
+    assert proxy._pending == {}
 
 
 def test_subprocess_proxy_ignores_unlink_failure_when_popen_fails(monkeypatch):
@@ -8602,7 +11203,7 @@ def test_qwen_64k_profile_helpers_cover_omitted_diagnostics_and_error_categories
         FakeLlama,
     )
     assert kwargs == {}
-    assert diagnostics["profile_id"] == model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q8
+    assert diagnostics["profile_id"] == "qwen64k_kv_q8_fa_balanced_batch"
     assert diagnostics["omitted"]["type_v"] == "worker_capability_unsupported"
 
     assert (
@@ -8896,10 +11497,10 @@ def test_qwen_64k_readiness_recovery_accepts_decode_failure_categories(monkeypat
         manager._qwen_64k_first_readiness_failure_category = None
         manager._qwen_64k_first_readiness_failure_diagnostics = {}
         manager._qwen_64k_selected_profile_index = 0
-        manager._qwen_64k_selected_profile_id = "qwen64k_f16_fa_small_batch"
+        manager._qwen_64k_selected_profile_id = "qwen64k_kv_q8_fa_small_batch"
         manager._qwen_64k_runtime_profiles = [
-            {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
-            {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
+            {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal", "kv_precision": "q8", "batch_profile": "safe"}},
+            {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal", "kv_precision": "f16", "batch_profile": "safe"}},
         ]
         monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock())
         monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=replacement_runtime))
@@ -8943,16 +11544,16 @@ def test_qwen_64k_readiness_recovery_preserves_first_failure_across_profiles(mon
     manager._qwen_64k_profile_recovery_count = 0
     manager._qwen_64k_first_readiness_failure_category = None
     manager._qwen_64k_selected_profile_index = 0
-    manager._qwen_64k_selected_profile_id = "qwen64k_f16_fa_small_batch"
+    manager._qwen_64k_selected_profile_id = "qwen64k_kv_q8_fa_small_batch"
     manager._qwen_64k_runtime_profiles = [
-        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal"}},
-        {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal"}},
-        {"profile_id": "qwen64k_kv_q4_fa_small_batch", "diagnostics": {"backend": "metal"}},
+        {"profile_id": "qwen64k_kv_q8_fa_small_batch", "diagnostics": {"backend": "metal", "kv_precision": "q8", "batch_profile": "safe"}},
+        {"profile_id": "qwen64k_f16_fa_small_batch", "diagnostics": {"backend": "metal", "kv_precision": "f16", "batch_profile": "safe"}},
+        {"profile_id": "qwen64k_kv_q4_fa_small_batch", "diagnostics": {"backend": "metal", "kv_precision": "q4", "batch_profile": "safe"}},
     ]
     monkeypatch.setattr(manager, "_close_llm_proxy", MagicMock())
     monkeypatch.setattr(manager, "get_llm_instance", MagicMock(return_value=second_runtime))
 
-    # First failure: F16 fails with backend_graph_compute_failure
+    # First failure: Q8 fails with a permitted non-memory compatibility failure.
     result1 = manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
         first_runtime,
         "backend_graph_compute_failure",
@@ -8963,7 +11564,7 @@ def test_qwen_64k_readiness_recovery_preserves_first_failure_across_profiles(mon
     assert manager._qwen_64k_profile_recovery_count == 1
     assert manager._qwen_64k_selected_profile_index == 1
 
-    # Second failure: Q8 fails with metal_command_buffer_out_of_memory
+    # Second failure: F16 fails with positively classified memory pressure.
     manager.llm = second_runtime
     manager.get_llm_instance = MagicMock(return_value=third_runtime)
     result2 = manager.reinitialize_qwen_64k_with_next_profile_after_readiness_failure(
@@ -8978,10 +11579,65 @@ def test_qwen_64k_readiness_recovery_preserves_first_failure_across_profiles(mon
     assert manager._qwen_64k_selected_profile_index == 2
 
 
-def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
+def test_qwen_64k_q8_context_memory_failure_retries_q4_profile(tmp_path):
     from utils.context_profiles import apply_context_profile
 
     attempts = []
+    config = MagicMock(is_production=False)
+    values = {
+        'model.profile_id': 'qwen3-8b-q4-k-m',
+        'model.context_size': 8192,
+        'model.use_mock': False,
+        'model.n_gpu_layers': -1,
+        'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
+        'model.enforce_gpu_memory_headroom': False,
+        'paths.models_dir': str(tmp_path),
+    }
+    config.get.side_effect = lambda key, default=None: values.get(key, default)
+    config.set.side_effect = lambda key, value: values.__setitem__(key, value)
+    manager = ModelManager(config)
+    apply_context_profile(manager, '64k-full')
+    Path(manager.model_path).write_text('fake')
+
+    class FakeLlama:
+        def __init__(self, **kwargs):
+            attempts.append(dict(kwargs))
+            if kwargs.get('type_k') == 8:
+                raise ValueError('Failed to create llama_context: Metal KV cache allocation failed')
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            return '<qwen>'
+
+    fake_llama_cpp = SimpleNamespace(
+        Llama=FakeLlama,
+        LLAMA_ROPE_SCALING_TYPE_YARN=2,
+        GGML_TYPE_Q8_0=8,
+        GGML_TYPE_Q4_0=2,
+        __file__='/opt/token.place/llama_cpp/__init__.py',
+        __version__='0.3.32',
+    )
+    with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
+        llm = manager.get_llm_instance()
+
+    assert llm is not None
+    assert len(attempts) == 2
+    assert attempts[0]['n_ctx'] == 65536
+    assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
+    assert attempts[1]['type_k'] == 2
+    assert attempts[1]['type_v'] == 2
+    assert attempts[1]['flash_attn'] is True
+    assert attempts[1]['offload_kqv'] is True
+    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_kv_cache_allocation'
+
+
+def test_qwen_64k_q8_memory_failure_without_q4_stops_before_f16(tmp_path):
+    from utils.context_profiles import apply_context_profile
+
+    attempts = []
+    failed_attempts = []
     config = MagicMock(is_production=False)
     values = {
         'model.profile_id': 'qwen3-8b-q4-k-m',
@@ -8998,36 +11654,63 @@ def test_qwen_64k_context_create_failure_retries_q8_profile(tmp_path):
     apply_context_profile(manager, '64k-full')
     Path(manager.model_path).write_text('fake')
 
+    class ClosableMemoryFailure(ValueError):
+        def __init__(self):
+            super().__init__('Failed to create llama_context: CUDA out of memory SECRET_PAYLOAD')
+            self.close = MagicMock()
+
     class FakeLlama:
         def __init__(self, **kwargs):
             attempts.append(dict(kwargs))
-            if 'type_k' not in kwargs:
-                raise ValueError('Failed to create llama_context: Metal KV cache allocation failed')
+            failure = ClosableMemoryFailure()
+            failed_attempts.append(failure)
+            raise failure
 
-        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
-            return '<qwen>'
-
+    q8_profile = {
+        'profile_id': 'qwen64k_kv_q8_fa_small_batch',
+        'kwargs': {'type_k': 8, 'type_v': 8, 'flash_attn': True, 'offload_kqv': True},
+        'diagnostics': {
+            'profile_id': 'qwen64k_kv_q8_fa_small_batch',
+            'preferred_profile_id': 'qwen64k_kv_q8_fa_small_batch',
+            'kv_precision': 'q8',
+            'applied': {'type_k': 8, 'type_v': 8, 'flash_attn': True, 'offload_kqv': True},
+            'backend': 'cuda',
+        },
+    }
+    f16_profile = {
+        'profile_id': 'qwen64k_f16_fa_small_batch',
+        'kwargs': {'flash_attn': True, 'offload_kqv': True},
+        'diagnostics': {
+            'profile_id': 'qwen64k_f16_fa_small_batch',
+            'kv_precision': 'f16',
+            'applied': {'flash_attn': True, 'offload_kqv': True},
+            'backend': 'cuda',
+        },
+    }
     fake_llama_cpp = SimpleNamespace(
         Llama=FakeLlama,
         LLAMA_ROPE_SCALING_TYPE_YARN=2,
-        GGML_TYPE_Q8_0=8,
         __file__='/opt/token.place/llama_cpp/__init__.py',
-        __version__='0.3.32',
     )
     with patch('utils.llm.model_manager._import_llama_cpp_runtime', return_value=fake_llama_cpp), \
-         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
-        llm = manager.get_llm_instance()
+         patch('utils.llm.model_manager._build_qwen_64k_runtime_profiles', return_value=[q8_profile, f16_profile]), \
+         patch.object(manager, '_runtime_capabilities', return_value={'backend': 'cuda', 'gpu_offload_supported': True, 'error': None}):
+        assert manager.get_llm_instance() is None
 
-    assert llm is not None
-    assert len(attempts) == 2
-    assert attempts[0]['n_ctx'] == 65536
-    assert 'type_k' not in attempts[0]
-    assert attempts[1]['type_k'] == 8
-    assert attempts[1]['type_v'] == 8
-    assert attempts[1]['flash_attn'] is True
-    assert attempts[1]['offload_kqv'] is True
-    assert manager.last_compute_diagnostics['qwen_64k_memory_profile']['profile_id'] == 'qwen64k_kv_q8_fa_small_batch'
-    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_kv_cache_allocation'
+    assert len(attempts) == 1
+    assert attempts[0]['type_k'] == attempts[0]['type_v'] == 8
+    assert failed_attempts[0].close.call_count == 1
+    assert manager.llm is None
+    assert manager.last_compute_diagnostics['api_v1_runtime_ready'] is False
+    assert manager.last_compute_diagnostics['api_v1_readiness_result'] == 'failed'
+    assert manager._qwen_64k_profile_attempt_ids == ['qwen64k_kv_q8_fa_small_batch']
+    assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == 'runtime_context_create_cuda_memory'
+    assert manager.last_compute_diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category'] == 'runtime_context_create_cuda_memory'
+    assert manager.last_compute_diagnostics['api_v1_readiness_qwen_64k_runtime_profile_fallback_reason'] == 'memory_pressure'
+    assert 'profile exhaustion before registration' in manager.last_runtime_init_error
+    assert 'SECRET_PAYLOAD' not in manager.last_runtime_init_error
+    assert 'type_k' not in f16_profile['kwargs']
+    assert 'type_v' not in f16_profile['kwargs']
 
 
 def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
@@ -9042,6 +11725,7 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'paths.models_dir': str(tmp_path),
     }
@@ -9076,11 +11760,10 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
          patch.object(manager, '_runtime_capabilities', return_value={'backend': 'metal', 'gpu_offload_supported': True, 'error': None}):
         assert manager.get_llm_instance() is None
 
-    assert len(attempts) == 3
+    assert len(attempts) == 2
     assert manager.llm is None
     assert manager.last_qwen_64k_init_failures
     assert [failure['safe_error_category'] for failure in manager.last_qwen_64k_init_failures] == [
-        'runtime_context_create_metal_buffer_limit',
         'runtime_context_create_metal_buffer_limit',
         'runtime_context_create_metal_buffer_limit',
     ]
@@ -9120,7 +11803,7 @@ def test_qwen_64k_all_profiles_fail_closed_before_registration(tmp_path):
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_result'] == 'failed'
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category'] == 'runtime_context_create_metal_buffer_limit'
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_attempt_ids'] == (
-        'qwen64k_f16_fa_small_batch,qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
+        'qwen64k_kv_q8_fa_small_batch,qwen64k_kv_q4_fa_small_batch'
     )
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_id'] == 'qwen64k_kv_q4_fa_small_batch'
     assert diagnostics['api_v1_readiness_backend_used'] == 'metal'
@@ -9197,6 +11880,7 @@ def test_qwen_64k_subprocess_initialization_failures_are_safe_one_attempt(
         'model.use_mock': False,
         'model.n_gpu_layers': -1,
         'model.gpu_mode': 'gpu',
+        'model.qwen_64k_batch_profile': 'safe',
         'model.enforce_gpu_memory_headroom': False,
         'model.download_chunk_size_mb': 1,
         'paths.models_dir': str(tmp_path),
@@ -9254,12 +11938,12 @@ def test_qwen_64k_subprocess_initialization_failures_are_safe_one_attempt(
     assert manager.llm is None
     assert manager.last_qwen_64k_init_failures
     assert [failure['profile_id'] for failure in manager.last_qwen_64k_init_failures] == [
-        'qwen64k_f16_fa_small_batch'
+        'qwen64k_kv_q8_fa_small_batch'
     ]
     assert manager.last_qwen_64k_init_failures[0]['safe_error_category'] == expected_category
     assert manager.last_compute_diagnostics['api_v1_runtime_ready'] is False
     assert manager.last_compute_diagnostics['api_v1_readiness_qwen_64k_runtime_profile_attempt_ids'] == (
-        'qwen64k_f16_fa_small_batch'
+        'qwen64k_kv_q8_fa_small_batch'
     )
     serialized = (
         str(manager.last_runtime_init_error)
@@ -9380,6 +12064,8 @@ def test_qwen_64k_failure_readiness_publisher_handles_empty_and_non_dict_kwargs(
     manager.last_compute_diagnostics = {'existing': 'unchanged'}
     manager._qwen_64k_profile_attempt_ids = ['qwen64k_f16_fa_small_batch']
     manager.last_qwen_64k_memory_profile_diagnostics = {
+        'kv_precision': 'q4',
+        'fallback_reason': 'memory_pressure',
         'applied': {
             'type_k': 8,
             'type_v': 8,
@@ -9407,11 +12093,43 @@ def test_qwen_64k_failure_readiness_publisher_handles_empty_and_non_dict_kwargs(
 
     diagnostics = manager.last_compute_diagnostics
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_type_k'] == 8
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_kv_precision'] == 'q4'
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_fallback_reason'] == 'memory_pressure'
     assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_result'] == 'failed'
     assert (
         diagnostics['api_v1_readiness_qwen_64k_runtime_profile_failure_category']
         == 'runtime_context_create_cuda_memory'
     )
+
+
+def test_qwen_64k_failure_readiness_publisher_prefers_persisted_transition_reason():
+    manager = object.__new__(ModelManager)
+    manager._qwen_64k_profile_attempt_ids = [
+        'qwen64k_kv_q8_fa_small_batch',
+        'qwen64k_kv_q4_fa_small_batch',
+    ]
+    manager._qwen_64k_selected_profile_fallback_reason = 'memory_pressure'
+    manager.last_qwen_64k_memory_profile_diagnostics = {
+        'kv_precision': 'q4',
+        'fallback_reason': 'compatibility_failure',
+        'applied': {},
+    }
+
+    manager._publish_qwen_64k_init_failure_readiness_diagnostics(
+        compute_plan={'backend_used': 'cuda'},
+        profile_failures=[{
+            'profile_id': 'qwen64k_kv_q4_fa_small_batch',
+            'safe_error_category': 'runtime_context_create_failed',
+            'attempted_runtime_kwargs': {},
+        }],
+    )
+
+    diagnostics = manager.last_compute_diagnostics
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_preferred_profile_id'] == (
+        'qwen64k_kv_q8_fa_balanced_batch'
+    )
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_kv_precision'] == 'q4'
+    assert diagnostics['api_v1_readiness_qwen_64k_runtime_profile_fallback_reason'] == 'memory_pressure'
 
 
 def test_qwen_64k_failure_readiness_publisher_falls_back_to_attempted_profile_ids():
@@ -10863,7 +13581,7 @@ def test_qwen_64k_recovery_exhaustion_and_lifecycle_edge_coverage(monkeypatch):
     manager._close_llm_proxy.assert_called_once_with(failed_runtime)
     manager.get_llm_instance.assert_not_called()
     assert manager.llm is None
-    assert manager._qwen_64k_selected_profile_index == 1
+    assert manager._qwen_64k_selected_profile_index == 0
     assert manager._qwen_64k_first_readiness_failure_diagnostics["method"] == "create_completion"
 
     class BadProcess:
@@ -10920,14 +13638,15 @@ def test_complete_cuda_desktop_probe_is_authoritative_without_reprobe(monkeypatc
         facade.Llama,
         model_path=__file__,
         n_ctx=65536,
+        batch_profile='safe',
     )
 
     assert diagnostics['supported'] is True
     assert diagnostics['child_probe_reprobe_attempted'] is False
     assert diagnostics['child_probe_reprobe_skipped_reason'] == 'desktop_probe_authoritative'
     assert [profile['profile_id'] for profile in profiles] == [
-        model_manager_module.QWEN_64K_RUNTIME_PROFILE_DEFAULT,
         model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q8,
+        model_manager_module.QWEN_64K_RUNTIME_PROFILE_F16,
         model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q4,
     ]
     assert profiles[0]['diagnostics']['backend'] == 'cuda'
@@ -11410,3 +14129,579 @@ def test_subprocess_worker_identity_mismatch_fails_before_constructor_without_le
     assert str(module_path) not in message
     assert str(other) not in message
     assert probe['llama_module_identity'] not in message
+
+@pytest.mark.parametrize(
+    ('batch_profile', 'expected'),
+    [('safe', (256, 128)), ('balanced', (512, 256)), ('experimental', (1024, 512))],
+)
+def test_qwen_64k_batch_profiles_have_exact_values_and_unique_structured_ids(batch_profile, expected):
+    from utils.llm.model_manager import _build_qwen_64k_runtime_profiles
+
+    class Llama:
+        def __init__(self, *, type_k=None, type_v=None, flash_attn=None, offload_kqv=None, n_batch=None, n_ubatch=None):
+            pass
+
+    module = SimpleNamespace(
+        Llama=Llama, GGML_TYPE_Q8_0=8, GGML_TYPE_Q4_0=2,
+        __file__='/opt/llama_cpp/__init__.py', __version__='0.3.32',
+    )
+    profiles = _build_qwen_64k_runtime_profiles(
+        module, Llama, model_path='model.gguf', n_ctx=65536, batch_profile=batch_profile,
+    )
+    combinations = [(p['diagnostics']['kv_precision'], p['diagnostics']['batch_profile']) for p in profiles]
+    assert len(combinations) == len(set(combinations))
+    q8 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q8' and p['diagnostics']['batch_profile'] == batch_profile)
+    assert (q8['kwargs']['n_batch'], q8['kwargs']['n_ubatch']) == expected
+    assert q8['diagnostics']['preferred_profile_id'] == q8['profile_id']
+    assert all(p['kwargs']['n_batch'] >= p['kwargs']['n_ubatch'] > 0 for p in profiles)
+    q4 = next(p for p in profiles if p['diagnostics']['kv_precision'] == 'q4')
+    assert (q4['kwargs']['n_batch'], q4['kwargs']['n_ubatch']) == (256, 128)
+
+
+def test_qwen_64k_batch_profile_normalization_defaults_safely_without_implicit_experimental():
+    from utils.llm.model_manager import normalize_qwen_64k_batch_profile
+
+    assert normalize_qwen_64k_batch_profile(None) == 'balanced'
+    assert normalize_qwen_64k_batch_profile('unknown') == 'balanced'
+    assert normalize_qwen_64k_batch_profile(' experimental ') == 'balanced'
+    assert normalize_qwen_64k_batch_profile('experimental') == 'experimental'
+
+
+def test_qwen_64k_readiness_budget_covers_all_remaining_runtime_profiles():
+    manager = object.__new__(ModelManager)
+    manager.model_profile = {'provider': 'qwen'}
+    manager.context_tier = '64k-full'
+    manager._qwen_64k_selected_profile_index = 0
+    manager._qwen_64k_runtime_profiles = [
+        {'profile_id': f'profile-{index}'} for index in range(7)
+    ]
+
+    assert manager.qwen_64k_readiness_profile_attempt_budget() == 7
+    manager._qwen_64k_selected_profile_index = 3
+    assert manager.qwen_64k_readiness_profile_attempt_budget() == 4
+
+
+@pytest.mark.parametrize(
+    ("requested", "precision", "category", "expected"),
+    [
+        ("safe", "q8", "runtime_context_create_cuda_memory", [("q8", "safe"), ("q4", "safe")]),
+        ("balanced", "q8", "runtime_context_create_cuda_memory", [("q8", "balanced"), ("q8", "safe"), ("q4", "safe")]),
+        ("experimental", "q8", "runtime_context_create_cuda_memory", [("q8", "experimental"), ("q8", "balanced"), ("q8", "safe"), ("q4", "safe")]),
+        ("safe", "f16", "runtime_context_create_cuda_memory", [("f16", "safe"), ("q4", "safe")]),
+        ("balanced", "f16", "runtime_context_create_cuda_memory", [("f16", "balanced"), ("f16", "safe"), ("q4", "safe")]),
+        ("experimental", "f16", "runtime_context_create_cuda_memory", [("f16", "experimental"), ("f16", "balanced"), ("f16", "safe"), ("q4", "safe")]),
+    ],
+)
+def test_qwen_64k_structured_memory_fallback_graph(requested, precision, category, expected):
+    from utils.llm import model_manager as model_manager_module
+
+    profiles = [
+        {
+            "profile_id": model_manager_module._qwen_64k_profile_id(kv_precision, batch_profile),
+            "diagnostics": {"kv_precision": kv_precision, "batch_profile": batch_profile},
+        }
+        for batch_profile in ("experimental", "balanced", "safe")
+        for kv_precision in ("q8", "f16")
+        if batch_profile in ({"experimental", "balanced", "safe"} if requested == "experimental" else {requested, "safe"})
+    ]
+    profiles.append({
+        "profile_id": model_manager_module.QWEN_64K_RUNTIME_PROFILE_Q4,
+        "diagnostics": {"kv_precision": "q4", "batch_profile": "safe"},
+    })
+    active = model_manager_module._qwen_64k_profile_id(precision, requested)
+    attempts = []
+    while active:
+        profile = next(item for item in profiles if item["profile_id"] == active)
+        attempts.append((profile["diagnostics"]["kv_precision"], profile["diagnostics"]["batch_profile"]))
+        next_index = model_manager_module._next_qwen_64k_runtime_profile_index(profiles, active, category)
+        active = profiles[next_index]["profile_id"] if next_index is not None else None
+
+    assert attempts == expected
+    assert len(attempts) == len(set(attempts))
+    if requested != "experimental":
+        assert all(batch_profile != "experimental" for _, batch_profile in attempts)
+    if attempts[-1][0] == "q4":
+        assert model_manager_module.QWEN_64K_BATCH_PROFILES[attempts[-1][1]] == {"n_batch": 256, "n_ubatch": 128}
+
+
+@pytest.mark.parametrize("batch_profile", ["safe", "balanced", "experimental"])
+def test_qwen_64k_q8_compatibility_fallback_stays_in_same_batch_without_q4(batch_profile):
+    from utils.llm import model_manager as model_manager_module
+
+    profiles = [
+        {
+            "profile_id": model_manager_module._qwen_64k_profile_id(precision, batch_profile),
+            "diagnostics": {"kv_precision": precision, "batch_profile": batch_profile},
+        }
+        for precision in ("q8", "f16")
+    ]
+    q8_id = profiles[0]["profile_id"]
+    next_index = model_manager_module._next_qwen_64k_runtime_profile_index(
+        profiles, q8_id, "runtime_context_create_unsupported_kwarg"
+    )
+    assert profiles[next_index]["diagnostics"] == {"kv_precision": "f16", "batch_profile": batch_profile}
+    assert model_manager_module._next_qwen_64k_runtime_profile_index(
+        profiles, profiles[next_index]["profile_id"], "runtime_context_create_failed"
+    ) is None
+    assert model_manager_module._next_qwen_64k_runtime_profile_index(
+        profiles, "qwen64k_unknown_profile", "runtime_context_create_cuda_memory"
+    ) is None
+
+
+def _write_minimal_gguf(path, metadata):
+    def s(value):
+        data = value.encode('utf-8')
+        return len(data).to_bytes(8, 'little') + data
+    payload = bytearray(b'GGUF')
+    payload += (3).to_bytes(4, 'little')
+    payload += (0).to_bytes(8, 'little')
+    payload += len(metadata).to_bytes(8, 'little')
+    for key, value in metadata.items():
+        payload += s(key)
+        if isinstance(value, str):
+            payload += (8).to_bytes(4, 'little') + s(value)
+        elif isinstance(value, bool):
+            payload += (7).to_bytes(4, 'little') + int(value).to_bytes(1, 'little')
+        elif isinstance(value, int):
+            payload += (4).to_bytes(4, 'little') + value.to_bytes(4, 'little')
+        elif isinstance(value, float):
+            import struct
+
+            payload += (6).to_bytes(4, 'little') + struct.pack('<f', value)
+        elif isinstance(value, list):
+            payload += (9).to_bytes(4, 'little')
+            if all(isinstance(item, str) for item in value):
+                payload += (8).to_bytes(4, 'little')
+                payload += len(value).to_bytes(8, 'little')
+                for item in value:
+                    payload += s(item)
+            elif all(isinstance(item, int) for item in value):
+                payload += (4).to_bytes(4, 'little')
+                payload += len(value).to_bytes(8, 'little')
+                for item in value:
+                    payload += item.to_bytes(4, 'little')
+            else:
+                raise TypeError(value)
+        else:
+            raise TypeError(value)
+    path.write_bytes(bytes(payload))
+
+
+
+
+def _llama_cpp_kv_fixture():
+    return json.loads((Path(__file__).parent.parent / 'fixtures' / 'llama_cpp_kv_allocation_b3fed31b9.json').read_text())
+
+
+def test_parse_pinned_llama_cpp_kv_allocation_diagnostic_precision_and_devices():
+    from utils.llm import model_manager as module
+
+    result = module.parse_llama_cpp_kv_allocation_diagnostics([
+        'llama_kv_cache_unified: Metal0 KV buffer size = 100.00 MiB',
+        'llama_kv_cache_unified: Metal1 KV buffer size = 20.00 MiB',
+    ])
+    assert result['observed_bytes'] == 120 * 1024 * 1024
+    assert result['precision_bytes'] == 2 * 5243
+    assert result['record_count'] == 2
+    assert 'Metal0' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('lines, code', [
+    ([], 'kv_runtime_diagnostic_missing'),
+    (['llama_kv_cache_unified: Metal0 KV buffer size = 1.00 MiB'] * 2,
+     'kv_runtime_diagnostic_ambiguous'),
+    (['llama_kv_cache_unified: Metal0 KV buffer size = 1.0 MiB',
+      'llama_kv_cache_unified: Metal1 KV buffer size = 1.00 MiB'],
+     'kv_runtime_diagnostic_mixed_precision'),
+])
+def test_parse_pinned_llama_cpp_kv_allocation_diagnostic_fails_closed(lines, code):
+    from utils.llm import model_manager as module
+
+    with pytest.raises(ValueError, match=code):
+        module.parse_llama_cpp_kv_allocation_diagnostics(lines)
+
+
+def test_initialization_diagnostic_barrier_waits_for_delayed_reader():
+    from utils.llm import model_manager as module
+
+    proxy = object.__new__(module._SubprocessLlamaProxy)
+    proxy._stderr_activity = threading.Event()
+    delayed = threading.Thread(target=lambda: (time.sleep(0.075), proxy._stderr_activity.set()))
+    started = time.monotonic()
+    delayed.start()
+    proxy._wait_for_initialization_stderr()
+    delayed.join()
+    assert time.monotonic() - started >= 0.1
+
+def _qwen3_8b_metadata():
+    return {
+        'general.architecture': 'qwen3',
+        'qwen3.block_count': 36,
+        'qwen3.attention.head_count': 32,
+        'qwen3.attention.head_count_kv': 8,
+        'qwen3.attention.key_length': 128,
+        'qwen3.attention.value_length': 128,
+        'qwen3.embedding_length': 4096,
+    }
+
+
+@pytest.mark.parametrize(
+    ('ggml_type', 'elements', 'expected'),
+    [
+        ('f16', 31, 62),
+        ('f16', 32, 64),
+        ('q8', 32, 34),
+        ('q4', 32, 18),
+    ],
+)
+def test_qwen_64k_ggml_block_row_accounting_rejects_naive_quantized_bytes(ggml_type, elements, expected):
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._ggml_row_size_bytes(elements, ggml_type) == expected
+
+
+@pytest.mark.parametrize(('ggml_type', 'elements'), [('q8', 31), ('q8', 33), ('q4', 31), ('q4', 33)])
+def test_qwen_64k_ggml_quantized_rows_reject_invalid_block_widths(ggml_type, elements):
+    from utils.llm import model_manager as model_manager_module
+
+    with pytest.raises(ValueError, match='ggml_row_width_not_block_divisible'):
+        model_manager_module._ggml_row_size_bytes(elements, ggml_type)
+
+
+def test_qwen_64k_tensor_allocation_aligns_each_kv_tensor():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._ggml_tensor_2d_allocation_bytes(1, 1, 'f16') == 32
+    assert model_manager_module._ggml_tensor_2d_allocation_bytes(32, 1, 'q4') == 32
+    assert model_manager_module._ggml_tensor_2d_allocation_bytes(64, 1, 'q8') == 96
+    for case in _llama_cpp_kv_fixture()['boundary_cases']:
+        assert model_manager_module._ggml_tensor_2d_allocation_bytes(
+            case['rows'], case['columns'], case['type'], case['backend']
+        ) == case['allocation_bytes']
+        breakdown = model_manager_module._ggml_tensor_2d_allocation_breakdown(
+            case['rows'], case['columns'], case['type'], case['backend']
+        )
+        assert breakdown['logical_payload_bytes'] == case['logical_payload_bytes']
+        assert breakdown['backend_tail_padding_bytes'] == case['backend_tail_padding_bytes']
+        assert breakdown['allocator_alignment_padding_bytes'] == case['allocator_alignment_padding_bytes']
+    with pytest.raises(ValueError, match='ggml_row_width_not_block_divisible'):
+        model_manager_module._ggml_tensor_2d_allocation_bytes(33, 1, 'q8')
+
+
+def test_qwen_64k_estimate_uses_separate_k_v_dimensions_types_and_gqa():
+    from utils.llm import model_manager as model_manager_module
+
+    metadata = {
+        'general.architecture': 'qwen3',
+        'qwen3.block_count': 3,
+        'qwen3.attention.head_count': 12,
+        'qwen3.attention.head_count_kv': 4,
+        'qwen3.attention.key_length': 80,
+        'qwen3.attention.value_length': 96,
+    }
+    result = model_manager_module._estimate_kv_cache_bytes_from_metadata(metadata, 17, 'q8', 'q4', 'metal')
+
+    assert result['gqa_groups'] == 3
+    assert result['n_embd_k_gqa'] == 320
+    assert result['n_embd_v_gqa'] == 384
+    assert result['k_row_size_bytes'] == 340
+    assert result['v_row_size_bytes'] == 216
+    assert result['requested_context_size_tokens'] == 17
+    assert result['allocated_context_size_tokens'] == 256
+    assert result['kv_cache_bytes'] == (87040 + 55296) * 3
+
+
+@pytest.mark.parametrize('case', _llama_cpp_kv_fixture()['qwen3_8b_metal'])
+def test_qwen3_8b_reference_kv_bytes_match_ggml_block_evidence(tmp_path, case):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    estimate = model_manager_module._qwen_64k_memory_estimate(
+        model, case['requested_context_tokens'], case['type_k'], 'metal'
+    )
+
+    assert estimate['exact_kv_cache_bytes'] == case['backend_buffer_bytes']
+    assert estimate['kv_cache_breakdown']['allocated_context_size_tokens'] == case['allocated_context_tokens']
+    assert estimate['kv_cache_breakdown']['k_tensor_payload_bytes_total'] == case['logical_k_bytes_total']
+    assert estimate['kv_cache_breakdown']['v_tensor_payload_bytes_total'] == case['logical_v_bytes_total']
+    assert estimate['metadata_source'] == 'gguf_header'
+    assert estimate['conservative_fallback_used'] is False
+
+
+def test_qwen_64k_gguf_metadata_parser_skips_common_non_required_types(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3_with_tokenizer_arrays.gguf'
+    metadata = {
+        'general.architecture': 'qwen3',
+        'general.alignment': 32,
+        'tokenizer.ggml.tokens': ['<unk>'] * 5000,
+        'tokenizer.ggml.scores': [1, 2, 3],
+        'tokenizer.ggml.add_bos_token': True,
+        'qwen3.block_count': 36,
+        'qwen3.attention.head_count': 32,
+        'qwen3.attention.head_count_kv': 8,
+        'qwen3.attention.key_length': 128,
+        'qwen3.attention.value_length': 128,
+        'qwen3.embedding_length': 4096,
+        'qwen3.rope.freq_base': 1000000.0,
+        'tokenizer.ggml.merges': ['a b'] * 5000,
+    }
+    _write_minimal_gguf(model, metadata)
+
+    parsed = model_manager_module._read_gguf_metadata(model)
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'cuda')
+
+    assert parsed['general.architecture'] == 'qwen3'
+    assert parsed['qwen3.block_count'] == 36
+    assert 'tokenizer.ggml.tokens' not in parsed
+    assert estimate['metadata_source'] == 'gguf_header'
+    assert estimate['conservative_fallback_used'] is False
+    assert estimate['exact_kv_cache_bytes'] == 641728512
+
+
+def test_llama_cpp_kv_fixture_provenance_pin_is_exact_full_sha():
+    fixture = _llama_cpp_kv_fixture()
+    commit = fixture['provenance']['llama_cpp_commit']
+
+    assert commit == 'b3fed31b99f9bd37725833674252bccb429bb183'
+    assert re.fullmatch(r'[0-9a-f]{40}', commit)
+
+
+@pytest.mark.parametrize('required_key', [
+    'qwen3.attention.head_count_kv',
+    'qwen3.attention.key_length',
+    'qwen3.attention.value_length',
+])
+def test_qwen_64k_required_array_metadata_fails_closed_without_exact_fields(tmp_path, required_key):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'required_array.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata[required_key] = [8 if required_key.endswith('head_count_kv') else 128]
+    _write_minimal_gguf(model, metadata)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'metal')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+    assert estimate['estimated_kv_cache_bytes'] >= 2147483648
+    assert estimate['exact_kv_cache_bytes'] is None
+    assert estimate['exact_kv_payload_bytes'] is None
+    assert estimate['exact_kv_allocation_bytes'] is None
+    assert estimate['kv_cache_breakdown']['exact_allocation_available'] is False
+
+
+def test_toy_architecture_is_not_in_production_exact_layout_allowlist():
+    from utils.llm import model_manager as model_manager_module
+
+    assert 'toy' not in model_manager_module.SUPPORTED_STANDARD_KV_ARCHITECTURES
+    with pytest.raises(ValueError, match='kv_layout_architecture_unsupported'):
+        model_manager_module._estimate_kv_cache_bytes_from_metadata(
+            {
+                'general.architecture': 'toy',
+                'toy.block_count': 1,
+                'toy.attention.head_count': 1,
+                'toy.attention.head_count_kv': 1,
+                'toy.attention.key_length': 32,
+                'toy.attention.value_length': 32,
+            },
+            256,
+            'q8',
+            'q8',
+        )
+
+def test_qwen_64k_profile_diagnostics_include_breakdown_and_preserve_order(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    class Llama:
+        def __init__(self, *, type_k=None, type_v=None, flash_attn=None, offload_kqv=None, n_batch=None, n_ubatch=None):
+            pass
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    module = SimpleNamespace(Llama=Llama, GGML_TYPE_Q8_0=8, GGML_TYPE_Q4_0=2, GGML_TYPE_F16=1, __version__='0.3.32', __token_place_worker_capabilities__={'backend': 'metal'})
+
+    profiles = model_manager_module._build_qwen_64k_runtime_profiles(module, Llama, model_path=model, n_ctx=65536, batch_profile='experimental')
+
+    assert [(p['diagnostics']['kv_precision'], p['diagnostics']['batch_profile']) for p in profiles] == [
+        ('q8', 'experimental'), ('f16', 'experimental'),
+        ('q8', 'balanced'), ('f16', 'balanced'),
+        ('q8', 'safe'), ('f16', 'safe'), ('q4', 'safe'),
+    ]
+    assert profiles[0]['diagnostics']['memory_estimate']['exact_kv_cache_bytes'] == 5133828096
+    assert profiles[-1]['diagnostics']['memory_estimate']['exact_kv_cache_bytes'] == 2717908992
+
+
+
+def test_qwen_64k_memory_estimate_uses_batch_profile_without_changing_exact_kv(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    safe = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'safe')
+    balanced = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'balanced')
+    experimental = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'experimental')
+
+    assert safe['exact_kv_cache_bytes'] == balanced['exact_kv_cache_bytes'] == experimental['exact_kv_cache_bytes']
+    assert safe['batch_dependent_buffer_bytes'] < balanced['batch_dependent_buffer_bytes'] < experimental['batch_dependent_buffer_bytes']
+    assert safe['estimated_total_runtime_bytes'] < balanced['estimated_total_runtime_bytes'] < experimental['estimated_total_runtime_bytes']
+    assert balanced['model_weights_bytes'] == balanced['model_file_size_bytes']
+    assert balanced['exact_kv_payload_bytes'] <= balanced['exact_kv_allocation_bytes']
+
+
+def test_qwen_64k_gguf_metadata_cache_reuses_stable_file_identity(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    model_manager_module.GGUF_METADATA_CACHE.clear()
+    first = model_manager_module._read_gguf_metadata(model)
+
+    def fail_open(*args, **kwargs):
+        raise AssertionError('cached metadata should avoid reparsing')
+
+    monkeypatch.setattr(model_manager_module, 'open', fail_open, raising=False)
+    second = model_manager_module._read_gguf_metadata(model)
+
+    assert first == second
+
+
+def test_qwen_64k_checked_math_rejects_int64_boundary_overflow():
+    from utils.llm import model_manager as model_manager_module
+
+    assert model_manager_module._checked_add((2 ** 63) - 2, 1, 'boundary') == (2 ** 63) - 1
+    with pytest.raises(OverflowError, match='boundary_overflow'):
+        model_manager_module._checked_add((2 ** 63) - 1, 1, 'boundary')
+    with pytest.raises(OverflowError, match='boundary_overflow'):
+        model_manager_module._checked_mul(2 ** 62, 2, 'boundary')
+
+@pytest.mark.parametrize(
+    ('precision', 'floor'),
+    [('f16', 4294967296), ('q8', 2147483648), ('q4', 1073741824)],
+)
+def test_qwen_64k_incomplete_metadata_uses_visible_conservative_fallback(tmp_path, precision, floor):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'bad.gguf'
+    _write_minimal_gguf(model, {'general.architecture': 'qwen3'})
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, precision, 'cuda')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['metadata_source'] == 'conservative_qwen3_8b_compatibility_fallback'
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+    assert estimate['estimated_kv_cache_bytes'] >= floor
+    assert estimate['estimated_kv_cache_bytes'] == estimate['legacy_compatibility_floor_bytes']
+    assert estimate['fallback_assumed_shape_kv_cache_bytes'] < estimate['estimated_kv_cache_bytes']
+    assert estimate['exact_kv_cache_bytes'] is None
+    assert estimate['exact_kv_payload_bytes'] is None
+    assert estimate['exact_kv_allocation_bytes'] is None
+    assert estimate['kv_cache_breakdown']['exact_allocation_available'] is False
+
+
+@pytest.mark.parametrize('bad_metadata', [
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 0, 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': True, 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 1.5, 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': '1', 'qwen3.attention.head_count': 1},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 1, 'qwen3.attention.head_count': 3, 'qwen3.attention.head_count_kv': 2, 'qwen3.embedding_length': 12},
+    {'general.architecture': 'qwen3', 'qwen3.block_count': 1, 'qwen3.attention.head_count': 3, 'qwen3.embedding_length': 10},
+])
+def test_qwen_64k_invalid_metadata_is_rejected_by_exact_estimator(bad_metadata):
+    from utils.llm import model_manager as model_manager_module
+
+    with pytest.raises(ValueError):
+        model_manager_module._estimate_kv_cache_bytes_from_metadata(bad_metadata, 8192, 'q8', 'q8')
+
+
+
+def test_qwen_64k_gguf_metadata_rejects_non_integral_architecture_values(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'float_layers.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata['qwen3.block_count'] = 36.5
+    _write_minimal_gguf(model, metadata)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'cuda')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+    assert estimate['estimated_kv_cache_bytes'] >= 2147483648
+    assert estimate['exact_kv_cache_bytes'] is None
+
+
+def test_qwen_64k_gguf_metadata_rejects_truncated_skipped_array_after_required_keys(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'truncated_array.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata['tokenizer.ggml.token_type'] = [1] * 16
+    _write_minimal_gguf(model, metadata)
+    model.write_bytes(model.read_bytes()[:-3])
+
+    with pytest.raises(ValueError, match='gguf_metadata_truncated'):
+        model_manager_module._read_gguf_metadata(model)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'cuda')
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['estimated_kv_cache_bytes'] >= 2147483648
+    assert estimate['exact_kv_cache_bytes'] is None
+
+
+def test_qwen_64k_unknown_backend_is_conservative_non_exact(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 17, 'q8', 'unknown')
+
+    assert estimate['exact_kv_cache_bytes'] is None
+    assert estimate['kv_cache_breakdown']['backend_allocation_mode'] == 'conservative_max_supported_backend'
+    assert estimate['estimated_kv_cache_bytes'] >= 36 * (6016 + 6016)
+
+
+def test_qwen_64k_unsupported_layout_fails_closed_to_non_exact_fallback(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'hybrid.gguf'
+    metadata = _qwen3_8b_metadata()
+    metadata['qwen3.attention.sliding_window'] = 4096
+    _write_minimal_gguf(model, metadata)
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'metal')
+
+    assert estimate['conservative_fallback_used'] is True
+    assert estimate['exact_kv_cache_bytes'] is None
+    assert estimate['conservative_fallback_reason'] == 'ValueError'
+
+
+def test_qwen3_8b_64k_balanced_q8_metal_viability_uses_profile_artifact_size(tmp_path, monkeypatch):
+    from utils.llm import model_manager as model_manager_module
+    from utils.llm.model_profiles import MODEL_PROFILES, QWEN3_8B_PROFILE_ID
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    artifact_size = MODEL_PROFILES[QWEN3_8B_PROFILE_ID]['artifact_size_bytes']
+    monkeypatch.setattr(model_manager_module.os.path, 'getsize', lambda path: artifact_size)
+
+    estimate = model_manager_module._qwen_64k_memory_estimate(model, 65536, 'q8', 'metal', 'balanced')
+
+    assert artifact_size == 5027783488
+    assert estimate['exact_kv_cache_bytes'] == 5133828096
+    assert estimate['conservative_fallback_used'] is False
+    assert estimate['estimated_total_runtime_bytes'] < 24 * 1024 ** 3
+
+def test_qwen_64k_estimates_are_monotonic_for_context_and_quantization(tmp_path):
+    from utils.llm import model_manager as model_manager_module
+
+    model = tmp_path / 'qwen3.gguf'
+    _write_minimal_gguf(model, _qwen3_8b_metadata())
+    q8_8k = model_manager_module._qwen_64k_memory_estimate(model, 8192, 'q8', 'metal')['exact_kv_cache_bytes']
+    q8_32k = model_manager_module._qwen_64k_memory_estimate(model, 32768, 'q8', 'metal')['exact_kv_cache_bytes']
+    f16_32k = model_manager_module._qwen_64k_memory_estimate(model, 32768, 'f16', 'metal')['exact_kv_cache_bytes']
+    q4_32k = model_manager_module._qwen_64k_memory_estimate(model, 32768, 'q4', 'metal')['exact_kv_cache_bytes']
+
+    assert q8_8k < q8_32k
+    assert q4_32k < q8_32k < f16_32k

@@ -1,16 +1,61 @@
 import copy
+import time
 from urllib.parse import urlparse
 
 from api.v1 import compute_provider
 from api.v1.compute_provider import (
+    CompletionResult,
     ComputeProviderError,
     DistributedApiV1ComputeProvider,
     FallbackApiV1ComputeProvider,
     LocalApiV1ComputeProvider,
+    coerce_completion_result,
     get_api_v1_compute_provider_for_mode,
     get_api_v1_resolved_provider_path,
 )
 from relay import app
+
+
+def test_admitted_ttl_rejects_boolean_metadata():
+    assert compute_provider._coerce_admitted_ttl(True) == 0.0
+    assert compute_provider._coerce_admitted_ttl(False) == 0.0
+    assert compute_provider._coerce_admitted_ttl("30") == 30.0
+
+
+def test_completion_result_message_compatibility_contract():
+    message = {"role": "assistant", "content": "hello"}
+    result = CompletionResult(
+        message=message,
+        finish_reason="length",
+        usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        output_budget={"effective_output_tokens": 1},
+    )
+
+    assert result.get("content") == "hello"
+    assert result.get("missing", "fallback") == "fallback"
+    assert result == message
+    assert result == CompletionResult(
+        message=message,
+        finish_reason="length",
+        usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        output_budget={"effective_output_tokens": 1},
+    )
+    assert result != CompletionResult(message=message)
+    assert result != "hello"
+
+
+def test_coerce_completion_result_compatibility_contract():
+    result = CompletionResult(message={"role": "assistant", "content": "current"})
+    assert coerce_completion_result(result) is result
+
+    legacy_message = {"role": "assistant", "content": "legacy"}
+    assert coerce_completion_result(legacy_message) == CompletionResult(message=legacy_message)
+
+    try:
+        coerce_completion_result("not a message")
+        raise AssertionError("expected ComputeProviderError")
+    except ComputeProviderError as exc:
+        assert str(exc) == "assistant response must be a message object"
 
 
 def _clear_distributed_target_env(monkeypatch):
@@ -82,9 +127,19 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
 
     def fake_get(url, timeout, params=None):
         assert url == "https://node-a.example/api/v1/relay/servers/next"
-        assert params == {"model": "qwen3-8b-instruct", "context_tier": "8k-fast"}
+        assert params["model"] == "qwen3-8b-instruct"
+        assert params["context_tier"] == "8k-fast"
+        assert params["client_public_key"] == fake_crypto.public_key_b64
+        assert params["request_id"].startswith("api-v1-")
+        assert params["cancel_token"]
         assert 0 < timeout <= 5
-        return _FakeResponse(200, {"server_public_key": "server-public-key"})
+        return _FakeResponse(200, {
+            "server_public_key": "server-public-key",
+            "reservation_token": "reservation-proof",
+            "requested_model": "qwen3-8b-instruct",
+            "requested_context_tier": "8k-fast",
+            "request_deadline_epoch": time.time() + 5,
+        })
 
     def fake_post(url, json, timeout):
         posted_payloads.append((url, copy.deepcopy(json), timeout))
@@ -146,6 +201,9 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
                 "request_id": fake_crypto._encrypted["cipher-1"]["request_id"],
                 "api_v1_response": {
                     "message": {"role": "assistant", "content": "Distributed secure response"},
+                    "finish_reason": "length",
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                    "output_budget": {"requested_tokens": 8, "available_tokens": 3, "effective_tokens": 3},
                 },
             }
             encrypted_response = fake_crypto.encrypt_message(response_envelope, fake_crypto.public_key_b64)
@@ -167,10 +225,14 @@ def test_distributed_compute_provider_round_trip_uses_e2ee_envelope(monkeypatch)
         options={"temperature": 0.2},
     )
     assert response["content"] == "Distributed secure response"
+    assert response.finish_reason == "length"
+    assert response.usage == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    assert response.output_budget["effective_tokens"] == 3
     relay_request_id = fake_crypto._encrypted["cipher-1"]["request_id"]
     expected_retrieve_payload = {
         "client_public_key": fake_crypto.public_key_b64,
         "request_id": relay_request_id,
+        "retrieval_credential": "reservation-proof",
     }
     assert retrieve_calls == [expected_retrieve_payload] * 8
     assert posted_payloads[0][0] == "https://node-a.example/api/v1/relay/requests"
@@ -910,6 +972,60 @@ def test_distributed_compute_provider_timeout_after_enqueue_posts_single_cancel(
     }
     assert cancel_posts[0][2] == 1.0
 
+
+def test_distributed_compute_provider_accepts_result_after_301_seconds_with_480_ttl(
+    monkeypatch,
+):
+    fake_crypto = _FakeCryptoManager()
+    clock = {"now": 100.0}
+    response_envelope = {
+        "protocol": "tokenplace_api_v1_relay_e2ee",
+        "version": 1,
+        "request_id": None,
+        "client_public_key": fake_crypto.public_key_b64,
+        "api_v1_response": {
+            "message": {"role": "assistant", "content": "completed late"},
+        },
+    }
+
+    monkeypatch.setattr(
+        compute_provider.DistributedApiV1ComputeProvider,
+        "_build_request_crypto_manager",
+        lambda _self: fake_crypto,
+    )
+    monkeypatch.setattr(compute_provider.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        compute_provider.requests,
+        "get",
+        lambda url, timeout, params=None: _FakeResponse(
+            200, {"server_public_key": "server-public-key"}
+        ),
+    )
+
+    def fake_post(url, json, timeout):
+        if url.endswith("/api/v1/relay/requests"):
+            response_envelope["request_id"] = json["request_id"]
+            return _FakeResponse(200, {"request_ttl_seconds": 480})
+        if url.endswith("/api/v1/relay/responses/retrieve"):
+            clock["now"] = 401.0
+            encrypted = fake_crypto.encrypt_message(response_envelope, b"unused")
+            return _FakeResponse(200, encrypted)
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(compute_provider.requests, "post", fake_post)
+    provider = DistributedApiV1ComputeProvider(
+        base_url="https://node-a.example",
+        timeout_seconds=485,
+    )
+
+    result = provider.complete_chat(
+        model_id="llama-3.1-8b-instruct",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert clock["now"] == 401.0
+    assert result.message == {"role": "assistant", "content": "completed late"}
+
 def test_distributed_compute_provider_cancel_failure_does_not_mask_timeout(monkeypatch):
     fake_crypto = _FakeCryptoManager()
     posted = []
@@ -1021,7 +1137,7 @@ def test_get_provider_defaults_invalid_distributed_timeout(monkeypatch):
     try:
         provider = compute_provider.get_api_v1_compute_provider()
         assert isinstance(provider, compute_provider.DistributedApiV1ComputeProvider)
-        assert provider.timeout_seconds == 120.0
+        assert provider.timeout_seconds == 485.0
     finally:
         compute_provider._build_api_v1_compute_provider.cache_clear()
 

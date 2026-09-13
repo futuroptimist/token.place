@@ -1,7 +1,10 @@
 """Tests for the CryptoClient helper class."""
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
+import logging
+import threading
 from typing import Iterator
 
 import pytest
@@ -150,7 +153,21 @@ def test_send_chat_message(_mock_time, mock_requests):
     # Mock responses
     mock_faucet_response = MagicMock()
     mock_faucet_response.status_code = 200
-    mock_faucet_response.json.return_value = {'success': True}
+    mock_faucet_response.json.return_value = {
+        'success': True,
+        'retrieval_credential': 'retrieval-proof',
+    }
+
+    mock_selection_response = MagicMock()
+    mock_selection_response.status_code = 200
+    mock_selection_response.json.return_value = {
+        'server_public_key': base64.b64encode(b'mock_public_key').decode(),
+        'reservation_token': 'reservation-proof',
+        'requested_model': 'qwen3-8b-instruct',
+        'requested_context_tier': '8k-fast',
+        'request_deadline_epoch': 12345.0,
+    }
+    mock_requests.get.return_value = mock_selection_response
 
     mock_retrieve_response = MagicMock()
     mock_retrieve_response.status_code = 200
@@ -765,18 +782,36 @@ def test_send_chat_message_uses_per_request_id_without_shared_state(monkeypatch)
     retrieve_calls = []
 
     monkeypatch.setattr('utils.crypto_helpers.uuid.uuid4', lambda: FixedUuid())
+    selection_response = MagicMock()
+    selection_response.status_code = 200
+    selection_response.json.return_value = {
+        'server_public_key': base64.b64encode(b'request-server-key').decode(),
+        'reservation_token': 'reservation-proof',
+        'requested_model': 'qwen3-8b-instruct',
+        'requested_context_tier': '8k-fast',
+        'request_deadline_epoch': 12345.0,
+    }
+    monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *args, **kwargs: selection_response)
     monkeypatch.setattr(
         client,
-        'encrypt_message',
-        lambda envelope: {'ciphertext': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'},
+        '_encrypt_message_for_key',
+        lambda envelope, key: {'ciphertext': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'},
     )
 
     def fake_send(endpoint, payload):
         sent_payloads.append((endpoint, payload))
-        return {'message': 'Request received'}
+        return {'message': 'Request received', 'retrieval_credential': 'retrieval-proof'}
 
-    def fake_retrieve(max_retries, retry_delay=2, expected_request_id=None, chat_history=None):
-        retrieve_calls.append((max_retries, retry_delay, expected_request_id, chat_history))
+    def fake_retrieve(
+        max_retries,
+        retry_delay=2,
+        expected_request_id=None,
+        chat_history=None,
+        retrieval_credential=None,
+    ):
+        retrieve_calls.append(
+            (max_retries, retry_delay, expected_request_id, chat_history, retrieval_credential)
+        )
         return [{'role': 'assistant', 'content': 'ok'}]
 
     monkeypatch.setattr(client, 'send_encrypted_message', fake_send)
@@ -789,7 +824,7 @@ def test_send_chat_message_uses_per_request_id_without_shared_state(monkeypatch)
     assert sent_payloads[0][1]['request_id'] == 'crypto-client-abc123'
     assert sent_payloads[0][1]['protocol'] == 'tokenplace_api_v1_relay_e2ee'
     assert retrieve_calls == [
-        (7, 2, 'crypto-client-abc123', [{'role': 'user', 'content': 'hello'}])
+        (7, 2, 'crypto-client-abc123', [{'role': 'user', 'content': 'hello'}], 'retrieval-proof')
     ]
     assert not hasattr(client, '_last_chat_relay_request_id')
 
@@ -827,12 +862,17 @@ def test_retrieve_chat_response_filters_with_explicit_request_id(monkeypatch):
         retry_delay=0,
         expected_request_id='req-1',
         chat_history=[{'role': 'user', 'content': 'hi'}],
+        retrieval_credential='retrieval-proof',
     )
 
     assert sent_payloads == [
         (
             'https://test-server.com/api/v1/relay/responses/retrieve',
-            {'client_public_key': 'client-key', 'request_id': 'req-1'},
+            {
+                'client_public_key': 'client-key',
+                'request_id': 'req-1',
+                'retrieval_credential': 'retrieval-proof',
+            },
             10,
         )
     ]
@@ -923,3 +963,257 @@ def test_retrieve_chat_response_api_v1_message_without_original_history(monkeypa
         retry_delay=0,
         expected_request_id='req-1',
     ) == [{'role': 'assistant', 'content': 'done'}]
+
+
+def test_chat_send_proofs_are_bound_request_local_and_secret_safe(monkeypatch, caplog):
+    client = CryptoClient('https://test-server.com')
+    selected_key = base64.b64encode(b'selected-key').decode()
+    selection_calls = []
+    encrypted_plaintexts = []
+    submissions = []
+    retrievals = []
+    barrier = threading.Barrier(2)
+
+    class SelectionResponse:
+        status_code = 200
+
+        def __init__(self, params):
+            self.params = params
+
+        def json(self):
+            suffix = self.params['request_id']
+            return {
+                'server_public_key': selected_key,
+                'reservation_token': f'reservation-{suffix}',
+                'requested_model': self.params['model'],
+                'requested_context_tier': self.params['context_tier'],
+                'request_deadline_epoch': 9999999999.0,
+            }
+
+    def select(_url, params, timeout):
+        selection_calls.append(dict(params))
+        barrier.wait()
+        return SelectionResponse(dict(params))
+
+    def encrypt_local(envelope, key):
+        encrypted_plaintexts.append((dict(envelope), key))
+        return {'ciphertext': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'}
+
+    def submit(_endpoint, payload):
+        submissions.append(dict(payload))
+        return {
+            'message': 'Request received',
+            'retrieval_credential': f"retrieve-{payload['request_id']}",
+        }
+
+    def retrieve(*_args, **kwargs):
+        retrievals.append(dict(kwargs))
+        return [{'role': 'assistant', 'content': 'ok'}]
+
+    monkeypatch.setattr('utils.crypto_helpers.requests.get', select)
+    monkeypatch.setattr(client, '_encrypt_message_for_key', encrypt_local)
+    monkeypatch.setattr(client, 'send_encrypted_message', submit)
+    monkeypatch.setattr(client, 'retrieve_chat_response', retrieve)
+    monkeypatch.setattr('utils.crypto_helpers.time.sleep', lambda _seconds: None)
+
+    with caplog.at_level(logging.DEBUG, logger='crypto_client'):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(client.send_chat_message, ('first', 'second')))
+
+    assert all(result == [{'role': 'assistant', 'content': 'ok'}] for result in results)
+    assert len({call['request_id'] for call in selection_calls}) == 2
+    assert len({call['cancel_token'] for call in selection_calls}) == 2
+    by_request = {payload['request_id']: payload for payload in submissions}
+    for selection in selection_calls:
+        request_id = selection['request_id']
+        submission = by_request[request_id]
+        assert submission['cancel_token'] == selection['cancel_token']
+        assert submission['reservation_token'] == f'reservation-{request_id}'
+        assert submission['requested_model'] == selection['model']
+        assert submission['requested_context_tier'] == selection['context_tier']
+        assert submission['request_deadline_epoch'] == 9999999999.0
+    assert all(
+        not {'cancel_token', 'reservation_token', 'retrieval_credential'} & envelope.keys()
+        for envelope, _key in encrypted_plaintexts
+    )
+    assert {
+        (call['expected_request_id'], call['retrieval_credential']) for call in retrievals
+    } == {(request_id, f'retrieve-{request_id}') for request_id in by_request}
+    log_text = caplog.text
+    for selection in selection_calls:
+        assert selection['cancel_token'] not in log_text
+        assert f"reservation-{selection['request_id']}" not in log_text
+        assert f"retrieve-{selection['request_id']}" not in log_text
+
+
+@pytest.mark.parametrize(
+    'selection_update',
+    [
+        {'reservation_token': None},
+        {'request_deadline_epoch': 'invalid'},
+        {'requested_context_tier': '64k'},
+        {'server_public_key': 'not base64!'},
+    ],
+)
+def test_chat_send_fails_closed_on_invalid_reservation_metadata(monkeypatch, selection_update):
+    client = CryptoClient('https://test-server.com')
+    selection = {
+        'server_public_key': base64.b64encode(b'selected-key').decode(),
+        'reservation_token': 'reservation-proof',
+        'requested_model': 'qwen3-8b-instruct',
+        'requested_context_tier': '8k-fast',
+        'request_deadline_epoch': 9999999999.0,
+    }
+    selection.update(selection_update)
+    response = MagicMock(status_code=200)
+    response.json.return_value = selection
+    monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *args, **kwargs: response)
+    submit = MagicMock()
+    monkeypatch.setattr(client, 'send_encrypted_message', submit)
+
+    assert client.send_chat_message('hello') is None
+    submit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('failure', 'expected_log'),
+    [
+        ('selection_status', 'Failed to select relay server: 503'),
+        ('selection_exception', 'Exception while selecting relay server: RuntimeError'),
+        ('encryption_exception', 'Failed to encrypt API v1 relay envelope: RuntimeError'),
+        ('enqueue_empty', 'Failed to send message to API v1 relay requests'),
+        ('enqueue_unexpected', 'Unexpected response from API v1 relay requests'),
+    ],
+)
+def test_chat_send_fails_closed_at_relay_boundaries(
+    monkeypatch,
+    caplog,
+    failure,
+    expected_log,
+):
+    client = CryptoClient('https://test-server.com')
+    selection = MagicMock(status_code=503 if failure == 'selection_status' else 200)
+    selection.json.return_value = {
+        'server_public_key': base64.b64encode(b'selected-key').decode(),
+        'reservation_token': 'reservation-proof',
+        'requested_model': 'qwen3-8b-instruct',
+        'requested_context_tier': '8k-fast',
+        'request_deadline_epoch': 9999999999.0,
+    }
+
+    if failure == 'selection_exception':
+        monkeypatch.setattr(
+            'utils.crypto_helpers.requests.get',
+            MagicMock(side_effect=RuntimeError('selection failed')),
+        )
+    else:
+        monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *args, **kwargs: selection)
+
+    if failure == 'encryption_exception':
+        monkeypatch.setattr(
+            client,
+            '_encrypt_message_for_key',
+            MagicMock(side_effect=RuntimeError('encryption failed')),
+        )
+    else:
+        monkeypatch.setattr(
+            client,
+            '_encrypt_message_for_key',
+            lambda *_args: {'ciphertext': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'},
+        )
+
+    enqueue_result = {
+        'message': 'Request received',
+        'retrieval_credential': 'retrieval-proof',
+    }
+    if failure == 'enqueue_empty':
+        enqueue_result = None
+    elif failure == 'enqueue_unexpected':
+        enqueue_result = {'retrieval_credential': 'retrieval-proof'}
+    submit = MagicMock(return_value=enqueue_result)
+    monkeypatch.setattr(client, 'send_encrypted_message', submit)
+
+    with caplog.at_level(logging.ERROR, logger='crypto_client'):
+        assert client.send_chat_message('hello') is None
+
+    assert expected_log in caplog.text
+    assert 'reservation-proof' not in caplog.text
+    assert 'retrieval-proof' not in caplog.text
+
+
+@pytest.mark.parametrize('retrieval_credential', [None, '', 42])
+def test_chat_send_fails_closed_on_invalid_retrieval_credential(
+    monkeypatch,
+    retrieval_credential,
+):
+    client = CryptoClient('https://test-server.com')
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        'server_public_key': base64.b64encode(b'selected-key').decode(),
+        'reservation_token': 'reservation-proof',
+        'requested_model': 'qwen3-8b-instruct',
+        'requested_context_tier': '8k-fast',
+        'request_deadline_epoch': 9999999999.0,
+    }
+    monkeypatch.setattr('utils.crypto_helpers.requests.get', lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        client,
+        '_encrypt_message_for_key',
+        lambda *_args: {'ciphertext': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'},
+    )
+    enqueue_response = {'message': 'Request received'}
+    if retrieval_credential is not None:
+        enqueue_response['retrieval_credential'] = retrieval_credential
+    monkeypatch.setattr(
+        client,
+        'send_encrypted_message',
+        lambda *_args: enqueue_response,
+    )
+    retrieve = MagicMock()
+    monkeypatch.setattr(client, 'retrieve_chat_response', retrieve)
+
+    assert client.send_chat_message('hello') is None
+    retrieve.assert_not_called()
+
+
+def test_sequential_chat_sends_select_fresh_reservations(monkeypatch):
+    client = CryptoClient('https://test-server.com')
+    selections = []
+    submissions = []
+
+    def select(_url, params, timeout):
+        selections.append(dict(params))
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            'server_public_key': base64.b64encode(b'selected-key').decode(),
+            'reservation_token': f"reservation-{len(selections)}",
+            'requested_model': params['model'],
+            'requested_context_tier': params['context_tier'],
+            'request_deadline_epoch': 9999999999.0,
+        }
+        return response
+
+    monkeypatch.setattr('utils.crypto_helpers.requests.get', select)
+    monkeypatch.setattr(
+        client,
+        '_encrypt_message_for_key',
+        lambda *_args: {'ciphertext': 'ciphertext', 'cipherkey': 'cipherkey', 'iv': 'iv'},
+    )
+
+    def submit(_endpoint, payload):
+        submissions.append(dict(payload))
+        return {'message': 'Request received', 'retrieval_credential': f"retrieve-{len(submissions)}"}
+
+    monkeypatch.setattr(client, 'send_encrypted_message', submit)
+    monkeypatch.setattr(client, 'retrieve_chat_response', lambda *_args, **_kwargs: [])
+    monkeypatch.setattr('utils.crypto_helpers.time.sleep', lambda _seconds: None)
+
+    assert client.send_chat_message('first') == []
+    assert client.send_chat_message('second') == []
+    assert len(selections) == 2
+    assert selections[0]['request_id'] != selections[1]['request_id']
+    assert selections[0]['cancel_token'] != selections[1]['cancel_token']
+    assert [payload['reservation_token'] for payload in submissions] == [
+        'reservation-1',
+        'reservation-2',
+    ]

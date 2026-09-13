@@ -698,6 +698,11 @@ _SAFE_READINESS_DIAGNOSTIC_KEYS = {
     "api_v1_readiness_completion_smoke_plain_completion_metal_error_category",
     "api_v1_readiness_completion_smoke_plain_completion_metal_command_buffer_status",
     "api_v1_readiness_qwen_64k_runtime_profile_id",
+    "api_v1_readiness_qwen_64k_runtime_preferred_profile_id",
+    "api_v1_readiness_qwen_64k_batch_profile_requested",
+    "api_v1_readiness_qwen_64k_batch_profile_selected",
+    "api_v1_readiness_qwen_64k_runtime_profile_kv_precision",
+    "api_v1_readiness_qwen_64k_runtime_profile_fallback_reason",
     "api_v1_readiness_qwen_64k_runtime_profile_attempt_ids",
     "api_v1_readiness_qwen_64k_runtime_profile_recovery_count",
     "api_v1_readiness_qwen_64k_runtime_profile_flash_attn",
@@ -758,12 +763,18 @@ def _relay_runtime_state(
 ) -> str:
     if warm_load_state == "failed":
         return "failed"
+    if not warm_load_enabled:
+        return "ready" if running else "stopped"
+    if warm_load_state == "not_started":
+        return "starting" if running else "stopped"
+    # Warm-load progress is meaningful before the runtime-ready handshake.
+    # Keep reporting that phase while ``running`` remains false so callers can
+    # distinguish provisioning from a stopped bridge without treating it as
+    # authoritative Running state.
+    if warm_load_state == "warming":
+        return "warming"
     if not running:
         return "stopped"
-    if not warm_load_enabled:
-        return "ready"
-    if warm_load_state == "not_started":
-        return "starting"
     return warm_load_state
 
 
@@ -815,6 +826,10 @@ def _startup_context_tier(args: argparse.Namespace) -> str:
     return "8k-fast"
 
 
+def _normalize_qwen_64k_batch_profile(value: Any) -> str:
+    return value if value in {"safe", "balanced", "experimental"} else "balanced"
+
+
 def _load_context_profile_helpers() -> Tuple[Any, Any]:
     """Import context-profile helpers after baseline dependency preflight."""
 
@@ -841,7 +856,11 @@ def _structured_provisioning_payload(args: argparse.Namespace, *, phase: str, st
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     return {
         "type": "started",
-        "running": True,
+        # Provisioning heartbeats deliberately retain the historical event
+        # type, but they are not the operator startup handshake.  The native
+        # parent must keep the attached process in Starting until the later
+        # runtime-ready ``started`` event reports Running.
+        "running": False,
         "registered": False,
         "registered_relay_count": 0,
         "registered_relay_urls": [],
@@ -1200,6 +1219,9 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     args.context_tier = normalize_context_tier(getattr(args, "context_tier", "8k-fast"))
+    args.qwen_64k_batch_profile = _normalize_qwen_64k_batch_profile(
+        getattr(args, "qwen_64k_batch_profile", "balanced")
+    )
 
     relay_urls = _normalize_relay_urls(
         getattr(args, "relay_url", None),
@@ -1287,6 +1309,7 @@ def run(args: argparse.Namespace) -> int:
     runtime.model_manager.parent_model_path_exists = parent_model_path_exists
     runtime.model_manager.model_path_was_relative = model_path_was_relative
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
+    runtime.model_manager.qwen_64k_batch_profile = args.qwen_64k_batch_profile
     apply_compute_mode(runtime.model_manager, args.mode)
     try:
         private_runtime_setup = dict(runtime_setup)
@@ -1482,10 +1505,17 @@ def run(args: argparse.Namespace) -> int:
         return _sanitize_public_payload(payload)
 
     def emit_status_event(*, registered: bool, active_relay_url: str, current_last_error: Optional[str]) -> None:
+        # Status heartbeats emitted by the warm-load gate are progress only.
+        # Reporting them as running lets the native supervisor observe a
+        # transient Running state before the runtime-ready ``started`` event,
+        # after which a genuine warm-load failure looks like a Running
+        # regression.  Once warm-load is ready (or deliberately disabled),
+        # relay-poll status updates remain authoritative Running updates.
+        runtime_ready = not warm_load_enabled or warm_load_state == "ready"
         emit_operator_event(
             build_status_payload(
                 event_type="status",
-                running=True,
+                running=runtime_ready,
                 registered=registered,
                 active_relay_url=active_relay_url,
                 current_last_error=current_last_error,
@@ -1660,19 +1690,6 @@ def run(args: argparse.Namespace) -> int:
         warm_load_fatal = True
 
     last_error: Optional[str] = None
-    emit_operator_event(
-        build_status_payload(
-            event_type="started",
-            running=True,
-            registered=False,
-            active_relay_url=runtime.relay_client.relay_url,
-            current_last_error=None,
-            extra={
-                "llama_repo_stub_imported": repo_llama_cpp_shim_imported,
-                "use_mock_llm": bool(getattr(runtime.model_manager, "use_mock_llm", False)),
-            },
-        )
-    )
     if runtime_path == "sidecar":
         print(
             "desktop.compute_node_bridge.runtime_path.relay_uses_bridge "
@@ -1747,7 +1764,7 @@ def run(args: argparse.Namespace) -> int:
             emit_operator_event(
                 build_status_payload(
                     event_type="status",
-                    running=True,
+                    running=False,
                     registered=False,
                     active_relay_url=runtime.relay_client.relay_url,
                     current_last_error=last_error,
@@ -1796,7 +1813,7 @@ def run(args: argparse.Namespace) -> int:
                 emit_operator_event(
                     build_status_payload(
                         event_type="status",
-                        running=True,
+                        running=False,
                         registered=False,
                         active_relay_url=runtime.relay_client.relay_url,
                         current_last_error=last_error,
@@ -2564,6 +2581,25 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         if warm_runtime_before_registration():
+            # ``started`` is the native supervisor's runtime-ready handshake,
+            # not merely proof that Python imports and process attachment
+            # succeeded.  Emit it only after the active packaged runtime has
+            # passed the same warm-load gate that protects relay registration.
+            emit_operator_event(
+                build_status_payload(
+                    event_type="started",
+                    running=True,
+                    registered=False,
+                    active_relay_url=runtime.relay_client.relay_url,
+                    current_last_error=None,
+                    extra={
+                        "llama_repo_stub_imported": repo_llama_cpp_shim_imported,
+                        "use_mock_llm": bool(
+                            getattr(runtime.model_manager, "use_mock_llm", False)
+                        ),
+                    },
+                )
+            )
             for relay_runtime in runtimes:
                 thread = threading.Thread(
                     target=poll_relay_loop,
@@ -3050,11 +3086,184 @@ def installed_context_smoke_payload(context_tier: str, launch_number: str) -> Di
         )
     return payload
 
+
+def _headless_result(*, success: bool, phase: str, failure_code: str,
+                     identity: bool, warm_load: str, evidence: bool) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "success": success,
+        "last_completed_phase": phase,
+        "failure_code": failure_code,
+        "packaged_runtime_identity": "validated" if identity else "failed",
+        "selected_backend": "cpu",
+        "warm_load_result": warm_load,
+        "authoritative_evidence_result": "validated" if evidence else "failed",
+    }
+
+
+def _headless_classify_readiness(ready: bool, diagnostics: Dict[str, Any],
+                                 evidence: Any = None,
+                                 fixture: Any = None) -> str:
+    if ready:
+        prompt_tokens = diagnostics.get("api_v1_readiness_prompt_tokens")
+        if (diagnostics.get("api_v1_readiness_result") == "passed"
+                and diagnostics.get("api_v1_readiness_tokenizer_render_bridge_available") is True
+                and isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool)
+                and prompt_tokens > 0):
+            expected_runtime = os.environ.get("TOKENPLACE_BUNDLED_RUNTIME_ID")
+            counts = evidence.get("target_offsets_tokens") if isinstance(evidence, dict) else None
+            evidence_valid = (
+                isinstance(fixture, dict)
+                and isinstance(evidence, dict)
+                and evidence.get("method") == "packaged_admission_render_and_tokenize_chat"
+                and evidence.get("runtime_identity") == expected_runtime
+                and evidence.get("fixture_sha256") == fixture.get("fixture_sha256")
+                and evidence.get("total_prompt_tokens") == prompt_tokens
+                and isinstance(counts, dict) and counts
+                and set(counts) == set(fixture.get("target_prefix_utf8_bytes", {}))
+                and all(isinstance(value, int) and not isinstance(value, bool) and value > 0
+                        for value in counts.values())
+            )
+            return "success" if evidence_valid else "authoritative_evidence_failed"
+        return "authoritative_evidence_failed"
+    return "warm_load_failed"
+
+
+def headless_cpu_admission(args: Any) -> int:
+    """Exercise the installed CPU model and API-v1 admission boundary without a relay."""
+    result = _headless_result(success=False, phase="arguments_validated",
+                              failure_code="packaged_runtime_identity_failed",
+                              identity=False, warm_load="not_started", evidence=False)
+    runtime = None
+    startup_emitted = False
+    identity_values = [os.environ.get(name, "") for name in (
+        "TOKENPLACE_APP_VERSION", "TOKENPLACE_BUILD_ID", "TOKENPLACE_TARGET_TRIPLE",
+        "TOKENPLACE_BUNDLED_RUNTIME_ID", "TOKENPLACE_RUNTIME_ID")]
+    try:
+        if args.mode != "cpu" or not args.model or not os.path.isfile(args.model):
+            result["failure_code"] = "invalid_arguments"
+            return 2
+        if not all(identity_values) or identity_values[-1] != identity_values[-2]:
+            return 3
+        result["packaged_runtime_identity"] = "validated"
+        dependency = ensure_desktop_python_dependencies()
+        if dependency.get("ok") != "true":
+            result["failure_code"] = "packaged_runtime_identity_failed"
+            return 3
+        setup = _ensure_desktop_llama_runtime_for_context("cpu", args.context_tier)
+        if setup.get("selected_backend") != "cpu":
+            result["failure_code"] = "unsupported_backend"
+            return 2
+        from utils.compute_node_runtime import (ComputeNodeRuntime,
+                                                ComputeNodeRuntimeConfig,
+                                                apply_compute_mode,
+                                                authoritative_readiness_fixture)
+        apply_context_profile, normalize_context_tier = _load_context_profile_helpers()
+        args.context_tier = normalize_context_tier(args.context_tier)
+        runtime = ComputeNodeRuntime(ComputeNodeRuntimeConfig(
+            relay_url="http://127.0.0.1:1", relay_port=1,
+            use_configured_relay_fallbacks=False,
+            relay_urls=("http://127.0.0.1:1",)))
+        manager = runtime.model_manager
+        if getattr(manager, "use_mock_llm", False):
+            result["failure_code"] = "mock_runtime_rejected"
+            return 4
+        manager.model_path = os.path.abspath(args.model)
+        manager.parent_model_path_exists = True
+        manager.model_path_was_relative = False
+        # The explicit headless fixture is not the production Qwen artifact.
+        # Keep this exception boundary-local and in memory.
+        manager.headless_admission_fixture = True
+        manager.model_profile = dict(manager.model_profile)
+        manager.model_profile["provider"] = "headless-admission-fixture"
+        manager.model_profile["chat_template_policy"] = "headless-plain-chat"
+        apply_context_profile(manager, args.context_tier)
+        apply_compute_mode(manager, "cpu")
+        manager.desktop_runtime_probe = dict(setup)
+        result["last_completed_phase"] = "runtime_identity_validated"
+        print(json.dumps({"type": "headless_internal", "phase": "startup_ready"},
+                         sort_keys=True, separators=(",", ":")), flush=True)
+        startup_emitted = True
+        _, fixture = authoritative_readiness_fixture()
+        # Model parents are read-only inputs; scratch uses process temporary storage.
+        with tempfile.TemporaryDirectory(
+            prefix="tokenplace-headless-",
+            ignore_cleanup_errors=True,
+        ) as directory:
+            request_path = os.path.join(directory, "request.json")
+            evidence_path = os.path.join(directory, "evidence.json")
+            with open(request_path, "w", encoding="utf-8") as handle:
+                json.dump(fixture, handle, sort_keys=True, separators=(",", ":"))
+            old_request = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST")
+            old_evidence = os.environ.get("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE")
+            os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST"] = request_path
+            os.environ["TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE"] = evidence_path
+            try:
+                ready = runtime.ensure_api_v1_runtime_ready()
+                try:
+                    with open(evidence_path, encoding="utf-8") as handle:
+                        evidence = json.load(handle)
+                except (OSError, ValueError, TypeError):
+                    evidence = None
+            finally:
+                for name, previous in (
+                    ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_REQUEST", old_request),
+                    ("TOKEN_PLACE_LONG_CONTEXT_BENCHMARK_TOKENIZER_EVIDENCE", old_evidence),
+                ):
+                    if previous is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = previous
+        diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
+        readiness = _headless_classify_readiness(ready, diagnostics, evidence, fixture)
+        if readiness != "success":
+            if readiness == "authoritative_evidence_failed":
+                result["warm_load_result"] = "ready"
+                result["failure_code"] = "authoritative_evidence_failed"
+                result["last_completed_phase"] = "warm_load_completed"
+                return 6
+            result["failure_code"] = "warm_load_failed"
+            return 5
+        result["warm_load_result"] = "ready"
+        result["last_completed_phase"] = "warm_load_completed"
+        result.update(success=True, failure_code="none",
+                      authoritative_evidence_result="validated")
+        return 0
+    except Exception:
+        if not startup_emitted:
+            result["failure_code"] = "bridge_exited_before_startup_event"
+        else:
+            result["failure_code"] = "warm_load_failed"
+        return 7
+    finally:
+        cleanup_ok = True
+        if runtime is not None:
+            try:
+                runtime.stop(shutdown_deadline=time.monotonic() + 2.0)
+                manager = runtime.model_manager
+                loaded_runtime = getattr(manager, "llm", None)
+                if loaded_runtime is not None:
+                    close_runtime = getattr(manager, "_close_llm_proxy", None)
+                    if not callable(close_runtime) or close_runtime(loaded_runtime) is not True:
+                        raise RuntimeError("headless_runtime_cleanup_failed")
+                    manager.llm = None
+            except Exception:
+                cleanup_ok = False
+        if not cleanup_ok:
+            result.update(success=False, failure_code="cleanup_failed")
+        elif result["success"]:
+            result["last_completed_phase"] = "cleanup_completed"
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
+        if not cleanup_ok:
+            return 8
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="token.place desktop compute-node bridge")
     parser.add_argument("--installed-context-smoke", action="store_true")
     parser.add_argument("--operator-runtime-preflight", action="store_true")
     parser.add_argument("--operator-runtime-preflight-cpu-smoke", action="store_true")
+    parser.add_argument("--headless-cpu-admission", action="store_true")
     parser.add_argument("--model", required=False)
     parser.add_argument("--mode", default="auto")
     parser.add_argument("--relay-url", action="append", default=None)
@@ -3066,7 +3275,12 @@ def main() -> int:
     )
     parser.add_argument("--relay-port", type=int, default=None)
     parser.add_argument("--context-tier", default="8k-fast")
+    parser.add_argument("--startup-timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--qwen-64k-batch-profile", default="balanced", choices=("safe", "balanced", "experimental"))
     args = parser.parse_args()
+
+    if args.headless_cpu_admission:
+        return headless_cpu_admission(args)
 
     if args.installed_context_smoke:
         print(json.dumps(installed_context_smoke_payload(args.context_tier, os.environ.get("TOKENPLACE_INSTALLER_IDENTITY_LAUNCH_NUMBER", "1")), sort_keys=True, separators=(",", ":")))

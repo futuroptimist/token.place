@@ -3220,6 +3220,9 @@ def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(
         assert second.replace_encrypted_progress_if_claimed(
             node_id, owner, consumer, *identity, claim.generation, latest
         ).state == "replaced"
+        assert second.renew_claim_or_read_control(
+            node_id, owner, consumer, *identity, claim.generation
+        ).state == "continued"
         pending = first.retrieve_encrypted_response(
             *identity, selection.reservation_token
         )
@@ -3233,6 +3236,42 @@ def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(
     finally:
         first.close()
         second.close()
+
+
+def test_queued_encrypted_request_retrieval_is_pending(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node_id, owner = "queued-progress-node", _digest("queued-progress-owner")
+    identity = ("queued-progress-client", "queued-progress-request")
+    try:
+        store.register(node_id, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 10
+        selection = store.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        store.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+            ),
+            "cancel",
+        )
+
+        pending = store.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert (pending.state, pending.request_deadline_epoch, pending.progress) == (
+            "pending",
+            deadline,
+            None,
+        )
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("stage", ("reserved", "queued", "claimed"))

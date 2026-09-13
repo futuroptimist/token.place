@@ -251,7 +251,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "fb7c269edb9b1b921831cb5056a7661426ecee8cae9eeb250820c16f7fd0256e"  # pragma: allowlist secret
+    expected_digest = "ee62f5e172f0ecefdd0d75efcda969e0c982bd3234a58d6690a250b5e0035680"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -294,7 +294,7 @@ def test_progress_script_is_registered_digest_pinned_and_bounded():
     (
         (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947"),  # pragma: allowlist secret
         (valkey_relay_state.ENQUEUE_SCRIPT, "b9230062be58f017bfb618a368e3fd0d498cadf29c2793201886f1f3e40b9fcb"),  # pragma: allowlist secret
-        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "673eee38ba27545169d832d19d7acf48729963132ca6f106d3f0b15eeb4be949"),  # pragma: allowlist secret
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "1c470b73eeab901af47264a80d6f8a10c6957f30a2da6b18d9127fb8d7dfa663"),  # pragma: allowlist secret
         (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "0485b8e9644ada8810eb8c7e4a799ca32d779597c4488d195082447d3fb091a4"),  # pragma: allowlist secret
     ),
 )

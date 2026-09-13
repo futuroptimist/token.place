@@ -20,6 +20,12 @@ def _embedded_release_metadata(html: str) -> dict[str, str]:
     return json.loads(match.group(1))
 
 
+def _css_declarations(html: str, selector: str) -> str:
+    match = re.search(rf'{re.escape(selector)}\s*\{{(?P<declarations>[^}}]*)\}}', html)
+    assert match is not None, f'missing CSS rule for {selector}'
+    return match.group('declarations')
+
+
 def test_flask_builtin_static_route_is_disabled():
     endpoints = {rule.endpoint for rule in relay.app.url_map.iter_rules()}
 
@@ -236,6 +242,22 @@ def test_static_index_references_existing_compute_node_last_updated_computed():
         assert re.search(r'computed:\s*{[\s\S]*computeNodeCountLastUpdatedLabel\s*\(', chat_js)
     if 'modelsLoaded' in index_html:
         assert re.search(r'data:\s*{[\s\S]*modelsLoaded\s*:', chat_js)
+
+
+def test_landing_page_constrains_and_wraps_long_api_routes():
+    index_html = INDEX_HTML_PATH.read_text(encoding='utf-8')
+    expected_properties = {
+        '.container': ('min-width: 0;', 'max-width: 100%;', 'overflow-wrap: anywhere;'),
+        '.chat-container': ('min-width: 0;', 'max-width: 100%;'),
+        '.api-path': ('overflow-wrap: anywhere;', 'word-break: break-word;'),
+        'table': ('table-layout: fixed;',),
+        'code': ('overflow-wrap: anywhere;',),
+    }
+
+    for selector, properties in expected_properties.items():
+        declarations = _css_declarations(index_html, selector)
+        for property_declaration in properties:
+            assert property_declaration in declarations
 
 
 def test_static_index_has_no_raw_mustache_interpolation():

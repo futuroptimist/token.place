@@ -9,9 +9,16 @@
     <link rel="icon" href="/static/icon.ico" type="image/vnd.microsoft.icon">
     <title>token.place</title>
     <style>
+        html {
+            max-width: 100%;
+            overflow-x: hidden;
+        }
         body {
             display: flex;
             justify-content: center;
+            width: 100%;
+            min-width: 0;
+            overflow-x: hidden;
             margin: 0;
             padding: 0;
             font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
@@ -19,9 +26,13 @@
             color: #ffffff;
         }
         .container {
+            box-sizing: border-box;
             width: 50%;
+            min-width: 0;
+            max-width: 100%;
             margin-left: auto;
             margin-right: auto;
+            overflow-wrap: anywhere;
         }
         h1, h2, h3, p {
             margin: 20px 0;
@@ -59,9 +70,11 @@
             color: greenyellow;
             padding: 5px;
             border-radius: 5px;
+            box-sizing: border-box;
             word-wrap: normal;
             overflow-x: auto;
             white-space: pre;
+            max-width: 100%;
         }
         code {
             font-family: 'Courier New', Courier, monospace;
@@ -69,6 +82,8 @@
             padding: 2px 4px;
             border-radius: 3px;
             font-size: 0.9em;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
         a:hover {
             border-bottom: 1px solid #ffffff;
@@ -77,6 +92,9 @@
             display: none;
         }
         .chat-container {
+            box-sizing: border-box;
+            min-width: 0;
+            max-width: 100%;
             background-color: rgba(255, 255, 255, 0.1);
             border-radius: 10px;
             padding: 20px;
@@ -287,9 +305,11 @@
             background-color: rgba(255, 255, 255, 0.4);
         }
         .api-endpoint {
+            min-width: 0;
             margin-bottom: 30px;
             border-left: 3px solid #00ffff;
             padding-left: 15px;
+            overflow-wrap: anywhere;
         }
         .api-method {
             display: inline-block;
@@ -309,9 +329,12 @@
         .api-path {
             font-family: 'Courier New', Courier, monospace;
             color: #ffffff;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
         table {
             width: 100%;
+            table-layout: fixed;
             border-collapse: collapse;
             margin: 20px 0;
         }
@@ -319,6 +342,8 @@
             padding: 10px;
             text-align: left;
             border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
         th {
             background-color: rgba(0, 255, 255, 0.1);

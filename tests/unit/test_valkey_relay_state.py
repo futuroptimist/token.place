@@ -14,6 +14,7 @@ import valkey_relay_state
 
 from valkey_relay_state import (
     ACCEPT_RESPONSE_SCRIPT,
+    REPLACE_PROGRESS_SCRIPT,
     RETRIEVE_RESPONSE_SCRIPT,
     DirectPrimary,
     ReviewedScript,
@@ -250,7 +251,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "82d25c377e3df42263b09540f18557a0579e270f25b2c811d0876c7a96e81e45"  # pragma: allowlist secret
+    expected_digest = "07e7b73897e1312083399534c2682f6336e6e1e48f9c0f3010a9ef87794e9b31"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -276,7 +277,25 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     assert "return {'acknowledged',tv[9],tv[8],tv[13]}" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "local canonical=string.format('%.6f',n)" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "string.format('%.17g',n)==value" in RETRIEVE_RESPONSE_SCRIPT.source
-    assert "local function lua_number(value)\n  return lua_float(value)" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "local function lua_number(value)" in RETRIEVE_RESPONSE_SCRIPT.source
+
+
+def test_progress_script_is_registered_digest_pinned_and_bounded():
+    expected = "e1f0b44c964488caf668b20b4764476fac42cdeab79a45d380c092cfc8249c53"  # pragma: allowlist secret
+    assert REPLACE_PROGRESS_SCRIPT.sha256 == expected
+    assert SCRIPT_DIGESTS[REPLACE_PROGRESS_SCRIPT.name] == expected
+    assert (
+        hashlib.sha256(REPLACE_PROGRESS_SCRIPT.source.encode()).hexdigest() == expected
+    )
+    assert "redis.call('TIME')" in REPLACE_PROGRESS_SCRIPT.source
+    assert (
+        "redis.call('ZRANGE',deadlines,0,max_lifecycles)"
+        in REPLACE_PROGRESS_SCRIPT.source
+    )
+    assert not re.search(
+        r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
+        REPLACE_PROGRESS_SCRIPT.source,
+    )
 
 
 @pytest.mark.parametrize(

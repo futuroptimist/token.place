@@ -198,7 +198,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "be8be5ddad84b77b4bb37777587453029dd9ac36bc92027f3812ab5829e4e238"  # pragma: allowlist secret
+    expected_digest = "fcf78bf55769fe5e577c827cad7d69030ed99eebc7b385feeed17578c6a1d4c5"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -285,13 +285,15 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_progress_script_is_registered_digest_pinned_and_bounded():
-    expected = "b60574714d21e9df09c4d65230f8711061dbc093b552d9426eae96da74234ec3"  # pragma: allowlist secret
+    expected = "3f6fcc7888e734efc7aa513be5874f38cc3fa12caf9ce780bf5fe2cdbf87690b"  # pragma: allowlist secret
     assert PROGRESS_TRANSITION_SCRIPT.sha256 == expected
     assert SCRIPT_DIGESTS[PROGRESS_TRANSITION_SCRIPT.name] == expected
     assert "SCAN" not in PROGRESS_TRANSITION_SCRIPT.source.upper()
     assert "ZRANGE',progress_expiries,0,max_progress" in PROGRESS_TRANSITION_SCRIPT.source
     assert "redis.call('TIME')" in PROGRESS_TRANSITION_SCRIPT.source
     assert "redis.call('HLEN',key)~=9" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "not canonical_progress(envelope)" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "canonical_progress(v[9])" in PROGRESS_TRANSITION_SCRIPT.source
 
 
 @pytest.mark.parametrize(
@@ -299,14 +301,32 @@ def test_progress_script_is_registered_digest_pinned_and_bounded():
     (
         (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947"),  # pragma: allowlist secret
         (valkey_relay_state.ENQUEUE_SCRIPT, "b9230062be58f017bfb618a368e3fd0d498cadf29c2793201886f1f3e40b9fcb"),  # pragma: allowlist secret
-        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "0bebbd23cb2e55963be5f8f9c69b283d693e4cb64ebc43fcaade1290e25f2291"),  # pragma: allowlist secret
-        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "5eafc6023abb053d1e934db207bc95253019b493416a2bf4fea571d27b1a8058"),  # pragma: allowlist secret
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "ee7253365cd3517a8b48f714c12077d1677d425481c2304684366c07caa29d22"),  # pragma: allowlist secret
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "d4784e8bb3c2c1f0ef6d402dfb32ca3172d6678184f45b2d56b37aa54ee3167e"),  # pragma: allowlist secret
     ),
 )
 def test_control_transition_scripts_are_digest_pinned(script, digest):
     assert script.sha256 == digest
     assert SCRIPT_DIGESTS[script.name] == digest
     assert hashlib.sha256(script.source.encode()).hexdigest() == digest
+
+
+@pytest.mark.parametrize(
+    "script",
+    (
+        valkey_relay_state.CLAIM_SCRIPT,
+        valkey_relay_state.CONTROL_CLAIM_SCRIPT,
+        valkey_relay_state.CANCEL_REQUEST_SCRIPT,
+        valkey_relay_state.ACCEPT_RESPONSE_SCRIPT,
+        valkey_relay_state.PROGRESS_TRANSITION_SCRIPT,
+        valkey_relay_state.NODE_TRANSITION_SCRIPT,
+    ),
+)
+def test_progress_bearing_mutation_scripts_require_canonical_envelopes(script):
+    assert "local function canonical_progress(value)" in script.source
+    assert "canonical_progress(pv[9])" in script.source or (
+        "canonical_progress(v[9])" in script.source
+    )
 
 
 def test_cancel_retained_control_timeline_is_outcome_specific():

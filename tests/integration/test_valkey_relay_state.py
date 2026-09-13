@@ -3245,9 +3245,10 @@ def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(
         b"{",
         b'{"protocol":"tokenplace_api_v1_relay_e2ee","version":1,"ciphertext":"progress","cipherkey":"key","iv":"iv"}',
         b'{"cipherkey":"key","ciphertext":"progress","extra":"field","iv":"iv","protocol":"tokenplace_api_v1_relay_e2ee","version":1}',
+        b'["key","progress","iv","tokenplace_api_v1_relay_e2ee",1]',
         b'{"cipherkey":"key","ciphertext":"\xff","iv":"iv","protocol":"tokenplace_api_v1_relay_e2ee","version":1}',
     ),
-    ids=("malformed", "noncanonical", "extra-field", "invalid-utf8"),
+    ids=("malformed", "noncanonical", "extra-field", "numeric-keys", "invalid-utf8"),
 )
 def test_progress_retrieval_rejects_invalid_envelope_without_mutation(
     valkey_server, stored_envelope
@@ -3947,7 +3948,6 @@ def test_control_paired_authority_corruption_fails_without_mutation(
             first._foundation._client.hset(terminal, "expires_at_epoch", float(control_expiry) - 1)
             first._foundation._client.zadd(
                 cfg.key("terminals:expiry"),
-        cfg.key("progress:expiry"),
                 {f"{client}:{request}": float(control_expiry) - 1},
             )
         elif corruption == "raw_client_identity":

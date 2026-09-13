@@ -14,6 +14,7 @@ import valkey_relay_state
 
 from valkey_relay_state import (
     ACCEPT_RESPONSE_SCRIPT,
+    PROGRESS_SCRIPT,
     RETRIEVE_RESPONSE_SCRIPT,
     DirectPrimary,
     ReviewedScript,
@@ -246,6 +247,20 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
     )
     assert expiry_guard_offset < ACCEPT_RESPONSE_SCRIPT.source.index(
         "redis.call('XDEL',queue"
+    )
+
+
+def test_progress_script_is_registered_digest_pinned_and_bounded():
+    expected = "28419ac92f5e46f8b58581be29837fd1698579001c59e71430bccbf610eaad92"  # pragma: allowlist secret
+    assert PROGRESS_SCRIPT.sha256 == expected
+    assert SCRIPT_DIGESTS[PROGRESS_SCRIPT.name] == expected
+    assert hashlib.sha256(PROGRESS_SCRIPT.source.encode()).hexdigest() == expected
+    assert "local t=redis.call('TIME')" in PROGRESS_SCRIPT.source
+    assert "redis.call('ZRANGE',deadlines,0,max_lifecycles)" in PROGRESS_SCRIPT.source
+    assert "redis.call('DEL',progress)" in PROGRESS_SCRIPT.source
+    assert not re.search(
+        r"redis\.call\(['\"](?:SCAN|KEYS|FLUSHALL|FLUSHDB|CONFIG)['\"]",
+        PROGRESS_SCRIPT.source,
     )
 
 

@@ -29,11 +29,13 @@ from relay_state_store import (
     ComputeNodeCapabilities,
     ComputeNodeRegistration,
     ControlTombstoneRecord,
+    EncryptedProgressEnvelope,
     EncryptedRequestEnvelope,
     EncryptedResponseEnvelope,
     EnqueueResult,
     NodeTombstoneRecord,
     NodeTransitionResult,
+    ProgressReplacementResult,
     QueuedRequest,
     RelayStateCapacityExceeded,
     RelayStateConflict,
@@ -1914,6 +1916,91 @@ ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     True,
 )
 
+PROGRESS_SOURCE = """\
+local leases,node,queue,claim,request,claim_expiries,deadlines,progress,work=unpack(KEYS)
+local prefix,node_digest,node_id,owner,consumer,client,request_digest,generation,mode,
+  protocol,version,ciphertext,cipherkey,iv,client_public_key,request_id,max_identity,max_node_id,
+  max_progress,max_global,max_client,max_lifecycles=unpack(ARGV)
+max_identity,max_node_id,max_progress,max_global,max_client,max_lifecycles=tonumber(max_identity),tonumber(max_node_id),tonumber(max_progress),tonumber(max_global),tonumber(max_client),tonumber(max_lifecycles)
+local member=client..':'..request_digest
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local function finite(v) local n=tonumber(v); return n and n==n and math.abs(n)~=math.huge and n end
+local function digest(v) return v and string.len(v)==64 and not string.find(v,'[^0-9a-f]') end
+local function integer(v) local n=finite(v); return n and n>=1 and n<=9007199254740990 and n%1==0 and tostring(n)==v and n end
+local function valid_progress(key,c,q,deadline)
+  if redis.call('EXISTS',key)==0 then return true end
+  local v=redis.call('HMGET',key,'client','request','deadline','protocol','version','ciphertext','cipherkey','iv','generation')
+  local d=finite(v[3]); local g=integer(v[9])
+  return v[1]==c and v[2]==q and d and d==deadline and v[4]=='tokenplace_api_v1_relay_e2ee' and
+    v[5]=='1' and string.len(v[6])>0 and string.len(v[7])>0 and string.len(v[8])>0 and
+    string.len(v[4])+string.len(v[5])+string.len(v[6])+string.len(v[7])+string.len(v[8])<=max_progress and g
+end
+if not digest(client) or not digest(request_digest) or not digest(node_digest) or not digest(owner) or not digest(consumer) or
+  string.len(node_id)<1 or string.len(node_id)>max_node_id or string.len(client_public_key)<1 or string.len(client_public_key)>max_identity or
+  string.len(request_id)<1 or string.len(request_id)>max_identity or not integer(generation) or (mode~='replace' and mode~='retrieve') then return {'schema'} end
+local rv=redis.call('HMGET',request,'state','client','request','client_public_key','request_id','node_id','node_digest','deadline','sequence','claim_generation','queue_entry','token_digest','envelope')
+local rp=0 for i=1,#rv do if rv[i] then rp=rp+1 end end
+if rp==0 then return mode=='retrieve' and {'not_pending'} or {'missing'} end
+if rp~=#rv then return {'schema'} end
+local deadline,sequence,request_generation=finite(rv[8]),integer(rv[9]),integer(rv[10])
+if rv[2]~=client or rv[3]~=request_digest or rv[4]~=client_public_key or rv[5]~=request_id or not deadline or not sequence or not request_generation or
+  rv[11]~=rv[9]..'-0' or not digest(rv[12]) or string.len(rv[13])<1 then return {'schema'} end
+if mode=='retrieve' then
+  if rv[12]~=owner then return {'invalid'} end
+  if rv[1]~='claimed' or deadline<=now then return {'not_pending'} end
+  local cv=redis.call('HMGET',claim,'client','request','node_digest','node_id','owner_digest','consumer_digest','deadline','sequence','generation','lease_expires')
+  for i=1,#cv do if not cv[i] then return {'schema'} end end
+  local claim_deadline,claim_sequence,claim_generation,claim_lease=finite(cv[7]),integer(cv[8]),integer(cv[9]),finite(cv[10])
+  local indexed_claim=finite(redis.call('ZSCORE',claim_expiries,member)); local indexed_deadline=finite(redis.call('ZSCORE',deadlines,member))
+  if not claim_deadline or not claim_sequence or not claim_generation or not claim_lease or not indexed_claim or indexed_claim~=claim_lease or not indexed_deadline or indexed_deadline~=deadline or
+    cv[1]~=client or cv[2]~=request_digest or cv[3]~=rv[7] or cv[4]~=rv[6] or not digest(cv[3]) or string.len(cv[4])<1 or string.len(cv[4])>max_node_id or
+    not digest(cv[5]) or not digest(cv[6]) or claim_deadline~=deadline or claim_sequence~=sequence or claim_generation~=request_generation then return {'schema'} end
+  if claim_lease<=now then return {'not_pending'} end
+  if redis.call('ZSCORE',prefix..'node_work:'..cv[3],member)~='1' then return {'schema'} end
+  local entry=redis.call('XRANGE',prefix..'queue:'..cv[3],rv[11],rv[11],'COUNT',1)
+  if #entry~=1 or entry[1][1]~=rv[11] or #entry[1][2]~=4 then return {'schema'} end
+  if not valid_progress(progress,client,request_digest,deadline) then return {'schema'} end
+  local pv=redis.call('HMGET',progress,'protocol','version','ciphertext','cipherkey','iv')
+  if redis.call('EXISTS',progress)==1 then redis.call('DEL',progress); return {'pending',rv[8],unpack(pv)} end
+  return {'pending',rv[8]}
+end
+local lease=finite(redis.call('ZSCORE',leases,node_digest)); local nv=redis.call('HMGET',node,'node_id','control_credential_digest','lease_expires_at_epoch')
+if not lease or redis.call('EXISTS',node)~=1 or not finite(nv[3]) or finite(nv[3])~=lease then return {'owner'} end
+if lease<=now or nv[1]~=node_id or nv[2]~=owner then return {'owner'} end
+local cv=redis.call('HMGET',claim,'client','request','node_digest','node_id','owner_digest','consumer_digest','deadline','sequence','generation','lease_expires')
+for i=1,#cv do if not cv[i] then return {'missing'} end end
+local claim_deadline,claim_sequence,claim_generation,claim_lease=finite(cv[7]),integer(cv[8]),integer(cv[9]),finite(cv[10]); local indexed_claim=finite(redis.call('ZSCORE',claim_expiries,member)); local indexed_deadline=finite(redis.call('ZSCORE',deadlines,member))
+if not claim_deadline or not claim_sequence or not claim_generation or not claim_lease or not indexed_claim or indexed_claim~=claim_lease or not indexed_deadline or indexed_deadline~=deadline or
+  rv[1]~='claimed' or request_generation~=claim_generation or cv[1]~=client or cv[2]~=request_digest or cv[3]~=rv[7] or cv[4]~=rv[6] or claim_deadline~=deadline or claim_sequence~=sequence or redis.call('ZSCORE',work,member)~='1' then return {'schema'} end
+if rv[6]~=node_id or rv[7]~=node_digest or cv[5]~=owner or cv[6]~=consumer then return {'owner'} end
+if tostring(claim_generation)~=generation then return {'stale'} end
+if claim_lease<=now or deadline<=now then return {'missing'} end
+if protocol~='tokenplace_api_v1_relay_e2ee' or version~='1' or string.len(ciphertext)<1 or string.len(cipherkey)<1 or string.len(iv)<1 or string.len(protocol)+string.len(version)+string.len(ciphertext)+string.len(cipherkey)+string.len(iv)>max_progress then return {'schema'} end
+if not valid_progress(progress,client,request_digest,deadline) then return {'schema'} end
+local existed=redis.call('EXISTS',progress)==1
+if not existed then
+  local members=redis.call('ZRANGE',deadlines,0,max_lifecycles)
+  if #members>max_lifecycles then return {'schema'} end
+  local total,per_client=0,0
+  for _,m in ipairs(members) do
+    local colon=string.find(m,':',1,true); local c=colon and string.sub(m,1,colon-1); local q=colon and string.sub(m,colon+1)
+    if not digest(c) or not digest(q) then return {'schema'} end
+    local d=finite(redis.call('ZSCORE',deadlines,m)); local pk=prefix..'progress:'..c..':'..q
+    if not d or not valid_progress(pk,c,q,d) then return {'schema'} end
+    if redis.call('EXISTS',pk)==1 then total=total+1; if c==client then per_client=per_client+1 end end
+  end
+  if total>=max_global or per_client>=max_client then return {'capacity'} end
+end
+redis.call('HSET',progress,'client',client,'request',request_digest,'deadline',rv[8],'protocol',protocol,'version',version,'ciphertext',ciphertext,'cipherkey',cipherkey,'iv',iv,'generation',generation)
+return {existed and 'replaced' or 'accepted'}
+"""
+PROGRESS_SCRIPT = ReviewedScript(
+    "replace_or_retrieve_encrypted_progress_v1",
+    PROGRESS_SOURCE,
+    "28419ac92f5e46f8b58581be29837fd1698579001c59e71430bccbf610eaad92",  # pragma: allowlist secret
+    True,
+)
+
 RETRIEVE_RESPONSE_SOURCE = """\
 local response,terminal,response_expiries,terminal_expiries,request=unpack(KEYS)
 local client,request_digest,client_public_key,request_id,retrieval_digest,supplied_ack,mode,
@@ -2542,6 +2629,7 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         CONTROL_CLAIM_SCRIPT.name: CONTROL_CLAIM_SCRIPT,
         CANCEL_REQUEST_SCRIPT.name: CANCEL_REQUEST_SCRIPT,
         ACCEPT_RESPONSE_SCRIPT.name: ACCEPT_RESPONSE_SCRIPT,
+        PROGRESS_SCRIPT.name: PROGRESS_SCRIPT,
         RETRIEVE_RESPONSE_SCRIPT.name: RETRIEVE_RESPONSE_SCRIPT,
         NODE_TRANSITION_SCRIPT.name: NODE_TRANSITION_SCRIPT,
         PENDING_TRANSITION_READ_SCRIPT.name: PENDING_TRANSITION_READ_SCRIPT,
@@ -4137,6 +4225,86 @@ class ValkeyRegistrationStore:
             )
         raise ValkeySchemaIncompatibleError("state schema incompatible")
 
+    @staticmethod
+    def _serialized_progress_envelope(envelope: EncryptedProgressEnvelope) -> bytes:
+        return json.dumps(
+            {
+                "protocol": envelope.protocol,
+                "version": envelope.version,
+                "ciphertext": envelope.ciphertext,
+                "cipherkey": envelope.cipherkey,
+                "iv": envelope.iv,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+
+    def replace_encrypted_progress_if_claimed(
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        consumer_identity: str,
+        client_public_key: str,
+        request_id: str,
+        generation: int,
+        envelope: EncryptedProgressEnvelope,
+    ) -> ProgressReplacementResult:
+        """Atomically replace the single bounded advisory ciphertext record."""
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        consumer = self._consumer_digest(consumer_identity)
+        client, request = self._identity(client_public_key, request_id)
+        if type(generation) is not int or generation < 1:
+            raise RelayStateStoreError("claim generation is invalid")
+        if type(envelope) is not EncryptedProgressEnvelope:
+            raise RelayStateStoreError(
+                "progress envelope must be EncryptedProgressEnvelope"
+            )
+        encoded = self._serialized_progress_envelope(envelope)
+        if len(encoded) > self.config.max_progress_envelope_bytes:
+            raise RelayStateStoreError(
+                "encrypted progress exceeds its configured byte bound"
+            )
+        node = self._node_digest(node_id)
+        cfg = self._foundation.config
+        keys = (
+            cfg.key("nodes:lease"), cfg.key("node", node), cfg.key("queue", node),
+            cfg.key("claim", client, request), cfg.key("request", client, request),
+            cfg.key("claims:expiry"), cfg.key("requests:deadline"),
+            cfg.key("progress", client, request), cfg.key("node_work", node),
+        )
+        args = (
+            cfg.key_prefix.encode(), node.encode(), node_id.encode(),
+            control_credential_digest.encode(), consumer.encode(), client.encode(),
+            request.encode(), str(generation).encode(), b"replace",
+            envelope.protocol.encode(), str(envelope.version).encode(),
+            envelope.ciphertext.encode(), envelope.cipherkey.encode(), envelope.iv.encode(),
+            client_public_key.encode(), request_id.encode(),
+            str(self.config.max_identity_bytes).encode(),
+            str(self.config.max_node_id_bytes).encode(),
+            str(self.config.max_progress_envelope_bytes).encode(),
+            str(self.config.max_progress_records).encode(),
+            str(self.config.max_progress_records_per_client).encode(),
+            str(self.config.max_request_lifecycles).encode(),
+        )
+        status, values = self._ascii_status(
+            self._foundation.execute(PROGRESS_SCRIPT.name, keys, args)
+        )
+        if values:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if status == "owner":
+            raise RelayStateCredentialMismatch("progress owner is invalid")
+        if status in {"missing", "stale"}:
+            raise RelayStateConflict("progress claim is missing or expired")
+        if status == "capacity":
+            raise RelayStateCapacityExceeded("progress capacity reached")
+        if status == "schema":
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        if status not in {"accepted", "replaced"}:
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        return ProgressReplacementResult(status)
+
     def accept_encrypted_response(
         self,
         node_id: str,
@@ -4316,6 +4484,57 @@ class ValkeyRegistrationStore:
             else self._safe_acknowledgement_digest(acknowledgement_token)
         )
         cfg = self._foundation.config
+        zero = "0" * 64
+        progress_keys = (
+            cfg.key("nodes:lease"), cfg.key("node", zero), cfg.key("queue", zero),
+            cfg.key("claim", client, request), cfg.key("request", client, request),
+            cfg.key("claims:expiry"), cfg.key("requests:deadline"),
+            cfg.key("progress", client, request), cfg.key("node_work", zero),
+        )
+        progress_args = (
+            cfg.key_prefix.encode(), zero.encode(), b"x", retrieval_digest.encode(),
+            zero.encode(), client.encode(), request.encode(), b"1", b"retrieve",
+            b"", b"", b"", b"", b"", client_public_key.encode(), request_id.encode(),
+            str(self.config.max_identity_bytes).encode(),
+            str(self.config.max_node_id_bytes).encode(),
+            str(self.config.max_progress_envelope_bytes).encode(),
+            str(self.config.max_progress_records).encode(),
+            str(self.config.max_progress_records_per_client).encode(),
+            str(self.config.max_request_lifecycles).encode(),
+        )
+        def pending_transition() -> ResponseRetrievalResult | None:
+            progress_status, progress_values = self._ascii_status(
+                self._foundation.execute(
+                    PROGRESS_SCRIPT.name,
+                    progress_keys,
+                    progress_args,
+                    max_result_bytes=self.config.max_progress_envelope_bytes
+                    + _CLAIM_RESULT_METADATA_BYTES,
+                )
+            )
+            if progress_status == "invalid" and not progress_values:
+                return ResponseRetrievalResult("invalid_retrieval_credential")
+            if progress_status == "pending" and len(progress_values) in {1, 6}:
+                try:
+                    deadline = float(self._decode_text(progress_values[0]))
+                    if not math.isfinite(deadline):
+                        raise ValueError
+                    progress = (
+                        None
+                        if len(progress_values) == 1
+                        else self._decode_progress_envelope(progress_values[1:])
+                    )
+                except (TypeError, ValueError, OverflowError, UnicodeDecodeError):
+                    raise ValkeySchemaIncompatibleError(
+                        "state schema incompatible"
+                    ) from None
+                return ResponseRetrievalResult(
+                    "pending", request_deadline_epoch=deadline, progress=progress
+                )
+            if progress_status == "schema" or progress_values:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            if progress_status not in {"not_pending"}:
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
         keys = (
             cfg.key("response", client, request),
             cfg.key("terminal", client, request),
@@ -4357,7 +4576,8 @@ class ValkeyRegistrationStore:
 
         status, values = transition("read")
         if status == "invalid_credential" and not values:
-            return ResponseRetrievalResult("invalid_retrieval_credential")
+            pending = pending_transition()
+            return pending or ResponseRetrievalResult("invalid_retrieval_credential")
         if status == "invalid_ack" and not values:
             return ResponseRetrievalResult("invalid_acknowledgement")
         if status in {"retrieval_expired", "completed_unavailable"} and not values:
@@ -4495,6 +4715,22 @@ class ValkeyRegistrationStore:
         )
         if status != "cleaned" or values:
             raise ValkeySchemaIncompatibleError("state schema incompatible")
+
+    @staticmethod
+    def _decode_progress_envelope(values: list[object]) -> EncryptedProgressEnvelope:
+        if len(values) != 5 or not all(isinstance(value, bytes) for value in values):
+            raise ValkeySchemaIncompatibleError("state schema incompatible")
+        try:
+            protocol, raw_version, ciphertext, cipherkey, iv = (
+                value.decode("utf-8") for value in values
+            )
+            if raw_version != "1":
+                raise ValueError
+            return EncryptedProgressEnvelope(
+                protocol, 1, ciphertext, cipherkey, iv
+            )
+        except (UnicodeDecodeError, ValueError, RelayStateStoreError):
+            raise ValkeySchemaIncompatibleError("state schema incompatible") from None
 
     @staticmethod
     def _decode_response_envelope(raw: bytes) -> EncryptedResponseEnvelope:

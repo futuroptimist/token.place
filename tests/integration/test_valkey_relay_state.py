@@ -18,6 +18,7 @@ import redis
 
 from relay_state_store import (
     ComputeNodeCapabilities,
+    EncryptedProgressEnvelope,
     EncryptedRequestEnvelope,
     EncryptedResponseEnvelope,
     InMemoryRelayStateStore,
@@ -36,6 +37,7 @@ from valkey_relay_state import (
     CLAIM_SCRIPT,
     CONTROL_CLAIM_SCRIPT,
     NODE_TRANSITION_SCRIPT,
+    PROGRESS_SCRIPT,
     PENDING_TRANSITION_READ_SCRIPT,
     RENEW_CLAIM_SCRIPT,
     RETRIEVE_RESPONSE_SCRIPT,
@@ -4089,7 +4091,9 @@ def _delete_claim_fixture_state(store, node_ids, identities):
     ]
     for node_id in node_ids:
         node = store._node_digest(node_id)
-        keys.extend((cfg.key("node", node), cfg.key("queue", node)))
+        keys.extend(
+            (cfg.key("node", node), cfg.key("queue", node), cfg.key("node_work", node))
+        )
     for client_id, request_id in identities:
         client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
         request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
@@ -12009,3 +12013,59 @@ def test_node_work_contract_rejects_active_writer_membership_corruption(
         writer._foundation._client.delete(work)
         observer.close()
         writer.close()
+
+
+def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node, owner, consumer = "progress-node", _digest("progress-owner"), "progress-consumer"
+    identity = ("progress-client", "progress-request")
+    initial = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "first-ciphertext", "first-key", "first-iv"
+    )
+    replacement = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "latest-ciphertext", "latest-key", "latest-iv"
+    )
+    try:
+        first.register(node, _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 60
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        first.enqueue_encrypted_request(
+            *identity, selection.reservation_token, node, "qwen3-8b-instruct",
+            "8k-fast", deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request-cipher", "request-key", "request-iv"
+            ),
+            "cancel",
+        )
+        claim = first.claim_queued_request(node, owner, consumer)
+        assert first.replace_encrypted_progress_if_claimed(
+            node, owner, consumer, *identity, claim.generation, initial
+        ).state == "accepted"
+        assert second.replace_encrypted_progress_if_claimed(
+            node, owner, consumer, *identity, claim.generation, replacement
+        ).state == "replaced"
+
+        pending = second.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert pending.state == "pending"
+        assert pending.request_deadline_epoch == claim.request_deadline_epoch
+        assert pending.progress == replacement
+        again = first.retrieve_encrypted_response(*identity, selection.reservation_token)
+        assert again.state == "pending"
+        assert again.progress is None
+        client, request = first._identity(*identity)
+        assert int(
+            first._foundation._client.hget(
+                first._foundation.config.key("claim", client, request), "generation"
+            )
+        ) == claim.generation
+    finally:
+        _delete_claim_fixture_state(first, (node,), (identity,))
+        first.close()
+        second.close()

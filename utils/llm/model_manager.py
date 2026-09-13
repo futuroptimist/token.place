@@ -2854,6 +2854,7 @@ class _SubprocessLlamaProxy:
         self._process._token_place_legacy_frames = self._legacy_frames  # type: ignore[attr-defined]
         self._stderr_reader_thread: Optional[threading.Thread] = None
         self._stdout_reader_thread: Optional[threading.Thread] = None
+        self._completed_inference_count = 0
         self._start_stderr_tail_reader()
         try:
             import_message = self._rpc({'method': '__import__'}, timeout_seconds=self._timeout_seconds, stage='llama_cpp_import', check_health=False)
@@ -3322,6 +3323,7 @@ class _SubprocessLlamaProxy:
         except LlamaCppWorkerEOFError:
             self._closed = True
             raise
+        self._completed_inference_count = getattr(self, '_completed_inference_count', 0) + 1
         return message.get('result')
 
 
@@ -3364,7 +3366,41 @@ class _SubprocessLlamaProxy:
         except LlamaCppWorkerEOFError:
             self._closed = True
             raise
+        self._completed_inference_count = getattr(self, '_completed_inference_count', 0) + 1
         return message.get('result')
+
+    def worker_execution_diagnostics(self) -> Dict[str, Any]:
+        """Return execution evidence observed inside the constructed worker.
+
+        llama.cpp reports the device and actual layer offload on the worker's
+        stderr stream.  Do not substitute constructor kwargs or the parent's
+        compute plan when that worker report is absent.
+        """
+        if getattr(self, '_completed_inference_count', 0) < 1 or not self.is_alive():
+            return {}
+        lines = self._stderr_since(0)
+        offload_matches = []
+        for line in lines:
+            match = re.search(
+                r"offload(?:ed|ing)\s+(\d+)(?:/(\d+))?\s+(?:repeating\s+)?layers?",
+                line,
+                re.IGNORECASE,
+            )
+            if match:
+                offload_matches.append((int(match.group(1)), int(match.group(2) or 0)))
+        if not offload_matches:
+            return {}
+        offloaded, supported = offload_matches[-1]
+        if offloaded <= 0:
+            return {"observed_backend": "cpu", "observed_offloaded_layers": 0}
+        text = "\n".join(lines).lower()
+        backend = "cuda" if "cuda" in text else "metal" if "metal" in text else None
+        if backend is None:
+            return {}
+        layers: Any = (
+            "all_supported_layers" if supported > 0 and offloaded >= supported else offloaded
+        )
+        return {"observed_backend": backend, "observed_offloaded_layers": layers}
 
 
     def apply_chat_template(self, *args, **kwargs):
@@ -7563,6 +7599,15 @@ class ModelManager:
             except Exception:
                 return None
         return None
+
+    def worker_execution_diagnostics(self) -> Dict[str, Any]:
+        """Read post-completion telemetry from the active worker itself."""
+        with self.llm_lock:
+            reporter = getattr(self.llm, 'worker_execution_diagnostics', None)
+            if not callable(reporter):
+                return {}
+            report = reporter()
+        return dict(report) if isinstance(report, dict) else {}
 
     def worker_lifecycle_status(self) -> Dict[str, Any]:
         with self.llm_lock:

@@ -47,6 +47,7 @@ const BENCHMARK_TOKENIZER_REQUEST_ARG_NAME: &str =
     "--token-place-long-context-benchmark-tokenizer-request";
 const BENCHMARK_TOKENIZER_EVIDENCE_ARG_NAME: &str =
     "--token-place-long-context-benchmark-tokenizer-evidence";
+const GPU_COMPLETION_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(190);
 
 fn benchmark_stage_path(evidence: &Path) -> PathBuf {
     let mut stage = evidence.as_os_str().to_os_string();
@@ -2770,6 +2771,339 @@ pub(crate) fn operator_start_preflight_record(
     Ok(payload)
 }
 
+fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value> {
+    fn exact_keys(value: Option<&Value>, expected: &[&str]) -> bool {
+        value.and_then(Value::as_object).is_some_and(|map| {
+            map.len() == expected.len() && map.keys().all(|key| expected.contains(&key.as_str()))
+        })
+    }
+    let allowed_keys = [
+        "schema_version",
+        "qualification",
+        "success",
+        "failure_code",
+        "artifact",
+        "identity",
+        "backend",
+        "completion",
+        "phases",
+        "total_deadline_ms",
+        "total_elapsed_ms",
+        "cleanup",
+        "side_effects",
+    ];
+    let keys_are_allowlisted = event.as_object().is_some_and(|map| {
+        map.len() == allowed_keys.len()
+            && map.keys().all(|key| allowed_keys.contains(&key.as_str()))
+    }) && exact_keys(event.get("artifact"), &["filename", "size_bytes"])
+        && exact_keys(
+            event.get("identity"),
+            &[
+                "app_version",
+                "build_id",
+                "target_triple",
+                "bundled_runtime_id",
+                "runtime_id",
+            ],
+        )
+        && exact_keys(
+            event.get("backend"),
+            &["declared", "observed", "gpu_verified"],
+        )
+        && exact_keys(
+            event.get("completion"),
+            &["path", "count", "max_output_tokens", "result"],
+        )
+        && exact_keys(
+            event.get("cleanup"),
+            &["attempted", "verified", "owned_worker_alive"],
+        )
+        && exact_keys(
+            event.get("side_effects"),
+            &["relay_contacts", "registrations", "benchmark_attempts"],
+        )
+        && exact_keys(
+            event.get("phases"),
+            &[
+                "runtime_startup",
+                "model_load",
+                "generation",
+                "cancellation",
+                "cleanup",
+            ],
+        )
+        && event
+            .get("phases")
+            .and_then(Value::as_object)
+            .is_some_and(|phases| {
+                phases
+                    .values()
+                    .all(|phase| exact_keys(Some(phase), &["deadline_ms", "elapsed_ms", "outcome"]))
+            });
+    let success = event.get("success").and_then(Value::as_bool) == Some(true);
+    let failure_code = event.get("failure_code").and_then(Value::as_str);
+    let allowed_failure = matches!(
+        failure_code,
+        Some(
+            "not_started"
+                | "none"
+                | "runtime_identity_mismatch"
+                | "model_missing"
+                | "gpu_mode_required"
+                | "gpu_runtime_unavailable"
+                | "mock_runtime_rejected"
+                | "model_identity_mismatch"
+                | "model_identity_validation_unavailable"
+                | "generation_boundary_missing"
+                | "completion_count_invalid"
+                | "completion_failed"
+                | "cpu_fallback_or_unverified_gpu"
+                | "phase_deadline_exceeded"
+                | "total_deadline_exceeded"
+                | "generation_cancelled"
+                | "worker_or_protocol_failure"
+                | "cleanup_failed"
+        )
+    );
+    let identity = event.get("identity").and_then(Value::as_object);
+    let nonempty_identity = [
+        "app_version",
+        "build_id",
+        "target_triple",
+        "bundled_runtime_id",
+        "runtime_id",
+    ]
+    .iter()
+    .all(|key| {
+        identity
+            .and_then(|values| values.get(*key))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty() && value != "unknown")
+    });
+    let phases_valid = event
+        .get("phases")
+        .and_then(Value::as_object)
+        .is_some_and(|phases| {
+            let deadlines = [
+                ("runtime_startup", 45_000),
+                ("model_load", 120_000),
+                ("generation", 45_000),
+                ("cancellation", 5_000),
+                ("cleanup", 10_000),
+            ];
+            deadlines.iter().all(|(name, deadline)| {
+                let phase = phases.get(*name);
+                let elapsed = phase
+                    .and_then(|value| value.get("elapsed_ms"))
+                    .and_then(Value::as_u64);
+                phase
+                    .and_then(|value| value.get("deadline_ms"))
+                    .and_then(Value::as_u64)
+                    == Some(*deadline)
+                    && elapsed.is_some_and(|value| value <= *deadline)
+                    && matches!(
+                        phase
+                            .and_then(|value| value.get("outcome"))
+                            .and_then(Value::as_str),
+                        Some("not_started" | "passed" | "failed")
+                    )
+            })
+        });
+    let accepted_success = !success
+        || (failure_code == Some("none")
+            && event.pointer("/artifact/filename").and_then(Value::as_str)
+                == Some(EXPECTED_MODEL_ARTIFACT_FILENAME)
+            && event
+                .pointer("/artifact/size_bytes")
+                .and_then(Value::as_u64)
+                == Some(5_027_783_488)
+            && nonempty_identity
+            && event.pointer("/identity/runtime_id")
+                == event.pointer("/identity/bundled_runtime_id")
+            && event.pointer("/completion/path").and_then(Value::as_str)
+                == Some("shared_api_v1_generation")
+            && event
+                .pointer("/completion/max_output_tokens")
+                .and_then(Value::as_u64)
+                == Some(64)
+            && event.pointer("/completion/count").and_then(Value::as_u64) == Some(1)
+            && event.pointer("/completion/result").and_then(Value::as_str) == Some("passed")
+            && event
+                .pointer("/backend/gpu_verified")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && matches!(
+                event.pointer("/backend/observed").and_then(Value::as_str),
+                Some("cuda" | "metal")
+            )
+            && event.pointer("/backend/declared") == event.pointer("/backend/observed")
+            && phases_valid
+            && event
+                .pointer("/phases/runtime_startup/outcome")
+                .and_then(Value::as_str)
+                == Some("passed")
+            && event
+                .pointer("/phases/model_load/outcome")
+                .and_then(Value::as_str)
+                == Some("passed")
+            && event
+                .pointer("/phases/generation/outcome")
+                .and_then(Value::as_str)
+                == Some("passed")
+            && event
+                .pointer("/phases/cleanup/outcome")
+                .and_then(Value::as_str)
+                == Some("passed")
+            && event.get("total_deadline_ms").and_then(Value::as_u64) == Some(180_000)
+            && event
+                .get("total_elapsed_ms")
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value <= 180_000)
+            && event.pointer("/cleanup/verified").and_then(Value::as_bool) == Some(true)
+            && event.pointer("/cleanup/attempted").and_then(Value::as_bool) == Some(true)
+            && event
+                .pointer("/cleanup/owned_worker_alive")
+                .and_then(Value::as_bool)
+                == Some(false));
+    let scalar_values_valid = matches!(
+        event.pointer("/artifact/filename").and_then(Value::as_str),
+        Some("unknown" | EXPECTED_MODEL_ARTIFACT_FILENAME)
+    ) && event
+        .pointer("/artifact/size_bytes")
+        .and_then(Value::as_u64)
+        .is_some()
+        && matches!(
+            event.pointer("/backend/declared").and_then(Value::as_str),
+            Some("unknown" | "cuda" | "metal")
+        )
+        && matches!(
+            event.pointer("/backend/observed").and_then(Value::as_str),
+            Some("unknown" | "cuda" | "metal")
+        )
+        && event
+            .pointer("/backend/gpu_verified")
+            .and_then(Value::as_bool)
+            .is_some()
+        && event.pointer("/completion/path").and_then(Value::as_str)
+            == Some("shared_api_v1_generation")
+        && event
+            .pointer("/completion/max_output_tokens")
+            .and_then(Value::as_u64)
+            == Some(64)
+        && event
+            .pointer("/completion/count")
+            .and_then(Value::as_u64)
+            .is_some()
+        && matches!(
+            event.pointer("/completion/result").and_then(Value::as_str),
+            Some("not_started" | "missing" | "passed" | "failed" | "invalid_api_v1_envelope")
+        );
+    let valid = keys_are_allowlisted
+        && event.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && event.get("qualification").and_then(Value::as_str)
+            == Some("installed_gpu_child_worker_completion")
+        && event.get("success").and_then(Value::as_bool).is_some()
+        && allowed_failure
+        && (!success || failure_code == Some("none"))
+        && (success || failure_code != Some("none"))
+        && scalar_values_valid
+        && phases_valid
+        && accepted_success
+        && event
+            .pointer("/side_effects/relay_contacts")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && event
+            .pointer("/side_effects/registrations")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && event
+            .pointer("/side_effects/benchmark_attempts")
+            .and_then(Value::as_u64)
+            == Some(0);
+    if !valid {
+        anyhow::bail!("gpu_completion_preflight_rejected")
+    }
+    Ok(event)
+}
+
+/// Produce the same privacy-safe protocol shape when native preparation fails
+/// before the Python qualification child can emit evidence.
+pub(crate) fn gpu_completion_preflight_native_failure() -> Value {
+    let phases = serde_json::json!({
+        "runtime_startup": {"deadline_ms": 45000, "elapsed_ms": 0, "outcome": "failed"},
+        "model_load": {"deadline_ms": 120000, "elapsed_ms": 0, "outcome": "not_started"},
+        "generation": {"deadline_ms": 45000, "elapsed_ms": 0, "outcome": "not_started"},
+        "cancellation": {"deadline_ms": 5000, "elapsed_ms": 0, "outcome": "not_started"},
+        "cleanup": {"deadline_ms": 10000, "elapsed_ms": 0, "outcome": "passed"}
+    });
+    serde_json::json!({
+        "schema_version": 1,
+        "qualification": "installed_gpu_child_worker_completion",
+        "success": false,
+        "failure_code": "worker_or_protocol_failure",
+        "artifact": {"filename": "unknown", "size_bytes": 0},
+        "identity": {"app_version": "unknown", "build_id": "unknown", "target_triple": "unknown", "bundled_runtime_id": "unknown", "runtime_id": "unknown"},
+        "backend": {"declared": "unknown", "observed": "unknown", "gpu_verified": false},
+        "completion": {"path": "shared_api_v1_generation", "count": 0, "max_output_tokens": 64, "result": "not_started"},
+        "phases": phases,
+        "total_deadline_ms": 180000,
+        "total_elapsed_ms": 0,
+        "cleanup": {"attempted": true, "verified": true, "owned_worker_alive": false},
+        "side_effects": {"relay_contacts": 0, "registrations": 0, "benchmark_attempts": 0}
+    })
+}
+
+pub(crate) fn operator_gpu_completion_preflight_record(
+    config: &DesktopConfig,
+    app: &AppHandle,
+) -> anyhow::Result<Value> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let current_exe = std::env::current_exe().ok();
+    let resource_dir = app.path().resource_dir().ok();
+    let context = BridgeResourceContext {
+        exe_path: current_exe.as_deref(),
+        manifest_dir,
+        tauri_resource_dir: resource_dir.as_deref(),
+    };
+    let preparation = prepare_operator_bridge_launch(&context)?;
+    let launcher = preparation
+        .launcher
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("gpu_completion_preflight_bundled_runtime_missing"))?;
+    if !matches!(launcher.source, PythonLauncherSource::BundledRuntime) {
+        anyhow::bail!("gpu_completion_preflight_system_runtime_rejected");
+    }
+    let mut command = preparation.command()?;
+    configure_runtime_bootstrap_env(&mut command, &config.preferred_mode);
+    let identity = crate::build_identity::build_identity();
+    command
+        .env("TOKENPLACE_APP_VERSION", identity.app_version)
+        .env("TOKENPLACE_BUILD_ID", identity.build_id)
+        .env("TOKENPLACE_TARGET_TRIPLE", identity.target_triple)
+        .env("TOKENPLACE_BUNDLED_RUNTIME_ID", identity.bundled_runtime_id)
+        .env("TOKENPLACE_RUNTIME_ID", &launcher.runtime_id)
+        .arg("--installed-gpu-completion-preflight")
+        .arg("--model")
+        .arg(&config.model_path)
+        .arg("--mode")
+        .arg(format!("{:?}", config.preferred_mode).to_lowercase())
+        .arg("--context-tier")
+        .arg("8k-fast");
+    std::thread::spawn(move || -> anyhow::Result<Value> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_operator_preflight_child(
+                command,
+                GPU_COMPLETION_PREFLIGHT_TIMEOUT,
+                validate_gpu_completion_preflight_event,
+            ))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("gpu_completion_preflight_child_failed"))?
+}
+
 /// Structural-only smoke gate: confirms the packaged app launches, resolves
 /// its bundled resources, and passes dependency/environment preflight on a
 /// CPU-only request. It does NOT claim GPU/CUDA/Metal validation -- that
@@ -2844,16 +3178,21 @@ pub(crate) fn operator_start_preflight_cpu_smoke_record(
     Ok(payload)
 }
 
-async fn cleanup_production_operator_preflight_child(child: &mut Child, pid: Option<u32>) {
-    if let Some(pid) = pid {
-        terminate_bridge_process_tree(pid).await;
-    }
-    if tokio::time::timeout(OPERATOR_PREFLIGHT_REAP_TIMEOUT, child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.kill().await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+async fn cleanup_production_operator_preflight_child(
+    containment: &BridgeProcessContainment,
+    child: &mut Child,
+) -> bool {
+    containment.terminate_and_reap(child).await
+}
+
+fn require_operator_preflight_cleanup(
+    result: anyhow::Result<Value>,
+    cleanup_succeeded: bool,
+) -> anyhow::Result<Value> {
+    if cleanup_succeeded {
+        result
+    } else {
+        Err(anyhow::anyhow!("operator_preflight_child_cleanup_failed"))
     }
 }
 
@@ -3064,11 +3403,16 @@ async fn run_operator_preflight_child(
     validate_success: fn(Value) -> anyhow::Result<Value>,
 ) -> anyhow::Result<Value> {
     command.stdout(Stdio::piped()).stderr(Stdio::null());
-    isolate_bridge_process_tree(&mut command);
+    let containment = BridgeProcessContainment::prepare(&mut command)
+        .map_err(|_| anyhow::anyhow!("operator_preflight_child_spawn_failed"))?;
     let mut child = command
         .spawn()
         .map_err(|_| anyhow::anyhow!("operator_preflight_child_spawn_failed"))?;
-    let pid = child.id();
+    if containment.assign_and_resume(&child).is_err() {
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(OPERATOR_PREFLIGHT_REAP_TIMEOUT, child.wait()).await;
+        anyhow::bail!("operator_preflight_child_spawn_failed");
+    }
     let result = async {
         let stdout = child
             .stdout
@@ -3093,8 +3437,9 @@ async fn run_operator_preflight_child(
         validate_success(event)
     }
     .await;
-    cleanup_production_operator_preflight_child(&mut child, pid).await;
-    result
+    let cleanup_succeeded =
+        cleanup_production_operator_preflight_child(&containment, &mut child).await;
+    require_operator_preflight_cleanup(result, cleanup_succeeded)
 }
 
 async fn run_production_operator_preflight_child(
@@ -5471,6 +5816,26 @@ mod tests {
         }
     }
 
+    fn exited_operator_preflight_test_command(output: &str) -> Command {
+        #[cfg(unix)]
+        {
+            let mut command = Command::new("sh");
+            command.args(["-c", &format!("printf '%s' '{output}'")]);
+            command
+        }
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("[Console]::Out.Write('{output}')"),
+            ]);
+            command
+        }
+    }
+
     fn oversized_unterminated_operator_preflight_test_command() -> Command {
         let byte_count = OPERATOR_PREFLIGHT_EVENT_MAX_BYTES + 2;
         #[cfg(unix)]
@@ -5503,6 +5868,18 @@ mod tests {
         assert_eq!(event["type"], "status");
         assert_eq!(event["production_runtime_preflight"], true);
         assert_eq!(event["network_actions"], 0);
+    }
+
+    #[tokio::test]
+    async fn operator_preflight_accepts_valid_event_after_owned_tree_exits() {
+        let event = run_production_operator_preflight_child(
+            exited_operator_preflight_test_command(PRODUCTION_PREFLIGHT_VALIDATED_EVENT),
+            production_operator_preflight_event_test_timeout(),
+        )
+        .await
+        .expect("an exited, fully reaped owned process tree must pass cleanup");
+
+        assert_eq!(event["startup_result"], "runtime_validated");
     }
 
     #[tokio::test]
@@ -5741,6 +6118,17 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "wedged child was not terminated and boundedly reaped"
         );
+    }
+
+    #[test]
+    fn operator_preflight_rejects_validated_event_when_parent_cleanup_fails() {
+        let event = serde_json::from_str(PRODUCTION_PREFLIGHT_VALIDATED_EVENT)
+            .expect("valid production preflight event");
+
+        let error = require_operator_preflight_cleanup(Ok(event), false)
+            .expect_err("cleanup failure must override a validated child event");
+
+        assert_eq!(error.to_string(), "operator_preflight_child_cleanup_failed");
     }
 
     #[test]
@@ -8895,6 +9283,67 @@ mod tests {
                 "rejected inspect payload should fail: {rejected}"
             );
         }
+    }
+
+    #[test]
+    fn gpu_completion_preflight_validator_requires_single_gpu_completion_and_cleanup() {
+        let accepted = serde_json::json!({
+            "schema_version": 1,
+            "qualification": "installed_gpu_child_worker_completion",
+            "success": true,
+            "failure_code": "none",
+            "artifact": {"filename": "Qwen3-8B-Q4_K_M.gguf", "size_bytes": 5027783488_u64},
+            "identity": {"app_version": "0.1.19", "build_id": "build", "target_triple": "target", "bundled_runtime_id": "runtime", "runtime_id": "runtime"},
+            "backend": {"declared": "cuda", "observed": "cuda", "gpu_verified": true},
+            "completion": {"path": "shared_api_v1_generation", "count": 1, "max_output_tokens": 64, "result": "passed"},
+            "phases": {
+                "runtime_startup": {"deadline_ms": 45000, "elapsed_ms": 1, "outcome": "passed"},
+                "model_load": {"deadline_ms": 120000, "elapsed_ms": 1, "outcome": "passed"},
+                "generation": {"deadline_ms": 45000, "elapsed_ms": 1, "outcome": "passed"},
+                "cancellation": {"deadline_ms": 5000, "elapsed_ms": 0, "outcome": "not_started"},
+                "cleanup": {"deadline_ms": 10000, "elapsed_ms": 1, "outcome": "passed"}
+            },
+            "total_deadline_ms": 180000,
+            "total_elapsed_ms": 1,
+            "cleanup": {"attempted": true, "verified": true, "owned_worker_alive": false},
+            "side_effects": {"relay_contacts": 0, "registrations": 0, "benchmark_attempts": 0}
+        });
+        assert!(validate_gpu_completion_preflight_event(accepted.clone()).is_ok());
+        assert!(
+            validate_gpu_completion_preflight_event(gpu_completion_preflight_native_failure())
+                .is_ok()
+        );
+        for pointer in ["/backend/gpu_verified", "/cleanup/verified"] {
+            let mut rejected = accepted.clone();
+            *rejected.pointer_mut(pointer).expect("fixture pointer") = Value::Bool(false);
+            assert!(validate_gpu_completion_preflight_event(rejected).is_err());
+        }
+        let mut duplicate = accepted.clone();
+        duplicate["completion"]["count"] = Value::from(2);
+        assert!(validate_gpu_completion_preflight_event(duplicate).is_err());
+        for (pointer, value) in [
+            ("/failure_code", Value::String("unexpected".into())),
+            ("/artifact/filename", Value::String("other.gguf".into())),
+            (
+                "/identity/runtime_id",
+                Value::String("other-runtime".into()),
+            ),
+            ("/backend/declared", Value::String("metal".into())),
+            ("/completion/max_output_tokens", Value::from(63)),
+            ("/phases/generation/deadline_ms", Value::from(46_000)),
+            ("/total_deadline_ms", Value::from(181_000)),
+            ("/total_elapsed_ms", Value::from(180_001)),
+        ] {
+            let mut rejected = accepted.clone();
+            *rejected.pointer_mut(pointer).expect("fixture pointer") = value;
+            assert!(validate_gpu_completion_preflight_event(rejected).is_err());
+        }
+        let mut failed = accepted;
+        failed["success"] = Value::Bool(false);
+        failed["failure_code"] = Value::String("cleanup_failed".into());
+        assert!(validate_gpu_completion_preflight_event(failed.clone()).is_ok());
+        failed["secret"] = Value::String("must not pass".into());
+        assert!(validate_gpu_completion_preflight_event(failed).is_err());
     }
 
     #[test]

@@ -3359,6 +3359,7 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         "TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION",
         "TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS",
         "TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS",
+        "TOKEN_PLACE_VERBOSE_LLM_LOGS",
     )
     previous_bounded_env = {name: os.environ.get(name) for name in bounded_env_names}
     try:
@@ -3497,6 +3498,9 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         os.environ["TOKEN_PLACE_API_V1_READINESS_SMOKE_COMPLETION"] = "1"
         os.environ["TOKEN_PLACE_LLAMA_CPP_RUNTIME_STAGE_TIMEOUT_SECONDS"] = "45"
         os.environ["TOKEN_PLACE_LLAMA_CPP_SUBPROCESS_INFERENCE_TIMEOUT_SECONDS"] = "45"
+        # Capture llama.cpp's worker-side device/offload report. The subprocess
+        # retains these logs internally; only parsed allowlisted fields leave it.
+        os.environ["TOKEN_PLACE_VERBOSE_LLM_LOGS"] = "1"
 
         # Readiness loads the model before it crosses the wrapped production
         # generation boundary.  Switch from the load deadline to the fresh
@@ -3509,9 +3513,13 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         load_elapsed = int((time.monotonic() - model_phase_started) * 1000)
         diagnostics = getattr(manager, "last_compute_diagnostics", {}) or {}
         smoke_result = diagnostics.get("api_v1_readiness_completion_smoke_result")
-        # The readiness backend is a requested/planned value.  Only diagnostics
-        # produced after worker load attest where the model actually executed.
-        observed = diagnostics.get("device_backend")
+        worker_reporter = getattr(manager, "worker_execution_diagnostics", None)
+        worker_diagnostics = worker_reporter() if callable(worker_reporter) else {}
+        if not isinstance(worker_diagnostics, dict):
+            worker_diagnostics = {}
+        # This report is emitted by the constructed worker after a completed
+        # inference. Plan/readiness fields are intentionally not fallbacks.
+        observed = worker_diagnostics.get("observed_backend")
         evidence["phases"]["model_load"].update(
             elapsed_ms=max(0, load_elapsed - generation_elapsed_ms),
             outcome="passed" if ready else "failed",
@@ -3520,10 +3528,9 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             elapsed_ms=generation_elapsed_ms,
             outcome="passed" if smoke_result == "passed" else "failed",
         )
-        device_backend = diagnostics.get("device_backend")
-        offloaded_layers = diagnostics.get("offloaded_layers")
+        offloaded_layers = worker_diagnostics.get("observed_offloaded_layers")
         actual_gpu_offload = (
-            device_backend == declared
+            observed == declared
             and (offloaded_layers == "all_supported_layers"
                  or isinstance(offloaded_layers, int) and not isinstance(offloaded_layers, bool)
                  and offloaded_layers > 0)

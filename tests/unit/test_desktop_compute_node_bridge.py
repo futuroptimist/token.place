@@ -19,6 +19,7 @@ import requests
 import yaml
 
 from utils import compute_node_runtime
+from utils.llm import model_manager
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -78,6 +79,10 @@ class _CompletionPreflightManager:
         self.model_path = str(model_path)
         self.models_dir = str(model_path.parent)
         self.last_compute_diagnostics = {}
+        self.worker_diagnostics = {
+            "observed_backend": "cuda",
+            "observed_offloaded_layers": "all_supported_layers",
+        }
         fixture = b"fixture"
         self.model_profile = {
             "artifact_size_bytes": len(fixture),
@@ -86,6 +91,9 @@ class _CompletionPreflightManager:
 
     def worker_lifecycle_status(self):
         return {"worker_alive": self.llm is not None}
+
+    def worker_execution_diagnostics(self):
+        return dict(self.worker_diagnostics)
 
     def _validate_existing_model_artifact(self, **_kwargs):
         return True, "valid"
@@ -123,8 +131,6 @@ class _CompletionPreflightRuntime:
         self.model_manager.last_compute_diagnostics = {
             "api_v1_readiness_completion_smoke_result": "passed" if self.outcome == "success" else self.outcome,
             "api_v1_readiness_backend_used": "cuda",
-            "device_backend": "cuda",
-            "offloaded_layers": "all_supported_layers",
         }
         return self.outcome == "success"
 
@@ -184,6 +190,60 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
 
 
 @pytest.mark.parametrize(
+    ("backend", "offloaded_layers"),
+    [("cuda", 24), ("metal", "all_supported_layers")],
+)
+def test_installed_gpu_completion_preflight_uses_worker_attested_gpu(
+        monkeypatch, tmp_path, backend, offloaded_layers):
+    _completion_preflight_environment(monkeypatch)
+    monkeypatch.setattr(
+        compute_node_bridge,
+        "_ensure_desktop_llama_runtime_for_context",
+        lambda *_args: {"selected_backend": backend, "runtime_action": "already_supported"},
+    )
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+
+    class Runtime(_CompletionPreflightRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.model_manager.worker_diagnostics = {
+                "observed_backend": backend,
+                "observed_offloaded_layers": offloaded_layers,
+            }
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), Runtime
+    )
+
+    assert code == 0
+    assert evidence["backend"] == {
+        "declared": backend, "observed": backend, "gpu_verified": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("lines", "expected"),
+    [
+        (["ggml_cuda_init: found CUDA0", "load_tensors: offloaded 33/33 layers to GPU"],
+         {"observed_backend": "cuda", "observed_offloaded_layers": "all_supported_layers"}),
+        (["ggml_metal_init: Metal GPU", "load_tensors: offloaded 12/33 layers to GPU"],
+         {"observed_backend": "metal", "observed_offloaded_layers": 12}),
+        (["load_tensors: offloaded 0/33 layers to GPU"],
+         {"observed_backend": "cpu", "observed_offloaded_layers": 0}),
+        (["worker initialized without an offload report"], {}),
+    ],
+)
+def test_subprocess_worker_execution_diagnostics_are_observed(lines, expected):
+    proxy = object.__new__(model_manager._SubprocessLlamaProxy)
+    proxy._completed_inference_count = 1
+    proxy.is_alive = lambda: True
+    proxy._stderr_since = lambda _cursor: lines
+
+    assert proxy.worker_execution_diagnostics() == expected
+
+
+@pytest.mark.parametrize(
     ("mutation", "expected"),
     [
         ("identity", "runtime_identity_mismatch"),
@@ -200,6 +260,9 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
         ("generation_missing", "generation_boundary_missing"),
         ("completion_missing", "completion_count_invalid"),
         ("observed_cpu", "cpu_fallback_or_unverified_gpu"),
+        ("missing_worker_telemetry", "cpu_fallback_or_unverified_gpu"),
+        ("mismatched_worker_backend", "cpu_fallback_or_unverified_gpu"),
+        ("zero_worker_offload", "cpu_fallback_or_unverified_gpu"),
         ("missing_offload", "cpu_fallback_or_unverified_gpu"),
         ("malformed", "completion_failed"),
         ("worker_exit", "worker_or_protocol_failure"),
@@ -238,9 +301,17 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
                 def cpu_result():
                     result = original()
                     self.model_manager.last_compute_diagnostics["api_v1_readiness_backend_used"] = "cpu"
-                    self.model_manager.last_compute_diagnostics["device_backend"] = "cpu"
+                    self.model_manager.worker_diagnostics.update(
+                        observed_backend="cpu", observed_offloaded_layers=0
+                    )
                     return result
                 self.ensure_api_v1_runtime_ready = cpu_result
+            elif mutation == "missing_worker_telemetry":
+                self.model_manager.worker_diagnostics = {}
+            elif mutation == "mismatched_worker_backend":
+                self.model_manager.worker_diagnostics["observed_backend"] = "metal"
+            elif mutation == "zero_worker_offload":
+                self.model_manager.worker_diagnostics["observed_offloaded_layers"] = 0
             elif mutation == "artifact_hash":
                 self.model_manager.model_profile["artifact_sha256"] = "0" * 64
             elif mutation == "mock":
@@ -259,7 +330,7 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
                 original = self.ensure_api_v1_runtime_ready
                 def missing_offload_result():
                     result = original()
-                    self.model_manager.last_compute_diagnostics.pop("offloaded_layers")
+                    self.model_manager.worker_diagnostics.pop("observed_offloaded_layers")
                     return result
                 self.ensure_api_v1_runtime_ready = missing_offload_result
             elif mutation == "malformed":

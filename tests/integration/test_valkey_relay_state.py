@@ -4156,6 +4156,112 @@ def test_cancellation_is_shared_retrievable_and_retains_only_live_control(
         second.close()
 
 
+@pytest.mark.parametrize("transition", ("cancelled", "expired"))
+def test_progress_terminal_cleanup_removes_exact_authority(valkey_server, transition):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, max_claims=8)
+    second = _registration_store(valkey_server, namespace, max_claims=8)
+    node = f"progress-terminal-{transition}-node"
+    owner = _digest(f"progress-terminal-{transition}-owner")
+    consumer = f"progress-terminal-{transition}-consumer"
+    identities = (
+        (f"progress-terminal-{transition}-client", "target"),
+        (f"progress-terminal-{transition}-client", "neighbor"),
+    )
+    datastore = first._foundation._client
+    target_keys, target_member = _response_acceptance_authority(
+        first, node, identities[0]
+    )
+    neighbor_keys, neighbor_member = _response_acceptance_authority(
+        first, node, identities[1]
+    )
+    progress_expiry = first._foundation.config.key("progress:expiry")
+    try:
+        first.register(node, _capabilities(concurrency=2), owner)
+        now, micros = first._foundation.server_time()
+        target_deadline = now + micros / 1_000_000 + (
+            0.15 if transition == "expired" else 60
+        )
+        claims = []
+        for identity, deadline in zip(identities, (target_deadline, time.time() + 60)):
+            _enqueue_claim_fixture(first, node, owner, *identity, deadline)
+            claims.append(first.claim_queued_request(node, owner, consumer))
+            assert first.replace_encrypted_progress_if_claimed(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claims[-1].generation,
+                EncryptedProgressEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+                ),
+            )
+
+        neighbor_hashes_before = tuple(
+            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
+        )
+        neighbor_scores_before = (
+            datastore.zscore(neighbor_keys[5], neighbor_member),
+            datastore.zscore(neighbor_keys[6], neighbor_member),
+            datastore.zscore(progress_expiry, neighbor_member),
+        )
+        neighbor_queue_entry = datastore.hget(neighbor_keys[4], "queue_entry")
+        node_digest = first._node_digest(node)
+        node_work = first._foundation.config.key("node_work", node_digest)
+        neighbor_work_score = datastore.zscore(node_work, neighbor_member)
+        if transition == "expired":
+            _wait_for_server_epoch(first, target_deadline)
+        result = second.cancel_or_expire_request(
+            *identities[0],
+            "cancel" if transition == "cancelled" else None,
+            status=transition,
+            reason=(
+                "requester_cancelled"
+                if transition == "cancelled"
+                else "request_deadline_expired"
+            ),
+        )
+
+        assert (result.state, result.reason, result.new_outcome) == (
+            transition,
+            "requester_cancelled"
+            if transition == "cancelled"
+            else "request_deadline_expired",
+            True,
+        )
+        assert datastore.exists(target_keys[3]) == 0
+        assert datastore.exists(target_keys[11]) == 0
+        assert datastore.zscore(target_keys[5], target_member) is None
+        assert datastore.zscore(target_keys[6], target_member) is None
+        assert datastore.zscore(progress_expiry, target_member) is None
+        assert datastore.hget(target_keys[4], "state") == transition.encode()
+        assert datastore.hgetall(target_keys[9])[b"outcome"] == transition.encode()
+        queue_after = datastore.xrange(target_keys[2])
+        assert all(
+            entry[0] != datastore.hget(target_keys[4], "queue_entry")
+            for entry in queue_after
+        )
+        assert any(entry[0] == neighbor_queue_entry for entry in queue_after)
+        assert datastore.zscore(node_work, target_member) is None
+        assert tuple(
+            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
+        ) == neighbor_hashes_before
+        assert (
+            datastore.zscore(neighbor_keys[5], neighbor_member),
+            datastore.zscore(neighbor_keys[6], neighbor_member),
+            datastore.zscore(progress_expiry, neighbor_member),
+        ) == neighbor_scores_before
+        assert datastore.zscore(node_work, neighbor_member) == neighbor_work_score
+    finally:
+        _delete_claim_fixture_state(first, (node,), identities)
+        datastore.zrem(progress_expiry, target_member, neighbor_member)
+        datastore.zrem(
+            first._foundation.config.key("node_work", first._node_digest(node)),
+            target_member,
+            neighbor_member,
+        )
+        first.close()
+        second.close()
 
 @pytest.mark.parametrize("retrieval_state", ("response_ready", "acknowledged", "retrieval_expired"))
 @pytest.mark.parametrize("transition", ("cancelled", "expired"))
@@ -7772,6 +7878,9 @@ def test_encrypted_response_first_transition_removes_exact_authority_once(
         assert datastore.zscore(keys[5], member) is None
         assert datastore.zscore(keys[6], member) is None
         assert datastore.exists(keys[11]) == 0
+        assert datastore.zscore(
+            first._foundation.config.key("progress:expiry"), member
+        ) is None
         assert datastore.hget(keys[4], "state") == b"response_ready"
         assert datastore.hget(node_key, "scheduler_claimed_work") == scheduler_before
         assert tuple(
@@ -7789,6 +7898,9 @@ def test_encrypted_response_first_transition_removes_exact_authority_once(
         assert not retried.new_outcome
         assert retried == dataclasses.replace(accepted, new_outcome=False)
         assert _exact_key_snapshot(first, keys) == after
+        assert datastore.zscore(
+            first._foundation.config.key("progress:expiry"), member
+        ) is None
         assert tuple(
             datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
         ) == neighbor_hashes_before

@@ -3691,6 +3691,128 @@ def test_progress_replacement_wrong_authority_is_redacted_and_non_mutating(
         caller.close()
 
 
+@pytest.mark.parametrize(
+    ("bound", "same_client", "limits"),
+    (
+        (
+            "global",
+            False,
+            {"max_progress_records": 1, "max_progress_records_per_client": 2},
+        ),
+        (
+            "per-client",
+            True,
+            {"max_progress_records": 2, "max_progress_records_per_client": 1},
+        ),
+    ),
+)
+def test_progress_capacity_rejects_without_eviction_and_allows_replacement(
+    valkey_server, bound, same_client, limits
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace, **limits)
+    caller = _registration_store(valkey_server, namespace, **limits)
+    node_id, owner, consumer = (
+        f"progress-{bound}-capacity-node",
+        _digest(f"progress-{bound}-capacity-owner"),
+        "progress-capacity-consumer",
+    )
+    retained_client = f"progress-{bound}-capacity-client"
+    attempted_client = retained_client if same_client else f"{retained_client}-other"
+    identities = (
+        (retained_client, "retained-request"),
+        (attempted_client, "attempted-request"),
+    )
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "retained", "key", "iv"
+    )
+    cfg = writer._foundation.config
+    datastore = writer._foundation._client
+    node = writer._node_digest(node_id)
+    progress_expiry = cfg.key("progress:expiry")
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        claims = []
+        for identity in identities:
+            _enqueue_claim_fixture(
+                writer, node_id, owner, *identity, time.time() + 60
+            )
+            claims.append(writer.claim_queued_request(node_id, owner, consumer))
+
+        assert writer.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identities[0], claims[0].generation, envelope
+        ).state == "accepted"
+
+        identity_keys = []
+        for identity in identities:
+            client, request = writer._identity(*identity)
+            identity_keys.extend(
+                cfg.key(kind, client, request)
+                for kind in ("request", "claim", "progress")
+            )
+        hash_keys = (cfg.key("node", node), *identity_keys)
+        zset_keys = (
+            cfg.key("nodes:lease"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            progress_expiry,
+            cfg.key("node_work", node),
+        )
+        queue = cfg.key("queue", node)
+
+        def snapshot():
+            return (
+                tuple(datastore.hgetall(key) for key in hash_keys),
+                tuple(
+                    datastore.zrange(key, 0, -1, withscores=True)
+                    for key in zset_keys
+                ),
+                datastore.xrange(queue),
+            )
+
+        before = snapshot()
+        with pytest.raises(
+            RelayStateCapacityExceeded, match="^progress capacity reached$"
+        ):
+            caller.replace_encrypted_progress_if_claimed(
+                node_id,
+                owner,
+                consumer,
+                *identities[1],
+                claims[1].generation,
+                dataclasses.replace(envelope, ciphertext="attempted"),
+            )
+        assert snapshot() == before
+
+        retained_progress = hash_keys[3]
+        unrelated_before = tuple(datastore.hgetall(key) for key in hash_keys[4:])
+        indexes_before = tuple(
+            datastore.zrange(key, 0, -1, withscores=True) for key in zset_keys
+        )
+        replacement = dataclasses.replace(envelope, ciphertext="replacement")
+        assert caller.replace_encrypted_progress_if_claimed(
+            node_id,
+            owner,
+            consumer,
+            *identities[0],
+            claims[0].generation,
+            replacement,
+        ).state == "replaced"
+        assert writer.progress_records()[0].envelope == replacement
+        assert tuple(datastore.hgetall(key) for key in hash_keys[4:]) == unrelated_before
+        assert tuple(
+            datastore.zrange(key, 0, -1, withscores=True) for key in zset_keys
+        ) == indexes_before
+        assert datastore.hgetall(retained_progress)[b"envelope"] == (
+            writer._serialized_progress_envelope(replacement)
+        )
+    finally:
+        _delete_claim_fixture_state(writer, (node_id,), identities)
+        datastore.delete(progress_expiry, cfg.key("node_work", node))
+        writer.close()
+        caller.close()
+
+
 def test_progress_reclaim_discards_old_generation_and_fences_stale_caller(valkey_server):
     namespace = uuid.uuid4().hex
     writer = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.05)

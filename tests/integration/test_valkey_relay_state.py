@@ -3223,6 +3223,42 @@ def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(
         assert second.renew_claim_or_read_control(
             node_id, owner, consumer, *identity, claim.generation
         ).state == "continued"
+        datastore = first._foundation._client
+        cfg = first._foundation.config
+        client, request = first._identity(*identity)
+        node = first._node_digest(node_id)
+        member = f"{client}:{request}"
+        progress_key = cfg.key("progress", client, request)
+
+        def pending_authority_snapshot():
+            return (
+                datastore.hgetall(progress_key),
+                datastore.zrange(cfg.key("progress:expiry"), 0, -1, withscores=True),
+                datastore.hgetall(cfg.key("request", client, request)),
+                datastore.hgetall(cfg.key("claim", client, request)),
+                datastore.zrange(cfg.key("requests:deadline"), 0, -1, withscores=True),
+                datastore.zrange(cfg.key("claims:expiry"), 0, -1, withscores=True),
+                datastore.xrange(cfg.key("queue", node)),
+                datastore.hgetall(cfg.key("node", node)),
+                datastore.zrange(cfg.key("nodes:lease"), 0, -1, withscores=True),
+                datastore.zrange(cfg.key("node_work", node), 0, -1, withscores=True),
+                datastore.zscore(cfg.key("progress:expiry"), member),
+            )
+
+        before = pending_authority_snapshot()
+        invalid = second.retrieve_encrypted_response(
+            *identity, _digest("wrong-pending-progress-credential")
+        )
+        assert (
+            invalid.state,
+            invalid.envelope,
+            invalid.acknowledgement_token,
+            invalid.replay_expires_at_epoch,
+            invalid.request_deadline_epoch,
+            invalid.progress,
+        ) == ("invalid_retrieval_credential", None, None, None, None, None)
+        assert pending_authority_snapshot() == before
+
         pending = first.retrieve_encrypted_response(
             *identity, selection.reservation_token
         )

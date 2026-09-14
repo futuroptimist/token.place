@@ -10445,10 +10445,24 @@ def test_node_removed_record_round_trips_terminal_retrieval_and_control(
                 "cancellation-proof",
             )
         claim = None
+        progress_key = None
+        progress_member = None
         if stage == "claimed":
             claim = first.claim_queued_request(node, owner, consumer)
             cfg = first._foundation.config
             client, request = first._identity(*identity)
+            progress_key = cfg.key("progress", client, request)
+            progress_member = f"{client}:{request}"
+            assert first.replace_encrypted_progress_if_claimed(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claim.generation,
+                EncryptedProgressEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+                ),
+            ).state == "accepted"
             past = seconds + micros / 1_000_000 - 1
             first._foundation._client.hset(
                 cfg.key("claim", client, request), "lease_expires", str(past)
@@ -10480,6 +10494,15 @@ def test_node_removed_record_round_trips_terminal_retrieval_and_control(
         )
         assert terminal.generation == (claim.generation if claim else 0)
         assert terminal.retrieval_credential_digest == _digest(credential)
+        if progress_key is not None:
+            datastore = second._foundation._client
+            assert datastore.exists(progress_key) == 0
+            assert (
+                datastore.zscore(
+                    second._foundation.config.key("progress:expiry"), progress_member
+                )
+                is None
+            )
         assert second.retrieve_encrypted_response(*identity, credential).state == (
             "completed_unavailable"
         )

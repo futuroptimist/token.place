@@ -3813,6 +3813,103 @@ def test_progress_capacity_rejects_without_eviction_and_allows_replacement(
         caller.close()
 
 
+@pytest.mark.parametrize(
+    ("boundary", "claim_ttl", "deadline_offset"),
+    (
+        ("claim_lease_boundary", 0.08, 5.0),
+        ("request_deadline_boundary", 2.0, 0.15),
+    ),
+)
+def test_progress_replacement_inclusive_expiry_boundaries_are_non_mutating(
+    valkey_server, boundary, claim_ttl, deadline_offset
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(
+        valkey_server, namespace, claim_ttl_seconds=claim_ttl
+    )
+    caller = _registration_store(
+        valkey_server, namespace, claim_ttl_seconds=claim_ttl
+    )
+    node_id = "progress-expiry-boundary-node"
+    owner, consumer = _digest("progress-expiry-boundary-owner"), "worker"
+    identity = (f"{boundary}-client", f"{boundary}-request")
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "retained", "key", "iv"
+    )
+    cfg = writer._foundation.config
+    datastore = writer._foundation._client
+    node = writer._node_digest(node_id)
+    client, request = writer._identity(*identity)
+    member = f"{client}:{request}"
+    progress_expiry = cfg.key("progress:expiry")
+    node_work = cfg.key("node_work", node)
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        seconds, micros = writer._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + deadline_offset
+        _enqueue_claim_fixture(writer, node_id, owner, *identity, deadline)
+        claim = writer.claim_queued_request(node_id, owner, consumer)
+        assert writer.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, envelope
+        ).state == "accepted"
+        if boundary == "request_deadline_boundary":
+            assert claim.lease_expires_at_epoch == claim.request_deadline_epoch
+        else:
+            assert claim.lease_expires_at_epoch < claim.request_deadline_epoch
+
+        hash_keys = tuple(
+            cfg.key(kind, client, request)
+            for kind in ("progress", "claim", "request")
+        ) + (cfg.key("node", node),)
+        zset_keys = tuple(
+            cfg.key(kind)
+            for kind in (
+                "requests:deadline",
+                "claims:expiry",
+                "progress:expiry",
+                "nodes:lease",
+            )
+        ) + (node_work,)
+        queue = cfg.key("queue", node)
+
+        def snapshot():
+            return (
+                tuple(datastore.hgetall(key) for key in hash_keys),
+                tuple(
+                    datastore.zrange(key, 0, -1, withscores=True)
+                    for key in zset_keys
+                ),
+                datastore.xrange(queue),
+            )
+
+        before = snapshot()
+        assert datastore.zscore(progress_expiry, member) == deadline
+        due = (
+            claim.lease_expires_at_epoch
+            if boundary == "claim_lease_boundary"
+            else claim.request_deadline_epoch
+        )
+        _wait_for_server_epoch(writer, due)
+
+        with pytest.raises(
+            RelayStateConflict, match="^progress claim is missing or expired$"
+        ):
+            caller.replace_encrypted_progress_if_claimed(
+                node_id,
+                owner,
+                consumer,
+                *identity,
+                claim.generation,
+                dataclasses.replace(envelope, ciphertext="replacement"),
+            )
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(writer, (node_id,), (identity,))
+        datastore.delete(progress_expiry, node_work)
+        writer.close()
+        caller.close()
+
+
 def test_progress_reclaim_discards_old_generation_and_fences_stale_caller(valkey_server):
     namespace = uuid.uuid4().hex
     writer = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.05)

@@ -3597,6 +3597,214 @@ def test_progress_replacement_rejects_inconsistent_existing_authority_without_mu
         store.close()
 
 
+@pytest.mark.parametrize(
+    ("mismatch", "error", "message"),
+    (
+        ("node", RelayStateCredentialMismatch, "progress owner is invalid"),
+        ("owner", RelayStateCredentialMismatch, "progress owner is invalid"),
+        ("consumer", RelayStateCredentialMismatch, "progress owner is invalid"),
+        ("client", RelayStateConflict, "progress claim is missing or expired"),
+        ("request", RelayStateConflict, "progress claim is missing or expired"),
+        ("generation", RelayStateConflict, "progress claim is missing or expired"),
+    ),
+)
+def test_progress_replacement_wrong_authority_is_redacted_and_non_mutating(
+    valkey_server, caplog, mismatch, error, message
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    caller = _registration_store(valkey_server, namespace)
+    node_id, owner, consumer = (
+        "progress-credential-node",
+        _digest("progress-credential-owner"),
+        "progress-credential-consumer",
+    )
+    identity = ("progress-credential-client", "progress-credential-request")
+    attempted = {
+        "node": "supplied-progress-node",
+        "owner": _digest("supplied-progress-owner"),
+        "consumer": "supplied-progress-consumer",
+        "client": "supplied-progress-client",
+        "request": "supplied-progress-request",
+        "generation": 919191,
+    }
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "progress-secret", "key-secret", "iv-secret"
+    )
+    arguments = [node_id, owner, consumer, *identity, None, envelope]
+    positions = {"node": 0, "owner": 1, "consumer": 2, "client": 3, "request": 4, "generation": 5}
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        deadline = writer._foundation.server_time()[0] + 60
+        _enqueue_claim_fixture(writer, node_id, owner, *identity, deadline)
+        claim = writer.claim_queued_request(node_id, owner, consumer)
+        writer.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, envelope
+        )
+        arguments[5] = claim.generation
+        arguments[positions[mismatch]] = attempted[mismatch]
+        attempted_identity = (arguments[3], arguments[4])
+        valid_keys, _ = _response_acceptance_authority(writer, node_id, identity)
+        attempted_keys, _ = _response_acceptance_authority(
+            writer, arguments[0], attempted_identity
+        )
+        progress_expiry = writer._foundation.config.key("progress:expiry")
+
+        def snapshot():
+            return (
+                _exact_key_snapshot(writer, valid_keys),
+                _exact_key_snapshot(writer, attempted_keys),
+                writer._foundation._client.zrange(
+                    progress_expiry, 0, -1, withscores=True
+                ),
+            )
+
+        before = snapshot()
+        markers = (
+            namespace,
+            *arguments[:5],
+            attempted["generation"],
+            deadline,
+            envelope.ciphertext,
+            envelope.cipherkey,
+            envelope.iv,
+            *valid_keys,
+            *attempted_keys,
+        )
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(error, match=f"^{message}$") as caught:
+                caller.replace_encrypted_progress_if_claimed(*arguments)
+        _assert_redacted_acceptance_failure(caught, caplog, markers)
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(
+            writer,
+            (node_id, attempted["node"]),
+            (
+                identity,
+                (attempted["client"], identity[1]),
+                (identity[0], attempted["request"]),
+            ),
+        )
+        writer.close()
+        caller.close()
+
+
+def test_progress_reclaim_discards_old_generation_and_fences_stale_caller(valkey_server):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.05)
+    reclaimer = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.05)
+    node_id, owner = "progress-reclaim-node", _digest("progress-reclaim-owner")
+    identity = ("progress-reclaim-client", "progress-reclaim-request")
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "old-progress", "old-key", "old-iv"
+    )
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(writer, node_id, owner, *identity, time.time() + 60)
+        old = writer.claim_queued_request(node_id, owner, "old-consumer")
+        writer.replace_encrypted_progress_if_claimed(
+            node_id, owner, "old-consumer", *identity, old.generation, envelope
+        )
+        _wait_for_server_epoch(writer, old.lease_expires_at_epoch)
+        current = reclaimer.claim_queued_request(node_id, owner, "current-consumer")
+        assert current.state == "reclaimed" and current.generation > old.generation
+        assert writer.progress_records() == ()
+
+        keys, _ = _response_acceptance_authority(writer, node_id, identity)
+        progress_expiry = writer._foundation.config.key("progress:expiry")
+        before = (
+            _exact_key_snapshot(writer, keys),
+            writer._foundation._client.zrange(progress_expiry, 0, -1, withscores=True),
+        )
+        with pytest.raises(
+            RelayStateConflict, match="^progress claim is missing or expired$"
+        ):
+            writer.replace_encrypted_progress_if_claimed(
+                node_id, owner, "old-consumer", *identity, old.generation, envelope
+            )
+        assert (
+            _exact_key_snapshot(writer, keys),
+            writer._foundation._client.zrange(progress_expiry, 0, -1, withscores=True),
+        ) == before
+        replacement = dataclasses.replace(envelope, ciphertext="current-progress")
+        assert reclaimer.replace_encrypted_progress_if_claimed(
+            node_id,
+            owner,
+            "current-consumer",
+            *identity,
+            current.generation,
+            replacement,
+        ).state == "accepted"
+        assert reclaimer.progress_records()[0].envelope == replacement
+    finally:
+        _delete_claim_fixture_state(writer, (node_id,), (identity,))
+        writer.close()
+        reclaimer.close()
+
+
+def test_progress_node_id_reuse_discards_old_authority_and_fences_stale_caller(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    replacement_store = _registration_store(valkey_server, namespace)
+    node_id = "progress-reused-node"
+    old_owner = _digest("progress-reused-old-owner")
+    new_owner = _digest("progress-reused-new-owner")
+    identities = (("progress-reuse-client", "old"), ("progress-reuse-client", "new"))
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "old-progress", "old-key", "old-iv"
+    )
+    try:
+        writer.register(node_id, _capabilities(), old_owner)
+        _enqueue_claim_fixture(writer, node_id, old_owner, *identities[0], time.time() + 60)
+        old = writer.claim_queued_request(node_id, old_owner, "old-consumer")
+        writer.replace_encrypted_progress_if_claimed(
+            node_id, old_owner, "old-consumer", *identities[0], old.generation, envelope
+        )
+        assert writer.unregister(node_id, old_owner)
+        replacement_store.register(node_id, _capabilities(), new_owner)
+        assert writer.progress_records() == ()
+
+        keys, _ = _response_acceptance_authority(writer, node_id, identities[0])
+        before = _exact_key_snapshot(writer, keys)
+        with pytest.raises(
+            RelayStateCredentialMismatch, match="^progress owner is invalid$"
+        ):
+            replacement_store.replace_encrypted_progress_if_claimed(
+                node_id,
+                old_owner,
+                "old-consumer",
+                *identities[0],
+                old.generation,
+                envelope,
+            )
+        assert _exact_key_snapshot(writer, keys) == before
+
+        _enqueue_claim_fixture(
+            replacement_store, node_id, new_owner, *identities[1], time.time() + 60
+        )
+        fresh = replacement_store.claim_queued_request(
+            node_id, new_owner, "fresh-consumer"
+        )
+        replacement = dataclasses.replace(envelope, ciphertext="fresh-progress")
+        assert replacement_store.replace_encrypted_progress_if_claimed(
+            node_id,
+            new_owner,
+            "fresh-consumer",
+            *identities[1],
+            fresh.generation,
+            replacement,
+        ).state == "accepted"
+        assert replacement_store.progress_records()[0].envelope == replacement
+    finally:
+        _delete_claim_fixture_state(writer, (node_id,), identities)
+        writer.close()
+        replacement_store.close()
+
+
 def test_queued_encrypted_request_retrieval_is_pending(valkey_server):
     store = _registration_store(valkey_server, uuid.uuid4().hex)
     node_id, owner = "queued-progress-node", _digest("queued-progress-owner")

@@ -38,6 +38,7 @@ from valkey_relay_state import (
     CONTROL_CLAIM_SCRIPT,
     NODE_TRANSITION_SCRIPT,
     PENDING_TRANSITION_READ_SCRIPT,
+    PROGRESS_TRANSITION_SCRIPT,
     RENEW_CLAIM_SCRIPT,
     RETRIEVE_RESPONSE_SCRIPT,
     SCRIPT_DIGESTS,
@@ -3273,6 +3274,135 @@ def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(
         _delete_claim_fixture_state(first, (node_id,), (identity,))
         first.close()
         second.close()
+
+
+def test_encrypted_progress_concurrent_replacement_and_retrieval_across_stores(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    stores = tuple(_registration_store(valkey_server, namespace) for _ in range(2))
+    first, second = stores
+    node_id, owner, consumer = (
+        "concurrent-progress-node",
+        _digest("concurrent-progress-owner"),
+        "worker",
+    )
+    identity = ("concurrent-progress-client", "concurrent-progress-request")
+    originals = [store._foundation._client.evalsha for store in stores]
+    try:
+        first.register(node_id, _capabilities(), owner)
+        deadline = first._foundation.server_time()[0] + 60
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        first.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+            ),
+            "cancel",
+        )
+        claim = second.claim_queued_request(node_id, owner, consumer)
+        envelopes = (
+            EncryptedProgressEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "concurrent-a", "key", "iv"
+            ),
+            EncryptedProgressEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "concurrent-b", "key", "iv"
+            ),
+        )
+
+        replacement_barrier = Barrier(2, timeout=2)
+        for store, original in zip(stores, originals):
+            def synchronized(*args, original=original):
+                if args[0] == PROGRESS_TRANSITION_SCRIPT.eval_sha1:
+                    replacement_barrier.wait()
+                return original(*args)
+
+            store._foundation._client.evalsha = synchronized
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            replacements = [
+                pool.submit(
+                    store.replace_encrypted_progress_if_claimed,
+                    node_id,
+                    owner,
+                    consumer,
+                    *identity,
+                    claim.generation,
+                    envelope,
+                )
+                for store, envelope in zip(stores, envelopes)
+            ]
+            outcomes = [future.result(timeout=3).state for future in replacements]
+        assert sorted(outcomes) == ["accepted", "replaced"]
+
+        cfg = first._foundation.config
+        datastore = first._foundation._client
+        client, request = first._identity(*identity)
+        node = first._node_digest(node_id)
+        member = f"{client}:{request}"
+        progress_key = cfg.key("progress", client, request)
+        records = first.progress_records()
+        assert len(records) == 1
+        assert records[0].envelope in envelopes
+        assert datastore.zrange(
+            cfg.key("progress:expiry"), 0, -1, withscores=True
+        ) == [(member.encode(), deadline)]
+
+        def lifecycle_snapshot():
+            return (
+                datastore.hgetall(cfg.key("request", client, request)),
+                datastore.hgetall(cfg.key("claim", client, request)),
+                datastore.zrange(cfg.key("requests:deadline"), 0, -1, withscores=True),
+                datastore.zrange(cfg.key("claims:expiry"), 0, -1, withscores=True),
+                datastore.xrange(cfg.key("queue", node)),
+                datastore.hgetall(cfg.key("node", node)),
+                datastore.zrange(cfg.key("nodes:lease"), 0, -1, withscores=True),
+                datastore.zrange(cfg.key("node_work", node), 0, -1, withscores=True),
+            )
+
+        authority_before = lifecycle_snapshot()
+        retrieval_barrier = Barrier(2, timeout=2)
+        for store, original in zip(stores, originals):
+            def synchronized(*args, original=original):
+                if args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1:
+                    retrieval_barrier.wait()
+                return original(*args)
+
+            store._foundation._client.evalsha = synchronized
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            retrievals = [
+                pool.submit(
+                    store.retrieve_encrypted_response,
+                    *identity,
+                    selection.reservation_token,
+                )
+                for store in stores
+            ]
+            results = [future.result(timeout=3) for future in retrievals]
+        assert all(
+            result.state == "pending"
+            and result.request_deadline_epoch == deadline
+            for result in results
+        )
+        delivered = [result.progress for result in results if result.progress is not None]
+        assert delivered == [records[0].envelope]
+        assert sum(result.progress is None for result in results) == 1
+        assert first.progress_records() == ()
+        assert datastore.exists(progress_key) == 0
+        assert datastore.zscore(cfg.key("progress:expiry"), member) is None
+        assert lifecycle_snapshot() == authority_before
+    finally:
+        for store, original in zip(stores, originals):
+            store._foundation._client.evalsha = original
+        _delete_claim_fixture_state(first, (node_id,), (identity,))
+        for store in stores:
+            store.close()
 
 
 @pytest.mark.parametrize(

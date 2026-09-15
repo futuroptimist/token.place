@@ -331,6 +331,7 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
         request_identities = (
             *(("contract-client", request_id) for request_id in (
                 "response", "reclaim", "deadline", "cancel", "concurrent",
+                "conflict",
                 "claimed", "reserved", "queued",
             )),
             *(("contract-capacity-client", f"capacity-held-{index}")

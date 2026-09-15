@@ -405,17 +405,66 @@ def assert_relay_state_lifecycle_contract(
     assert control.state == "acknowledged"
 
     concurrent_selection, _ = create_claim("concurrent", "worker-concurrent")
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        outcomes = tuple(
-            pool.map(
-                lambda token: writer.cancel_or_expire_request(
-                    client, "concurrent", token
-                ),
-                ("cancel-concurrent", "cancel-concurrent"),
-            )
-        )
+    outcomes = synchronized_results(
+        lambda: writer.cancel_or_expire_request(
+            client, "concurrent", "cancel-concurrent"
+        ),
+        lambda: observer.cancel_or_expire_request(
+            client, "concurrent", "cancel-concurrent"
+        ),
+    )
     assert sum(item.new_outcome for item in outcomes) == 1
     assert {item.state for item in outcomes} == {"cancelled"}
+    concurrent_terminals = terminal_records_for_request(client, "concurrent")
+    assert len(concurrent_terminals) == 1
+    assert concurrent_terminals[0]["outcome"] == "cancelled"
+    assert observer.claimed_request(node_id, "concurrent") is None
+    assert terminal_records_for_request(client, "concurrent") == concurrent_terminals
+
+    _, conflict_claim = create_claim("conflict", "worker-conflict")
+    cancellation, response = synchronized_results(
+        lambda: writer.cancel_or_expire_request(
+            client, "conflict", "cancel-conflict"
+        ),
+        lambda: observer.accept_encrypted_response(
+            node_id,
+            owner,
+            "worker-conflict",
+            client,
+            "conflict",
+            conflict_claim.generation,
+            response_envelope("contract-conflict-response"),
+        ),
+    )
+    conflict_terminals = terminal_records_for_request(client, "conflict")
+    assert len(conflict_terminals) == 1
+    assert observer.claimed_request(node_id, "conflict") is None
+    if conflict_terminals[0]["outcome"] == "completed":
+        assert cancellation.state == "completed"
+        assert not cancellation.new_outcome
+        assert response.state == "response_ready"
+        assert response.new_outcome
+        assert len(writer.response_records()) == 1
+        assert not observer.accept_encrypted_response(
+            node_id,
+            owner,
+            "worker-conflict",
+            client,
+            "conflict",
+            conflict_claim.generation,
+            response_envelope("contract-conflict-response"),
+        ).new_outcome
+    else:
+        assert conflict_terminals[0]["outcome"] == "cancelled"
+        assert cancellation.state == "cancelled"
+        assert cancellation.new_outcome
+        assert isinstance(response, RelayStateConflict)
+        assert str(response) == "response lifecycle conflict"
+        assert writer.response_records() == ()
+        assert not observer.cancel_or_expire_request(
+            client, "conflict", "cancel-conflict"
+        ).new_outcome
+    assert terminal_records_for_request(client, "conflict") == conflict_terminals
 
     deadline_lease = writer.renew(node_id, owner)
     deadline_selection = writer.select_and_reserve(

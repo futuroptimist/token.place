@@ -206,6 +206,218 @@ def accept_response(store, claim, **overrides):
     return store.accept_encrypted_response(**values)
 
 
+# This is deliberately a callable contract rather than a second implementation of
+# the assertions in the Valkey suite.  The real-backend integration test imports
+# it and supplies two clients for one namespace; the unit test supplies the one
+# process-local memory store.  Keep backend-only corruption and transport tests in
+# their respective suites.
+RELAY_STATE_LIFECYCLE_CONTRACT = (
+    "registration_scheduler",
+    "reservation_queue_claim_control",
+    "progress_pending_delivery",
+    "response_replay_acknowledgement",
+    "cancellation_terminal_deduplication",
+    "bounded_node_transition_fencing",
+)
+
+
+def assert_relay_state_lifecycle_contract(stores, capabilities, *, now_epoch: float):
+    """Exercise the same implemented lifecycle through backend-neutral calls."""
+
+    writer, observer = stores
+    owner = digest("contract-owner")
+    replacement_owner = digest("contract-replacement-owner")
+    node_id = "contract-node"
+    client = "contract-client"
+
+    registered = writer.register(node_id, capabilities, owner)
+    assert observer.get(node_id) == registered
+    assert observer.list() == (registered,)
+    renewed = observer.renew(node_id, owner)
+    assert renewed is not None
+    assert writer.set_scheduler_state(
+        node_id, owner, SchedulerNodeState(healthy=True, draining=False)
+    )
+
+    def create_claim(request_id, consumer):
+        deadline = now_epoch + 120
+        selected = writer.select_and_reserve(
+            client,
+            request_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+        )
+        assert selected.selected_node_id == node_id
+        enqueued = observer.enqueue_encrypted_request(
+            client,
+            request_id,
+            selected.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            envelope(f"sealed-{request_id}"),
+            f"cancel-{request_id}",
+        )
+        assert enqueued.state == "queued"
+        claim = writer.claim_queued_request(node_id, owner, consumer)
+        assert claim.state == "claimed"
+        assert observer.claimed_request(node_id, request_id) is not None
+        renewed_claim = observer.renew_claim_or_read_control(
+            node_id, owner, consumer, client, request_id, claim.generation
+        )
+        assert renewed_claim.state == "continued"
+        return selected, claim
+
+    response_selection, response_claim = create_claim("response", "worker-response")
+    progress = observer.replace_encrypted_progress_if_claimed(
+        node_id,
+        owner,
+        "worker-response",
+        client,
+        "response",
+        response_claim.generation,
+        progress_envelope("progress-one"),
+    )
+    assert progress.state == "accepted"
+    replaced_progress = writer.replace_encrypted_progress_if_claimed(
+        node_id,
+        owner,
+        "worker-response",
+        client,
+        "response",
+        response_claim.generation,
+        progress_envelope("progress-two"),
+    )
+    assert replaced_progress.state == "replaced"
+    pending = observer.retrieve_encrypted_response(
+        client, "response", response_selection.reservation_token
+    )
+    assert pending.state == "pending"
+    assert pending.progress == progress_envelope("progress-two")
+    assert writer.progress_records() == ()
+    assert (
+        observer.retrieve_encrypted_response(
+            client, "response", response_selection.reservation_token
+        ).progress
+        is None
+    )
+
+    accepted = observer.accept_encrypted_response(
+        node_id,
+        owner,
+        "worker-response",
+        client,
+        "response",
+        response_claim.generation,
+        response_envelope("contract-response"),
+    )
+    assert accepted.state == "response_ready" and accepted.new_outcome
+    first = writer.retrieve_encrypted_response(
+        client, "response", response_selection.reservation_token
+    )
+    replay = observer.retrieve_encrypted_response(
+        client, "response", response_selection.reservation_token
+    )
+    assert first == replay and first.state == "response_ready"
+    acknowledged = writer.retrieve_encrypted_response(
+        client,
+        "response",
+        response_selection.reservation_token,
+        first.acknowledgement_token,
+    )
+    assert acknowledged.state == "acknowledged"
+    assert (
+        observer.accept_encrypted_response(
+            node_id,
+            owner,
+            "worker-response",
+            client,
+            "response",
+            response_claim.generation,
+            response_envelope("contract-response"),
+        ).new_outcome
+        is False
+    )
+
+    _, cancel_claim = create_claim("cancel", "worker-cancel")
+    cancelled = observer.cancel_or_expire_request(client, "cancel", "cancel-cancel")
+    assert cancelled.state == "cancelled" and cancelled.new_outcome
+    assert not writer.cancel_or_expire_request(
+        client, "cancel", "cancel-cancel"
+    ).new_outcome
+    control = writer.renew_claim_or_read_control(
+        node_id,
+        owner,
+        "worker-cancel",
+        client,
+        "cancel",
+        cancel_claim.generation,
+        acknowledge=True,
+    )
+    assert control.state == "acknowledged"
+
+    # Three active states force continuation when the harness configures a
+    # one-item transition batch: reserved, queued, and claimed.
+    _, transition_claim = create_claim("claimed", "worker-transition")
+    writer.select_and_reserve(
+        client, "reserved", "qwen3-8b-instruct", "8k-fast", now_epoch + 120
+    )
+    queued_selection = writer.select_and_reserve(
+        client, "queued", "qwen3-8b-instruct", "8k-fast", now_epoch + 120
+    )
+    observer.enqueue_encrypted_request(
+        client,
+        "queued",
+        queued_selection.reservation_token,
+        node_id,
+        "qwen3-8b-instruct",
+        "8k-fast",
+        now_epoch + 120,
+        envelope("sealed-queued"),
+        "cancel-queued",
+    )
+    transitions = [observer.unregister_node_and_transition_work(node_id, owner)]
+    assert transitions[0].continuation_required
+    assert writer.get(node_id) is None
+    with pytest.raises(RelayStateConflict):
+        writer.register(node_id, capabilities, replacement_owner)
+    while transitions[-1].continuation_required:
+        transitions.append(writer.unregister_node_and_transition_work(node_id, owner))
+    assert sum(item.processed_count for item in transitions) == 3
+    assert sum(item.new_outcomes for item in transitions) == 3
+    fenced = observer.renew_claim_or_read_control(
+        node_id,
+        owner,
+        "worker-transition",
+        client,
+        "claimed",
+        transition_claim.generation,
+    )
+    assert fenced.state == "cancelled"
+    writer.register(node_id, capabilities, replacement_owner)
+    with pytest.raises(RelayStateCredentialMismatch):
+        observer.renew(node_id, owner)
+
+
+def test_full_relay_state_lifecycle_contract_matrix(capabilities):
+    clock = EpochClock()
+    store = InMemoryRelayStateStore(
+        RelayStateStoreConfig(
+            namespace="testing.lifecycle-contract", node_transition_batch_size=1
+        ),
+        acknowledgement_key=b"c" * 32,
+        epoch_time=clock,
+    )
+    assert_relay_state_lifecycle_contract(
+        (store, store),
+        replace(capabilities, max_concurrency=8),
+        now_epoch=clock.value,
+    )
+
+
+
 def test_progress_replaces_latest_and_pending_retrieval_is_one_shot(
     store_factory, capabilities
 ):

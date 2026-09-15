@@ -31,6 +31,7 @@ from relay_state_store import (
     SchedulerNodeState,
 )
 from tests.registration_store_contract import assert_registration_contract
+from tests.unit.test_relay_state_store import assert_relay_state_lifecycle_contract
 from valkey_relay_state import (
     ACCEPT_RESPONSE_SCRIPT,
     CANCEL_REQUEST_SCRIPT,
@@ -269,6 +270,70 @@ def _registration_store(port, namespace, **overrides):
         RelayStateStoreConfig(namespace="testing.valkey", **overrides),
         acknowledgement_key=_ACKNOWLEDGEMENT_KEY,
     )
+
+
+def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_server):
+    """Run the backend-neutral matrix through independent Redis clients."""
+
+    namespace = uuid.uuid4().hex
+    stores = [
+        _registration_store(valkey_server, namespace, node_transition_batch_size=1)
+        for _ in range(2)
+    ]
+    first = stores[0]
+    cfg = first._foundation.config
+    node_id = "contract-node"
+    client_id = "contract-client"
+    request_ids = ("response", "cancel", "reserved", "queued", "claimed")
+    try:
+        seconds, micros = first._foundation.server_time()
+        assert_relay_state_lifecycle_contract(
+            stores,
+            _capabilities(concurrency=8),
+            now_epoch=seconds + micros / 1_000_000,
+        )
+    finally:
+        node = first._node_digest(node_id)
+        keys = [
+            cfg.key("schema"),
+            cfg.key("nodes:lease"),
+            cfg.key("cursor"),
+            cfg.key("reservations:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            cfg.key("responses:expiry"),
+            cfg.key("terminals:expiry"),
+            cfg.key("control:expiry"),
+            cfg.key("node_tombstones:expiry"),
+            cfg.key("former_owners:expiry"),
+            cfg.key("node_transitions:pending"),
+            cfg.key("node", node),
+            cfg.key("queue", node),
+            cfg.key("node_work", node),
+            cfg.key("node_transition", node),
+            cfg.key("node_tombstone", node),
+        ]
+        owner_digests = (
+            _digest(_digest("contract-owner")),
+            _digest(_digest("contract-replacement-owner")),
+        )
+        keys.extend(cfg.key("former_owner", node, owner) for owner in owner_digests)
+        for request_id in request_ids:
+            client, request = first._identity(client_id, request_id)
+            keys.extend(
+                (
+                    cfg.key("request", client, request),
+                    cfg.key("claim", client, request),
+                    cfg.key("response", client, request),
+                    cfg.key("terminal", client, request),
+                    cfg.key("progress", client, request),
+                    cfg.key("control", node, client, request),
+                )
+            )
+        first._foundation._client.delete(*keys)
+        for store in stores:
+            store.close()
+
 
 
 def _capabilities(concurrency=2):

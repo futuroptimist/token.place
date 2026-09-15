@@ -438,6 +438,7 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "expected_epoch" in script.source
     assert "redis.call('ZADD',pending_index,now,node_digest)" in script.source
     assert "if redis.call('ZSCORE',pending_index,node_digest) then return {'schema'} end" in script.source
+    assert "if progress_exists==0 then\n    if progress_score_raw then return {'schema'} end" in script.source
     assert script.source.index("local expired_tombs=") < script.source.index(
         "for _,m in ipairs(expired_tombs) do redis.call('DEL'"
     )

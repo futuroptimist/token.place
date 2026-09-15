@@ -2507,8 +2507,13 @@ for _,member in ipairs(members) do
   local request_deadline=canonical_number(r[6],false)
   if r[2]~=client or r[3]~=request or r[4]~=node_digest or r[5]~=node_id or not request_deadline or not digest(r[7]) or (r[8]~='' and not digest(r[8])) or (r[10] and not integer(r[10])) or (r[11] and not integer(r[11])) then return {'schema'} end
   local progress_key=prefix..'progress:'..client..':'..request
-  local progress_exists=redis.call('EXISTS',progress_key); local progress_score=finite(redis.call('ZSCORE',prefix..'progress:expiry',member))
-  if progress_exists~=(progress_score and 1 or 0) then return {'schema'} end
+  local progress_exists=redis.call('EXISTS',progress_key)
+  local progress_score_raw=redis.call('ZSCORE',prefix..'progress:expiry',member)
+  if progress_exists==0 then
+    if progress_score_raw then return {'schema'} end
+  elseif progress_exists~=1 or not progress_score_raw then return {'schema'} end
+  local progress_score=finite(progress_score_raw)
+  if progress_score_raw and not progress_score then return {'schema'} end
   if progress_exists==1 then
     local pv=redis.call('HMGET',progress_key,'client','request','node_digest','node_id','owner_digest','consumer_digest','generation','deadline','envelope')
     local pg=integer(pv[7]); local pd=canonical_number(pv[8],false)
@@ -2766,7 +2771,7 @@ NODE_TRANSITION_SOURCE = NODE_TRANSITION_SOURCE.replace("__CANONICAL_PROGRESS__"
 NODE_TRANSITION_SCRIPT = ReviewedScript(
     "node_transition_v1",
     NODE_TRANSITION_SOURCE,
-    "93f824d474f5de52694815057dacc4f6454495b0251d0a99716d46e1abfe0812",  # pragma: allowlist secret
+    "ffcf60641460ffd7c8e1626c9d243258330e795b44383693a07508b696caf972",  # pragma: allowlist secret
     True,
 )
 

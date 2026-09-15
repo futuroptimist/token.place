@@ -282,9 +282,6 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
     ]
     first = stores[0]
     cfg = first._foundation.config
-    node_id = "contract-node"
-    client_id = "contract-client"
-    request_ids = ("response", "cancel", "reserved", "queued", "claimed")
     try:
         seconds, micros = first._foundation.server_time()
         assert_relay_state_lifecycle_contract(
@@ -293,44 +290,14 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
             now_epoch=seconds + micros / 1_000_000,
         )
     finally:
-        node = first._node_digest(node_id)
-        keys = [
-            cfg.key("schema"),
-            cfg.key("nodes:lease"),
-            cfg.key("cursor"),
-            cfg.key("reservations:expiry"),
-            cfg.key("requests:deadline"),
-            cfg.key("claims:expiry"),
-            cfg.key("responses:expiry"),
-            cfg.key("terminals:expiry"),
-            cfg.key("control:expiry"),
-            cfg.key("node_tombstones:expiry"),
-            cfg.key("former_owners:expiry"),
-            cfg.key("node_transitions:pending"),
-            cfg.key("node", node),
-            cfg.key("queue", node),
-            cfg.key("node_work", node),
-            cfg.key("node_transition", node),
-            cfg.key("node_tombstone", node),
-        ]
-        owner_digests = (
-            _digest(_digest("contract-owner")),
-            _digest(_digest("contract-replacement-owner")),
+        # The namespace is unique to this test, so deleting everything below its
+        # prefix is both isolated and robust when the contract fails before an
+        # opaque reservation token can be retained by the caller.
+        keys = tuple(
+            first._foundation._client.scan_iter(match=f"{cfg.key_prefix}*")
         )
-        keys.extend(cfg.key("former_owner", node, owner) for owner in owner_digests)
-        for request_id in request_ids:
-            client, request = first._identity(client_id, request_id)
-            keys.extend(
-                (
-                    cfg.key("request", client, request),
-                    cfg.key("claim", client, request),
-                    cfg.key("response", client, request),
-                    cfg.key("terminal", client, request),
-                    cfg.key("progress", client, request),
-                    cfg.key("control", node, client, request),
-                )
-            )
-        first._foundation._client.delete(*keys)
+        if keys:
+            first._foundation._client.delete(*keys)
         for store in stores:
             store.close()
 

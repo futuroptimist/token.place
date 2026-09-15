@@ -340,6 +340,164 @@ def _wait_for_server_epoch(store, boundary, timeout=2.0):
 
     _wait_until(boundary_reached, timeout=timeout)
 
+
+@pytest.fixture(params=("memory", "valkey"), ids=("memory", "real-valkey"))
+def relay_state_contract_backend(request, valkey_server):
+    """Provide the same lifecycle contract surface for both implemented stores.
+
+    Valkey observers deliberately use separate redis-py clients.  The in-memory
+    implementation is process-local by design, so its writer and observer are
+    the same store rather than pretending that a namespace joins two instances.
+    """
+
+    namespace = uuid.uuid4().hex
+    if request.param == "memory":
+        store = InMemoryRelayStateStore(
+            RelayStateStoreConfig(namespace=f"testing.contract.{namespace}"),
+            acknowledgement_key=_ACKNOWLEDGEMENT_KEY,
+            epoch_time=time.time,
+        )
+        yield request.param, store, store
+        return
+
+    writer = _registration_store(valkey_server, namespace)
+    observer = _registration_store(valkey_server, namespace)
+    try:
+        assert writer._foundation._client is not observer._foundation._client
+        yield request.param, writer, observer
+    finally:
+        writer.close()
+        observer.close()
+
+
+def test_relay_state_backend_contract_through_encrypted_progress(
+    relay_state_contract_backend,
+):
+    """Exercise one backend-neutral journey through every progress-era stage."""
+
+    backend, writer, observer = relay_state_contract_backend
+    node_id = f"contract-node-{uuid.uuid4().hex}"
+    owner = _digest("contract-owner")
+    consumer = "contract-consumer"
+    identity = ("contract-client", f"contract-request-{uuid.uuid4().hex}")
+    deadline = time.time() + 60
+    selection = None
+    try:
+        registered = writer.register(node_id, _capabilities(), owner)
+        assert observer.get(node_id) == registered
+        assert observer.list() == (registered,)
+        renewed = observer.renew(node_id, owner)
+        assert (
+            renewed is not None
+            and renewed.lease_expires_at_epoch >= registered.lease_expires_at_epoch
+        )
+
+        scheduler = SchedulerNodeState(healthy=True, draining=False, claimed_work=0)
+        assert writer.set_scheduler_state(node_id, owner, scheduler) is True
+        selection = observer.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel-contract"
+        )
+        assert selection.created and selection.selected_node_id == node_id
+        request = EncryptedRequestEnvelope(
+            "tokenplace_api_v1_relay_e2ee",
+            1,
+            "contract-ciphertext",
+            "contract-key",
+            "contract-iv",
+        )
+        assert (
+            writer.enqueue_encrypted_request(
+                *identity,
+                selection.reservation_token,
+                node_id,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                request,
+                "cancel-contract",
+            ).state
+            == "queued"
+        )
+        claim = observer.claim_queued_request(node_id, owner, consumer)
+        assert claim.state == "claimed"
+        assert (
+            writer.renew_claim(
+                node_id, owner, consumer, *identity, claim.generation
+            ).state
+            == "continued"
+        )
+
+        first_progress = EncryptedProgressEnvelope(
+            "tokenplace_api_v1_relay_e2ee",
+            1,
+            "contract-progress-1",
+            "progress-key",
+            "progress-iv",
+        )
+        latest_progress = dataclasses.replace(
+            first_progress, ciphertext="contract-progress-2"
+        )
+        assert (
+            observer.replace_encrypted_progress_if_claimed(
+                node_id, owner, consumer, *identity, claim.generation, first_progress
+            ).state
+            == "accepted"
+        )
+        assert (
+            writer.replace_encrypted_progress_if_claimed(
+                node_id, owner, consumer, *identity, claim.generation, latest_progress
+            ).state
+            == "replaced"
+        )
+        pending = observer.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert (pending.state, pending.progress) == ("pending", latest_progress)
+        assert (
+            writer.retrieve_encrypted_response(
+                *identity, selection.reservation_token
+            ).progress
+            is None
+        )
+
+        response = EncryptedResponseEnvelope(
+            "tokenplace_api_v1_relay_e2ee",
+            1,
+            "contract-response",
+            "response-key",
+            "response-iv",
+        )
+        accepted = writer.accept_encrypted_response(
+            node_id, owner, consumer, *identity, claim.generation, response
+        )
+        assert accepted.state == "response_ready" and accepted.new_outcome
+        replay = observer.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert replay.state == "response_ready" and replay.envelope == response
+        assert replay.acknowledgement_token is not None
+        acknowledged = writer.retrieve_encrypted_response(
+            *identity, selection.reservation_token, replay.acknowledgement_token
+        )
+        assert acknowledged.state == "acknowledged"
+        assert (
+            observer.retrieve_encrypted_response(
+                *identity, selection.reservation_token, replay.acknowledgement_token
+            ).state
+            == "acknowledged"
+        )
+        assert writer.active_claims(node_id) == ()
+        assert writer.progress_records() == ()
+        assert (
+            observer.unregister_node_and_transition_work(node_id, owner).state
+            == "complete"
+        )
+        assert writer.get(node_id) is None
+    finally:
+        if backend == "valkey":
+            _delete_claim_fixture_state(writer, (node_id,), (identity,))
+
+
 def _registration_keys(store, *node_ids):
     return [
         store._foundation.config.key("schema"),

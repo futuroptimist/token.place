@@ -281,8 +281,12 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
             valkey_server,
             namespace,
             node_transition_batch_size=1,
-            claim_ttl_seconds=1,
-            lease_ttl_seconds=2,
+            claim_ttl_seconds=2,
+            lease_ttl_seconds=3,
+            max_reservations_per_client=5,
+            max_reservations_per_node=5,
+            max_queue_depth_per_node=5,
+            max_terminal_records_per_client=16,
         )
         for _ in range(2)
     ]
@@ -296,7 +300,7 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
             _capabilities(concurrency=8),
             now_epoch=seconds + micros / 1_000_000,
             advance_to=lambda boundary: _wait_for_server_epoch(
-                first, boundary, timeout=3
+                first, boundary, timeout=4
             ),
             selections=selections,
         )
@@ -304,9 +308,15 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
         node_ids = (
             "contract-node", "contract-lease-node", "contract-deadline-node"
         )
-        request_ids = (
-            "response", "reclaim", "deadline", "cancel", "concurrent",
-            "claimed", "reserved", "queued",
+        request_identities = (
+            *(("contract-client", request_id) for request_id in (
+                "response", "reclaim", "deadline", "cancel", "concurrent",
+                "claimed", "reserved", "queued",
+            )),
+            *(("contract-capacity-client", f"capacity-held-{index}")
+              for index in range(5)),
+            ("contract-capacity-client", "capacity-rejected"),
+            ("contract-capacity-release-client", "capacity-released"),
         )
         node = first._node_digest("contract-node")
         owner = _digest("contract-owner")
@@ -333,8 +343,8 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
                 cfg.key(kind, digest_value)
                 for kind in ("node", "queue", "node_work", "node_transition", "node_tombstone")
             )
-        for request_id in request_ids:
-            client_digest, request_digest = first._identity("contract-client", request_id)
+        for client_id, request_id in request_identities:
+            client_digest, request_digest = first._identity(client_id, request_id)
             keys.extend(
                 cfg.key(kind, client_digest, request_digest)
                 for kind in ("request", "claim", "response", "terminal", "progress")
@@ -973,7 +983,7 @@ def test_selection_capacity_bounds_match_memory_without_rejection_mutation(
     limits = dict(
         max_reservations=8,
         max_reservations_per_client=8,
-        max_reservations_per_node=8,
+        max_reservations_per_node=5,
         max_request_lifecycles=8,
         max_queue_depth_per_node=8,
         max_queued_requests=8,

@@ -283,6 +283,7 @@ def assert_relay_state_lifecycle_contract(
     reclaimed = observer.claim_queued_request(node_id, owner, "worker-new")
     assert reclaimed.state == "reclaimed"
     assert reclaimed.generation == original_claim.generation + 1
+    assert writer.renew(node_id, owner) is not None
     assert writer.renew_claim(
         node_id,
         owner,
@@ -324,6 +325,10 @@ def assert_relay_state_lifecycle_contract(
         ).progress
         is None
     )
+    assert writer.renew_claim(
+        node_id, owner, "worker-response", client, "response",
+        response_claim.generation,
+    ).state == "continued"
 
     accepted = observer.accept_encrypted_response(
         node_id,
@@ -455,17 +460,78 @@ def assert_relay_state_lifecycle_contract(
     )
     selections.append(deadline_selection)
     advance_to(deadline_selection.request_deadline_epoch)
-    deadline_results = tuple(
-        observer.cancel_or_expire_request(
-            client, "deadline", status="expired", reason="request_deadline_expired"
-        )
-        for _ in range(2)
+    first_deadline = observer.cancel_or_expire_request(
+        client, "deadline", status="expired", reason="request_deadline_expired"
     )
+    duplicate_deadline = writer.cancel_or_expire_request(
+        client, "deadline", status="expired", reason="request_deadline_expired"
+    )
+    deadline_results = (first_deadline, duplicate_deadline)
     assert all(
         (item.state, item.reason) == ("expired", "request_deadline_expired")
         for item in deadline_results
     )
-    assert sum(item.new_outcome for item in deadline_results) <= 1
+    # An eager in-process reaper can create the terminal immediately before the
+    # first typed result is read; either way, this first attempt proves the one
+    # semantic outcome and the duplicate must remain non-mutating.
+    observed_new_outcomes = sum(item.new_outcome for item in deadline_results)
+    semantic_new_outcomes = observed_new_outcomes or int(
+        first_deadline.state == "expired"
+    )
+    assert semantic_new_outcomes == 1
+    assert not duplicate_deadline.new_outcome
+
+    # Fill the fixture's shared per-client, per-node, and queue bounds. The
+    # rejected reservation must not leave a partial lifecycle behind, and
+    # terminalizing the held work must make that exact capacity reusable.
+    capacity_client = "contract-capacity-client"
+    capacity_deadline = now_epoch + 120
+    capacity_request_ids = tuple(f"capacity-held-{index}" for index in range(5))
+    for request_id in capacity_request_ids:
+        selected = writer.select_and_reserve(
+            capacity_client, request_id, "qwen3-8b-instruct", "8k-fast",
+            capacity_deadline,
+        )
+        assert selected.selected_node_id == deadline_node
+        selections.append(selected)
+        observer.enqueue_encrypted_request(
+            capacity_client, request_id, selected.reservation_token, deadline_node,
+            "qwen3-8b-instruct", "8k-fast", capacity_deadline,
+            envelope(f"sealed-{request_id}"), f"cancel-{request_id}",
+        )
+    capacity_snapshot = (
+        writer.list_reservations(), observer.queued_requests(deadline_node),
+        writer.active_claims(deadline_node),
+    )
+    with pytest.raises(RelayStateNoCapacity):
+        observer.select_and_reserve(
+            capacity_client, "capacity-rejected", "qwen3-8b-instruct",
+            "8k-fast", capacity_deadline,
+        )
+    assert (
+        writer.list_reservations(), observer.queued_requests(deadline_node),
+        writer.active_claims(deadline_node),
+    ) == capacity_snapshot
+    for request_id in capacity_request_ids:
+        assert writer.cancel_or_expire_request(
+            capacity_client, request_id, f"cancel-{request_id}"
+        ).new_outcome
+    released = observer.select_and_reserve(
+        "contract-capacity-release-client", "capacity-released",
+        "qwen3-8b-instruct", "8k-fast", capacity_deadline,
+    )
+    assert released.created
+    selections.append(released)
+    observer.enqueue_encrypted_request(
+        "contract-capacity-release-client", "capacity-released",
+        released.reservation_token, deadline_node, "qwen3-8b-instruct", "8k-fast",
+        capacity_deadline, envelope("sealed-capacity-released"),
+        "cancel-capacity-released",
+    )
+    assert writer.cancel_or_expire_request(
+        "contract-capacity-release-client", "capacity-released",
+        "cancel-capacity-released",
+    ).new_outcome
 
     # Contract records are immutable defensive values and their bounded
     # representations must not disclose credentials or encrypted payloads.
@@ -483,8 +549,12 @@ def test_full_relay_state_lifecycle_contract_matrix(capabilities):
         RelayStateStoreConfig(
             namespace="testing.lifecycle-contract",
             node_transition_batch_size=1,
-            claim_ttl_seconds=1,
-            lease_ttl_seconds=2,
+            claim_ttl_seconds=2,
+            lease_ttl_seconds=3,
+            max_reservations_per_client=5,
+            max_reservations_per_node=5,
+            max_queue_depth_per_node=5,
+            max_terminal_records_per_client=16,
         ),
         acknowledgement_key=b"c" * 32,
         epoch_time=clock,

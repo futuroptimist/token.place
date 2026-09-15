@@ -3276,6 +3276,112 @@ def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(
         second.close()
 
 
+def test_encrypted_progress_namespace_isolation(valkey_server):
+    stores = tuple(
+        _registration_store(valkey_server, uuid.uuid4().hex) for _ in range(2)
+    )
+    node_id = "shared-progress-node"
+    owner = _digest("shared-progress-owner")
+    consumer = "shared-progress-consumer"
+    identity = ("shared-progress-client", "shared-progress-request")
+    progress = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "namespace-a-progress", "key", "iv"
+    )
+    fixtures = []
+    try:
+        for store in stores:
+            store.register(node_id, _capabilities(), owner)
+            seconds, micros = store._foundation.server_time()
+            deadline = seconds + micros / 1_000_000 + 10
+            selection = store.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+            )
+            store.enqueue_encrypted_request(
+                *identity,
+                selection.reservation_token,
+                node_id,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                EncryptedRequestEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+                ),
+                "cancel",
+            )
+            claim = store.claim_queued_request(node_id, owner, consumer)
+            fixtures.append((selection.reservation_token, deadline, claim.generation))
+
+        first, second = stores
+        assert first.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, fixtures[0][2], progress
+        ).state == "accepted"
+        client, request = first._identity(*identity)
+        member = f"{client}:{request}"
+        progress_keys = tuple(
+            store._foundation.config.key("progress", client, request)
+            for store in stores
+        )
+        expiry_keys = tuple(
+            store._foundation.config.key("progress:expiry") for store in stores
+        )
+        assert second._foundation._client.hgetall(progress_keys[1]) == {}
+        assert second._foundation._client.zscore(expiry_keys[1], member) is None
+        assert second.progress_records() == ()
+
+        before = tuple(
+            (
+                _lifecycle_authority_snapshot(store, node_id, identity),
+                store._foundation._client.zrange(
+                    expiry_key, 0, -1, withscores=True
+                ),
+            )
+            for store, expiry_key in zip(stores, expiry_keys)
+        )
+        pending_b = second.retrieve_encrypted_response(
+            *identity, fixtures[1][0]
+        )
+        assert (
+            pending_b.state,
+            pending_b.request_deadline_epoch,
+            pending_b.progress,
+        ) == ("pending", fixtures[1][1], None)
+        assert tuple(
+            (
+                _lifecycle_authority_snapshot(store, node_id, identity),
+                store._foundation._client.zrange(
+                    expiry_key, 0, -1, withscores=True
+                ),
+            )
+            for store, expiry_key in zip(stores, expiry_keys)
+        ) == before
+
+        pending_a = first.retrieve_encrypted_response(*identity, fixtures[0][0])
+        assert (
+            pending_a.state,
+            pending_a.request_deadline_epoch,
+            pending_a.progress,
+        ) == ("pending", fixtures[0][1], progress)
+        assert first._foundation._client.hgetall(progress_keys[0]) == {}
+        assert first._foundation._client.zscore(expiry_keys[0], member) is None
+        assert first.progress_records() == ()
+        first_after = _lifecycle_authority_snapshot(first, node_id, identity)
+        assert first_after == (
+            before[0][0][0][:2] + ({},) + before[0][0][0][3:],
+            *before[0][0][1:],
+        )
+        assert second._foundation._client.hgetall(progress_keys[1]) == {}
+        assert second._foundation._client.zscore(expiry_keys[1], member) is None
+        assert second.progress_records() == ()
+        assert _lifecycle_authority_snapshot(second, node_id, identity) == before[1][0]
+    finally:
+        for store in stores:
+            _delete_claim_fixture_state(store, (node_id,), (identity,))
+            store._foundation._client.delete(
+                store._foundation.config.key("progress:expiry")
+            )
+            store.close()
+
+
 def test_encrypted_progress_concurrent_replacement_and_retrieval_across_stores(
     valkey_server,
 ):

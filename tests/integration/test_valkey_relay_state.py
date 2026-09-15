@@ -283,6 +283,7 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
             node_transition_batch_size=1,
             claim_ttl_seconds=2,
             lease_ttl_seconds=3,
+            max_reservations=5,
             max_reservations_per_client=5,
             max_reservations_per_node=5,
             max_queue_depth_per_node=5,
@@ -295,6 +296,24 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
     selections = []
     try:
         seconds, micros = first._foundation.server_time()
+
+        def terminal_records_for_request(client_id, request_id):
+            client_digest, request_digest = first._identity(client_id, request_id)
+            key = cfg.key("terminal", client_digest, request_digest)
+            raw = first._foundation._client.hgetall(key)
+            score = first._foundation._client.zscore(
+                cfg.key("terminals:expiry"), f"{client_digest}:{request_digest}"
+            )
+            if not raw or score is None:
+                return ()
+            return (
+                {
+                    "outcome": raw[b"outcome"].decode(),
+                    "reason": raw[b"reason"].decode(),
+                    "snapshot": (tuple(sorted(raw.items())), score),
+                },
+            )
+
         assert_relay_state_lifecycle_contract(
             stores,
             _capabilities(concurrency=8),
@@ -303,6 +322,7 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
                 first, boundary, timeout=4
             ),
             selections=selections,
+            terminal_records_for_request=terminal_records_for_request,
         )
     finally:
         node_ids = (
@@ -316,7 +336,7 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
             *(("contract-capacity-client", f"capacity-held-{index}")
               for index in range(5)),
             ("contract-capacity-client", "capacity-rejected"),
-            ("contract-capacity-release-client", "capacity-released"),
+            ("contract-capacity-client", "capacity-released"),
         )
         node = first._node_digest("contract-node")
         owner = _digest("contract-owner")
@@ -327,7 +347,7 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
             cfg.key(
                 "former_owner",
                 first._node_digest("contract-lease-node"),
-                owner,
+                _digest("contract-lease-owner"),
             ),
         )
         keys = [
@@ -983,7 +1003,7 @@ def test_selection_capacity_bounds_match_memory_without_rejection_mutation(
     limits = dict(
         max_reservations=8,
         max_reservations_per_client=8,
-        max_reservations_per_node=5,
+        max_reservations_per_node=8,
         max_request_lifecycles=8,
         max_queue_depth_per_node=8,
         max_queued_requests=8,

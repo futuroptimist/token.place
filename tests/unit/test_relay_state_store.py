@@ -226,12 +226,32 @@ RELAY_STATE_LIFECYCLE_CONTRACT = (
 
 
 def assert_relay_state_lifecycle_contract(
-    stores, capabilities, *, now_epoch: float, advance_to, selections=None
+    stores,
+    capabilities,
+    *,
+    now_epoch: float,
+    advance_to,
+    selections=None,
+    terminal_records_for_request=None,
 ):
     """Exercise the same implemented lifecycle through backend-neutral calls."""
 
     writer, observer = stores
     selections = [] if selections is None else selections
+    if terminal_records_for_request is None:
+        def terminal_records_for_request(client_id, request_id):
+            return tuple(
+                {
+                    "outcome": record.outcome,
+                    "reason": record.reason,
+                    "snapshot": record,
+                }
+                for record in observer.terminal_records()
+                if record.client_identity_digest
+                == digest_with_domain(client_id, b"client\0")
+                and record.request_identity_digest
+                == digest_with_domain(request_id, b"request\0")
+            )
     owner = digest("contract-owner")
     replacement_owner = digest("contract-replacement-owner")
     node_id = "contract-node"
@@ -397,6 +417,54 @@ def assert_relay_state_lifecycle_contract(
     assert sum(item.new_outcome for item in outcomes) == 1
     assert {item.state for item in outcomes} == {"cancelled"}
 
+    deadline_lease = writer.renew(node_id, owner)
+    deadline_selection = writer.select_and_reserve(
+        client,
+        "deadline",
+        "qwen3-8b-instruct",
+        "8k-fast",
+        deadline_lease.lease_expires_at_epoch - 2.5,
+    )
+    selections.append(deadline_selection)
+    observer.enqueue_encrypted_request(
+        client,
+        "deadline",
+        deadline_selection.reservation_token,
+        node_id,
+        "qwen3-8b-instruct",
+        "8k-fast",
+        deadline_selection.request_deadline_epoch,
+        envelope("sealed-deadline"),
+        "cancel-deadline",
+    )
+    advance_to(deadline_selection.request_deadline_epoch)
+    first_deadline = observer.cancel_or_expire_request(
+        client, "deadline", status="expired", reason="request_deadline_expired"
+    )
+    assert observer.list_reservations() == ()
+    deadline_terminals = terminal_records_for_request(client, "deadline")
+    assert len(deadline_terminals) == 1
+    assert (deadline_terminals[0]["outcome"], deadline_terminals[0]["reason"]) == (
+        "expired",
+        "request_deadline_expired",
+    )
+    deadline_snapshot = deadline_terminals
+    duplicate_deadline = writer.cancel_or_expire_request(
+        client, "deadline", status="expired", reason="request_deadline_expired"
+    )
+    deadline_results = (first_deadline, duplicate_deadline)
+    assert all(
+        (item.state, item.reason) == ("expired", "request_deadline_expired")
+        for item in deadline_results
+    )
+    # The in-process store eagerly reaps at the start of the first typed call,
+    # so that call reports the authoritative record as pre-existing. Valkey's
+    # atomic transition reports its creation. Neither behavior permits the
+    # duplicate to report or persist another outcome.
+    assert first_deadline.new_outcome is (writer is not observer)
+    assert not duplicate_deadline.new_outcome
+    assert terminal_records_for_request(client, "deadline") == deadline_snapshot
+
     # Four active states force continuation when the harness configures a
     # one-item transition batch: reserved, queued, claimed, and reclaimed.
     _, transition_claim = create_claim("claimed", "worker-transition")
@@ -451,35 +519,6 @@ def assert_relay_state_lifecycle_contract(
 
     deadline_node = "contract-deadline-node"
     writer.register(deadline_node, capabilities, digest("contract-deadline-owner"))
-    deadline_selection = writer.select_and_reserve(
-        client,
-        "deadline",
-        "qwen3-8b-instruct",
-        "8k-fast",
-        leased.lease_expires_at_epoch + 1,
-    )
-    selections.append(deadline_selection)
-    advance_to(deadline_selection.request_deadline_epoch)
-    first_deadline = observer.cancel_or_expire_request(
-        client, "deadline", status="expired", reason="request_deadline_expired"
-    )
-    duplicate_deadline = writer.cancel_or_expire_request(
-        client, "deadline", status="expired", reason="request_deadline_expired"
-    )
-    deadline_results = (first_deadline, duplicate_deadline)
-    assert all(
-        (item.state, item.reason) == ("expired", "request_deadline_expired")
-        for item in deadline_results
-    )
-    # An eager in-process reaper can create the terminal immediately before the
-    # first typed result is read; either way, this first attempt proves the one
-    # semantic outcome and the duplicate must remain non-mutating.
-    observed_new_outcomes = sum(item.new_outcome for item in deadline_results)
-    semantic_new_outcomes = observed_new_outcomes or int(
-        first_deadline.state == "expired"
-    )
-    assert semantic_new_outcomes == 1
-    assert not duplicate_deadline.new_outcome
 
     # Fill the fixture's shared per-client, per-node, and queue bounds. The
     # rejected reservation must not leave a partial lifecycle behind, and
@@ -517,19 +556,19 @@ def assert_relay_state_lifecycle_contract(
             capacity_client, request_id, f"cancel-{request_id}"
         ).new_outcome
     released = observer.select_and_reserve(
-        "contract-capacity-release-client", "capacity-released",
+        capacity_client, "capacity-released",
         "qwen3-8b-instruct", "8k-fast", capacity_deadline,
     )
     assert released.created
     selections.append(released)
     observer.enqueue_encrypted_request(
-        "contract-capacity-release-client", "capacity-released",
+        capacity_client, "capacity-released",
         released.reservation_token, deadline_node, "qwen3-8b-instruct", "8k-fast",
         capacity_deadline, envelope("sealed-capacity-released"),
         "cancel-capacity-released",
     )
     assert writer.cancel_or_expire_request(
-        "contract-capacity-release-client", "capacity-released",
+        capacity_client, "capacity-released",
         "cancel-capacity-released",
     ).new_outcome
 
@@ -551,6 +590,7 @@ def test_full_relay_state_lifecycle_contract_matrix(capabilities):
             node_transition_batch_size=1,
             claim_ttl_seconds=2,
             lease_ttl_seconds=3,
+            max_reservations=5,
             max_reservations_per_client=5,
             max_reservations_per_node=5,
             max_queue_depth_per_node=5,

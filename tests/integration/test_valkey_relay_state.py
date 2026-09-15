@@ -19,6 +19,7 @@ import redis
 from relay_state_store import (
     ComputeNodeCapabilities,
     EncryptedRequestEnvelope,
+    EncryptedProgressEnvelope,
     EncryptedResponseEnvelope,
     InMemoryRelayStateStore,
     RelayStateCapacityExceeded,
@@ -37,6 +38,7 @@ from valkey_relay_state import (
     CONTROL_CLAIM_SCRIPT,
     NODE_TRANSITION_SCRIPT,
     PENDING_TRANSITION_READ_SCRIPT,
+    PROGRESS_TRANSITION_SCRIPT,
     RENEW_CLAIM_SCRIPT,
     RETRIEVE_RESPONSE_SCRIPT,
     SCRIPT_DIGESTS,
@@ -3181,6 +3183,1155 @@ def _enqueue_claim_fixture(
     return envelope
 
 
+def test_encrypted_progress_replaces_and_is_retrieved_once_across_stores(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    node_id, owner, consumer = "progress-node", _digest("progress-owner"), "worker"
+    identity = ("progress-client", "progress-request")
+    try:
+        first.register(node_id, _capabilities(), owner)
+        seconds, micros = first._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 10
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        first.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+            ),
+            "cancel",
+        )
+        claim = second.claim_queued_request(node_id, owner, consumer)
+        initial = EncryptedProgressEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "first", "key", "iv"
+        )
+        latest = dataclasses.replace(initial, ciphertext="latest")
+        assert first.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, initial
+        ).state == "accepted"
+        assert second.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, latest
+        ).state == "replaced"
+        assert second.renew_claim_or_read_control(
+            node_id, owner, consumer, *identity, claim.generation
+        ).state == "continued"
+        datastore = first._foundation._client
+        cfg = first._foundation.config
+        client, request = first._identity(*identity)
+        node = first._node_digest(node_id)
+        member = f"{client}:{request}"
+        progress_key = cfg.key("progress", client, request)
+
+        def pending_authority_snapshot():
+            return (
+                datastore.hgetall(progress_key),
+                datastore.zrange(cfg.key("progress:expiry"), 0, -1, withscores=True),
+                datastore.hgetall(cfg.key("request", client, request)),
+                datastore.hgetall(cfg.key("claim", client, request)),
+                datastore.zrange(cfg.key("requests:deadline"), 0, -1, withscores=True),
+                datastore.zrange(cfg.key("claims:expiry"), 0, -1, withscores=True),
+                datastore.xrange(cfg.key("queue", node)),
+                datastore.hgetall(cfg.key("node", node)),
+                datastore.zrange(cfg.key("nodes:lease"), 0, -1, withscores=True),
+                datastore.zrange(cfg.key("node_work", node), 0, -1, withscores=True),
+                datastore.zscore(cfg.key("progress:expiry"), member),
+            )
+
+        before = pending_authority_snapshot()
+        invalid = second.retrieve_encrypted_response(
+            *identity, _digest("wrong-pending-progress-credential")
+        )
+        assert (
+            invalid.state,
+            invalid.envelope,
+            invalid.acknowledgement_token,
+            invalid.replay_expires_at_epoch,
+            invalid.request_deadline_epoch,
+            invalid.progress,
+        ) == ("invalid_retrieval_credential", None, None, None, None, None)
+        assert pending_authority_snapshot() == before
+
+        pending = first.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert (pending.state, pending.request_deadline_epoch, pending.progress) == (
+            "pending", deadline, latest
+        )
+        assert second.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        ).progress is None
+        assert first.progress_records() == ()
+    finally:
+        _delete_claim_fixture_state(first, (node_id,), (identity,))
+        first.close()
+        second.close()
+
+
+def test_encrypted_progress_namespace_isolation(valkey_server):
+    stores = tuple(
+        _registration_store(valkey_server, uuid.uuid4().hex) for _ in range(2)
+    )
+    node_id = "shared-progress-node"
+    owner = _digest("shared-progress-owner")
+    consumer = "shared-progress-consumer"
+    identity = ("shared-progress-client", "shared-progress-request")
+    progress = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "namespace-a-progress", "key", "iv"
+    )
+    fixtures = []
+    try:
+        for store in stores:
+            store.register(node_id, _capabilities(), owner)
+            seconds, micros = store._foundation.server_time()
+            deadline = seconds + micros / 1_000_000 + 10
+            selection = store.select_and_reserve(
+                *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+            )
+            store.enqueue_encrypted_request(
+                *identity,
+                selection.reservation_token,
+                node_id,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                EncryptedRequestEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+                ),
+                "cancel",
+            )
+            claim = store.claim_queued_request(node_id, owner, consumer)
+            fixtures.append((selection.reservation_token, deadline, claim.generation))
+
+        first, second = stores
+        assert first.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, fixtures[0][2], progress
+        ).state == "accepted"
+        client, request = first._identity(*identity)
+        member = f"{client}:{request}"
+        progress_keys = tuple(
+            store._foundation.config.key("progress", client, request)
+            for store in stores
+        )
+        expiry_keys = tuple(
+            store._foundation.config.key("progress:expiry") for store in stores
+        )
+        assert second._foundation._client.hgetall(progress_keys[1]) == {}
+        assert second._foundation._client.zscore(expiry_keys[1], member) is None
+        assert second.progress_records() == ()
+
+        before = tuple(
+            (
+                _lifecycle_authority_snapshot(store, node_id, identity),
+                store._foundation._client.zrange(
+                    expiry_key, 0, -1, withscores=True
+                ),
+            )
+            for store, expiry_key in zip(stores, expiry_keys)
+        )
+        pending_b = second.retrieve_encrypted_response(
+            *identity, fixtures[1][0]
+        )
+        assert (
+            pending_b.state,
+            pending_b.request_deadline_epoch,
+            pending_b.progress,
+        ) == ("pending", fixtures[1][1], None)
+        assert tuple(
+            (
+                _lifecycle_authority_snapshot(store, node_id, identity),
+                store._foundation._client.zrange(
+                    expiry_key, 0, -1, withscores=True
+                ),
+            )
+            for store, expiry_key in zip(stores, expiry_keys)
+        ) == before
+
+        pending_a = first.retrieve_encrypted_response(*identity, fixtures[0][0])
+        assert (
+            pending_a.state,
+            pending_a.request_deadline_epoch,
+            pending_a.progress,
+        ) == ("pending", fixtures[0][1], progress)
+        assert first._foundation._client.hgetall(progress_keys[0]) == {}
+        assert first._foundation._client.zscore(expiry_keys[0], member) is None
+        assert first.progress_records() == ()
+        first_after = _lifecycle_authority_snapshot(first, node_id, identity)
+        assert first_after == (
+            before[0][0][0][:2] + ({},) + before[0][0][0][3:],
+            *before[0][0][1:],
+        )
+        assert second._foundation._client.hgetall(progress_keys[1]) == {}
+        assert second._foundation._client.zscore(expiry_keys[1], member) is None
+        assert second.progress_records() == ()
+        assert _lifecycle_authority_snapshot(second, node_id, identity) == before[1][0]
+    finally:
+        for store in stores:
+            _delete_claim_fixture_state(store, (node_id,), (identity,))
+            store._foundation._client.delete(
+                store._foundation.config.key("progress:expiry")
+            )
+            store.close()
+
+
+def test_encrypted_progress_concurrent_replacement_and_retrieval_across_stores(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    stores = tuple(_registration_store(valkey_server, namespace) for _ in range(2))
+    first, second = stores
+    node_id, owner, consumer = (
+        "concurrent-progress-node",
+        _digest("concurrent-progress-owner"),
+        "worker",
+    )
+    identity = ("concurrent-progress-client", "concurrent-progress-request")
+    originals = [store._foundation._client.evalsha for store in stores]
+    try:
+        first.register(node_id, _capabilities(), owner)
+        deadline = first._foundation.server_time()[0] + 60
+        selection = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        first.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+            ),
+            "cancel",
+        )
+        claim = second.claim_queued_request(node_id, owner, consumer)
+        envelopes = (
+            EncryptedProgressEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "concurrent-a", "key", "iv"
+            ),
+            EncryptedProgressEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "concurrent-b", "key", "iv"
+            ),
+        )
+
+        replacement_barrier = Barrier(2, timeout=2)
+        for store, original in zip(stores, originals):
+            def synchronized(*args, original=original):
+                if args[0] == PROGRESS_TRANSITION_SCRIPT.eval_sha1:
+                    replacement_barrier.wait()
+                return original(*args)
+
+            store._foundation._client.evalsha = synchronized
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            replacements = [
+                pool.submit(
+                    store.replace_encrypted_progress_if_claimed,
+                    node_id,
+                    owner,
+                    consumer,
+                    *identity,
+                    claim.generation,
+                    envelope,
+                )
+                for store, envelope in zip(stores, envelopes)
+            ]
+            outcomes = [future.result(timeout=3).state for future in replacements]
+        assert sorted(outcomes) == ["accepted", "replaced"]
+
+        cfg = first._foundation.config
+        datastore = first._foundation._client
+        client, request = first._identity(*identity)
+        node = first._node_digest(node_id)
+        member = f"{client}:{request}"
+        progress_key = cfg.key("progress", client, request)
+        records = first.progress_records()
+        assert len(records) == 1
+        assert records[0].envelope in envelopes
+        assert datastore.zrange(
+            cfg.key("progress:expiry"), 0, -1, withscores=True
+        ) == [(member.encode(), deadline)]
+
+        def lifecycle_snapshot():
+            return (
+                datastore.hgetall(cfg.key("request", client, request)),
+                datastore.hgetall(cfg.key("claim", client, request)),
+                datastore.zrange(cfg.key("requests:deadline"), 0, -1, withscores=True),
+                datastore.zrange(cfg.key("claims:expiry"), 0, -1, withscores=True),
+                datastore.xrange(cfg.key("queue", node)),
+                datastore.hgetall(cfg.key("node", node)),
+                datastore.zrange(cfg.key("nodes:lease"), 0, -1, withscores=True),
+                datastore.zrange(cfg.key("node_work", node), 0, -1, withscores=True),
+            )
+
+        authority_before = lifecycle_snapshot()
+        retrieval_barrier = Barrier(2, timeout=2)
+        for store, original in zip(stores, originals):
+            def synchronized(*args, original=original):
+                if args[0] == RETRIEVE_RESPONSE_SCRIPT.eval_sha1:
+                    retrieval_barrier.wait()
+                return original(*args)
+
+            store._foundation._client.evalsha = synchronized
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            retrievals = [
+                pool.submit(
+                    store.retrieve_encrypted_response,
+                    *identity,
+                    selection.reservation_token,
+                )
+                for store in stores
+            ]
+            results = [future.result(timeout=3) for future in retrievals]
+        assert all(
+            result.state == "pending"
+            and result.request_deadline_epoch == deadline
+            for result in results
+        )
+        delivered = [result.progress for result in results if result.progress is not None]
+        assert delivered == [records[0].envelope]
+        assert sum(result.progress is None for result in results) == 1
+        assert first.progress_records() == ()
+        assert datastore.exists(progress_key) == 0
+        assert datastore.zscore(cfg.key("progress:expiry"), member) is None
+        assert lifecycle_snapshot() == authority_before
+    finally:
+        for store, original in zip(stores, originals):
+            store._foundation._client.evalsha = original
+        _delete_claim_fixture_state(first, (node_id,), (identity,))
+        for store in stores:
+            store.close()
+
+
+@pytest.mark.parametrize(
+    "stored_node_id",
+    (b"", b"x" * 8193, b"invalid-\xff-node"),
+    ids=("empty", "oversized", "invalid-utf8"),
+)
+def test_progress_records_rejects_invalid_node_id_without_mutation(
+    valkey_server, stored_node_id
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node_id, owner, consumer = "progress-inspection-node", _digest(
+        "progress-inspection-owner"
+    ), "worker"
+    identity = ("progress-inspection-client", "progress-inspection-request")
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+    )
+    try:
+        store.register(node_id, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 60
+        selection = _enqueue_claim_fixture(
+            store, node_id, owner, *identity, deadline
+        )
+        claim = store.claim_queued_request(node_id, owner, consumer)
+        store.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, envelope
+        )
+        cfg = store._foundation.config
+        client, request = store._identity(*identity)
+        member = f"{client}:{request}"
+        progress_key = cfg.key("progress", client, request)
+        progress_index = cfg.key("progress:expiry")
+        store._foundation._client.hset(progress_key, "node_id", stored_node_id)
+
+        def snapshot():
+            return (
+                store._foundation._client.hgetall(progress_key),
+                store._foundation._client.zrange(
+                    progress_index, 0, -1, withscores=True
+                ),
+            )
+
+        before = snapshot()
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store.progress_records()
+        assert snapshot() == before
+
+        store._foundation._client.hset(progress_key, "node_id", node_id)
+        records = store.progress_records()
+        assert len(records) == 1
+        assert records[0].envelope == envelope
+        assert records[0].expires_at_epoch == deadline
+        assert store._foundation._client.zscore(progress_index, member) == deadline
+    finally:
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "stored_envelope",
+    (
+        b"{",
+        b'{"protocol":"tokenplace_api_v1_relay_e2ee","version":1,"ciphertext":"progress","cipherkey":"key","iv":"iv"}',
+        b'{"cipherkey":"key","ciphertext":"progress","extra":"field","iv":"iv","protocol":"tokenplace_api_v1_relay_e2ee","version":1}',
+        b'["key","progress","iv","tokenplace_api_v1_relay_e2ee",1]',
+        b'{"cipherkey":"key","ciphertext":"\xff","iv":"iv","protocol":"tokenplace_api_v1_relay_e2ee","version":1}',
+    ),
+    ids=("malformed", "noncanonical", "extra-field", "numeric-keys", "invalid-utf8"),
+)
+def test_progress_retrieval_rejects_invalid_envelope_without_mutation(
+    valkey_server, stored_envelope
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node_id, owner, consumer = (
+        "invalid-progress-node",
+        _digest("invalid-progress-owner"),
+        "worker",
+    )
+    identity = ("invalid-progress-client", "invalid-progress-request")
+    try:
+        store.register(node_id, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 10
+        selection = store.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        store.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+            ),
+            "cancel",
+        )
+        claim = store.claim_queued_request(node_id, owner, consumer)
+        store.replace_encrypted_progress_if_claimed(
+            node_id,
+            owner,
+            consumer,
+            *identity,
+            claim.generation,
+            EncryptedProgressEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+            ),
+        )
+
+        cfg = store._foundation.config
+        client = hashlib.sha256(f"client\0{identity[0]}".encode()).hexdigest()
+        request = hashlib.sha256(f"request\0{identity[1]}".encode()).hexdigest()
+        member = f"{client}:{request}"
+        node = store._node_digest(node_id)
+        progress_key = cfg.key("progress", client, request)
+        store._foundation._client.hset(progress_key, "envelope", stored_envelope)
+
+        def lifecycle_snapshot():
+            client_api = store._foundation._client
+            return (
+                client_api.hgetall(progress_key),
+                client_api.zscore(cfg.key("progress:expiry"), member),
+                client_api.hgetall(cfg.key("request", client, request)),
+                client_api.hgetall(cfg.key("claim", client, request)),
+                client_api.zscore(cfg.key("requests:deadline"), member),
+                client_api.zscore(cfg.key("claims:expiry"), member),
+                client_api.xrange(cfg.key("queue", node)),
+                client_api.zrange(cfg.key("node_work", node), 0, -1, withscores=True),
+            )
+
+        before = lifecycle_snapshot()
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store.retrieve_encrypted_response(*identity, selection.reservation_token)
+        assert lifecycle_snapshot() == before
+    finally:
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "stored_envelope",
+    (
+        b"{",
+        b'{"protocol":"tokenplace_api_v1_relay_e2ee","version":1,"ciphertext":"progress","cipherkey":"key","iv":"iv"}',
+        b'{"cipherkey":"key","ciphertext":"progress","extra":"field","iv":"iv","protocol":"tokenplace_api_v1_relay_e2ee","version":1}',
+        b'["key","progress","iv","tokenplace_api_v1_relay_e2ee",1]',
+        b'{"cipherkey":"key","ciphertext":"progress","iv":"iv","protocol":"tokenplace_api_v1_relay_e2ee","version":2}',
+        b'{"cipherkey":"key","ciphertext":"\xff","iv":"iv","protocol":"tokenplace_api_v1_relay_e2ee","version":1}',
+    ),
+    ids=("malformed", "noncanonical", "extra-field", "numeric-keys", "invalid-value", "invalid-utf8"),
+)
+@pytest.mark.parametrize(
+    "transition", ("control", "cancel", "response", "claim", "progress", "node")
+)
+def test_progress_mutations_reject_invalid_envelopes_without_mutation(
+    valkey_server, stored_envelope, transition
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex, claim_ttl_seconds=30)
+    node_id, owner, consumer = "canonical-progress-node", _digest("canonical-progress-owner"), "worker"
+    identity = ("canonical-progress-client", "canonical-progress-request")
+    try:
+        store.register(node_id, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 120
+        selection = _enqueue_claim_fixture(
+            store, node_id, owner, *identity, deadline
+        )
+        claim = store.claim_queued_request(node_id, owner, consumer)
+        store.replace_encrypted_progress_if_claimed(
+            node_id,
+            owner,
+            consumer,
+            *identity,
+            claim.generation,
+            EncryptedProgressEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+            ),
+        )
+        cfg = store._foundation.config
+        client, request = store._identity(*identity)
+        node = store._node_digest(node_id)
+        member = f"{client}:{request}"
+        progress_key = cfg.key("progress", client, request)
+        store._foundation._client.hset(progress_key, "envelope", stored_envelope)
+        if transition == "claim":
+            expired = store._foundation.server_time()[0] - 1
+            store._foundation._client.hset(
+                cfg.key("claim", client, request), "lease_expires", expired
+            )
+            store._foundation._client.zadd(cfg.key("claims:expiry"), {member: expired})
+
+        keys = (
+            cfg.key("node", node),
+            cfg.key("request", client, request),
+            cfg.key("claim", client, request),
+            progress_key,
+            cfg.key("response", client, request),
+            cfg.key("terminal", client, request),
+            cfg.key("control", node, client, request),
+            cfg.key("cursor"),
+        )
+        indexes = (
+            cfg.key("nodes:lease"),
+            cfg.key("claims:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("progress:expiry"),
+            cfg.key("responses:expiry"),
+            cfg.key("terminals:expiry"),
+            cfg.key("control:expiry"),
+            cfg.key("node_work", node),
+        )
+
+        def snapshot():
+            client_api = store._foundation._client
+            return (
+                tuple(client_api.hgetall(key) for key in keys),
+                tuple(client_api.zrange(key, 0, -1, withscores=True) for key in indexes),
+                client_api.xrange(cfg.key("queue", node)),
+            )
+
+        before = snapshot()
+        with pytest.raises(ValkeySchemaIncompatibleError, match="^state schema incompatible$"):
+            if transition == "control":
+                store.renew_claim_or_read_control(
+                    node_id, owner, consumer, *identity, claim.generation
+                )
+            elif transition == "cancel":
+                store.cancel_or_expire_request(*identity, "cancel")
+            elif transition == "response":
+                store.accept_encrypted_response(
+                    node_id,
+                    owner,
+                    consumer,
+                    *identity,
+                    claim.generation,
+                    EncryptedResponseEnvelope(
+                        "tokenplace_api_v1_relay_e2ee", 1, "response", "key", "iv"
+                    ),
+                )
+            elif transition == "claim":
+                store.claim_queued_request(node_id, owner, "replacement-worker")
+            elif transition == "progress":
+                store.replace_encrypted_progress_if_claimed(
+                    node_id,
+                    owner,
+                    consumer,
+                    *identity,
+                    claim.generation,
+                    EncryptedProgressEnvelope(
+                        "tokenplace_api_v1_relay_e2ee", 1, "replacement", "key", "iv"
+                    ),
+                )
+            else:
+                store.unregister_node_and_transition_work(node_id, owner)
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("node_digest", _digest("wrong-progress-node")),
+        ("node_id", "wrong-progress-node"),
+        ("owner_digest", _digest("wrong-progress-owner")),
+        ("consumer_digest", _digest("wrong-progress-consumer")),
+        ("generation", "2"),
+        ("deadline", "1"),
+        ("node_id", b"invalid-\xff-node"),
+        ("expiry_score", 1),
+    ),
+    ids=(
+        "node",
+        "node-id",
+        "owner",
+        "consumer",
+        "generation",
+        "deadline",
+        "invalid-utf8-node-id",
+        "expiry-score",
+    ),
+)
+def test_progress_replacement_rejects_inconsistent_existing_authority_without_mutation(
+    valkey_server, field, value
+):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node_id, owner, consumer = "progress-authority-node", _digest(
+        "progress-authority-owner"
+    ), "worker"
+    identity = ("progress-authority-client", "progress-authority-request")
+    try:
+        store.register(node_id, _capabilities(), owner)
+        deadline = store._foundation.server_time()[0] + 60
+        _enqueue_claim_fixture(store, node_id, owner, *identity, deadline)
+        claim = store.claim_queued_request(node_id, owner, consumer)
+        envelope = EncryptedProgressEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+        )
+        store.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, envelope
+        )
+        cfg = store._foundation.config
+        client, request = store._identity(*identity)
+        member = f"{client}:{request}"
+        progress = cfg.key("progress", client, request)
+        progress_expiry = cfg.key("progress:expiry")
+        if field == "expiry_score":
+            store._foundation._client.zadd(progress_expiry, {member: value})
+        else:
+            store._foundation._client.hset(progress, field, value)
+
+        node = store._node_digest(node_id)
+        keys = (
+            progress,
+            cfg.key("claim", client, request),
+            cfg.key("request", client, request),
+            cfg.key("node", node),
+        )
+        indexes = (
+            progress_expiry,
+            cfg.key("claims:expiry"),
+            cfg.key("requests:deadline"),
+            cfg.key("node_work", node),
+        )
+
+        def snapshot():
+            client_api = store._foundation._client
+            return (
+                tuple(client_api.hgetall(key) for key in keys),
+                tuple(
+                    client_api.zrange(key, 0, -1, withscores=True)
+                    for key in indexes
+                ),
+                client_api.xrange(cfg.key("queue", node)),
+            )
+
+        before = snapshot()
+        with pytest.raises(
+            ValkeySchemaIncompatibleError, match="^state schema incompatible$"
+        ):
+            store.replace_encrypted_progress_if_claimed(
+                node_id,
+                owner,
+                consumer,
+                *identity,
+                claim.generation,
+                dataclasses.replace(envelope, ciphertext="replacement"),
+            )
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(store, (node_id,), (identity,))
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "error", "message"),
+    (
+        ("node", RelayStateCredentialMismatch, "progress owner is invalid"),
+        ("owner", RelayStateCredentialMismatch, "progress owner is invalid"),
+        ("consumer", RelayStateCredentialMismatch, "progress owner is invalid"),
+        ("client", RelayStateConflict, "progress claim is missing or expired"),
+        ("request", RelayStateConflict, "progress claim is missing or expired"),
+        ("generation", RelayStateConflict, "progress claim is missing or expired"),
+    ),
+)
+def test_progress_replacement_wrong_authority_is_redacted_and_non_mutating(
+    valkey_server, caplog, mismatch, error, message
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    caller = _registration_store(valkey_server, namespace)
+    node_id, owner, consumer = (
+        "progress-credential-node",
+        _digest("progress-credential-owner"),
+        "progress-credential-consumer",
+    )
+    identity = ("progress-credential-client", "progress-credential-request")
+    attempted = {
+        "node": "supplied-progress-node",
+        "owner": _digest("supplied-progress-owner"),
+        "consumer": "supplied-progress-consumer",
+        "client": "supplied-progress-client",
+        "request": "supplied-progress-request",
+        "generation": 919191,
+    }
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "progress-secret", "key-secret", "iv-secret"
+    )
+    arguments = [node_id, owner, consumer, *identity, None, envelope]
+    positions = {"node": 0, "owner": 1, "consumer": 2, "client": 3, "request": 4, "generation": 5}
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        deadline = writer._foundation.server_time()[0] + 60
+        _enqueue_claim_fixture(writer, node_id, owner, *identity, deadline)
+        claim = writer.claim_queued_request(node_id, owner, consumer)
+        writer.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, envelope
+        )
+        arguments[5] = claim.generation
+        arguments[positions[mismatch]] = attempted[mismatch]
+        attempted_identity = (arguments[3], arguments[4])
+        valid_keys, _ = _response_acceptance_authority(writer, node_id, identity)
+        attempted_keys, _ = _response_acceptance_authority(
+            writer, arguments[0], attempted_identity
+        )
+        progress_expiry = writer._foundation.config.key("progress:expiry")
+
+        def snapshot():
+            return (
+                _exact_key_snapshot(writer, valid_keys),
+                _exact_key_snapshot(writer, attempted_keys),
+                writer._foundation._client.zrange(
+                    progress_expiry, 0, -1, withscores=True
+                ),
+            )
+
+        before = snapshot()
+        markers = (
+            namespace,
+            *arguments[:5],
+            attempted["generation"],
+            deadline,
+            envelope.ciphertext,
+            envelope.cipherkey,
+            envelope.iv,
+            *valid_keys,
+            *attempted_keys,
+        )
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(error, match=f"^{message}$") as caught:
+                caller.replace_encrypted_progress_if_claimed(*arguments)
+        _assert_redacted_acceptance_failure(caught, caplog, markers)
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(
+            writer,
+            (node_id, attempted["node"]),
+            (
+                identity,
+                (attempted["client"], identity[1]),
+                (identity[0], attempted["request"]),
+            ),
+        )
+        writer.close()
+        caller.close()
+
+
+@pytest.mark.parametrize(
+    ("bound", "same_client", "limits"),
+    (
+        (
+            "global",
+            False,
+            {"max_progress_records": 1, "max_progress_records_per_client": 2},
+        ),
+        (
+            "per-client",
+            True,
+            {"max_progress_records": 2, "max_progress_records_per_client": 1},
+        ),
+    ),
+)
+def test_progress_capacity_rejects_without_eviction_and_allows_replacement(
+    valkey_server, bound, same_client, limits
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace, **limits)
+    caller = _registration_store(valkey_server, namespace, **limits)
+    node_id, owner, consumer = (
+        f"progress-{bound}-capacity-node",
+        _digest(f"progress-{bound}-capacity-owner"),
+        "progress-capacity-consumer",
+    )
+    retained_client = f"progress-{bound}-capacity-client"
+    attempted_client = retained_client if same_client else f"{retained_client}-other"
+    identities = (
+        (retained_client, "retained-request"),
+        (attempted_client, "attempted-request"),
+    )
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "retained", "key", "iv"
+    )
+    cfg = writer._foundation.config
+    datastore = writer._foundation._client
+    node = writer._node_digest(node_id)
+    progress_expiry = cfg.key("progress:expiry")
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        claims = []
+        for identity in identities:
+            _enqueue_claim_fixture(
+                writer, node_id, owner, *identity, time.time() + 60
+            )
+            claims.append(writer.claim_queued_request(node_id, owner, consumer))
+
+        assert writer.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identities[0], claims[0].generation, envelope
+        ).state == "accepted"
+
+        identity_keys = []
+        for identity in identities:
+            client, request = writer._identity(*identity)
+            identity_keys.extend(
+                cfg.key(kind, client, request)
+                for kind in ("request", "claim", "progress")
+            )
+        hash_keys = (cfg.key("node", node), *identity_keys)
+        zset_keys = (
+            cfg.key("nodes:lease"),
+            cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"),
+            progress_expiry,
+            cfg.key("node_work", node),
+        )
+        queue = cfg.key("queue", node)
+
+        def snapshot():
+            return (
+                tuple(datastore.hgetall(key) for key in hash_keys),
+                tuple(
+                    datastore.zrange(key, 0, -1, withscores=True)
+                    for key in zset_keys
+                ),
+                datastore.xrange(queue),
+            )
+
+        before = snapshot()
+        with pytest.raises(
+            RelayStateCapacityExceeded, match="^progress capacity reached$"
+        ):
+            caller.replace_encrypted_progress_if_claimed(
+                node_id,
+                owner,
+                consumer,
+                *identities[1],
+                claims[1].generation,
+                dataclasses.replace(envelope, ciphertext="attempted"),
+            )
+        assert snapshot() == before
+
+        retained_progress = hash_keys[3]
+        unrelated_before = tuple(datastore.hgetall(key) for key in hash_keys[4:])
+        indexes_before = tuple(
+            datastore.zrange(key, 0, -1, withscores=True) for key in zset_keys
+        )
+        replacement = dataclasses.replace(envelope, ciphertext="replacement")
+        assert caller.replace_encrypted_progress_if_claimed(
+            node_id,
+            owner,
+            consumer,
+            *identities[0],
+            claims[0].generation,
+            replacement,
+        ).state == "replaced"
+        assert writer.progress_records()[0].envelope == replacement
+        assert tuple(datastore.hgetall(key) for key in hash_keys[4:]) == unrelated_before
+        assert tuple(
+            datastore.zrange(key, 0, -1, withscores=True) for key in zset_keys
+        ) == indexes_before
+        assert datastore.hgetall(retained_progress)[b"envelope"] == (
+            writer._serialized_progress_envelope(replacement)
+        )
+    finally:
+        _delete_claim_fixture_state(writer, (node_id,), identities)
+        datastore.delete(progress_expiry, cfg.key("node_work", node))
+        writer.close()
+        caller.close()
+
+
+@pytest.mark.parametrize(
+    ("boundary", "claim_ttl", "deadline_offset"),
+    (
+        ("claim_lease_boundary", 0.08, 5.0),
+        ("request_deadline_boundary", 2.0, 0.15),
+    ),
+)
+def test_progress_replacement_inclusive_expiry_boundaries_are_non_mutating(
+    valkey_server, boundary, claim_ttl, deadline_offset
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(
+        valkey_server, namespace, claim_ttl_seconds=claim_ttl
+    )
+    caller = _registration_store(
+        valkey_server, namespace, claim_ttl_seconds=claim_ttl
+    )
+    node_id = "progress-expiry-boundary-node"
+    owner, consumer = _digest("progress-expiry-boundary-owner"), "worker"
+    identity = (f"{boundary}-client", f"{boundary}-request")
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "retained", "key", "iv"
+    )
+    cfg = writer._foundation.config
+    datastore = writer._foundation._client
+    node = writer._node_digest(node_id)
+    client, request = writer._identity(*identity)
+    member = f"{client}:{request}"
+    progress_expiry = cfg.key("progress:expiry")
+    node_work = cfg.key("node_work", node)
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        seconds, micros = writer._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + deadline_offset
+        _enqueue_claim_fixture(writer, node_id, owner, *identity, deadline)
+        claim = writer.claim_queued_request(node_id, owner, consumer)
+        assert writer.replace_encrypted_progress_if_claimed(
+            node_id, owner, consumer, *identity, claim.generation, envelope
+        ).state == "accepted"
+        if boundary == "request_deadline_boundary":
+            assert claim.lease_expires_at_epoch == claim.request_deadline_epoch
+        else:
+            assert claim.lease_expires_at_epoch < claim.request_deadline_epoch
+
+        hash_keys = tuple(
+            cfg.key(kind, client, request)
+            for kind in ("progress", "claim", "request")
+        ) + (cfg.key("node", node),)
+        zset_keys = tuple(
+            cfg.key(kind)
+            for kind in (
+                "requests:deadline",
+                "claims:expiry",
+                "progress:expiry",
+                "nodes:lease",
+            )
+        ) + (node_work,)
+        queue = cfg.key("queue", node)
+
+        def snapshot():
+            return (
+                tuple(datastore.hgetall(key) for key in hash_keys),
+                tuple(
+                    datastore.zrange(key, 0, -1, withscores=True)
+                    for key in zset_keys
+                ),
+                datastore.xrange(queue),
+            )
+
+        before = snapshot()
+        assert datastore.zscore(progress_expiry, member) == deadline
+        due = (
+            claim.lease_expires_at_epoch
+            if boundary == "claim_lease_boundary"
+            else claim.request_deadline_epoch
+        )
+        _wait_for_server_epoch(writer, due)
+
+        with pytest.raises(
+            RelayStateConflict, match="^progress claim is missing or expired$"
+        ):
+            caller.replace_encrypted_progress_if_claimed(
+                node_id,
+                owner,
+                consumer,
+                *identity,
+                claim.generation,
+                dataclasses.replace(envelope, ciphertext="replacement"),
+            )
+        assert snapshot() == before
+    finally:
+        _delete_claim_fixture_state(writer, (node_id,), (identity,))
+        datastore.delete(progress_expiry, node_work)
+        writer.close()
+        caller.close()
+
+
+def test_progress_reclaim_discards_old_generation_and_fences_stale_caller(valkey_server):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.05)
+    reclaimer = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.05)
+    node_id, owner = "progress-reclaim-node", _digest("progress-reclaim-owner")
+    identity = ("progress-reclaim-client", "progress-reclaim-request")
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "old-progress", "old-key", "old-iv"
+    )
+    try:
+        writer.register(node_id, _capabilities(), owner)
+        _enqueue_claim_fixture(writer, node_id, owner, *identity, time.time() + 60)
+        old = writer.claim_queued_request(node_id, owner, "old-consumer")
+        writer.replace_encrypted_progress_if_claimed(
+            node_id, owner, "old-consumer", *identity, old.generation, envelope
+        )
+        _wait_for_server_epoch(writer, old.lease_expires_at_epoch)
+        current = reclaimer.claim_queued_request(node_id, owner, "current-consumer")
+        assert current.state == "reclaimed" and current.generation > old.generation
+        assert writer.progress_records() == ()
+
+        keys, _ = _response_acceptance_authority(writer, node_id, identity)
+        progress_expiry = writer._foundation.config.key("progress:expiry")
+        before = (
+            _exact_key_snapshot(writer, keys),
+            writer._foundation._client.zrange(progress_expiry, 0, -1, withscores=True),
+        )
+        with pytest.raises(
+            RelayStateConflict, match="^progress claim is missing or expired$"
+        ):
+            writer.replace_encrypted_progress_if_claimed(
+                node_id, owner, "old-consumer", *identity, old.generation, envelope
+            )
+        assert (
+            _exact_key_snapshot(writer, keys),
+            writer._foundation._client.zrange(progress_expiry, 0, -1, withscores=True),
+        ) == before
+        replacement = dataclasses.replace(envelope, ciphertext="current-progress")
+        assert reclaimer.replace_encrypted_progress_if_claimed(
+            node_id,
+            owner,
+            "current-consumer",
+            *identity,
+            current.generation,
+            replacement,
+        ).state == "accepted"
+        assert reclaimer.progress_records()[0].envelope == replacement
+    finally:
+        _delete_claim_fixture_state(writer, (node_id,), (identity,))
+        writer.close()
+        reclaimer.close()
+
+
+def test_progress_node_id_reuse_discards_old_authority_and_fences_stale_caller(
+    valkey_server,
+):
+    namespace = uuid.uuid4().hex
+    writer = _registration_store(valkey_server, namespace)
+    replacement_store = _registration_store(valkey_server, namespace)
+    node_id = "progress-reused-node"
+    old_owner = _digest("progress-reused-old-owner")
+    new_owner = _digest("progress-reused-new-owner")
+    identities = (("progress-reuse-client", "old"), ("progress-reuse-client", "new"))
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "old-progress", "old-key", "old-iv"
+    )
+    try:
+        writer.register(node_id, _capabilities(), old_owner)
+        _enqueue_claim_fixture(writer, node_id, old_owner, *identities[0], time.time() + 60)
+        old = writer.claim_queued_request(node_id, old_owner, "old-consumer")
+        writer.replace_encrypted_progress_if_claimed(
+            node_id, old_owner, "old-consumer", *identities[0], old.generation, envelope
+        )
+        assert writer.unregister(node_id, old_owner)
+        replacement_store.register(node_id, _capabilities(), new_owner)
+        assert writer.progress_records() == ()
+
+        keys, _ = _response_acceptance_authority(writer, node_id, identities[0])
+        before = _exact_key_snapshot(writer, keys)
+        with pytest.raises(
+            RelayStateCredentialMismatch, match="^progress owner is invalid$"
+        ):
+            replacement_store.replace_encrypted_progress_if_claimed(
+                node_id,
+                old_owner,
+                "old-consumer",
+                *identities[0],
+                old.generation,
+                envelope,
+            )
+        assert _exact_key_snapshot(writer, keys) == before
+
+        _enqueue_claim_fixture(
+            replacement_store, node_id, new_owner, *identities[1], time.time() + 60
+        )
+        fresh = replacement_store.claim_queued_request(
+            node_id, new_owner, "fresh-consumer"
+        )
+        replacement = dataclasses.replace(envelope, ciphertext="fresh-progress")
+        assert replacement_store.replace_encrypted_progress_if_claimed(
+            node_id,
+            new_owner,
+            "fresh-consumer",
+            *identities[1],
+            fresh.generation,
+            replacement,
+        ).state == "accepted"
+        assert replacement_store.progress_records()[0].envelope == replacement
+    finally:
+        _delete_claim_fixture_state(writer, (node_id,), identities)
+        writer.close()
+        replacement_store.close()
+
+
+def test_queued_encrypted_request_retrieval_is_pending(valkey_server):
+    store = _registration_store(valkey_server, uuid.uuid4().hex)
+    node_id, owner = "queued-progress-node", _digest("queued-progress-owner")
+    identity = ("queued-progress-client", "queued-progress-request")
+    try:
+        store.register(node_id, _capabilities(), owner)
+        seconds, micros = store._foundation.server_time()
+        deadline = seconds + micros / 1_000_000 + 10
+        selection = store.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, "cancel"
+        )
+        store.enqueue_encrypted_request(
+            *identity,
+            selection.reservation_token,
+            node_id,
+            "qwen3-8b-instruct",
+            "8k-fast",
+            deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "request", "key", "iv"
+            ),
+            "cancel",
+        )
+
+        pending = store.retrieve_encrypted_response(
+            *identity, selection.reservation_token
+        )
+        assert (pending.state, pending.request_deadline_epoch, pending.progress) == (
+            "pending",
+            deadline,
+            None,
+        )
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("stage", ("reserved", "queued", "claimed"))
 def test_cancellation_is_shared_retrievable_and_retains_only_live_control(
     valkey_server, stage
@@ -3241,6 +4392,112 @@ def test_cancellation_is_shared_retrievable_and_retains_only_live_control(
         second.close()
 
 
+@pytest.mark.parametrize("transition", ("cancelled", "expired"))
+def test_progress_terminal_cleanup_removes_exact_authority(valkey_server, transition):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, max_claims=8)
+    second = _registration_store(valkey_server, namespace, max_claims=8)
+    node = f"progress-terminal-{transition}-node"
+    owner = _digest(f"progress-terminal-{transition}-owner")
+    consumer = f"progress-terminal-{transition}-consumer"
+    identities = (
+        (f"progress-terminal-{transition}-client", "target"),
+        (f"progress-terminal-{transition}-client", "neighbor"),
+    )
+    datastore = first._foundation._client
+    target_keys, target_member = _response_acceptance_authority(
+        first, node, identities[0]
+    )
+    neighbor_keys, neighbor_member = _response_acceptance_authority(
+        first, node, identities[1]
+    )
+    progress_expiry = first._foundation.config.key("progress:expiry")
+    try:
+        first.register(node, _capabilities(concurrency=2), owner)
+        now, micros = first._foundation.server_time()
+        target_deadline = now + micros / 1_000_000 + (
+            0.15 if transition == "expired" else 60
+        )
+        claims = []
+        for identity, deadline in zip(identities, (target_deadline, time.time() + 60)):
+            _enqueue_claim_fixture(first, node, owner, *identity, deadline)
+            claims.append(first.claim_queued_request(node, owner, consumer))
+            assert first.replace_encrypted_progress_if_claimed(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claims[-1].generation,
+                EncryptedProgressEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+                ),
+            )
+
+        neighbor_hashes_before = tuple(
+            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
+        )
+        neighbor_scores_before = (
+            datastore.zscore(neighbor_keys[5], neighbor_member),
+            datastore.zscore(neighbor_keys[6], neighbor_member),
+            datastore.zscore(progress_expiry, neighbor_member),
+        )
+        neighbor_queue_entry = datastore.hget(neighbor_keys[4], "queue_entry")
+        node_digest = first._node_digest(node)
+        node_work = first._foundation.config.key("node_work", node_digest)
+        neighbor_work_score = datastore.zscore(node_work, neighbor_member)
+        if transition == "expired":
+            _wait_for_server_epoch(first, target_deadline)
+        result = second.cancel_or_expire_request(
+            *identities[0],
+            "cancel" if transition == "cancelled" else None,
+            status=transition,
+            reason=(
+                "requester_cancelled"
+                if transition == "cancelled"
+                else "request_deadline_expired"
+            ),
+        )
+
+        assert (result.state, result.reason, result.new_outcome) == (
+            transition,
+            "requester_cancelled"
+            if transition == "cancelled"
+            else "request_deadline_expired",
+            True,
+        )
+        assert datastore.exists(target_keys[3]) == 0
+        assert datastore.exists(target_keys[11]) == 0
+        assert datastore.zscore(target_keys[5], target_member) is None
+        assert datastore.zscore(target_keys[6], target_member) is None
+        assert datastore.zscore(progress_expiry, target_member) is None
+        assert datastore.hget(target_keys[4], "state") == transition.encode()
+        assert datastore.hgetall(target_keys[9])[b"outcome"] == transition.encode()
+        queue_after = datastore.xrange(target_keys[2])
+        assert all(
+            entry[0] != datastore.hget(target_keys[4], "queue_entry")
+            for entry in queue_after
+        )
+        assert any(entry[0] == neighbor_queue_entry for entry in queue_after)
+        assert datastore.zscore(node_work, target_member) is None
+        assert tuple(
+            datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
+        ) == neighbor_hashes_before
+        assert (
+            datastore.zscore(neighbor_keys[5], neighbor_member),
+            datastore.zscore(neighbor_keys[6], neighbor_member),
+            datastore.zscore(progress_expiry, neighbor_member),
+        ) == neighbor_scores_before
+        assert datastore.zscore(node_work, neighbor_member) == neighbor_work_score
+    finally:
+        _delete_claim_fixture_state(first, (node,), identities)
+        datastore.zrem(progress_expiry, target_member, neighbor_member)
+        datastore.zrem(
+            first._foundation.config.key("node_work", first._node_digest(node)),
+            target_member,
+            neighbor_member,
+        )
+        first.close()
+        second.close()
 
 @pytest.mark.parametrize("retrieval_state", ("response_ready", "acknowledged", "retrieval_expired"))
 @pytest.mark.parametrize("transition", ("cancelled", "expired"))
@@ -6825,8 +8082,13 @@ def test_encrypted_response_first_transition_removes_exact_authority_once(
         for identity in identities:
             _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
             claims.append(first.claim_queued_request(node, owner, consumer))
-        datastore.hset(keys[11], mapping={"stage": "generating"})
-        datastore.hset(neighbor_keys[11], mapping={"stage": "neighbor"})
+        progress = EncryptedProgressEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+        )
+        for identity, claim in zip(identities, claims):
+            assert first.replace_encrypted_progress_if_claimed(
+                node, owner, consumer, *identity, claim.generation, progress
+            )
 
         queue_before = datastore.xrange(keys[2])
         addressed_entry = datastore.hget(keys[4], "queue_entry")
@@ -6852,6 +8114,9 @@ def test_encrypted_response_first_transition_removes_exact_authority_once(
         assert datastore.zscore(keys[5], member) is None
         assert datastore.zscore(keys[6], member) is None
         assert datastore.exists(keys[11]) == 0
+        assert datastore.zscore(
+            first._foundation.config.key("progress:expiry"), member
+        ) is None
         assert datastore.hget(keys[4], "state") == b"response_ready"
         assert datastore.hget(node_key, "scheduler_claimed_work") == scheduler_before
         assert tuple(
@@ -6869,6 +8134,9 @@ def test_encrypted_response_first_transition_removes_exact_authority_once(
         assert not retried.new_outcome
         assert retried == dataclasses.replace(accepted, new_outcome=False)
         assert _exact_key_snapshot(first, keys) == after
+        assert datastore.zscore(
+            first._foundation.config.key("progress:expiry"), member
+        ) is None
         assert tuple(
             datastore.hgetall(neighbor_keys[index]) for index in (3, 4, 11)
         ) == neighbor_hashes_before
@@ -9413,10 +10681,24 @@ def test_node_removed_record_round_trips_terminal_retrieval_and_control(
                 "cancellation-proof",
             )
         claim = None
+        progress_key = None
+        progress_member = None
         if stage == "claimed":
             claim = first.claim_queued_request(node, owner, consumer)
             cfg = first._foundation.config
             client, request = first._identity(*identity)
+            progress_key = cfg.key("progress", client, request)
+            progress_member = f"{client}:{request}"
+            assert first.replace_encrypted_progress_if_claimed(
+                node,
+                owner,
+                consumer,
+                *identity,
+                claim.generation,
+                EncryptedProgressEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "progress", "key", "iv"
+                ),
+            ).state == "accepted"
             past = seconds + micros / 1_000_000 - 1
             first._foundation._client.hset(
                 cfg.key("claim", client, request), "lease_expires", str(past)
@@ -9448,6 +10730,15 @@ def test_node_removed_record_round_trips_terminal_retrieval_and_control(
         )
         assert terminal.generation == (claim.generation if claim else 0)
         assert terminal.retrieval_credential_digest == _digest(credential)
+        if progress_key is not None:
+            datastore = second._foundation._client
+            assert datastore.exists(progress_key) == 0
+            assert (
+                datastore.zscore(
+                    second._foundation.config.key("progress:expiry"), progress_member
+                )
+                is None
+            )
         assert second.retrieve_encrypted_response(*identity, credential).state == (
             "completed_unavailable"
         )

@@ -14,6 +14,7 @@ import valkey_relay_state
 
 from valkey_relay_state import (
     ACCEPT_RESPONSE_SCRIPT,
+    PROGRESS_TRANSITION_SCRIPT,
     RETRIEVE_RESPONSE_SCRIPT,
     DirectPrimary,
     ReviewedScript,
@@ -32,6 +33,7 @@ from valkey_relay_state import (
     SERVER_TIME_SCRIPT,
 )
 from relay_state_store import (
+    EncryptedProgressEnvelope,
     EncryptedRequestEnvelope,
     EncryptedResponseEnvelope,
     RelayStateCapacityExceeded,
@@ -80,6 +82,93 @@ def test_response_serialization_is_canonical_sorted_utf8():
         b'{"cipherkey":"key","ciphertext":"cipher-\xe2\x98\x83","iv":"iv",'
         b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}'
     )
+
+
+def test_progress_serialization_and_decoder_are_canonical_sorted_utf8():
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher-☃", "key", "iv"
+    )
+    encoded = ValkeyRegistrationStore._serialized_progress_envelope(envelope)
+
+    assert encoded == (
+        b'{"cipherkey":"key","ciphertext":"cipher-\xe2\x98\x83","iv":"iv",'
+        b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}'
+    )
+    assert ValkeyRegistrationStore._decode_progress_envelope(encoded) == envelope
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b"[]",
+        b'{"protocol":"tokenplace_api_v1_relay_e2ee"}',
+        b'{"cipherkey":"key", "ciphertext":"cipher","iv":"iv",'
+        b'"protocol":"tokenplace_api_v1_relay_e2ee","version":1}',
+    ),
+)
+def test_progress_envelope_decoder_rejects_malformed_or_noncanonical_bytes(raw):
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        ValkeyRegistrationStore._decode_progress_envelope(raw)
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected", "error"),
+    (
+        ([b"accepted"], "accepted", None),
+        ([b"replaced"], "replaced", None),
+        ([b"owner"], None, RelayStateCredentialMismatch),
+        ([b"missing"], None, RelayStateConflict),
+        ([b"stale"], None, RelayStateConflict),
+        ([b"capacity"], None, RelayStateCapacityExceeded),
+        ([b"schema"], None, ValkeySchemaIncompatibleError),
+        ([b"unexpected"], None, ValkeySchemaIncompatibleError),
+        ([b"accepted", b"extra"], None, ValkeySchemaIncompatibleError),
+    ),
+)
+def test_replace_progress_decodes_fixed_script_results(reply, expected, error):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    foundation.execute.return_value = reply
+    store = registration_store_with_foundation(foundation)
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher", "key", "iv"
+    )
+
+    if error is not None:
+        with pytest.raises(error):
+            store.replace_encrypted_progress_if_claimed(
+                "node", "a" * 64, "consumer", "client", "request", 1, envelope
+            )
+    else:
+        result = store.replace_encrypted_progress_if_claimed(
+            "node", "a" * 64, "consumer", "client", "request", 1, envelope
+        )
+        assert result.state == expected
+
+
+@pytest.mark.parametrize(
+    ("generation", "envelope", "max_bytes", "message"),
+    (
+        (0, EncryptedProgressEnvelope("tokenplace_api_v1_relay_e2ee", 1, "c", "k", "i"), 1024, "generation"),
+        (1, object(), 1024, "EncryptedProgressEnvelope"),
+        (1, EncryptedProgressEnvelope("tokenplace_api_v1_relay_e2ee", 1, "cipher", "key", "iv"), 1, "byte bound"),
+    ),
+)
+def test_replace_progress_rejects_invalid_inputs_before_dispatch(
+    generation, envelope, max_bytes, message
+):
+    foundation = Mock(spec=ValkeyFoundation)
+    foundation.config = config()
+    store = registration_store_with_foundation(foundation)
+    store._config = dataclasses.replace(
+        store.config, max_progress_envelope_bytes=max_bytes
+    )
+
+    with pytest.raises(RelayStateStoreError, match=message):
+        store.replace_encrypted_progress_if_claimed(
+            "node", "a" * 64, "consumer", "client", "request", generation, envelope
+        )
+    foundation.execute.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -197,7 +286,7 @@ def test_completed_inspector_distinguishes_disappearance_from_remaining_authorit
 
 
 def test_accept_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "0cc5fabffcf2a547a60e062751d7a62b4cf87fbb1fbadd1210c2eed7ef55cd96"  # pragma: allowlist secret
+    expected_digest = "fcf78bf55769fe5e577c827cad7d69030ed99eebc7b385feeed17578c6a1d4c5"  # pragma: allowlist secret
     assert ACCEPT_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[ACCEPT_RESPONSE_SCRIPT.name] == ACCEPT_RESPONSE_SCRIPT.sha256
     assert hashlib.sha256(ACCEPT_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -250,7 +339,7 @@ def test_accept_response_script_is_registered_digest_pinned_and_bounded():
 
 
 def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
-    expected_digest = "82d25c377e3df42263b09540f18557a0579e270f25b2c811d0876c7a96e81e45"  # pragma: allowlist secret
+    expected_digest = "674964d7109d98dce068af6f169336d851a07dffcf8ceee4c18864d89d49e6e4"  # pragma: allowlist secret
     assert RETRIEVE_RESPONSE_SCRIPT.sha256 == expected_digest
     assert SCRIPT_DIGESTS[RETRIEVE_RESPONSE_SCRIPT.name] == expected_digest
     assert hashlib.sha256(RETRIEVE_RESPONSE_SCRIPT.source.encode()).hexdigest() == expected_digest
@@ -277,6 +366,27 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     assert "local canonical=string.format('%.6f',n)" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "string.format('%.17g',n)==value" in RETRIEVE_RESPONSE_SCRIPT.source
     assert "local function lua_number(value)\n  return lua_float(value)" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert "not canonical_progress(pv[9])" in RETRIEVE_RESPONSE_SCRIPT.source
+    assert RETRIEVE_RESPONSE_SCRIPT.source.index(
+        "not canonical_progress(pv[9])"
+    ) < RETRIEVE_RESPONSE_SCRIPT.source.index("redis.call('DEL',progress)", 1)
+
+
+def test_progress_script_is_registered_digest_pinned_and_bounded():
+    expected = "922eaff7fd75709908378e82d5bb60af2a43eb65c950672623f8549e471202ab"  # pragma: allowlist secret
+    assert PROGRESS_TRANSITION_SCRIPT.sha256 == expected
+    assert SCRIPT_DIGESTS[PROGRESS_TRANSITION_SCRIPT.name] == expected
+    assert "SCAN" not in PROGRESS_TRANSITION_SCRIPT.source.upper()
+    assert "ZRANGE',progress_expiries,0,max_progress" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "redis.call('TIME')" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "redis.call('HLEN',key)~=9" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "not canonical_progress(envelope)" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "canonical_progress(v[9])" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "valid_utf8(v[4])" in PROGRESS_TRANSITION_SCRIPT.source
+    assert "pv[3]~=cv[3]" in PROGRESS_TRANSITION_SCRIPT.source
+    assert PROGRESS_TRANSITION_SCRIPT.source.index("pv[3]~=cv[3]") < (
+        PROGRESS_TRANSITION_SCRIPT.source.index("redis.call('HSET',progress")
+    )
 
 
 @pytest.mark.parametrize(
@@ -284,14 +394,32 @@ def test_retrieve_response_script_is_registered_digest_pinned_and_bounded():
     (
         (valkey_relay_state.SELECT_AND_RESERVE_SCRIPT, "19b5c036b744b91821742e99650b80d0de0d1b213097970eaa98caedc330d947"),  # pragma: allowlist secret
         (valkey_relay_state.ENQUEUE_SCRIPT, "b9230062be58f017bfb618a368e3fd0d498cadf29c2793201886f1f3e40b9fcb"),  # pragma: allowlist secret
-        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "673eee38ba27545169d832d19d7acf48729963132ca6f106d3f0b15eeb4be949"),  # pragma: allowlist secret
-        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "7a22355773765ee16a35c1fbf85cc34968ab4eb822baed7115ea04f33dae77d5"),  # pragma: allowlist secret
+        (valkey_relay_state.CONTROL_CLAIM_SCRIPT, "ee7253365cd3517a8b48f714c12077d1677d425481c2304684366c07caa29d22"),  # pragma: allowlist secret
+        (valkey_relay_state.CANCEL_REQUEST_SCRIPT, "d4784e8bb3c2c1f0ef6d402dfb32ca3172d6678184f45b2d56b37aa54ee3167e"),  # pragma: allowlist secret
     ),
 )
 def test_control_transition_scripts_are_digest_pinned(script, digest):
     assert script.sha256 == digest
     assert SCRIPT_DIGESTS[script.name] == digest
     assert hashlib.sha256(script.source.encode()).hexdigest() == digest
+
+
+@pytest.mark.parametrize(
+    "script",
+    (
+        valkey_relay_state.CLAIM_SCRIPT,
+        valkey_relay_state.CONTROL_CLAIM_SCRIPT,
+        valkey_relay_state.CANCEL_REQUEST_SCRIPT,
+        valkey_relay_state.ACCEPT_RESPONSE_SCRIPT,
+        valkey_relay_state.PROGRESS_TRANSITION_SCRIPT,
+        valkey_relay_state.NODE_TRANSITION_SCRIPT,
+    ),
+)
+def test_progress_bearing_mutation_scripts_require_canonical_envelopes(script):
+    assert "local function canonical_progress(value)" in script.source
+    assert "canonical_progress(pv[9])" in script.source or (
+        "canonical_progress(v[9])" in script.source
+    )
 
 
 def test_cancel_retained_control_timeline_is_outcome_specific():
@@ -310,6 +438,7 @@ def test_node_transition_script_is_registered_digest_pinned_and_bounded():
     assert "expected_epoch" in script.source
     assert "redis.call('ZADD',pending_index,now,node_digest)" in script.source
     assert "if redis.call('ZSCORE',pending_index,node_digest) then return {'schema'} end" in script.source
+    assert "if progress_exists==0 then\n    if progress_score_raw then return {'schema'} end" in script.source
     assert script.source.index("local expired_tombs=") < script.source.index(
         "for _,m in ipairs(expired_tombs) do redis.call('DEL'"
     )
@@ -648,6 +777,37 @@ def _ready_retrieval_reply(store, *, acknowledgement_digest=None):
             or hashlib.sha256(token.encode()).hexdigest().encode()
         ),
     ], token
+
+
+def test_retrieve_response_decodes_pending_progress_and_empty_progress():
+    store = _retrieval_store_with_replies()
+    envelope = EncryptedProgressEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "cipher", "key", "iv"
+    )
+    store._foundation.execute.side_effect = [
+        [b"pending", b"10", store._serialized_progress_envelope(envelope)],
+        [b"pending", b"11", b""],
+    ]
+
+    with_progress = store.retrieve_encrypted_response(
+        "a" * 64, "b" * 64, "c" * 64
+    )
+    without_progress = store.retrieve_encrypted_response(
+        "a" * 64, "b" * 64, "c" * 64
+    )
+
+    assert with_progress.progress == envelope
+    assert with_progress.request_deadline_epoch == 10
+    assert without_progress.progress is None
+    assert without_progress.request_deadline_epoch == 11
+
+
+@pytest.mark.parametrize("deadline", (b"nan", b"-1"))
+def test_retrieve_response_rejects_invalid_pending_deadline(deadline):
+    store = _retrieval_store_with_replies([b"pending", deadline, b""])
+
+    with pytest.raises(ValkeySchemaIncompatibleError, match="state schema"):
+        store.retrieve_encrypted_response("a" * 64, "b" * 64, "c" * 64)
 
 
 @pytest.mark.parametrize(

@@ -314,6 +314,11 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
         former_owner_keys = (
             cfg.key("former_owner", node, owner),
             cfg.key("former_owner", node, replacement_owner),
+            cfg.key(
+                "former_owner",
+                first._node_digest("contract-lease-node"),
+                owner,
+            ),
         )
         keys = [
             cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),

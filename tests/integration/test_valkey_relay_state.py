@@ -5362,6 +5362,165 @@ def _delete_claim_fixture_state(store, node_ids, identities):
     store._foundation._client.delete(*keys)
 
 
+@pytest.mark.parametrize("backend", ("memory", "valkey"))
+def test_relay_state_lifecycle_backend_contract_matrix(valkey_server, backend):
+    """Run one public lifecycle contract unchanged against both implementations.
+
+    The Valkey leg deliberately alternates independently constructed clients.  The
+    memory leg uses its single process-local authority; cross-instance coordination
+    is a Valkey capability, rather than something the memory contract advertises.
+    Backend-specific fault injection and boundary cases remain below this common
+    journey so unsupported shared-runtime behavior is not mistaken for parity.
+    """
+
+    namespace = uuid.uuid4().hex
+    config = RelayStateStoreConfig(
+        namespace=f"contract-{backend}", claim_ttl_seconds=10
+    )
+    if backend == "memory":
+        first = InMemoryRelayStateStore(
+            config, acknowledgement_key=_ACKNOWLEDGEMENT_KEY
+        )
+        stores = (first, first)
+    else:
+        first = _registration_store(
+            valkey_server, namespace, claim_ttl_seconds=10
+        )
+        stores = (
+            first,
+            _registration_store(valkey_server, namespace, claim_ttl_seconds=10),
+        )
+
+    writer, observer = stores
+    node, owner, consumer = "contract-node", _digest("contract-owner"), "worker"
+    identities = (("contract-client", "response"), ("contract-client", "cancel"))
+    try:
+        registered = writer.register(node, _capabilities(), owner)
+        renewed = observer.renew(node, owner)
+        assert renewed.node_id == registered.node_id
+        assert observer.get(node) == renewed
+        assert observer.list() == (renewed,)
+        assert writer.set_scheduler_state(
+            node, owner, SchedulerNodeState(healthy=True, claimed_work=0)
+        )
+
+        deadline = (
+            writer._foundation.server_time()[0] + 60
+            if backend == "valkey"
+            else time.time() + 60
+        )
+        selections = []
+        for client, request in identities:
+            selection = writer.select_and_reserve(
+                client,
+                request,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                f"cancel-{request}",
+            )
+            selections.append(selection)
+            queued = observer.enqueue_encrypted_request(
+                client,
+                request,
+                selection.reservation_token,
+                node,
+                "qwen3-8b-instruct",
+                "8k-fast",
+                deadline,
+                EncryptedRequestEnvelope(
+                    "tokenplace_api_v1_relay_e2ee", 1, "ciphertext", "cipherkey", "iv"
+                ),
+                f"cancel-{request}",
+            )
+            assert queued.created
+
+        claim = writer.claim_queued_request(node, owner, consumer)
+        observed_claim = observer.claimed_request(node, claim.request_id)[1]
+        assert (
+            observed_claim.generation,
+            observed_claim.lease_expires_at_epoch,
+            observed_claim.request_deadline_epoch,
+            observed_claim.envelope,
+        ) == (
+            claim.generation,
+            claim.lease_expires_at_epoch,
+            claim.request_deadline_epoch,
+            claim.envelope,
+        )
+        assert observer.renew_claim(
+            node, owner, consumer, identities[0][0], identities[0][1], claim.generation
+        ).state == "continued"
+        progress = EncryptedProgressEnvelope(
+            "tokenplace_api_v1_relay_e2ee", 1, "progress", "progress-key", "progress-iv"
+        )
+        assert observer.replace_encrypted_progress_if_claimed(
+            node,
+            owner,
+            consumer,
+            identities[0][0],
+            identities[0][1],
+            claim.generation,
+            progress,
+        ).state == "accepted"
+        pending = writer.retrieve_encrypted_response(
+            *identities[0], selections[0].reservation_token
+        )
+        assert pending.state == "pending" and pending.progress == progress
+        assert observer.retrieve_encrypted_response(
+            *identities[0], selections[0].reservation_token
+        ).progress is None
+
+        accepted = observer.accept_encrypted_response(
+            node,
+            owner,
+            consumer,
+            *identities[0],
+            claim.generation,
+            EncryptedResponseEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, "response", "response-key", "response-iv"
+            ),
+        )
+        assert accepted.state == "response_ready" and accepted.new_outcome
+        replay = writer.retrieve_encrypted_response(
+            *identities[0], selections[0].reservation_token
+        )
+        assert replay.state == "response_ready" and replay.acknowledgement_token
+        assert observer.retrieve_encrypted_response(
+            *identities[0],
+            selections[0].reservation_token,
+            replay.acknowledgement_token,
+        ).state == "acknowledged"
+
+        cancelled = writer.cancel_or_expire_request(
+            *identities[1], "cancel-cancel"
+        )
+        assert cancelled.state == "cancelled" and cancelled.new_outcome
+        duplicate = observer.cancel_or_expire_request(
+            *identities[1], "cancel-cancel"
+        )
+        assert duplicate.state == "cancelled" and not duplicate.new_outcome
+        removal = observer.unregister_node_and_transition_work(node, owner)
+        assert removal.state == "complete"
+        assert writer.get(node) is None
+        assert len(writer.node_tombstones()) == 1
+    finally:
+        if backend == "valkey":
+            _delete_claim_fixture_state(first, (node,), identities)
+            cfg = first._foundation.config
+            node_digest = first._node_digest(node)
+            first._foundation._client.delete(
+                cfg.key("node_work", node_digest),
+                cfg.key("node_tombstone", node_digest),
+                cfg.key("node_tombstones:expiry"),
+                cfg.key("former_owner", node_digest, owner),
+                cfg.key("former_owners:expiry"),
+                cfg.key("control:expiry"),
+            )
+            for store in stores:
+                store.close()
+
+
 def _response_acceptance_authority(store, node_id, identity):
     """Return the exact declared keys and identity member for one acceptance."""
     cfg = store._foundation.config

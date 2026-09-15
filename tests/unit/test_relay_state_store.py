@@ -213,7 +213,11 @@ def accept_response(store, claim, **overrides):
 # their respective suites.
 RELAY_STATE_LIFECYCLE_CONTRACT = (
     "registration_scheduler",
+    "inclusive_registration_lease_expiry",
     "reservation_queue_claim_control",
+    "claim_reclaim_generation_fencing",
+    "request_deadline_expiry_capacity_release",
+    "concurrent_exactly_once_outcomes",
     "progress_pending_delivery",
     "response_replay_acknowledgement",
     "cancellation_terminal_deduplication",
@@ -221,10 +225,13 @@ RELAY_STATE_LIFECYCLE_CONTRACT = (
 )
 
 
-def assert_relay_state_lifecycle_contract(stores, capabilities, *, now_epoch: float):
+def assert_relay_state_lifecycle_contract(
+    stores, capabilities, *, now_epoch: float, advance_to, selections=None
+):
     """Exercise the same implemented lifecycle through backend-neutral calls."""
 
     writer, observer = stores
+    selections = [] if selections is None else selections
     owner = digest("contract-owner")
     replacement_owner = digest("contract-replacement-owner")
     node_id = "contract-node"
@@ -249,6 +256,7 @@ def assert_relay_state_lifecycle_contract(stores, capabilities, *, now_epoch: fl
             deadline,
         )
         assert selected.selected_node_id == node_id
+        selections.append(selected)
         enqueued = observer.enqueue_encrypted_request(
             client,
             request_id,
@@ -268,8 +276,21 @@ def assert_relay_state_lifecycle_contract(stores, capabilities, *, now_epoch: fl
             node_id, owner, consumer, client, request_id, claim.generation
         )
         assert renewed_claim.state == "continued"
-        return selected, claim
+        return selected, observer.claimed_request(node_id, request_id)[1]
 
+    reclaim_selection, original_claim = create_claim("reclaim", "worker-old")
+    advance_to(original_claim.lease_expires_at_epoch)
+    reclaimed = observer.claim_queued_request(node_id, owner, "worker-new")
+    assert reclaimed.state == "reclaimed"
+    assert reclaimed.generation == original_claim.generation + 1
+    assert writer.renew_claim(
+        node_id,
+        owner,
+        "worker-old",
+        client,
+        "reclaim",
+        original_claim.generation,
+    ).state == "stale_generation"
     response_selection, response_claim = create_claim("response", "worker-response")
     progress = observer.replace_encrypted_progress_if_claimed(
         node_id,
@@ -358,12 +379,26 @@ def assert_relay_state_lifecycle_contract(stores, capabilities, *, now_epoch: fl
     )
     assert control.state == "acknowledged"
 
-    # Three active states force continuation when the harness configures a
-    # one-item transition batch: reserved, queued, and claimed.
+    concurrent_selection, _ = create_claim("concurrent", "worker-concurrent")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(
+            pool.map(
+                lambda token: writer.cancel_or_expire_request(
+                    client, "concurrent", token
+                ),
+                ("cancel-concurrent", "cancel-concurrent"),
+            )
+        )
+    assert sum(item.new_outcome for item in outcomes) == 1
+    assert {item.state for item in outcomes} == {"cancelled"}
+
+    # Four active states force continuation when the harness configures a
+    # one-item transition batch: reserved, queued, claimed, and reclaimed.
     _, transition_claim = create_claim("claimed", "worker-transition")
-    writer.select_and_reserve(
+    reserved_selection = writer.select_and_reserve(
         client, "reserved", "qwen3-8b-instruct", "8k-fast", now_epoch + 120
     )
+    selections.append(reserved_selection)
     queued_selection = writer.select_and_reserve(
         client, "queued", "qwen3-8b-instruct", "8k-fast", now_epoch + 120
     )
@@ -385,8 +420,8 @@ def assert_relay_state_lifecycle_contract(stores, capabilities, *, now_epoch: fl
         writer.register(node_id, capabilities, replacement_owner)
     while transitions[-1].continuation_required:
         transitions.append(writer.unregister_node_and_transition_work(node_id, owner))
-    assert sum(item.processed_count for item in transitions) == 3
-    assert sum(item.new_outcomes for item in transitions) == 3
+    assert sum(item.processed_count for item in transitions) == 4
+    assert sum(item.new_outcomes for item in transitions) == 4
     fenced = observer.renew_claim_or_read_control(
         node_id,
         owner,
@@ -400,12 +435,56 @@ def assert_relay_state_lifecycle_contract(stores, capabilities, *, now_epoch: fl
     with pytest.raises(RelayStateCredentialMismatch):
         observer.renew(node_id, owner)
 
+    lease_owner = digest("contract-lease-owner")
+    leased = writer.register("contract-lease-node", capabilities, lease_owner)
+    advance_to(leased.lease_expires_at_epoch)
+    expired = []
+    while "contract-lease-node" not in {item.node_id for item in expired}:
+        expired.extend(observer.expire())
+    assert "contract-lease-node" in {item.node_id for item in expired}
+    assert writer.get("contract-lease-node") is None
+
+    deadline_node = "contract-deadline-node"
+    writer.register(deadline_node, capabilities, digest("contract-deadline-owner"))
+    deadline_selection = writer.select_and_reserve(
+        client,
+        "deadline",
+        "qwen3-8b-instruct",
+        "8k-fast",
+        leased.lease_expires_at_epoch + 1,
+    )
+    selections.append(deadline_selection)
+    advance_to(deadline_selection.request_deadline_epoch)
+    deadline_results = tuple(
+        observer.cancel_or_expire_request(
+            client, "deadline", status="expired", reason="request_deadline_expired"
+        )
+        for _ in range(2)
+    )
+    assert all(
+        (item.state, item.reason) == ("expired", "request_deadline_expired")
+        for item in deadline_results
+    )
+    assert sum(item.new_outcome for item in deadline_results) <= 1
+
+    # Contract records are immutable defensive values and their bounded
+    # representations must not disclose credentials or encrypted payloads.
+    rendered = repr(transitions)
+    assert owner not in rendered and "sealed-" not in rendered
+    with pytest.raises(FrozenInstanceError):
+        transitions[-1].state = "mutated"
+
+    return tuple(selections)
+
 
 def test_full_relay_state_lifecycle_contract_matrix(capabilities):
     clock = EpochClock()
     store = InMemoryRelayStateStore(
         RelayStateStoreConfig(
-            namespace="testing.lifecycle-contract", node_transition_batch_size=1
+            namespace="testing.lifecycle-contract",
+            node_transition_batch_size=1,
+            claim_ttl_seconds=1,
+            lease_ttl_seconds=2,
         ),
         acknowledgement_key=b"c" * 32,
         epoch_time=clock,
@@ -414,6 +493,7 @@ def test_full_relay_state_lifecycle_contract_matrix(capabilities):
         (store, store),
         replace(capabilities, max_concurrency=8),
         now_epoch=clock.value,
+        advance_to=lambda boundary: setattr(clock, "value", boundary),
     )
 
 

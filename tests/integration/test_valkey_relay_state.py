@@ -277,27 +277,70 @@ def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_serv
 
     namespace = uuid.uuid4().hex
     stores = [
-        _registration_store(valkey_server, namespace, node_transition_batch_size=1)
+        _registration_store(
+            valkey_server,
+            namespace,
+            node_transition_batch_size=1,
+            claim_ttl_seconds=1,
+            lease_ttl_seconds=2,
+        )
         for _ in range(2)
     ]
     first = stores[0]
     cfg = first._foundation.config
+    selections = []
     try:
         seconds, micros = first._foundation.server_time()
         assert_relay_state_lifecycle_contract(
             stores,
             _capabilities(concurrency=8),
             now_epoch=seconds + micros / 1_000_000,
+            advance_to=lambda boundary: _wait_for_server_epoch(
+                first, boundary, timeout=3
+            ),
+            selections=selections,
         )
     finally:
-        # The namespace is unique to this test, so deleting everything below its
-        # prefix is both isolated and robust when the contract fails before an
-        # opaque reservation token can be retained by the caller.
-        keys = tuple(
-            first._foundation._client.scan_iter(match=f"{cfg.key_prefix}*")
+        node_ids = (
+            "contract-node", "contract-lease-node", "contract-deadline-node"
         )
-        if keys:
-            first._foundation._client.delete(*keys)
+        request_ids = (
+            "response", "reclaim", "deadline", "cancel", "concurrent",
+            "claimed", "reserved", "queued",
+        )
+        node = first._node_digest("contract-node")
+        owner = _digest("contract-owner")
+        replacement_owner = _digest("contract-replacement-owner")
+        former_owner_keys = (
+            cfg.key("former_owner", node, owner),
+            cfg.key("former_owner", node, replacement_owner),
+        )
+        keys = [
+            cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+            cfg.key("claims:expiry"), cfg.key("responses:expiry"),
+            cfg.key("terminals:expiry"), cfg.key("control:expiry"),
+            cfg.key("node_tombstones:expiry"), cfg.key("former_owners:expiry"),
+            cfg.key("node_transitions:pending"), *former_owner_keys,
+        ]
+        for digest_value in map(first._node_digest, node_ids):
+            keys.extend(
+                cfg.key(kind, digest_value)
+                for kind in ("node", "queue", "node_work", "node_transition", "node_tombstone")
+            )
+        for request_id in request_ids:
+            client_digest, request_digest = first._identity("contract-client", request_id)
+            keys.extend(
+                cfg.key(kind, client_digest, request_digest)
+                for kind in ("request", "claim", "response", "terminal", "progress")
+            )
+            keys.append(cfg.key("control", node, client_digest, request_digest))
+        keys.extend(
+            cfg.key("reservation", _digest(item.reservation_token))
+            for item in selections if item.reservation_token is not None
+        )
+        first._foundation._client.delete(*keys)
+        assert first._foundation._client.exists(*former_owner_keys) == 0
         for store in stores:
             store.close()
 

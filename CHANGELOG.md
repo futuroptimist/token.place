@@ -3,6 +3,12 @@
 All notable changes to token.place are tracked here. This project uses a lightweight
 [Keep a Changelog](https://keepachangelog.com/) style without duplicating release checklists.
 
+## v0.1.2 - Relay/web release metadata correction
+
+- Corrected public relay/web metadata to `0.1.2`.
+- Kept the desktop release at `0.1.19` (`desktop-v0.1.19`).
+- Reused the qualified Qwen relay image without rebuilding it.
+
 ## v0.1.1 - Multi-relay desktop and release metadata
 
 - Added the landing-page environment/version badge so production, staging, and local development

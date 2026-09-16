@@ -12607,11 +12607,11 @@ def test_node_owner_retention_retry_precedes_replacement_pending_transition(
                 store._foundation._client.zadd(
                     store._foundation.config.key("nodes:lease"), {digest: cutoff}
                 )
-        return continuation_store.unregister_node_and_transition_work(
+        return continuation_store._unregister_node_and_transition_work(
             node,
             owner if cause == "explicit_unregister" else None,
             cause=cause,
-            _expected_transition_epoch=expected_epoch,
+            expected_transition_epoch=expected_epoch,
         )
 
     try:
@@ -12636,11 +12636,11 @@ def test_node_owner_retention_retry_precedes_replacement_pending_transition(
             cfg.key("former_owner", digest, owner_b),
         )
         before = _node_transition_authority_snapshot(store, node, identities, extra)
-        stale = continuation_store.unregister_node_and_transition_work(
+        stale = continuation_store._unregister_node_and_transition_work(
             node,
             owner_b if replacement_cause == "explicit_unregister" else None,
             cause=replacement_cause,
-            _expected_transition_epoch="0",
+            expected_transition_epoch="0",
         )
         assert stale.state == "stale"
         assert _node_transition_authority_snapshot(store, node, identities, extra) == before

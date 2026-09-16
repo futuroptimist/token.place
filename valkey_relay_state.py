@@ -3060,10 +3060,10 @@ class ValkeyFoundation:
 
 
 class ValkeyRegistrationStore:
-    """Internal Valkey implementation through encrypted-response acceptance.
+    """Internal Valkey implementation of the complete ``RelayStateStore`` contract.
 
-    This deliberately does not implement or advertise ``RelayStateStore``: the
-    remaining coordination transitions must exist before runtime selection is safe.
+    Conformance does not select this backend for the relay runtime; runtime
+    selection and deployment remain separate, fail-closed integration work.
     """
 
     def __init__(
@@ -3474,11 +3474,11 @@ class ValkeyRegistrationStore:
                 ) from None
             if not math.isfinite(epoch_number):
                 raise ValkeySchemaIncompatibleError("state schema incompatible")
-            self.unregister_node_and_transition_work(
+            self._unregister_node_and_transition_work(
                 pending_node,
                 pending_owner if pending_cause == "explicit_unregister" else None,
                 cause=pending_cause,
-                _expected_transition_epoch=pending_epoch,
+                expected_transition_epoch=pending_epoch,
             )
         return tuple(sorted(expired, key=lambda record: record.node_id))
 
@@ -3494,7 +3494,18 @@ class ValkeyRegistrationStore:
         control_credential_digest: str | None = None,
         *,
         cause: str = "explicit_unregister",
-        _expected_transition_epoch: str = "",
+    ) -> NodeTransitionResult:
+        return self._unregister_node_and_transition_work(
+            node_id, control_credential_digest, cause=cause
+        )
+
+    def _unregister_node_and_transition_work(
+        self,
+        node_id: str,
+        control_credential_digest: str | None = None,
+        *,
+        cause: str = "explicit_unregister",
+        expected_transition_epoch: str = "",
     ) -> NodeTransitionResult:
         self._validate_node_id(node_id)
         if cause not in {"explicit_unregister", "registration_lease_expired"}:
@@ -3543,7 +3554,7 @@ class ValkeyRegistrationStore:
             str(self.config.max_terminal_records_per_client).encode(),
             str(self.config.max_control_tombstones).encode(),
             str(self.config.max_control_tombstones_per_node).encode(),
-            _expected_transition_epoch.encode("ascii"),
+            expected_transition_epoch.encode("ascii"),
             str(self.config.max_node_id_bytes).encode(),
             str(self.config.max_identity_bytes).encode(),
             str(self.config.max_envelope_bytes).encode(),
@@ -3562,7 +3573,7 @@ class ValkeyRegistrationStore:
             )
         if status == "conflict":
             raise RelayStateConflict("node transition cause conflicts")
-        if status == "stale" and not values and _expected_transition_epoch:
+        if status == "stale" and not values and expected_transition_epoch:
             return NodeTransitionResult(status, cause, None, 0, 0, 0, 0, 0, False)
         capacity = {
             "pending_capacity": "pending node-transition capacity reached",

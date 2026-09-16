@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -41,10 +42,29 @@ from relay_state_store import (
     RelayStateCredentialMismatch,
     RelayStateInvalidReservation,
     RelayStateNoCapacity,
+    RelayStateStore,
     RelayStateStoreConfig,
     RelayStateStoreError,
     SchedulerNodeState,
 )
+
+
+def test_store_advertises_the_complete_relay_state_protocol():
+    """Keep the public Valkey surface exactly aligned with the protocol oracle."""
+
+    protocol_methods = {
+        name: member
+        for name, member in RelayStateStore.__dict__.items()
+        if callable(member) and not name.startswith("_")
+    }
+    assert set(protocol_methods) <= set(ValkeyRegistrationStore.__dict__)
+    for name, member in protocol_methods.items():
+        assert inspect.signature(getattr(ValkeyRegistrationStore, name)) == (
+            inspect.signature(member)
+        )
+
+    store = object.__new__(ValkeyRegistrationStore)
+    assert isinstance(store, RelayStateStore)
 
 
 @pytest.mark.parametrize("key", [None, "x" * 32, bytearray(32), b"x" * 31])
@@ -588,10 +608,10 @@ def test_node_transition_rejects_invalid_cause_inputs(cause, credential, message
 def test_node_transition_accepts_stale_pending_recovery_result():
     store = _node_transition_store_with_reply([b"stale"])
 
-    result = store.unregister_node_and_transition_work(
+    result = store._unregister_node_and_transition_work(
         "node-a",
         cause="registration_lease_expired",
-        _expected_transition_epoch="1.0",
+        expected_transition_epoch="1.0",
     )
 
     assert result.state == "stale"

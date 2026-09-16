@@ -224,6 +224,54 @@ RELAY_STATE_LIFECYCLE_CONTRACT = (
     "bounded_node_transition_fencing",
 )
 
+# Keep this inventory explicit: adding a protocol operation must make every
+# backend's conformance gate fail until that backend implements the operation.
+RELAY_STATE_STORE_OPERATIONS = frozenset(
+    {
+        "config",
+        "register",
+        "renew",
+        "get",
+        "list",
+        "expire",
+        "unregister",
+        "unregister_node_and_transition_work",
+        "set_scheduler_state",
+        "select_and_reserve",
+        "enqueue_encrypted_request",
+        "list_reservations",
+        "queued_requests",
+        "claimed_request",
+        "claim_queued_request",
+        "renew_claim",
+        "renew_claim_or_read_control",
+        "cancel_or_expire_request",
+        "active_claims",
+        "accept_encrypted_response",
+        "replace_encrypted_progress_if_claimed",
+        "retrieve_encrypted_response",
+        "response_records",
+        "progress_records",
+        "terminal_records",
+        "control_tombstones",
+        "node_tombstones",
+    }
+)
+
+
+def assert_relay_state_protocol_implementation(implementation_type):
+    """Assert that an implementation explicitly covers the public protocol."""
+
+    protocol_operations = {
+        name for name in RelayStateStore.__dict__ if not name.startswith("_")
+    }
+    assert protocol_operations == RELAY_STATE_STORE_OPERATIONS
+    assert RELAY_STATE_STORE_OPERATIONS <= implementation_type.__dict__.keys()
+
+
+def test_memory_store_explicitly_implements_complete_protocol_inventory():
+    assert_relay_state_protocol_implementation(InMemoryRelayStateStore)
+
 
 def assert_relay_state_lifecycle_contract(
     stores,

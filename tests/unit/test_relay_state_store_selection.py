@@ -7,7 +7,9 @@ import pytest
 
 import relay
 from relay_state_store import InMemoryRelayStateStore, RelayStateStoreError
-from valkey_relay_state import (SCRIPT_DIGESTS, ValkeySchemaIncompatibleError,
+from valkey_relay_state import (SCRIPT_DIGESTS, ValkeyReadOnlyError,
+                                ValkeyRegistrationStore,
+                                ValkeySchemaIncompatibleError,
                                 ValkeyUnavailableError)
 
 VALKEY_ENV = {
@@ -35,12 +37,13 @@ VALKEY_ENV = {
 
 @pytest.fixture(autouse=True)
 def isolated_selection(monkeypatch):
+    previous_store = relay.api_v1_relay_state_store
     for name in tuple(relay.os.environ):
         if name == relay.API_V1_STATE_BACKEND_ENV or name.startswith(
             relay._VALKEY_ENV_PREFIX
         ):
             monkeypatch.delenv(name)
-    relay.api_v1_relay_state_store = None
+    relay.api_v1_relay_state_store = previous_store
     yield
     relay.api_v1_relay_state_store = None
 
@@ -150,9 +153,16 @@ def test_missing_shared_acknowledgement_key_fails_before_connect(monkeypatch):
 @pytest.mark.parametrize(
     "sentinels",
     [
+        "null",
+        '"valkey.internal"',
+        "[]",
         '{"host":"valkey.internal","port":26379}',
         '[{"host":"valkey.internal","port":26379}]',
         '[["valkey.internal"]]',
+        '[["valkey.internal",26379,"extra"]]',
+        '[["valkey.internal",true]]',
+        '[["valkey.internal",0]]',
+        '[["bad host",26379]]',
     ],
 )
 def test_malformed_sentinel_shape_is_bounded(monkeypatch, sentinels):
@@ -166,6 +176,40 @@ def test_malformed_sentinel_shape_is_bounded(monkeypatch, sentinels):
         RelayStateStoreError, match="invalid Valkey runtime configuration"
     ):
         relay._new_api_v1_relay_state_store()
+
+
+def test_valid_sentinel_authentication_and_tls_configuration(monkeypatch):
+    _set_valkey_env(
+        monkeypatch,
+        TOKENPLACE_RELAY_VALKEY_DISCOVERY="sentinel",
+        TOKENPLACE_RELAY_VALKEY_SENTINELS_JSON='[["sentinel-a",26379],["sentinel-b",26380]]',
+        TOKENPLACE_RELAY_VALKEY_SENTINEL_SERVICE="relay-primary",
+        TOKENPLACE_RELAY_VALKEY_SENTINEL_USERNAME="sentinel-user",
+        TOKENPLACE_RELAY_VALKEY_SENTINEL_PASSWORD="sentinel-password",
+        TOKENPLACE_RELAY_VALKEY_TLS="true",
+        TOKENPLACE_RELAY_VALKEY_TLS_CA_CERT="/run/secrets/ca.pem",
+        TOKENPLACE_RELAY_VALKEY_USERNAME="relay-user",
+        TOKENPLACE_RELAY_VALKEY_PASSWORD="relay-password",
+    )
+    configs = []
+    foundation = Mock()
+    monkeypatch.setattr(
+        relay,
+        "ValkeyFoundation",
+        lambda config, expected: (configs.append(config) or foundation),
+    )
+    monkeypatch.setattr(relay, "ValkeyRegistrationStore", Mock(return_value=Mock()))
+
+    relay._new_api_v1_relay_state_store()
+
+    config = configs[0]
+    assert config.sentinel.sentinels == (
+        ("sentinel-a", 26379),
+        ("sentinel-b", 26380),
+    )
+    assert config.sentinel.sentinel_username == "sentinel-user"
+    assert config.tls is True
+    assert config.tls_ca_cert == "/run/secrets/ca.pem"
 
 
 def test_optional_valkey_settings_are_trimmed_or_omitted(monkeypatch):
@@ -221,9 +265,83 @@ def test_valkey_failure_is_redacted_and_never_falls_back(monkeypatch, failure):
     foundation.close.assert_called_once_with()
 
 
+def test_cleanup_failure_does_not_replace_original_bounded_failure(monkeypatch):
+    _set_valkey_env(monkeypatch)
+    foundation = Mock()
+    foundation.initialize_manifest.side_effect = ValkeyUnavailableError(
+        "state backend unavailable"
+    )
+    foundation.close.side_effect = RuntimeError("cleanup-secret.example:6380/password")
+    monkeypatch.setattr(relay, "ValkeyFoundation", Mock(return_value=foundation))
+
+    with pytest.raises(
+        ValkeyUnavailableError, match="^state backend unavailable$"
+    ) as caught:
+        relay._new_api_v1_relay_state_store()
+
+    assert "cleanup-secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    [
+        ("TOKENPLACE_RELAY_VALKEY_SCHEMA_MAJOR", "2"),
+        ("TOKENPLACE_RELAY_VALKEY_READER_REVISION", "2"),
+        ("TOKENPLACE_RELAY_VALKEY_WRITER_REVISION", "2"),
+        ("TOKENPLACE_RELAY_VALKEY_SUPPORTED_SCHEMA_READ_MAX", "2"),
+        ("TOKENPLACE_RELAY_VALKEY_SUPPORTED_WRITER_MAX", "2"),
+        ("TOKENPLACE_RELAY_VALKEY_ACTIVE_SCHEMA_REVISION", "2"),
+        ("TOKENPLACE_RELAY_VALKEY_ACTIVE_WRITER_REVISION", "2"),
+    ],
+)
+def test_environment_cannot_expand_reviewed_schema_support(
+    monkeypatch, setting, value
+):
+    _set_valkey_env(monkeypatch, **{setting: value})
+    constructor = Mock()
+    monkeypatch.setattr(relay, "ValkeyFoundation", constructor)
+
+    with pytest.raises(
+        RelayStateStoreError, match="^invalid Valkey runtime configuration$"
+    ):
+        relay._new_api_v1_relay_state_store()
+
+    constructor.assert_not_called()
+
+
+def test_invalid_combined_namespace_fails_before_foundation_construction(monkeypatch):
+    _set_valkey_env(
+        monkeypatch,
+        TOKENPLACE_RELAY_VALKEY_ENVIRONMENT="e" * 64,
+        TOKENPLACE_RELAY_VALKEY_CLUSTER="c" * 64,
+    )
+    constructor = Mock()
+    monkeypatch.setattr(relay, "ValkeyFoundation", constructor)
+
+    with pytest.raises(RelayStateStoreError, match="namespace must be"):
+        relay._new_api_v1_relay_state_store()
+
+    constructor.assert_not_called()
+
+
 def test_reset_replaces_then_closes_old_store(monkeypatch):
     old = Mock()
     old.close.side_effect = lambda: _assert_reset_lock_released()
+    new = Mock()
+    relay.api_v1_relay_state_store = old
+    monkeypatch.setattr(relay, "_new_api_v1_relay_state_store", Mock(return_value=new))
+
+    relay._reset_api_v1_relay_state_store()
+
+    assert relay.api_v1_relay_state_store is new
+    old.close.assert_called_once_with()
+
+
+def test_successful_reset_publishes_replacement_despite_old_cleanup_failure(
+    monkeypatch,
+):
+    old = Mock()
+    old.close.side_effect = RuntimeError("old-store-secret.example:6380/password")
     new = Mock()
     relay.api_v1_relay_state_store = old
     monkeypatch.setattr(relay, "_new_api_v1_relay_state_store", Mock(return_value=new))
@@ -242,10 +360,27 @@ def test_runtime_valkey_failure_is_a_store_error():
     assert issubclass(ValkeyUnavailableError, RelayStateStoreError)
 
 
-def test_runtime_valkey_failure_returns_bounded_route_response():
-    store = Mock()
-    store.get.side_effect = ValkeyUnavailableError("state backend unavailable")
-    relay.api_v1_relay_state_store = store
+@pytest.mark.parametrize(
+    "failure_type",
+    [ValkeyUnavailableError, ValkeyReadOnlyError, ValkeySchemaIncompatibleError],
+)
+def test_selected_valkey_runtime_failure_returns_redacted_bounded_route_response(
+    monkeypatch, caplog, failure_type
+):
+    secret = "redis://user:password@injected.example:6380/key/payload/token"
+
+    class FailingValkeyStore(ValkeyRegistrationStore):
+        def __init__(self, foundation, config, *, acknowledgement_key):
+            pass
+
+        def get(self, node_id):
+            raise failure_type(secret)
+
+    _set_valkey_env(monkeypatch)
+    foundation = Mock()
+    monkeypatch.setattr(relay, "ValkeyFoundation", Mock(return_value=foundation))
+    monkeypatch.setattr(relay, "ValkeyRegistrationStore", FailingValkeyStore)
+    relay.api_v1_relay_state_store = relay._new_api_v1_relay_state_store()
     relay.app.config["TESTING"] = True
 
     response = relay.app.test_client().post(
@@ -264,7 +399,49 @@ def test_runtime_valkey_failure_returns_bounded_route_response():
     )
 
     assert response.status_code == 503
-    assert response.get_json()["error"]["code"] == "state_backend_unavailable"
+    assert response.get_json() == {
+        "error": {
+            "code": "state_backend_unavailable",
+            "message": "Relay state is temporarily unavailable",
+        }
+    }
+    assert secret not in response.get_data(as_text=True)
+    assert secret not in caplog.text
+    assert secret not in repr(relay.api_v1_relay_state_store)
+
+
+def test_valkey_startup_failure_returns_redacted_bounded_route_response(
+    monkeypatch, caplog
+):
+    secret = "redis://user:password@startup.example:6380/key/payload/token"
+    _set_valkey_env(monkeypatch)
+    foundation = Mock()
+    foundation.initialize_manifest.side_effect = ValkeyUnavailableError(secret)
+    monkeypatch.setattr(relay, "ValkeyFoundation", Mock(return_value=foundation))
+    relay.app.config["TESTING"] = True
+
+    response = relay.app.test_client().post(
+        "/api/v1/relay/servers/register",
+        json={
+            "server_public_key": "node-key",
+            "capabilities": {
+                "supported_model_ids": ["qwen3-8b-instruct"],
+                "active_context_tier": "8k-fast",
+                "maximum_total_context_tokens": 8192,
+                "default_output_token_reservation": 1024,
+                "maximum_output_tokens": 1024,
+                "max_concurrency": 1,
+            },
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.get_json()["error"] == {
+        "code": "state_backend_unavailable",
+        "message": "Relay state is temporarily unavailable",
+    }
+    assert secret not in response.get_data(as_text=True)
+    assert secret not in caplog.text
 
 
 def test_failed_reset_keeps_existing_store_open(monkeypatch):

@@ -5579,6 +5579,39 @@ def _accepted_retrieval_fixture(stores, label):
     return node, identity, credential, envelope, accepted, keys, member
 
 
+def test_shared_acknowledgement_is_stable_and_cross_instance(valkey_server):
+    """Independent clients derive and accept one namespace-stable acknowledgement."""
+
+    namespace = uuid.uuid4().hex
+    stores = []
+    fixture = None
+    try:
+        stores = [
+            _registration_store(valkey_server, namespace),
+            _registration_store(valkey_server, namespace),
+        ]
+        fixture = _accepted_retrieval_fixture(stores, "cross-instance-ack")
+        _, identity, credential, envelope, _, _, _ = fixture
+
+        first_delivery = stores[0].retrieve_encrypted_response(*identity, credential)
+        second_delivery = stores[1].retrieve_encrypted_response(*identity, credential)
+        assert first_delivery.envelope == second_delivery.envelope == envelope
+        assert (
+            first_delivery.acknowledgement_token
+            == second_delivery.acknowledgement_token
+        )
+
+        acknowledged = stores[1].retrieve_encrypted_response(
+            *identity, credential, first_delivery.acknowledgement_token
+        )
+        assert acknowledged.state == "acknowledged"
+    finally:
+        if fixture is not None and stores:
+            _delete_claim_fixture_state(stores[0], (fixture[0],), (fixture[1],))
+        for store in stores:
+            store.close()
+
+
 def test_response_retrieval_namespace_isolation(valkey_server):
     namespaces = (uuid.uuid4().hex, uuid.uuid4().hex)
     stores = tuple(_registration_store(valkey_server, value) for value in namespaces)

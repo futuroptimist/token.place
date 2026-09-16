@@ -1058,6 +1058,9 @@ def _api_v1_in_flight_ttl_seconds() -> float:
 
 API_V1_STATE_BACKEND_ENV = "TOKENPLACE_RELAY_STATE_BACKEND"
 _VALKEY_ENV_PREFIX = "TOKENPLACE_RELAY_VALKEY_"
+_VALKEY_SCHEMA_MAJOR = 1
+_VALKEY_READER_REVISION = 1
+_VALKEY_WRITER_REVISION = 1
 
 
 def _required_valkey_setting(name: str) -> str:
@@ -1106,10 +1109,23 @@ def _valkey_discovery() -> DirectPrimary | SentinelPrimary:
     if mode == "sentinel":
         try:
             raw_endpoints = json.loads(_required_valkey_setting("SENTINELS_JSON"))
-            if not isinstance(raw_endpoints, list):
+            if (
+                not isinstance(raw_endpoints, list)
+                or not raw_endpoints
+                or len(raw_endpoints) > 32
+            ):
                 raise TypeError
             if any(
-                not isinstance(item, (list, tuple)) or len(item) != 2
+                not isinstance(item, list)
+                or len(item) != 2
+                or not isinstance(item[0], str)
+                or not item[0]
+                or len(item[0]) > 253
+                or any(character.isspace() for character in item[0])
+                or any(character in item[0] for character in "/@")
+                or isinstance(item[1], bool)
+                or not isinstance(item[1], int)
+                or not 1 <= item[1] <= 65535
                 for item in raw_endpoints
             ):
                 raise TypeError
@@ -1154,6 +1170,20 @@ def _new_valkey_api_v1_relay_state_store() -> RelayStateStore:
     read_max = _valkey_int_setting("SUPPORTED_SCHEMA_READ_MAX")
     writer_min = _valkey_int_setting("SUPPORTED_WRITER_MIN")
     writer_max = _valkey_int_setting("SUPPORTED_WRITER_MAX")
+    active_schema_revision = _valkey_int_setting("ACTIVE_SCHEMA_REVISION")
+    active_writer_revision = _valkey_int_setting("ACTIVE_WRITER_REVISION")
+    if (
+        schema_major != _VALKEY_SCHEMA_MAJOR
+        or reader_revision != _VALKEY_READER_REVISION
+        or writer_revision != _VALKEY_WRITER_REVISION
+        or (read_min, read_max)
+        != (_VALKEY_READER_REVISION, _VALKEY_READER_REVISION)
+        or (writer_min, writer_max)
+        != (_VALKEY_WRITER_REVISION, _VALKEY_WRITER_REVISION)
+        or active_schema_revision != _VALKEY_READER_REVISION
+        or active_writer_revision != _VALKEY_WRITER_REVISION
+    ):
+        raise RelayStateStoreError("invalid Valkey runtime configuration")
     discovery = _valkey_discovery()
     acknowledgement_key = _valkey_acknowledgement_key()
     config = ValkeyConfig(
@@ -1182,8 +1212,8 @@ def _new_valkey_api_v1_relay_state_store() -> RelayStateStore:
     )
     expected = SchemaManifest(
         schema_major=schema_major,
-        active_schema_revision=_valkey_int_setting("ACTIVE_SCHEMA_REVISION"),
-        active_writer_revision=_valkey_int_setting("ACTIVE_WRITER_REVISION"),
+        active_schema_revision=active_schema_revision,
+        active_writer_revision=active_writer_revision,
         reader_min=read_min,
         reader_max=read_max,
         writer_min=writer_min,
@@ -1191,17 +1221,23 @@ def _new_valkey_api_v1_relay_state_store() -> RelayStateStore:
         script_digests=SCRIPT_DIGESTS,
         migration_epoch=_valkey_int_setting("MIGRATION_EPOCH"),
     )
+    store_config = _api_v1_store_config(
+        f"{config.environment}.{config.cluster}"
+    )
     foundation = ValkeyFoundation(config, expected)
     try:
         foundation.initialize_manifest()
         foundation.readiness()
         return ValkeyRegistrationStore(
             foundation,
-            _api_v1_store_config(f"{config.environment}.{config.cluster}"),
+            store_config,
             acknowledgement_key=acknowledgement_key,
         )
     except Exception:
-        foundation.close()
+        try:
+            foundation.close()
+        except Exception:
+            LOGGER.warning("relay.state_backend_cleanup_failed")
         raise
 
 
@@ -1245,7 +1281,10 @@ def _reset_api_v1_relay_state_store() -> None:
         _api_v1_seen_stale_lease_evictions.clear()
     close = getattr(old_store, "close", None)
     if close is not None:
-        close()
+        try:
+            close()
+        except Exception:
+            LOGGER.warning("relay.state_backend_cleanup_failed")
 
 
 def _reconcile_api_v1_stale_lease_evictions(store: RelayStateStore) -> None:

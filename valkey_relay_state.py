@@ -3062,9 +3062,9 @@ class ValkeyFoundation:
 class ValkeyRegistrationStore:
     """Valkey-backed implementation of the complete ``RelayStateStore`` surface.
 
-    The implementation remains internal and is not selected by the relay runtime.
-    Protocol conformance does not by itself provide high-availability deployment,
-    failover, or operational readiness guarantees.
+    The relay runtime selects this implementation only through explicit, validated
+    configuration. Protocol conformance and runtime selection do not by themselves
+    provide high-availability deployment or failover guarantees.
     """
 
     def __init__(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -25,6 +27,16 @@ from relay_state_store import (
 )
 from utils.llm.model_profiles import build_model_aliases
 from utils.inference_timeout import DEFAULT_INFERENCE_TIMEOUT_SECONDS
+from valkey_relay_state import (
+    SCRIPT_DIGESTS,
+    DirectPrimary,
+    SchemaManifest,
+    SentinelPrimary,
+    ValkeyConfig,
+    ValkeyConfigurationError,
+    ValkeyFoundation,
+    ValkeyRegistrationStore,
+)
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from prometheus_client import (
@@ -989,6 +1001,20 @@ DEFAULT_CAPABILITY_MODEL_IDS: list[str] = []
 MODEL_ALIASES = build_model_aliases()
 ALLOWED_BACKEND_CLASSES = {"cpu", "cuda", "metal", "vulkan", "gpu", "unknown"}
 
+API_V1_STATE_BACKEND_ENV = "TOKEN_PLACE_API_V1_STATE_BACKEND"
+API_V1_VALKEY_ENVIRONMENT_ENV = "TOKEN_PLACE_API_V1_VALKEY_ENVIRONMENT"
+API_V1_VALKEY_CLUSTER_ENV = "TOKEN_PLACE_API_V1_VALKEY_CLUSTER"
+API_V1_VALKEY_SCHEMA_MAJOR_ENV = "TOKEN_PLACE_API_V1_VALKEY_SCHEMA_MAJOR"
+API_V1_VALKEY_SCHEMA_REVISION_ENV = "TOKEN_PLACE_API_V1_VALKEY_SCHEMA_REVISION"
+API_V1_VALKEY_MIGRATION_EPOCH_ENV = "TOKEN_PLACE_API_V1_VALKEY_MIGRATION_EPOCH"
+API_V1_VALKEY_DISCOVERY_ENV = "TOKEN_PLACE_API_V1_VALKEY_DISCOVERY"
+API_V1_VALKEY_HOST_ENV = "TOKEN_PLACE_API_V1_VALKEY_HOST"
+API_V1_VALKEY_PORT_ENV = "TOKEN_PLACE_API_V1_VALKEY_PORT"
+API_V1_VALKEY_SENTINELS_ENV = "TOKEN_PLACE_API_V1_VALKEY_SENTINELS"
+API_V1_VALKEY_SENTINEL_SERVICE_ENV = "TOKEN_PLACE_API_V1_VALKEY_SENTINEL_SERVICE"
+API_V1_VALKEY_TLS_ENV = "TOKEN_PLACE_API_V1_VALKEY_TLS"
+API_V1_VALKEY_ACKNOWLEDGEMENT_KEY_ENV = "TOKEN_PLACE_API_V1_VALKEY_ACKNOWLEDGEMENT_KEY"
+
 
 def _server_ping_age_seconds(last_ping: Any) -> float:
     if isinstance(last_ping, datetime):
@@ -1050,8 +1076,7 @@ def _api_v1_in_flight_ttl_seconds() -> float:
     return max(value, 1.0)
 
 
-def _new_api_v1_relay_state_store() -> RelayStateStore:
-    """Construct the single authoritative, single-process API-v1 state store."""
+def _memory_api_v1_relay_state_store() -> RelayStateStore:
     return InMemoryRelayStateStore(
         RelayStateStoreConfig(
             namespace="tokenplace.relay.memory",
@@ -1062,6 +1087,135 @@ def _new_api_v1_relay_state_store() -> RelayStateStore:
         ),
         acknowledgement_key=secrets.token_bytes(32),
     )
+
+
+def _required_valkey_setting(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not value:
+        raise ValkeyConfigurationError("invalid Valkey runtime configuration")
+    return value
+
+
+def _valkey_integer_setting(name: str, *, minimum: int = 0) -> int:
+    try:
+        value = int(_required_valkey_setting(name))
+    except ValueError:
+        raise ValkeyConfigurationError("invalid Valkey runtime configuration") from None
+    if value < minimum:
+        raise ValkeyConfigurationError("invalid Valkey runtime configuration")
+    return value
+
+
+def _valkey_tls_setting() -> bool:
+    value = _required_valkey_setting(API_V1_VALKEY_TLS_ENV)
+    if value not in {"true", "false"}:
+        raise ValkeyConfigurationError("invalid Valkey runtime configuration")
+    return value == "true"
+
+
+def _valkey_discovery() -> DirectPrimary | SentinelPrimary:
+    mode = _required_valkey_setting(API_V1_VALKEY_DISCOVERY_ENV)
+    if mode == "direct":
+        return DirectPrimary(
+            _required_valkey_setting(API_V1_VALKEY_HOST_ENV),
+            _valkey_integer_setting(API_V1_VALKEY_PORT_ENV, minimum=1),
+        )
+    if mode == "sentinel":
+        try:
+            raw = json.loads(_required_valkey_setting(API_V1_VALKEY_SENTINELS_ENV))
+            sentinels = tuple((item[0], item[1]) for item in raw)
+        except (TypeError, ValueError, json.JSONDecodeError, IndexError):
+            raise ValkeyConfigurationError("invalid Valkey runtime configuration") from None
+        return SentinelPrimary(
+            sentinels,
+            _required_valkey_setting(API_V1_VALKEY_SENTINEL_SERVICE_ENV),
+            os.environ.get("TOKEN_PLACE_API_V1_VALKEY_SENTINEL_USERNAME"),
+            os.environ.get("TOKEN_PLACE_API_V1_VALKEY_SENTINEL_PASSWORD"),
+        )
+    raise ValkeyConfigurationError("invalid Valkey runtime configuration")
+
+
+def _valkey_acknowledgement_key() -> bytes:
+    try:
+        key = base64.b64decode(
+            _required_valkey_setting(API_V1_VALKEY_ACKNOWLEDGEMENT_KEY_ENV),
+            validate=True,
+        )
+    except (binascii.Error, ValueError):
+        raise ValkeyConfigurationError("invalid Valkey runtime configuration") from None
+    if len(key) < 32:
+        raise ValkeyConfigurationError("invalid Valkey runtime configuration")
+    return key
+
+
+def _valkey_api_v1_relay_state_store() -> RelayStateStore:
+    schema_major = _valkey_integer_setting(API_V1_VALKEY_SCHEMA_MAJOR_ENV, minimum=1)
+    revision = _valkey_integer_setting(API_V1_VALKEY_SCHEMA_REVISION_ENV, minimum=1)
+    migration_epoch = _valkey_integer_setting(API_V1_VALKEY_MIGRATION_EPOCH_ENV)
+    discovery = _valkey_discovery()
+    tls = _valkey_tls_setting()
+    config = ValkeyConfig(
+        environment=_required_valkey_setting(API_V1_VALKEY_ENVIRONMENT_ENV),
+        cluster=_required_valkey_setting(API_V1_VALKEY_CLUSTER_ENV),
+        schema_major=schema_major,
+        reader_revision=revision,
+        writer_revision=revision,
+        supported_schema_read_min=revision,
+        supported_schema_read_max=revision,
+        supported_writer_min=revision,
+        supported_writer_max=revision,
+        direct=discovery if isinstance(discovery, DirectPrimary) else None,
+        sentinel=discovery if isinstance(discovery, SentinelPrimary) else None,
+        tls=tls,
+        tls_ca_cert=os.environ.get("TOKEN_PLACE_API_V1_VALKEY_TLS_CA_CERT"),
+        tls_client_cert=os.environ.get("TOKEN_PLACE_API_V1_VALKEY_TLS_CLIENT_CERT"),
+        tls_client_key=os.environ.get("TOKEN_PLACE_API_V1_VALKEY_TLS_CLIENT_KEY"),
+        username=os.environ.get("TOKEN_PLACE_API_V1_VALKEY_USERNAME"),
+        password=os.environ.get("TOKEN_PLACE_API_V1_VALKEY_PASSWORD"),
+    )
+    manifest = SchemaManifest(
+        schema_major=schema_major,
+        active_schema_revision=revision,
+        active_writer_revision=revision,
+        reader_min=revision,
+        reader_max=revision,
+        writer_min=revision,
+        writer_max=revision,
+        script_digests=SCRIPT_DIGESTS,
+        migration_epoch=migration_epoch,
+    )
+    acknowledgement_key = _valkey_acknowledgement_key()
+    foundation = ValkeyFoundation(config, manifest)
+    try:
+        foundation.initialize_manifest()
+        foundation.readiness()
+        return ValkeyRegistrationStore(
+            foundation,
+            RelayStateStoreConfig(
+                namespace=f"tokenplace.relay.valkey.{config.environment}.{config.cluster}",
+                lease_ttl_seconds=float(_api_v1_lease_seconds()),
+                claim_ttl_seconds=float(_api_v1_in_flight_ttl_seconds()),
+                max_request_ttl_seconds=float(HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS),
+                max_queue_depth_per_node=_api_v1_max_queue_depth_per_node(),
+            ),
+            acknowledgement_key=acknowledgement_key,
+        )
+    except Exception:
+        try:
+            foundation.close()
+        except Exception:
+            LOGGER.error("relay.api_v1.state_store.close_failed")
+        raise
+
+
+def _new_api_v1_relay_state_store() -> RelayStateStore:
+    """Construct the explicitly selected authoritative API-v1 state store."""
+    backend = os.environ.get(API_V1_STATE_BACKEND_ENV, "memory")
+    if backend == "memory":
+        return _memory_api_v1_relay_state_store()
+    if backend == "valkey":
+        return _valkey_api_v1_relay_state_store()
+    raise ValueError("invalid API-v1 state backend")
 
 
 api_v1_relay_state_store: RelayStateStore | None = None
@@ -1078,9 +1232,18 @@ def _api_v1_store() -> RelayStateStore:
 
 def _reset_api_v1_relay_state_store() -> None:
     global api_v1_relay_state_store
+    replacement = _new_api_v1_relay_state_store()
     with _api_v1_stale_lease_eviction_lock:
-        api_v1_relay_state_store = _new_api_v1_relay_state_store()
+        previous = api_v1_relay_state_store
+        api_v1_relay_state_store = replacement
         _api_v1_seen_stale_lease_evictions.clear()
+    if previous is not None:
+        close = getattr(previous, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                LOGGER.error("relay.api_v1.state_store.close_failed")
 
 
 def _reconcile_api_v1_stale_lease_evictions(store: RelayStateStore) -> None:

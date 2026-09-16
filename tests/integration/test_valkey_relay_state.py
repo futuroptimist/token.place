@@ -1,3 +1,4 @@
+import base64
 import concurrent.futures
 import dataclasses
 import hashlib
@@ -15,6 +16,7 @@ from threading import Barrier, Event
 
 import pytest
 import redis
+import relay
 
 from relay_state_store import (
     ComputeNodeCapabilities,
@@ -149,6 +151,40 @@ def _foundation(port, namespace=None, expected=None):
         retry_attempts=1,
     )
     return ValkeyFoundation(cfg, expected or _manifest())
+
+
+def test_runtime_factory_initializes_explicit_valkey_backend(valkey_server, monkeypatch):
+    cluster = uuid.uuid4().hex
+    settings = {
+        relay.API_V1_STATE_BACKEND_ENV: "valkey",
+        relay.API_V1_VALKEY_ENVIRONMENT_ENV: "test",
+        relay.API_V1_VALKEY_CLUSTER_ENV: cluster,
+        relay.API_V1_VALKEY_SCHEMA_MAJOR_ENV: "1",
+        relay.API_V1_VALKEY_SCHEMA_REVISION_ENV: "1",
+        relay.API_V1_VALKEY_MIGRATION_EPOCH_ENV: "0",
+        relay.API_V1_VALKEY_DISCOVERY_ENV: "direct",
+        relay.API_V1_VALKEY_HOST_ENV: "127.0.0.1",
+        relay.API_V1_VALKEY_PORT_ENV: str(valkey_server),
+        relay.API_V1_VALKEY_TLS_ENV: "false",
+        relay.API_V1_VALKEY_ACKNOWLEDGEMENT_KEY_ENV: base64.b64encode(
+            _ACKNOWLEDGEMENT_KEY
+        ).decode(),
+    }
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+
+    first = relay._new_api_v1_relay_state_store()
+    second = relay._new_api_v1_relay_state_store()
+    try:
+        assert isinstance(first, ValkeyRegistrationStore)
+        assert isinstance(second, ValkeyRegistrationStore)
+        assert first._acknowledgement_key == second._acknowledgement_key
+        first._foundation.readiness()
+        second._foundation.readiness()
+    finally:
+        first._foundation._client.delete(first._foundation.config.key("schema"))
+        first.close()
+        second.close()
 
 
 def test_atomic_initialization_compatibility_readiness_and_exact_cleanup(valkey_server):

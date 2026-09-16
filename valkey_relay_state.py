@@ -3060,10 +3060,11 @@ class ValkeyFoundation:
 
 
 class ValkeyRegistrationStore:
-    """Internal Valkey implementation through encrypted-response acceptance.
+    """Valkey-backed implementation of the complete ``RelayStateStore`` surface.
 
-    This deliberately does not implement or advertise ``RelayStateStore``: the
-    remaining coordination transitions must exist before runtime selection is safe.
+    The implementation remains internal and is not selected by the relay runtime.
+    Protocol conformance does not by itself provide high-availability deployment,
+    failover, or operational readiness guarantees.
     """
 
     def __init__(

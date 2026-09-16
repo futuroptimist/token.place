@@ -275,6 +275,9 @@ def assert_relay_state_protocol_implementation(implementation_type):
             assert isinstance(implementation_member, property), (
                 f"{implementation_type.__name__}.{name} must remain a property"
             )
+            assert implementation_member.fget is not None, (
+                f"{implementation_type.__name__}.{name} must remain readable"
+            )
             continue
 
         assert inspect.isfunction(implementation_member), (
@@ -303,11 +306,22 @@ def assert_relay_state_protocol_implementation(implementation_type):
             for parameter in implementation_parameters
             if parameter.kind in positional_kinds
         )
-        assert len(implementation_positional) >= len(protocol_positional) and tuple(
-            (parameter.name, parameter.kind)
-            for parameter in implementation_positional[: len(protocol_positional)]
-        ) == tuple(
-            (parameter.name, parameter.kind) for parameter in protocol_positional
+        paired_positional = zip(
+            protocol_positional,
+            implementation_positional[: len(protocol_positional)],
+            strict=False,
+        )
+        assert len(implementation_positional) >= len(protocol_positional) and all(
+            protocol_parameter.name == implementation_parameter.name
+            and (
+                protocol_parameter.kind == implementation_parameter.kind
+                or (
+                    protocol_parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+                    and implementation_parameter.kind
+                    is inspect.Parameter.POSITIONAL_OR_KEYWORD
+                )
+            )
+            for protocol_parameter, implementation_parameter in paired_positional
         ), f"{implementation_type.__name__}.{name} has incompatible positional parameters"
 
         implementation_by_name = implementation_signature.parameters
@@ -319,14 +333,17 @@ def assert_relay_state_protocol_implementation(implementation_type):
                 f"{implementation_type.__name__}.{name} is missing "
                 f"{protocol_parameter.name!r}"
             )
-            assert implementation_parameter.kind == protocol_parameter.kind, (
+            compatible_kinds = {protocol_parameter.kind}
+            if protocol_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                compatible_kinds.add(inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            assert implementation_parameter.kind in compatible_kinds, (
                 f"{implementation_type.__name__}.{name} changes the parameter kind "
                 f"of {protocol_parameter.name!r}"
             )
             if protocol_parameter.default is not inspect.Parameter.empty:
-                assert implementation_parameter.default is not inspect.Parameter.empty, (
-                    f"{implementation_type.__name__}.{name} makes optional parameter "
-                    f"{protocol_parameter.name!r} required"
+                assert implementation_parameter.default == protocol_parameter.default, (
+                    f"{implementation_type.__name__}.{name} changes the default of "
+                    f"{protocol_parameter.name!r}"
                 )
 
         protocol_names = {parameter.name for parameter in protocol_parameters}
@@ -366,6 +383,11 @@ def _expire_with_required_extension(self, required_extra):
             "expire",
             _expire_with_required_extension,
             "adds required parameter 'required_extra'",
+        ),
+        (
+            "renew",
+            lambda self, node_id, control_credential_digest, *, capabilities=False: None,
+            "changes the default of 'capabilities'",
         ),
     ),
 )

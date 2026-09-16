@@ -31,7 +31,10 @@ from relay_state_store import (
     SchedulerNodeState,
 )
 from tests.registration_store_contract import assert_registration_contract
-from tests.unit.test_relay_state_store import assert_relay_state_lifecycle_contract
+from tests.unit.test_relay_state_store import (
+    assert_relay_state_lifecycle_contract,
+    assert_relay_state_protocol_implementation,
+)
 from valkey_relay_state import (
     ACCEPT_RESPONSE_SCRIPT,
     CANCEL_REQUEST_SCRIPT,
@@ -270,6 +273,10 @@ def _registration_store(port, namespace, **overrides):
         RelayStateStoreConfig(namespace="testing.valkey", **overrides),
         acknowledgement_key=_ACKNOWLEDGEMENT_KEY,
     )
+
+
+def test_valkey_store_explicitly_implements_complete_protocol_inventory():
+    assert_relay_state_protocol_implementation(ValkeyRegistrationStore)
 
 
 def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_server):

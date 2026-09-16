@@ -1961,7 +1961,7 @@ local function bounded(index,kind,limit,per_limit)
       local accepted_at=finite(values[7]); local replay_at=finite(values[8]); local stored=finite(values[9])
       local completed=values[3]=='completed' and values[4]=='response_completed' and
         (values[5]=='response_ready' or values[5]=='acknowledged' or values[5]=='retrieval_expired') and digest(values[6]) and replay_at and accepted_at and replay_at>=accepted_at and stored and stored>=replay_at
-      local removed=values[3]=='cancelled' and values[4]=='server_unregistered' and values[5]=='completed_unavailable' and values[6]=='' and accepted_at and replay_at==accepted_at and stored and stored>=accepted_at
+      local removed=((values[3]=='cancelled' and (values[4]=='requester_cancelled' or values[4]=='server_unregistered')) or (values[3]=='expired' and values[4]=='request_deadline_expired')) and values[5]=='completed_unavailable' and values[6]=='' and accepted_at and replay_at==accepted_at and stored and stored>=accepted_at
       if values[1]~=c or values[2]~=q or (not completed and not removed) or stored~=score_value then return nil end
       local response_exists=redis.call('EXISTS',prefix..'response:'..c..':'..q)
       if (completed and values[5]=='response_ready' and response_exists~=1) or (completed and (values[5]=='acknowledged' or values[5]=='retrieval_expired') and response_exists~=0) or (removed and response_exists~=0) then return nil end
@@ -1990,7 +1990,7 @@ ACCEPT_RESPONSE_SOURCE = ACCEPT_RESPONSE_SOURCE.replace("__CANONICAL_PROGRESS__"
 ACCEPT_RESPONSE_SCRIPT = ReviewedScript(
     "accept_encrypted_response_v1",
     ACCEPT_RESPONSE_SOURCE,
-    "fcf78bf55769fe5e577c827cad7d69030ed99eebc7b385feeed17578c6a1d4c5",  # pragma: allowlist secret
+    "9a1b905285f6ad3a7487ee80fefdeb1a80a463eabdf1b6843e3c9ac9c1d13e41",  # pragma: allowlist secret
     True,
 )
 

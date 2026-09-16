@@ -260,7 +260,7 @@ RELAY_STATE_STORE_OPERATIONS = frozenset(
 
 
 def assert_relay_state_protocol_implementation(implementation_type):
-    """Assert that an implementation explicitly covers the public protocol."""
+    """Assert that an implementation explicitly and compatibly covers the protocol."""
 
     protocol_operations = {
         name for name in RelayStateStore.__dict__ if not name.startswith("_")
@@ -268,9 +268,136 @@ def assert_relay_state_protocol_implementation(implementation_type):
     assert protocol_operations == RELAY_STATE_STORE_OPERATIONS
     assert RELAY_STATE_STORE_OPERATIONS <= implementation_type.__dict__.keys()
 
+    for name in RELAY_STATE_STORE_OPERATIONS:
+        protocol_member = RelayStateStore.__dict__[name]
+        implementation_member = implementation_type.__dict__[name]
+        if isinstance(protocol_member, property):
+            assert isinstance(implementation_member, property), (
+                f"{implementation_type.__name__}.{name} must remain a property"
+            )
+            continue
+
+        assert inspect.isfunction(implementation_member), (
+            f"{implementation_type.__name__}.{name} must remain an instance method"
+        )
+        protocol_signature = inspect.signature(protocol_member)
+        implementation_signature = inspect.signature(implementation_member)
+        protocol_parameters = tuple(protocol_signature.parameters.values())
+        implementation_parameters = tuple(
+            implementation_signature.parameters.values()
+        )
+
+        # Positional arguments must retain their order so every call accepted by
+        # the protocol has the same meaning in the implementation.
+        positional_kinds = {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+        protocol_positional = tuple(
+            parameter
+            for parameter in protocol_parameters
+            if parameter.kind in positional_kinds
+        )
+        implementation_positional = tuple(
+            parameter
+            for parameter in implementation_parameters
+            if parameter.kind in positional_kinds
+        )
+        assert len(implementation_positional) >= len(protocol_positional) and tuple(
+            (parameter.name, parameter.kind)
+            for parameter in implementation_positional[: len(protocol_positional)]
+        ) == tuple(
+            (parameter.name, parameter.kind) for parameter in protocol_positional
+        ), f"{implementation_type.__name__}.{name} has incompatible positional parameters"
+
+        implementation_by_name = implementation_signature.parameters
+        for protocol_parameter in protocol_parameters:
+            implementation_parameter = implementation_by_name.get(
+                protocol_parameter.name
+            )
+            assert implementation_parameter is not None, (
+                f"{implementation_type.__name__}.{name} is missing "
+                f"{protocol_parameter.name!r}"
+            )
+            assert implementation_parameter.kind == protocol_parameter.kind, (
+                f"{implementation_type.__name__}.{name} changes the parameter kind "
+                f"of {protocol_parameter.name!r}"
+            )
+            if protocol_parameter.default is not inspect.Parameter.empty:
+                assert implementation_parameter.default is not inspect.Parameter.empty, (
+                    f"{implementation_type.__name__}.{name} makes optional parameter "
+                    f"{protocol_parameter.name!r} required"
+                )
+
+        protocol_names = {parameter.name for parameter in protocol_parameters}
+        for implementation_parameter in implementation_parameters:
+            if implementation_parameter.name in protocol_names:
+                continue
+            assert (
+                implementation_parameter.default is not inspect.Parameter.empty
+                or implementation_parameter.kind
+                in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+            ), (
+                f"{implementation_type.__name__}.{name} adds required parameter "
+                f"{implementation_parameter.name!r}"
+            )
+
 
 def test_memory_store_explicitly_implements_complete_protocol_inventory():
     assert_relay_state_protocol_implementation(InMemoryRelayStateStore)
+
+
+def _expire_with_required_extension(self, required_extra):
+    del self, required_extra
+    return ()
+
+
+@pytest.mark.parametrize(
+    ("operation", "replacement", "message"),
+    (
+        ("config", lambda self: None, "must remain a property"),
+        ("register", None, "must remain an instance method"),
+        (
+            "get",
+            lambda self, *, node_id: None,
+            "incompatible positional parameters",
+        ),
+        (
+            "expire",
+            _expire_with_required_extension,
+            "adds required parameter 'required_extra'",
+        ),
+    ),
+)
+def test_protocol_implementation_gate_rejects_incompatible_members(
+    operation, replacement, message
+):
+    members = {
+        name: InMemoryRelayStateStore.__dict__[name]
+        for name in RELAY_STATE_STORE_OPERATIONS
+    }
+    members[operation] = replacement
+    incompatible_type = type("IncompatibleRelayStateStore", (), members)
+
+    with pytest.raises(AssertionError, match=message):
+        assert_relay_state_protocol_implementation(incompatible_type)
+
+
+def test_protocol_implementation_gate_allows_optional_extension_parameters():
+    members = {
+        name: InMemoryRelayStateStore.__dict__[name]
+        for name in RELAY_STATE_STORE_OPERATIONS
+    }
+
+    def expire(self, optional_extension=None):
+        del self, optional_extension
+        return ()
+
+    members["expire"] = expire
+
+    assert_relay_state_protocol_implementation(
+        type("ExtendedRelayStateStore", (), members)
+    )
 
 
 def assert_relay_state_lifecycle_contract(

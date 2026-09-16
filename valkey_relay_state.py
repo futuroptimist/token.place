@@ -3060,10 +3060,10 @@ class ValkeyFoundation:
 
 
 class ValkeyRegistrationStore:
-    """Internal Valkey implementation through encrypted-response acceptance.
+    """Shared-state implementation of the complete ``RelayStateStore`` contract.
 
-    This deliberately does not implement or advertise ``RelayStateStore``: the
-    remaining coordination transitions must exist before runtime selection is safe.
+    Runtime backend selection remains a separate integration step; conformance here
+    does not enable Valkey in ``relay.py`` or advertise deployment/HA readiness.
     """
 
     def __init__(

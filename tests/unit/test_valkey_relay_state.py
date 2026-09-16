@@ -41,10 +41,20 @@ from relay_state_store import (
     RelayStateCredentialMismatch,
     RelayStateInvalidReservation,
     RelayStateNoCapacity,
+    RelayStateStore,
     RelayStateStoreConfig,
     RelayStateStoreError,
     SchedulerNodeState,
 )
+
+
+def test_valkey_store_explicitly_conforms_to_relay_state_store_protocol():
+    """Keep the advertised store capability synchronized with the public protocol."""
+
+    store = object.__new__(ValkeyRegistrationStore)
+
+    assert isinstance(store, RelayStateStore)
+    assert "complete ``RelayStateStore`` contract" in ValkeyRegistrationStore.__doc__
 
 
 @pytest.mark.parametrize("key", [None, "x" * 32, bytearray(32), b"x" * 31])

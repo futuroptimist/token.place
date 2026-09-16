@@ -1091,7 +1091,10 @@ def _valkey_bool_setting(name: str, default: str = "false") -> bool:
 
 def _optional_valkey_setting(name: str) -> str | None:
     value = os.environ.get(_VALKEY_ENV_PREFIX + name)
-    return value if value else None
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
 
 
 def _valkey_discovery() -> DirectPrimary | SentinelPrimary:
@@ -1103,8 +1106,15 @@ def _valkey_discovery() -> DirectPrimary | SentinelPrimary:
     if mode == "sentinel":
         try:
             raw_endpoints = json.loads(_required_valkey_setting("SENTINELS_JSON"))
+            if not isinstance(raw_endpoints, list):
+                raise TypeError
+            if any(
+                not isinstance(item, (list, tuple)) or len(item) != 2
+                for item in raw_endpoints
+            ):
+                raise TypeError
             endpoints = tuple((item[0], item[1]) for item in raw_endpoints)
-        except (TypeError, ValueError, json.JSONDecodeError, IndexError):
+        except (TypeError, ValueError, json.JSONDecodeError, IndexError, KeyError):
             raise RelayStateStoreError("invalid Valkey runtime configuration") from None
         return SentinelPrimary(
             endpoints,
@@ -1197,7 +1207,7 @@ def _new_valkey_api_v1_relay_state_store() -> RelayStateStore:
 
 def _new_api_v1_relay_state_store() -> RelayStateStore:
     """Construct the explicitly selected authoritative API-v1 state store."""
-    backend = os.environ.get(API_V1_STATE_BACKEND_ENV, "memory")
+    backend = os.environ.get(API_V1_STATE_BACKEND_ENV, "memory").strip().lower()
     if backend == "memory":
         return InMemoryRelayStateStore(
             _api_v1_store_config("tokenplace.relay.memory"),
@@ -1233,9 +1243,9 @@ def _reset_api_v1_relay_state_store() -> None:
         old_store = api_v1_relay_state_store
         api_v1_relay_state_store = _new_api_v1_relay_state_store()
         _api_v1_seen_stale_lease_evictions.clear()
-        close = getattr(old_store, "close", None)
-        if close is not None:
-            close()
+    close = getattr(old_store, "close", None)
+    if close is not None:
+        close()
 
 
 def _reconcile_api_v1_stale_lease_evictions(store: RelayStateStore) -> None:

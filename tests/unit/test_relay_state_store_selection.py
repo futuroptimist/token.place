@@ -60,6 +60,11 @@ def test_memory_is_default_and_explicit_selection(monkeypatch):
     assert isinstance(relay._new_api_v1_relay_state_store(), InMemoryRelayStateStore)
 
 
+def test_backend_selection_normalizes_case_and_whitespace(monkeypatch):
+    monkeypatch.setenv(relay.API_V1_STATE_BACKEND_ENV, "  MEMORY  ")
+    assert isinstance(relay._new_api_v1_relay_state_store(), InMemoryRelayStateStore)
+
+
 def test_unknown_backend_is_rejected(monkeypatch):
     monkeypatch.setenv(relay.API_V1_STATE_BACKEND_ENV, "redis")
     with pytest.raises(RelayStateStoreError, match="unsupported relay state backend"):
@@ -143,6 +148,57 @@ def test_missing_shared_acknowledgement_key_fails_before_connect(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "sentinels",
+    [
+        '{"host":"valkey.internal","port":26379}',
+        '[{"host":"valkey.internal","port":26379}]',
+        '[["valkey.internal"]]',
+    ],
+)
+def test_malformed_sentinel_shape_is_bounded(monkeypatch, sentinels):
+    _set_valkey_env(
+        monkeypatch,
+        TOKENPLACE_RELAY_VALKEY_DISCOVERY="sentinel",
+        TOKENPLACE_RELAY_VALKEY_SENTINELS_JSON=sentinels,
+        TOKENPLACE_RELAY_VALKEY_SENTINEL_SERVICE="relay-primary",
+    )
+    with pytest.raises(
+        RelayStateStoreError, match="invalid Valkey runtime configuration"
+    ):
+        relay._new_api_v1_relay_state_store()
+
+
+def test_optional_valkey_settings_are_trimmed_or_omitted(monkeypatch):
+    _set_valkey_env(
+        monkeypatch,
+        TOKENPLACE_RELAY_VALKEY_USERNAME="  relay-user  ",
+        TOKENPLACE_RELAY_VALKEY_PASSWORD="   ",
+    )
+    configs = []
+
+    class Foundation:
+        def __init__(self, config, expected):
+            configs.append(config)
+
+        def initialize_manifest(self):
+            pass
+
+        def readiness(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(relay, "ValkeyFoundation", Foundation)
+    monkeypatch.setattr(relay, "ValkeyRegistrationStore", Mock(return_value=Mock()))
+
+    relay._new_api_v1_relay_state_store()
+
+    assert configs[0].username == "relay-user"
+    assert configs[0].password is None
+
+
+@pytest.mark.parametrize(
     "failure",
     [
         ValkeyUnavailableError("state backend unavailable"),
@@ -167,6 +223,7 @@ def test_valkey_failure_is_redacted_and_never_falls_back(monkeypatch, failure):
 
 def test_reset_replaces_then_closes_old_store(monkeypatch):
     old = Mock()
+    old.close.side_effect = lambda: _assert_reset_lock_released()
     new = Mock()
     relay.api_v1_relay_state_store = old
     monkeypatch.setattr(relay, "_new_api_v1_relay_state_store", Mock(return_value=new))
@@ -175,6 +232,39 @@ def test_reset_replaces_then_closes_old_store(monkeypatch):
 
     assert relay.api_v1_relay_state_store is new
     old.close.assert_called_once_with()
+
+
+def _assert_reset_lock_released():
+    assert not relay._api_v1_stale_lease_eviction_lock.locked()
+
+
+def test_runtime_valkey_failure_is_a_store_error():
+    assert issubclass(ValkeyUnavailableError, RelayStateStoreError)
+
+
+def test_runtime_valkey_failure_returns_bounded_route_response():
+    store = Mock()
+    store.get.side_effect = ValkeyUnavailableError("state backend unavailable")
+    relay.api_v1_relay_state_store = store
+    relay.app.config["TESTING"] = True
+
+    response = relay.app.test_client().post(
+        "/api/v1/relay/servers/register",
+        json={
+            "server_public_key": "node-key",
+            "capabilities": {
+                "supported_model_ids": ["qwen3-8b-instruct"],
+                "active_context_tier": "8k-fast",
+                "maximum_total_context_tokens": 8192,
+                "default_output_token_reservation": 1024,
+                "maximum_output_tokens": 1024,
+                "max_concurrency": 1,
+            },
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.get_json()["error"]["code"] == "state_backend_unavailable"
 
 
 def test_failed_reset_keeps_existing_store_open(monkeypatch):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -22,6 +24,15 @@ from relay_state_store import (
     EncryptedResponseEnvelope, InMemoryRelayStateStore, RelayStateCapacityExceeded,
     RelayStateConflict, RelayStateCredentialMismatch, RelayStateInvalidReservation,
     RelayStateNoCapacity, RelayStateStore, RelayStateStoreConfig, RelayStateStoreError,
+)
+from valkey_relay_state import (
+    SCRIPT_DIGESTS,
+    DirectPrimary,
+    SchemaManifest,
+    SentinelPrimary,
+    ValkeyConfig,
+    ValkeyFoundation,
+    ValkeyRegistrationStore,
 )
 from utils.llm.model_profiles import build_model_aliases
 from utils.inference_timeout import DEFAULT_INFERENCE_TIMEOUT_SECONDS
@@ -983,6 +994,11 @@ DEFAULT_CONTEXT_TIER = "8k-fast"
 MAX_API_V1_MODEL_IDS_PER_NODE = 64
 CONTEXT_TIER_ORDER = {"8k-fast": 8192, "64k-full": 65536}
 DEFAULT_MODEL_IDS = ["qwen3-8b-instruct"]
+
+API_V1_STATE_BACKEND_ENV = "TOKEN_PLACE_API_V1_STATE_BACKEND"
+API_V1_VALKEY_ENV_PREFIX = "TOKEN_PLACE_API_V1_VALKEY_"
+_VALKEY_SCHEMA_REVISION = 1
+
 # Missing capability payloads are accepted for diagnostics, but fail closed for
 # model-aware API v1 scheduling until the node explicitly reports model support.
 DEFAULT_CAPABILITY_MODEL_IDS: list[str] = []
@@ -1050,18 +1066,158 @@ def _api_v1_in_flight_ttl_seconds() -> float:
     return max(value, 1.0)
 
 
-def _new_api_v1_relay_state_store() -> RelayStateStore:
-    """Construct the single authoritative, single-process API-v1 state store."""
-    return InMemoryRelayStateStore(
-        RelayStateStoreConfig(
-            namespace="tokenplace.relay.memory",
-            lease_ttl_seconds=float(_api_v1_lease_seconds()),
-            claim_ttl_seconds=float(_api_v1_in_flight_ttl_seconds()),
-            max_request_ttl_seconds=float(HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS),
-            max_queue_depth_per_node=_api_v1_max_queue_depth_per_node(),
-        ),
-        acknowledgement_key=secrets.token_bytes(32),
+def _api_v1_relay_store_config(namespace: str) -> RelayStateStoreConfig:
+    return RelayStateStoreConfig(
+        namespace=namespace,
+        lease_ttl_seconds=float(_api_v1_lease_seconds()),
+        claim_ttl_seconds=float(_api_v1_in_flight_ttl_seconds()),
+        max_request_ttl_seconds=float(HARD_MAX_API_V1_REQUEST_DEADLINE_SECONDS),
+        max_queue_depth_per_node=_api_v1_max_queue_depth_per_node(),
     )
+
+
+def _required_valkey_setting(name: str) -> str:
+    value = os.environ.get(API_V1_VALKEY_ENV_PREFIX + name)
+    if value is None or not value:
+        raise ValueError("invalid Valkey runtime configuration")
+    return value
+
+
+def _valkey_int_setting(name: str, *, minimum: int = 1, maximum: int = 65535) -> int:
+    raw = _required_valkey_setting(name)
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("invalid Valkey runtime configuration") from None
+    if str(value) != raw or not minimum <= value <= maximum:
+        raise ValueError("invalid Valkey runtime configuration")
+    return value
+
+
+def _optional_valkey_setting(name: str) -> str | None:
+    value = os.environ.get(API_V1_VALKEY_ENV_PREFIX + name)
+    return value if value else None
+
+
+def _valkey_tls_setting() -> bool:
+    value = os.environ.get(API_V1_VALKEY_ENV_PREFIX + "TLS", "false")
+    if value not in {"true", "false"}:
+        raise ValueError("invalid Valkey runtime configuration")
+    return value == "true"
+
+
+def _valkey_discovery() -> DirectPrimary | SentinelPrimary:
+    mode = _required_valkey_setting("DISCOVERY")
+    if mode == "direct":
+        return DirectPrimary(
+            _required_valkey_setting("HOST"), _valkey_int_setting("PORT")
+        )
+    if mode == "sentinel":
+        endpoints = []
+        for endpoint in _required_valkey_setting("SENTINELS").split(","):
+            host, separator, port = endpoint.rpartition(":")
+            if not separator:
+                raise ValueError("invalid Valkey runtime configuration")
+            try:
+                parsed_port = int(port)
+            except ValueError:
+                raise ValueError("invalid Valkey runtime configuration") from None
+            if str(parsed_port) != port:
+                raise ValueError("invalid Valkey runtime configuration")
+            endpoints.append((host, parsed_port))
+        return SentinelPrimary(
+            tuple(endpoints),
+            _required_valkey_setting("SENTINEL_SERVICE"),
+            _optional_valkey_setting("SENTINEL_USERNAME"),
+            _optional_valkey_setting("SENTINEL_PASSWORD"),
+        )
+    raise ValueError("invalid Valkey runtime configuration")
+
+
+def _valkey_acknowledgement_key() -> bytes:
+    try:
+        key = base64.b64decode(
+            _required_valkey_setting("ACKNOWLEDGEMENT_KEY"), validate=True
+        )
+    except (binascii.Error, ValueError):
+        raise ValueError("invalid Valkey runtime configuration") from None
+    if len(key) < 32:
+        raise ValueError("invalid Valkey runtime configuration")
+    return key
+
+
+def _new_valkey_api_v1_relay_state_store() -> RelayStateStore:
+    schema_major = _valkey_int_setting("SCHEMA_MAJOR", maximum=1024)
+    reader_revision = _valkey_int_setting("READER_REVISION", maximum=1024)
+    writer_revision = _valkey_int_setting("WRITER_REVISION", maximum=1024)
+    if (
+        schema_major != 1
+        or reader_revision != _VALKEY_SCHEMA_REVISION
+        or writer_revision != _VALKEY_SCHEMA_REVISION
+    ):
+        raise ValueError("invalid Valkey runtime configuration")
+    acknowledgement_key = _valkey_acknowledgement_key()
+    discovery = _valkey_discovery()
+    config_kwargs = dict(
+        environment=_required_valkey_setting("ENVIRONMENT"),
+        cluster=_required_valkey_setting("CLUSTER"),
+        schema_major=schema_major,
+        reader_revision=reader_revision,
+        writer_revision=writer_revision,
+        supported_schema_read_min=_VALKEY_SCHEMA_REVISION,
+        supported_schema_read_max=_VALKEY_SCHEMA_REVISION,
+        supported_writer_min=_VALKEY_SCHEMA_REVISION,
+        supported_writer_max=_VALKEY_SCHEMA_REVISION,
+        tls=_valkey_tls_setting(),
+        tls_ca_cert=_optional_valkey_setting("TLS_CA_CERT"),
+        tls_client_cert=_optional_valkey_setting("TLS_CLIENT_CERT"),
+        tls_client_key=_optional_valkey_setting("TLS_CLIENT_KEY"),
+        username=_optional_valkey_setting("USERNAME"),
+        password=_optional_valkey_setting("PASSWORD"),
+    )
+    if isinstance(discovery, DirectPrimary):
+        config_kwargs["direct"] = discovery
+    else:
+        config_kwargs["sentinel"] = discovery
+    config = ValkeyConfig(**config_kwargs)
+    manifest = SchemaManifest(
+        schema_major=schema_major,
+        active_schema_revision=_VALKEY_SCHEMA_REVISION,
+        active_writer_revision=_VALKEY_SCHEMA_REVISION,
+        reader_min=_VALKEY_SCHEMA_REVISION,
+        reader_max=_VALKEY_SCHEMA_REVISION,
+        writer_min=_VALKEY_SCHEMA_REVISION,
+        writer_max=_VALKEY_SCHEMA_REVISION,
+        script_digests=SCRIPT_DIGESTS,
+        migration_epoch=0,
+    )
+    foundation = ValkeyFoundation(config, manifest)
+    try:
+        foundation.initialize_manifest()
+        foundation.readiness()
+        return ValkeyRegistrationStore(
+            foundation,
+            _api_v1_relay_store_config(
+                f"tokenplace.relay.valkey.{config.environment}.{config.cluster}"
+            ),
+            acknowledgement_key=acknowledgement_key,
+        )
+    except Exception:
+        foundation.close()
+        raise
+
+
+def _new_api_v1_relay_state_store() -> RelayStateStore:
+    """Construct the explicitly selected API-v1 state store."""
+    backend = os.environ.get(API_V1_STATE_BACKEND_ENV, "memory")
+    if backend == "memory":
+        return InMemoryRelayStateStore(
+            _api_v1_relay_store_config("tokenplace.relay.memory"),
+            acknowledgement_key=secrets.token_bytes(32),
+        )
+    if backend == "valkey":
+        return _new_valkey_api_v1_relay_state_store()
+    raise ValueError("invalid relay state backend")
 
 
 api_v1_relay_state_store: RelayStateStore | None = None
@@ -1079,6 +1235,12 @@ def _api_v1_store() -> RelayStateStore:
 def _reset_api_v1_relay_state_store() -> None:
     global api_v1_relay_state_store
     with _api_v1_stale_lease_eviction_lock:
+        old_store = api_v1_relay_state_store
+        api_v1_relay_state_store = None
+        if old_store is not None:
+            close = getattr(old_store, "close", None)
+            if close is not None:
+                close()
         api_v1_relay_state_store = _new_api_v1_relay_state_store()
         _api_v1_seen_stale_lease_evictions.clear()
 

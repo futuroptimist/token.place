@@ -1994,6 +1994,7 @@ class InMemoryRelayStateStore:
         supplied = self._safe_cancellation_token_digest(cancellation_token)
         with self._lock:
             now = self._now()
+            terminal_before_reap = self._terminals.get(identity)
             self._reap_locked(now)
             terminal = self._terminals.get(identity)
             if terminal is not None:
@@ -2005,8 +2006,18 @@ class InMemoryRelayStateStore:
                         "invalid_cancellation_proof",
                         False,
                     )
+                # An explicit expiry at the inclusive deadline can be the call
+                # that drives the eager in-memory reaper.  Report that outcome
+                # as newly created just as the atomic Valkey transition does;
+                # later retries still observe the retained outcome as existing.
+                created_by_this_expiry = (
+                    terminal_before_reap is None
+                    and status == "expired"
+                    and terminal.outcome == status
+                    and terminal.reason == reason
+                )
                 return TerminalTransitionResult(
-                    terminal.outcome, terminal.reason, False
+                    terminal.outcome, terminal.reason, created_by_this_expiry
                 )
             if status == "cancelled":
                 expected = self._cancellation_token_digests.get(identity)

@@ -506,11 +506,10 @@ def assert_relay_state_lifecycle_contract(
         (item.state, item.reason) == ("expired", "request_deadline_expired")
         for item in deadline_results
     )
-    # The in-process store eagerly reaps at the start of the first typed call,
-    # so that call reports the authoritative record as pre-existing. Valkey's
-    # atomic transition reports its creation. Neither behavior permits the
-    # duplicate to report or persist another outcome.
-    assert first_deadline.new_outcome is (writer is not observer)
+    # Both backends report that the explicit expiry call created the outcome,
+    # including when the in-memory implementation's eager reaper performs the
+    # terminal transition at the beginning of that same call.
+    assert first_deadline.new_outcome
     assert not duplicate_deadline.new_outcome
     assert terminal_records_for_request(client, "deadline") == deadline_snapshot
 

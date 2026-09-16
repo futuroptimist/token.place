@@ -41,10 +41,50 @@ from relay_state_store import (
     RelayStateCredentialMismatch,
     RelayStateInvalidReservation,
     RelayStateNoCapacity,
+    RelayStateStore,
     RelayStateStoreConfig,
     RelayStateStoreError,
     SchedulerNodeState,
 )
+
+
+def test_valkey_store_explicitly_implements_every_public_protocol_operation():
+    protocol_operations = {
+        name
+        for name, member in RelayStateStore.__dict__.items()
+        if not name.startswith("_") and (callable(member) or isinstance(member, property))
+    }
+
+    assert protocol_operations == {
+        "config",
+        "register",
+        "renew",
+        "get",
+        "list",
+        "expire",
+        "unregister",
+        "unregister_node_and_transition_work",
+        "set_scheduler_state",
+        "select_and_reserve",
+        "enqueue_encrypted_request",
+        "list_reservations",
+        "queued_requests",
+        "claimed_request",
+        "claim_queued_request",
+        "renew_claim",
+        "renew_claim_or_read_control",
+        "cancel_or_expire_request",
+        "active_claims",
+        "accept_encrypted_response",
+        "replace_encrypted_progress_if_claimed",
+        "retrieve_encrypted_response",
+        "response_records",
+        "progress_records",
+        "terminal_records",
+        "control_tombstones",
+        "node_tombstones",
+    }
+    assert protocol_operations <= ValkeyRegistrationStore.__dict__.keys()
 
 
 @pytest.mark.parametrize("key", [None, "x" * 32, bytearray(32), b"x" * 31])

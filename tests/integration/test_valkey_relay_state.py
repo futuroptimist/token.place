@@ -12044,13 +12044,15 @@ def test_node_transition_capacity_fences_and_reports_admissible_prefix(
                 )
         if cause == "registration_lease_expired":
             digest = store._node_digest(node)
+            lease_expired_at = now - 1
             store._foundation._client.hset(
                 store._foundation.config.key("node", digest),
                 "lease_expires_at_epoch",
-                str(now),
+                str(lease_expired_at),
             )
             store._foundation._client.zadd(
-                store._foundation.config.key("nodes:lease"), {digest: now}
+                store._foundation.config.key("nodes:lease"),
+                {digest: lease_expired_at},
             )
             result = store.unregister_node_and_transition_work(node, cause=cause)
         else:

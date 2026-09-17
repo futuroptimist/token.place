@@ -1984,6 +1984,24 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client, monke
     }
 
 
+def test_healthz_filters_expired_legacy_servers_without_mutating_state(client):
+    """Readiness omits stale registrations but leaves cleanup to runtime paths."""
+    expired_server_key = base64.b64encode(b"expired_server_key").decode("utf-8")
+    known_servers[expired_server_key] = {
+        "public_key": expired_server_key,
+        "last_ping": datetime.now() - timedelta(seconds=20),
+        "last_ping_duration": 5,
+    }
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert expired_server_key not in {
+        node["server_public_key"] for node in response.get_json()["registeredServers"]
+    }
+    assert expired_server_key in known_servers
+
+
 def test_healthz_returns_draining_when_shutdown_flag_set(client):
     """healthz should switch to draining status and 503 during shutdown."""
     relay_module.DRAINING.set()

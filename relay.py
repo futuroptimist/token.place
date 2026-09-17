@@ -142,6 +142,10 @@ _METRICS_INITIALIZED = False
 
 
 DRAINING = threading.Event()
+# Serializes the transition into draining with writes that admit new work.  The
+# event remains available for cheap read-only checks, but a check which guards a
+# reservation or claim must be made while this lock is held.
+_ADMISSION_LOCK = threading.RLock()
 _ORIGINAL_SIGNAL_HANDLERS: dict[int, Any] = {}
 STATIC_DIR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 INDEX_HTML_PATH = os.path.join(STATIC_DIR_PATH, "index.html")
@@ -184,9 +188,8 @@ def _render_index_html(host: str | None = None) -> str:
 def _handle_shutdown_signal(signum: int, frame: Any) -> None:
     """Mark the process as draining and defer to the original handler."""
 
-    if not DRAINING.is_set():
+    if _begin_draining():
         LOGGER.info("relay.shutdown.signal", extra={"signal": signum})
-        DRAINING.set()
 
     original = _ORIGINAL_SIGNAL_HANDLERS.get(signum)
     if callable(original) and original not in (signal.SIG_DFL, signal.SIG_IGN, _handle_shutdown_signal):
@@ -196,6 +199,16 @@ def _handle_shutdown_signal(signum: int, frame: Any) -> None:
     if original in (signal.SIG_DFL, None):
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
+
+
+def _begin_draining() -> bool:
+    """Atomically close admission and report whether this call changed state."""
+
+    with _ADMISSION_LOCK:
+        if DRAINING.is_set():
+            return False
+        DRAINING.set()
+        return True
 
 
 def _install_shutdown_handlers() -> None:
@@ -1836,6 +1849,11 @@ def _live_server_diagnostics(
     diagnostics_by_key: dict[str, dict[str, Any]] = {}
     if not api_v1_only:
         for server_public_key, payload in list(known_servers.items()):
+            stale_after = payload.get("last_ping_duration", _server_stale_seconds())
+            if not isinstance(stale_after, (int, float)):
+                stale_after = _server_stale_seconds()
+            if _server_ping_age_seconds(payload.get("last_ping")) > max(float(stale_after), 1.0):
+                continue
             queue_depth = len(client_inference_requests.get(server_public_key, []))
             diagnostics_by_key[server_public_key] = {
                 "server_public_key": server_public_key,
@@ -2489,8 +2507,6 @@ def next_server():
 @app.route('/api/v1/relay/servers/next', methods=['GET'])
 def api_v1_relay_servers_next():
     """Atomically select and reserve an API-v1 compute node."""
-    if DRAINING.is_set():
-        return _draining_response()
     requested_model = (request.args.get("model") or DEFAULT_MODEL_IDS[0]).strip().lower()
     canonical_model = MODEL_ALIASES.get(requested_model, requested_model)
     tier = (request.args.get("context_tier") or DEFAULT_CONTEXT_TIER).strip()
@@ -2501,9 +2517,12 @@ def api_v1_relay_servers_next():
     cancel_token = request.args.get("cancel_token") or secrets.token_hex(32)
     deadline = time.time() + _api_v1_request_deadline_seconds()
     try:
-        result = _api_v1_store().select_and_reserve(
-            client_key, request_id, canonical_model, tier, deadline, cancel_token
-        )
+        with _ADMISSION_LOCK:
+            if DRAINING.is_set():
+                return _draining_response()
+            result = _api_v1_store().select_and_reserve(
+                client_key, request_id, canonical_model, tier, deadline, cancel_token
+            )
         registration = _api_v1_store().get(result.selected_node_id)
         if registration is None:
             raise RelayStateNoCapacity("no scheduler capacity")
@@ -3354,10 +3373,11 @@ def api_v1_relay_servers_poll():
                 if registration is None:
                     return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
                 next_lease_refresh = time.monotonic() + lease_refresh_interval
-            if DRAINING.is_set():
-                return jsonify({'message': 'No requests available', 'next_ping_in_x_seconds': 0,
-                                'poll_wait_seconds': _api_v1_poll_wait_seconds()}), 200
-            result = store.claim_queued_request(node, digest, node)
+            with _ADMISSION_LOCK:
+                if DRAINING.is_set():
+                    return jsonify({'message': 'No requests available', 'next_ping_in_x_seconds': 0,
+                                    'poll_wait_seconds': _api_v1_poll_wait_seconds()}), 200
+                result = store.claim_queued_request(node, digest, node)
             if result.state != 'empty' or time.monotonic() >= wait_deadline:
                 break
             time.sleep(min(0.05, max(wait_deadline - time.monotonic(), 0.0)))
@@ -3426,12 +3446,13 @@ def api_v1_relay_requests():
     node=envelope.pop('server_public_key'); model=data.get('requested_model') or DEFAULT_MODEL_IDS[0]; tier=data.get('requested_context_tier') or DEFAULT_CONTEXT_TIER
     deadline=data.get('request_deadline_epoch') or time.time()+_api_v1_request_deadline_seconds()
     token=data.get('reservation_token')
-    if DRAINING.is_set() and (not isinstance(token, str) or not token):
-        return _draining_response()
     try:
         store = _api_v1_store()
         if not isinstance(token,str) or not token:
-            selection=store.select_and_reserve(client_key,request_id,model,tier,deadline,cancel)
+            with _ADMISSION_LOCK:
+                if DRAINING.is_set():
+                    return _draining_response()
+                selection=store.select_and_reserve(client_key,request_id,model,tier,deadline,cancel)
             token=selection.reservation_token
             if selection.selected_node_id != node or token is None:
                 raise RelayStateInvalidReservation('reservation invalid')
@@ -3974,8 +3995,8 @@ def serve(host: str, port: int) -> None:
         shutdown_thread.start()
 
     def _handle_signal(signum, _frame):
-        LOGGER.info("relay.shutdown.signal", extra={"signal": signum})
-        DRAINING.set()
+        if _begin_draining():
+            LOGGER.info("relay.shutdown.signal", extra={"signal": signum})
         if shutdown_requested.is_set():
             return
         shutdown_requested.set()

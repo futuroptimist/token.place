@@ -1,6 +1,7 @@
 """Focused route wiring coverage for the in-memory API-v1 relay state store."""
 
 import json
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -122,6 +123,88 @@ def test_draining_suppresses_new_reservations_and_claims(monkeypatch):
     reserve.assert_not_called()
     claim.assert_not_called()
     assert len(store.queued_requests(node)) == 1
+
+
+def test_drain_transition_cannot_race_server_reservation(monkeypatch):
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, _, _, _ = _queue_for_owner(client, request_id="existing-work")
+    store = relay._api_v1_store()
+    store.cancel_or_expire_request("control-client", "existing-work", "control-cancel")
+    original = store.select_and_reserve
+    drain_started = threading.Event()
+    drain_finished = threading.Event()
+    drain_thread = None
+
+    def reserve_while_shutdown_starts(*args, **kwargs):
+        nonlocal drain_thread
+        def begin_draining():
+            drain_started.set()
+            relay._begin_draining()
+            drain_finished.set()
+
+        drain_thread = threading.Thread(target=begin_draining)
+        drain_thread.start()
+        assert drain_started.wait(1)
+        assert not relay.DRAINING.is_set()
+        assert not drain_finished.is_set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "select_and_reserve", reserve_while_shutdown_starts)
+    try:
+        response = client.get(
+            "/api/v1/relay/servers/next",
+            query_string={
+                "client_public_key": "racing-client",
+                "request_id": "racing-request",
+            },
+        )
+        assert response.status_code == 200
+        assert response.get_json()["server_public_key"] == node
+        assert drain_finished.wait(1)
+    finally:
+        if drain_thread is not None:
+            drain_thread.join(timeout=1)
+        relay.DRAINING.clear()
+
+
+def test_drain_transition_cannot_race_server_claim(monkeypatch):
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, credential, _, _ = _queue_for_owner(client, request_id="claim-race")
+    store = relay._api_v1_store()
+    original = store.claim_queued_request
+    drain_started = threading.Event()
+    drain_finished = threading.Event()
+    drain_thread = None
+
+    def claim_while_shutdown_starts(*args, **kwargs):
+        nonlocal drain_thread
+        def begin_draining():
+            drain_started.set()
+            relay._begin_draining()
+            drain_finished.set()
+
+        drain_thread = threading.Thread(target=begin_draining)
+        drain_thread.start()
+        assert drain_started.wait(1)
+        assert not relay.DRAINING.is_set()
+        assert not drain_finished.is_set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "claim_queued_request", claim_while_shutdown_starts)
+    try:
+        response = client.post(
+            "/api/v1/relay/servers/poll",
+            json={"server_public_key": node, "control_credential": credential},
+        )
+        assert response.status_code == 200
+        assert response.get_json()["request_id"] == "claim-race"
+        assert drain_finished.wait(1)
+    finally:
+        if drain_thread is not None:
+            drain_thread.join(timeout=1)
+        relay.DRAINING.clear()
 
 
 def test_request_queued_event_is_once_only_and_privacy_safe(monkeypatch):

@@ -3096,6 +3096,10 @@ class ValkeyRegistrationStore:
     def close(self) -> None:
         self._foundation.close()
 
+    def readiness(self) -> None:
+        """Verify the shared backend without reading or mutating protocol state."""
+        self._foundation.readiness()
+
     @staticmethod
     def _node_digest(node_id: str) -> str:
         return hashlib.sha256(b"node\0" + node_id.encode("utf-8")).hexdigest()

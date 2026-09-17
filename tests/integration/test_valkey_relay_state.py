@@ -191,6 +191,46 @@ def test_atomic_initialization_compatibility_readiness_and_exact_cleanup(valkey_
         foundation.close()
 
 
+def test_healthz_real_valkey_is_side_effect_free_and_namespace_isolated(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    other_namespace = uuid.uuid4().hex
+    foundation = _foundation(valkey_server, namespace)
+    other = _foundation(valkey_server, other_namespace)
+    previous_store = relay.api_v1_relay_state_store
+    schema_key = foundation.config.key("schema")
+    other_schema_key = other.config.key("schema")
+    try:
+        foundation.initialize_manifest()
+        other.initialize_manifest()
+        store = ValkeyRegistrationStore(
+            foundation,
+            RelayStateStoreConfig(namespace=f"test.{namespace}"),
+            acknowledgement_key=_ACKNOWLEDGEMENT_KEY,
+        )
+        relay.api_v1_relay_state_store = store
+        monkeypatch.setattr(relay, "_live_server_diagnostics", lambda: [])
+        before = (
+            foundation._client.get(schema_key),
+            foundation._client.get(other_schema_key),
+        )
+
+        response = relay.app.test_client().get("/healthz")
+
+        assert response.status_code == 200
+        assert response.get_json()["status"] == "ok"
+        assert (
+            foundation._client.get(schema_key),
+            foundation._client.get(other_schema_key),
+        ) == before
+    finally:
+        relay.api_v1_relay_state_store = previous_store
+        foundation._client.delete(schema_key, other_schema_key)
+        foundation.close()
+        other.close()
+
+
 def test_incompatible_existing_manifest_is_not_repaired(valkey_server):
     foundation = _foundation(valkey_server)
     incompatible = _manifest(schema_major=2)

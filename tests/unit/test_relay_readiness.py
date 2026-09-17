@@ -42,7 +42,9 @@ def test_healthz_reports_draining_state(relay_client):
 
     assert draining_response.status_code == 503
     assert draining_response.headers.get("Retry-After") == "0"
+    assert draining_response.headers.get("Cache-Control") == "no-store"
 
     draining_payload = draining_response.get_json()
-    assert draining_payload["status"] == "draining"
-    assert draining_payload["details"]["shutdown"] is True
+    assert draining_payload == {
+        "error": {"code": "relay_draining", "message": "Relay is draining"}
+    }

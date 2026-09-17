@@ -453,6 +453,119 @@ def test_runtime_valkey_failure_is_a_store_error():
 
 
 @pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (
+            ValkeyUnavailableError("redis://user:secret@private.example/key"),
+            {
+                "code": "state_backend_unavailable",
+                "message": "Relay state is temporarily unavailable",
+            },
+        ),
+        (
+            ValkeyReadOnlyError("replica private.example"),
+            {
+                "code": "state_backend_unavailable",
+                "message": "Relay state is temporarily unavailable",
+            },
+        ),
+        (
+            ValkeySchemaIncompatibleError("secret schema key"),
+            {
+                "code": "state_schema_incompatible",
+                "message": "Relay state schema is incompatible",
+            },
+        ),
+    ],
+)
+def test_healthz_valkey_readiness_fails_closed_before_protocol_reads(
+    monkeypatch, caplog, failure, expected
+):
+    store = ValkeyRegistrationStore.__new__(ValkeyRegistrationStore)
+    store.readiness = Mock(side_effect=failure)
+    relay.api_v1_relay_state_store = store
+    diagnostics = Mock()
+    monkeypatch.setattr(relay, "_live_server_diagnostics", diagnostics)
+    relay.app.config["TESTING"] = True
+
+    response = relay.app.test_client().get("/healthz")
+
+    assert response.status_code == 503
+    assert response.get_json() == {"error": expected}
+    diagnostics.assert_not_called()
+    assert "private.example" not in response.get_data(as_text=True)
+    assert "secret" not in response.get_data(as_text=True)
+    assert "private.example" not in caplog.text
+    assert "secret" not in caplog.text
+
+
+def test_healthz_valkey_readiness_precedes_protocol_diagnostics(monkeypatch):
+    store = ValkeyRegistrationStore.__new__(ValkeyRegistrationStore)
+    calls = []
+    store.readiness = Mock(side_effect=lambda: calls.append("readiness"))
+    relay.api_v1_relay_state_store = store
+    monkeypatch.setattr(
+        relay,
+        "_live_server_diagnostics",
+        Mock(side_effect=lambda: calls.append("diagnostics") or []),
+    )
+    relay.app.config["TESTING"] = True
+
+    response = relay.app.test_client().get("/healthz")
+
+    assert response.status_code == 200
+    assert calls == ["readiness", "diagnostics"]
+
+
+def test_draining_health_and_liveness_do_not_touch_store(monkeypatch):
+    relay.api_v1_relay_state_store = None
+    constructor = Mock(side_effect=AssertionError("state store must not be touched"))
+    monkeypatch.setattr(relay, "_new_api_v1_relay_state_store", constructor)
+    relay.DRAINING.set()
+    relay.app.config["TESTING"] = True
+    try:
+        client = relay.app.test_client()
+        health = client.get("/healthz")
+        live = client.get("/livez")
+    finally:
+        relay.DRAINING.clear()
+
+    assert health.status_code == 503
+    assert health.headers["Retry-After"] == "0"
+    assert health.headers["Cache-Control"] == "no-store"
+    assert health.get_json() == {
+        "error": {"code": "relay_draining", "message": "Relay is draining"}
+    }
+    assert live.status_code == 200
+    assert live.get_json() == {"status": "alive"}
+    constructor.assert_not_called()
+
+
+def test_draining_suppresses_new_reservations_and_claims(monkeypatch):
+    store = Mock()
+    relay.api_v1_relay_state_store = store
+    monkeypatch.setattr(relay, "_validate_server_registration", lambda: None)
+    relay.DRAINING.set()
+    relay.app.config["TESTING"] = True
+    try:
+        client = relay.app.test_client()
+        reservation = client.get("/api/v1/relay/servers/next")
+        claim = client.post(
+            "/api/v1/relay/servers/poll",
+            json={"server_public_key": "node", "control_credential": "credential"},
+        )
+    finally:
+        relay.DRAINING.clear()
+
+    assert reservation.status_code == claim.status_code == 503
+    assert reservation.get_json() == claim.get_json() == {
+        "error": {"code": "relay_draining", "message": "Relay is draining"}
+    }
+    store.select_and_reserve.assert_not_called()
+    store.claim_queued_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
     "failure_type",
     [ValkeyUnavailableError, ValkeyReadOnlyError, ValkeySchemaIncompatibleError],
 )

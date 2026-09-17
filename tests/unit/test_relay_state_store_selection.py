@@ -38,14 +38,26 @@ VALKEY_ENV = {
 @pytest.fixture(autouse=True)
 def isolated_selection(monkeypatch):
     previous_store = relay.api_v1_relay_state_store
+    previous_testing = relay.app.config["TESTING"]
     for name in tuple(relay.os.environ):
         if name == relay.API_V1_STATE_BACKEND_ENV or name.startswith(
             relay._VALKEY_ENV_PREFIX
         ):
             monkeypatch.delenv(name)
-    relay.api_v1_relay_state_store = previous_store
-    yield
     relay.api_v1_relay_state_store = None
+    try:
+        yield
+    finally:
+        test_store = relay.api_v1_relay_state_store
+        if test_store is not None and test_store is not previous_store:
+            close = getattr(test_store, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    pass
+        relay.api_v1_relay_state_store = previous_store
+        relay.app.config["TESTING"] = previous_testing
 
 
 def _set_valkey_env(monkeypatch, **changes):
@@ -406,7 +418,10 @@ def test_invalid_combined_namespace_fails_before_foundation_construction(monkeyp
 
 def test_reset_replaces_then_closes_old_store(monkeypatch):
     old = Mock()
-    old.close.side_effect = lambda: _assert_reset_lock_released()
+    lock_observations = []
+    old.close.side_effect = lambda: lock_observations.append(
+        relay._api_v1_stale_lease_eviction_lock.locked()
+    )
     new = Mock()
     relay.api_v1_relay_state_store = old
     monkeypatch.setattr(relay, "_new_api_v1_relay_state_store", Mock(return_value=new))
@@ -415,6 +430,7 @@ def test_reset_replaces_then_closes_old_store(monkeypatch):
 
     assert relay.api_v1_relay_state_store is new
     old.close.assert_called_once_with()
+    assert lock_observations == [False]
 
 
 def test_successful_reset_publishes_replacement_despite_old_cleanup_failure(
@@ -430,10 +446,6 @@ def test_successful_reset_publishes_replacement_despite_old_cleanup_failure(
 
     assert relay.api_v1_relay_state_store is new
     old.close.assert_called_once_with()
-
-
-def _assert_reset_lock_released():
-    assert not relay._api_v1_stale_lease_eviction_lock.locked()
 
 
 def test_runtime_valkey_failure_is_a_store_error():

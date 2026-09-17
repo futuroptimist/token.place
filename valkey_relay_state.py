@@ -3093,6 +3093,10 @@ class ValkeyRegistrationStore:
     def config(self) -> RelayStateStoreConfig:
         return self._config
 
+    def readiness(self) -> None:
+        """Run the bounded, side-effect-free readiness checks for this store."""
+        self._foundation.readiness()
+
     def close(self) -> None:
         self._foundation.close()
 

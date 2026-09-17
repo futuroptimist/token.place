@@ -1994,9 +1994,11 @@ def test_healthz_returns_draining_when_shutdown_flag_set(client):
 
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "0"
+    assert response.headers["Cache-Control"] == "no-store"
     payload = response.get_json()
-    assert payload["status"] == "draining"
-    assert payload["details"]["shutdown"] is True
+    assert payload == {
+        "error": {"message": "Relay is draining", "code": "relay_draining"}
+    }
 
 
 def test_livez_remains_alive_when_draining(client):

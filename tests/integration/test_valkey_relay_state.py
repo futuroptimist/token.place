@@ -247,6 +247,54 @@ def test_runtime_factory_incompatible_existing_manifest_is_not_repaired(
         client.close()
 
 
+def test_runtime_health_is_ready_side_effect_free_and_namespace_isolated(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    other_namespace = uuid.uuid4().hex
+    _set_runtime_factory_env(monkeypatch, valkey_server, namespace)
+    client = redis.Redis(host="127.0.0.1", port=valkey_server, socket_timeout=0.4)
+    prefix = f"tokenplace:{{test:{namespace}}}:relay:v1:"
+    schema_key = prefix + "schema"
+    protocol_keys = tuple(
+        prefix + suffix
+        for suffix in (
+            "nodes:lease",
+            "cursor",
+            "reservations:expiry",
+            "requests:deadline",
+            "claims:expiry",
+        )
+    )
+    other_key = f"tokenplace:{{test:{other_namespace}}}:relay:v1:sentinel"
+    previous = relay.api_v1_relay_state_store
+    store = None
+    try:
+        client.set(other_key, b"untouched")
+        store = relay._new_api_v1_relay_state_store()
+        relay.api_v1_relay_state_store = store
+        before = (
+            client.dump(schema_key),
+            tuple(client.dump(key) for key in protocol_keys),
+        )
+
+        response = relay.app.test_client().get("/healthz")
+
+        assert response.status_code == 200
+        assert response.get_json()["registeredServers"] == []
+        assert (
+            client.dump(schema_key),
+            tuple(client.dump(key) for key in protocol_keys),
+        ) == before
+        assert client.get(other_key) == b"untouched"
+    finally:
+        relay.api_v1_relay_state_store = previous
+        if store is not None:
+            store.close()
+        client.delete(schema_key, *protocol_keys, other_key)
+        client.close()
+
+
 def test_concurrent_manifest_initialization_is_atomic(valkey_server):
     namespace = uuid.uuid4().hex
     stores = [_foundation(valkey_server, namespace) for _ in range(12)]

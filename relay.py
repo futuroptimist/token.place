@@ -28,6 +28,7 @@ from relay_state_store import (
 from valkey_relay_state import (
     SCRIPT_DIGESTS, DirectPrimary, SchemaManifest, SentinelPrimary, ValkeyConfig,
     ValkeyFoundation, ValkeyFoundationError, ValkeyRegistrationStore,
+    ValkeySchemaIncompatibleError,
 )
 from utils.llm.model_profiles import build_model_aliases
 from utils.inference_timeout import DEFAULT_INFERENCE_TIMEOUT_SECONDS
@@ -1314,7 +1315,35 @@ def _credential_digest(value: str) -> str:
 
 
 def _store_failure_response():
-    return jsonify({"error": {"message": "Relay state is temporarily unavailable", "code": "state_backend_unavailable"}}), 503
+    return jsonify(
+        {
+            "error": {
+                "message": "Relay state is temporarily unavailable",
+                "code": "state_backend_unavailable",
+            }
+        }
+    ), 503
+
+
+def _schema_failure_response():
+    return jsonify(
+        {
+            "error": {
+                "message": "Relay state schema is incompatible",
+                "code": "state_schema_incompatible",
+            }
+        }
+    ), 503
+
+
+def _draining_response():
+    response = jsonify(
+        {"error": {"message": "Relay is draining", "code": "relay_draining"}}
+    )
+    response.status_code = 503
+    response.headers["Retry-After"] = "0"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 
@@ -2089,9 +2118,15 @@ def metrics():
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    _evict_stale_servers()
+    if DRAINING.is_set():
+        return _draining_response()
     try:
+        store = _api_v1_store()
+        if isinstance(store, ValkeyRegistrationStore):
+            store.readiness()
         registered_servers = _live_server_diagnostics()
+    except ValkeySchemaIncompatibleError:
+        return _schema_failure_response()
     except RelayStateStoreError:
         return _store_failure_response()
     gpu_host = app.config.get("gpu_host")
@@ -2120,15 +2155,6 @@ def healthz():
     status["configuredUpstreamServers"] = configured_servers
     if app.config.get("public_base_url"):
         status["publicBaseUrl"] = app.config["public_base_url"]
-
-    if DRAINING.is_set():
-        status["status"] = "draining"
-        status.setdefault("details", {})["shutdown"] = True
-        response = jsonify(status)
-        response.status_code = 503
-        response.headers["Retry-After"] = "0"
-        response.headers.setdefault("Cache-Control", "no-store")
-        return response
 
     if require_upstream_health and gpu_host and not _can_resolve_gpu_host(gpu_host):
         status["status"] = "degraded"
@@ -2479,6 +2505,8 @@ def next_server():
 @app.route('/api/v1/relay/servers/next', methods=['GET'])
 def api_v1_relay_servers_next():
     """Atomically select and reserve an API-v1 compute node."""
+    if DRAINING.is_set():
+        return _draining_response()
     requested_model = (request.args.get("model") or DEFAULT_MODEL_IDS[0]).strip().lower()
     canonical_model = MODEL_ALIASES.get(requested_model, requested_model)
     tier = (request.args.get("context_tier") or DEFAULT_CONTEXT_TIER).strip()
@@ -3324,6 +3352,8 @@ def api_v1_relay_servers_poll():
     node = data['server_public_key']; credential = data.get('control_credential')
     if not isinstance(credential, str) or not credential:
         return jsonify({'error': {'message': 'Missing or invalid relay server control credential', 'code': 403}}), 403
+    if DRAINING.is_set():
+        return _draining_response()
     try:
         store = _api_v1_store()
         registration = store.get(node)
@@ -3411,6 +3441,8 @@ def api_v1_relay_requests():
     node=envelope.pop('server_public_key'); model=data.get('requested_model') or DEFAULT_MODEL_IDS[0]; tier=data.get('requested_context_tier') or DEFAULT_CONTEXT_TIER
     deadline=data.get('request_deadline_epoch') or time.time()+_api_v1_request_deadline_seconds()
     token=data.get('reservation_token')
+    if DRAINING.is_set() and (not isinstance(token, str) or not token):
+        return _draining_response()
     try:
         store = _api_v1_store()
         if not isinstance(token,str) or not token:

@@ -1092,12 +1092,14 @@ def _valkey_bool_setting(name: str, default: str = "false") -> bool:
     return raw == "true"
 
 
-def _optional_valkey_setting(name: str) -> str | None:
+def _optional_valkey_setting(name: str, *, credential: bool = False) -> str | None:
     value = os.environ.get(_VALKEY_ENV_PREFIX + name)
     if value is None:
         return None
-    value = value.strip()
-    return value or None
+    if not value.strip():
+        raise RelayStateStoreError("invalid Valkey runtime configuration")
+    # Credential whitespace is significant and must not be normalized.
+    return value if credential else value.strip()
 
 
 def _valkey_discovery() -> DirectPrimary | SentinelPrimary:
@@ -1135,8 +1137,8 @@ def _valkey_discovery() -> DirectPrimary | SentinelPrimary:
         return SentinelPrimary(
             endpoints,
             _required_valkey_setting("SENTINEL_SERVICE"),
-            _optional_valkey_setting("SENTINEL_USERNAME"),
-            _optional_valkey_setting("SENTINEL_PASSWORD"),
+            _optional_valkey_setting("SENTINEL_USERNAME", credential=True),
+            _optional_valkey_setting("SENTINEL_PASSWORD", credential=True),
         )
     raise RelayStateStoreError("invalid Valkey runtime configuration")
 
@@ -1207,8 +1209,8 @@ def _new_valkey_api_v1_relay_state_store() -> RelayStateStore:
         tls_ca_cert=_optional_valkey_setting("TLS_CA_CERT"),
         tls_client_cert=_optional_valkey_setting("TLS_CLIENT_CERT"),
         tls_client_key=_optional_valkey_setting("TLS_CLIENT_KEY"),
-        username=_optional_valkey_setting("USERNAME"),
-        password=_optional_valkey_setting("PASSWORD"),
+        username=_optional_valkey_setting("USERNAME", credential=True),
+        password=_optional_valkey_setting("PASSWORD", credential=True),
     )
     expected = SchemaManifest(
         schema_major=schema_major,

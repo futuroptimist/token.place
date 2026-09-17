@@ -212,11 +212,32 @@ def test_valid_sentinel_authentication_and_tls_configuration(monkeypatch):
     assert config.tls_ca_cert == "/run/secrets/ca.pem"
 
 
-def test_optional_valkey_settings_are_trimmed_or_omitted(monkeypatch):
+@pytest.mark.parametrize(
+    ("setting", "value", "attribute"),
+    [
+        ("TOKENPLACE_RELAY_VALKEY_USERNAME", "  relay-user  ", "username"),
+        ("TOKENPLACE_RELAY_VALKEY_PASSWORD", "  relay-password  ", "password"),
+        (
+            "TOKENPLACE_RELAY_VALKEY_SENTINEL_USERNAME",
+            "  sentinel-user  ",
+            "sentinel_username",
+        ),
+        (
+            "TOKENPLACE_RELAY_VALKEY_SENTINEL_PASSWORD",
+            "  sentinel-password  ",
+            "sentinel_password",
+        ),
+    ],
+)
+def test_optional_valkey_credentials_are_preserved_exactly(
+    monkeypatch, setting, value, attribute
+):
     _set_valkey_env(
         monkeypatch,
-        TOKENPLACE_RELAY_VALKEY_USERNAME="  relay-user  ",
-        TOKENPLACE_RELAY_VALKEY_PASSWORD="   ",
+        TOKENPLACE_RELAY_VALKEY_DISCOVERY="sentinel",
+        TOKENPLACE_RELAY_VALKEY_SENTINELS_JSON='[["sentinel-a",26379]]',
+        TOKENPLACE_RELAY_VALKEY_SENTINEL_SERVICE="relay-primary",
+        **{setting: value},
     )
     configs = []
 
@@ -238,8 +259,67 @@ def test_optional_valkey_settings_are_trimmed_or_omitted(monkeypatch):
 
     relay._new_api_v1_relay_state_store()
 
-    assert configs[0].username == "relay-user"
-    assert configs[0].password is None
+    target = configs[0].sentinel if attribute.startswith("sentinel_") else configs[0]
+    assert getattr(target, attribute) == value
+
+
+def test_absent_optional_valkey_settings_remain_absent(monkeypatch):
+    _set_valkey_env(monkeypatch)
+    configs = []
+    foundation = Mock()
+    monkeypatch.setattr(
+        relay,
+        "ValkeyFoundation",
+        lambda config, expected: (configs.append(config) or foundation),
+    )
+    monkeypatch.setattr(relay, "ValkeyRegistrationStore", Mock(return_value=Mock()))
+
+    relay._new_api_v1_relay_state_store()
+
+    config = configs[0]
+    assert config.username is None
+    assert config.password is None
+    assert config.tls_ca_cert is None
+    assert config.tls_client_cert is None
+    assert config.tls_client_key is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "USERNAME",
+        "PASSWORD",
+        "SENTINEL_USERNAME",
+        "SENTINEL_PASSWORD",
+        "TLS_CA_CERT",
+        "TLS_CLIENT_CERT",
+        "TLS_CLIENT_KEY",
+    ],
+)
+def test_explicit_blank_optional_valkey_settings_fail_before_io(
+    monkeypatch, caplog, name
+):
+    secret = " \t "
+    changes = {f"TOKENPLACE_RELAY_VALKEY_{name}": secret}
+    if name.startswith("SENTINEL_"):
+        changes.update(
+            TOKENPLACE_RELAY_VALKEY_DISCOVERY="sentinel",
+            TOKENPLACE_RELAY_VALKEY_SENTINELS_JSON='[["sentinel-a",26379]]',
+            TOKENPLACE_RELAY_VALKEY_SENTINEL_SERVICE="relay-primary",
+        )
+    _set_valkey_env(monkeypatch, **changes)
+    constructor = Mock()
+    monkeypatch.setattr(relay, "ValkeyFoundation", constructor)
+
+    with pytest.raises(
+        RelayStateStoreError, match="^invalid Valkey runtime configuration$"
+    ) as caught:
+        relay._new_api_v1_relay_state_store()
+
+    constructor.assert_not_called()
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
+    assert secret not in caplog.text
 
 
 @pytest.mark.parametrize(

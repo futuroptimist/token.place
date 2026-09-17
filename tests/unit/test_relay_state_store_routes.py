@@ -7,6 +7,11 @@ import pytest
 
 import relay
 from relay_state_store import RelayStateStoreError
+from valkey_relay_state import (
+    ValkeyRegistrationStore,
+    ValkeySchemaIncompatibleError,
+    ValkeyUnavailableError,
+)
 
 
 def _queue_for_owner(client, *, request_id="control-request"):
@@ -41,6 +46,82 @@ def _claim_for_control(client, *, request_id="control-request"):
     }).get_json()
     claim = relay._api_v1_store().active_claims(node)[0]
     return node, credential, poll, (queued, claim, reservation_token)
+
+
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        (ValkeyUnavailableError("secret backend address"), "state_backend_unavailable"),
+        (ValkeySchemaIncompatibleError("secret schema key"), "state_schema_incompatible"),
+    ],
+)
+def test_healthz_valkey_readiness_fails_closed_before_protocol_reads(
+    monkeypatch, failure, code
+):
+    store = object.__new__(ValkeyRegistrationStore)
+    readiness = Mock(side_effect=failure)
+    store.readiness = readiness
+    protocol_read = Mock(side_effect=AssertionError("protocol state must not be read"))
+    store.list = protocol_read
+    monkeypatch.setattr(relay, "_api_v1_store", lambda: store)
+    client = relay.app.test_client()
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.get_json()["error"]["code"] == code
+    assert b"secret" not in response.data
+    readiness.assert_called_once_with()
+    protocol_read.assert_not_called()
+
+
+def test_livez_never_touches_state_store_while_draining(monkeypatch):
+    monkeypatch.setattr(
+        relay, "_api_v1_store", Mock(side_effect=AssertionError("store touched"))
+    )
+    relay.DRAINING.set()
+    try:
+        response = relay.app.test_client().get("/livez")
+    finally:
+        relay.DRAINING.clear()
+
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "alive"}
+
+
+def test_draining_suppresses_new_reservations_and_claims(monkeypatch):
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, credential, _, _ = _queue_for_owner(client, request_id="drain-queued")
+    store = relay._api_v1_store()
+    reserve = Mock(wraps=store.select_and_reserve)
+    claim = Mock(wraps=store.claim_queued_request)
+    monkeypatch.setattr(store, "select_and_reserve", reserve)
+    monkeypatch.setattr(store, "claim_queued_request", claim)
+
+    relay.DRAINING.set()
+    try:
+        selection = client.get(
+            "/api/v1/relay/servers/next",
+            query_string={"client_public_key": "new", "request_id": "new"},
+        )
+        poll = client.post(
+            "/api/v1/relay/servers/poll",
+            json={"server_public_key": node, "control_credential": credential},
+        )
+    finally:
+        relay.DRAINING.clear()
+
+    assert selection.status_code == 503
+    assert selection.get_json() == {
+        "status": "draining",
+        "details": {"shutdown": True},
+    }
+    assert poll.status_code == 200
+    assert poll.get_json()["message"] == "No requests available"
+    reserve.assert_not_called()
+    claim.assert_not_called()
+    assert len(store.queued_requests(node)) == 1
 
 
 def test_request_queued_event_is_once_only_and_privacy_safe(monkeypatch):

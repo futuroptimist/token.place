@@ -5,7 +5,7 @@ import logging
 import math
 import re
 import traceback
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 import redis
@@ -72,6 +72,20 @@ def test_acknowledgement_key_is_copied_and_never_represented():
     assert store._acknowledgement_key == key
     assert store._acknowledgement_key is not key
     assert key.decode() not in repr(store)
+
+
+def test_registration_store_readiness_delegates_without_protocol_reads():
+    foundation = Mock(spec=ValkeyFoundation)
+    store = ValkeyRegistrationStore(
+        foundation,
+        RelayStateStoreConfig(namespace="testing.unit"),
+        acknowledgement_key=b"shared-test-acknowledgement-key-32",
+    )
+
+    store.readiness()
+
+    foundation.readiness.assert_called_once_with()
+    assert foundation.method_calls == [call.readiness()]
 
 
 def test_response_serialization_is_canonical_sorted_utf8():

@@ -1,3 +1,4 @@
+import base64
 import concurrent.futures
 import dataclasses
 import hashlib
@@ -16,6 +17,7 @@ from threading import Barrier, Event
 import pytest
 import redis
 
+import relay
 from relay_state_store import (
     ComputeNodeCapabilities,
     EncryptedRequestEnvelope,
@@ -28,6 +30,7 @@ from relay_state_store import (
     RelayStateInvalidReservation,
     RelayStateNoCapacity,
     RelayStateStoreConfig,
+    RelayStateStoreError,
     SchedulerNodeState,
 )
 from tests.registration_store_contract import assert_registration_contract
@@ -58,6 +61,32 @@ from valkey_relay_state import (
 )
 
 _ACKNOWLEDGEMENT_KEY = b"shared-test-acknowledgement-key-32"
+
+
+def _set_runtime_factory_env(monkeypatch, port, namespace):
+    values = {
+        "TOKENPLACE_RELAY_STATE_BACKEND": "valkey",
+        "TOKENPLACE_RELAY_VALKEY_DISCOVERY": "direct",
+        "TOKENPLACE_RELAY_VALKEY_HOST": "127.0.0.1",
+        "TOKENPLACE_RELAY_VALKEY_PORT": str(port),
+        "TOKENPLACE_RELAY_VALKEY_ENVIRONMENT": "test",
+        "TOKENPLACE_RELAY_VALKEY_CLUSTER": namespace,
+        "TOKENPLACE_RELAY_VALKEY_SCHEMA_MAJOR": "1",
+        "TOKENPLACE_RELAY_VALKEY_READER_REVISION": "1",
+        "TOKENPLACE_RELAY_VALKEY_WRITER_REVISION": "1",
+        "TOKENPLACE_RELAY_VALKEY_SUPPORTED_SCHEMA_READ_MIN": "1",
+        "TOKENPLACE_RELAY_VALKEY_SUPPORTED_SCHEMA_READ_MAX": "1",
+        "TOKENPLACE_RELAY_VALKEY_SUPPORTED_WRITER_MIN": "1",
+        "TOKENPLACE_RELAY_VALKEY_SUPPORTED_WRITER_MAX": "1",
+        "TOKENPLACE_RELAY_VALKEY_ACTIVE_SCHEMA_REVISION": "1",
+        "TOKENPLACE_RELAY_VALKEY_ACTIVE_WRITER_REVISION": "1",
+        "TOKENPLACE_RELAY_VALKEY_MIGRATION_EPOCH": "0",
+        "TOKENPLACE_RELAY_VALKEY_ACKNOWLEDGEMENT_KEY_BASE64": base64.b64encode(
+            _ACKNOWLEDGEMENT_KEY
+        ).decode(),
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
 
 
 def _free_port():
@@ -176,6 +205,46 @@ def test_incompatible_existing_manifest_is_not_repaired(valkey_server):
     finally:
         foundation._client.delete(foundation.config.key("schema"))
         foundation.close()
+
+
+def test_runtime_factory_incompatible_existing_manifest_is_not_repaired(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    _set_runtime_factory_env(monkeypatch, valkey_server, namespace)
+    client = redis.Redis(host="127.0.0.1", port=valkey_server, socket_timeout=0.4)
+    prefix = f"tokenplace:{{test:{namespace}}}:relay:v1:"
+    schema_key = prefix + "schema"
+    protocol_keys = tuple(
+        prefix + suffix
+        for suffix in (
+            "nodes:lease",
+            "cursor",
+            "reservations:expiry",
+            "requests:deadline",
+            "claims:expiry",
+            "responses:expiry",
+            "terminals:expiry",
+        )
+    )
+    incompatible = _manifest(schema_major=2).encode()
+    try:
+        client.set(schema_key, incompatible)
+        before = (
+            client.get(schema_key),
+            tuple(client.dump(key) for key in protocol_keys),
+        )
+        started = time.monotonic()
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            relay._new_api_v1_relay_state_store()
+        assert time.monotonic() - started < 3
+        assert (
+            client.get(schema_key),
+            tuple(client.dump(key) for key in protocol_keys),
+        ) == before
+    finally:
+        client.delete(schema_key, *protocol_keys)
+        client.close()
 
 
 def test_concurrent_manifest_initialization_is_atomic(valkey_server):
@@ -5451,6 +5520,12 @@ def test_control_renewal_rejects_unsupported_authority_without_mutation(
 
 
 def _delete_claim_fixture_state(store, node_ids, identities):
+    store._foundation._client.delete(
+        *_claim_fixture_state_keys(store, node_ids, identities)
+    )
+
+
+def _claim_fixture_state_keys(store, node_ids, identities):
     cfg = store._foundation.config
     keys = [
         cfg.key("schema"),
@@ -5464,7 +5539,13 @@ def _delete_claim_fixture_state(store, node_ids, identities):
     ]
     for node_id in node_ids:
         node = store._node_digest(node_id)
-        keys.extend((cfg.key("node", node), cfg.key("queue", node)))
+        keys.extend(
+            (
+                cfg.key("node", node),
+                cfg.key("queue", node),
+                cfg.key("node_work", node),
+            )
+        )
     for client_id, request_id in identities:
         client = hashlib.sha256(f"client\0{client_id}".encode()).hexdigest()
         request = hashlib.sha256(f"request\0{request_id}".encode()).hexdigest()
@@ -5477,7 +5558,7 @@ def _delete_claim_fixture_state(store, node_ids, identities):
                 cfg.key("progress", client, request),
             )
         )
-    store._foundation._client.delete(*keys)
+    return tuple(keys)
 
 
 def _response_acceptance_authority(store, node_id, identity):
@@ -5564,19 +5645,123 @@ def _accepted_retrieval_fixture(stores, label):
         f"{label}-key",
         f"{label}-iv",
     )
+    keys, member = _response_acceptance_authority(first, node, identity)
     first.register(node, _capabilities(), owner)
     _enqueue_claim_fixture(first, node, owner, *identity, time.time() + 60)
     claim = first.claim_queued_request(node, owner, consumer)
     accepted = first.accept_encrypted_response(
         node, owner, consumer, *identity, claim.generation, envelope
     )
-    keys, member = _response_acceptance_authority(first, node, identity)
     retrieval_digest = hashlib.sha256(credential.encode()).hexdigest()
     first._foundation._client.hset(keys[4], "token_digest", retrieval_digest)
     first._foundation._client.hset(
         keys[9], "retrieval_credential_digest", retrieval_digest
     )
     return node, identity, credential, envelope, accepted, keys, member
+
+
+def test_runtime_factory_shared_acknowledgement_is_stable_and_cross_instance(
+    valkey_server, monkeypatch
+):
+    """Independent clients derive and accept one namespace-stable acknowledgement."""
+    result = _run_runtime_factory_acknowledgement(
+        valkey_server, monkeypatch, failure=None
+    )
+    first_delivery, second_delivery, envelope, acknowledged = result
+    assert first_delivery.envelope == second_delivery.envelope == envelope
+    assert first_delivery.acknowledgement_token == second_delivery.acknowledgement_token
+    assert acknowledged.state == "acknowledged"
+
+
+@pytest.mark.parametrize("failure", ("second-construction", "lifecycle-setup"))
+def test_runtime_factory_acknowledgement_cleanup_after_partial_failures(
+    valkey_server, monkeypatch, failure
+):
+    _run_runtime_factory_acknowledgement(valkey_server, monkeypatch, failure=failure)
+
+
+def _run_runtime_factory_acknowledgement(valkey_server, monkeypatch, failure):
+    namespace = uuid.uuid4().hex
+    _set_runtime_factory_env(monkeypatch, valkey_server, namespace)
+    stores = []
+    close_attempts = []
+    label = "cross-instance-ack"
+    node = f"{label}-node"
+    identity = (f"{label}-client", f"{label}-request")
+    prefix = f"tokenplace:{{test:{namespace}}}:relay:v1:"
+    exact_keys = (prefix + "schema",)
+    observer = redis.Redis(host="127.0.0.1", port=valkey_server, socket_timeout=0.4)
+
+    original_factory = relay._new_api_v1_relay_state_store
+    construction_count = 0
+
+    def construct():
+        nonlocal construction_count
+        construction_count += 1
+        if failure == "second-construction" and construction_count == 2:
+            raise RelayStateStoreError("injected bounded construction failure")
+        return original_factory()
+
+    def acquire_store():
+        store = relay._new_api_v1_relay_state_store()
+        original_close = store.close
+
+        def close():
+            close_attempts.append(store)
+            return original_close()
+
+        store.close = close
+        stores.append(store)
+        return store
+
+    monkeypatch.setattr(relay, "_new_api_v1_relay_state_store", construct)
+    try:
+        acquire_store()
+        exact_keys = _claim_fixture_state_keys(stores[0], (node,), (identity,))
+        if failure == "second-construction":
+            with pytest.raises(RelayStateStoreError, match="construction failure"):
+                acquire_store()
+            return None
+
+        acquire_store()
+        if failure == "lifecycle-setup":
+            original_enqueue = globals()["_enqueue_claim_fixture"]
+
+            def fail_after_enqueue(*args, **kwargs):
+                original_enqueue(*args, **kwargs)
+                raise RelayStateStoreError("injected bounded lifecycle failure")
+
+            monkeypatch.setattr(
+                "tests.integration.test_valkey_relay_state._enqueue_claim_fixture",
+                fail_after_enqueue,
+            )
+            with pytest.raises(RelayStateStoreError, match="lifecycle failure"):
+                _accepted_retrieval_fixture(stores, label)
+            return None
+
+        fixture = _accepted_retrieval_fixture(stores, label)
+        _, _, credential, envelope, _, _, _ = fixture
+        first_delivery = stores[0].retrieve_encrypted_response(*identity, credential)
+        second_delivery = stores[1].retrieve_encrypted_response(*identity, credential)
+        acknowledged = stores[1].retrieve_encrypted_response(
+            *identity, credential, first_delivery.acknowledgement_token
+        )
+        return first_delivery, second_delivery, envelope, acknowledged
+    finally:
+        try:
+            if stores:
+                observer.delete(*exact_keys)
+        finally:
+            for store in stores:
+                try:
+                    store.close()
+                except Exception:
+                    pass
+            try:
+                assert close_attempts == stores
+                assert observer.exists(*exact_keys) == 0
+            finally:
+                observer.close()
 
 
 def test_response_retrieval_namespace_isolation(valkey_server):

@@ -144,7 +144,7 @@ def _validate_script_result(
             raise ValkeyScriptError("invalid reviewed script result")
 
 
-class ValkeyFoundationError(RuntimeError):
+class ValkeyFoundationError(RelayStateStoreError):
     """A bounded, detail-free Valkey foundation failure."""
 
 

@@ -594,7 +594,7 @@ def test_run_all_tests_pr_has_path_gated_macos_metal_bootstrap() -> None:
     assert 'test "$(uname -m)" = "arm64"' in job_text
     assert "scripts/prepare_embedded_python_runtime.py" in job_text
     assert "test -x src-tauri/python-runtime/bin/python3" in job_text
-    assert "src-tauri/python-runtime/bin/python3 -m pip check" in job_text
+    assert "PYTHONDONTWRITEBYTECODE=1 src-tauri/python-runtime/bin/python3 -B -m pip check" in job_text
     assert "steps.changes.outputs.run" not in job_text
     assert "Summarize skipped Metal bootstrap" not in job_text
 

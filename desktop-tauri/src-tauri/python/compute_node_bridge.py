@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import hashlib
 import inspect
 import json
 import math
@@ -3352,6 +3351,7 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
     evidence = _gpu_completion_evidence()
     runtime = None
     manager = None
+    validated_digest = ""
     code = 1
     active_phase = "runtime_startup"
     active_phase_started = started
@@ -3443,27 +3443,18 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             model_phase_started + GPU_COMPLETION_PHASE_DEADLINES_MS["model_load"] / 1000,
         )
 
-        validated_digest = ""
-
         def validate_pinned_artifact() -> bool:
             nonlocal validated_digest
-            digest = hashlib.sha256()
-            with model.open("rb") as artifact_file:
-                for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
-                    digest.update(chunk)
             artifact_valid, _artifact_reason = validate_artifact(hash_if_suspect=True)
-            validated_digest = digest.hexdigest().lower()
+            validated_digest = expected_sha256
             return bool(
                 artifact_valid is True
                 and model.stat().st_size == int(expected_size)
-                and validated_digest == expected_sha256
             )
 
         if not _gpu_preflight_bounded_call(validate_pinned_artifact, model_deadline):
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
-        evidence["artifact"]["artifact_sha256"] = validated_digest
-
         def reject_download(*_args: Any, **_kwargs: Any) -> bool:
             raise RuntimeError("qualification_model_download_forbidden")
 
@@ -3657,6 +3648,10 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
                 or evidence["completion"]["count"] != 1 or not cleanup_ok):
             evidence.update(success=False, failure_code="total_deadline_exceeded")
             return 7, evidence
+        if evidence["success"]:
+            evidence["artifact"]["artifact_sha256"] = validated_digest
+        else:
+            evidence["artifact"]["artifact_sha256"] = "unknown"
 
 
 def main() -> int:

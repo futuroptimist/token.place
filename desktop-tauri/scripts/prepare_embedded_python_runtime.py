@@ -490,6 +490,13 @@ def clean(runtime: Path) -> None:
         if p.is_dir() and p.name in {"__pycache__", "tests", "test"}: shutil.rmtree(p, ignore_errors=True)
         elif p.is_file() and (p.suffix == ".pyc" or p.name.endswith(".pyo")): p.unlink(missing_ok=True)
 
+def contains_python_bytecode(runtime: Path) -> bool:
+    return any(
+        (p.is_dir() and p.name == "__pycache__")
+        or (p.is_file() and p.suffix in {".pyc", ".pyo"})
+        for p in runtime.rglob("*")
+    )
+
 def provenance(m: dict, packages: dict) -> dict:
     try: commit = subprocess.check_output(["git","rev-parse","HEAD"], cwd=ROOT.parent, text=True).strip()
     except Exception: commit = "unknown"
@@ -497,7 +504,7 @@ def provenance(m: dict, packages: dict) -> dict:
 
 def existing_valid(m: dict) -> bool:
     prov = OUTPUT / PROVENANCE; py = OUTPUT / "bin" / "python3"
-    if not prov.is_file() or not py.is_file(): return False
+    if not prov.is_file() or not py.is_file() or contains_python_bytecode(OUTPUT): return False
     try:
         data=json.loads(prov.read_text());
         if data.get("source_archive_sha256") != m["sha256"] or data.get("expected_backend") != "metal" or data.get("build_profile") != BUILD_PROFILE: return False

@@ -676,7 +676,7 @@ def test_workflow_prepares_and_validates_embedded_macos_runtime() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'Prepare embedded macOS Python runtime' in text
     assert 'python scripts/prepare_embedded_python_runtime.py' in text
-    assert 'src-tauri/python-runtime/bin/python3 -m pip check' in text
+    assert 'PYTHONDONTWRITEBYTECODE=1 src-tauri/python-runtime/bin/python3 -B -m pip check' in text
     assert '--require-embedded-python-runtime' in text
 
 
@@ -1916,6 +1916,15 @@ def test_validator_main_rejects_app_and_dmg_shape_errors(monkeypatch, tmp_path) 
         assert 'DMG filename must match' in str(exc)
 
     set_args(app_only=True, app_path=str(tmp_path / 'missing.app'))
+    try:
+        validator.main()
+        assert False
+    except SystemExit as exc:
+        assert 'app bundle missing' in str(exc)
+
+    app_file = tmp_path / 'not-a-directory.app'
+    app_file.write_text('not an app bundle', encoding='utf-8')
+    set_args(app_only=True, app_path=str(app_file))
     try:
         validator.main()
         assert False

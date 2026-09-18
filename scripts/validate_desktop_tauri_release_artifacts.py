@@ -855,7 +855,7 @@ def main() -> None:
                 _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
             _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing, require_embedded_python_runtime=args.require_embedded_python_runtime)
 
-    if not app_path.exists() or app_path.suffix != ".app":
+    if not app_path.is_dir() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
     _validate_no_python_bytecode(app_path)
     if not expected_icon.exists() or not expected_icon.is_file():

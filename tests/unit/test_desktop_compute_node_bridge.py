@@ -96,7 +96,9 @@ class _CompletionPreflightManager:
         return dict(self.worker_diagnostics)
 
     def _validate_existing_model_artifact(self, **_kwargs):
-        return True, "valid"
+        actual_sha256 = hashlib.sha256(Path(self.model_path).read_bytes()).hexdigest()
+        valid = actual_sha256 == self.model_profile["artifact_sha256"]
+        return valid, "valid" if valid else "sha256_mismatch"
 
     def _is_managed_canonical_model_path(self):
         return Path(self.model_path).resolve() == Path(self.models_dir, self.file_name).resolve()
@@ -364,6 +366,7 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     assert code != 0 or evidence["success"] is False
     assert evidence["success"] is False
     assert evidence["failure_code"] == expected
+    assert evidence["artifact"]["artifact_sha256"] == "unknown"
     serialized = json.dumps(evidence)
     assert "secret child log" not in serialized
     assert "fixture" not in serialized

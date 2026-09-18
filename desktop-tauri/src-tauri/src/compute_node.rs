@@ -2795,51 +2795,46 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
     let keys_are_allowlisted = event.as_object().is_some_and(|map| {
         map.len() == allowed_keys.len()
             && map.keys().all(|key| allowed_keys.contains(&key.as_str()))
-    }) && exact_keys(event.get("artifact"), &["filename", "size_bytes"])
-        && exact_keys(
-            event.get("identity"),
-            &[
-                "app_version",
-                "build_id",
-                "target_triple",
-                "bundled_runtime_id",
-                "runtime_id",
-            ],
-        )
-        && exact_keys(
-            event.get("backend"),
-            &["declared", "observed", "gpu_verified"],
-        )
-        && exact_keys(
-            event.get("completion"),
-            &["path", "count", "max_output_tokens", "result"],
-        )
-        && exact_keys(
-            event.get("cleanup"),
-            &["attempted", "verified", "owned_worker_alive"],
-        )
-        && exact_keys(
-            event.get("side_effects"),
-            &["relay_contacts", "registrations", "benchmark_attempts"],
-        )
-        && exact_keys(
-            event.get("phases"),
-            &[
-                "runtime_startup",
-                "model_load",
-                "generation",
-                "cancellation",
-                "cleanup",
-            ],
-        )
-        && event
-            .get("phases")
-            .and_then(Value::as_object)
-            .is_some_and(|phases| {
-                phases
-                    .values()
-                    .all(|phase| exact_keys(Some(phase), &["deadline_ms", "elapsed_ms", "outcome"]))
-            });
+    }) && exact_keys(
+        event.get("artifact"),
+        &["filename", "size_bytes", "artifact_sha256"],
+    ) && exact_keys(
+        event.get("identity"),
+        &[
+            "app_version",
+            "build_id",
+            "target_triple",
+            "bundled_runtime_id",
+            "runtime_id",
+        ],
+    ) && exact_keys(
+        event.get("backend"),
+        &["declared", "observed", "gpu_verified"],
+    ) && exact_keys(
+        event.get("completion"),
+        &["path", "count", "max_output_tokens", "result"],
+    ) && exact_keys(
+        event.get("cleanup"),
+        &["attempted", "verified", "owned_worker_alive"],
+    ) && exact_keys(
+        event.get("side_effects"),
+        &["relay_contacts", "registrations", "benchmark_attempts"],
+    ) && exact_keys(
+        event.get("phases"),
+        &[
+            "runtime_startup",
+            "model_load",
+            "generation",
+            "cancellation",
+            "cleanup",
+        ],
+    ) && event.get("phases").and_then(Value::as_object).is_some_and(
+        |phases| {
+            phases
+                .values()
+                .all(|phase| exact_keys(Some(phase), &["deadline_ms", "elapsed_ms", "outcome"]))
+        },
+    );
     let success = event.get("success").and_then(Value::as_bool) == Some(true);
     let failure_code = event.get("failure_code").and_then(Value::as_str);
     let allowed_failure = matches!(
@@ -2917,6 +2912,10 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
                 .pointer("/artifact/size_bytes")
                 .and_then(Value::as_u64)
                 == Some(5_027_783_488)
+            && event
+                .pointer("/artifact/artifact_sha256")
+                .and_then(Value::as_str)
+                == Some("d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785")
             && nonempty_identity
             && event.pointer("/identity/runtime_id")
                 == event.pointer("/identity/bundled_runtime_id")
@@ -2972,6 +2971,16 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
         .pointer("/artifact/size_bytes")
         .and_then(Value::as_u64)
         .is_some()
+        && event
+            .pointer("/artifact/artifact_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                value == "unknown"
+                    || (value.len() == 64
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+            })
         && matches!(
             event.pointer("/backend/declared").and_then(Value::as_str),
             Some("unknown" | "cuda" | "metal")
@@ -3042,7 +3051,7 @@ pub(crate) fn gpu_completion_preflight_native_failure() -> Value {
         "qualification": "installed_gpu_child_worker_completion",
         "success": false,
         "failure_code": "worker_or_protocol_failure",
-        "artifact": {"filename": "unknown", "size_bytes": 0},
+        "artifact": {"filename": "unknown", "size_bytes": 0, "artifact_sha256": "unknown"},
         "identity": {"app_version": "unknown", "build_id": "unknown", "target_triple": "unknown", "bundled_runtime_id": "unknown", "runtime_id": "unknown"},
         "backend": {"declared": "unknown", "observed": "unknown", "gpu_verified": false},
         "completion": {"path": "shared_api_v1_generation", "count": 0, "max_output_tokens": 64, "result": "not_started"},
@@ -9292,8 +9301,8 @@ mod tests {
             "qualification": "installed_gpu_child_worker_completion",
             "success": true,
             "failure_code": "none",
-            "artifact": {"filename": "Qwen3-8B-Q4_K_M.gguf", "size_bytes": 5027783488_u64},
-            "identity": {"app_version": "0.1.19", "build_id": "build", "target_triple": "target", "bundled_runtime_id": "runtime", "runtime_id": "runtime"},
+            "artifact": {"filename": "Qwen3-8B-Q4_K_M.gguf", "size_bytes": 5027783488_u64, "artifact_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"},
+            "identity": {"app_version": "0.1.20", "build_id": "build", "target_triple": "target", "bundled_runtime_id": "runtime", "runtime_id": "runtime"},
             "backend": {"declared": "cuda", "observed": "cuda", "gpu_verified": true},
             "completion": {"path": "shared_api_v1_generation", "count": 1, "max_output_tokens": 64, "result": "passed"},
             "phases": {

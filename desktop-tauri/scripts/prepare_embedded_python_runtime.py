@@ -94,6 +94,7 @@ def extract_archive(archive: Path, m: dict, tmp_parent: Path) -> Path:
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy(); env.update(kw.pop("env", {}) or {})
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONNOUSERSITE"] = "1"
     result = subprocess.run(cmd, text=True, capture_output=True, check=False, env=env, **kw)
     if result.returncode != 0:
@@ -516,6 +517,7 @@ def prepare(cache_dir: Path) -> None:
         py=staging/"bin"/"python3"; py.chmod(py.stat().st_mode | 0o755)
         normalize_python_build_standalone_macos_runtime(staging, m); audit_macho_runtime(staging); prove_interpreter(py, staging, m); install_packages(py, m, cache_dir/"pip"); probe_runtime(py, m); clean(staging); audit_macho_runtime(staging)
         packages=json.loads(run([str(py),"-c","import json,importlib.metadata as im; print(json.dumps({d.metadata['Name']: d.version for d in im.distributions()}))"]).stdout)
+        clean(staging)
         (staging/PROVENANCE).write_text(json.dumps(provenance(m, packages), indent=2, sort_keys=True)+"\n")
         for notice in m["runtime_notices"]: (staging/notice["path"]).write_text(f"{notice['name']} redistribution notice: {notice['license']}\nSee upstream distribution for complete license text.\n")
         backup=tmp/"old-runtime"

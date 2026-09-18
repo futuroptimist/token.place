@@ -284,6 +284,13 @@ def test_clean_preserves_pip_internal_build_package(tmp_path):
     assert not pycache.exists()
 
 
+def test_run_suppresses_child_bytecode(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: captured.update(kwargs) or type('Result', (), {'returncode': 0})())
+    prep.run(['python3', '-c', 'pass'])
+    assert captured['env']['PYTHONDONTWRITEBYTECODE'] == '1'
+
+
 def test_load_manifest_rejects_latest_url_uppercase_sha_and_package_drift(tmp_path):
     p = tmp_path / 'm.json'
     cases = [

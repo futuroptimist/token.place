@@ -3314,7 +3314,7 @@ def _gpu_completion_evidence(*, success: bool = False, failure_code: str = "not_
         "qualification": "installed_gpu_child_worker_completion",
         "success": success,
         "failure_code": failure_code,
-        "artifact": {"filename": "unknown", "size_bytes": 0},
+        "artifact": {"filename": "unknown", "size_bytes": 0, "artifact_sha256": "unknown"},
         "identity": {
             "app_version": os.environ.get("TOKENPLACE_APP_VERSION", "unknown"),
             "build_id": os.environ.get("TOKENPLACE_BUILD_ID", "unknown"),
@@ -3422,7 +3422,7 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
                 or managed_path_check() is not True):
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
-        evidence["artifact"] = {"filename": model.name, "size_bytes": model.stat().st_size}
+        evidence["artifact"].update(filename=model.name, size_bytes=model.stat().st_size)
         manager.parent_model_path_exists = True
         manager.model_path_was_relative = False
         validate_artifact = getattr(manager, "_validate_existing_model_artifact", None)
@@ -3443,21 +3443,26 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             model_phase_started + GPU_COMPLETION_PHASE_DEADLINES_MS["model_load"] / 1000,
         )
 
+        validated_digest = ""
+
         def validate_pinned_artifact() -> bool:
+            nonlocal validated_digest
             digest = hashlib.sha256()
             with model.open("rb") as artifact_file:
                 for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
                     digest.update(chunk)
             artifact_valid, _artifact_reason = validate_artifact(hash_if_suspect=True)
+            validated_digest = digest.hexdigest().lower()
             return bool(
                 artifact_valid is True
                 and model.stat().st_size == int(expected_size)
-                and digest.hexdigest().lower() == expected_sha256
+                and validated_digest == expected_sha256
             )
 
         if not _gpu_preflight_bounded_call(validate_pinned_artifact, model_deadline):
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
+        evidence["artifact"]["artifact_sha256"] = validated_digest
 
         def reject_download(*_args: Any, **_kwargs: Any) -> bool:
             raise RuntimeError("qualification_model_download_forbidden")

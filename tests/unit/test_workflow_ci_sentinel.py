@@ -227,6 +227,11 @@ def test_desktop_release_workflow_has_per_tag_concurrency() -> None:
 def test_desktop_release_temporary_artifacts_expire_after_seven_days() -> None:
     workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-release.yml")
     build_steps = _job_steps(workflow_data["jobs"]["build"])
+    build_text = yaml.dump(workflow_data["jobs"]["build"], sort_keys=True)
+    assert (
+        "PYTHONDONTWRITEBYTECODE=1 "
+        "src-tauri/python-runtime/bin/python3 -B -m pip check"
+    ) in build_text
     upload_steps = [
         step
         for step in build_steps

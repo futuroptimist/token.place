@@ -676,7 +676,10 @@ def test_workflow_prepares_and_validates_embedded_macos_runtime() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'Prepare embedded macOS Python runtime' in text
     assert 'python scripts/prepare_embedded_python_runtime.py' in text
-    assert 'src-tauri/python-runtime/bin/python3 -m pip check' in text
+    assert (
+        'PYTHONDONTWRITEBYTECODE=1 '
+        'src-tauri/python-runtime/bin/python3 -B -m pip check'
+    ) in text
     assert '--require-embedded-python-runtime' in text
 
 

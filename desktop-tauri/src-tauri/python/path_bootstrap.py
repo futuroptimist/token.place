@@ -9,6 +9,11 @@ import sys
 import sysconfig
 from collections.abc import Iterable
 
+# Packaged launchers set this before Python starts. Mirror the interpreter flag
+# here so in-process imports and copied child environments share the contract.
+if os.environ.get("PYTHONDONTWRITEBYTECODE") == "1":
+    sys.dont_write_bytecode = True
+
 _CRITICAL_STDLIB_MODULES = (
     "collections",
     "typing",

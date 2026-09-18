@@ -2795,7 +2795,15 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
     let keys_are_allowlisted = event.as_object().is_some_and(|map| {
         map.len() == allowed_keys.len()
             && map.keys().all(|key| allowed_keys.contains(&key.as_str()))
-    }) && exact_keys(event.get("artifact"), &["filename", "size_bytes"])
+    }) && event
+        .get("artifact")
+        .and_then(Value::as_object)
+        .is_some_and(|artifact| {
+            (artifact.len() == 2 || artifact.len() == 3)
+                && artifact.keys().all(|key| {
+                    ["filename", "size_bytes", "artifact_sha256"].contains(&key.as_str())
+                })
+        })
         && exact_keys(
             event.get("identity"),
             &[
@@ -2917,6 +2925,10 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
                 .pointer("/artifact/size_bytes")
                 .and_then(Value::as_u64)
                 == Some(5_027_783_488)
+            && event
+                .pointer("/artifact/artifact_sha256")
+                .and_then(Value::as_str)
+                == Some("d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785")
             && nonempty_identity
             && event.pointer("/identity/runtime_id")
                 == event.pointer("/identity/bundled_runtime_id")
@@ -9292,8 +9304,12 @@ mod tests {
             "qualification": "installed_gpu_child_worker_completion",
             "success": true,
             "failure_code": "none",
-            "artifact": {"filename": "Qwen3-8B-Q4_K_M.gguf", "size_bytes": 5027783488_u64},
-            "identity": {"app_version": "0.1.19", "build_id": "build", "target_triple": "target", "bundled_runtime_id": "runtime", "runtime_id": "runtime"},
+            "artifact": {
+                "filename": "Qwen3-8B-Q4_K_M.gguf",
+                "size_bytes": 5027783488_u64,
+                "artifact_sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+            },
+            "identity": {"app_version": "0.1.20", "build_id": "build", "target_triple": "target", "bundled_runtime_id": "runtime", "runtime_id": "runtime"},
             "backend": {"declared": "cuda", "observed": "cuda", "gpu_verified": true},
             "completion": {"path": "shared_api_v1_generation", "count": 1, "max_output_tokens": 64, "result": "passed"},
             "phases": {
@@ -9324,6 +9340,7 @@ mod tests {
         for (pointer, value) in [
             ("/failure_code", Value::String("unexpected".into())),
             ("/artifact/filename", Value::String("other.gguf".into())),
+            ("/artifact/artifact_sha256", Value::String("0".repeat(64))),
             (
                 "/identity/runtime_id",
                 Value::String("other-runtime".into()),

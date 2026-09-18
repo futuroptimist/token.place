@@ -620,6 +620,13 @@ def _validate_macho_linkage(path: Path, app_path: Path) -> None:
                 _fail(f"native audit failed in {rel}: arch={arch} category=rpath ref={_safe_macho_ref(rpath)}")
 
 def _validate_embedded_python_runtime(app_path: Path) -> None:
+    bytecode = [
+        path.relative_to(app_path).as_posix()
+        for path in app_path.rglob("*")
+        if path.name == "__pycache__" or (path.is_file() and path.suffix.lower() in {".pyc", ".pyo"})
+    ]
+    if bytecode:
+        _fail(f"packaged app contains forbidden Python bytecode: {bytecode[0]}")
     runtime = app_path / "Contents" / "Resources" / "python-runtime"
     py = runtime / "bin" / "python3"
     if not py.exists() or not os.access(py, os.X_OK):

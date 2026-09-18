@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +16,21 @@ MODULE_PATH = (
     / 'python'
     / 'path_bootstrap.py'
 )
+
+
+def test_packaged_bytecode_environment_sets_interpreter_flag():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import importlib.util; s=importlib.util.spec_from_file_location('path_bootstrap', {str(MODULE_PATH)!r}); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); import sys; print(sys.dont_write_bytecode)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert result.stdout.strip() == "True"
 
 
 @pytest.fixture(scope='session')

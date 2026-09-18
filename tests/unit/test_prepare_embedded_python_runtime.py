@@ -284,6 +284,20 @@ def test_clean_preserves_pip_internal_build_package(tmp_path):
     assert not pycache.exists()
 
 
+def test_run_and_probe_environments_disable_bytecode(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_subprocess_run(cmd, **kwargs):
+        captured.append(kwargs["env"])
+        return subprocess.CompletedProcess(cmd, 0, '{"backend":"metal","gpu_offload_supported":true,"llama_cpp_python_version":"0.3.32","qwen_64k_yarn_support":"supported","rope_scaling_type_supported":true,"rope_freq_scale_supported":true,"yarn_orig_ctx_supported":true,"constructor_kwarg_support":{"flash_attn":true,"offload_kqv":true,"n_batch":true,"n_ubatch":true}}', '')
+
+    monkeypatch.setattr(prep.subprocess, "run", fake_subprocess_run)
+    prep.run(["python", "-c", "pass"])
+    prep.probe_runtime(tmp_path / "python3", manifest())
+
+    assert all(env["PYTHONDONTWRITEBYTECODE"] == "1" for env in captured)
+
+
 def test_load_manifest_rejects_latest_url_uppercase_sha_and_package_drift(tmp_path):
     p = tmp_path / 'm.json'
     cases = [

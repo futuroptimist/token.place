@@ -147,7 +147,7 @@ def _completion_preflight_args(model):
 
 def _completion_preflight_environment(monkeypatch):
     for name, value in {
-        "TOKENPLACE_APP_VERSION": "0.1.19",
+        "TOKENPLACE_APP_VERSION": "0.1.20",
         "TOKENPLACE_BUILD_ID": "build-test",
         "TOKENPLACE_TARGET_TRIPLE": "x86_64-pc-windows-msvc",
         "TOKENPLACE_BUNDLED_RUNTIME_ID": "runtime-test",
@@ -180,6 +180,11 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
     assert code == 0
     assert evidence["success"] is True
     assert evidence["completion"]["count"] == 1
+    assert evidence["artifact"] == {
+        "filename": model.name,
+        "size_bytes": len(b"fixture"),
+        "artifact_sha256": hashlib.sha256(b"fixture").hexdigest(),
+    }
     assert evidence["backend"] == {"declared": "cuda", "observed": "cuda", "gpu_verified": True}
     assert evidence["cleanup"] == {"attempted": True, "verified": True, "owned_worker_alive": False}
     assert created[0].stop_saw_loaded_worker is True
@@ -217,6 +222,7 @@ def test_installed_gpu_completion_preflight_uses_worker_attested_gpu(
     )
 
     assert code == 0
+    assert evidence["artifact"]["artifact_sha256"] == hashlib.sha256(b"fixture").hexdigest()
     assert evidence["backend"] == {
         "declared": backend, "observed": backend, "gpu_verified": True,
     }

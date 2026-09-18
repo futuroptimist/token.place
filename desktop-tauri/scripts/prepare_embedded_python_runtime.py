@@ -95,6 +95,7 @@ def extract_archive(archive: Path, m: dict, tmp_parent: Path) -> Path:
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy(); env.update(kw.pop("env", {}) or {})
     env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     result = subprocess.run(cmd, text=True, capture_output=True, check=False, env=env, **kw)
     if result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
@@ -476,7 +477,10 @@ def _missing_runtime_capabilities(payload: dict) -> list[str]:
 
 def probe_runtime(py: Path, m: dict) -> dict:
     code = "import json,importlib.metadata as im; from desktop_runtime_setup import _probe_llama_runtime; p=_probe_llama_runtime(); print(json.dumps(p.__dict__))"
-    env = {"PYTHONPATH": str(SRC_TAURI / "python") + os.pathsep + str(SRC_TAURI.parent.parent)}
+    env = {
+        "PYTHONPATH": str(SRC_TAURI / "python") + os.pathsep + str(SRC_TAURI.parent.parent),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
     payload = json.loads(run([str(py), "-c", code], env=env).stdout)
     if payload.get("backend") != "metal" or not payload.get("gpu_offload_supported"): raise RuntimePrepError("embedded llama_cpp runtime is not Metal-capable")
     if payload.get("llama_cpp_python_version") != m["required_packages"]["llama-cpp-python"]: raise RuntimePrepError("wrong llama-cpp-python version")

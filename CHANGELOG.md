@@ -6,7 +6,7 @@ All notable changes to token.place are tracked here. This project uses a lightwe
 ## v0.1.2 - Relay/web release metadata correction
 
 - Corrected public relay/web metadata to `0.1.2`.
-- Kept the desktop release at `0.1.19` (`desktop-v0.1.19`).
+- Kept the desktop release at `0.1.20` (`desktop-v0.1.20`).
 - Reused the qualified Qwen relay image without rebuilding it.
 
 ## v0.1.1 - Multi-relay desktop and release metadata

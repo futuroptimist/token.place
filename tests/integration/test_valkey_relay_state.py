@@ -426,31 +426,75 @@ def test_healthz_populated_valkey_state_is_filtered_without_mutation(
     store = _registration_store(valkey_server, namespace, lease_ttl_seconds=300)
     other = _registration_store(valkey_server, other_namespace)
     live_node, expired_node = "health-live-node", "health-expired-node"
-    live_identity = ("health-live-client", "health-live-request")
-    expired_identity = ("health-expired-client", "health-expired-request")
+    identities = {
+        "live": ("health-live-client", "health-live-request"),
+        "expired_node": ("health-expired-client", "health-expired-request"),
+        "due_request": ("health-due-client", "health-due-request"),
+        "due_claim": ("health-claim-client", "health-claim-request"),
+        "due_reservation": ("health-reservation-client", "health-reservation-request"),
+    }
     owner = _digest("health-owner")
-    store.register(live_node, _capabilities(), owner)
-    store.register(expired_node, _capabilities(), owner)
-    _enqueue_claim_fixture(
-        store, live_node, owner, *live_identity, time.time() + 300
-    )
-    _enqueue_claim_fixture(
-        store, expired_node, owner, *expired_identity, time.time() + 300
-    )
     cfg = store._foundation.config
-    expired_member = store._node_digest(expired_node)
-    store._foundation._client.zadd(cfg.key("nodes:lease"), {expired_member: 0})
-    store._foundation._client.hset(
-        cfg.key("node", expired_member), "lease_expires_at_epoch", 0
-    )
-    keys = tuple(dict.fromkeys(
-        _response_acceptance_authority(store, live_node, live_identity)[0]
-        + _response_acceptance_authority(store, expired_node, expired_identity)[0]
+    keys = list(_claim_fixture_state_keys(
+        store, (live_node, expired_node), tuple(identities.values())
     ))
     sentinel = other._foundation.config.key_prefix + "test-sentinel"
-    other._foundation._client.set(sentinel, b"untouched")
-    before = _read_exact_keys(store._foundation._client, keys)
     try:
+        store.register(expired_node, _capabilities(), owner)
+        _enqueue_claim_fixture(
+            store, expired_node, owner, *identities["expired_node"],
+            time.time() + 300,
+        )
+        store.register(live_node, _capabilities(concurrency=8), owner)
+        _enqueue_claim_fixture(
+            store, live_node, owner, *identities["due_claim"], time.time() + 300
+        )
+        claim = store.claim_queued_request(live_node, owner, live_node)
+        assert (claim.client_public_key, claim.request_id) == identities["due_claim"]
+        expired_member = store._node_digest(expired_node)
+        store._foundation._client.zadd(cfg.key("nodes:lease"), {expired_member: 0})
+        store._foundation._client.hset(
+            cfg.key("node", expired_member), "lease_expires_at_epoch", 0
+        )
+        for name in ("live", "due_request"):
+            _enqueue_claim_fixture(
+                store, live_node, owner, *identities[name], time.time() + 300
+            )
+        reservation = store.select_and_reserve(
+            *identities["due_reservation"], "qwen3-8b-instruct", "8k-fast",
+            time.time() + 300, "reservation-cancel",
+        )
+        reservation_digest = hashlib.sha256(
+            reservation.reservation_token.encode()
+        ).hexdigest()
+        keys.append(cfg.key("reservation", reservation_digest))
+
+        due = store._foundation.server_time()[0] - 1
+        due_client, due_request = store._identity(*identities["due_request"])
+        due_claim_client, due_claim_request = store._identity(*identities["due_claim"])
+        store._foundation._client.hset(
+            cfg.key("request", due_client, due_request), "deadline", due
+        )
+        store._foundation._client.zadd(
+            cfg.key("requests:deadline"), {f"{due_client}:{due_request}": due}
+        )
+        store._foundation._client.hset(
+            cfg.key("claim", due_claim_client, due_claim_request),
+            "lease_expires", due,
+        )
+        store._foundation._client.zadd(
+            cfg.key("claims:expiry"),
+            {f"{due_claim_client}:{due_claim_request}": due},
+        )
+        store._foundation._client.hset(
+            cfg.key("reservation", reservation_digest), "reservation_expires", due
+        )
+        store._foundation._client.zadd(
+            cfg.key("reservations:expiry"), {reservation_digest: due}
+        )
+        keys = tuple(dict.fromkeys(keys))
+        other._foundation._client.set(sentinel, b"untouched")
+        before = _read_exact_keys(store._foundation._client, keys)
         monkeypatch.setattr(relay, "api_v1_relay_state_store", store)
 
         response = relay.app.test_client().get("/healthz")
@@ -462,6 +506,7 @@ def test_healthz_populated_valkey_state_is_filtered_without_mutation(
         }
         assert set(diagnostics) == {live_node}
         assert diagnostics[live_node]["queue_depth"] == 1
+        assert diagnostics[live_node]["in_flight_count"] == 0
         assert body["status"] == "ok"
         assert _read_exact_keys(store._foundation._client, keys) == before
         assert other._foundation._client.get(sentinel) == b"untouched"
@@ -477,8 +522,8 @@ def test_real_valkey_routes_preserve_accepted_work_while_draining(
     valkey_server, monkeypatch
 ):
     namespace = uuid.uuid4().hex
-    first = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.1)
-    second = _registration_store(valkey_server, namespace, claim_ttl_seconds=0.1)
+    first = _registration_store(valkey_server, namespace, claim_ttl_seconds=30)
+    second = _registration_store(valkey_server, namespace, claim_ttl_seconds=30)
     cfg = first._foundation.config
     node = "drain-route-node"
     credential = "drain-route-control"
@@ -555,6 +600,12 @@ def test_real_valkey_routes_preserve_accepted_work_while_draining(
         )
         response_claim = second.claim_queued_request(node, owner, node)
         assert response_claim.state == "reclaimed"
+        assert response_claim.generation == original_claim.generation + 1
+        assert (
+            response_claim.client_public_key, response_claim.request_id
+        ) == (
+            original_claim.client_public_key, original_claim.request_id
+        )
         rejected = client.post("/api/v1/relay/responses", json={
             "server_public_key": node, "control_credential": "invalid-secret",
             "claim_generation": response_claim.generation,

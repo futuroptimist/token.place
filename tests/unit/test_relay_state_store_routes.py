@@ -204,6 +204,22 @@ def test_healthz_memory_snapshot_filters_without_reaping():
     assert store._node_tombstones == {}
 
 
+def test_healthz_memory_snapshot_reports_live_claim_counts():
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, _, _, _ = _claim_for_control(client, request_id="health-claimed")
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    diagnostics = {
+        record["server_public_key"]: record
+        for record in response.get_json()["registeredServers"]
+    }
+    assert diagnostics[node]["queue_depth"] == 0
+    assert diagnostics[node]["in_flight_count"] == 1
+
+
 def test_livez_never_touches_state_store_while_draining(monkeypatch):
     monkeypatch.setattr(
         relay, "_api_v1_store", Mock(side_effect=AssertionError("store touched"))

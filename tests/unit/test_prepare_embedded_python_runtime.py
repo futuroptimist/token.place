@@ -284,6 +284,25 @@ def test_clean_preserves_pip_internal_build_package(tmp_path):
     assert not pycache.exists()
 
 
+def test_clean_removes_case_insensitive_bytecode_suffixes(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    bytecode_files = [runtime / 'package' / f'module{suffix}' for suffix in ['.pyc', '.pyo', '.PYC', '.PyO']]
+    bytecode_files[0].parent.mkdir(parents=True)
+    for bytecode in bytecode_files:
+        bytecode.write_bytes(b'cache')
+
+    prep.clean(runtime)
+
+    assert all(not bytecode.exists() for bytecode in bytecode_files)
+
+
+def test_run_suppresses_child_bytecode(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: captured.update(kwargs) or type('Result', (), {'returncode': 0})())
+    prep.run(['python3', '-c', 'pass'])
+    assert captured['env']['PYTHONDONTWRITEBYTECODE'] == '1'
+
+
 def test_load_manifest_rejects_latest_url_uppercase_sha_and_package_drift(tmp_path):
     p = tmp_path / 'm.json'
     cases = [
@@ -406,6 +425,23 @@ def test_existing_valid_accepts_matching_provenance_after_full_validation(tmp_pa
     monkeypatch.setattr(prep, 'probe_runtime', lambda py, m: {'backend': 'metal'})
     monkeypatch.setattr(prep, 'audit_macho_runtime', lambda runtime: None)
     assert prep.existing_valid(manifest()) is True
+
+
+def test_existing_valid_rejects_runtime_with_python_bytecode(tmp_path, monkeypatch):
+    output = tmp_path / 'python-runtime'
+    (output / 'bin').mkdir(parents=True)
+    (output / 'bin' / 'python3').write_text('#!/bin/sh\n', encoding='utf-8')
+    (output / 'package' / '__pycache__').mkdir(parents=True)
+    (output / 'package' / '__pycache__' / 'module.pyc').write_bytes(b'cached')
+    (output / prep.PROVENANCE).write_text(json.dumps({
+        'source_archive_sha256': '0' * 64,
+        'expected_backend': 'metal',
+        'installed_packages': manifest()['required_packages'],
+        'build_profile': prep.BUILD_PROFILE,
+    }), encoding='utf-8')
+    monkeypatch.setattr(prep, 'OUTPUT', output)
+
+    assert prep.existing_valid(manifest()) is False
 
 
 def test_prepare_reuses_valid_existing_runtime_without_download(tmp_path, monkeypatch, capsys):

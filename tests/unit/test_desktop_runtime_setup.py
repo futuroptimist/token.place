@@ -1451,6 +1451,22 @@ def test_maybe_reexec_for_runtime_refresh_handles_execve_oserror(monkeypatch):
     desktop_runtime_setup.maybe_reexec_for_runtime_refresh({'runtime_action': 'installed_cuda_reexec'})
 
 
+def test_packaged_runtime_refresh_reexec_suppresses_bytecode(monkeypatch):
+    monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: True)
+    monkeypatch.delenv(desktop_runtime_setup.REEXEC_GUARD_ENV, raising=False)
+    captured = {}
+    monkeypatch.setattr(
+        desktop_runtime_setup.os,
+        'execve',
+        lambda _exe, _argv, env: captured.update(env),
+    )
+
+    desktop_runtime_setup.maybe_reexec_for_runtime_refresh({'runtime_action': 'installed_metal_reexec'})
+
+    assert captured['PYTHONDONTWRITEBYTECODE'] == '1'
+
+
 def test_source_repair_cooldown_skips_immediate_retries(monkeypatch, tmp_path):
     monkeypatch.setattr(desktop_runtime_setup, 'sys', _SysStub)
     monkeypatch.setenv(desktop_runtime_setup.ENABLE_BOOTSTRAP_ENV, '1')
@@ -4390,6 +4406,7 @@ def test_exact_packaged_probe_ignores_hostile_dependency_targets(monkeypatch, tm
     assert probe.error == 'probe_process_abnormal_exit'
     env = called['popen_env']
     assert env['PYTHONNOUSERSITE'] == '1'
+    assert env['PYTHONDONTWRITEBYTECODE'] == '1'
     assert str(hostile) not in env.get('PYTHONPATH', '')
     assert 'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET' not in env
 

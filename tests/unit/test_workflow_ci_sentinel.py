@@ -227,6 +227,11 @@ def test_desktop_release_workflow_has_per_tag_concurrency() -> None:
 def test_desktop_release_temporary_artifacts_expire_after_seven_days() -> None:
     workflow_data = _load_workflow(WORKFLOW_DIR / "desktop-release.yml")
     build_steps = _job_steps(workflow_data["jobs"]["build"])
+    build_text = yaml.dump(workflow_data["jobs"]["build"], sort_keys=True)
+    assert (
+        "PYTHONDONTWRITEBYTECODE=1 "
+        "src-tauri/python-runtime/bin/python3 -B -m pip check"
+    ) in build_text
     upload_steps = [
         step
         for step in build_steps
@@ -594,7 +599,10 @@ def test_run_all_tests_pr_has_path_gated_macos_metal_bootstrap() -> None:
     assert 'test "$(uname -m)" = "arm64"' in job_text
     assert "scripts/prepare_embedded_python_runtime.py" in job_text
     assert "test -x src-tauri/python-runtime/bin/python3" in job_text
-    assert "src-tauri/python-runtime/bin/python3 -m pip check" in job_text
+    assert (
+        "PYTHONDONTWRITEBYTECODE=1 "
+        "src-tauri/python-runtime/bin/python3 -B -m pip check"
+    ) in job_text
     assert "steps.changes.outputs.run" not in job_text
     assert "Summarize skipped Metal bootstrap" not in job_text
 

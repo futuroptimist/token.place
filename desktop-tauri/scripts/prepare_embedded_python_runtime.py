@@ -94,6 +94,7 @@ def extract_archive(archive: Path, m: dict, tmp_parent: Path) -> Path:
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy(); env.update(kw.pop("env", {}) or {})
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONNOUSERSITE"] = "1"
     result = subprocess.run(cmd, text=True, capture_output=True, check=False, env=env, **kw)
     if result.returncode != 0:
@@ -487,7 +488,14 @@ def probe_runtime(py: Path, m: dict) -> dict:
 def clean(runtime: Path) -> None:
     for p in runtime.rglob("*"):
         if p.is_dir() and p.name in {"__pycache__", "tests", "test"}: shutil.rmtree(p, ignore_errors=True)
-        elif p.is_file() and (p.suffix == ".pyc" or p.name.endswith(".pyo")): p.unlink(missing_ok=True)
+        elif p.is_file() and p.suffix.lower() in {".pyc", ".pyo"}: p.unlink(missing_ok=True)
+
+def contains_python_bytecode(runtime: Path) -> bool:
+    return any(
+        (p.is_dir() and p.name == "__pycache__")
+        or (p.is_file() and p.suffix.lower() in {".pyc", ".pyo"})
+        for p in runtime.rglob("*")
+    )
 
 def provenance(m: dict, packages: dict) -> dict:
     try: commit = subprocess.check_output(["git","rev-parse","HEAD"], cwd=ROOT.parent, text=True).strip()
@@ -496,7 +504,7 @@ def provenance(m: dict, packages: dict) -> dict:
 
 def existing_valid(m: dict) -> bool:
     prov = OUTPUT / PROVENANCE; py = OUTPUT / "bin" / "python3"
-    if not prov.is_file() or not py.is_file(): return False
+    if not prov.is_file() or not py.is_file() or contains_python_bytecode(OUTPUT): return False
     try:
         data=json.loads(prov.read_text());
         if data.get("source_archive_sha256") != m["sha256"] or data.get("expected_backend") != "metal" or data.get("build_profile") != BUILD_PROFILE: return False
@@ -516,6 +524,7 @@ def prepare(cache_dir: Path) -> None:
         py=staging/"bin"/"python3"; py.chmod(py.stat().st_mode | 0o755)
         normalize_python_build_standalone_macos_runtime(staging, m); audit_macho_runtime(staging); prove_interpreter(py, staging, m); install_packages(py, m, cache_dir/"pip"); probe_runtime(py, m); clean(staging); audit_macho_runtime(staging)
         packages=json.loads(run([str(py),"-c","import json,importlib.metadata as im; print(json.dumps({d.metadata['Name']: d.version for d in im.distributions()}))"]).stdout)
+        clean(staging)
         (staging/PROVENANCE).write_text(json.dumps(provenance(m, packages), indent=2, sort_keys=True)+"\n")
         for notice in m["runtime_notices"]: (staging/notice["path"]).write_text(f"{notice['name']} redistribution notice: {notice['license']}\nSee upstream distribution for complete license text.\n")
         backup=tmp/"old-runtime"

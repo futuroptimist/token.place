@@ -44,6 +44,32 @@ def test_bootstrap_adds_resources_import_root_for_exe_python_layout(tmp_path, pa
         sys.path[:] = original_sys_path
 
 
+def test_packaged_bootstrap_suppresses_bytecode(tmp_path, path_bootstrap, monkeypatch):
+    script = tmp_path / 'TokenPlace.app' / 'Contents' / 'Resources' / 'python' / 'bridge.py'
+    original = sys.dont_write_bytecode
+    monkeypatch.delenv('PYTHONDONTWRITEBYTECODE', raising=False)
+    try:
+        sys.dont_write_bytecode = False
+        path_bootstrap._suppress_packaged_bytecode(str(script))
+        assert sys.dont_write_bytecode is True
+        assert os.environ['PYTHONDONTWRITEBYTECODE'] == '1'
+    finally:
+        sys.dont_write_bytecode = original
+
+
+def test_development_bootstrap_leaves_bytecode_settings_unchanged(tmp_path, path_bootstrap, monkeypatch):
+    script = tmp_path / 'repo' / 'desktop-tauri' / 'src-tauri' / 'python' / 'bridge.py'
+    original = sys.dont_write_bytecode
+    monkeypatch.delenv('PYTHONDONTWRITEBYTECODE', raising=False)
+    try:
+        sys.dont_write_bytecode = False
+        path_bootstrap._suppress_packaged_bytecode(str(script))
+        assert sys.dont_write_bytecode is False
+        assert 'PYTHONDONTWRITEBYTECODE' not in os.environ
+    finally:
+        sys.dont_write_bytecode = original
+
+
 def test_bootstrap_adds_repo_root_for_dev_layout(tmp_path, path_bootstrap):
     script = tmp_path / 'repo' / 'desktop-tauri' / 'src-tauri' / 'python' / 'model_bridge.py'
     repo_root = tmp_path / 'repo'

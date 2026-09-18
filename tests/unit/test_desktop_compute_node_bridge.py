@@ -96,7 +96,9 @@ class _CompletionPreflightManager:
         return dict(self.worker_diagnostics)
 
     def _validate_existing_model_artifact(self, **_kwargs):
-        return True, "valid"
+        actual_sha256 = hashlib.sha256(Path(self.model_path).read_bytes()).hexdigest()
+        valid = actual_sha256 == self.model_profile["artifact_sha256"]
+        return valid, "valid" if valid else "sha256_mismatch"
 
     def _is_managed_canonical_model_path(self):
         return Path(self.model_path).resolve() == Path(self.models_dir, self.file_name).resolve()
@@ -147,7 +149,7 @@ def _completion_preflight_args(model):
 
 def _completion_preflight_environment(monkeypatch):
     for name, value in {
-        "TOKENPLACE_APP_VERSION": "0.1.19",
+        "TOKENPLACE_APP_VERSION": "0.1.20",
         "TOKENPLACE_BUILD_ID": "build-test",
         "TOKENPLACE_TARGET_TRIPLE": "x86_64-pc-windows-msvc",
         "TOKENPLACE_BUNDLED_RUNTIME_ID": "runtime-test",
@@ -180,6 +182,11 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
     assert code == 0
     assert evidence["success"] is True
     assert evidence["completion"]["count"] == 1
+    assert evidence["artifact"] == {
+        "filename": "Qwen3-8B-Q4_K_M.gguf",
+        "size_bytes": len(b"fixture"),
+        "artifact_sha256": hashlib.sha256(b"fixture").hexdigest(),
+    }
     assert evidence["backend"] == {"declared": "cuda", "observed": "cuda", "gpu_verified": True}
     assert evidence["cleanup"] == {"attempted": True, "verified": True, "owned_worker_alive": False}
     assert created[0].stop_saw_loaded_worker is True
@@ -187,6 +194,13 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
     serialized = json.dumps(evidence)
     assert "private output" not in serialized
     assert str(model.parent) not in serialized
+
+
+def test_gpu_completion_failure_does_not_claim_an_artifact_digest():
+    evidence = compute_node_bridge._gpu_completion_evidence(failure_code="model_missing")
+    assert evidence["artifact"] == {
+        "filename": "unknown", "size_bytes": 0, "artifact_sha256": "unknown",
+    }
 
 
 @pytest.mark.parametrize(
@@ -352,6 +366,7 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     assert code != 0 or evidence["success"] is False
     assert evidence["success"] is False
     assert evidence["failure_code"] == expected
+    assert evidence["artifact"]["artifact_sha256"] == "unknown"
     serialized = json.dumps(evidence)
     assert "secret child log" not in serialized
     assert "fixture" not in serialized

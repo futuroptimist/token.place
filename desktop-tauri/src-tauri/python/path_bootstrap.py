@@ -20,6 +20,21 @@ _CRITICAL_STDLIB_MODULES = (
 )
 
 
+def _suppress_packaged_bytecode(script_path: str) -> None:
+    normalized = os.path.normcase(os.path.normpath(os.path.abspath(script_path)))
+    executable_parent = os.path.basename(os.path.dirname(os.path.abspath(sys.executable))).lower()
+    packaged = (
+        f"{os.sep}contents{os.sep}resources{os.sep}" in normalized.lower()
+        or executable_parent == "python-runtime"
+    )
+    if packaged:
+        sys.dont_write_bytecode = True
+        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
+
+_suppress_packaged_bytecode(__file__)
+
+
 def _strip_windows_extended_path_prefix(path_text: str) -> str:
     if path_text.startswith("\\\\?\\UNC\\"):
         return "\\\\" + path_text[8:]

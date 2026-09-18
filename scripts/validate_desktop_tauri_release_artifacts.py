@@ -389,6 +389,17 @@ def _app_tree_fingerprint(app_path: Path) -> dict[str, AppTreeEntry]:
     return fingerprint
 
 
+def _validate_no_python_bytecode(app_path: Path) -> None:
+    forbidden = [
+        path.relative_to(app_path).as_posix()
+        for path in app_path.rglob("*")
+        if path.name == "__pycache__" or (path.is_file() and path.suffix.lower() in {".pyc", ".pyo"})
+    ]
+    if forbidden:
+        sample = ", ".join(sorted(forbidden)[:20])
+        _fail(f"packaged app contains forbidden Python bytecode/cache paths: {sample}")
+
+
 def _describe_app_tree_changes(before: dict[str, AppTreeEntry], after: dict[str, AppTreeEntry]) -> list[str]:
     changes: list[str] = []
     before_paths = set(before)
@@ -808,6 +819,7 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool, require_embe
             elif DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
                 _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")
             mounted_app = apps[0]
+            _validate_no_python_bytecode(mounted_app)
             if require_embedded_python_runtime:
                 _validate_embedded_python_runtime_non_mutating(mounted_app)
             _codesign_verify(mounted_app)
@@ -843,8 +855,9 @@ def main() -> None:
                 _fail(f"DMG filename must match token.place-desktop-<version>-apple-silicon.dmg: {dmg_path.name}")
             _validate_dmg_contents(dmg_path, expect_signing=args.expect_signing, require_embedded_python_runtime=args.require_embedded_python_runtime)
 
-    if not app_path.exists() or app_path.suffix != ".app":
+    if not app_path.is_dir() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
+    _validate_no_python_bytecode(app_path)
     if not expected_icon.exists() or not expected_icon.is_file():
         _fail(f"expected icon missing or invalid: {expected_icon}")
 

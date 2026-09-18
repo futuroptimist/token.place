@@ -276,12 +276,15 @@ def test_clean_preserves_pip_internal_build_package(tmp_path):
     pycache = runtime / 'lib' / 'python3.11' / 'site-packages' / 'somepkg' / '__pycache__'
     pycache.mkdir(parents=True)
     (pycache / 'module.pyc').write_bytes(b'cache')
+    optimized = runtime / 'lib' / 'python3.11' / 'site-packages' / 'somepkg' / 'module.pyo'
+    optimized.write_bytes(b'cache')
 
     prep.clean(runtime)
 
     assert (pip_build / '__init__.py').is_file()
     assert not test_dir.exists()
     assert not pycache.exists()
+    assert not optimized.exists()
 
 
 def test_load_manifest_rejects_latest_url_uppercase_sha_and_package_drift(tmp_path):
@@ -1100,6 +1103,7 @@ def test_prepare_runtime_run_download_and_macho_file_errors(monkeypatch, tmp_pat
     monkeypatch.setattr(prep.subprocess, 'run', fake_subprocess_run)
     assert prep.run(['cmd']).stdout == 'ok'
     assert captured_env['PYTHONNOUSERSITE'] == '1'
+    assert captured_env['PYTHONDONTWRITEBYTECODE'] == '1'
 
     def failing_subprocess_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 2, 'out', 'err')

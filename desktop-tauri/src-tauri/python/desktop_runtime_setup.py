@@ -24,6 +24,17 @@ if (_PACKAGED_RESOURCES_ROOT / "utils").is_dir() and str(_PACKAGED_RESOURCES_ROO
     sys.path.insert(0, str(_PACKAGED_RESOURCES_ROOT))
 
 _PACKAGED_IDENTITY_HELPER = _PACKAGED_RESOURCES_ROOT / "utils" / "llm" / "llama_module_identity.py"
+
+
+def _copied_process_env() -> Dict[str, str]:
+    """Copy the environment while keeping packaged Python resources immutable."""
+    env = os.environ.copy()
+    executable_parts = {
+        part.lower() for part in _safe_resolve_path(sys.executable).parts
+    }
+    if "python-runtime" in executable_parts:
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
 _HAS_PACKAGED_IDENTITY_HELPER = _PACKAGED_IDENTITY_HELPER.is_file() or any(
     (Path(entry or ".") / "utils" / "llm" / "llama_module_identity.py").is_file() for entry in sys.path
 )
@@ -596,7 +607,7 @@ def _python_version_text() -> str:
 
 def _pip_version_summary() -> str:
     try:
-        env = os.environ.copy()
+        env = _copied_process_env()
         env.pop("PYTHONPATH", None)
         result = subprocess.run(
             [sys.executable, "-m", "pip", "--version"],
@@ -898,7 +909,7 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
             probe_error_code="missing_environment_contract",
         )
     cmd = [sys.executable, "-c", _PROBE_SNIPPET]
-    env = os.environ.copy()
+    env = _copied_process_env()
     if exact_packaged:
         for key in list(env):
             upper = key.upper()
@@ -1351,7 +1362,7 @@ def _source_build_repair(
     cancellation_predicate: Optional[Any] = None,
     heartbeat: Optional[Any] = None,
 ) -> tuple[bool, str]:
-    env = os.environ.copy()
+    env = _copied_process_env()
     backend_label = backend.upper()
     if backend == "cuda":
         env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
@@ -1832,7 +1843,7 @@ def maybe_reexec_for_runtime_refresh(
         return
     if os.environ.get(REEXEC_GUARD_ENV) == "1":
         return
-    env = os.environ.copy()
+    env = _copied_process_env()
     env[REEXEC_GUARD_ENV] = "1"
     try:
         os.execve(sys.executable, [sys.executable, *sys.argv], env)
@@ -2362,7 +2373,7 @@ def _ensure_desktop_llama_runtime_impl(
                 f"without writing to interpreter prefix; detail={dependency_target_error or 'unknown'}"
             )
             break
-        env = os.environ.copy()
+        env = _copied_process_env()
         env.update(plan.pip_env())
         existing_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = os.pathsep.join(
@@ -2785,7 +2796,7 @@ def ensure_desktop_python_dependencies(*, repo_root: Optional[Path] = None, muta
         }
 
     target_dir_str = str(target_dir)
-    env = os.environ.copy()
+    env = _copied_process_env()
     env["TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET"] = target_dir_str
     try:
         with _ManagedSiteMutationLock(target_dir, cancellation_predicate=cancellation_predicate, heartbeat=heartbeat):

@@ -27,6 +27,15 @@ sys.modules['desktop_runtime_setup'] = desktop_runtime_setup
 SPEC.loader.exec_module(desktop_runtime_setup)
 
 
+def test_copied_process_env_suppresses_bytecode_only_for_packaged_runtime(monkeypatch) -> None:
+    monkeypatch.delenv('PYTHONDONTWRITEBYTECODE', raising=False)
+    monkeypatch.setattr(desktop_runtime_setup.sys, 'executable', '/app/Contents/Resources/python-runtime/bin/python3')
+    assert desktop_runtime_setup._copied_process_env()['PYTHONDONTWRITEBYTECODE'] == '1'
+
+    monkeypatch.setattr(desktop_runtime_setup.sys, 'executable', '/usr/bin/python3')
+    assert 'PYTHONDONTWRITEBYTECODE' not in desktop_runtime_setup._copied_process_env()
+
+
 
 def test_packaged_runtime_setup_imports_utils_from_resources_root(tmp_path) -> None:
     resources_root = tmp_path / 'token.place desktop.app' / 'Contents' / 'Resources'

@@ -147,7 +147,7 @@ def _completion_preflight_args(model):
 
 def _completion_preflight_environment(monkeypatch):
     for name, value in {
-        "TOKENPLACE_APP_VERSION": "0.1.19",
+        "TOKENPLACE_APP_VERSION": "0.1.20",
         "TOKENPLACE_BUILD_ID": "build-test",
         "TOKENPLACE_TARGET_TRIPLE": "x86_64-pc-windows-msvc",
         "TOKENPLACE_BUNDLED_RUNTIME_ID": "runtime-test",
@@ -179,6 +179,11 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
 
     assert code == 0
     assert evidence["success"] is True
+    assert evidence["artifact"] == {
+        "filename": "Qwen3-8B-Q4_K_M.gguf",
+        "size_bytes": len(b"fixture"),
+        "artifact_sha256": hashlib.sha256(b"fixture").hexdigest(),
+    }
     assert evidence["completion"]["count"] == 1
     assert evidence["backend"] == {"declared": "cuda", "observed": "cuda", "gpu_verified": True}
     assert evidence["cleanup"] == {"attempted": True, "verified": True, "owned_worker_alive": False}
@@ -187,6 +192,25 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
     serialized = json.dumps(evidence)
     assert "private output" not in serialized
     assert str(model.parent) not in serialized
+
+
+def test_installed_gpu_completion_preflight_rejects_unpinned_artifact_hash(monkeypatch, tmp_path):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"fixture")
+
+    class Runtime(_CompletionPreflightRuntime):
+        def __init__(self, config):
+            super().__init__(config)
+            self.model_manager.model_profile["artifact_sha256"] = "0" * 64
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), Runtime
+    )
+
+    assert code == 3
+    assert evidence["failure_code"] == "model_identity_mismatch"
+    assert evidence["artifact"]["artifact_sha256"] == "unknown"
 
 
 @pytest.mark.parametrize(

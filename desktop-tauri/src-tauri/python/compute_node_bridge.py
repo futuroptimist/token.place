@@ -21,6 +21,12 @@ import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
+# Packaged runtimes are code-signed, immutable app resources.  Prevent imports
+# from writing bytecode into that tree without changing source-tree execution.
+_executable_parts = os.path.normcase(os.path.abspath(sys.executable)).split(os.sep)
+if "python-runtime" in _executable_parts:
+    sys.dont_write_bytecode = True
+
 
 def _is_windows_dll_loader_error(exc: BaseException) -> bool:
     """Recognize common Windows loader failures without retaining their detail."""
@@ -3314,7 +3320,7 @@ def _gpu_completion_evidence(*, success: bool = False, failure_code: str = "not_
         "qualification": "installed_gpu_child_worker_completion",
         "success": success,
         "failure_code": failure_code,
-        "artifact": {"filename": "unknown", "size_bytes": 0},
+        "artifact": {"filename": "unknown", "size_bytes": 0, "artifact_sha256": "unknown"},
         "identity": {
             "app_version": os.environ.get("TOKENPLACE_APP_VERSION", "unknown"),
             "build_id": os.environ.get("TOKENPLACE_BUILD_ID", "unknown"),
@@ -3422,7 +3428,7 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
                 or managed_path_check() is not True):
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
-        evidence["artifact"] = {"filename": model.name, "size_bytes": model.stat().st_size}
+        evidence["artifact"].update(filename=model.name, size_bytes=model.stat().st_size)
         manager.parent_model_path_exists = True
         manager.model_path_was_relative = False
         validate_artifact = getattr(manager, "_validate_existing_model_artifact", None)
@@ -3443,21 +3449,26 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             model_phase_started + GPU_COMPLETION_PHASE_DEADLINES_MS["model_load"] / 1000,
         )
 
-        def validate_pinned_artifact() -> bool:
+        def validate_pinned_artifact() -> Optional[str]:
             digest = hashlib.sha256()
             with model.open("rb") as artifact_file:
                 for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
                     digest.update(chunk)
             artifact_valid, _artifact_reason = validate_artifact(hash_if_suspect=True)
-            return bool(
+            actual_sha256 = digest.hexdigest().lower()
+            if not (
                 artifact_valid is True
                 and model.stat().st_size == int(expected_size)
-                and digest.hexdigest().lower() == expected_sha256
-            )
+                and actual_sha256 == expected_sha256
+            ):
+                return None
+            return actual_sha256
 
-        if not _gpu_preflight_bounded_call(validate_pinned_artifact, model_deadline):
+        artifact_sha256 = _gpu_preflight_bounded_call(validate_pinned_artifact, model_deadline)
+        if not artifact_sha256:
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
+        evidence["artifact"]["artifact_sha256"] = artifact_sha256
 
         def reject_download(*_args: Any, **_kwargs: Any) -> bool:
             raise RuntimeError("qualification_model_download_forbidden")

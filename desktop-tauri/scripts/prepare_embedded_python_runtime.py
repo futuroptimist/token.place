@@ -95,6 +95,7 @@ def extract_archive(archive: Path, m: dict, tmp_parent: Path) -> Path:
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy(); env.update(kw.pop("env", {}) or {})
     env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     result = subprocess.run(cmd, text=True, capture_output=True, check=False, env=env, **kw)
     if result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)

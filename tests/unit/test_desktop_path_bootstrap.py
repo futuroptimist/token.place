@@ -59,6 +59,24 @@ def test_bootstrap_adds_repo_root_for_dev_layout(tmp_path, path_bootstrap):
         sys.path[:] = original_sys_path
 
 
+def test_packaged_bootstrap_disables_bytecode_without_changing_development(tmp_path, path_bootstrap):
+    packaged = tmp_path / 'Token Place.app' / 'Contents' / 'Resources' / 'python' / 'model_bridge.py'
+    development = tmp_path / 'repo' / 'desktop-tauri' / 'src-tauri' / 'python' / 'model_bridge.py'
+    for script in (packaged, development):
+        script.parent.mkdir(parents=True)
+        script.write_text('# bridge\n', encoding='utf-8')
+
+    original = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = False
+        path_bootstrap.ensure_runtime_import_paths(str(development))
+        assert sys.dont_write_bytecode is False
+        path_bootstrap.ensure_runtime_import_paths(str(packaged))
+        assert sys.dont_write_bytecode is True
+    finally:
+        sys.dont_write_bytecode = original
+
+
 def test_bootstrap_supports_nested_up_packaged_layout(tmp_path, path_bootstrap):
     script = tmp_path / 'bin' / 'resources' / 'python' / 'model_bridge.py'
     import_root = tmp_path / 'bin' / 'resources' / '_up_' / '_up_'

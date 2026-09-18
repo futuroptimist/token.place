@@ -907,6 +907,7 @@ def _probe_llama_runtime(*, runtime_root: Optional[Path] = None, cancellation_pr
         pythonpath_entries = [str(dependency_target), str(python_root)] if dependency_target is not None else [str(python_root)]
         probe_cwd = str(python_root)
         env["PYTHONNOUSERSITE"] = "1"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
     elif unbundled_windows:
         pythonpath_entries = None
         probe_cwd = None
@@ -1834,6 +1835,8 @@ def maybe_reexec_for_runtime_refresh(
         return
     env = os.environ.copy()
     env[REEXEC_GUARD_ENV] = "1"
+    if _is_exact_packaged_runtime_layout():
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         os.execve(sys.executable, [sys.executable, *sys.argv], env)
     except OSError:

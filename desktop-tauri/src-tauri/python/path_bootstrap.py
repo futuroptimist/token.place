@@ -9,6 +9,12 @@ import sys
 import sysconfig
 from collections.abc import Iterable
 
+_BOOTSTRAP_PATH = os.path.realpath(os.path.abspath(__file__)).replace("\\", "/").lower()
+if "/contents/resources/python/" in _BOOTSTRAP_PATH or "/resources/python/" in _BOOTSTRAP_PATH:
+    # Set this while the bootstrap module itself is still importing so Python
+    # cannot write its bytecode into the signed packaged resource tree.
+    sys.dont_write_bytecode = True
+
 _CRITICAL_STDLIB_MODULES = (
     "collections",
     "typing",
@@ -204,6 +210,11 @@ def ensure_runtime_import_paths(
     script_path = _safe_resolve_path_text(script_file)
     script_dir = os.path.dirname(script_path)
     script_root = _parent(script_dir)
+    normalized_script = script_path.replace("\\", "/").lower()
+    if "/contents/resources/python/" in normalized_script or "/resources/python/" in normalized_script:
+        # Packaged bridges execute from immutable application resources. Prevent
+        # imports from creating unsigned bytecode beside those resources.
+        sys.dont_write_bytecode = True
     explicit_import_root = os.environ.get("TOKEN_PLACE_PYTHON_IMPORT_ROOT", "").strip()
     dependency_target = os.environ.get("TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET", "").strip()
     candidates = [

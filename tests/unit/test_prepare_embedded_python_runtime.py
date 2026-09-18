@@ -6,6 +6,8 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parents[2] / 'desktop-tauri' / 'scripts' / 'prepare_embedded_python_runtime.py'
 spec = importlib.util.spec_from_file_location('prepare_embedded_python_runtime', SCRIPT)
 assert spec is not None
@@ -276,12 +278,25 @@ def test_clean_preserves_pip_internal_build_package(tmp_path):
     pycache = runtime / 'lib' / 'python3.11' / 'site-packages' / 'somepkg' / '__pycache__'
     pycache.mkdir(parents=True)
     (pycache / 'module.pyc').write_bytes(b'cache')
+    (runtime / 'stale.pyo').write_bytes(b'cache')
 
     prep.clean(runtime)
 
     assert (pip_build / '__init__.py').is_file()
     assert not test_dir.exists()
     assert not pycache.exists()
+    assert not (runtime / 'stale.pyo').exists()
+
+
+def test_clean_fails_if_bytecode_cannot_be_removed(tmp_path, monkeypatch):
+    runtime = tmp_path / 'python-runtime'
+    pycache = runtime / '__pycache__'
+    pycache.mkdir(parents=True)
+    (pycache / 'module.pyc').write_bytes(b'cache')
+    monkeypatch.setattr(prep.shutil, 'rmtree', lambda *_args, **_kwargs: None)
+
+    with pytest.raises(prep.RuntimePrepError, match='cleanup left Python bytecode'):
+        prep.clean(runtime)
 
 
 def test_load_manifest_rejects_latest_url_uppercase_sha_and_package_drift(tmp_path):

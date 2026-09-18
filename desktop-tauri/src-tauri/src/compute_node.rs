@@ -306,6 +306,8 @@ fn apply_benchmark_tokenizer_env<C>(
 }
 
 const EXPECTED_MODEL_ARTIFACT_FILENAME: &str = "Qwen3-8B-Q4_K_M.gguf";
+const EXPECTED_MODEL_ARTIFACT_SHA256: &str =
+    "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputeNodeRequest {
@@ -2783,6 +2785,7 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
         "success",
         "failure_code",
         "artifact",
+        "artifact_sha256",
         "identity",
         "backend",
         "completion",
@@ -2793,7 +2796,7 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
         "side_effects",
     ];
     let keys_are_allowlisted = event.as_object().is_some_and(|map| {
-        map.len() == allowed_keys.len()
+        (map.len() == allowed_keys.len() || map.len() + 1 == allowed_keys.len())
             && map.keys().all(|key| allowed_keys.contains(&key.as_str()))
     }) && exact_keys(event.get("artifact"), &["filename", "size_bytes"])
         && exact_keys(
@@ -2917,6 +2920,8 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
                 .pointer("/artifact/size_bytes")
                 .and_then(Value::as_u64)
                 == Some(5_027_783_488)
+            && event.get("artifact_sha256").and_then(Value::as_str)
+                == Some(EXPECTED_MODEL_ARTIFACT_SHA256)
             && nonempty_identity
             && event.pointer("/identity/runtime_id")
                 == event.pointer("/identity/bundled_runtime_id")
@@ -2972,6 +2977,9 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
         .pointer("/artifact/size_bytes")
         .and_then(Value::as_u64)
         .is_some()
+        && event
+            .get("artifact_sha256")
+            .is_none_or(|value| value.as_str() == Some(EXPECTED_MODEL_ARTIFACT_SHA256))
         && matches!(
             event.pointer("/backend/declared").and_then(Value::as_str),
             Some("unknown" | "cuda" | "metal")
@@ -9293,6 +9301,7 @@ mod tests {
             "success": true,
             "failure_code": "none",
             "artifact": {"filename": "Qwen3-8B-Q4_K_M.gguf", "size_bytes": 5027783488_u64},
+            "artifact_sha256": EXPECTED_MODEL_ARTIFACT_SHA256,
             "identity": {"app_version": "0.1.19", "build_id": "build", "target_triple": "target", "bundled_runtime_id": "runtime", "runtime_id": "runtime"},
             "backend": {"declared": "cuda", "observed": "cuda", "gpu_verified": true},
             "completion": {"path": "shared_api_v1_generation", "count": 1, "max_output_tokens": 64, "result": "passed"},
@@ -9309,6 +9318,12 @@ mod tests {
             "side_effects": {"relay_contacts": 0, "registrations": 0, "benchmark_attempts": 0}
         });
         assert!(validate_gpu_completion_preflight_event(accepted.clone()).is_ok());
+        let mut missing_digest = accepted.clone();
+        missing_digest
+            .as_object_mut()
+            .expect("fixture object")
+            .remove("artifact_sha256");
+        assert!(validate_gpu_completion_preflight_event(missing_digest).is_err());
         assert!(
             validate_gpu_completion_preflight_event(gpu_completion_preflight_native_failure())
                 .is_ok()

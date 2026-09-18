@@ -488,6 +488,9 @@ def clean(runtime: Path) -> None:
     for p in runtime.rglob("*"):
         if p.is_dir() and p.name in {"__pycache__", "tests", "test"}: shutil.rmtree(p, ignore_errors=True)
         elif p.is_file() and (p.suffix == ".pyc" or p.name.endswith(".pyo")): p.unlink(missing_ok=True)
+    leftovers = [p for p in runtime.rglob("*") if p.name == "__pycache__" or p.suffix in {".pyc", ".pyo"}]
+    if leftovers:
+        raise RuntimePrepError(f"embedded runtime cleanup left Python bytecode: {leftovers[0]}")
 
 def provenance(m: dict, packages: dict) -> dict:
     try: commit = subprocess.check_output(["git","rev-parse","HEAD"], cwd=ROOT.parent, text=True).strip()

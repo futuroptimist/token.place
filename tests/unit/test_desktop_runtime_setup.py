@@ -981,6 +981,7 @@ def test_maybe_reexec_for_runtime_refresh_reexecs_once(monkeypatch):
     monkeypatch.setenv('TOKENPLACE_COMPUTE_NODE_SESSION_ID', 'session-123')
     monkeypatch.setenv('TOKENPLACE_OPERATOR_EVENT_SEQUENCE', '41')
     monkeypatch.setenv('TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET', '/tmp/token-place-managed-site')
+    monkeypatch.setattr(desktop_runtime_setup, '_is_exact_packaged_runtime_layout', lambda: True)
 
     desktop_runtime_setup.maybe_reexec_for_runtime_refresh({'runtime_action': 'installed_cuda_reexec'})
 
@@ -989,6 +990,7 @@ def test_maybe_reexec_for_runtime_refresh_reexecs_once(monkeypatch):
     assert called['env']['TOKENPLACE_COMPUTE_NODE_SESSION_ID'] == 'session-123'
     assert called['env']['TOKENPLACE_OPERATOR_EVENT_SEQUENCE'] == '41'
     assert called['env']['TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET'] == '/tmp/token-place-managed-site'
+    assert called['env']['PYTHONDONTWRITEBYTECODE'] == '1'
 
 
 def test_windows_runtime_bootstrap_respects_opt_out_env(monkeypatch):
@@ -4390,6 +4392,7 @@ def test_exact_packaged_probe_ignores_hostile_dependency_targets(monkeypatch, tm
     assert probe.error == 'probe_process_abnormal_exit'
     env = called['popen_env']
     assert env['PYTHONNOUSERSITE'] == '1'
+    assert env['PYTHONDONTWRITEBYTECODE'] == '1'
     assert str(hostile) not in env.get('PYTHONPATH', '')
     assert 'TOKEN_PLACE_DESKTOP_DEPENDENCY_TARGET' not in env
 

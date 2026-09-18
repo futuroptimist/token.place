@@ -389,6 +389,18 @@ def _app_tree_fingerprint(app_path: Path) -> dict[str, AppTreeEntry]:
     return fingerprint
 
 
+def _validate_no_python_bytecode(root: Path) -> None:
+    offenders = [
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.name == "__pycache__" or (path.is_file() and path.suffix.lower() in {".pyc", ".pyo"})
+    ]
+    if offenders:
+        sample = ", ".join(offenders[:10])
+        suffix = "" if len(offenders) <= 10 else f" (+{len(offenders) - 10} more)"
+        _fail(f"packaged artifact contains forbidden Python bytecode: {sample}{suffix}")
+
+
 def _describe_app_tree_changes(before: dict[str, AppTreeEntry], after: dict[str, AppTreeEntry]) -> list[str]:
     changes: list[str] = []
     before_paths = set(before)
@@ -808,6 +820,7 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool, require_embe
             elif DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
                 _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")
             mounted_app = apps[0]
+            _validate_no_python_bytecode(mounted_app)
             if require_embedded_python_runtime:
                 _validate_embedded_python_runtime_non_mutating(mounted_app)
             _codesign_verify(mounted_app)
@@ -845,6 +858,7 @@ def main() -> None:
 
     if not app_path.exists() or app_path.suffix != ".app":
         _fail(f"app bundle missing or invalid: {app_path}")
+    _validate_no_python_bytecode(app_path)
     if not expected_icon.exists() or not expected_icon.is_file():
         _fail(f"expected icon missing or invalid: {expected_icon}")
 

@@ -180,6 +180,11 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
     assert code == 0
     assert evidence["success"] is True
     assert evidence["completion"]["count"] == 1
+    assert evidence["artifact"] == {
+        "filename": "Qwen3-8B-Q4_K_M.gguf",
+        "size_bytes": len(b"fixture"),
+    }
+    assert evidence["artifact_sha256"] == hashlib.sha256(b"fixture").hexdigest()
     assert evidence["backend"] == {"declared": "cuda", "observed": "cuda", "gpu_verified": True}
     assert evidence["cleanup"] == {"attempted": True, "verified": True, "owned_worker_alive": False}
     assert created[0].stop_saw_loaded_worker is True
@@ -187,6 +192,22 @@ def test_installed_gpu_completion_preflight_success_is_single_and_private(monkey
     serialized = json.dumps(evidence)
     assert "private output" not in serialized
     assert str(model.parent) not in serialized
+
+
+def test_installed_gpu_completion_pinned_identity_failure_does_not_attest_digest(monkeypatch, tmp_path):
+    _completion_preflight_environment(monkeypatch)
+    model = tmp_path / "Qwen3-8B-Q4_K_M.gguf"
+    model.write_bytes(b"wrong fixture")
+
+    code, evidence = compute_node_bridge.installed_gpu_completion_preflight(
+        _completion_preflight_args(model), _CompletionPreflightRuntime
+    )
+
+    assert code == 3
+    assert evidence["failure_code"] == "model_identity_mismatch"
+    assert evidence["artifact"]["filename"] == model.name
+    assert evidence["artifact"]["size_bytes"] == len(b"wrong fixture")
+    assert "artifact_sha256" not in evidence
 
 
 @pytest.mark.parametrize(

@@ -169,4 +169,4 @@ jobs:
           python -m pip install --upgrade pip
           python scripts/prepare_embedded_python_runtime.py
           test -x src-tauri/python-runtime/bin/python3
-          PYTHONDONTWRITEBYTECODE=1 src-tauri/python-runtime/bin/python3 -B -m pip check
+          src-tauri/python-runtime/bin/python3 -m pip check

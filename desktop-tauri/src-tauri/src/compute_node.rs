@@ -2975,11 +2975,11 @@ fn validate_gpu_completion_preflight_event(event: Value) -> anyhow::Result<Value
             .pointer("/artifact/artifact_sha256")
             .and_then(Value::as_str)
             .is_some_and(|value| {
-                value == "unknown"
-                    || (value.len() == 64
-                        && value
-                            .bytes()
-                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+                if success {
+                    value == "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+                } else {
+                    value == "unknown"
+                }
             })
         && matches!(
             event.pointer("/backend/declared").and_then(Value::as_str),
@@ -9318,6 +9318,9 @@ mod tests {
             "side_effects": {"relay_contacts": 0, "registrations": 0, "benchmark_attempts": 0}
         });
         assert!(validate_gpu_completion_preflight_event(accepted.clone()).is_ok());
+        let mut wrong_digest = accepted.clone();
+        wrong_digest["artifact"]["artifact_sha256"] = Value::String("0".repeat(64));
+        assert!(validate_gpu_completion_preflight_event(wrong_digest).is_err());
         assert!(
             validate_gpu_completion_preflight_event(gpu_completion_preflight_native_failure())
                 .is_ok()
@@ -9350,6 +9353,7 @@ mod tests {
         let mut failed = accepted;
         failed["success"] = Value::Bool(false);
         failed["failure_code"] = Value::String("cleanup_failed".into());
+        failed["artifact"]["artifact_sha256"] = Value::String("unknown".into());
         assert!(validate_gpu_completion_preflight_event(failed.clone()).is_ok());
         failed["secret"] = Value::String("must not pass".into());
         assert!(validate_gpu_completion_preflight_event(failed).is_err());

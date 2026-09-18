@@ -488,12 +488,12 @@ def probe_runtime(py: Path, m: dict) -> dict:
 def clean(runtime: Path) -> None:
     for p in runtime.rglob("*"):
         if p.is_dir() and p.name in {"__pycache__", "tests", "test"}: shutil.rmtree(p, ignore_errors=True)
-        elif p.is_file() and (p.suffix == ".pyc" or p.name.endswith(".pyo")): p.unlink(missing_ok=True)
+        elif p.is_file() and p.suffix.lower() in {".pyc", ".pyo"}: p.unlink(missing_ok=True)
 
 def contains_python_bytecode(runtime: Path) -> bool:
     return any(
         (p.is_dir() and p.name == "__pycache__")
-        or (p.is_file() and p.suffix in {".pyc", ".pyo"})
+        or (p.is_file() and p.suffix.lower() in {".pyc", ".pyo"})
         for p in runtime.rglob("*")
     )
 

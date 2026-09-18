@@ -676,7 +676,7 @@ def test_workflow_prepares_and_validates_embedded_macos_runtime() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
     assert 'Prepare embedded macOS Python runtime' in text
     assert 'python scripts/prepare_embedded_python_runtime.py' in text
-    assert 'PYTHONDONTWRITEBYTECODE=1 src-tauri/python-runtime/bin/python3 -B -m pip check' in text
+    assert 'src-tauri/python-runtime/bin/python3 -m pip check' in text
     assert '--require-embedded-python-runtime' in text
 
 
@@ -2351,12 +2351,22 @@ def test_app_tree_fingerprint_reports_mutations(tmp_path) -> None:
     assert 'retargeted symlink: Contents/Resources/link' in changes
 
 
-def test_release_validator_rejects_preexisting_python_bytecode(tmp_path) -> None:
+@pytest.mark.parametrize('relative_path', [
+    'python/__pycache__',
+    'python/bridge.pyc',
+    'python/bridge.pyo',
+    'python/bridge.PYC',
+    'python/bridge.PyO',
+])
+def test_release_validator_rejects_preexisting_python_bytecode(tmp_path, relative_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'x.app'
-    cache = app / 'Contents' / 'Resources' / 'python' / '__pycache__'
-    cache.mkdir(parents=True)
-    (cache / 'bridge.cpython-311.pyc').write_bytes(b'bytecode')
+    forbidden = app / 'Contents' / 'Resources' / relative_path
+    if forbidden.name == '__pycache__':
+        forbidden.mkdir(parents=True)
+    else:
+        forbidden.parent.mkdir(parents=True, exist_ok=True)
+        forbidden.write_bytes(b'bytecode')
     with pytest.raises(SystemExit, match='forbidden Python bytecode'):
         validator._validate_no_python_bytecode(app)
 

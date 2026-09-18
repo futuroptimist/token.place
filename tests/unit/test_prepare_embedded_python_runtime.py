@@ -284,6 +284,18 @@ def test_clean_preserves_pip_internal_build_package(tmp_path):
     assert not pycache.exists()
 
 
+def test_clean_removes_case_insensitive_bytecode_suffixes(tmp_path):
+    runtime = tmp_path / 'python-runtime'
+    bytecode_files = [runtime / 'package' / f'module{suffix}' for suffix in ['.pyc', '.pyo', '.PYC', '.PyO']]
+    bytecode_files[0].parent.mkdir(parents=True)
+    for bytecode in bytecode_files:
+        bytecode.write_bytes(b'cache')
+
+    prep.clean(runtime)
+
+    assert all(not bytecode.exists() for bytecode in bytecode_files)
+
+
 def test_run_suppresses_child_bytecode(monkeypatch):
     captured = {}
     monkeypatch.setattr(prep.subprocess, 'run', lambda *args, **kwargs: captured.update(kwargs) or type('Result', (), {'returncode': 0})())

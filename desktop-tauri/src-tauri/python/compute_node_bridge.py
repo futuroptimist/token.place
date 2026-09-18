@@ -3446,11 +3446,10 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         def validate_pinned_artifact() -> bool:
             nonlocal validated_digest
             artifact_valid, _artifact_reason = validate_artifact(hash_if_suspect=True)
-            validated_digest = expected_sha256
-            return bool(
-                artifact_valid is True
-                and model.stat().st_size == int(expected_size)
-            )
+            valid = artifact_valid is True and model.stat().st_size == int(expected_size)
+            if valid:
+                validated_digest = expected_sha256
+            return valid
 
         if not _gpu_preflight_bounded_call(validate_pinned_artifact, model_deadline):
             evidence["failure_code"] = "model_identity_mismatch"

@@ -12,6 +12,7 @@ import subprocess
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from threading import Barrier, Event
 
 import pytest
@@ -95,13 +96,13 @@ def _free_port():
         return sock.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def valkey_server(tmp_path_factory):
+@contextmanager
+def _isolated_valkey_server(tmp_path_factory, label):
     executable = shutil.which("valkey-server")
     if executable is None:
         pytest.fail("valkey-server is required for the real-backend integration tests")
     port = _free_port()
-    work = tmp_path_factory.mktemp("valkey-foundation")
+    work = tmp_path_factory.mktemp(label)
     process = subprocess.Popen(
         [
             executable,
@@ -141,6 +142,12 @@ def valkey_server(tmp_path_factory):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+
+
+@pytest.fixture(scope="module")
+def valkey_server(tmp_path_factory):
+    with _isolated_valkey_server(tmp_path_factory, "valkey-foundation") as port:
+        yield port
 
 
 def _manifest(**changes):
@@ -333,20 +340,25 @@ def test_concurrent_manifest_initialization_is_atomic(valkey_server):
 
 
 def test_server_time_and_exact_noscript_recovery_without_lifecycle_mutation(
-    valkey_server,
+    tmp_path_factory,
 ):
-    foundation = _foundation(valkey_server)
-    try:
-        foundation.initialize_manifest()
-        assert foundation._client.script_exists(SERVER_TIME_SCRIPT.eval_sha1) == [False]
-        before = foundation._client.dbsize()
-        seconds, micros = foundation.server_time()
-        assert abs(seconds - time.time()) < 5 and 0 <= micros < 1_000_000
-        assert foundation._client.script_exists(SERVER_TIME_SCRIPT.eval_sha1) == [True]
-        assert foundation._client.dbsize() == before  # only the schema manifest exists
-    finally:
-        foundation._client.delete(foundation.config.key("schema"))
-        foundation.close()
+    with _isolated_valkey_server(tmp_path_factory, "valkey-server-time") as port:
+        foundation = _foundation(port)
+        try:
+            foundation.initialize_manifest()
+            assert foundation._client.script_exists(SERVER_TIME_SCRIPT.eval_sha1) == [
+                False
+            ]
+            before = foundation._client.dbsize()
+            seconds, micros = foundation.server_time()
+            assert abs(seconds - time.time()) < 5 and 0 <= micros < 1_000_000
+            assert foundation._client.script_exists(SERVER_TIME_SCRIPT.eval_sha1) == [
+                True
+            ]
+            assert foundation._client.dbsize() == before  # only the schema manifest exists
+        finally:
+            foundation._client.delete(foundation.config.key("schema"))
+            foundation.close()
 
 
 def test_conflicting_concurrent_initializers_preserve_one_manifest(valkey_server):

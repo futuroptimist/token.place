@@ -189,8 +189,7 @@ def _render_index_html(host: str | None = None) -> str:
 def _handle_shutdown_signal(signum: int, frame: Any) -> None:
     """Mark the process as draining and defer to the original handler."""
 
-    if _begin_draining():
-        LOGGER.info("relay.shutdown.signal", extra={"signal": signum})
+    _begin_draining_async(signum)
 
     original = _ORIGINAL_SIGNAL_HANDLERS.get(signum)
     if callable(original) and original not in (signal.SIG_DFL, signal.SIG_IGN, _handle_shutdown_signal):
@@ -210,6 +209,28 @@ def _begin_draining() -> bool:
             return False
         DRAINING.set()
         return True
+
+
+def _begin_draining_async(signum: int, after_drain=None) -> None:
+    """Hand signal-driven drain coordination to a thread that may safely wait.
+
+    Python can run a handler on the main thread while that thread owns the
+    admission lock, even when the signal was delivered to another thread.
+    Signal handlers therefore never acquire the gate synchronously; the drain
+    transition still takes the gate and remains ordered with every admission.
+    """
+
+    def begin_draining() -> None:
+        if _begin_draining():
+            LOGGER.info("relay.shutdown.signal", extra={"signal": signum})
+        if after_drain is not None:
+            after_drain()
+
+    threading.Thread(
+        target=begin_draining,
+        name="relay-drain-coordinator",
+        daemon=False,
+    ).start()
 
 
 @contextmanager
@@ -4060,20 +4081,19 @@ def serve(host: str, port: int) -> None:
             except Exception:  # pragma: no cover - defensive logging path
                 LOGGER.exception("relay.shutdown.error")
 
-        shutdown_thread = threading.Thread(
+        thread = threading.Thread(
             target=_shutdown_server,
             name="relay-server-shutdown",
             daemon=False,
         )
-        shutdown_thread.start()
+        thread.start()
+        shutdown_thread = thread
 
     def _handle_signal(signum, _frame):
-        if _begin_draining():
-            LOGGER.info("relay.shutdown.signal", extra={"signal": signum})
         if shutdown_requested.is_set():
             return
         shutdown_requested.set()
-        _shutdown_server_async()
+        _begin_draining_async(signum, _shutdown_server_async)
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)

@@ -1,6 +1,10 @@
 """Focused route wiring coverage for the in-memory API-v1 relay state store."""
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
 import threading
 from unittest.mock import Mock
 
@@ -13,6 +17,106 @@ from valkey_relay_state import (
     ValkeySchemaIncompatibleError,
     ValkeyUnavailableError,
 )
+
+
+@pytest.mark.parametrize("handler_path", ["installed", "serve"])
+@pytest.mark.parametrize("pthread_sigmask", [True, False])
+def test_real_shutdown_signals_do_not_deadlock_admission(
+    handler_path, pthread_sigmask
+):
+    """Exercise both production handlers in a bounded child process."""
+
+    program = textwrap.dedent(
+        f"""
+        import os
+        import signal
+        import threading
+        chained = []
+        signal.signal(signal.SIGTERM, lambda signum, frame: chained.append(signum))
+        signal.signal(signal.SIGINT, lambda signum, frame: chained.append(signum))
+        import relay
+
+        if not {pthread_sigmask!r}:
+            relay.signal.pthread_sigmask = None
+
+        client = relay.app.test_client()
+        registration = client.post('/api/v1/relay/servers/register', json={{
+            'server_public_key': 'signal-node',
+            'capabilities': {{'supported_model_ids': ['qwen3-8b-instruct'],
+                'active_context_tier': '8k-fast',
+                'maximum_total_context_tokens': 8192,
+                'default_output_token_reservation': 1024,
+                'maximum_output_tokens': 1024, 'max_concurrency': 1}},
+        }}).get_json()
+        selection = client.get('/api/v1/relay/servers/next', query_string={{
+            'client_public_key': 'signal-client', 'request_id': 'accepted',
+            'cancel_token': 'signal-cancel',
+        }}).get_json()
+        response = client.post('/api/v1/relay/requests', json={{
+            'server_public_key': 'signal-node',
+            'client_public_key': 'signal-client', 'request_id': 'accepted',
+            'cancel_token': 'signal-cancel',
+            'reservation_token': selection['reservation_token'],
+            'request_deadline_epoch': selection['request_deadline_epoch'],
+            'protocol': 'tokenplace_api_v1_relay_e2ee', 'version': 1,
+            'ciphertext': 'sealed', 'cipherkey': 'key', 'iv': 'iv',
+        }})
+        assert response.status_code == 200
+
+        sent = threading.Event()
+        def send_signals():
+            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), signal.SIGINT)
+            sent.set()
+
+        class Server:
+            def serve_forever(self):
+                with relay._admission_gate():
+                    sender = threading.Thread(target=send_signals)
+                    sender.start()
+                    assert sent.wait(2)
+                    sender.join()
+            def shutdown(self):
+                self.stopped.set()
+            stopped = threading.Event()
+
+        server = Server()
+        if {handler_path!r} == 'serve':
+            relay.make_server = lambda *args, **kwargs: server
+            relay.serve('127.0.0.1', 0)
+            assert server.stopped.wait(2)
+        else:
+            with relay._admission_gate():
+                sender = threading.Thread(target=send_signals)
+                sender.start()
+                assert sent.wait(2)
+                sender.join()
+
+        assert relay.DRAINING.wait(2)
+        denied = client.get('/api/v1/relay/servers/next', query_string={{
+            'client_public_key': 'late-client', 'request_id': 'late',
+        }})
+        assert denied.status_code == 503
+        poll = client.post('/api/v1/relay/servers/poll', json={{
+            'server_public_key': 'signal-node',
+            'control_credential': registration['control_credential'],
+        }})
+        assert poll.status_code == 200
+        assert poll.get_json()['message'] == 'No requests available'
+        assert len(relay._api_v1_store().queued_requests('signal-node')) == 1
+        if {handler_path!r} == 'installed':
+            assert sorted(chained) == sorted([signal.SIGTERM, signal.SIGINT])
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=os.fspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def _queue_for_owner(client, *, request_id="control-request"):

@@ -1869,6 +1869,33 @@ def _evict_stale_servers() -> list[str]:
     return evicted
 
 
+def _health_eligible_known_server_items() -> list[tuple[str, dict[str, Any]]]:
+    """Snapshot legacy registrations that eviction would currently preserve."""
+    default_stale_after = _server_stale_seconds()
+    now_monotonic = time.monotonic()
+    eligible: list[tuple[str, dict[str, Any]]] = []
+    with server_round_robin_lock:
+        server_items = list(known_servers.items())
+    for server_public_key, payload in server_items:
+        polling_until = payload.get("polling_until_monotonic")
+        if isinstance(polling_until, (int, float)) and polling_until > now_monotonic:
+            eligible.append((server_public_key, payload))
+            continue
+        if _api_v1_active_in_flight_count(payload, now_monotonic=now_monotonic) > 0:
+            eligible.append((server_public_key, payload))
+            continue
+        in_flight_until = payload.get("api_v1_in_flight_until_monotonic")
+        if isinstance(in_flight_until, (int, float)) and in_flight_until > now_monotonic:
+            eligible.append((server_public_key, payload))
+            continue
+        stale_after = payload.get("last_ping_duration", default_stale_after)
+        if not isinstance(stale_after, (int, float)):
+            stale_after = default_stale_after
+        if _server_ping_age_seconds(payload.get("last_ping")) <= max(float(stale_after), 1.0):
+            eligible.append((server_public_key, payload))
+    return eligible
+
+
 def _api_v1_server_diagnostics(
     store: RelayStateStore | None = None, *, health_probe: bool = False
 ) -> list[dict[str, Any]]:
@@ -1925,6 +1952,7 @@ def _live_server_diagnostics(
     api_v1_diagnostics: list[dict[str, Any]] | None = None,
     store: RelayStateStore | None = None,
     health_probe: bool = False,
+    known_server_items: list[tuple[str, dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     if api_v1_diagnostics is None:
         api_v1_diagnostics = _api_v1_server_diagnostics(
@@ -1932,12 +1960,9 @@ def _live_server_diagnostics(
         )
     diagnostics_by_key: dict[str, dict[str, Any]] = {}
     if not api_v1_only:
-        for server_public_key, payload in list(known_servers.items()):
-            stale_after = payload.get("last_ping_duration", _server_stale_seconds())
-            if not isinstance(stale_after, (int, float)):
-                stale_after = _server_stale_seconds()
-            if _server_ping_age_seconds(payload.get("last_ping")) > max(float(stale_after), 1.0):
-                continue
+        if known_server_items is None:
+            known_server_items = list(known_servers.items())
+        for server_public_key, payload in known_server_items:
             queue_depth = len(client_inference_requests.get(server_public_key, []))
             diagnostics_by_key[server_public_key] = {
                 "server_public_key": server_public_key,
@@ -2212,8 +2237,11 @@ def healthz():
         store, close_store = _api_v1_health_store()
         if isinstance(store, ValkeyRegistrationStore):
             store.readiness()
+        eligible_known_servers = _health_eligible_known_server_items()
         registered_servers = _live_server_diagnostics(
-            store=store, health_probe=True
+            store=store,
+            health_probe=True,
+            known_server_items=eligible_known_servers,
         )
     except ValkeySchemaIncompatibleError:
         return _schema_failure_response()
@@ -2245,7 +2273,7 @@ def healthz():
         "activeUpstreamServers": active_upstream_servers,
         "requiredUpstreamServers": required_upstream_servers,
         "gpuHost": gpu_host,
-        "knownServers": len(known_servers),
+        "knownServers": len(eligible_known_servers),
         "registeredServers": registered_servers,
     }
     status["configuredUpstreamServers"] = configured_servers
@@ -2261,7 +2289,7 @@ def healthz():
         )
         return jsonify(status), 503
 
-    if not known_servers:
+    if not eligible_known_servers:
         status.setdefault("details", {})["knownServers"] = "empty"
 
     return jsonify(status)

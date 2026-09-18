@@ -1984,22 +1984,94 @@ def test_healthz_reports_configured_upstreams_and_live_queue_depth(client, monke
     }
 
 
-def test_healthz_filters_expired_legacy_servers_without_mutating_state(client):
-    """Readiness omits stale registrations but leaves cleanup to runtime paths."""
-    expired_server_key = base64.b64encode(b"expired_server_key").decode("utf-8")
-    known_servers[expired_server_key] = {
-        "public_key": expired_server_key,
-        "last_ping": datetime.now() - timedelta(seconds=20),
+def test_healthz_filters_only_unprotected_expired_legacy_servers_without_mutation(client, monkeypatch):
+    """Readiness mirrors eviction eligibility without performing its cleanup."""
+    now = 1000.0
+    monkeypatch.setattr(relay_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(relay_module, "_server_ping_age_seconds", lambda ping: float(ping))
+    registrations = {
+        "fresh": {"last_ping": 1, "last_ping_duration": 5},
+        "expired": {"last_ping": 20, "last_ping_duration": 5},
+        "active-poll": {
+            "last_ping": 20,
+            "last_ping_duration": 5,
+            "polling_until_monotonic": now + 1,
+        },
+        "active-request": {
+            "last_ping": 20,
+            "last_ping_duration": 5,
+            "api_v1_in_flight_requests": {"request": {"expires_at": now + 1}},
+        },
+        "active-in-flight-window": {
+            "last_ping": 20,
+            "last_ping_duration": 5,
+            "api_v1_in_flight_until_monotonic": now + 1,
+        },
+        "expired-protections": {
+            "last_ping": 20,
+            "last_ping_duration": 5,
+            "polling_until_monotonic": now,
+            "api_v1_in_flight_requests": {"request": {"expires_at": now}},
+            "api_v1_in_flight_until_monotonic": now,
+        },
+    }
+    known_servers.update(registrations)
+    client_inference_requests["active-poll"] = [{"opaque": "queued"}]
+    records_before = {key: dict(value) for key, value in known_servers.items()}
+    queue_before = list(client_inference_requests["active-poll"])
+
+    response = client.get("/healthz")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert {node["server_public_key"] for node in payload["registeredServers"]} == {
+        "fresh",
+        "active-poll",
+        "active-request",
+        "active-in-flight-window",
+    }
+    assert payload["knownServers"] == 4
+    assert payload.get("details", {}).get("knownServers") is None
+    assert known_servers == records_before
+    assert client_inference_requests["active-poll"] == queue_before
+
+
+def test_healthz_reports_empty_when_only_expired_legacy_servers_remain(client, monkeypatch):
+    monkeypatch.setattr(relay_module.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(relay_module, "_server_ping_age_seconds", lambda _ping: 20.0)
+    known_servers["expired"] = {
+        "last_ping": 0,
         "last_ping_duration": 5,
+        "polling_until_monotonic": 1000.0,
+        "api_v1_in_flight_until_monotonic": 999.0,
     }
 
     response = client.get("/healthz")
 
     assert response.status_code == 200
-    assert expired_server_key not in {
-        node["server_public_key"] for node in response.get_json()["registeredServers"]
+    assert response.get_json()["registeredServers"] == []
+    assert response.get_json()["knownServers"] == 0
+    assert response.get_json()["details"]["knownServers"] == "empty"
+    assert "expired" in known_servers
+
+
+def test_relay_diagnostics_keeps_eviction_protected_stale_registration_visible(client, monkeypatch):
+    now = 1000.0
+    monkeypatch.setattr(relay_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(relay_module, "_server_ping_age_seconds", lambda _ping: 20.0)
+    known_servers["protected"] = {
+        "last_ping": 0,
+        "last_ping_duration": 5,
+        "polling_until_monotonic": now + 1,
     }
-    assert expired_server_key in known_servers
+
+    response = client.get("/relay/diagnostics")
+
+    assert response.status_code == 200
+    assert [
+        node["server_public_key"] for node in response.get_json()["registered_compute_nodes"]
+    ] == ["protected"]
+    assert "protected" in known_servers
 
 
 def test_healthz_returns_draining_when_shutdown_flag_set(client):

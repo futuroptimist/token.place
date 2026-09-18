@@ -448,7 +448,7 @@ class SchemaManifest:
             }:
                 raise ValueError
             return cls(**value)
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
             raise ValkeySchemaIncompatibleError("state schema incompatible") from None
 
 

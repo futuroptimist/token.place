@@ -13,6 +13,7 @@ import signal
 import socket
 import sys
 import threading
+from contextlib import contextmanager
 import time
 from datetime import datetime
 from typing import Any, Dict
@@ -145,7 +146,7 @@ DRAINING = threading.Event()
 # Serializes the transition into draining with writes that admit new work.  The
 # event remains available for cheap read-only checks, but a check which guards a
 # reservation or claim must be made while this lock is held.
-_ADMISSION_LOCK = threading.RLock()
+_ADMISSION_LOCK = threading.Lock()
 _ORIGINAL_SIGNAL_HANDLERS: dict[int, Any] = {}
 STATIC_DIR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 INDEX_HTML_PATH = os.path.join(STATIC_DIR_PATH, "index.html")
@@ -209,6 +210,23 @@ def _begin_draining() -> bool:
             return False
         DRAINING.set()
         return True
+
+
+@contextmanager
+def _admission_gate():
+    """Exclude drain signals while a short admission transition is dispatched."""
+
+    blocked = {signal.SIGINT, signal.SIGTERM}
+    previous_mask = None
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if pthread_sigmask is not None:
+        previous_mask = pthread_sigmask(signal.SIG_BLOCK, blocked)
+    try:
+        with _ADMISSION_LOCK:
+            yield
+    finally:
+        if pthread_sigmask is not None and previous_mask is not None:
+            pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _install_shutdown_handlers() -> None:
@@ -1178,7 +1196,9 @@ def _api_v1_store_config(namespace: str) -> RelayStateStoreConfig:
     )
 
 
-def _new_valkey_api_v1_relay_state_store() -> RelayStateStore:
+def _new_valkey_api_v1_relay_state_store(
+    *, initialize_manifest: bool = True
+) -> RelayStateStore:
     schema_major = _valkey_int_setting("SCHEMA_MAJOR")
     reader_revision = _valkey_int_setting("READER_REVISION")
     writer_revision = _valkey_int_setting("WRITER_REVISION")
@@ -1242,8 +1262,9 @@ def _new_valkey_api_v1_relay_state_store() -> RelayStateStore:
     )
     foundation = ValkeyFoundation(config, expected)
     try:
-        foundation.initialize_manifest()
-        foundation.readiness()
+        if initialize_manifest:
+            foundation.initialize_manifest()
+            foundation.readiness()
         return ValkeyRegistrationStore(
             foundation,
             store_config,
@@ -1289,6 +1310,24 @@ def _api_v1_store() -> RelayStateStore:
     return api_v1_relay_state_store
 
 
+def _api_v1_health_store() -> tuple[RelayStateStore, bool]:
+    """Return a probe store without cold-start manifest creation or repair."""
+
+    if api_v1_relay_state_store is not None:
+        return _api_v1_store(), False
+    backend = os.environ.get(API_V1_STATE_BACKEND_ENV, "memory").strip().lower()
+    if backend == "valkey":
+        try:
+            return _new_valkey_api_v1_relay_state_store(initialize_manifest=False), True
+        except RelayStateStoreError:
+            raise
+        except ValkeyFoundationError as exc:
+            raise RelayStateStoreError(str(exc)) from None
+        except (TypeError, ValueError):
+            raise RelayStateStoreError("invalid Valkey runtime configuration") from None
+    return _api_v1_store(), False
+
+
 def _reset_api_v1_relay_state_store() -> None:
     global api_v1_relay_state_store
     with _api_v1_stale_lease_eviction_lock:
@@ -1303,14 +1342,17 @@ def _reset_api_v1_relay_state_store() -> None:
             LOGGER.warning("relay.state_backend_cleanup_failed")
 
 
-def _reconcile_api_v1_stale_lease_evictions(store: RelayStateStore) -> None:
+def _reconcile_api_v1_stale_lease_evictions(
+    store: RelayStateStore, tombstones=None
+) -> None:
     """Record each retained store-backed lease-expiry transition once."""
     if METRICS_MODE == "degraded":
         return
     with _api_v1_stale_lease_eviction_lock:
         if store is not api_v1_relay_state_store:
             return
-        tombstones = store.node_tombstones()
+        if tombstones is None:
+            tombstones = store.node_tombstones()
         retained = {
             (record.node_identity_digest, record.transition_epoch)
             for record in tombstones
@@ -1806,16 +1848,33 @@ def _evict_stale_servers() -> list[str]:
     return evicted
 
 
-def _api_v1_server_diagnostics() -> list[dict[str, Any]]:
-    store = _api_v1_store()
+def _api_v1_server_diagnostics(
+    store: RelayStateStore | None = None, *, health_probe: bool = False
+) -> list[dict[str, Any]]:
+    store = store or _api_v1_store()
     now = time.time()
     diagnostics = []
-    registrations = store.list()
-    _reconcile_api_v1_stale_lease_evictions(store)
+    if health_probe and isinstance(store, InMemoryRelayStateStore):
+        registrations, queue_depths, in_flight_counts, tombstones = (
+            store.health_snapshot()
+        )
+        _reconcile_api_v1_stale_lease_evictions(store, tombstones)
+    else:
+        registrations = store.list()
+        queue_depths = {
+            record.node_id: len(store.queued_requests(record.node_id))
+            for record in registrations
+        }
+        in_flight_counts = {
+            record.node_id: len(store.active_claims(record.node_id))
+            for record in registrations
+        }
+        if not health_probe:
+            _reconcile_api_v1_stale_lease_evictions(store)
     for record in registrations:
         capabilities = record.capabilities
-        queue_depth = len(store.queued_requests(record.node_id))
-        in_flight = len(store.active_claims(record.node_id))
+        queue_depth = queue_depths[record.node_id]
+        in_flight = in_flight_counts[record.node_id]
         lease_remaining = max(record.lease_expires_at_epoch - now, 0.0)
         diagnostics.append({
             "server_public_key": record.node_id,
@@ -1843,9 +1902,13 @@ def _live_server_diagnostics(
     *,
     api_v1_only: bool = False,
     api_v1_diagnostics: list[dict[str, Any]] | None = None,
+    store: RelayStateStore | None = None,
+    health_probe: bool = False,
 ) -> list[dict[str, Any]]:
     if api_v1_diagnostics is None:
-        api_v1_diagnostics = _api_v1_server_diagnostics()
+        api_v1_diagnostics = _api_v1_server_diagnostics(
+            store, health_probe=health_probe
+        )
     diagnostics_by_key: dict[str, dict[str, Any]] = {}
     if not api_v1_only:
         for server_public_key, payload in list(known_servers.items()):
@@ -2122,15 +2185,25 @@ def metrics():
 def healthz():
     if DRAINING.is_set():
         return _draining_response()
+    store = None
+    close_store = False
     try:
-        store = _api_v1_store()
+        store, close_store = _api_v1_health_store()
         if isinstance(store, ValkeyRegistrationStore):
             store.readiness()
-        registered_servers = _live_server_diagnostics()
+        registered_servers = _live_server_diagnostics(
+            store=store, health_probe=True
+        )
     except ValkeySchemaIncompatibleError:
         return _schema_failure_response()
     except RelayStateStoreError:
         return _store_failure_response()
+    finally:
+        if close_store and store is not None:
+            try:
+                store.close()
+            except Exception:
+                LOGGER.warning("relay.state_backend_cleanup_failed")
     gpu_host = app.config.get("gpu_host")
     configured_servers = app.config.get("relay_configured_servers", [])
     require_upstream_health = _env_truthy(REQUIRE_UPSTREAM_HEALTH_ENV, default=False)
@@ -2517,7 +2590,7 @@ def api_v1_relay_servers_next():
     cancel_token = request.args.get("cancel_token") or secrets.token_hex(32)
     deadline = time.time() + _api_v1_request_deadline_seconds()
     try:
-        with _ADMISSION_LOCK:
+        with _admission_gate():
             if DRAINING.is_set():
                 return _draining_response()
             result = _api_v1_store().select_and_reserve(
@@ -3373,7 +3446,7 @@ def api_v1_relay_servers_poll():
                 if registration is None:
                     return jsonify({'error': {'message': 'Server with the specified public key not found', 'code': 404}}), 404
                 next_lease_refresh = time.monotonic() + lease_refresh_interval
-            with _ADMISSION_LOCK:
+            with _admission_gate():
                 if DRAINING.is_set():
                     return jsonify({'message': 'No requests available', 'next_ping_in_x_seconds': 0,
                                     'poll_wait_seconds': _api_v1_poll_wait_seconds()}), 200
@@ -3449,7 +3522,7 @@ def api_v1_relay_requests():
     try:
         store = _api_v1_store()
         if not isinstance(token,str) or not token:
-            with _ADMISSION_LOCK:
+            with _admission_gate():
                 if DRAINING.is_set():
                     return _draining_response()
                 selection=store.select_and_reserve(client_key,request_id,model,tier,deadline,cancel)

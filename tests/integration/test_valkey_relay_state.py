@@ -274,7 +274,6 @@ def test_healthz_real_valkey_is_ready_without_capacity_or_state_mutation(
         client.set(isolated_key, b"untouched")
         before = tuple(client.dump(key) for key in exact_keys)
         monkeypatch.setattr(relay, "api_v1_relay_state_store", store)
-        monkeypatch.setattr(relay, "_live_server_diagnostics", lambda: [])
 
         response = relay.app.test_client().get("/healthz")
 
@@ -288,6 +287,32 @@ def test_healthz_real_valkey_is_ready_without_capacity_or_state_mutation(
         client.delete(*exact_keys, isolated_key)
         client.close()
         store.close()
+
+
+def test_cold_healthz_does_not_initialize_manifest_or_fallback(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    _set_runtime_factory_env(monkeypatch, valkey_server, namespace)
+    client = redis.Redis(host="127.0.0.1", port=valkey_server, socket_timeout=0.4)
+    schema_key = f"tokenplace:{{test:{namespace}}}:relay:v1:schema"
+    try:
+        monkeypatch.setattr(relay, "api_v1_relay_state_store", None)
+
+        response = relay.app.test_client().get("/healthz")
+
+        assert response.status_code == 503
+        assert response.get_json() == {
+            "error": {
+                "message": "Relay state schema is incompatible",
+                "code": "state_schema_incompatible",
+            }
+        }
+        assert client.get(schema_key) is None
+        assert relay.api_v1_relay_state_store is None
+    finally:
+        client.delete(schema_key)
+        client.close()
 
 
 def test_concurrent_manifest_initialization_is_atomic(valkey_server):

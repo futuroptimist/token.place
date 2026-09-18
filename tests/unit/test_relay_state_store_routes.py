@@ -76,6 +76,30 @@ def test_healthz_valkey_readiness_fails_closed_before_protocol_reads(
     protocol_read.assert_not_called()
 
 
+def test_healthz_memory_snapshot_filters_without_reaping():
+    relay._reset_api_v1_relay_state_store()
+    store = relay._api_v1_store()
+    client = relay.app.test_client()
+    response = client.post("/api/v1/relay/servers/register", json={
+        "server_public_key": "expired-health-node",
+        "capabilities": {"supported_model_ids": ["qwen3-8b-instruct"],
+                         "active_context_tier": "8k-fast",
+                         "maximum_total_context_tokens": 8192,
+                         "default_output_token_reservation": 1024,
+                         "maximum_output_tokens": 1024, "max_concurrency": 1},
+    })
+    assert response.status_code == 200
+    record = store._records["expired-health-node"]
+    store._epoch_time = lambda: record.lease_expires_at_epoch + 1
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.get_json()["registeredServers"] == []
+    assert "expired-health-node" in store._records
+    assert store._node_tombstones == {}
+
+
 def test_livez_never_touches_state_store_while_draining(monkeypatch):
     monkeypatch.setattr(
         relay, "_api_v1_store", Mock(side_effect=AssertionError("store touched"))
@@ -204,6 +228,55 @@ def test_drain_transition_cannot_race_server_claim(monkeypatch):
     finally:
         if drain_thread is not None:
             drain_thread.join(timeout=1)
+        relay.DRAINING.clear()
+
+
+def test_drain_during_waiting_poll_skips_another_claim(monkeypatch):
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    registration = client.post("/api/v1/relay/servers/register", json={
+        "server_public_key": "waiting-node",
+        "capabilities": {"supported_model_ids": ["qwen3-8b-instruct"],
+                         "active_context_tier": "8k-fast",
+                         "maximum_total_context_tokens": 8192,
+                         "default_output_token_reservation": 1024,
+                         "maximum_output_tokens": 1024, "max_concurrency": 1},
+    }).get_json()
+    store = relay._api_v1_store()
+    claim = Mock(wraps=store.claim_queued_request)
+    monkeypatch.setattr(store, "claim_queued_request", claim)
+    waiting = threading.Event()
+    resume = threading.Event()
+
+    def controlled_wait(_seconds):
+        waiting.set()
+        assert resume.wait(1)
+
+    monkeypatch.setattr(relay.time, "sleep", controlled_wait)
+    result = {}
+
+    def poll():
+        with relay.app.test_client() as thread_client:
+            result["response"] = thread_client.post(
+                "/api/v1/relay/servers/poll",
+                json={"server_public_key": "waiting-node",
+                      "control_credential": registration["control_credential"]},
+            )
+
+    worker = threading.Thread(target=poll)
+    worker.start()
+    try:
+        assert waiting.wait(1)
+        assert relay._begin_draining()
+        resume.set()
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        assert result["response"].status_code == 200
+        assert result["response"].get_json()["message"] == "No requests available"
+        assert claim.call_count == 1
+    finally:
+        resume.set()
+        worker.join(timeout=1)
         relay.DRAINING.clear()
 
 
@@ -680,9 +753,10 @@ def test_operational_endpoints_bound_store_snapshot_failures(
     if method_name != "list":
         _queue_for_owner(client, request_id=f"failure-{method_name}")
     secret = "sensitive-store-failure"
+    target_method = "health_snapshot" if endpoint == "/healthz" else method_name
     monkeypatch.setattr(
         relay._api_v1_store(),
-        method_name,
+        target_method,
         Mock(side_effect=RelayStateStoreError(secret)),
     )
 

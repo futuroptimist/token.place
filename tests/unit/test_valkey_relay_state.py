@@ -1708,6 +1708,21 @@ def test_manifest_decoder_rejects_invalid_encodings(raw):
         SchemaManifest.decode(raw)
 
 
+def test_manifest_decoder_normalizes_recursion_failure(monkeypatch):
+    monkeypatch.setattr(
+        valkey_relay_state.json,
+        "loads",
+        Mock(side_effect=RecursionError("private deeply nested manifest")),
+    )
+
+    with pytest.raises(ValkeySchemaIncompatibleError) as caught:
+        SchemaManifest.decode(b"{}")
+
+    assert str(caught.value) == "state schema incompatible"
+    assert caught.value.__cause__ is None
+    assert "private" not in repr(caught.value)
+
+
 @pytest.mark.parametrize(
     "result",
     [None, True, 123, b"x" * 65_537, [[[[[[[[[b"too-deep"]]]]]]]]]],

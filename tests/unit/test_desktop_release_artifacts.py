@@ -1817,6 +1817,12 @@ def test_validator_native_ref_and_macho_kind_edge_paths(tmp_path) -> None:
     except SystemExit as exc:
         assert 'forbidden external Mach-O LC_RPATH' in str(exc)
 
+    with pytest.raises(SystemExit, match='forbidden external Mach-O linkage'):
+        validator._validate_macho_ref('/unapproved/location/libexample.dylib', owner, app)
+
+    outside = tmp_path / 'outside.dylib'
+    assert validator._macho_relative(outside, app) == Path('outside.dylib')
+
 
 def test_validator_macho_linkage_skips_non_macos_and_non_macho(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
@@ -1877,9 +1883,62 @@ def test_validator_run_and_sha_failure_paths(monkeypatch, tmp_path) -> None:
     except SystemExit as exc:
         assert 'Command failed (bad)' in str(exc)
 
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, 'out', 'err'),
+    )
+    assert validator._run(['good']) == 'out\nerr'
+
     payload = tmp_path / 'payload'
     payload.write_bytes(b'abc')
     assert validator._sha256(payload) == 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+
+
+def test_validator_mutation_guard_reraises_probe_failure_when_tree_is_unchanged(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+
+    def fail_probe():
+        raise RuntimeError('probe failed')
+
+    with pytest.raises(RuntimeError, match='probe failed'):
+        validator._run_with_app_mutation_guard(app, 'runtime probe', fail_probe)
+
+
+def test_validator_describes_file_type_change() -> None:
+    validator = _load_release_artifact_validator()
+    before = {'payload': validator.AppTreeEntry('file', None, False, None)}
+    after = {'payload': validator.AppTreeEntry('dir', None, False, None)}
+
+    assert validator._describe_app_tree_changes(before, after) == ['type changed: payload (file -> dir)']
+
+
+def test_validator_macho_linkage_redacts_rejected_rpath(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    binary = app / 'Contents' / 'MacOS' / 'helper'
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, f'{binary}: Mach-O 64-bit executable', ''),
+    )
+
+    def fake_run(cmd):
+        if cmd[:2] == ['lipo', '-archs']:
+            return 'arm64'
+        if '-L' in cmd:
+            return f'{binary} (architecture arm64):\n'
+        return 'Load command 0\ncmd LC_RPATH\ncmdsize 32\npath /opt/private/lib (offset 12)\n'
+
+    monkeypatch.setattr(validator, '_run', fake_run)
+
+    with pytest.raises(SystemExit, match=r'native audit failed.*category=rpath ref=lib'):
+        validator._validate_macho_linkage(binary, app)
 
 
 def test_validate_macho_linkage_rejects_file_and_lipo_failures(monkeypatch, tmp_path) -> None:
@@ -2368,6 +2427,51 @@ def test_validator_main_rejects_invalid_app_metadata(monkeypatch, tmp_path, case
         validator.main()
 
 
+def test_validator_main_rejects_stale_artifact_name(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(tmp_path / 'Tokenplace Desktop.app'),
+            dmg_path=None,
+            app_only=True,
+            tauri_config='unused',
+            expected_icon='unused',
+            expect_signing=False,
+            require_embedded_python_runtime=False,
+            expect_notarization=False,
+        ),
+    )
+
+    with pytest.raises(SystemExit, match='stale Electron branding'):
+        validator.main()
+
+
+def test_validator_main_warns_when_signing_lacks_notarization(monkeypatch, tmp_path, capsys) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=None,
+            app_only=True,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=True,
+            require_embedded_python_runtime=False,
+            expect_notarization=False,
+        ),
+    )
+    monkeypatch.setattr(validator, '_run', lambda _cmd: 'arm64')
+
+    validator.main()
+
+    assert 'Signing configured without notarization credentials' in capsys.readouterr().out
+
+
 def test_validator_dmg_contents_skips_mounting_outside_macos(monkeypatch, tmp_path, capsys) -> None:
     validator = _load_release_artifact_validator()
     monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
@@ -2380,6 +2484,38 @@ def test_validator_dmg_contents_skips_mounting_outside_macos(monkeypatch, tmp_pa
     validator._validate_dmg_contents(tmp_path / 'release.dmg', expect_signing=False)
 
     assert 'Skipping DMG mounted-content checks outside macOS' in capsys.readouterr().out
+
+
+def test_validator_dmg_contents_rejects_multiple_root_apps(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    mount = tmp_path / 'mount'
+    (mount / 'First.app').mkdir(parents=True)
+    (mount / 'Second.app').mkdir()
+
+    class MountHandle:
+        name = str(mount)
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda _dmg: MountHandle())
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda *_args: None)
+
+    with pytest.raises(SystemExit, match=r'exactly one \.app at root; found 2'):
+        validator._validate_dmg_contents(tmp_path / 'release.dmg', expect_signing=False)
+
+
+def test_validator_hdiutil_info_plist_rejects_non_mapping(monkeypatch) -> None:
+    validator = _load_release_artifact_validator()
+    payload = validator.plistlib.dumps(['not', 'a', 'mapping'])
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, payload, b''),
+    )
+
+    assert validator._hdiutil_info_plist() == {}
 
 
 def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None:

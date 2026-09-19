@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ def _load_release_artifact_validator():
     import importlib.util
 
     script_path = Path('scripts/validate_desktop_tauri_release_artifacts.py')
-    spec = importlib.util.spec_from_file_location('validate_desktop_tauri_release_artifacts', script_path)
+    spec = importlib.util.spec_from_file_location('scripts.validate_desktop_tauri_release_artifacts', script_path)
     assert spec is not None
     assert spec.loader is not None
     validator = importlib.util.module_from_spec(spec)
@@ -189,6 +190,159 @@ def test_gatekeeper_validation_rejects_missing_secure_timestamp(monkeypatch, tmp
 
     with pytest.raises(SystemExit, match='secure timestamp is missing'):
         validator._validate_gatekeeper_ready(app)
+
+
+def test_gatekeeper_validation_discovers_macho_leaf_and_excludes_non_code_and_symlink(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    macho = app / 'helper'
+    macho.write_bytes(b'macho')
+    non_code = app / 'README.txt'
+    non_code.write_text('documentation', encoding='utf-8')
+    symlink = app / 'helper-link'
+    symlink.symlink_to(macho.name)
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+
+    subprocess_calls = []
+    tool_calls = []
+
+    def fake_subprocess_run(cmd, **kwargs):
+        subprocess_calls.append(cmd)
+        if cmd[0] == 'file':
+            description = 'Mach-O 64-bit executable' if Path(cmd[-1]) == macho else 'ASCII text'
+            return subprocess.CompletedProcess(cmd, 0, description, '')
+        return subprocess.CompletedProcess(cmd, 0, b'', b'')
+
+    def fake_tool(cmd):
+        tool_calls.append(cmd)
+        if cmd[:3] == ['codesign', '--display', '--verbose=4']:
+            return 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now'
+        return ''
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_subprocess_run)
+    monkeypatch.setattr(validator, '_run', fake_tool)
+
+    validator._validate_gatekeeper_ready(app)
+
+    displayed_paths = [Path(call[-1]) for call in tool_calls if call[:3] == ['codesign', '--display', '--verbose=4']]
+    assert displayed_paths == [app, macho]
+    inspected_paths = [Path(call[-1]) for call in subprocess_calls if call[0] == 'file']
+    assert inspected_paths == [non_code, macho]
+    assert symlink not in inspected_paths
+
+
+@pytest.mark.parametrize(
+    ('details', 'message'),
+    [
+        ('flags=0x10000(runtime)\nTimestamp=now', 'not signed by Developer ID Application'),
+        ('Authority=Developer ID Application: Example\nTimestamp=now', 'hardened runtime is missing'),
+        ('Authority=Developer ID Application: Example\nflags=0x10000(runtime)', 'secure timestamp is missing'),
+    ],
+)
+def test_gatekeeper_validation_rejects_invalid_codesign_evidence(monkeypatch, tmp_path, details, message) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: details)
+
+    with pytest.raises(SystemExit, match=message):
+        validator._validate_gatekeeper_ready(app)
+
+
+@pytest.mark.parametrize(
+    ('returncode', 'entitlement_bytes', 'message'),
+    [
+        (1, b'', 'unable to inspect release entitlements'),
+        (0, b'not a plist', 'invalid release entitlements'),
+        (
+            0,
+            plistlib.dumps({'com.apple.security.get-task-allow': True}),
+            'forbidden get-task-allow entitlement',
+        ),
+    ],
+)
+def test_gatekeeper_validation_rejects_unsafe_entitlements(
+    monkeypatch, tmp_path, returncode, entitlement_bytes, message,
+) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator,
+        '_run',
+        lambda cmd: 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now',
+    )
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, returncode, entitlement_bytes, b''),
+    )
+
+    with pytest.raises(SystemExit, match=message):
+        validator._validate_gatekeeper_ready(app)
+
+
+@pytest.mark.parametrize(
+    'entitlement_bytes',
+    [b'', plistlib.dumps({}), plistlib.dumps({'com.apple.security.get-task-allow': False})],
+)
+def test_gatekeeper_validation_permits_empty_or_false_entitlements(monkeypatch, tmp_path, entitlement_bytes) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator,
+        '_run',
+        lambda cmd: 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now',
+    )
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, entitlement_bytes, b''),
+    )
+
+    validator._validate_gatekeeper_ready(app)
+
+
+def test_gatekeeper_validation_checks_app_and_dmg_with_exact_commands(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    dmg = tmp_path / 'Example.dmg'
+    dmg.write_bytes(b'dmg')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    calls = []
+
+    def fake_tool(cmd):
+        calls.append(cmd)
+        if cmd[:3] == ['codesign', '--display', '--verbose=4']:
+            return 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now'
+        return ''
+
+    monkeypatch.setattr(validator, '_run', fake_tool)
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, b'', b''),
+    )
+
+    validator._validate_gatekeeper_ready(app, dmg)
+
+    assert calls == [
+        ['codesign', '--display', '--verbose=4', str(app)],
+        ['xcrun', 'stapler', 'validate', str(app)],
+        ['spctl', '--assess', '--verbose=4', '--type', 'execute', str(app)],
+        ['codesign', '--verify', '--strict', '--verbose=4', str(dmg)],
+        ['xcrun', 'stapler', 'validate', str(dmg)],
+        [
+            'spctl', '--assess', '--verbose=4', '--type', 'open',
+            '--context', 'context:primary-signature', str(dmg),
+        ],
+    ]
 
 
 def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:

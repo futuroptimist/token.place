@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ def _load_release_artifact_validator():
     import importlib.util
 
     script_path = Path('scripts/validate_desktop_tauri_release_artifacts.py')
-    spec = importlib.util.spec_from_file_location('validate_desktop_tauri_release_artifacts', script_path)
+    spec = importlib.util.spec_from_file_location('scripts.validate_desktop_tauri_release_artifacts', script_path)
     assert spec is not None
     assert spec.loader is not None
     validator = importlib.util.module_from_spec(spec)
@@ -54,7 +55,7 @@ def test_build_job_caches_runner_pip_only_on_macos_without_masking_failures() ->
     required_fail_closed_steps = (
         'Setup Python',
         'Build Tauri bundles',
-        'Validate macOS staged artifact guardrails',
+        'Validate macOS signed and notarized artifacts',
         'Validate Windows MSI and NSIS artifact contents',
     )
     assert all('continue-on-error' not in steps_by_name[name] for name in required_fail_closed_steps)
@@ -86,55 +87,264 @@ def test_tauri_icon_set_references_expected_files() -> None:
     assert expected.issubset(icons)
 
 
-def test_workflow_sets_explicit_dmg_volume_name() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
+def test_release_script_sets_explicit_dmg_volume_name() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
     assert 'hdiutil create -volname "token.place desktop"' in text
 
 
-def test_workflow_stages_dmg_directory_with_app_readme_and_applications_symlink() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    assert 'dmg_stage_dir="$RUNNER_TEMP/token-place-dmg-stage"' in text
-    assert 'cp -R "${app_path}" "${dmg_stage_dir}/"' in text
-    assert 'cp "${preview_notice}" "${dmg_stage_dir}/${preview_notice_name}"' in text
-    assert 'ln -s /Applications "${dmg_stage_dir}/Applications"' in text
-    assert '-srcfolder "${dmg_stage_dir}"' in text
-    assert '-srcfolder "${app_path}"' not in text
+def test_release_script_uses_macos_base64_decode_flag() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    assert 'decode_base64()' in text
+    assert text.count('/usr/bin/base64 -D') == 1
+    assert text.count('| decode_base64 >') == 2
+    assert 'base64 --decode' not in text
+
+
+def test_workflow_stages_dmg_with_stapled_app_and_applications_symlink() -> None:
+    workflow = WORKFLOW.read_text(encoding='utf-8')
+    script = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    assert 'dmg_stage_dir="$RUNNER_TEMP/token-place-dmg-stage"' in workflow
+    assert 'ditto "${app_path}" "${dmg_stage_dir}/$(basename "${app_path}")"' in script
+    assert script.index('xcrun stapler staple "${app_path}"') < script.index('ditto "${app_path}"')
+    assert 'ln -s /Applications "${dmg_stage_dir}/Applications"' in script
+    assert '-srcfolder "${dmg_stage_dir}"' in script
 
 
 def test_workflow_requires_exactly_one_staged_macos_dmg() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
-    assert 'Expected exactly one staged macOS .dmg in release-artifacts' in text
+    assert 'exactly one staged macOS .dmg' in text
 
 
-def test_workflow_uses_ad_hoc_signing_fallback_without_paid_secrets() -> None:
+def test_workflow_fails_closed_and_runs_notarization_before_checksums() -> None:
     text = WORKFLOW.read_text(encoding='utf-8')
-    assert "export TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'" in text
-    assert "export APPLE_SIGNING_IDENTITY='-'" in text
-    assert 'using ad-hoc signing for preview/dev-only macOS artifacts' in text
+    script = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    assert "TAURI_BUNDLE_MACOS_SIGNING_IDENTITY='-'" not in text
+    for secret in (
+        'APPLE_SIGNING_IDENTITY', 'APPLE_CERTIFICATE_P12_BASE64',
+        'APPLE_CERTIFICATE_PASSWORD', 'APPLE_NOTARY_KEY_P8_BASE64',
+        'APPLE_NOTARY_KEY_ID', 'APPLE_NOTARY_ISSUER_ID',
+    ):
+        assert f'secrets.{secret}' in text
+        assert secret in script
+    assert text.index('sign_and_notarize_macos_release.sh') < text.index('Generate SHA256 checksums')
+    assert '--require-gatekeeper-ready' in text
+    assert "if: always() && runner.os == 'macOS'" in text
+    assert 'apple-notarization-logs' in text
 
 
-def test_workflow_does_not_gate_release_on_notary_profile() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    assert 'APPLE_NOTARYTOOL_KEYCHAIN_PROFILE is set, but notarization/stapling is not performed' in text
-    assert 'skipping strict Gatekeeper notarization enforcement' in text
-    assert 'signing_flag="--expect-signing"' in text
+def test_macos_release_script_signs_inside_out_and_staples_app_and_dmg() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    assert 'codesign --deep' not in text
+    assert '--options runtime --timestamp' in text
+    for extension in ('framework', 'xpc', 'appex', 'bundle', 'plugin', 'app'):
+        assert f"-name '*.{extension}'" in text
+    assert 'file -b "${candidate}"' in text
+    assert text.count('xcrun stapler staple') == 2
+    assert text.count('xcrun stapler validate') == 2
+    assert text.count('submit_and_record') == 3  # definition plus app and final DMG
+    assert 'status}" != "Accepted"' in text
+    assert 'trap cleanup EXIT' in text
+    assert 'rm -rf "${private_dir}"' in text
 
 
-def test_workflow_emits_preview_warning_asset_for_macos_downloads() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    assert 'preview_notice_name="README BEFORE OPENING.txt"' in text
-    assert 'README-macos-apple-silicon-preview.txt' in text
-    assert 'This preview build is ad-hoc signed and not notarized.' in text
-    assert 'This preview build is signed with the configured Apple signing identity, but it is not notarized.' in text
-    assert 'This preview build is ad-hoc signed and not notarized for public Gatekeeper trust.' not in text
-    assert 'Apple could not verify' in text
-    assert 'token.place desktop' in text
-    assert 'click Done' in text
-    assert 'System Settings -> Privacy & Security' in text
-    assert 'Open Anyway / Allow / Open for token.place desktop' in text
-    assert 'Control-click (right-click) the app and choose Open when available.' in text
-    assert 'System Settings -> Privacy & Security' in text
-    assert 'paid Developer ID signing + notarization' in text
+def test_validator_enforces_gatekeeper_release_evidence() -> None:
+    text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
+    assert '--require-gatekeeper-ready' in text
+    assert 'Authority=Developer ID Application:' in text
+    assert 'hardened runtime is missing' in text
+    assert 'secure timestamp is missing' in text
+    assert 'com.apple.security.get-task-allow' in text
+    assert '["xcrun", "stapler", "validate", str(app_path)]' in text
+    assert 'context:primary-signature' in text
+
+
+@pytest.mark.parametrize('timestamp_line', ['Timestamp=Sep 19, 2026 at 05:00:00', 'Signed Time=Sep 19, 2026 at 05:00:00'])
+def test_gatekeeper_validation_accepts_codesign_timestamp_formats(monkeypatch, tmp_path, timestamp_line) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: (
+        f'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\n{timestamp_line}'
+        if cmd[:3] == ['codesign', '--display', '--verbose=4'] else ''
+    ))
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, b'', b''),
+    )
+
+    validator._validate_gatekeeper_ready(app)
+
+
+def test_gatekeeper_validation_rejects_missing_secure_timestamp(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator,
+        '_run',
+        lambda cmd: 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)',
+    )
+
+    with pytest.raises(SystemExit, match='secure timestamp is missing'):
+        validator._validate_gatekeeper_ready(app)
+
+
+def test_gatekeeper_validation_discovers_macho_leaf_and_excludes_non_code_and_symlink(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    macho = app / 'helper'
+    macho.write_bytes(b'macho')
+    non_code = app / 'README.txt'
+    non_code.write_text('documentation', encoding='utf-8')
+    symlink = app / 'helper-link'
+    symlink.symlink_to(macho.name)
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+
+    subprocess_calls = []
+    tool_calls = []
+
+    def fake_subprocess_run(cmd, **kwargs):
+        subprocess_calls.append(cmd)
+        if cmd[0] == 'file':
+            description = 'Mach-O 64-bit executable' if Path(cmd[-1]) == macho else 'ASCII text'
+            return subprocess.CompletedProcess(cmd, 0, description, '')
+        return subprocess.CompletedProcess(cmd, 0, b'', b'')
+
+    def fake_tool(cmd):
+        tool_calls.append(cmd)
+        if cmd[:3] == ['codesign', '--display', '--verbose=4']:
+            return 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now'
+        return ''
+
+    monkeypatch.setattr(validator.subprocess, 'run', fake_subprocess_run)
+    monkeypatch.setattr(validator, '_run', fake_tool)
+
+    validator._validate_gatekeeper_ready(app)
+
+    displayed_paths = [Path(call[-1]) for call in tool_calls if call[:3] == ['codesign', '--display', '--verbose=4']]
+    assert set(displayed_paths) == {app, macho}
+    assert len(displayed_paths) == 2
+    inspected_paths = [Path(call[-1]) for call in subprocess_calls if call[0] == 'file']
+    assert set(inspected_paths) == {macho, non_code}
+    assert len(inspected_paths) == 2
+    assert symlink not in inspected_paths
+
+
+@pytest.mark.parametrize(
+    ('details', 'message'),
+    [
+        ('flags=0x10000(runtime)\nTimestamp=now', 'not signed by Developer ID Application'),
+        ('Authority=Developer ID Application: Example\nTimestamp=now', 'hardened runtime is missing'),
+        ('Authority=Developer ID Application: Example\nflags=0x10000(runtime)', 'secure timestamp is missing'),
+    ],
+)
+def test_gatekeeper_validation_rejects_invalid_codesign_evidence(monkeypatch, tmp_path, details, message) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: details)
+
+    with pytest.raises(SystemExit, match=message):
+        validator._validate_gatekeeper_ready(app)
+
+
+@pytest.mark.parametrize(
+    ('returncode', 'entitlement_bytes', 'message'),
+    [
+        (1, b'', 'unable to inspect release entitlements'),
+        (0, b'not a plist', 'invalid release entitlements'),
+        (
+            0,
+            plistlib.dumps({'com.apple.security.get-task-allow': True}),
+            'forbidden get-task-allow entitlement',
+        ),
+    ],
+)
+def test_gatekeeper_validation_rejects_unsafe_entitlements(
+    monkeypatch, tmp_path, returncode, entitlement_bytes, message,
+) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator,
+        '_run',
+        lambda cmd: 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now',
+    )
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, returncode, entitlement_bytes, b''),
+    )
+
+    with pytest.raises(SystemExit, match=message):
+        validator._validate_gatekeeper_ready(app)
+
+
+@pytest.mark.parametrize(
+    'entitlement_bytes',
+    [b'', plistlib.dumps({}), plistlib.dumps({'com.apple.security.get-task-allow': False})],
+)
+def test_gatekeeper_validation_permits_empty_or_false_entitlements(monkeypatch, tmp_path, entitlement_bytes) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator,
+        '_run',
+        lambda cmd: 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now',
+    )
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, entitlement_bytes, b''),
+    )
+
+    validator._validate_gatekeeper_ready(app)
+
+
+def test_gatekeeper_validation_checks_app_and_dmg_with_exact_commands(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    dmg = tmp_path / 'Example.dmg'
+    dmg.write_bytes(b'dmg')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    calls = []
+
+    def fake_tool(cmd):
+        calls.append(cmd)
+        if cmd[:3] == ['codesign', '--display', '--verbose=4']:
+            return 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\nTimestamp=now'
+        return ''
+
+    monkeypatch.setattr(validator, '_run', fake_tool)
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, b'', b''),
+    )
+
+    validator._validate_gatekeeper_ready(app, dmg)
+
+    assert calls == [
+        ['codesign', '--display', '--verbose=4', str(app)],
+        ['xcrun', 'stapler', 'validate', str(app)],
+        ['spctl', '--assess', '--verbose=4', '--type', 'execute', str(app)],
+        ['codesign', '--verify', '--strict', '--verbose=4', str(dmg)],
+        ['xcrun', 'stapler', 'validate', str(dmg)],
+        [
+            'spctl', '--assess', '--verbose=4', '--type', 'open',
+            '--context', 'context:primary-signature', str(dmg),
+        ],
+    ]
 
 
 def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
@@ -146,20 +356,6 @@ def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
     assert 'DMG_PREVIEW_REQUIRED_PHRASES' in text
     assert 'platform.system()' in text
     assert 'hdiutil' in text
-
-
-def test_workflow_writes_preview_notice_via_printf() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    assert "printf '%s\\n' \\" in text
-    assert '> "${preview_notice}"' in text
-
-
-def test_preview_notice_uses_full_signing_decision_in_stage_step() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    assert 'APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}' in text
-    assert 'APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}' in text
-    assert 'APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}' in text
-    assert 'if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then' in text
 
 
 def test_validator_retries_transient_hdiutil_attach_errors(monkeypatch) -> None:
@@ -1054,7 +1250,7 @@ def test_release_workflow_uses_explicit_windows_x86_64_target_and_bundle_paths()
 def test_release_workflow_installs_pytest_before_macos_probe() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     install_index = workflow.index('- name: Install macOS validation test dependencies')
-    validate_index = workflow.index('- name: Validate macOS staged artifact guardrails')
+    validate_index = workflow.index('- name: Validate macOS signed and notarized artifacts')
     assert install_index < validate_index
     install_step = workflow[install_index:validate_index]
     assert "if: runner.os == 'macOS'" in install_step
@@ -1409,12 +1605,13 @@ def test_validate_macho_linkage_allows_runtime_relative_rpath_and_system_depende
     validator._validate_macho_linkage(binary, app)
 
 
-def test_workflow_validates_app_before_creating_dmg() -> None:
-    text = WORKFLOW.read_text(encoding='utf-8')
-    app_only_index = text.index('--app-only')
+def test_workflow_notarizes_and_staples_app_before_creating_dmg() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    app_submit_index = text.index('submit_and_record "${app_zip}" app')
+    app_staple_index = text.index('xcrun stapler staple "${app_path}"')
     hdiutil_index = text.index('hdiutil create -volname "token.place desktop"')
-    final_validator_index = text.rindex('--dmg-path "${dmg_path}"')
-    assert app_only_index < hdiutil_index < final_validator_index
+    dmg_submit_index = text.index('submit_and_record "${dmg_path}" dmg')
+    assert app_submit_index < app_staple_index < hdiutil_index < dmg_submit_index
 
 def test_validate_macho_linkage_allows_bundle_without_install_id_and_skips_otool_d(monkeypatch, tmp_path):
     validator = _load_release_artifact_validator()
@@ -2497,7 +2694,7 @@ def test_validator_main_macos_dmg_runtime_validation_does_not_probe_source_app(m
 
     validator.main()
 
-    assert dmg_calls == [(dmg, {'expect_signing': False, 'require_embedded_python_runtime': True})]
+    assert dmg_calls == [(dmg, {'expect_signing': False, 'require_embedded_python_runtime': True, 'require_gatekeeper_ready': False})]
     assert runtime_apps == []
     assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 2
 
@@ -2600,7 +2797,7 @@ def _load_windows_release_validator():
     return module
 
 
-def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.20') -> tuple[Path, Path]:
+def _write_windows_runtime_fixture(root: Path, *, version: str = '0.1.21') -> tuple[Path, Path]:
     validator = _load_windows_release_validator()
     manifest = json.loads(Path('desktop-tauri/src-tauri/python/embedded_python_runtime_windows_x86_64_manifest.json').read_text(encoding='utf-8'))
     runtime = root / 'resources' / 'python-runtime'
@@ -2660,7 +2857,7 @@ def test_windows_validator_without_version_args_derives_package_json_version(tmp
 def test_windows_release_validator_accepts_extracted_msi_and_nsis(tmp_path):
     validator = _load_windows_release_validator()
     nsis, msi = _write_windows_runtime_fixture(tmp_path)
-    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.20']) == 0
+    assert validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.21']) == 0
 
 
 def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_path):
@@ -2675,7 +2872,7 @@ def test_windows_release_validator_rejects_version_and_provenance_mismatch(tmp_p
     data['llama_cpp_cuda_wheel']['flavor'] = 'cpu'
     provenance.write_text(json.dumps(data), encoding='utf-8')
     with pytest.raises(validator.ValidationError, match='incomplete Windows runtime provenance'):
-        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.20'])
+        validator.main(['--windows-nsis', str(nsis), '--windows-msi', str(msi), '--expected-version', '0.1.21'])
 
 
 def _extract_workflow_job_block(text: str, job_key: str) -> str:
@@ -3950,7 +4147,7 @@ def test_windows_installer_identity_admission_failure_runs_probe_without_replaci
     monkeypatch, tmp_path, probe_result, capsys,
 ) -> None:
     guard = _load_windows_installer_identity()
-    installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe', 'nsis', '0.1.20')
+    installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe', 'nsis', '0.1.21')
     exe = tmp_path / 'token-place.exe'
     model = tmp_path / 'tiny.gguf'
     events = []
@@ -3986,7 +4183,7 @@ def test_windows_installer_identity_admission_failure_runs_probe_without_replaci
 
     with pytest.raises(guard.InstallerIdentityError) as raised:
         guard.run_scenario(
-            guard.Scenario('clean-nsis-0.1.20', installer),
+            guard.Scenario('clean-nsis-0.1.21', installer),
             'abcdef123456',
             tokenizer_boundary_model=model,
         )
@@ -3998,7 +4195,7 @@ def test_windows_installer_identity_admission_failure_runs_probe_without_replaci
 
 def test_windows_installer_identity_admission_success_skips_native_probe(monkeypatch, tmp_path) -> None:
     guard = _load_windows_installer_identity()
-    installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe', 'nsis', '0.1.20')
+    installer = guard.Installer(tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe', 'nsis', '0.1.21')
     exe = tmp_path / 'token-place.exe'
     model = tmp_path / 'tiny.gguf'
     events = []
@@ -4028,7 +4225,7 @@ def test_windows_installer_identity_admission_success_skips_native_probe(monkeyp
     )
 
     guard.run_scenario(
-        guard.Scenario('clean-nsis-0.1.20', installer),
+        guard.Scenario('clean-nsis-0.1.21', installer),
         'abcdef123456',
         tokenizer_boundary_model=model,
     )
@@ -5550,10 +5747,10 @@ def test_installed_context_smoke_uses_get_llm_instance_boundary() -> None:
 
 def test_windows_installer_identity_main_non_windows_contract_success(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.20-x64.msi'
-    previous_nsis = tmp_path / 'token.place-desktop-0.1.19-x64-setup.exe'
-    previous_msi = tmp_path / 'token.place-desktop-0.1.19-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.21-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.20-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
         path.write_text('artifact', encoding='utf-8')
     monkeypatch.setattr(guard.sys, 'platform', 'linux')
@@ -6442,20 +6639,20 @@ def test_windows_installer_identity_validate_tiers_detects_runtime_and_profile_d
 
 def test_windows_installer_identity_run_all_and_main_windows_paths(monkeypatch, tmp_path, capsys) -> None:
     guard = _load_windows_installer_identity()
-    current_nsis = tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe'
-    current_msi = tmp_path / 'token.place-desktop-0.1.20-x64.msi'
-    previous_nsis = tmp_path / 'token.place-desktop-0.1.19-x64-setup.exe'
-    previous_msi = tmp_path / 'token.place-desktop-0.1.19-x64.msi'
+    current_nsis = tmp_path / 'token.place-desktop-0.1.21-x64-setup.exe'
+    current_msi = tmp_path / 'token.place-desktop-0.1.21-x64.msi'
+    previous_nsis = tmp_path / 'token.place-desktop-0.1.20-x64-setup.exe'
+    previous_msi = tmp_path / 'token.place-desktop-0.1.20-x64.msi'
     for path in (current_nsis, current_msi, previous_nsis, previous_msi):
         path.write_text('artifact', encoding='utf-8')
 
-    scenarios = [guard.Scenario('clean-nsis-0.1.20', guard.Installer(current_nsis, 'nsis', '0.1.20'))]
+    scenarios = [guard.Scenario('clean-nsis-0.1.21', guard.Installer(current_nsis, 'nsis', '0.1.21'))]
     artifacts_seen = []
     def fake_runner(scenario, build_id):
         artifacts_seen.append((scenario.name, build_id))
 
     guard.run_all_scenarios(scenarios, 'abcdef123456', runner=fake_runner, artifact_root=tmp_path / 'logs')
-    assert artifacts_seen == [('clean-nsis-0.1.20', 'abcdef123456')]
+    assert artifacts_seen == [('clean-nsis-0.1.21', 'abcdef123456')]
 
     old_argv = sys.argv
     monkeypatch.setattr(guard.sys, 'platform', 'win32')

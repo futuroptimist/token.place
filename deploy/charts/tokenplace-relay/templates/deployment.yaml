@@ -65,8 +65,6 @@ spec:
               value: "0.0.0.0"
             - name: RELAY_PORT
               value: "{{ .Values.containerPort }}"
-            - name: RELAY_REPLICAS
-              value: "{{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.maxReplicas }}{{ else }}{{ .Values.replicaCount }}{{ end }}"
             {{- if not $useHeadless }}
             - name: TOKENPLACE_GPU_HOST
               value: {{ $gpu.host | quote }}

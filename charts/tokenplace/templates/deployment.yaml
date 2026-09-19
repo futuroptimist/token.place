@@ -76,7 +76,6 @@ spec:
                 "RELAY_HOST" (dict "name" "RELAY_HOST" "value" "0.0.0.0")
                 "RELAY_PORT" (dict "name" "RELAY_PORT" "value" $relayPort)
                 "RELAY_WORKERS" (dict "name" "RELAY_WORKERS" "value" "1")
-                "RELAY_REPLICAS" (dict "name" "RELAY_REPLICAS" "value" (printf "%v" .Values.replicaCount))
                 "RELAY_THREADS" (dict "name" "RELAY_THREADS" "value" "4")
                 "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" (dict "name" "TOKENPLACE_RATE_LIMIT_TRUSTED_PROXIES" "value" (join "," .Values.rateLimit.trustedProxies))
                 "TOKENPLACE_RELAY_INTERNAL_URL" (dict "name" "TOKENPLACE_RELAY_INTERNAL_URL" "value" $selfDispatchURL)

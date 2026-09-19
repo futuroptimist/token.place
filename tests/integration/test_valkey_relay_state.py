@@ -12,6 +12,7 @@ import subprocess
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from threading import Barrier, Event
 
 import pytest
@@ -95,13 +96,13 @@ def _free_port():
         return sock.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def valkey_server(tmp_path_factory):
+@contextmanager
+def _isolated_valkey_server(tmp_path_factory, label):
     executable = shutil.which("valkey-server")
     if executable is None:
         pytest.fail("valkey-server is required for the real-backend integration tests")
     port = _free_port()
-    work = tmp_path_factory.mktemp("valkey-foundation")
+    work = tmp_path_factory.mktemp(label)
     process = subprocess.Popen(
         [
             executable,
@@ -141,6 +142,27 @@ def valkey_server(tmp_path_factory):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+
+
+def _read_exact_keys(client, keys):
+    """Read explicitly declared keys without using namespace-wide discovery."""
+    snapshot = []
+    for key in keys:
+        kind = client.type(key)
+        if kind == b"hash":
+            value = client.hgetall(key)
+        elif kind == b"zset":
+            value = client.zrange(key, 0, -1, withscores=True)
+        elif kind == b"stream":
+            value = client.xrange(key)
+        else:
+            value = client.get(key) if kind == b"string" else None
+        snapshot.append((kind, value))
+    return tuple(snapshot)
+@pytest.fixture(scope="module")
+def valkey_server(tmp_path_factory):
+    with _isolated_valkey_server(tmp_path_factory, "valkey-foundation") as port:
+        yield port
 
 
 def _manifest(**changes):
@@ -247,6 +269,385 @@ def test_runtime_factory_incompatible_existing_manifest_is_not_repaired(
         client.close()
 
 
+def test_healthz_real_valkey_is_ready_without_capacity_or_state_mutation(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    other_namespace = uuid.uuid4().hex
+    _set_runtime_factory_env(monkeypatch, valkey_server, namespace)
+    store = relay._new_api_v1_relay_state_store()
+    client = redis.Redis(host="127.0.0.1", port=valkey_server, socket_timeout=0.4)
+    prefix = f"tokenplace:{{test:{namespace}}}:relay:v1:"
+    exact_keys = tuple(
+        prefix + suffix
+        for suffix in (
+            "schema",
+            "nodes:lease",
+            "cursor",
+            "reservations:expiry",
+            "requests:deadline",
+            "claims:expiry",
+            "responses:expiry",
+            "terminals:expiry",
+        )
+    )
+    isolated_key = f"tokenplace:{{test:{other_namespace}}}:relay:v1:sentinel"
+    try:
+        client.set(isolated_key, b"untouched")
+        before = tuple(client.dump(key) for key in exact_keys)
+        monkeypatch.setattr(relay, "api_v1_relay_state_store", store)
+
+        response = relay.app.test_client().get("/healthz")
+
+        assert response.status_code == 200
+        assert response.get_json()["status"] == "ok"
+        assert response.get_json()["registeredServers"] == []
+        assert tuple(client.dump(key) for key in exact_keys) == before
+        assert client.get(isolated_key) == b"untouched"
+    finally:
+        monkeypatch.setattr(relay, "api_v1_relay_state_store", None)
+        client.delete(*exact_keys, isolated_key)
+        client.close()
+        store.close()
+
+
+def test_cold_healthz_does_not_initialize_manifest_or_fallback(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    _set_runtime_factory_env(monkeypatch, valkey_server, namespace)
+    client = redis.Redis(host="127.0.0.1", port=valkey_server, socket_timeout=0.4)
+    schema_key = f"tokenplace:{{test:{namespace}}}:relay:v1:schema"
+    try:
+        monkeypatch.setattr(relay, "api_v1_relay_state_store", None)
+
+        response = relay.app.test_client().get("/healthz")
+
+        assert response.status_code == 503
+        assert response.get_json() == {
+            "error": {
+                "message": "Relay state schema is incompatible",
+                "code": "state_schema_incompatible",
+            }
+        }
+        assert client.get(schema_key) is None
+        assert relay.api_v1_relay_state_store is None
+    finally:
+        client.delete(schema_key)
+        client.close()
+
+
+def test_healthz_real_valkey_readiness_failures_are_fixed_and_read_only(
+    valkey_server, monkeypatch, caplog
+):
+    namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace)
+    cfg = store._foundation.config
+    protocol_keys = (
+        cfg.key("nodes:lease"), cfg.key("cursor"),
+        cfg.key("reservations:expiry"), cfg.key("requests:deadline"),
+        cfg.key("claims:expiry"), cfg.key("responses:expiry"),
+        cfg.key("terminals:expiry"),
+    )
+    before = _read_exact_keys(store._foundation._client, protocol_keys)
+    original_role = store._foundation._client.role
+    try:
+        monkeypatch.setattr(relay, "api_v1_relay_state_store", store)
+        store._foundation._client.role = lambda: [b"slave", b"sensitive-host"]
+        response = relay.app.test_client().get("/healthz")
+        assert response.status_code == 503
+        assert response.get_json() == {
+            "error": {
+                "message": "Relay state is temporarily unavailable",
+                "code": "state_backend_unavailable",
+            }
+        }
+        assert _read_exact_keys(store._foundation._client, protocol_keys) == before
+        assert "sensitive-host" not in response.get_data(as_text=True)
+        assert "sensitive-host" not in caplog.text
+
+        store._foundation._client.role = original_role
+        script_digests = dict(SCRIPT_DIGESTS)
+        script_digests[next(iter(script_digests))] = "0" * 64
+        incompatible = dataclasses.replace(_manifest(), script_digests=script_digests)
+        store._foundation._client.set(cfg.key("schema"), incompatible.encode())
+        schema_before = _read_exact_keys(
+            store._foundation._client, (cfg.key("schema"), *protocol_keys)
+        )
+        response = relay.app.test_client().get("/healthz")
+        assert response.status_code == 503
+        assert response.get_json() == {
+            "error": {
+                "message": "Relay state schema is incompatible",
+                "code": "state_schema_incompatible",
+            }
+        }
+        assert _read_exact_keys(
+            store._foundation._client, (cfg.key("schema"), *protocol_keys)
+        ) == schema_before
+        assert "0" * 64 not in response.get_data(as_text=True)
+        assert "0" * 64 not in caplog.text
+    finally:
+        store._foundation._client.role = original_role
+        relay.api_v1_relay_state_store = None
+        store._foundation._client.delete(cfg.key("schema"), *protocol_keys)
+        store.close()
+
+
+def test_healthz_unavailable_real_valkey_endpoint_is_bounded_without_fallback(
+    monkeypatch, caplog
+):
+    port = _free_port()
+    namespace = "sensitive-unavailable-" + uuid.uuid4().hex
+    _set_runtime_factory_env(monkeypatch, port, namespace)
+    monkeypatch.setattr(relay, "api_v1_relay_state_store", None)
+    started = time.monotonic()
+
+    response = relay.app.test_client().get("/healthz")
+
+    assert time.monotonic() - started < 3
+    assert response.status_code == 503
+    assert response.get_json() == {
+        "error": {
+            "message": "Relay state is temporarily unavailable",
+            "code": "state_backend_unavailable",
+        }
+    }
+    assert relay.api_v1_relay_state_store is None
+    assert namespace not in response.get_data(as_text=True)
+    assert namespace not in caplog.text
+
+
+def test_healthz_populated_valkey_state_is_filtered_without_mutation(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    other_namespace = uuid.uuid4().hex
+    store = _registration_store(valkey_server, namespace, lease_ttl_seconds=300)
+    other = _registration_store(valkey_server, other_namespace)
+    live_node, expired_node = "health-live-node", "health-expired-node"
+    identities = {
+        "live": ("health-live-client", "health-live-request"),
+        "expired_node": ("health-expired-client", "health-expired-request"),
+        "due_request": ("health-due-client", "health-due-request"),
+        "due_claim": ("health-claim-client", "health-claim-request"),
+        "due_reservation": ("health-reservation-client", "health-reservation-request"),
+    }
+    owner = _digest("health-owner")
+    cfg = store._foundation.config
+    keys = list(_claim_fixture_state_keys(
+        store, (live_node, expired_node), tuple(identities.values())
+    ))
+    sentinel = other._foundation.config.key_prefix + "test-sentinel"
+    try:
+        store.register(expired_node, _capabilities(), owner)
+        _enqueue_claim_fixture(
+            store, expired_node, owner, *identities["expired_node"],
+            time.time() + 300,
+        )
+        store.register(live_node, _capabilities(concurrency=8), owner)
+        _enqueue_claim_fixture(
+            store, live_node, owner, *identities["due_claim"], time.time() + 300
+        )
+        claim = store.claim_queued_request(live_node, owner, live_node)
+        assert (claim.client_public_key, claim.request_id) == identities["due_claim"]
+        expired_member = store._node_digest(expired_node)
+        store._foundation._client.zadd(cfg.key("nodes:lease"), {expired_member: 0})
+        store._foundation._client.hset(
+            cfg.key("node", expired_member), "lease_expires_at_epoch", 0
+        )
+        for name in ("live", "due_request"):
+            _enqueue_claim_fixture(
+                store, live_node, owner, *identities[name], time.time() + 300
+            )
+        reservation = store.select_and_reserve(
+            *identities["due_reservation"], "qwen3-8b-instruct", "8k-fast",
+            time.time() + 300, "reservation-cancel",
+        )
+        reservation_digest = hashlib.sha256(
+            reservation.reservation_token.encode()
+        ).hexdigest()
+        keys.append(cfg.key("reservation", reservation_digest))
+
+        due = store._foundation.server_time()[0] - 1
+        due_client, due_request = store._identity(*identities["due_request"])
+        due_claim_client, due_claim_request = store._identity(*identities["due_claim"])
+        store._foundation._client.hset(
+            cfg.key("request", due_client, due_request), "deadline", due
+        )
+        store._foundation._client.zadd(
+            cfg.key("requests:deadline"), {f"{due_client}:{due_request}": due}
+        )
+        store._foundation._client.hset(
+            cfg.key("claim", due_claim_client, due_claim_request),
+            "lease_expires", due,
+        )
+        store._foundation._client.zadd(
+            cfg.key("claims:expiry"),
+            {f"{due_claim_client}:{due_claim_request}": due},
+        )
+        store._foundation._client.hset(
+            cfg.key("reservation", reservation_digest), "reservation_expires", due
+        )
+        store._foundation._client.zadd(
+            cfg.key("reservations:expiry"), {reservation_digest: due}
+        )
+        keys = tuple(dict.fromkeys(keys))
+        other._foundation._client.set(sentinel, b"untouched")
+        before = _read_exact_keys(store._foundation._client, keys)
+        monkeypatch.setattr(relay, "api_v1_relay_state_store", store)
+
+        response = relay.app.test_client().get("/healthz")
+
+        assert response.status_code == 200
+        body = response.get_json()
+        diagnostics = {
+            item["server_public_key"]: item for item in body["registeredServers"]
+        }
+        assert set(diagnostics) == {live_node}
+        assert diagnostics[live_node]["queue_depth"] == 1
+        assert diagnostics[live_node]["in_flight_count"] == 0
+        assert body["status"] == "ok"
+        assert _read_exact_keys(store._foundation._client, keys) == before
+        assert other._foundation._client.get(sentinel) == b"untouched"
+    finally:
+        relay.api_v1_relay_state_store = None
+        store._foundation._client.delete(*keys)
+        other._foundation._client.delete(sentinel, other._foundation.config.key("schema"))
+        store.close()
+        other.close()
+
+
+def test_real_valkey_routes_preserve_accepted_work_while_draining(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace, claim_ttl_seconds=30)
+    second = _registration_store(valkey_server, namespace, claim_ttl_seconds=30)
+    cfg = first._foundation.config
+    node = "drain-route-node"
+    credential = "drain-route-control"
+    owner = _digest(credential)
+    identities = {
+        name: (f"drain-{name}-client", f"drain-{name}-request")
+        for name in ("retrieve", "response", "cancel")
+    }
+    first.register(node, _capabilities(concurrency=4), owner)
+    selections = {}
+    deadline = time.time() + 300
+    for name, identity in identities.items():
+        selections[name] = first.select_and_reserve(
+            *identity, "qwen3-8b-instruct", "8k-fast", deadline, f"{name}-cancel"
+        )
+        first.enqueue_encrypted_request(
+            *identity, selections[name].reservation_token, node,
+            "qwen3-8b-instruct", "8k-fast", deadline,
+            EncryptedRequestEnvelope(
+                "tokenplace_api_v1_relay_e2ee", 1, f"{name}-ciphertext", "key", "iv"
+            ), f"{name}-cancel",
+        )
+    retrieval_claim = first.claim_queued_request(node, owner, node)
+    retrieval_envelope = EncryptedResponseEnvelope(
+        "tokenplace_api_v1_relay_e2ee", 1, "retrieval-response", "key", "iv"
+    )
+    first.accept_encrypted_response(
+        node, owner, node, *identities["retrieve"],
+        retrieval_claim.generation, retrieval_envelope,
+    )
+    authority = tuple(dict.fromkeys(sum(
+        (_response_acceptance_authority(first, node, identity)[0]
+         for identity in identities.values()),
+        (),
+    )))
+    client = relay.app.test_client()
+    try:
+        monkeypatch.setattr(relay, "api_v1_relay_state_store", first)
+        relay.DRAINING.set()
+
+        health = client.get("/healthz")
+        assert health.status_code == 503
+        assert health.get_json() == {"status": "draining", "details": {"shutdown": True}}
+        assert health.headers["Retry-After"] == "0"
+        assert health.headers["Cache-Control"] == "no-store"
+        assert client.get("/livez").get_json() == {"status": "alive"}
+        explicit = client.get("/api/v1/relay/servers/next", query_string={
+            "client_public_key": "late-client", "request_id": "late-request"
+        })
+        implicit = client.post("/api/v1/relay/requests", json={
+            "server_public_key": node, "client_public_key": "implicit-client",
+            "request_id": "implicit-request", "cancel_token": "implicit-cancel",
+            "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+            "ciphertext": "sealed", "cipherkey": "key", "iv": "iv",
+        })
+        poll = client.post("/api/v1/relay/servers/poll", json={
+            "server_public_key": node, "control_credential": credential,
+        })
+        assert explicit.status_code == implicit.status_code == 503
+        assert poll.status_code == 200
+        assert poll.get_json()["message"] == "No requests available"
+
+        original_claim = first.claim_queued_request(node, owner, node)
+        claim_identity = first._identity(
+            original_claim.client_public_key, original_claim.request_id
+        )
+        claim_member = ":".join(claim_identity)
+        expired = first._foundation.server_time()[0] - 1
+        first._foundation._client.hset(
+            cfg.key("claim", *claim_identity), "lease_expires", expired
+        )
+        first._foundation._client.zadd(
+            cfg.key("claims:expiry"), {claim_member: expired}
+        )
+        response_claim = second.claim_queued_request(node, owner, node)
+        assert response_claim.state == "reclaimed"
+        assert response_claim.generation == original_claim.generation + 1
+        assert (
+            response_claim.client_public_key, response_claim.request_id
+        ) == (
+            original_claim.client_public_key, original_claim.request_id
+        )
+        rejected = client.post("/api/v1/relay/responses", json={
+            "server_public_key": node, "control_credential": "invalid-secret",
+            "claim_generation": response_claim.generation,
+            "client_public_key": response_claim.client_public_key,
+            "request_id": response_claim.request_id,
+            "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+            "ciphertext": "response", "cipherkey": "key", "iv": "iv",
+        })
+        accepted = client.post("/api/v1/relay/responses", json={
+            "server_public_key": node, "control_credential": credential,
+            "claim_generation": response_claim.generation,
+            "client_public_key": response_claim.client_public_key,
+            "request_id": response_claim.request_id,
+            "protocol": "tokenplace_api_v1_relay_e2ee", "version": 1,
+            "ciphertext": "response", "cipherkey": "key", "iv": "iv",
+        })
+        cancelled = client.post("/api/v1/relay/requests/cancel", json={
+            "client_public_key": identities["cancel"][0],
+            "request_id": identities["cancel"][1], "cancel_token": "cancel-cancel",
+        })
+        retrieved = client.post("/api/v1/relay/responses/retrieve", json={
+            "client_public_key": identities["retrieve"][0],
+            "request_id": identities["retrieve"][1],
+            "retrieval_credential": selections["retrieve"].reservation_token,
+        })
+        assert rejected.status_code == 403
+        assert accepted.status_code == 200
+        assert cancelled.get_json()["status"] == "cancelled"
+        assert retrieved.status_code == 200
+        assert retrieved.get_json()["ciphertext"] == "retrieval-response"
+    finally:
+        relay.DRAINING.clear()
+        relay.api_v1_relay_state_store = None
+        first._foundation._client.delete(
+            *authority, cfg.key("schema"), cfg.key("cursor"),
+            cfg.key("reservations:expiry"), cfg.key("control:expiry"),
+            cfg.key("node_work", first._node_digest(node)),
+        )
+        first.close()
+        second.close()
+
+
 def test_concurrent_manifest_initialization_is_atomic(valkey_server):
     namespace = uuid.uuid4().hex
     stores = [_foundation(valkey_server, namespace) for _ in range(12)]
@@ -265,20 +666,25 @@ def test_concurrent_manifest_initialization_is_atomic(valkey_server):
 
 
 def test_server_time_and_exact_noscript_recovery_without_lifecycle_mutation(
-    valkey_server,
+    tmp_path_factory,
 ):
-    foundation = _foundation(valkey_server)
-    try:
-        foundation.initialize_manifest()
-        assert foundation._client.script_exists(SERVER_TIME_SCRIPT.eval_sha1) == [False]
-        before = foundation._client.dbsize()
-        seconds, micros = foundation.server_time()
-        assert abs(seconds - time.time()) < 5 and 0 <= micros < 1_000_000
-        assert foundation._client.script_exists(SERVER_TIME_SCRIPT.eval_sha1) == [True]
-        assert foundation._client.dbsize() == before  # only the schema manifest exists
-    finally:
-        foundation._client.delete(foundation.config.key("schema"))
-        foundation.close()
+    with _isolated_valkey_server(tmp_path_factory, "valkey-server-time") as port:
+        foundation = _foundation(port)
+        try:
+            foundation.initialize_manifest()
+            assert foundation._client.script_exists(SERVER_TIME_SCRIPT.eval_sha1) == [
+                False
+            ]
+            before = foundation._client.dbsize()
+            seconds, micros = foundation.server_time()
+            assert abs(seconds - time.time()) < 5 and 0 <= micros < 1_000_000
+            assert foundation._client.script_exists(SERVER_TIME_SCRIPT.eval_sha1) == [
+                True
+            ]
+            assert foundation._client.dbsize() == before  # only the schema manifest exists
+        finally:
+            foundation._client.delete(foundation.config.key("schema"))
+            foundation.close()
 
 
 def test_conflicting_concurrent_initializers_preserve_one_manifest(valkey_server):

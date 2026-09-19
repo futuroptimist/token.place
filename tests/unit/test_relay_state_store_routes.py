@@ -1,12 +1,122 @@
 """Focused route wiring coverage for the in-memory API-v1 relay state store."""
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
+import threading
 from unittest.mock import Mock
 
 import pytest
 
 import relay
 from relay_state_store import RelayStateStoreError
+from valkey_relay_state import (
+    ValkeyRegistrationStore,
+    ValkeySchemaIncompatibleError,
+    ValkeyUnavailableError,
+)
+
+
+@pytest.mark.parametrize("handler_path", ["installed", "serve"])
+@pytest.mark.parametrize("pthread_sigmask", [True, False])
+def test_real_shutdown_signals_do_not_deadlock_admission(
+    handler_path, pthread_sigmask
+):
+    """Exercise both production handlers in a bounded child process."""
+
+    program = textwrap.dedent(
+        f"""
+        import os
+        import signal
+        import threading
+        chained = []
+        signal.signal(signal.SIGTERM, lambda signum, frame: chained.append(signum))
+        signal.signal(signal.SIGINT, lambda signum, frame: chained.append(signum))
+        import relay
+
+        if not {pthread_sigmask!r}:
+            relay.signal.pthread_sigmask = None
+
+        client = relay.app.test_client()
+        registration = client.post('/api/v1/relay/servers/register', json={{
+            'server_public_key': 'signal-node',
+            'capabilities': {{'supported_model_ids': ['qwen3-8b-instruct'],
+                'active_context_tier': '8k-fast',
+                'maximum_total_context_tokens': 8192,
+                'default_output_token_reservation': 1024,
+                'maximum_output_tokens': 1024, 'max_concurrency': 1}},
+        }}).get_json()
+        selection = client.get('/api/v1/relay/servers/next', query_string={{
+            'client_public_key': 'signal-client', 'request_id': 'accepted',
+            'cancel_token': 'signal-cancel',
+        }}).get_json()
+        response = client.post('/api/v1/relay/requests', json={{
+            'server_public_key': 'signal-node',
+            'client_public_key': 'signal-client', 'request_id': 'accepted',
+            'cancel_token': 'signal-cancel',
+            'reservation_token': selection['reservation_token'],
+            'request_deadline_epoch': selection['request_deadline_epoch'],
+            'protocol': 'tokenplace_api_v1_relay_e2ee', 'version': 1,
+            'ciphertext': 'sealed', 'cipherkey': 'key', 'iv': 'iv',
+        }})
+        assert response.status_code == 200
+
+        sent = threading.Event()
+        def send_signals():
+            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), signal.SIGINT)
+            sent.set()
+
+        class Server:
+            def serve_forever(self):
+                with relay._admission_gate():
+                    sender = threading.Thread(target=send_signals)
+                    sender.start()
+                    assert sent.wait(2)
+                    sender.join()
+            def shutdown(self):
+                self.stopped.set()
+            stopped = threading.Event()
+
+        server = Server()
+        if {handler_path!r} == 'serve':
+            relay.make_server = lambda *args, **kwargs: server
+            relay.serve('127.0.0.1', 0)
+            assert server.stopped.wait(2)
+        else:
+            with relay._admission_gate():
+                sender = threading.Thread(target=send_signals)
+                sender.start()
+                assert sent.wait(2)
+                sender.join()
+
+        assert relay.DRAINING.wait(2)
+        denied = client.get('/api/v1/relay/servers/next', query_string={{
+            'client_public_key': 'late-client', 'request_id': 'late',
+        }})
+        assert denied.status_code == 503
+        poll = client.post('/api/v1/relay/servers/poll', json={{
+            'server_public_key': 'signal-node',
+            'control_credential': registration['control_credential'],
+        }})
+        assert poll.status_code == 200
+        assert poll.get_json()['message'] == 'No requests available'
+        assert len(relay._api_v1_store().queued_requests('signal-node')) == 1
+        if {handler_path!r} == 'installed':
+            assert sorted(chained) == sorted([signal.SIGTERM, signal.SIGINT])
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=os.fspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def _queue_for_owner(client, *, request_id="control-request"):
@@ -41,6 +151,253 @@ def _claim_for_control(client, *, request_id="control-request"):
     }).get_json()
     claim = relay._api_v1_store().active_claims(node)[0]
     return node, credential, poll, (queued, claim, reservation_token)
+
+
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        (ValkeyUnavailableError("secret backend address"), "state_backend_unavailable"),
+        (ValkeySchemaIncompatibleError("secret schema key"), "state_schema_incompatible"),
+    ],
+)
+def test_healthz_valkey_readiness_fails_closed_before_protocol_reads(
+    monkeypatch, failure, code
+):
+    store = object.__new__(ValkeyRegistrationStore)
+    readiness = Mock(side_effect=failure)
+    store.readiness = readiness
+    protocol_read = Mock(side_effect=AssertionError("protocol state must not be read"))
+    store.list = protocol_read
+    monkeypatch.setattr(relay, "_api_v1_store", lambda: store)
+    client = relay.app.test_client()
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.get_json()["error"]["code"] == code
+    assert b"secret" not in response.data
+    readiness.assert_called_once_with()
+    protocol_read.assert_not_called()
+
+
+def test_healthz_memory_snapshot_filters_without_reaping():
+    relay._reset_api_v1_relay_state_store()
+    store = relay._api_v1_store()
+    client = relay.app.test_client()
+    response = client.post("/api/v1/relay/servers/register", json={
+        "server_public_key": "expired-health-node",
+        "capabilities": {"supported_model_ids": ["qwen3-8b-instruct"],
+                         "active_context_tier": "8k-fast",
+                         "maximum_total_context_tokens": 8192,
+                         "default_output_token_reservation": 1024,
+                         "maximum_output_tokens": 1024, "max_concurrency": 1},
+    })
+    assert response.status_code == 200
+    record = store._records["expired-health-node"]
+    store._epoch_time = lambda: record.lease_expires_at_epoch + 1
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.get_json()["registeredServers"] == []
+    assert "expired-health-node" in store._records
+    assert store._node_tombstones == {}
+
+
+def test_healthz_memory_snapshot_reports_live_claim_counts():
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, _, _, _ = _claim_for_control(client, request_id="health-claimed")
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    diagnostics = {
+        record["server_public_key"]: record
+        for record in response.get_json()["registeredServers"]
+    }
+    assert diagnostics[node]["queue_depth"] == 0
+    assert diagnostics[node]["in_flight_count"] == 1
+
+
+def test_livez_never_touches_state_store_while_draining(monkeypatch):
+    monkeypatch.setattr(
+        relay, "_api_v1_store", Mock(side_effect=AssertionError("store touched"))
+    )
+    relay.DRAINING.set()
+    try:
+        response = relay.app.test_client().get("/livez")
+    finally:
+        relay.DRAINING.clear()
+
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "alive"}
+
+
+def test_draining_suppresses_new_reservations_and_claims(monkeypatch):
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, credential, _, _ = _queue_for_owner(client, request_id="drain-queued")
+    store = relay._api_v1_store()
+    reserve = Mock(wraps=store.select_and_reserve)
+    claim = Mock(wraps=store.claim_queued_request)
+    monkeypatch.setattr(store, "select_and_reserve", reserve)
+    monkeypatch.setattr(store, "claim_queued_request", claim)
+
+    relay.DRAINING.set()
+    try:
+        selection = client.get(
+            "/api/v1/relay/servers/next",
+            query_string={"client_public_key": "new", "request_id": "new"},
+        )
+        poll = client.post(
+            "/api/v1/relay/servers/poll",
+            json={"server_public_key": node, "control_credential": credential},
+        )
+    finally:
+        relay.DRAINING.clear()
+
+    assert selection.status_code == 503
+    assert selection.get_json() == {
+        "status": "draining",
+        "details": {"shutdown": True},
+    }
+    assert poll.status_code == 200
+    assert poll.get_json()["message"] == "No requests available"
+    reserve.assert_not_called()
+    claim.assert_not_called()
+    assert len(store.queued_requests(node)) == 1
+
+
+def test_drain_transition_cannot_race_server_reservation(monkeypatch):
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, _, _, _ = _queue_for_owner(client, request_id="existing-work")
+    store = relay._api_v1_store()
+    store.cancel_or_expire_request("control-client", "existing-work", "control-cancel")
+    original = store.select_and_reserve
+    drain_started = threading.Event()
+    drain_finished = threading.Event()
+    drain_thread = None
+
+    def reserve_while_shutdown_starts(*args, **kwargs):
+        nonlocal drain_thread
+        def begin_draining():
+            drain_started.set()
+            relay._begin_draining()
+            drain_finished.set()
+
+        drain_thread = threading.Thread(target=begin_draining)
+        drain_thread.start()
+        assert drain_started.wait(1)
+        assert not relay.DRAINING.is_set()
+        assert not drain_finished.is_set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "select_and_reserve", reserve_while_shutdown_starts)
+    try:
+        response = client.get(
+            "/api/v1/relay/servers/next",
+            query_string={
+                "client_public_key": "racing-client",
+                "request_id": "racing-request",
+            },
+        )
+        assert response.status_code == 200
+        assert response.get_json()["server_public_key"] == node
+        assert drain_finished.wait(1)
+    finally:
+        if drain_thread is not None:
+            drain_thread.join(timeout=1)
+        relay.DRAINING.clear()
+
+
+def test_drain_transition_cannot_race_server_claim(monkeypatch):
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    node, credential, _, _ = _queue_for_owner(client, request_id="claim-race")
+    store = relay._api_v1_store()
+    original = store.claim_queued_request
+    drain_started = threading.Event()
+    drain_finished = threading.Event()
+    drain_thread = None
+
+    def claim_while_shutdown_starts(*args, **kwargs):
+        nonlocal drain_thread
+        def begin_draining():
+            drain_started.set()
+            relay._begin_draining()
+            drain_finished.set()
+
+        drain_thread = threading.Thread(target=begin_draining)
+        drain_thread.start()
+        assert drain_started.wait(1)
+        assert not relay.DRAINING.is_set()
+        assert not drain_finished.is_set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "claim_queued_request", claim_while_shutdown_starts)
+    try:
+        response = client.post(
+            "/api/v1/relay/servers/poll",
+            json={"server_public_key": node, "control_credential": credential},
+        )
+        assert response.status_code == 200
+        assert response.get_json()["request_id"] == "claim-race"
+        assert drain_finished.wait(1)
+    finally:
+        if drain_thread is not None:
+            drain_thread.join(timeout=1)
+        relay.DRAINING.clear()
+
+
+def test_drain_during_waiting_poll_skips_another_claim(monkeypatch):
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    registration = client.post("/api/v1/relay/servers/register", json={
+        "server_public_key": "waiting-node",
+        "capabilities": {"supported_model_ids": ["qwen3-8b-instruct"],
+                         "active_context_tier": "8k-fast",
+                         "maximum_total_context_tokens": 8192,
+                         "default_output_token_reservation": 1024,
+                         "maximum_output_tokens": 1024, "max_concurrency": 1},
+    }).get_json()
+    store = relay._api_v1_store()
+    claim = Mock(wraps=store.claim_queued_request)
+    monkeypatch.setattr(store, "claim_queued_request", claim)
+    waiting = threading.Event()
+    resume = threading.Event()
+
+    def controlled_wait(_seconds):
+        waiting.set()
+        assert resume.wait(1)
+
+    monkeypatch.setattr(relay.time, "sleep", controlled_wait)
+    result = {}
+
+    def poll():
+        with relay.app.test_client() as thread_client:
+            result["response"] = thread_client.post(
+                "/api/v1/relay/servers/poll",
+                json={"server_public_key": "waiting-node",
+                      "control_credential": registration["control_credential"]},
+            )
+
+    worker = threading.Thread(target=poll)
+    worker.start()
+    try:
+        assert waiting.wait(1)
+        assert relay._begin_draining()
+        resume.set()
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        assert result["response"].status_code == 200
+        assert result["response"].get_json()["message"] == "No requests available"
+        assert claim.call_count == 1
+    finally:
+        resume.set()
+        worker.join(timeout=1)
+        relay.DRAINING.clear()
 
 
 def test_request_queued_event_is_once_only_and_privacy_safe(monkeypatch):
@@ -516,9 +873,10 @@ def test_operational_endpoints_bound_store_snapshot_failures(
     if method_name != "list":
         _queue_for_owner(client, request_id=f"failure-{method_name}")
     secret = "sensitive-store-failure"
+    target_method = "health_snapshot" if endpoint == "/healthz" else method_name
     monkeypatch.setattr(
         relay._api_v1_store(),
-        method_name,
+        target_method,
         Mock(side_effect=RelayStateStoreError(secret)),
     )
 

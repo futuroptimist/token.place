@@ -448,7 +448,7 @@ class SchemaManifest:
             }:
                 raise ValueError
             return cls(**value)
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
             raise ValkeySchemaIncompatibleError("state schema incompatible") from None
 
 
@@ -3095,6 +3095,11 @@ class ValkeyRegistrationStore:
 
     def close(self) -> None:
         self._foundation.close()
+
+    def readiness(self) -> None:
+        """Verify the shared backend without reading protocol state."""
+
+        self._foundation.readiness()
 
     @staticmethod
     def _node_digest(node_id: str) -> str:

@@ -1092,6 +1092,46 @@ class InMemoryRelayStateStore:
                 replace(self._records[node_id]) for node_id in sorted(self._records)
             )
 
+    def health_snapshot(self) -> tuple[
+        tuple[ComputeNodeRegistration, ...],
+        dict[str, int],
+        dict[str, int],
+        tuple[NodeTombstoneRecord, ...],
+    ]:
+        """Return live diagnostic counts without running lifecycle reapers."""
+
+        with self._lock:
+            now = self._now()
+            registrations = tuple(
+                replace(record)
+                for node_id in sorted(self._records)
+                if (record := self._records[node_id]).lease_expires_at_epoch > now
+            )
+            queue_depths = {}
+            in_flight_counts = {}
+            for record in registrations:
+                queue_depths[record.node_id] = sum(
+                    queued.request_deadline_epoch > now
+                    and (
+                        (claim := self._claims.get(identity)) is None
+                        or claim.lease_expires_at_epoch <= now
+                    )
+                    for identity, queued in self._queued.items()
+                    if queued.selected_node_id == record.node_id
+                )
+                in_flight_counts[record.node_id] = sum(
+                    claim.selected_node_id == record.node_id
+                    and claim.lease_expires_at_epoch > now
+                    and claim.request_deadline_epoch > now
+                    for claim in self._claims.values()
+                )
+            tombstones = tuple(
+                replace(record)
+                for record in self._node_tombstones.values()
+                if record.expires_at_epoch > now
+            )
+            return registrations, queue_depths, in_flight_counts, tombstones
+
     def expire(self) -> tuple[ComputeNodeRegistration, ...]:
         with self._lock:
             return tuple(

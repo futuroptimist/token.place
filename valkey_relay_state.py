@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 import redis
+from limits.storage import Storage
 from redis.exceptions import NoScriptError, RedisError, ResponseError
 from redis.sentinel import Sentinel
 
@@ -168,6 +169,145 @@ class ValkeyScriptError(ValkeyFoundationError):
     pass
 
 
+_RATE_LIMIT_SCRIPT = """
+local now = redis.call('TIME')
+local seconds = tonumber(now[1])
+local window = tonumber(ARGV[1])
+local amount = tonumber(ARGV[2])
+local epoch = math.floor(seconds / window)
+local key = ARGV[3] .. epoch
+local count = redis.call('INCRBY', key, amount)
+local reset = (epoch + 1) * window
+redis.call('EXPIREAT', key, reset + 2)
+return {count, reset}
+"""
+
+
+class ValkeyRateLimitStorage(Storage):
+    """limits-compatible fixed-window storage using Valkey server time.
+
+    The URI contains no connection material.  Connection and namespace settings
+    are taken from the validated relay Valkey environment so public and control
+    quotas cannot accidentally point at different services.
+    """
+
+    STORAGE_SCHEME = ["tokenplace-valkey"]
+
+    def __init__(self, uri: str | None = None, **options: Any):
+        super().__init__(uri, **options)
+        foundation = options.get("foundation")
+        if not callable(foundation) and not isinstance(foundation, ValkeyFoundation):
+            raise ValkeyConfigurationError("invalid shared rate-limit storage")
+        self._foundation_source = foundation
+        self._last_reset: dict[str, int] = {}
+
+    @property
+    def _foundation(self) -> "ValkeyFoundation":
+        source = self._foundation_source
+        foundation = source() if callable(source) else source
+        if not isinstance(foundation, ValkeyFoundation):
+            raise ValkeyConfigurationError("invalid shared rate-limit storage")
+        return foundation
+
+    @property
+    def base_exceptions(self):
+        return ValkeyFoundationError
+
+    @staticmethod
+    def _expiry_from_limits_key(key: str) -> int:
+        units = {"second": 1, "minute": 60, "hour": 3600, "day": 86400}
+        parts = key.rsplit("/", 3)
+        if len(parts) != 4 or parts[3] not in units:
+            raise ValkeyConfigurationError("invalid rate-limit key")
+        try:
+            multiple = int(parts[2])
+        except ValueError:
+            raise ValkeyConfigurationError("invalid rate-limit key") from None
+        expiry = multiple * units[parts[3]]
+        if not 1 <= expiry <= 31_536_000:
+            raise ValkeyConfigurationError("invalid rate-limit window")
+        return expiry
+
+    def _coordinates(self, key: str, expiry: int) -> tuple[str, str]:
+        route = "control" if "/api/v1/relay/" in key else "public"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        # A trailing colon lets the script append its authoritative epoch.
+        return self._foundation.config.key("ratelimit", route, digest, expiry), digest
+
+    def incr(self, key: str, expiry: int, amount: int = 1) -> int:
+        if expiry != self._expiry_from_limits_key(key) or not 1 <= amount <= 1_000_000:
+            raise ValkeyConfigurationError("invalid rate-limit mutation")
+        prefix, _ = self._coordinates(key, expiry)
+        manifest = self._foundation.read_manifest()
+        self._foundation.check_write_compatible(manifest)
+        result = self._foundation._call_mutating_script(
+            self._foundation._client.eval,
+            _RATE_LIMIT_SCRIPT,
+            0,
+            expiry,
+            amount,
+            prefix + ":",
+        )
+        if not isinstance(result, (list, tuple)) or len(result) != 2:
+            raise ValkeyScriptError("invalid rate-limit result")
+        try:
+            count, reset = map(int, result)
+        except (TypeError, ValueError):
+            raise ValkeyScriptError("invalid rate-limit result") from None
+        if count < 0 or reset < 0:
+            raise ValkeyScriptError("invalid rate-limit result")
+        self._last_reset[key] = reset
+        return count
+
+    def get(self, key: str) -> int:
+        expiry = self._expiry_from_limits_key(key)
+        seconds, _ = self._foundation.server_time()
+        prefix, _ = self._coordinates(key, expiry)
+        value = self._foundation._call(
+            self._foundation._client.get, f"{prefix}:{seconds // expiry}"
+        )
+        try:
+            return 0 if value is None else int(value)
+        except (TypeError, ValueError):
+            raise ValkeySchemaIncompatibleError("invalid rate-limit value") from None
+
+    def get_expiry(self, key: str) -> float:
+        expiry = self._expiry_from_limits_key(key)
+        seconds, _ = self._foundation.server_time()
+        return float(self._last_reset.get(key, (seconds // expiry + 1) * expiry))
+
+    def decr(self, key: str, amount: int = 1) -> int:
+        expiry = self._expiry_from_limits_key(key)
+        seconds, _ = self._foundation.server_time()
+        prefix, _ = self._coordinates(key, expiry)
+        value = self._foundation._call_mutating_script(
+            self._foundation._client.eval,
+            "local v=redis.call('GET',KEYS[1]); if not v then return 0 end; "
+            "v=tonumber(v); if not v then return redis.error_reply('schema') end; "
+            "local n=math.max(0,v-tonumber(ARGV[1])); redis.call('SET',KEYS[1],n,'KEEPTTL'); return n",
+            1,
+            f"{prefix}:{seconds // expiry}",
+            amount,
+        )
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValkeyScriptError("invalid rate-limit result")
+        return value
+
+    def clear(self, key: str) -> None:
+        expiry = self._expiry_from_limits_key(key)
+        seconds, _ = self._foundation.server_time()
+        prefix, _ = self._coordinates(key, expiry)
+        self._foundation._call_mutating_script(
+            self._foundation._client.delete, f"{prefix}:{seconds // expiry}"
+        )
+
+    def check(self) -> bool:
+        self._foundation.readiness()
+        return True
+
+    def reset(self) -> int | None:
+        # Broad deletion is deliberately unsupported.
+        return 0
 @dataclass(frozen=True, slots=True, repr=False)
 class DirectPrimary:
     host: str

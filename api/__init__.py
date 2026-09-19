@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Any
 
-from flask import Response, g, jsonify, request
+from flask import Response, g, has_request_context, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
 from limits.storage import storage_from_string
@@ -22,6 +22,8 @@ from prometheus_flask_exporter import PrometheusMetrics
 from api.client_identity import (
     ClientIdentityPolicy, current_client_address, current_limiter_key,
 )
+from api.shared_rate_limit import SharedValkeyRateLimitStorage  # noqa: F401
+from valkey_relay_state import ValkeyFoundationError
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 from config import get_config
@@ -394,6 +396,15 @@ def _control_server_owner_identity(data: Any) -> tuple[str, str] | None:
     if not (isinstance(server_public_key, str) and server_public_key.strip() and isinstance(credential, str) and credential):
         return None
     request_id = data.get("request_id")
+    owner_lookup = request.environ.get("tokenplace.owner_lookup") if has_request_context() else None
+    if callable(owner_lookup):
+        digest = _fingerprint(credential)
+        try:
+            if owner_lookup(server_public_key.strip(), digest, request_id):
+                return "server_public_key", server_public_key.strip()
+        except ValkeyFoundationError:
+            raise
+        return None
     for module_name in ("relay", "__main__"):
         module = sys.modules.get(module_name)
         known_servers = getattr(module, "known_servers", None) if module is not None else None
@@ -523,6 +534,22 @@ def _check_control_plane_limits(
             return False, retry_after, bucket_kind, ":".join(identifiers), limit_item
         planned_hits.append((bucket_kind, identifiers, limit_item))
 
+    storage = getattr(rate_limiter, "storage", None)
+    hit_many = getattr(storage, "hit_many", None)
+    if isinstance(storage, SharedValkeyRateLimitStorage) and callable(hit_many):
+        atomic_buckets = [
+            (limit_item.key_for(*identifiers), 1, limit_item.amount)
+            for _kind, identifiers, limit_item in planned_hits
+        ]
+        allowed, rejected_index, reset = hit_many(atomic_buckets)
+        if allowed:
+            return True, 0, "", "", None
+        bucket_kind, identifiers, limit_item = planned_hits[rejected_index]
+        return (
+            False, max(int(reset - time.time()), 1), bucket_kind,
+            ":".join(identifiers), limit_item,
+        )
+
     # Record identity buckets before the aggregate client-IP bucket. The limits
     # backend records each hit separately, so a concurrent over-limit identity
     # race must fail before it can consume the NAT-wide IP budget shared by
@@ -565,10 +592,10 @@ def _build_control_plane_rate_limit_response(limit_item: Any, retry_after: int):
     return response
 
 
-def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
+def _install_control_plane_rate_limiter(app, storage_uri: str | None, storage_options=None) -> None:
     route_limits = _control_plane_limits_from_env()
     control_plane_storage_uri = storage_uri or "memory://"
-    control_plane_storage = storage_from_string(control_plane_storage_uri)
+    control_plane_storage = storage_from_string(control_plane_storage_uri, **(storage_options or {}))
     control_plane_rate_limiter = FixedWindowRateLimiter(control_plane_storage)
     app.config["relay_control_plane_rate_limit_storage_uri"] = control_plane_storage_uri
     app.config["relay_control_plane_rate_limiter"] = control_plane_rate_limiter
@@ -751,7 +778,7 @@ def _install_public_quota_metrics(app, registry) -> None:
 
 
 def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metrics_path="/metrics",
-             metrics_instrumentation_enabled=True):
+             metrics_instrumentation_enabled=True, relay_store_factory=None):
     """Initialize the API with the Flask app.
 
     Relay callers may pass a dedicated Prometheus registry and disable the
@@ -760,6 +787,12 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     """
 
     app.extensions["tokenplace_client_identity_policy"] = ClientIdentityPolicy.from_environment()
+    if relay_store_factory is not None:
+        @app.before_request
+        def _install_owner_lookup():
+            request.environ["tokenplace.owner_lookup"] = (
+                lambda *args: relay_store_factory().authenticates_owner(*args)
+            )
     # Flask-Limiter's INFO rejection message includes its derived storage key.
     # Responses and bounded application telemetry provide the needed signal.
     logging.getLogger("flask-limiter").setLevel(logging.WARNING)
@@ -768,6 +801,16 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
         _install_public_quota_metrics(app, metrics_registry)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
+    storage_options = None
+    if relay_store_factory is not None and os.environ.get(
+        "TOKENPLACE_RELAY_STATE_BACKEND", "memory"
+    ).strip().lower() == "valkey":
+        limiter_storage_uri = "tokenplace-valkey://shared"
+        storage_options = {"store_factory": relay_store_factory}
+    workers = int(os.environ.get("RELAY_WORKERS", "1"))
+    replicas = int(os.environ.get("RELAY_REPLICAS", "1"))
+    if max(workers, replicas) > 1 and limiter_storage_uri != "tokenplace-valkey://shared":
+        raise RuntimeError("shared Valkey rate limiting is required")
     limiter_kwargs = {
         "default_limits": [
             os.environ.get("API_RATE_LIMIT", "60/hour"),
@@ -779,6 +822,10 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     }
     if limiter_storage_uri:
         limiter_kwargs["storage_uri"] = limiter_storage_uri
+    if storage_options:
+        limiter_kwargs["storage_options"] = storage_options
+    limiter_kwargs["swallow_errors"] = False
+    limiter_kwargs["in_memory_fallback_enabled"] = False
 
     limiter = Limiter(
         current_limiter_key,
@@ -791,7 +838,11 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
         g.tokenplace_public_quota_reason = _public_quota_limit_reason(exc)
         return _build_rate_limit_response(exc)
 
-    _install_control_plane_rate_limiter(app, limiter_storage_uri)
+    _install_control_plane_rate_limiter(app, limiter_storage_uri, storage_options)
+
+    @app.errorhandler(ValkeyFoundationError)
+    def _handle_rate_limit_backend_failure(_exc):
+        return jsonify({"error": {"message": "Rate limit service unavailable", "type": "service_unavailable", "code": "rate_limit_unavailable", "param": None}}), 503
 
     if metrics_instrumentation_enabled:
         PrometheusMetrics(

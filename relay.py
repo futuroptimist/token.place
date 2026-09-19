@@ -507,6 +507,7 @@ def create_app() -> Flask:
         metrics_export_defaults=False,
         metrics_path=None,
         metrics_instrumentation_enabled=METRICS_MODE == "normal",
+        relay_store_factory=lambda: _api_v1_store(),
     )
     LOGGER.info(
         "relay.app.initialized",

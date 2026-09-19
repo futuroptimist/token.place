@@ -2793,6 +2793,74 @@ PENDING_TRANSITION_READ_SCRIPT = ReviewedScript(
     False,
 )
 
+OWNER_AUTHORITY_SOURCE = """\
+local node,leases,control=KEYS[1],KEYS[2],KEYS[3]
+local node_digest,owner=ARGV[1],ARGV[2]
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local lease=redis.call('ZSCORE',leases,node_digest)
+if lease and tonumber(lease)>now then
+  local values=redis.call('HMGET',node,'control_credential_digest','lease_expires_at_epoch')
+  if not values[1] or not values[2] or tonumber(values[2])~=tonumber(lease) then return {'schema'} end
+  if values[1]==owner then return {'authenticated'} end
+end
+if control~='' and redis.call('EXISTS',control)==1 then
+  local values=redis.call('HMGET',control,'control_credential_digest','expires_at_epoch')
+  if not values[1] or not values[2] then return {'schema'} end
+  if tonumber(values[2])>now and values[1]==owner then return {'authenticated'} end
+end
+return {'unknown'}
+"""
+OWNER_AUTHORITY_SCRIPT = ReviewedScript(
+    "owner_authority_v1", OWNER_AUTHORITY_SOURCE,
+    "4e95bde1367bb29888665145983c66b2e6dc3e32b199258609ce7da3a258a31f",  # pragma: allowlist secret
+    False,
+)
+
+RATE_LIMIT_SOURCE = """\
+local operation,expiry,amount=ARGV[1],tonumber(ARGV[2]),tonumber(ARGV[3])
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local window=math.floor(now/expiry); local key=KEYS[1]..window
+if operation=='hit' then
+  local value=redis.call('INCRBY',key,amount)
+  if value==amount then redis.call('PEXPIREAT',key,math.ceil((window+1)*expiry*1000)+1000) end
+  return {'ok',tostring(value),tostring((window+1)*expiry)}
+elseif operation=='get' then
+  return {'ok',redis.call('GET',key) or '0',tostring((window+1)*expiry)}
+elseif operation=='decr' then
+  local value=tonumber(redis.call('GET',key) or '0'); if value>0 then value=redis.call('DECR',key) end
+  return {'ok',tostring(value),tostring((window+1)*expiry)}
+end
+return {'invalid'}
+"""
+RATE_LIMIT_SCRIPT = ReviewedScript(
+    "rate_limit_v1", RATE_LIMIT_SOURCE,
+    "c8cad9c4082bdb322630fc76c892be61ec8af6884b6ecefe0433ba3dca91986d",  # pragma: allowlist secret
+    True,
+)
+
+RATE_LIMIT_MULTI_SOURCE = """\
+local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000
+local resolved={}
+for index=1,#KEYS do
+  local offset=(index-1)*3; local expiry=tonumber(ARGV[offset+1])
+  local amount=tonumber(ARGV[offset+2]); local maximum=tonumber(ARGV[offset+3])
+  local window=math.floor(now/expiry); local key=KEYS[index]..window
+  local value=tonumber(redis.call('GET',key) or '0')
+  if value+amount>maximum then return {'limited',tostring(index),tostring((window+1)*expiry)} end
+  resolved[index]={key,window,expiry,value,amount}
+end
+for index,item in ipairs(resolved) do
+  local value=redis.call('INCRBY',item[1],item[5])
+  if value==item[5] then redis.call('PEXPIREAT',item[1],math.ceil((item[2]+1)*item[3]*1000)+1000) end
+end
+return {'ok'}
+"""
+RATE_LIMIT_MULTI_SCRIPT = ReviewedScript(
+    "rate_limit_multi_v1", RATE_LIMIT_MULTI_SOURCE,
+    "fed4734ade32938552fb37fd07a1c3320cc3ccff2ec41236ff9a862c7d28a535",  # pragma: allowlist secret
+    True,
+)
+
 SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
     {
         SERVER_TIME_SCRIPT.name: SERVER_TIME_SCRIPT,
@@ -2809,6 +2877,9 @@ SCRIPT_REGISTRY: Mapping[str, ReviewedScript] = MappingProxyType(
         RETRIEVE_RESPONSE_SCRIPT.name: RETRIEVE_RESPONSE_SCRIPT,
         NODE_TRANSITION_SCRIPT.name: NODE_TRANSITION_SCRIPT,
         PENDING_TRANSITION_READ_SCRIPT.name: PENDING_TRANSITION_READ_SCRIPT,
+        OWNER_AUTHORITY_SCRIPT.name: OWNER_AUTHORITY_SCRIPT,
+        RATE_LIMIT_SCRIPT.name: RATE_LIMIT_SCRIPT,
+        RATE_LIMIT_MULTI_SCRIPT.name: RATE_LIMIT_MULTI_SCRIPT,
     }
 )
 SCRIPT_DIGESTS: Mapping[str, str] = MappingProxyType(
@@ -3100,6 +3171,28 @@ class ValkeyRegistrationStore:
         """Verify the shared backend without reading protocol state."""
 
         self._foundation.readiness()
+
+    def authenticates_owner(
+        self, node_id: str, control_credential_digest: str, request_id: str | None = None
+    ) -> bool:
+        self._validate_node_id(node_id)
+        self._validate_digest(control_credential_digest)
+        node_digest = self._node_digest(node_id)
+        # Current registration authority is sufficient for pre-route bucketing.
+        # Request tombstones are intentionally not searched: their key requires
+        # the already-validated client identity, and rate limiting must not scan.
+        control_key = ""
+        result = self._foundation.execute(
+            OWNER_AUTHORITY_SCRIPT.name,
+            (self._foundation.config.key("node", node_digest),
+             self._foundation.config.key("nodes:lease"), control_key),
+            (node_digest.encode(), control_credential_digest.encode()),
+        )
+        if result == [b"authenticated"]:
+            return True
+        if result == [b"unknown"]:
+            return False
+        raise ValkeyScriptError("invalid owner authority result")
 
     @staticmethod
     def _node_digest(node_id: str) -> str:

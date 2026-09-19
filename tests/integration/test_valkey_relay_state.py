@@ -73,7 +73,7 @@ def _set_runtime_factory_env(monkeypatch, port, namespace):
         "TOKENPLACE_RELAY_VALKEY_PORT": str(port),
         "TOKENPLACE_RELAY_VALKEY_ENVIRONMENT": "test",
         "TOKENPLACE_RELAY_VALKEY_CLUSTER": namespace,
-        "TOKENPLACE_RELAY_VALKEY_SCHEMA_MAJOR": "2",
+        "TOKENPLACE_RELAY_VALKEY_SCHEMA_MAJOR": "1",
         "TOKENPLACE_RELAY_VALKEY_READER_REVISION": "1",
         "TOKENPLACE_RELAY_VALKEY_WRITER_REVISION": "1",
         "TOKENPLACE_RELAY_VALKEY_SUPPORTED_SCHEMA_READ_MIN": "1",
@@ -215,6 +215,7 @@ def test_shared_rate_limit_cross_instance_rollover_and_atomic_rejection(valkey_s
     namespace = uuid.uuid4().hex
     first = _foundation(valkey_server, namespace)
     second = _foundation(valkey_server, namespace)
+    cleanup_keys = [first.config.key("schema")]
     try:
         first.initialize_manifest()
         one = _shared_rate_limit_storage(first)
@@ -226,18 +227,50 @@ def test_shared_rate_limit_cross_instance_rollover_and_atomic_rejection(valkey_s
         allowed_key = "LIMITER/allowed/10/1/hour"
         exhausted_key = "LIMITER/exhausted/1/1/hour"
         assert one.incr(exhausted_key, 3600) == 1
+        exhausted_reset = one.get_expiry(exhausted_key)
         assert two.hit_many([
             (allowed_key, 1, 10), (exhausted_key, 1, 1),
         ])[:2] == (False, 1)
         assert one.get(allowed_key) == 0
 
         reset = one.get_expiry(second_key)
+        for key, expiry, key_reset in (
+            (second_key, 1, reset), (exhausted_key, 3600, exhausted_reset)
+        ):
+            digest = hashlib.sha256(key.encode()).hexdigest()
+            prefix = first.config.key("ratelimit", "application", digest, 0)[:-1]
+            cleanup_keys.append(f"{prefix}{int(key_reset // expiry) - 1}")
         time.sleep(max(reset - time.time(), 0) + 0.05)
         assert two.get(second_key) == 0
     finally:
-        first._client.flushdb()
+        first._client.delete(*cleanup_keys)
         first.close()
         second.close()
+
+
+def test_shared_script_manifest_requires_explicit_stopped_migration(valkey_server):
+    foundation = _foundation(valkey_server)
+    legacy = dataclasses.replace(
+        _manifest(),
+        script_digests={
+            name: digest for name, digest in SCRIPT_DIGESTS.items()
+            if name not in {"owner_authority_v1", "rate_limit_v1", "rate_limit_multi_v1"}
+        },
+    )
+    key = foundation.config.key("schema")
+    try:
+        foundation._client.set(key, legacy.encode())
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            foundation.initialize_manifest()
+        with pytest.raises(ValkeySchemaIncompatibleError):
+            foundation.migrate_shared_rate_limit_manifest(namespace_stopped=False)
+        assert foundation.migrate_shared_rate_limit_manifest(
+            namespace_stopped=True
+        ) == _manifest()
+        assert foundation.read_manifest() == _manifest()
+    finally:
+        foundation._client.delete(key)
+        foundation.close()
 
 
 def test_atomic_initialization_compatibility_readiness_and_exact_cleanup(valkey_server):

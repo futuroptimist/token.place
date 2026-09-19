@@ -3,11 +3,15 @@
 import os
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from flask import Flask, request as flask_request
 from relay_state_store import RelayStateStoreError
+from api.shared_rate_limit import (
+    RateLimitBackendUnavailable, SharedValkeyRateLimitStorage,
+)
+from valkey_relay_state import ValkeyRegistrationStore
 
 from api import (
     _check_control_plane_limits,
@@ -75,6 +79,53 @@ def test_owner_lookup_receives_tombstone_identity_fields():
     lookup.assert_called_once_with(
         "server-a", _fingerprint("secret"), "client-a", "request-a",
     )
+
+
+def _shared_storage(results):
+    foundation = Mock()
+    foundation.config.key.side_effect = (
+        lambda family, route, digest, window:
+        f"tokenplace:{{test:cluster}}:relay:v1:{family}:{route}:{digest}:{window}"
+    )
+    foundation.execute.side_effect = results
+    store = object.__new__(ValkeyRegistrationStore)
+    store._foundation = foundation
+    return SharedValkeyRateLimitStorage(
+        "tokenplace-valkey://shared", store_factory=lambda: store
+    ), foundation
+
+
+def test_shared_multi_bucket_uses_server_retry_after_without_local_clock():
+    storage, _ = _shared_storage(([b"limited", b"2", b"7"],))
+    buckets = [
+        ("LIMITER/ip/10/1/hour", 1, 10),
+        ("LIMITER/owner/2/1/hour", 1, 2),
+    ]
+    assert storage.hit_many(buckets) == (False, 1, 7)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    ([b"limited", b"0", b"1"], [b"limited", b"3", b"1"],
+     [b"limited", b"1", b"0"], [b"limited", b"1", b"3601"],
+     [b"limited", b"1", b"nan"]),
+)
+def test_shared_multi_bucket_malformed_bounds_fail_closed(reply):
+    storage, _ = _shared_storage((reply,))
+    with pytest.raises(RateLimitBackendUnavailable, match="invalid result"):
+        storage.hit_many([("LIMITER/ip/10/1/hour", 1, 10)])
+
+
+def test_shared_store_factory_failure_is_bounded():
+    def unavailable():
+        raise RelayStateStoreError("private detail")
+
+    storage = SharedValkeyRateLimitStorage(
+        "tokenplace-valkey://shared", store_factory=unavailable
+    )
+    with pytest.raises(RateLimitBackendUnavailable) as caught:
+        storage.get("LIMITER/ip/10/1/hour")
+    assert "private detail" not in str(caught.value)
 
 
 @patch.dict(os.environ, {"API_RATE_LIMIT": "1/minute"}, clear=True)

@@ -22,7 +22,9 @@ from prometheus_flask_exporter import PrometheusMetrics
 from api.client_identity import (
     ClientIdentityPolicy, current_client_address, current_limiter_key,
 )
-from api.shared_rate_limit import SharedValkeyRateLimitStorage  # noqa: F401
+from api.shared_rate_limit import (  # noqa: F401
+    RateLimitBackendUnavailable, SharedValkeyRateLimitStorage,
+)
 from relay_state_store import RelayStateStoreError
 from valkey_relay_state import ValkeyFoundationError
 from api.v1 import routes as v1_routes
@@ -550,7 +552,7 @@ def _check_control_plane_limits(
             return True, 0, "", "", None
         bucket_kind, identifiers, limit_item = planned_hits[rejected_index]
         return (
-            False, max(int(reset - time.time()), 1), bucket_kind,
+            False, reset, bucket_kind,
             ":".join(identifiers), limit_item,
         )
 
@@ -794,9 +796,15 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     if relay_store_factory is not None:
         @app.before_request
         def _install_owner_lookup():
-            request.environ["tokenplace.owner_lookup"] = (
-                lambda *args: relay_store_factory().authenticates_owner(*args)
-            )
+            def owner_lookup(*args):
+                try:
+                    return relay_store_factory().authenticates_owner(*args)
+                except (ValkeyFoundationError, RelayStateStoreError):
+                    raise RateLimitBackendUnavailable(
+                        "rate-limit backend unavailable"
+                    ) from None
+
+            request.environ["tokenplace.owner_lookup"] = owner_lookup
     # Flask-Limiter's INFO rejection message includes its derived storage key.
     # Responses and bounded application telemetry provide the needed signal.
     logging.getLogger("flask-limiter").setLevel(logging.WARNING)
@@ -844,8 +852,7 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
 
     _install_control_plane_rate_limiter(app, limiter_storage_uri, storage_options)
 
-    @app.errorhandler(ValkeyFoundationError)
-    @app.errorhandler(RelayStateStoreError)
+    @app.errorhandler(RateLimitBackendUnavailable)
     def _handle_rate_limit_backend_failure(_exc):
         return jsonify({"error": {"message": "Rate limit service unavailable", "type": "service_unavailable", "code": "rate_limit_unavailable", "param": None}}), 503
 

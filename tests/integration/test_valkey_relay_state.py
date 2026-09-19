@@ -17,8 +17,11 @@ from threading import Barrier, Event
 
 import pytest
 import redis
+from flask import Flask
+from limits.util import parse
 
 import relay
+from api import init_app
 from api.shared_rate_limit import SharedValkeyRateLimitStorage
 from relay_state_store import (
     ComputeNodeCapabilities,
@@ -246,6 +249,135 @@ def test_shared_rate_limit_cross_instance_rollover_and_atomic_rejection(valkey_s
         first._client.delete(*cleanup_keys)
         first.close()
         second.close()
+
+
+def test_shared_rate_limit_is_application_wide_for_public_and_control_routes(
+    valkey_server, monkeypatch
+):
+    namespace = uuid.uuid4().hex
+    _set_runtime_factory_env(monkeypatch, valkey_server, namespace)
+    monkeypatch.setenv("API_RATE_LIMIT", "1/hour")
+    monkeypatch.setenv("API_DAILY_QUOTA", "100/day")
+    monkeypatch.setenv("API_RELAY_CONTROL_PLANE_CONTROL_RATE_LIMIT", "1/hour")
+    monkeypatch.setenv("API_RELAY_CONTROL_PLANE_IP_RATE_LIMIT", "100/hour")
+
+    foundations = [
+        _foundation(valkey_server, namespace),
+        _foundation(valkey_server, namespace),
+    ]
+    foundations[0].initialize_manifest()
+    stores = [
+        ValkeyRegistrationStore(
+            foundation,
+            RelayStateStoreConfig(namespace="testing.valkey"),
+            acknowledgement_key=_ACKNOWLEDGEMENT_KEY,
+        )
+        for foundation in foundations
+    ]
+    node_id = "application-rate-limit-owner"
+    credential = "application-rate-limit-credential"
+    cleanup_keys = [
+        foundations[0].config.key("schema"),
+        foundations[0].config.key("nodes:lease"),
+        foundations[0].config.key("node", _digest(node_id)),
+    ]
+
+    def build_app(store):
+        app = Flask(f"shared-rate-limit-{id(store)}")
+
+        @app.get("/application-rate-limit")
+        def application_rate_limit():
+            return {"status": "ok"}
+
+        @app.post("/api/v1/relay/servers/control")
+        def relay_servers_control():
+            return {"status": "ok"}
+
+        init_app(
+            app,
+            metrics_instrumentation_enabled=False,
+            relay_store_factory=lambda: store,
+        )
+        return app
+
+    try:
+        stores[0].register(node_id, _capabilities(), _digest(credential))
+        apps = [build_app(store) for store in stores]
+        assert all(
+            isinstance(
+                next(iter(app.extensions["limiter"])).storage,
+                SharedValkeyRateLimitStorage,
+            )
+            for app in apps
+        )
+        assert {
+            app.config["relay_control_plane_rate_limit_storage_uri"]
+            for app in apps
+        } == {"tokenplace-valkey://shared"}
+
+        public_responses = []
+        control_responses = []
+        control_payload = {
+            "server_public_key": node_id,
+            "control_credential": credential,
+            "request_id": "application-rate-limit-request",
+        }
+        for app in apps:
+            with app.test_client() as client:
+                public_responses.append(client.get("/application-rate-limit"))
+                control_responses.append(
+                    client.post(
+                        "/api/v1/relay/servers/control",
+                        json=control_payload,
+                        environ_overrides={"REMOTE_ADDR": "198.51.100.77"},
+                    )
+                )
+
+        assert [response.status_code for response in public_responses] == [200, 429]
+        assert [response.status_code for response in control_responses] == [200, 429]
+
+        client_identity = "client:" + _digest("127.0.0.1")
+        control_route = "/api/v1/relay/servers/control"
+        logical_rate_limit_keys = (
+            f"LIMITER/{client_identity}/application_rate_limit/1/1/hour",
+            f"LIMITER/{client_identity}/application_rate_limit/100/1/day",
+            parse("100/hour").key_for(
+                control_route, "client_ip", _digest("198.51.100.77")
+            ),
+            parse("1/hour").key_for(
+                control_route, "server_public_key", _digest(node_id)
+            ),
+        )
+        shared_storage = next(iter(apps[0].extensions["limiter"])).storage
+        for logical_key in logical_rate_limit_keys:
+            expiry_seconds = 86400 if logical_key.endswith("/day") else 3600
+            reset = shared_storage.get_expiry(logical_key)
+            digest = hashlib.sha256(logical_key.encode()).hexdigest()
+            prefix = foundations[0].config.key(
+                "ratelimit", "application", digest, 0
+            )[:-1]
+            cleanup_keys.append(f"{prefix}{int(reset // expiry_seconds) - 1}")
+
+        with apps[0].test_client() as client:
+            public_repeated = client.get("/application-rate-limit")
+            control_repeated = client.post(
+                "/api/v1/relay/servers/control",
+                json=control_payload,
+                environ_overrides={"REMOTE_ADDR": "198.51.100.77"},
+            )
+        for first_rejection, second_rejection in (
+            (public_responses[1], public_repeated),
+            (control_responses[1], control_repeated),
+        ):
+            assert first_rejection.get_json() == second_rejection.get_json()
+            retry_after = first_rejection.headers["Retry-After"]
+            assert retry_after == second_rejection.headers["Retry-After"]
+            assert 1 <= int(retry_after) <= 3600
+            assert first_rejection.get_json()["error"]["code"] == "rate_limit_exceeded"
+    finally:
+        foundations[0]._client.delete(*cleanup_keys)
+        for store in stores:
+            store.close()
 
 
 def test_shared_script_manifest_requires_explicit_stopped_migration(valkey_server):

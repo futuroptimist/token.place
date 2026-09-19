@@ -229,6 +229,7 @@ RELAY_STATE_LIFECYCLE_CONTRACT = (
 RELAY_STATE_STORE_OPERATIONS = frozenset(
     {
         "config",
+        "authenticates_owner",
         "register",
         "renew",
         "get",

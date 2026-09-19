@@ -7,11 +7,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from flask import Flask, request as flask_request
+from relay_state_store import RelayStateStoreError
 
 from api import (
     _check_control_plane_limits,
     _control_plane_identity_for_request,
     _control_server_owner_identity,
+    _fingerprint,
     _load_relay_server_registration_tokens,
     init_app,
 )
@@ -26,6 +28,53 @@ def test_exceeding_api_rate_limit_returns_429():
     with app.test_client() as client:
         assert client.get("/api/v1/models").status_code == 200
         assert client.get("/api/v1/models").status_code == 429
+
+
+def test_owner_lookup_store_failure_returns_retryable_503():
+    def unavailable_store():
+        raise RelayStateStoreError("private backend detail")
+
+    app = Flask(__name__)
+    init_app(app, relay_store_factory=unavailable_store)
+
+    @app.post("/api/v1/relay/servers/control")
+    def control():
+        return {"status": "ok"}
+
+    with app.test_client() as client:
+        response = client.post(
+            "/api/v1/relay/servers/control",
+            json={
+                "server_public_key": "server-a",
+                "control_credential": "secret",
+                "request_id": "request-a",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.get_json()["error"]["code"] == "rate_limit_unavailable"
+    assert b"private backend detail" not in response.data
+
+
+def test_owner_lookup_receives_tombstone_identity_fields():
+    lookup = MagicMock(return_value=True)
+    app = Flask(__name__)
+    with app.test_request_context("/api/v1/relay/servers/control", method="POST"):
+        flask_request.environ["tokenplace.owner_lookup"] = lookup
+        payload = {
+            "server_public_key": "server-a",
+            "control_credential": "secret",
+            "client_public_key": "client-a",
+            "request_id": "request-a",
+        }
+        assert _control_server_owner_identity(payload) == (
+            "server_public_key",
+            "server-a",
+        )
+
+    lookup.assert_called_once_with(
+        "server-a", _fingerprint("secret"), "client-a", "request-a",
+    )
 
 
 @patch.dict(os.environ, {"API_RATE_LIMIT": "1/minute"}, clear=True)

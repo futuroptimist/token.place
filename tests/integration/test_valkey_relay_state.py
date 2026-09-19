@@ -19,6 +19,7 @@ import pytest
 import redis
 
 import relay
+from api.shared_rate_limit import SharedValkeyRateLimitStorage
 from relay_state_store import (
     ComputeNodeCapabilities,
     EncryptedRequestEnvelope,
@@ -72,7 +73,7 @@ def _set_runtime_factory_env(monkeypatch, port, namespace):
         "TOKENPLACE_RELAY_VALKEY_PORT": str(port),
         "TOKENPLACE_RELAY_VALKEY_ENVIRONMENT": "test",
         "TOKENPLACE_RELAY_VALKEY_CLUSTER": namespace,
-        "TOKENPLACE_RELAY_VALKEY_SCHEMA_MAJOR": "1",
+        "TOKENPLACE_RELAY_VALKEY_SCHEMA_MAJOR": "2",
         "TOKENPLACE_RELAY_VALKEY_READER_REVISION": "1",
         "TOKENPLACE_RELAY_VALKEY_WRITER_REVISION": "1",
         "TOKENPLACE_RELAY_VALKEY_SUPPORTED_SCHEMA_READ_MIN": "1",
@@ -200,6 +201,43 @@ def _foundation(port, namespace=None, expected=None):
         retry_attempts=1,
     )
     return ValkeyFoundation(cfg, expected or _manifest())
+
+
+def _shared_rate_limit_storage(foundation):
+    store = object.__new__(ValkeyRegistrationStore)
+    store._foundation = foundation
+    return SharedValkeyRateLimitStorage(
+        "tokenplace-valkey://shared", store_factory=lambda: store
+    )
+
+
+def test_shared_rate_limit_cross_instance_rollover_and_atomic_rejection(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _foundation(valkey_server, namespace)
+    second = _foundation(valkey_server, namespace)
+    try:
+        first.initialize_manifest()
+        one = _shared_rate_limit_storage(first)
+        two = _shared_rate_limit_storage(second)
+        second_key = "LIMITER/cross-instance/3/1/second"
+        assert one.incr(second_key, 1) == 1
+        assert two.get(second_key) == 1
+
+        allowed_key = "LIMITER/allowed/10/1/hour"
+        exhausted_key = "LIMITER/exhausted/1/1/hour"
+        assert one.incr(exhausted_key, 3600) == 1
+        assert two.hit_many([
+            (allowed_key, 1, 10), (exhausted_key, 1, 1),
+        ])[:2] == (False, 1)
+        assert one.get(allowed_key) == 0
+
+        reset = one.get_expiry(second_key)
+        time.sleep(max(reset - time.time(), 0) + 0.05)
+        assert two.get(second_key) == 0
+    finally:
+        first._client.flushdb()
+        first.close()
+        second.close()
 
 
 def test_atomic_initialization_compatibility_readiness_and_exact_cleanup(valkey_server):

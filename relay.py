@@ -507,6 +507,7 @@ def create_app() -> Flask:
         metrics_export_defaults=False,
         metrics_path=None,
         metrics_instrumentation_enabled=METRICS_MODE == "normal",
+        relay_store_factory=lambda: _api_v1_store(),
     )
     LOGGER.info(
         "relay.app.initialized",
@@ -1111,7 +1112,10 @@ def _api_v1_in_flight_ttl_seconds() -> float:
 
 API_V1_STATE_BACKEND_ENV = "TOKENPLACE_RELAY_STATE_BACKEND"
 _VALKEY_ENV_PREFIX = "TOKENPLACE_RELAY_VALKEY_"
-_VALKEY_SCHEMA_MAJOR = 1
+# The shared rate-limit and owner-authority scripts were added after the v1
+# manifest shipped. Use a fresh namespace rather than attempting to mutate an
+# initialized manifest in place.
+_VALKEY_SCHEMA_MAJOR = 2
 _VALKEY_READER_REVISION = 1
 _VALKEY_WRITER_REVISION = 1
 

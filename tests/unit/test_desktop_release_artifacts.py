@@ -1747,6 +1747,7 @@ def test_validator_parse_otool_libraries_rejects_structural_errors(tmp_path) -> 
     owner = tmp_path / 'Example.app' / 'Contents' / 'Resources' / 'python-runtime' / 'lib' / 'libexample.dylib'
     valid_header = f'{owner} (architecture arm64):'
     cases = [
+        f'{tmp_path / "unexpected.dylib"}:\n',
         f'{valid_header}\n{valid_header}\n',
         '\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n',
         f'{valid_header}\n/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n',
@@ -1804,6 +1805,7 @@ def test_validator_native_ref_and_macho_kind_edge_paths(tmp_path) -> None:
 
     validator._validate_macho_ref('', owner, app)
     assert validator._macho_file_kind('plain text') == 'other'
+    assert validator._macho_file_kind('Mach-O 64-bit executable') == 'executable'
     try:
         validator._validate_macho_ref('/usr/lib/libSystem.B.dylib', owner, app, install_id=True)
         assert False
@@ -1814,6 +1816,52 @@ def test_validator_native_ref_and_macho_kind_edge_paths(tmp_path) -> None:
         assert False
     except SystemExit as exc:
         assert 'forbidden external Mach-O LC_RPATH' in str(exc)
+
+
+def test_validator_macho_linkage_skips_non_macos_and_non_macho(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    candidate = tmp_path / 'helper'
+    candidate.write_bytes(b'not macho')
+    subprocess_calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(validator.subprocess, 'run', lambda *args, **kwargs: subprocess_calls.append(args[0]))
+
+    validator._validate_macho_linkage(candidate, tmp_path)
+    assert subprocess_calls == []
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, 'ASCII text', ''),
+    )
+    validator._validate_macho_linkage(candidate, tmp_path)
+
+
+def test_validator_macho_linkage_rejects_dylib_without_install_id(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    candidate = tmp_path / 'libexample.dylib'
+    candidate.write_bytes(b'macho')
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 0, f'{candidate}: Mach-O 64-bit dynamically linked shared library', '',
+        ),
+    )
+
+    def fake_run(cmd):
+        if cmd[:2] == ['lipo', '-archs']:
+            return 'arm64'
+        if '-L' in cmd:
+            return f'{candidate} (architecture arm64):\n'
+        return ''
+
+    monkeypatch.setattr(validator, '_run', fake_run)
+
+    with pytest.raises(SystemExit, match='missing LC_ID_DYLIB'):
+        validator._validate_macho_linkage(candidate, tmp_path)
 
 
 def test_validator_run_and_sha_failure_paths(monkeypatch, tmp_path) -> None:
@@ -2255,6 +2303,83 @@ def test_validator_main_rejects_app_and_dmg_shape_errors(monkeypatch, tmp_path) 
         assert False
     except SystemExit as exc:
         assert 'expected icon missing' in str(exc)
+
+
+@pytest.mark.parametrize(
+    ('case', 'message'),
+    [
+        ('missing_info', 'missing Info.plist'),
+        ('stale_product_name', 'stale app bundle name'),
+        ('stale_display_name', 'stale app display name'),
+        ('missing_config_icon', 'tauri icon list missing required entries'),
+        ('missing_bundled_icon', 'bundled icon not found'),
+        ('mismatched_bundled_icon', 'bundled icon hash does not match'),
+        ('missing_macos_dir', 'missing app executable directory'),
+        ('missing_executable_name', 'CFBundleExecutable is missing'),
+        ('missing_executable', 'CFBundleExecutable not found'),
+        ('wrong_architecture', 'binary is not Apple Silicon'),
+    ],
+)
+def test_validator_main_rejects_invalid_app_metadata(monkeypatch, tmp_path, case, message) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+    info_path = app / 'Contents' / 'Info.plist'
+    info = validator.plistlib.loads(info_path.read_bytes())
+
+    if case == 'missing_info':
+        info_path.unlink()
+    elif case == 'stale_product_name':
+        info['CFBundleName'] = 'tokenplace Desktop'
+        info_path.write_bytes(validator.plistlib.dumps(info))
+    elif case == 'stale_display_name':
+        info['CFBundleDisplayName'] = 'tokenplace Desktop'
+        info_path.write_bytes(validator.plistlib.dumps(info))
+    elif case == 'missing_config_icon':
+        tauri_config.write_text(json.dumps({'bundle': {'icon': []}}), encoding='utf-8')
+    elif case == 'missing_bundled_icon':
+        (app / 'Contents' / 'Resources' / 'token-icon.icns').unlink()
+    elif case == 'mismatched_bundled_icon':
+        (app / 'Contents' / 'Resources' / 'token-icon.icns').write_bytes(b'other')
+    elif case == 'missing_macos_dir':
+        shutil.rmtree(app / 'Contents' / 'MacOS')
+    elif case == 'missing_executable_name':
+        del info['CFBundleExecutable']
+        info_path.write_bytes(validator.plistlib.dumps(info))
+    elif case == 'missing_executable':
+        (app / 'Contents' / 'MacOS' / info['CFBundleExecutable']).unlink()
+
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=None,
+            app_only=True,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=False,
+            require_embedded_python_runtime=False,
+            expect_notarization=False,
+        ),
+    )
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'x86_64')
+
+    with pytest.raises(SystemExit, match=message):
+        validator.main()
+
+
+def test_validator_dmg_contents_skips_mounting_outside_macos(monkeypatch, tmp_path, capsys) -> None:
+    validator = _load_release_artifact_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(
+        validator,
+        '_attach_dmg_with_retries',
+        lambda _path: pytest.fail('DMG must not be mounted outside macOS'),
+    )
+
+    validator._validate_dmg_contents(tmp_path / 'release.dmg', expect_signing=False)
+
+    assert 'Skipping DMG mounted-content checks outside macOS' in capsys.readouterr().out
 
 
 def test_validator_embedded_runtime_failure_paths(monkeypatch, tmp_path) -> None:

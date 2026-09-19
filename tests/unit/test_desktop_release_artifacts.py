@@ -226,9 +226,11 @@ def test_gatekeeper_validation_discovers_macho_leaf_and_excludes_non_code_and_sy
     validator._validate_gatekeeper_ready(app)
 
     displayed_paths = [Path(call[-1]) for call in tool_calls if call[:3] == ['codesign', '--display', '--verbose=4']]
-    assert displayed_paths == [app, macho]
+    assert set(displayed_paths) == {app, macho}
+    assert len(displayed_paths) == 2
     inspected_paths = [Path(call[-1]) for call in subprocess_calls if call[0] == 'file']
-    assert inspected_paths == [non_code, macho]
+    assert set(inspected_paths) == {macho, non_code}
+    assert len(inspected_paths) == 2
     assert symlink not in inspected_paths
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import plistlib
+import runpy
 import shutil
 import subprocess
 import sys
@@ -1824,6 +1825,44 @@ def test_validator_native_ref_and_macho_kind_edge_paths(tmp_path) -> None:
     assert validator._macho_relative(outside, app) == Path('outside.dylib')
 
 
+def test_validator_accepts_resolved_in_app_macho_reference(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    owner = app / 'Contents' / 'MacOS' / 'example'
+    dependency = app / 'Contents' / 'Frameworks' / 'libexample.dylib'
+    dependency.parent.mkdir(parents=True)
+    dependency.write_bytes(b'macho')
+    reference = 'Contents/Frameworks/libexample.dylib'
+    original_resolve = Path.resolve
+
+    def resolve_reference(path, *args, **kwargs):
+        if str(path) == reference:
+            return dependency
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'resolve', resolve_reference)
+
+    validator._validate_macho_ref(reference, owner, app)
+
+
+def test_validator_macho_reference_resolution_failure_still_fails_closed(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    owner = app / 'Contents' / 'MacOS' / 'example'
+    reference = '/Volumes/external/libexample.dylib'
+    original_resolve = Path.resolve
+
+    def fail_reference_resolution(path, *args, **kwargs):
+        if str(path) == reference:
+            raise OSError('unreadable reference')
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'resolve', fail_reference_resolution)
+
+    with pytest.raises(SystemExit, match='forbidden external Mach-O linkage'):
+        validator._validate_macho_ref(reference, owner, app)
+
+
 def test_validator_macho_linkage_skips_non_macos_and_non_macho(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     candidate = tmp_path / 'helper'
@@ -1893,6 +1932,49 @@ def test_validator_run_and_sha_failure_paths(monkeypatch, tmp_path) -> None:
     payload = tmp_path / 'payload'
     payload.write_bytes(b'abc')
     assert validator._sha256(payload) == 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+
+
+def test_validator_path_matching_accepts_equivalent_resolved_dmg_path(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    dmg = tmp_path / 'release' / 'token.place.dmg'
+    equivalent = dmg.parent / '..' / dmg.parent.name / dmg.name
+
+    assert str(equivalent) != str(dmg)
+    assert validator._path_matches_dmg(str(equivalent), dmg)
+
+
+def test_validator_app_path_redaction_tolerates_resolution_failures(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+
+    monkeypatch.setattr(Path, 'resolve', lambda self: (_ for _ in ()).throw(OSError('unresolvable app')))
+    monkeypatch.setattr(
+        validator.os.path,
+        'realpath',
+        lambda path: (_ for _ in ()).throw(OSError('unresolvable app')),
+    )
+
+    assert validator._redact_allowed_app_locations(str(app / 'Contents'), app) == '<app-bundle>/Contents'
+
+
+def test_validator_app_tree_fingerprint_classifies_special_file(tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    special = app / 'unexpected.pipe'
+    validator.os.mkfifo(special)
+
+    fingerprint = validator._app_tree_fingerprint(app)
+
+    assert fingerprint['unexpected.pipe'].kind == 'other'
+
+
+def test_validator_script_entrypoint_rejects_unknown_argument(monkeypatch) -> None:
+    script = Path('scripts/validate_desktop_tauri_release_artifacts.py').resolve()
+    monkeypatch.setattr(sys, 'argv', [str(script), '--unknown-release-option'])
+
+    with pytest.raises(SystemExit, match='2'):
+        runpy.run_path(str(script), run_name='__main__')
 
 
 def test_validator_mutation_guard_reraises_probe_failure_when_tree_is_unchanged(tmp_path) -> None:

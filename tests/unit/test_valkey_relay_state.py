@@ -105,7 +105,7 @@ def test_owner_authentication_uses_cluster_safe_retained_control_key():
     assert all("{test:unit}" in key for key in keys)
 
 
-def test_owner_authentication_placeholder_stays_in_cluster_slot():
+def test_owner_authentication_without_tombstone_uses_two_cluster_safe_keys():
     foundation = Mock(spec=ValkeyFoundation)
     foundation.config = config()
     foundation.execute.return_value = [b"unknown"]
@@ -114,7 +114,10 @@ def test_owner_authentication_placeholder_stays_in_cluster_slot():
     assert not store.authenticates_owner("node-a", "a" * 64)
 
     keys = foundation.execute.call_args.args[1]
-    assert keys[2].endswith(":control:" + ":".join((store._node_digest("node-a"), "0" * 64, "0" * 64)))
+    assert keys == (
+        foundation.config.key("node", store._node_digest("node-a")),
+        foundation.config.key("nodes:lease"),
+    )
     assert all("{test:unit}" in key for key in keys)
 
 

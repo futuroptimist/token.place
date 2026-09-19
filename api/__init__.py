@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import secrets
 import sys
 import time
@@ -13,32 +14,52 @@ from typing import Any
 from flask import Response, g, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
+from limits.errors import StorageError
 from limits.storage import storage_from_string
 from limits.strategies import FixedWindowRateLimiter
 from limits.util import parse
 from prometheus_client import Counter
 from prometheus_flask_exporter import PrometheusMetrics
 
-from api.client_identity import (
-    ClientIdentityPolicy, current_client_address, current_limiter_key,
-)
+from api.client_identity import (ClientIdentityPolicy, current_client_address,
+                                 current_limiter_key)
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 from config import get_config
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
+RATE_LIMIT_SHARED_ENV = "TOKENPLACE_RATE_LIMIT_SHARED"
 LOGGER = logging.getLogger("tokenplace.api")
 
 PUBLIC_QUOTA_ROUTE_CLASSES = (
-    "root", "public_metadata", "public_version", "api_v1", "api_v2",
-    "operational", "static", "control_plane", "other_known", "unmatched",
+    "root",
+    "public_metadata",
+    "public_version",
+    "api_v1",
+    "api_v2",
+    "operational",
+    "static",
+    "control_plane",
+    "other_known",
+    "unmatched",
 )
 PUBLIC_QUOTA_METHODS = (
-    "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "other",
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+    "HEAD",
+    "other",
 )
 PUBLIC_QUOTA_OUTCOMES = ("accepted", "exempt", "rejected")
 PUBLIC_QUOTA_REASONS = (
-    "none", "hourly_limit", "daily_limit", "other_limit", "other_rejection",
+    "none",
+    "hourly_limit",
+    "daily_limit",
+    "other_limit",
+    "other_rejection",
 )
 
 CONTROL_PLANE_ROUTE_CLASS = "compute_node_control_plane"
@@ -270,7 +291,10 @@ def _relay_server_token_is_valid() -> bool:
 def _relay_server_token_boundary_has_configured_token() -> bool:
     """Return True only when this request matched an explicit relay token."""
 
-    return bool(_load_relay_server_registration_tokens()) and _relay_server_token_is_valid()
+    return (
+        bool(_load_relay_server_registration_tokens())
+        and _relay_server_token_is_valid()
+    )
 
 
 def _is_public_api_rate_limit_exempt_path(path: str) -> bool:
@@ -299,6 +323,50 @@ def _resolve_rate_limit_storage_uri() -> str | None:
     raw_value = os.environ.get(RATE_LIMIT_STORAGE_URI_ENV, "")
     storage_uri = raw_value.strip()
     return storage_uri or None
+
+
+def _shared_rate_limits_required() -> bool:
+    """Return whether process-local counters would be unsafe."""
+
+    explicit = os.environ.get(RATE_LIMIT_SHARED_ENV, "").strip().lower()
+    if explicit in {"1", "true", "yes", "on"}:
+        return True
+    worker_values = (
+        os.environ.get("RELAY_WORKERS", "1"),
+        os.environ.get("WEB_CONCURRENCY", "1"),
+    )
+    try:
+        multiple_workers = any(int(value) > 1 for value in worker_values)
+    except ValueError:
+        raise RuntimeError("invalid rate-limit coordination configuration") from None
+    return (
+        multiple_workers
+        or os.environ.get("TOKENPLACE_API_V1_STATE_BACKEND", "memory").strip().lower()
+        == "valkey"
+    )
+
+
+def _validate_rate_limit_storage(storage_uri: str | None) -> None:
+    if not _shared_rate_limits_required():
+        return
+    if not storage_uri or storage_uri.startswith("memory://"):
+        raise RuntimeError("shared rate-limit storage is required")
+    if not storage_uri.startswith(("redis://", "rediss://", "redis+sentinel://")):
+        raise RuntimeError("shared rate-limit storage must use Valkey")
+
+
+def _shared_rate_limit_key_prefix() -> str:
+    """Keep limiter keys inside the validated relay schema namespace."""
+
+    environment = os.environ.get("TOKENPLACE_VALKEY_ENVIRONMENT", "development")
+    cluster = os.environ.get("TOKENPLACE_VALKEY_CLUSTER", "local")
+    schema = os.environ.get("TOKENPLACE_VALKEY_SCHEMA_MAJOR", "1")
+    safe = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+    if not safe.fullmatch(environment) or not safe.fullmatch(cluster):
+        raise RuntimeError("invalid rate-limit namespace configuration")
+    if not schema.isdigit() or not 1 <= int(schema) <= 2**31 - 1:
+        raise RuntimeError("invalid rate-limit namespace configuration")
+    return f"tokenplace:{{{environment}:{cluster}}}:relay:v{schema}:ratelimit"
 
 
 def _fingerprint(value: str) -> str:
@@ -385,48 +453,64 @@ def _response_envelope_identity_for_rate_limit(data: Any) -> tuple[str, str] | N
     return None
 
 
-
 def _control_server_owner_identity(data: Any) -> tuple[str, str] | None:
     if not isinstance(data, dict):
         return None
     server_public_key = data.get("server_public_key")
     credential = data.get("control_credential")
-    if not (isinstance(server_public_key, str) and server_public_key.strip() and isinstance(credential, str) and credential):
+    if not (
+        isinstance(server_public_key, str)
+        and server_public_key.strip()
+        and isinstance(credential, str)
+        and credential
+    ):
         return None
     request_id = data.get("request_id")
     for module_name in ("relay", "__main__"):
         module = sys.modules.get(module_name)
-        known_servers = getattr(module, "known_servers", None) if module is not None else None
-        tombstones = (
-            getattr(module, "api_v1_control_tombstones", None)
+        digest_func = (
+            getattr(module, "_api_v1_control_credential_digest", None)
             if module is not None
             else None
         )
-        tombstone_key_func = (
-            getattr(module, "_control_tombstone_key", None) if module is not None else None
+        store_getter = (
+            getattr(module, "_get_api_v1_relay_state_store", None)
+            if module is not None
+            else None
         )
-        digest_func = getattr(module, "_api_v1_control_credential_digest", None) if module is not None else None
         if digest_func is None:
             continue
         server_key = server_public_key.strip()
         expected_digest = None
-        if isinstance(known_servers, dict):
-            payload = known_servers.get(server_key)
-            if isinstance(payload, dict):
-                expected_digest = payload.get("api_v1_control_credential_digest")
-        if (
-            expected_digest is None
-            and isinstance(tombstones, dict)
-            and callable(tombstone_key_func)
-            and isinstance(request_id, str)
-            and request_id
+        if callable(store_getter):
+            try:
+                store = store_getter()
+                registration = store.get(server_key)
+                if registration is not None:
+                    expected_digest = registration.control_credential_digest
+                elif isinstance(request_id, str) and request_id:
+                    for tombstone in store.control_tombstones():
+                        if (
+                            tombstone.node_id == server_key
+                            and tombstone.request_id == request_id
+                        ):
+                            expected_digest = tombstone.control_credential_digest
+                            break
+            except Exception:
+                LOGGER.warning("rate_limit.owner_lookup_failed")
+                return None
+        elif not _shared_rate_limits_required():
+            known_servers = getattr(module, "known_servers", None)
+            if isinstance(known_servers, dict):
+                payload = known_servers.get(server_key)
+                if isinstance(payload, dict):
+                    expected_digest = payload.get("api_v1_control_credential_digest")
+        if isinstance(expected_digest, str) and secrets.compare_digest(
+            digest_func(credential), expected_digest
         ):
-            tombstone = tombstones.get(tombstone_key_func(server_key, request_id))
-            if isinstance(tombstone, dict):
-                expected_digest = tombstone.get("control_credential_digest")
-        if isinstance(expected_digest, str) and secrets.compare_digest(digest_func(credential), expected_digest):
             return "server_public_key", server_key
     return None
+
 
 def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]:
     if path == "/api/v1/relay/responses":
@@ -435,7 +519,11 @@ def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]
             return identity
         return "client_ip", current_client_address()
 
-    if path in {"/api/v1/relay/servers/control", "/api/v1/relay/servers/unregister", "/api/v1/relay/progress"}:
+    if path in {
+        "/api/v1/relay/servers/control",
+        "/api/v1/relay/servers/unregister",
+        "/api/v1/relay/progress",
+    }:
         identity = _control_server_owner_identity(data)
         if identity is not None:
             return identity
@@ -568,7 +656,14 @@ def _build_control_plane_rate_limit_response(limit_item: Any, retry_after: int):
 def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
     route_limits = _control_plane_limits_from_env()
     control_plane_storage_uri = storage_uri or "memory://"
-    control_plane_storage = storage_from_string(control_plane_storage_uri)
+    storage_options = (
+        {"key_prefix": _shared_rate_limit_key_prefix(), "wrap_exceptions": True}
+        if storage_uri
+        else {}
+    )
+    control_plane_storage = storage_from_string(
+        control_plane_storage_uri, **storage_options
+    )
     control_plane_rate_limiter = FixedWindowRateLimiter(control_plane_storage)
     app.config["relay_control_plane_rate_limit_storage_uri"] = control_plane_storage_uri
     app.config["relay_control_plane_rate_limiter"] = control_plane_rate_limiter
@@ -587,11 +682,34 @@ def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
         # it.  Cache only the bounded bytes so the route sees the same body.
         if route == "/api/v1/relay/progress":
             body_limit = 16 * 1024
-            if request.content_length is not None and request.content_length > body_limit:
-                return jsonify({"error": {"message": "Progress envelope too large", "code": 413}}), 413
+            if (
+                request.content_length is not None
+                and request.content_length > body_limit
+            ):
+                return (
+                    jsonify(
+                        {
+                            "error": {
+                                "message": "Progress envelope too large",
+                                "code": 413,
+                            }
+                        }
+                    ),
+                    413,
+                )
             raw_body = request.stream.read(body_limit + 1)
             if len(raw_body) > body_limit:
-                return jsonify({"error": {"message": "Progress envelope too large", "code": 413}}), 413
+                return (
+                    jsonify(
+                        {
+                            "error": {
+                                "message": "Progress envelope too large",
+                                "code": 413,
+                            }
+                        }
+                    ),
+                    413,
+                )
             request._cached_data = raw_body
 
         remote_address = current_client_address()
@@ -666,6 +784,22 @@ def _build_rate_limit_response(exc: RateLimitExceeded):
     return response
 
 
+def _build_rate_limit_storage_failure_response():
+    response = jsonify(
+        {
+            "error": {
+                "message": "Rate limit service unavailable.",
+                "type": "service_unavailable_error",
+                "code": "rate_limit_unavailable",
+                "param": None,
+            }
+        }
+    )
+    response.status_code = 503
+    response.headers["Retry-After"] = "1"
+    return response
+
+
 def _public_quota_method(method: str | None) -> str:
     normalized = method.upper() if isinstance(method, str) else ""
     return normalized if normalized in PUBLIC_QUOTA_METHODS[:-1] else "other"
@@ -692,9 +826,13 @@ def _public_quota_route_class() -> str:
     rule = request.url_rule.rule
     if _normalized_path(rule) in RELAY_CONTROL_PLANE_RATE_LIMIT_PATHS:
         return "control_plane"
-    if endpoint.startswith(("v1.", "openai_v1.")) or rule.startswith(("/api/v1/", "/v1/")):
+    if endpoint.startswith(("v1.", "openai_v1.")) or rule.startswith(
+        ("/api/v1/", "/v1/")
+    ):
         return "api_v1"
-    if endpoint.startswith(("v2.", "openai_v2.")) or rule.startswith(("/api/v2/", "/v2/")):
+    if endpoint.startswith(("v2.", "openai_v2.")) or rule.startswith(
+        ("/api/v2/", "/v2/")
+    ):
         return "api_v2"
     return "other_known"
 
@@ -735,7 +873,10 @@ def _install_public_quota_metrics(app, registry) -> None:
         if response.status_code == 429:
             outcome = "rejected"
             rejection_reasons = {
-                "hourly_limit", "daily_limit", "other_limit", "other_rejection",
+                "hourly_limit",
+                "daily_limit",
+                "other_limit",
+                "other_rejection",
             }
             reason = reason if reason in rejection_reasons else "other_rejection"
         elif _is_public_api_rate_limit_exempt_path(request.path):
@@ -745,13 +886,22 @@ def _install_public_quota_metrics(app, registry) -> None:
             outcome = "accepted"
             reason = "none"
         counter.labels(
-            _public_quota_route_class(), _public_quota_method(request.method), outcome, reason,
+            _public_quota_route_class(),
+            _public_quota_method(request.method),
+            outcome,
+            reason,
         ).inc()
         return response
 
 
-def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metrics_path="/metrics",
-             metrics_instrumentation_enabled=True):
+def init_app(
+    app,
+    *,
+    metrics_registry=None,
+    metrics_export_defaults=True,
+    metrics_path="/metrics",
+    metrics_instrumentation_enabled=True,
+):
     """Initialize the API with the Flask app.
 
     Relay callers may pass a dedicated Prometheus registry and disable the
@@ -759,7 +909,9 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     contract. Defaults preserve the historical API behavior for other callers.
     """
 
-    app.extensions["tokenplace_client_identity_policy"] = ClientIdentityPolicy.from_environment()
+    app.extensions["tokenplace_client_identity_policy"] = (
+        ClientIdentityPolicy.from_environment()
+    )
     # Flask-Limiter's INFO rejection message includes its derived storage key.
     # Responses and bounded application telemetry provide the needed signal.
     logging.getLogger("flask-limiter").setLevel(logging.WARNING)
@@ -768,6 +920,7 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
         _install_public_quota_metrics(app, metrics_registry)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
+    _validate_rate_limit_storage(limiter_storage_uri)
     limiter_kwargs = {
         "default_limits": [
             os.environ.get("API_RATE_LIMIT", "60/hour"),
@@ -779,6 +932,8 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     }
     if limiter_storage_uri:
         limiter_kwargs["storage_uri"] = limiter_storage_uri
+        limiter_kwargs["key_prefix"] = _shared_rate_limit_key_prefix()
+        limiter_kwargs["storage_options"] = {"wrap_exceptions": True}
 
     limiter = Limiter(
         current_limiter_key,
@@ -790,6 +945,11 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     def _handle_rate_limit(exc: RateLimitExceeded):
         g.tokenplace_public_quota_reason = _public_quota_limit_reason(exc)
         return _build_rate_limit_response(exc)
+
+    @app.errorhandler(StorageError)
+    def _handle_rate_limit_storage_failure(_exc: StorageError):
+        LOGGER.error("rate_limit.storage_unavailable")
+        return _build_rate_limit_storage_failure_response()
 
     _install_control_plane_rate_limiter(app, limiter_storage_uri)
 

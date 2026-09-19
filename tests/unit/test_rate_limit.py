@@ -6,15 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from flask import Flask, request as flask_request
+from flask import Flask
+from flask import request as flask_request
 
-from api import (
-    _check_control_plane_limits,
-    _control_plane_identity_for_request,
-    _control_server_owner_identity,
-    _load_relay_server_registration_tokens,
-    init_app,
-)
+from api import (_check_control_plane_limits,
+                 _control_plane_identity_for_request,
+                 _control_server_owner_identity,
+                 _load_relay_server_registration_tokens, init_app)
 
 
 @patch.dict(os.environ, {"API_RATE_LIMIT": "1/minute"})
@@ -261,9 +259,41 @@ def test_production_with_rate_limit_storage_uri_uses_explicit_backend():
 
     assert limiter is limiter_instance
     assert limiter_cls.call_args.kwargs["storage_uri"] == "memcached://127.0.0.1:11211"
-    storage_cls.assert_called_once_with("memcached://127.0.0.1:11211")
+    storage_cls.assert_called_once_with(
+        "memcached://127.0.0.1:11211",
+        key_prefix="tokenplace:{development:local}:relay:v1:ratelimit",
+        wrap_exceptions=True,
+    )
     control_limiter_cls.assert_called_once_with(control_plane_storage)
     assert app.config["relay_control_plane_rate_limiter"] is control_plane_limiter
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {"RELAY_WORKERS": "2"},
+        {"WEB_CONCURRENCY": "2"},
+        {"TOKENPLACE_RATE_LIMIT_SHARED": "true"},
+        {"TOKENPLACE_API_V1_STATE_BACKEND": "valkey"},
+    ],
+)
+def test_shared_coordination_rejects_process_local_rate_limits(environment):
+    with patch.dict(os.environ, environment, clear=True):
+        with pytest.raises(RuntimeError, match="shared rate-limit storage is required"):
+            init_app(Flask(__name__))
+
+
+@patch.dict(
+    os.environ,
+    {
+        "RELAY_WORKERS": "2",
+        "TOKENPLACE_RATE_LIMIT_STORAGE_URI": "memcached://127.0.0.1:11211",
+    },
+    clear=True,
+)
+def test_shared_coordination_rejects_non_valkey_rate_limit_backend():
+    with pytest.raises(RuntimeError, match="must use Valkey"):
+        init_app(Flask(__name__))
 
 
 @patch.dict(
@@ -558,8 +588,15 @@ def test_control_server_owner_identity_requires_matching_bound_credential(monkey
         ) == ("server_public_key", "server-a")
 
 
-@pytest.mark.parametrize("payload", [None, {}, {"server_public_key": "victim"},
-                                      {"server_public_key": "victim", "control_credential": "wrong"}])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"server_public_key": "victim"},
+        {"server_public_key": "victim", "control_credential": "wrong"},
+    ],
+)
 def test_progress_identity_spoof_falls_back_to_ip(monkeypatch, payload):
     monkeypatch.setitem(
         sys.modules,
@@ -571,7 +608,8 @@ def test_progress_identity_spoof_falls_back_to_ip(monkeypatch, payload):
     )
     app = Flask(__name__)
     with app.test_request_context(
-        "/api/v1/relay/progress", method="POST",
+        "/api/v1/relay/progress",
+        method="POST",
         environ_base={"REMOTE_ADDR": "203.0.113.17"},
     ):
         assert _control_plane_identity_for_request(
@@ -598,8 +636,9 @@ def test_progress_exact_owners_have_independent_dedicated_buckets(configured_tok
         },
         _api_v1_control_credential_digest=digest,
     )
-    with patch.dict(os.environ, env, clear=True), patch.dict(
-        sys.modules, {"relay": relay_module, "__main__": relay_module}
+    with (
+        patch.dict(os.environ, env, clear=True),
+        patch.dict(sys.modules, {"relay": relay_module, "__main__": relay_module}),
     ):
         app = Flask(__name__)
         init_app(app)
@@ -608,12 +647,18 @@ def test_progress_exact_owners_have_independent_dedicated_buckets(configured_tok
         def progress():
             return {"status": "ok"}
 
-        headers = {"X-Relay-Server-Token": "registration-token"} if configured_token else {}
+        headers = (
+            {"X-Relay-Server-Token": "registration-token"} if configured_token else {}
+        )
         with app.test_client() as client:
+
             def submit(server, credential):
                 return client.post(
                     "/api/v1/relay/progress",
-                    json={"server_public_key": server, "control_credential": credential},
+                    json={
+                        "server_public_key": server,
+                        "control_credential": credential,
+                    },
                     headers=headers,
                     environ_overrides={"REMOTE_ADDR": "198.51.100.9"},
                 )
@@ -686,7 +731,9 @@ def test_poll_control_and_response_control_plane_routes_do_not_use_public_quota(
     relay_module = SimpleNamespace(
         SERVER_REGISTRATION_TOKENS=["relay-token"],
         known_servers={
-            "server-a": {"api_v1_control_credential_digest": digest("control-secret-a")},
+            "server-a": {
+                "api_v1_control_credential_digest": digest("control-secret-a")
+            },
         },
         _api_v1_control_credential_digest=digest,
     )
@@ -718,7 +765,10 @@ def test_poll_control_and_response_control_plane_routes_do_not_use_public_quota(
             response_submissions = [
                 client.post(
                     "/api/v1/relay/responses",
-                    json={"client_public_key": "client-a", "request_id": f"req-{index}"},
+                    json={
+                        "client_public_key": "client-a",
+                        "request_id": f"req-{index}",
+                    },
                     headers={"X-Relay-Server-Token": "relay-token"},
                     environ_overrides={"REMOTE_ADDR": "198.51.100.12"},
                 )
@@ -753,8 +803,12 @@ def test_tokenless_control_route_uses_verified_owner_identity_bucket():
     relay_module = SimpleNamespace(
         SERVER_REGISTRATION_TOKENS=[],
         known_servers={
-            "server-a": {"api_v1_control_credential_digest": digest("control-secret-a")},
-            "server-b": {"api_v1_control_credential_digest": digest("control-secret-b")},
+            "server-a": {
+                "api_v1_control_credential_digest": digest("control-secret-a")
+            },
+            "server-b": {
+                "api_v1_control_credential_digest": digest("control-secret-b")
+            },
         },
         _api_v1_control_credential_digest=digest,
     )

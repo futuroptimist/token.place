@@ -86,9 +86,15 @@ def test_tauri_icon_set_references_expected_files() -> None:
     assert expected.issubset(icons)
 
 
-def test_workflow_sets_explicit_dmg_volume_name() -> None:
+def test_release_script_sets_explicit_dmg_volume_name() -> None:
     text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
     assert 'hdiutil create -volname "token.place desktop"' in text
+
+
+def test_release_script_uses_macos_base64_decode_flag() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    assert text.count('| /usr/bin/base64 -D >') == 2
+    assert 'base64 --decode' not in text
 
 
 def test_workflow_stages_dmg_with_stapled_app_and_applications_symlink() -> None:

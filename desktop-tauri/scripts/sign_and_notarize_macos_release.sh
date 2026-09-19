@@ -49,8 +49,8 @@ cleanup() {
 trap cleanup EXIT
 
 umask 077
-printf '%s' "${APPLE_CERTIFICATE_P12_BASE64}" | base64 --decode > "${certificate_path}"
-printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" | base64 --decode > "${notary_key_path}"
+printf '%s' "${APPLE_CERTIFICATE_P12_BASE64}" | /usr/bin/base64 -D > "${certificate_path}"
+printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" | /usr/bin/base64 -D > "${notary_key_path}"
 security create-keychain -p "${keychain_password}" "${keychain_path}"
 security set-keychain-settings -lut 21600 "${keychain_path}"
 security unlock-keychain -p "${keychain_password}" "${keychain_path}"

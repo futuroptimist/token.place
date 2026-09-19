@@ -124,8 +124,9 @@ intentionally invalid.
 ## Desktop release workflow policy
 
 Pushing a new immutable `desktop-vX.Y.Z` tag is the canonical desktop release action. That tag
-launches the Desktop Tauri Release workflow to build, validate, checksum, sign when credentials are
-available, and publish the macOS Apple Silicon and Windows artifacts. Operators must not also
+launches the Desktop Tauri Release workflow to build, Developer ID sign, notarize, staple, validate,
+checksum, and publish the macOS Apple Silicon artifact while preserving the Windows artifact path.
+The macOS job fails closed when any protected Apple credential is unavailable. Operators must not also
 manually dispatch the same release unless they are intentionally retrying a failed run or rebuilding
 an existing tag. Manual dispatch remains available for dry runs, retries, and intentional rebuilds,
 but the release process must not force-move or reuse tags to change what a published release means.

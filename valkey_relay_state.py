@@ -3173,15 +3173,20 @@ class ValkeyRegistrationStore:
         self._foundation.readiness()
 
     def authenticates_owner(
-        self, node_id: str, control_credential_digest: str, request_id: str | None = None
+        self,
+        node_id: str,
+        control_credential_digest: str,
+        client_public_key: str | None = None,
+        request_id: str | None = None,
     ) -> bool:
         self._validate_node_id(node_id)
         self._validate_digest(control_credential_digest)
         node_digest = self._node_digest(node_id)
-        # Current registration authority is sufficient for pre-route bucketing.
-        # Request tombstones are intentionally not searched: their key requires
-        # the already-validated client identity, and rate limiting must not scan.
-        control_key = ""
+        control_key = self._foundation.config.key(
+            "control", node_digest, *(self._identity(client_public_key, request_id))
+        ) if client_public_key is not None and request_id is not None else (
+            self._foundation.config.key("control", node_digest, "0" * 64, "0" * 64)
+        )
         result = self._foundation.execute(
             OWNER_AUTHORITY_SCRIPT.name,
             (self._foundation.config.key("node", node_digest),

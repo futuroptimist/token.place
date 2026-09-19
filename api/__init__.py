@@ -23,6 +23,7 @@ from api.client_identity import (
     ClientIdentityPolicy, current_client_address, current_limiter_key,
 )
 from api.shared_rate_limit import SharedValkeyRateLimitStorage  # noqa: F401
+from relay_state_store import RelayStateStoreError
 from valkey_relay_state import ValkeyFoundationError
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
@@ -400,7 +401,10 @@ def _control_server_owner_identity(data: Any) -> tuple[str, str] | None:
     if callable(owner_lookup):
         digest = _fingerprint(credential)
         try:
-            if owner_lookup(server_public_key.strip(), digest, request_id):
+            client_public_key = data.get("client_public_key")
+            if owner_lookup(
+                server_public_key.strip(), digest, client_public_key, request_id
+            ):
                 return "server_public_key", server_public_key.strip()
         except ValkeyFoundationError:
             raise
@@ -841,6 +845,7 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     _install_control_plane_rate_limiter(app, limiter_storage_uri, storage_options)
 
     @app.errorhandler(ValkeyFoundationError)
+    @app.errorhandler(RelayStateStoreError)
     def _handle_rate_limit_backend_failure(_exc):
         return jsonify({"error": {"message": "Rate limit service unavailable", "type": "service_unavailable", "code": "rate_limit_unavailable", "param": None}}), 503
 

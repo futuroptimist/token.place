@@ -3101,6 +3101,85 @@ class ValkeyRegistrationStore:
 
         self._foundation.readiness()
 
+    def rate_limit_increment(
+        self, route_class: str, identity_digest: str, expiry: int, amount: int = 1
+    ) -> int:
+        """Atomically update one bounded fixed window using Valkey server time."""
+        if (
+            not isinstance(route_class, str)
+            or not _ROUTE_CLASS_RE.fullmatch(route_class)
+            or not isinstance(identity_digest, str)
+            or not _SHA256_RE.fullmatch(identity_digest)
+            or isinstance(expiry, bool)
+            or not isinstance(expiry, int)
+            or not 1 <= expiry <= 86_400
+            or isinstance(amount, bool)
+            or not isinstance(amount, int)
+            or not -1_000_000 <= amount <= 1_000_000
+        ):
+            raise RelayStateStoreError("invalid rate-limit operation")
+        key = self._foundation.config.key(
+            "ratelimit", route_class, identity_digest, expiry
+        )
+        script = """
+local t=redis.call('TIME'); local now=tonumber(t[1]); local span=tonumber(ARGV[1])
+local epoch=math.floor(now/span); local old=redis.call('HGET',KEYS[1],'epoch')
+local count=0
+if old and tonumber(old)==epoch then count=tonumber(redis.call('HGET',KEYS[1],'count') or '0') end
+count=math.max(0,count+tonumber(ARGV[2]))
+redis.call('HSET',KEYS[1],'epoch',epoch,'count',count)
+redis.call('EXPIREAT',KEYS[1],(epoch+1)*span+2)
+return {count,(epoch+1)*span}
+"""
+        result = self._foundation._call_mutating_script(
+            self._foundation._client.eval, script, 1, key, expiry, amount
+        )
+        _validate_script_result(result)
+        if (
+            not isinstance(result, list)
+            or len(result) != 2
+            or any(type(v) is not int for v in result)
+        ):
+            raise ValkeyScriptError("invalid reviewed script result")
+        return result[0]
+
+    def rate_limit_read(
+        self, route_class: str, identity_digest: str, expiry: int
+    ) -> tuple[int, float]:
+        """Read the current counter and reset time using authoritative server time."""
+        if (
+            not _ROUTE_CLASS_RE.fullmatch(route_class)
+            or not _SHA256_RE.fullmatch(identity_digest)
+            or isinstance(expiry, bool)
+            or not isinstance(expiry, int)
+            or not 1 <= expiry <= 86_400
+        ):
+            raise RelayStateStoreError("invalid rate-limit operation")
+        key = self._foundation.config.key(
+            "ratelimit", route_class, identity_digest, expiry
+        )
+        result = self._foundation._call(
+            self._foundation._client.eval,
+            """
+local t=redis.call('TIME'); local now=tonumber(t[1]); local span=tonumber(ARGV[1])
+local epoch=math.floor(now/span); local old=redis.call('HGET',KEYS[1],'epoch')
+if old and tonumber(old)==epoch then return {tonumber(redis.call('HGET',KEYS[1],'count') or '0'),(epoch+1)*span} end
+return {0,(epoch+1)*span}
+""",
+            1,
+            key,
+            expiry,
+        )
+        _validate_script_result(result)
+        if (
+            not isinstance(result, list)
+            or len(result) != 2
+            or any(type(v) is not int for v in result)
+        ):
+            raise ValkeyScriptError("invalid reviewed script result")
+        return result[0], float(result[1])
+
+
     @staticmethod
     def _node_digest(node_id: str) -> str:
         return hashlib.sha256(b"node\0" + node_id.encode("utf-8")).hexdigest()

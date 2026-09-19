@@ -1331,6 +1331,22 @@ def _api_v1_store() -> RelayStateStore:
     return api_v1_relay_state_store
 
 
+def _authenticate_control_owner(server_public_key: str, request_id: object, credential: str) -> bool:
+    """Authenticate current or retained owner authority through the store boundary."""
+    if not isinstance(server_public_key, str) or not isinstance(credential, str):
+        return False
+    supplied = _api_v1_control_credential_digest(credential)
+    store = _api_v1_store()
+    registration = store.get(server_public_key)
+    if registration is not None:
+        return secrets.compare_digest(registration.control_credential_digest, supplied)
+    if isinstance(request_id, str) and request_id:
+        for tombstone in store.control_tombstones():
+            if tombstone.selected_node_id == server_public_key:
+                return secrets.compare_digest(tombstone.control_credential_digest, supplied)
+    return False
+
+
 def _api_v1_health_store() -> tuple[RelayStateStore, bool]:
     """Return a probe store without cold-start manifest creation or repair."""
 

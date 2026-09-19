@@ -517,10 +517,9 @@ def test_control_server_owner_identity_requires_matching_bound_credential(monkey
         sys.modules,
         "relay",
         SimpleNamespace(
-            known_servers={
-                "server-a": {"api_v1_control_credential_digest": digest("secret-a")},
-            },
-            _api_v1_control_credential_digest=digest,
+            _authenticate_control_owner=lambda server, request, credential: (
+                server == "server-a" and credential == "secret-a"
+            ),
         ),
     )
 
@@ -564,10 +563,7 @@ def test_progress_identity_spoof_falls_back_to_ip(monkeypatch, payload):
     monkeypatch.setitem(
         sys.modules,
         "relay",
-        SimpleNamespace(
-            known_servers={"victim": {"api_v1_control_credential_digest": "secret"}},
-            _api_v1_control_credential_digest=lambda value: value,
-        ),
+        SimpleNamespace(_authenticate_control_owner=lambda *args: False),
     )
     app = Flask(__name__)
     with app.test_request_context(
@@ -592,11 +588,8 @@ def test_progress_exact_owners_have_independent_dedicated_buckets(configured_tok
     digest = lambda value: f"digest:{value}"
     relay_module = SimpleNamespace(
         SERVER_REGISTRATION_TOKENS=["registration-token"] if configured_token else [],
-        known_servers={
-            "server-a": {"api_v1_control_credential_digest": digest("secret-a")},
-            "server-b": {"api_v1_control_credential_digest": digest("secret-b")},
-        },
-        _api_v1_control_credential_digest=digest,
+        _authenticate_control_owner=lambda server, request, credential: credential
+        == {"server-a": "secret-a", "server-b": "secret-b"}.get(server),
     )
     with patch.dict(os.environ, env, clear=True), patch.dict(
         sys.modules, {"relay": relay_module, "__main__": relay_module}
@@ -631,9 +624,7 @@ def test_control_route_rate_limit_identity_falls_back_to_ip_without_owner_proof(
     monkeypatch.setitem(
         sys.modules,
         "relay",
-        SimpleNamespace(
-            known_servers={}, _api_v1_control_credential_digest=lambda value: value
-        ),
+        SimpleNamespace(_authenticate_control_owner=lambda *args: False),
     )
     app = Flask(__name__)
 
@@ -685,10 +676,9 @@ def test_poll_control_and_response_control_plane_routes_do_not_use_public_quota(
     digest = lambda value: f"digest:{value}"
     relay_module = SimpleNamespace(
         SERVER_REGISTRATION_TOKENS=["relay-token"],
-        known_servers={
-            "server-a": {"api_v1_control_credential_digest": digest("control-secret-a")},
-        },
-        _api_v1_control_credential_digest=digest,
+        _authenticate_control_owner=lambda server, request, credential: (
+            server == "server-a" and credential == "control-secret-a"
+        ),
     )
 
     with patch.dict(sys.modules, {"relay": relay_module, "__main__": relay_module}):
@@ -752,11 +742,8 @@ def test_tokenless_control_route_uses_verified_owner_identity_bucket():
     digest = lambda value: f"digest:{value}"
     relay_module = SimpleNamespace(
         SERVER_REGISTRATION_TOKENS=[],
-        known_servers={
-            "server-a": {"api_v1_control_credential_digest": digest("control-secret-a")},
-            "server-b": {"api_v1_control_credential_digest": digest("control-secret-b")},
-        },
-        _api_v1_control_credential_digest=digest,
+        _authenticate_control_owner=lambda server, request, credential: credential
+        == {"server-a": "control-secret-a", "server-b": "control-secret-b"}.get(server),
     )
     with patch.dict(sys.modules, {"relay": relay_module, "__main__": relay_module}):
         with app.test_client() as client:

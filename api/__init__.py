@@ -13,6 +13,7 @@ from typing import Any
 from flask import Response, g, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.errors import RateLimitExceeded
+from limits.errors import StorageError
 from limits.storage import storage_from_string
 from limits.strategies import FixedWindowRateLimiter
 from limits.util import parse
@@ -25,6 +26,7 @@ from api.client_identity import (
 from api.v1 import routes as v1_routes
 from api.v2 import routes as v2_routes
 from config import get_config
+from shared_rate_limit import SharedRateLimitStorage  # noqa: F401
 
 RATE_LIMIT_STORAGE_URI_ENV = "TOKENPLACE_RATE_LIMIT_STORAGE_URI"
 LOGGER = logging.getLogger("tokenplace.api")
@@ -301,6 +303,23 @@ def _resolve_rate_limit_storage_uri() -> str | None:
     return storage_uri or None
 
 
+def _shared_coordination_required() -> bool:
+    backend = os.environ.get("TOKENPLACE_RELAY_STATE_BACKEND", "memory").strip().lower()
+    try:
+        workers = int(os.environ.get("RELAY_WORKERS", "1"))
+        replicas = int(os.environ.get("RELAY_REPLICAS", "1"))
+    except ValueError:
+        raise RuntimeError("invalid shared-coordination configuration") from None
+    if workers < 1 or replicas < 1:
+        raise RuntimeError("invalid shared-coordination configuration")
+    return backend == "valkey" or workers > 1 or replicas > 1
+
+
+def _relay_store():
+    import relay
+    return relay._api_v1_store()
+
+
 def _fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -393,39 +412,11 @@ def _control_server_owner_identity(data: Any) -> tuple[str, str] | None:
     credential = data.get("control_credential")
     if not (isinstance(server_public_key, str) and server_public_key.strip() and isinstance(credential, str) and credential):
         return None
-    request_id = data.get("request_id")
-    for module_name in ("relay", "__main__"):
-        module = sys.modules.get(module_name)
-        known_servers = getattr(module, "known_servers", None) if module is not None else None
-        tombstones = (
-            getattr(module, "api_v1_control_tombstones", None)
-            if module is not None
-            else None
-        )
-        tombstone_key_func = (
-            getattr(module, "_control_tombstone_key", None) if module is not None else None
-        )
-        digest_func = getattr(module, "_api_v1_control_credential_digest", None) if module is not None else None
-        if digest_func is None:
-            continue
-        server_key = server_public_key.strip()
-        expected_digest = None
-        if isinstance(known_servers, dict):
-            payload = known_servers.get(server_key)
-            if isinstance(payload, dict):
-                expected_digest = payload.get("api_v1_control_credential_digest")
-        if (
-            expected_digest is None
-            and isinstance(tombstones, dict)
-            and callable(tombstone_key_func)
-            and isinstance(request_id, str)
-            and request_id
-        ):
-            tombstone = tombstones.get(tombstone_key_func(server_key, request_id))
-            if isinstance(tombstone, dict):
-                expected_digest = tombstone.get("control_credential_digest")
-        if isinstance(expected_digest, str) and secrets.compare_digest(digest_func(credential), expected_digest):
-            return "server_public_key", server_key
+    module = sys.modules.get("relay") or sys.modules.get("__main__")
+    adapter = getattr(module, "_authenticate_control_owner", None)
+    server_key = server_public_key.strip()
+    if callable(adapter) and adapter(server_key, data.get("request_id"), credential):
+        return "server_public_key", server_key
     return None
 
 def _control_plane_identity_for_request(path: str, data: Any) -> tuple[str, str]:
@@ -565,10 +556,10 @@ def _build_control_plane_rate_limit_response(limit_item: Any, retry_after: int):
     return response
 
 
-def _install_control_plane_rate_limiter(app, storage_uri: str | None) -> None:
+def _install_control_plane_rate_limiter(app, storage_uri: str | None, storage_options=None) -> None:
     route_limits = _control_plane_limits_from_env()
     control_plane_storage_uri = storage_uri or "memory://"
-    control_plane_storage = storage_from_string(control_plane_storage_uri)
+    control_plane_storage = storage_from_string(control_plane_storage_uri, **(storage_options or {}))
     control_plane_rate_limiter = FixedWindowRateLimiter(control_plane_storage)
     app.config["relay_control_plane_rate_limit_storage_uri"] = control_plane_storage_uri
     app.config["relay_control_plane_rate_limiter"] = control_plane_rate_limiter
@@ -768,6 +759,14 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
         _install_public_quota_metrics(app, metrics_registry)
 
     limiter_storage_uri = _resolve_rate_limit_storage_uri()
+    storage_options = None
+    if _shared_coordination_required():
+        if os.environ.get("TOKENPLACE_RELAY_STATE_BACKEND", "memory").strip().lower() != "valkey":
+            raise RuntimeError("shared coordination requires Valkey")
+        if limiter_storage_uri not in (None, "tokenplace-valkey://"):
+            raise RuntimeError("rate limits must use the relay Valkey service")
+        limiter_storage_uri = "tokenplace-valkey://"
+        storage_options = {"coordinator_factory": _relay_store, "route_class": "public-api"}
     limiter_kwargs = {
         "default_limits": [
             os.environ.get("API_RATE_LIMIT", "60/hour"),
@@ -779,6 +778,8 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
     }
     if limiter_storage_uri:
         limiter_kwargs["storage_uri"] = limiter_storage_uri
+    if storage_options:
+        limiter_kwargs["storage_options"] = storage_options
 
     limiter = Limiter(
         current_limiter_key,
@@ -791,7 +792,12 @@ def init_app(app, *, metrics_registry=None, metrics_export_defaults=True, metric
         g.tokenplace_public_quota_reason = _public_quota_limit_reason(exc)
         return _build_rate_limit_response(exc)
 
-    _install_control_plane_rate_limiter(app, limiter_storage_uri)
+    control_options = dict(storage_options, route_class="control-plane") if storage_options else None
+    _install_control_plane_rate_limiter(app, limiter_storage_uri, control_options)
+
+    @app.errorhandler(StorageError)
+    def _handle_rate_limit_storage_error(_exc):
+        return jsonify({"error": {"message": "Rate limit service unavailable", "code": "rate_limit_unavailable"}}), 503
 
     if metrics_instrumentation_enabled:
         PrometheusMetrics(

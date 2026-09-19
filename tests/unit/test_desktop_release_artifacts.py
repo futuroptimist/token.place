@@ -93,7 +93,9 @@ def test_release_script_sets_explicit_dmg_volume_name() -> None:
 
 def test_release_script_uses_macos_base64_decode_flag() -> None:
     text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
-    assert text.count('| /usr/bin/base64 -D >') == 2
+    assert 'decode_base64()' in text
+    assert text.count('/usr/bin/base64 -D') == 1
+    assert text.count('| decode_base64 >') == 2
     assert 'base64 --decode' not in text
 
 
@@ -133,7 +135,8 @@ def test_macos_release_script_signs_inside_out_and_staples_app_and_dmg() -> None
     text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
     assert 'codesign --deep' not in text
     assert '--options runtime --timestamp' in text
-    assert "-name '*.framework'" in text
+    for extension in ('framework', 'xpc', 'appex', 'bundle', 'plugin', 'app'):
+        assert f"-name '*.{extension}'" in text
     assert 'file -b "${candidate}"' in text
     assert text.count('xcrun stapler staple') == 2
     assert text.count('xcrun stapler validate') == 2
@@ -148,9 +151,44 @@ def test_validator_enforces_gatekeeper_release_evidence() -> None:
     assert '--require-gatekeeper-ready' in text
     assert 'Authority=Developer ID Application:' in text
     assert 'hardened runtime is missing' in text
+    assert 'secure timestamp is missing' in text
     assert 'com.apple.security.get-task-allow' in text
     assert '["xcrun", "stapler", "validate", str(app_path)]' in text
     assert 'context:primary-signature' in text
+
+
+@pytest.mark.parametrize('timestamp_line', ['Timestamp=Sep 19, 2026 at 05:00:00', 'Signed Time=Sep 19, 2026 at 05:00:00'])
+def test_gatekeeper_validation_accepts_codesign_timestamp_formats(monkeypatch, tmp_path, timestamp_line) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_run', lambda cmd: (
+        f'Authority=Developer ID Application: Example\nflags=0x10000(runtime)\n{timestamp_line}'
+        if cmd[:3] == ['codesign', '--display', '--verbose=4'] else ''
+    ))
+    monkeypatch.setattr(
+        validator.subprocess,
+        'run',
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, b'', b''),
+    )
+
+    validator._validate_gatekeeper_ready(app)
+
+
+def test_gatekeeper_validation_rejects_missing_secure_timestamp(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app = tmp_path / 'Example.app'
+    app.mkdir()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(
+        validator,
+        '_run',
+        lambda cmd: 'Authority=Developer ID Application: Example\nflags=0x10000(runtime)',
+    )
+
+    with pytest.raises(SystemExit, match='secure timestamp is missing'):
+        validator._validate_gatekeeper_ready(app)
 
 
 def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:

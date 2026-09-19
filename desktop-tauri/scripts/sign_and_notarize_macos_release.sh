@@ -49,8 +49,12 @@ cleanup() {
 trap cleanup EXIT
 
 umask 077
-printf '%s' "${APPLE_CERTIFICATE_P12_BASE64}" | /usr/bin/base64 -D > "${certificate_path}"
-printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" | /usr/bin/base64 -D > "${notary_key_path}"
+decode_base64() {
+  /usr/bin/base64 -D
+}
+
+printf '%s' "${APPLE_CERTIFICATE_P12_BASE64}" | decode_base64 > "${certificate_path}"
+printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" | decode_base64 > "${notary_key_path}"
 security create-keychain -p "${keychain_password}" "${keychain_path}"
 security set-keychain-settings -lut 21600 "${keychain_path}"
 security unlock-keychain -p "${keychain_password}" "${keychain_path}"
@@ -73,7 +77,7 @@ done < <(find "${app_path}/Contents" -type f -print0)
 
 while IFS= read -r bundle; do
   sign_one "${bundle}"
-done < <(find "${app_path}/Contents" -depth -type d \( -name '*.framework' -o -name '*.xpc' -o -name '*.appex' -o -name '*.app' \) -print)
+done < <(find "${app_path}/Contents" -depth -type d \( -name '*.framework' -o -name '*.xpc' -o -name '*.appex' -o -name '*.bundle' -o -name '*.plugin' -o -name '*.app' \) -print)
 codesign --force --sign "${APPLE_SIGNING_IDENTITY}" --options runtime --timestamp \
   --entitlements "$(dirname "$0")/../src-tauri/Entitlements.plist" "${app_path}"
 codesign --verify --deep --strict --verbose=4 "${app_path}"

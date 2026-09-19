@@ -465,6 +465,8 @@ def _validate_gatekeeper_ready(app_path: Path, dmg_path: Path | None = None) -> 
             _fail(f"code object is not signed by Developer ID Application: {code_object}")
         if not re.search(r"flags=.*\bruntime\b", details):
             _fail(f"hardened runtime is missing from code object: {code_object}")
+        if not re.search(r"^(?:Timestamp|Signed Time)=.+$", details, flags=re.MULTILINE):
+            _fail(f"secure timestamp is missing from code object: {code_object}")
 
     entitlements_result = subprocess.run(
         ["codesign", "--display", "--entitlements", ":-", str(app_path)],

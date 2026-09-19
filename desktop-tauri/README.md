@@ -88,9 +88,8 @@ CI runs — Rust target setup, `npm ci`, embedded Python runtime prep, `npm run 
 `npm run tauri build`, and artifact staging/validation — and writes the result to
 `desktop-tauri/release-artifacts/`:
 
-- **macOS**: a `.app` (ad-hoc signed unless `APPLE_SIGNING_IDENTITY` /
-  `APPLE_CERTIFICATE_P12_BASE64` / `APPLE_CERTIFICATE_PASSWORD` are already set in your
-  environment, same as CI) and a `.dmg` built via `hdiutil`.
+- **macOS**: local builds remain development previews. The publishable CI path requires
+  Developer ID signing and Apple notarization; it never falls back to ad-hoc signing.
 - **Windows 11**: both a NSIS `*-setup.exe` and a `*.msi` (Tauri's bundler downloads NSIS/WiX
   itself on first run — no separate install needed). Requires the MSVC C++ build tools
   (Visual Studio "Desktop development with C++" workload or the standalone Build Tools) for
@@ -126,8 +125,7 @@ The desktop-release CI pins **Node 20** and **Python 3.11**, which differ from t
 root's `.nvmrc` (18) and `.python-version` (3.12) — make sure the right versions are active
 (e.g. `nvm use 20`) before running the build.
 
-Local output is a preview build only: unsigned or ad-hoc signed, not notarized, matching what
-CI produces without Apple Developer ID / Windows code-signing secrets configured. It's for
+Local output is a preview build only: unsigned or ad-hoc signed and not notarized. It is for
 validating the packaged runtime path locally, not for distribution.
 
 **Recovering from an interrupted build.** A machine losing power or restarting mid `cargo
@@ -225,32 +223,23 @@ Desktop binaries released as GitHub Release assets are published only by the can
    - Desktop Tauri release staging is Tauri-only (`desktop-tauri/src-tauri/target/.../bundle`);
      legacy Electron artifacts from `desktop/` must never be published on this
      release channel.
-   - If Apple signing credentials are not configured in CI, the workflow emits
-     an explicit preview warning and uses ad-hoc signing for dev/preview builds.
-     Those builds are not equivalent to fully Developer ID signed + notarized
-     Gatekeeper-ready releases.
-   - If signing credentials are configured, CI validates with `codesign`.
-     Strict Gatekeeper notarization checks are skipped unless notarization is added.
+   - macOS release jobs fail closed unless all six protected secrets are configured:
+     `APPLE_SIGNING_IDENTITY`, `APPLE_CERTIFICATE_P12_BASE64`,
+     `APPLE_CERTIFICATE_PASSWORD`, `APPLE_NOTARY_KEY_P8_BASE64`,
+     `APPLE_NOTARY_KEY_ID`, and `APPLE_NOTARY_ISSUER_ID`.
+   - The workflow imports credentials into ephemeral runner files and a temporary keychain,
+     signs nested executable code inside-out with hardened runtime and secure timestamps,
+     notarizes and staples the app and DMG, validates Gatekeeper acceptance, and removes the
+     private files and keychain in an `always()` cleanup step. Notarization submission IDs and
+     failure logs are retained for 30 days as a workflow artifact; private keys are never included.
+   - Checksums and build manifests are generated only after signing, notarization, stapling,
+     and final artifact validation.
 
-### Unpaid macOS preview releases
+### Local macOS previews
 
-- token.place can publish Apple Silicon preview DMGs without a paid
-  Apple Developer Program account.
-- These preview builds use ad-hoc signing and are not notarized, so Gatekeeper
-  warnings after browser/GitHub download are expected.
-- The mounted DMG now includes an inline opening guide (`README BEFORE OPENING.txt`)
-  plus a sidecar release asset (`README-macos-apple-silicon-preview.txt`) that
-  explain the same manual-open flow.
-- Users must manually open/whitelist trusted previews:
-  - Drag/copy `token.place desktop.app` to **Applications** and try opening once.
-  - If macOS blocks with the expected “Apple could not verify…” dialog, click
-    **Done**, then use **System Settings → Privacy & Security** to
-    **Open Anyway / Allow / Open**.
-  - Control-click (or right-click) and choose **Open** remains a fallback path.
-- This flow does not remove Gatekeeper warnings for unpaid preview releases; it
-  explains the expected manual allow/open steps.
-- No-warning public distribution generally requires paid
-  Developer ID signing plus notarization.
+Developers may still make local unsigned or ad-hoc preview builds, but the canonical GitHub
+release workflow cannot publish them. A missing signing or notarization credential blocks the
+macOS matrix job and therefore blocks release publication.
 
 You can also run the workflow manually with `workflow_dispatch` and provide
 `tag_name` to rebuild/re-publish an existing desktop tag.

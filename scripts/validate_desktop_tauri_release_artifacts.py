@@ -46,6 +46,27 @@ def _run(cmd: list[str]) -> str:
     return f"{result.stdout}\n{result.stderr}".strip()
 
 
+def _validate_developer_id_signature(path: Path) -> None:
+    details = _run(["codesign", "-d", "--verbose=4", str(path)])
+    if "Authority=Developer ID Application:" not in details:
+        _fail(f"Developer ID Application signature missing: {path}")
+    if "flags=" not in details or "runtime" not in details.lower():
+        _fail(f"hardened runtime signature missing: {path}")
+    if "Timestamp=" not in details and "Signed Time=" not in details:
+        _fail(f"secure signing timestamp missing: {path}")
+    entitlements = _run(["codesign", "-d", "--entitlements", ":-", str(path)])
+    if "get-task-allow" in entitlements:
+        _fail(f"forbidden get-task-allow entitlement present: {path}")
+
+
+def _validate_notarization(app_path: Path, dmg_path: Path | None) -> None:
+    _run(["xcrun", "stapler", "validate", str(app_path)])
+    _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])
+    if dmg_path is not None:
+        _run(["xcrun", "stapler", "validate", str(dmg_path)])
+        _run(["spctl", "-a", "-vv", "--type", "install", str(dmg_path)])
+
+
 def _run_with_retries(
     cmd: list[str],
     *,
@@ -804,20 +825,14 @@ def _validate_dmg_contents(dmg_path: Path, *, expect_signing: bool, require_embe
             apps = sorted(p for p in root.iterdir() if p.is_dir() and p.suffix == ".app")
             if len(apps) != 1:
                 _fail(f"DMG must contain exactly one .app at root; found {len(apps)}")
-            readme_path = next((root / name for name in DMG_PREVIEW_README_NAMES if (root / name).is_file()), None)
-            if readme_path is None:
-                _fail(f"DMG must include one preview README at root: {DMG_PREVIEW_README_NAMES}")
-            readme_text = readme_path.read_text(encoding="utf-8")
-            missing = [phrase for phrase in DMG_PREVIEW_REQUIRED_PHRASES if phrase not in readme_text]
-            if missing:
-                _fail(f"DMG preview README missing required phrases: {missing}")
-            if expect_signing:
-                if DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[1] not in readme_text:
-                    _fail(
-                        "DMG preview README must describe configured Apple signing identity when --expect-signing is set"
-                    )
-            elif DMG_PREVIEW_SIGNING_PHRASE_OPTIONS[0] not in readme_text:
-                _fail("DMG preview README must include ad-hoc signing guidance for unsigned preview builds")
+            if not expect_signing:
+                readme_path = next((root / name for name in DMG_PREVIEW_README_NAMES if (root / name).is_file()), None)
+                if readme_path is None:
+                    _fail(f"preview DMG must include one README at root: {DMG_PREVIEW_README_NAMES}")
+                readme_text = readme_path.read_text(encoding="utf-8")
+                missing = [phrase for phrase in DMG_PREVIEW_REQUIRED_PHRASES if phrase not in readme_text]
+                if missing:
+                    _fail(f"DMG preview README missing required phrases: {missing}")
             mounted_app = apps[0]
             _validate_no_python_bytecode(mounted_app)
             if require_embedded_python_runtime:
@@ -907,6 +922,9 @@ def main() -> None:
 
     _codesign_verify(app_path)
 
+    if args.expect_signing:
+        _validate_developer_id_signature(app_path)
+
     if args.require_embedded_python_runtime:
         should_probe_source_app_copy = args.app_only or platform.system() != "Darwin" or dmg_path is None
         if should_probe_source_app_copy:
@@ -919,7 +937,9 @@ def main() -> None:
     _codesign_verify(app_path)
 
     if args.expect_notarization:
-        _run(["spctl", "-a", "-vv", "--type", "execute", str(app_path)])
+        if not args.expect_signing:
+            _fail("--expect-notarization requires --expect-signing")
+        _validate_notarization(app_path, dmg_path)
     elif args.expect_signing:
         print("::warning::Signing configured without notarization credentials; skipping strict Gatekeeper assessment.")
     else:

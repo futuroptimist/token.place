@@ -1957,12 +1957,18 @@ def test_validator_app_path_redaction_tolerates_resolution_failures(monkeypatch,
     assert validator._redact_allowed_app_locations(str(app / 'Contents'), app) == '<app-bundle>/Contents'
 
 
-def test_validator_app_tree_fingerprint_classifies_special_file(tmp_path) -> None:
+def test_validator_app_tree_fingerprint_classifies_special_file(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'Example.app'
     app.mkdir()
     special = app / 'unexpected.pipe'
-    validator.os.mkfifo(special)
+    special.touch()
+    original_is_file = Path.is_file
+    monkeypatch.setattr(
+        Path,
+        'is_file',
+        lambda self: False if self == special else original_is_file(self),
+    )
 
     fingerprint = validator._app_tree_fingerprint(app)
 

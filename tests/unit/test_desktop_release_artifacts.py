@@ -347,6 +347,28 @@ def test_gatekeeper_validation_checks_app_and_dmg_with_exact_commands(monkeypatc
     ]
 
 
+def test_gatekeeper_validation_rejects_non_macos(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Linux')
+
+    with pytest.raises(SystemExit, match='requires macOS'):
+        validator._validate_gatekeeper_ready(tmp_path / 'Example.app')
+
+
+def test_validator_parser_accepts_gatekeeper_ready_flag(monkeypatch) -> None:
+    validator = _load_release_artifact_validator()
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'validator', '--app-path', 'Example.app', '--tauri-config', 'tauri.json',
+            '--expected-icon', 'icon.icns', '--require-gatekeeper-ready',
+        ],
+    )
+
+    assert validator._parse_args().require_gatekeeper_ready is True
+
+
 def test_validator_checks_display_name_and_executable_and_dmg_pattern() -> None:
     text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
     assert 'CFBundleDisplayName' in text
@@ -1929,6 +1951,70 @@ def test_validator_dmg_contents_checks_preview_readme(monkeypatch, tmp_path) -> 
     assert handle.cleaned is True
 
 
+@pytest.mark.parametrize(
+    ('readme_text', 'expect_signing', 'message'),
+    [
+        (None, False, 'must include one preview README'),
+        ('unrelated preview instructions', False, 'missing required phrases'),
+        (
+            'This build is not notarized. Apple could not verify. '
+            'Open Privacy & Security. Developer ID notarization.',
+            False,
+            'ad-hoc signing guidance',
+        ),
+    ],
+)
+def test_validator_dmg_preview_fail_closed(monkeypatch, tmp_path, readme_text, expect_signing, message) -> None:
+    validator = _load_release_artifact_validator()
+    mount = tmp_path / 'mount'
+    mount.mkdir()
+    (mount / 'token.place desktop.app').mkdir()
+    if readme_text is not None:
+        (mount / 'README BEFORE OPENING.txt').write_text(readme_text, encoding='utf-8')
+
+    class MountHandle:
+        name = str(mount)
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: MountHandle())
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: None)
+
+    with pytest.raises(SystemExit, match=message):
+        validator._validate_dmg_contents(tmp_path / 'release.dmg', expect_signing=expect_signing)
+
+
+def test_validator_dmg_gatekeeper_ready_checks_mounted_app(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    mount = tmp_path / 'mount'
+    mounted_app = mount / 'token.place desktop.app'
+    mounted_app.mkdir(parents=True)
+
+    class MountHandle:
+        name = str(mount)
+
+        def cleanup(self):
+            pass
+
+    calls = []
+    monkeypatch.setattr(validator.platform, 'system', lambda: 'Darwin')
+    monkeypatch.setattr(validator, '_attach_dmg_with_retries', lambda dmg: MountHandle())
+    monkeypatch.setattr(validator, '_cleanup_dmg_attach_state', lambda dmg, path: None)
+    monkeypatch.setattr(validator, '_codesign_verify', lambda app: None)
+    monkeypatch.setattr(validator, '_run', lambda cmd: calls.append(cmd) or '')
+
+    validator._validate_dmg_contents(
+        tmp_path / 'release.dmg', expect_signing=True, require_gatekeeper_ready=True,
+    )
+
+    assert calls == [
+        ['xcrun', 'stapler', 'validate', str(mounted_app)],
+        ['spctl', '--assess', '--verbose=4', '--type', 'execute', str(mounted_app)],
+    ]
+
+
 def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) -> None:
     validator = _load_release_artifact_validator()
     app = tmp_path / 'token.place desktop.app'
@@ -1987,6 +2073,38 @@ def test_validator_full_main_validates_dmg_and_signing(monkeypatch, tmp_path) ->
     assert dmg_calls == [(dmg, True)]
     assert run_calls.count(['codesign', '--verify', '--deep', '--strict', '--verbose=4', str(app)]) == 2
     assert ['spctl', '-a', '-vv', '--type', 'execute', str(app)] in run_calls
+
+
+def test_validator_main_dispatches_gatekeeper_ready_validation(monkeypatch, tmp_path) -> None:
+    validator = _load_release_artifact_validator()
+    app, tauri_config, icon = _minimal_validator_app(validator, tmp_path)
+    gatekeeper_calls = []
+    monkeypatch.setattr(
+        validator,
+        '_parse_args',
+        lambda: validator.argparse.Namespace(
+            app_path=str(app),
+            dmg_path=None,
+            app_only=True,
+            tauri_config=str(tauri_config),
+            expected_icon=str(icon),
+            expect_signing=True,
+            require_embedded_python_runtime=False,
+            expect_notarization=True,
+            require_gatekeeper_ready=True,
+        ),
+    )
+    monkeypatch.setattr(validator, '_run', lambda cmd: 'arm64' if cmd[:2] == ['lipo', '-archs'] else '')
+    monkeypatch.setattr(validator, '_codesign_verify', lambda path: None)
+    monkeypatch.setattr(
+        validator,
+        '_validate_gatekeeper_ready',
+        lambda app_path, dmg_path: gatekeeper_calls.append((app_path, dmg_path)),
+    )
+
+    validator.main()
+
+    assert gatekeeper_calls == [(app, None)]
 
 
 def test_codesign_verify_fails_on_darwin_when_codesign_missing(monkeypatch, tmp_path) -> None:

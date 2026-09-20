@@ -957,6 +957,37 @@ def test_valkey_store_explicitly_implements_complete_protocol_inventory():
     assert_relay_state_protocol_implementation(ValkeyRegistrationStore)
 
 
+def test_availability_is_shared_and_does_not_advance_scheduler_state(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    capabilities = ComputeNodeCapabilities(
+        supported_model_ids=("qwen3-8b-instruct",),
+        active_context_tier="8k-fast",
+        maximum_total_context_tokens=8192,
+        default_output_token_reservation=1024,
+        maximum_output_tokens=2048,
+        max_concurrency=1,
+        backend_class="cuda",
+    )
+    try:
+        first.register(
+            "availability-node", capabilities, hashlib.sha256(b"owner").hexdigest()
+        )
+        cursor_key = first._foundation.config.key("cursor")
+        before = first._foundation._client.hgetall(cursor_key)
+        assert first.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == (
+            "available"
+        )
+        snapshot = second.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert snapshot.schedulable_compute_nodes == 1
+        assert second._foundation._client.hgetall(cursor_key) == before
+        assert first.list_reservations() == ()
+    finally:
+        first.close()
+        second.close()
+
+
 def test_full_relay_state_lifecycle_contract_matrix_across_instances(valkey_server):
     """Run the backend-neutral matrix through independent Redis clients."""
 

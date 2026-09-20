@@ -100,6 +100,38 @@ def test_registration_only_shared_backend_contract(capabilities):
     assert_registration_contract(store, capabilities, digest)
 
 
+def test_availability_snapshot_is_side_effect_free_and_classifies_capacity(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(clock=clock)
+    assert store.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == (
+        "no_registered_compute_nodes"
+    )
+    store.register("node-a", capabilities, digest("owner"))
+    before = (store.list_reservations(), dict(store._fairness_cursors))
+    snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+    assert snapshot.reason == "available"
+    assert snapshot.registered_compute_nodes == 1
+    assert snapshot.healthy_compute_nodes == 1
+    assert snapshot.matching_compute_nodes == 1
+    assert snapshot.schedulable_compute_nodes == 1
+    assert (store.list_reservations(), dict(store._fairness_cursors)) == before
+
+    store.set_scheduler_state(
+        "node-a", digest("owner"), SchedulerNodeState(healthy=False)
+    )
+    assert store.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == (
+        "no_healthy_compute_nodes"
+    )
+    clock.value += store.config.lease_ttl_seconds
+    assert store.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == (
+        "no_registered_compute_nodes"
+    )
+    assert "node-a" in store._records
+    assert store.get("node-a") is None
+
+
 def envelope(ciphertext="ciphertext"):
     return EncryptedRequestEnvelope(
         protocol="tokenplace_api_v1_relay_e2ee",
@@ -238,6 +270,7 @@ RELAY_STATE_STORE_OPERATIONS = frozenset(
         "unregister",
         "unregister_node_and_transition_work",
         "set_scheduler_state",
+        "inspect_eligibility",
         "select_and_reserve",
         "enqueue_encrypted_request",
         "list_reservations",

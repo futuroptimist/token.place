@@ -34,6 +34,12 @@ EXPECTED_NORMAL_FAMILIES = {
     "tokenplace_relay_queue_depth",
     "tokenplace_relay_request_outcomes_total",
     "tokenplace_relay_requests_total",
+    "tokenplace_relay_chat_available",
+    "tokenplace_relay_schedulable_compute_nodes",
+    "tokenplace_relay_chat_availability_state",
+    "tokenplace_relay_state_store_up",
+    "tokenplace_relay_state_store_operation_duration_seconds",
+    "tokenplace_relay_state_store_errors_total",
 }
 
 STRESS_PROBE = r'''

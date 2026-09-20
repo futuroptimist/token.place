@@ -1344,6 +1344,57 @@ class InMemoryRelayStateStore:
                 and record.capabilities.maximum_total_context_tokens
                 >= requested_tokens
             )
+            # Admission expires every stale registration before selecting a
+            # node.  Project the capacity consumed by those transitions so a
+            # read-only probe cannot advertise work that housekeeping would
+            # reject before selection begins.
+            retained_node_tombstones = {
+                node_digest
+                for node_digest, tombstone in self._node_tombstones.items()
+                if tombstone.expires_at_epoch > now
+            }
+            pending_authorities = {
+                transition.node_identity_digest:
+                transition.control_credential_digest
+                for transition in self._pending_node_transitions.values()
+            }
+            retained_owner_fences = {
+                (node_digest, owner_digest)
+                for node_digest, authorities
+                in self._former_node_authorities.items()
+                for owner_digest, authority in authorities.items()
+                if authority.expires_at_epoch > now
+                or pending_authorities.get(node_digest) == owner_digest
+            }
+            transition_capacity = True
+            for record in sorted(
+                (
+                    item
+                    for item in self._records.values()
+                    if item.lease_expires_at_epoch <= now
+                ),
+                key=lambda item: item.node_id,
+            ):
+                node_digest = self._node_digest(record.node_id)
+                owner = (node_digest, record.control_credential_digest)
+                if (
+                    len(self._pending_node_transitions)
+                    >= self.config.max_pending_node_transitions
+                    or (
+                        owner not in retained_owner_fences
+                        and len(retained_owner_fences)
+                        >= self.config.max_removed_owner_fences
+                    )
+                    or (
+                        node_digest not in retained_node_tombstones
+                        and len(retained_node_tombstones)
+                        >= self.config.max_node_tombstones
+                    )
+                ):
+                    transition_capacity = False
+                    break
+                retained_owner_fences.add(owner)
+                retained_node_tombstones.add(node_digest)
             # Predict the scheduler's bounded cleanup without mutating authority.
             # Deadline-due work remains capacity-consuming only when terminal or
             # control-tombstone capacity would defer its authoritative transition.
@@ -1434,7 +1485,9 @@ class InMemoryRelayStateStore:
                     for existing in self._fairness_cursors
                 )
             )
-            global_capacity = global_capacity and fingerprint_capacity
+            global_capacity = (
+                global_capacity and fingerprint_capacity and transition_capacity
+            )
             reservation_counts: dict[str, int] = {}
             queued_counts: dict[str, int] = {}
             for item in retained_reservations:

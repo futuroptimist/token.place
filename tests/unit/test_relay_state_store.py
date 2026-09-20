@@ -5381,3 +5381,118 @@ def test_inspect_eligibility_counts_retained_expired_lifecycles(
     assert snapshot.reason == "available"
     assert snapshot.schedulable_compute_nodes == 1
     assert len(store._reservations) == 1
+
+
+@pytest.mark.parametrize(
+    ("capacity_overrides", "error_match"),
+    [
+        ({"max_node_tombstones": 1}, "node tombstone capacity"),
+        ({"max_removed_owner_fences": 1}, "removed-owner fencing capacity"),
+        (
+            {"max_pending_node_transitions": 1, "node_transition_batch_size": 1},
+            "pending node-transition capacity",
+        ),
+    ],
+)
+def test_inspect_eligibility_fails_closed_for_expired_node_transition_capacity(
+    store_factory, capabilities, capacity_overrides, error_match
+):
+    clock = EpochClock(1000)
+    store = store_factory(
+        clock=clock,
+        lease_ttl_seconds=30,
+        **capacity_overrides,
+    )
+    store.register("node-live", capabilities, digest("owner-live"))
+    store.register("node-expired", capabilities, digest("owner-expired"))
+    store.register("node-removed", capabilities, digest("owner-removed"))
+    if "max_pending_node_transitions" in capacity_overrides:
+        store.set_scheduler_state(
+            "node-live", digest("owner-live"), SchedulerNodeState(draining=True)
+        )
+        store.set_scheduler_state(
+            "node-expired", digest("owner-expired"), SchedulerNodeState(draining=True)
+        )
+        queued_work(store, "pending-a", request_deadline_epoch=1100)
+        queued_work(store, "pending-b", request_deadline_epoch=1100)
+        store.set_scheduler_state(
+            "node-live", digest("owner-live"), SchedulerNodeState()
+        )
+        store.set_scheduler_state(
+            "node-expired", digest("owner-expired"), SchedulerNodeState()
+        )
+    transition = store.unregister_node_and_transition_work(
+        "node-removed", digest("owner-removed")
+    )
+    assert transition.continuation_required == (
+        "max_pending_node_transitions" in capacity_overrides
+    )
+
+    clock.value = 1020
+    store.renew("node-live", digest("owner-live"))
+    clock.value = 1031
+    before = (
+        dict(store._records),
+        dict(store._scheduler_states),
+        dict(store._pending_node_transitions),
+        dict(store._node_tombstones),
+        {
+            node_digest: dict(authorities)
+            for node_digest, authorities
+            in store._former_node_authorities.items()
+        },
+    )
+
+    for _ in range(2):
+        snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert snapshot.reason == "no_available_capacity"
+        assert snapshot.schedulable_compute_nodes == 0
+    assert before == (
+        store._records,
+        store._scheduler_states,
+        store._pending_node_transitions,
+        store._node_tombstones,
+        store._former_node_authorities,
+    )
+    with pytest.raises(RelayStateCapacityExceeded, match=error_match):
+        store.select_and_reserve(
+            "client-new",
+            "request-new",
+            "qwen3-8b-instruct",
+            "8k-fast",
+            1100,
+        )
+
+
+def test_inspect_eligibility_allows_projected_expired_node_transition(
+    store_factory, capabilities
+):
+    clock = EpochClock(1000)
+    store = store_factory(
+        clock=clock,
+        lease_ttl_seconds=30,
+        max_node_tombstones=2,
+        max_removed_owner_fences=2,
+    )
+    store.register("node-live", capabilities, digest("owner-live"))
+    store.register("node-expired", capabilities, digest("owner-expired"))
+    store.register("node-removed", capabilities, digest("owner-removed"))
+    assert store.unregister("node-removed", digest("owner-removed"))
+    clock.value = 1020
+    store.renew("node-live", digest("owner-live"))
+    clock.value = 1031
+
+    before = dict(store._records)
+    snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+
+    assert snapshot.reason == "available"
+    assert snapshot.schedulable_compute_nodes == 1
+    assert store._records == before
+    selection = store.select_and_reserve(
+        "client-new",
+        "request-new",
+        "qwen3-8b-instruct",
+        "8k-fast",
+        1100,
+    )
+    assert selection.selected_node_id == "node-live"

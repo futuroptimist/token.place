@@ -71,6 +71,7 @@ def test_headless_boundary_rejects_non_cpu_before_runtime(monkeypatch, tmp_path,
 
 
 class _CompletionPreflightManager:
+    desktop_model_path_fixture_override = True
     file_name = "Qwen3-8B-Q4_K_M.gguf"
     use_mock_llm = False
 
@@ -366,7 +367,20 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     assert code != 0 or evidence["success"] is False
     assert evidence["success"] is False
     assert evidence["failure_code"] == expected
-    assert evidence["artifact"]["artifact_sha256"] == "unknown"
+    if mutation in {"identity", "blank_identity", "missing_model", "cpu_mode", "fallback"}:
+        assert evidence["artifact"]["artifact_sha256"] == "unknown"
+    else:
+        assert evidence["artifact"]["filename"] == "Qwen3-8B-Q4_K_M.gguf"
+        if mutation in {
+            "model", "artifact_hash", "mock", "unmanaged", "validator_missing",
+            "profile_missing",
+        }:
+            assert evidence["artifact"]["size_bytes"] == 5027783488
+        else:
+            assert evidence["artifact"]["size_bytes"] == len(b"fixture")
+        assert evidence["artifact"]["artifact_sha256"] == (
+            compute_node_bridge.CANONICAL_DESKTOP_MODEL_SHA256
+        )
     serialized = json.dumps(evidence)
     assert "secret child log" not in serialized
     assert "fixture" not in serialized
@@ -838,6 +852,8 @@ def test_api_v1_recovery_backoff_seconds_parses_valid_values_and_defaults(
 
 
 class FakeModelManager:
+    desktop_model_path_fixture_override = True
+
     def __init__(self):
         self.model_path = ''
         self.default_n_gpu_layers = -1
@@ -854,6 +870,69 @@ class FakeModelManager:
             "last_worker_exit_code": None,
             "last_worker_restart_at_ms": None,
         }
+
+
+class CanonicalPathManager:
+    profile_id = compute_node_bridge.CANONICAL_DESKTOP_MODEL_PROFILE_ID
+    api_model_id = compute_node_bridge.CANONICAL_DESKTOP_API_MODEL_ID
+    file_name = compute_node_bridge.CANONICAL_DESKTOP_MODEL_FILENAME
+    model_profile = {
+        "artifact_size_bytes": compute_node_bridge.CANONICAL_DESKTOP_MODEL_SIZE_BYTES,
+        "artifact_sha256": compute_node_bridge.CANONICAL_DESKTOP_MODEL_SHA256,
+    }
+
+    def __init__(self, models_dir):
+        self.models_dir = str(models_dir)
+        self.model_path = os.path.join(self.models_dir, self.file_name)
+
+    def _is_managed_canonical_model_path(self):
+        return os.path.abspath(self.model_path) == os.path.abspath(
+            os.path.join(self.models_dir, self.file_name)
+        )
+
+
+def test_reconcile_flat_absolute_model_path_keeps_manager_canonical_identity(tmp_path):
+    manager = CanonicalPathManager(tmp_path / "old-models")
+    configured = tmp_path / "desktop-models" / manager.file_name
+
+    reconciled, reason = compute_node_bridge._reconcile_configured_model_path(
+        manager, str(configured)
+    )
+
+    assert (reconciled, reason) == (True, "canonical")
+    assert manager.models_dir == str(configured.parent)
+    assert manager.model_path == os.path.join(manager.models_dir, manager.file_name)
+    assert manager._is_managed_canonical_model_path() is True
+
+
+@pytest.mark.parametrize(
+    ("mutation", "configured_name"),
+    [
+        ("profile_id", "Qwen3-8B-Q4_K_M.gguf"),
+        ("api_model_id", "Qwen3-8B-Q4_K_M.gguf"),
+        ("file_name", "Qwen3-8B-Q4_K_M.gguf"),
+        ("artifact_size_bytes", "Qwen3-8B-Q4_K_M.gguf"),
+        ("artifact_sha256", "Qwen3-8B-Q4_K_M.gguf"),
+        (None, "wrong.gguf"),
+    ],
+)
+def test_reconcile_model_path_rejects_identity_mismatch_and_rolls_back(
+    tmp_path, mutation, configured_name
+):
+    manager = CanonicalPathManager(tmp_path / "original")
+    original = (manager.models_dir, manager.model_path)
+    if mutation in {"profile_id", "api_model_id", "file_name"}:
+        setattr(manager, mutation, "unsafe")
+    elif mutation is not None:
+        manager.model_profile = dict(manager.model_profile, **{mutation: 1})
+
+    reconciled, reason = compute_node_bridge._reconcile_configured_model_path(
+        manager, str(tmp_path / "configured" / configured_name)
+    )
+
+    assert reconciled is False
+    assert reason in {"model_identity_mismatch", "configured_filename_mismatch"}
+    assert (manager.models_dir, manager.model_path) == original
 
 
 class FakeRelayClient:
@@ -3521,6 +3600,7 @@ class _RelayClient:
 
 
 class _ModelManager:
+    desktop_model_path_fixture_override = True
     model_path = ""
 
 

@@ -103,6 +103,11 @@ class _CompletionPreflightManager:
     def _is_managed_canonical_model_path(self):
         return Path(self.model_path).resolve() == Path(self.models_dir, self.file_name).resolve()
 
+    def reconcile_configured_model_path(self, configured_path):
+        if Path(configured_path).resolve() != Path(self.model_path).resolve():
+            raise ValueError("fixture path mismatch")
+        return self.model_path
+
     def _close_llm_proxy(self, _loaded):
         return True
 
@@ -366,7 +371,23 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     assert code != 0 or evidence["success"] is False
     assert evidence["success"] is False
     assert evidence["failure_code"] == expected
-    assert evidence["artifact"]["artifact_sha256"] == "unknown"
+    if mutation in {"identity", "blank_identity", "missing_model", "cpu_mode", "fallback", "mock"}:
+        assert evidence["artifact"]["artifact_sha256"] == "unknown"
+    elif mutation == "profile_missing":
+        assert evidence["artifact"] == {
+            "filename": "Qwen3-8B-Q4_K_M.gguf",
+            "size_bytes": 0,
+            "artifact_sha256": "unknown",
+        }
+    else:
+        assert evidence["artifact"]["filename"] == "Qwen3-8B-Q4_K_M.gguf"
+        assert evidence["artifact"]["size_bytes"] == len(b"fixture")
+        assert len(evidence["artifact"]["artifact_sha256"]) == 64
+        assert evidence["backend"] == {
+            "declared": "cuda",
+            "observed": evidence["backend"]["observed"],
+            "gpu_verified": evidence["backend"]["gpu_verified"],
+        }
     serialized = json.dumps(evidence)
     assert "secret child log" not in serialized
     assert "fixture" not in serialized
@@ -854,6 +875,11 @@ class FakeModelManager:
             "last_worker_exit_code": None,
             "last_worker_restart_at_ms": None,
         }
+
+    def reconcile_configured_model_path(self, configured_path):
+        """Explicit test-fixture override for bridge lifecycle doubles."""
+        self.model_path = os.path.abspath(configured_path)
+        return self.model_path
 
 
 class FakeRelayClient:
@@ -3522,6 +3548,10 @@ class _RelayClient:
 
 class _ModelManager:
     model_path = ""
+
+    def reconcile_configured_model_path(self, configured_path):
+        self.model_path = configured_path
+        return self.model_path
 
 
 class ComputeNodeRuntime:

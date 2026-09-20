@@ -204,6 +204,38 @@ def test_healthz_memory_snapshot_filters_without_reaping():
     assert store._node_tombstones == {}
 
 
+def test_availability_is_bounded_no_store_and_side_effect_free():
+    relay.DRAINING.clear()
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    empty = client.get("/api/v1/relay/availability")
+    assert empty.status_code == 503
+    assert empty.headers["Cache-Control"] == "no-store"
+    assert empty.get_json()["reason"] == "no_registered_compute_nodes"
+
+    assert client.post("/api/v1/relay/servers/register", json={
+        "server_public_key": "availability-node",
+        "capabilities": {"supported_model_ids": ["qwen3-8b-instruct"],
+                         "active_context_tier": "8k-fast",
+                         "maximum_total_context_tokens": 8192,
+                         "default_output_token_reservation": 1024,
+                         "maximum_output_tokens": 1024, "max_concurrency": 1},
+    }).status_code == 200
+    store = relay._api_v1_store()
+    before = (store.list_reservations(), dict(store._fairness_cursors))
+    available = client.get("/api/v1/relay/availability")
+    assert available.status_code == 200
+    assert available.get_json() == {
+        "available": True,
+        "reason": "available",
+        "registered_compute_nodes": 1,
+        "healthy_compute_nodes": 1,
+        "matching_compute_nodes": 1,
+        "schedulable_compute_nodes": 1,
+    }
+    assert (store.list_reservations(), dict(store._fairness_cursors)) == before
+
+
 def test_healthz_memory_snapshot_reports_live_claim_counts():
     relay._reset_api_v1_relay_state_store()
     client = relay.app.test_client()

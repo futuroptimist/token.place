@@ -33,6 +33,7 @@ from relay_state_store import (
     EncryptedProgressEnvelope,
     EncryptedResponseEnvelope,
     EnqueueResult,
+    EligibilitySnapshot,
     NodeTombstoneRecord,
     NodeTransitionResult,
     ProgressRecord,
@@ -3549,6 +3550,83 @@ class ValkeyRegistrationStore:
                 continue
             records.append(self._decode_record(record))
         return tuple(sorted(records, key=lambda record: record.node_id))
+
+    def inspect_eligibility(
+        self, requested_model_id: str, requested_context_tier: str
+    ) -> EligibilitySnapshot:
+        """Read an authoritative, side-effect-free scheduler snapshot."""
+
+        if (
+            not isinstance(requested_model_id, str)
+            or not requested_model_id.strip()
+            or len(requested_model_id.strip().encode()) > self.config.max_model_id_bytes
+        ):
+            raise RelayStateStoreError("requested model is invalid")
+        model = requested_model_id.strip().lower()
+        if requested_context_tier not in CONTEXT_TIER_TOKEN_BOUNDS:
+            raise RelayStateStoreError("requested context tier is invalid")
+        tier = requested_context_tier
+        requested_tokens = CONTEXT_TIER_TOKEN_BOUNDS[tier]
+        registrations = self.list()  # list() uses Valkey TIME and strict expiry.
+        reservations = self.list_reservations()
+        reservation_counts: dict[str, int] = {}
+        for reservation in reservations:
+            reservation_counts[reservation.selected_node_id] = (
+                reservation_counts.get(reservation.selected_node_id, 0) + 1
+            )
+        healthy: list[tuple[ComputeNodeRegistration, SchedulerNodeState]] = []
+        matching: list[tuple[ComputeNodeRegistration, SchedulerNodeState]] = []
+        schedulable = 0
+        for record in registrations:
+            digest = self._node_digest(record.node_id)
+            raw = self._foundation._call(
+                self._foundation._client.hmget,
+                self._foundation.config.key("node", digest),
+                (b"scheduler_healthy", b"scheduler_draining", b"scheduler_claimed_work"),
+            )
+            if (
+                not isinstance(raw, list)
+                or len(raw) != 3
+                or raw[0] not in {b"0", b"1"}
+                or raw[1] not in {b"0", b"1"}
+            ):
+                raise ValkeySchemaIncompatibleError("state schema incompatible")
+            try:
+                claimed = int(raw[2])
+                if claimed < 0 or str(claimed).encode() != raw[2]:
+                    raise ValueError
+                state = SchedulerNodeState(raw[0] == b"1", raw[1] == b"1", claimed)
+            except (TypeError, ValueError):
+                raise ValkeySchemaIncompatibleError("state schema incompatible") from None
+            if not state.healthy or state.draining:
+                continue
+            healthy.append((record, state))
+            caps = record.capabilities
+            if (
+                model not in caps.supported_model_ids
+                or CONTEXT_TIER_TOKEN_BOUNDS[caps.active_context_tier] < requested_tokens
+                or caps.maximum_total_context_tokens < requested_tokens
+            ):
+                continue
+            matching.append((record, state))
+            reserved = reservation_counts.get(record.node_id, 0)
+            queued = len(self.queued_requests(record.node_id))
+            if (
+                reserved + queued + state.claimed_work < caps.max_concurrency
+                and reserved < self.config.max_reservations_per_node
+                and reserved + queued < self.config.max_queue_depth_per_node
+            ):
+                schedulable += 1
+        reason = (
+            "available" if schedulable else
+            "no_registered_compute_nodes" if not registrations else
+            "no_healthy_compute_nodes" if not healthy else
+            "no_matching_compute_node" if not matching else
+            "no_available_capacity"
+        )
+        return EligibilitySnapshot(
+            reason, len(registrations), len(healthy), len(matching), schedulable
+        )
 
     def expire(self) -> tuple[ComputeNodeRegistration, ...]:
         manifest = self._foundation.read_manifest()

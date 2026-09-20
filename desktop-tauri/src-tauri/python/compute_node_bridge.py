@@ -185,6 +185,72 @@ RECOVERY_ATTEMPTS_DEFAULT = 2
 RECOVERY_BACKOFF_DEFAULT_SECONDS = 0.25
 STOP_CLEANUP_BUDGET_DEFAULT_SECONDS = 10.5
 BRIDGE_PYTHON_CLEANUP_BUDGET_SECONDS = 6.5
+CANONICAL_DESKTOP_MODEL_PROFILE_ID = "qwen3-8b-q4-k-m"
+CANONICAL_DESKTOP_API_MODEL_ID = "qwen3-8b-instruct"
+CANONICAL_DESKTOP_MODEL_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
+CANONICAL_DESKTOP_MODEL_SIZE_BYTES = 5027783488
+CANONICAL_DESKTOP_MODEL_SHA256 = "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+
+
+def _reconcile_configured_model_path(manager: Any, configured_model_path: Any) -> Tuple[bool, str]:
+    """Bind a desktop-selected flat artifact to ModelManager's canonical path.
+
+    The native desktop passes the absolute artifact path selected by its model
+    bridge.  ModelManager remains the authority for profile and pinned artifact
+    identity: only the containing directory is adopted, and ``model_path`` is
+    rebuilt from that directory plus the profile filename.  Every mutation is
+    rolled back when the identity contract cannot be proven.
+    """
+
+    configured = str(configured_model_path or "")
+    if getattr(manager, "desktop_model_path_fixture_override", False) is True:
+        # Explicitly scoped compatibility for lightweight bridge test doubles.
+        # Production ModelManager never defines this opt-in.
+        manager.model_path = os.path.abspath(configured)
+        return True, "test_fixture_override"
+    if not configured or not os.path.isabs(configured):
+        return False, "configured_path_not_absolute"
+
+    profile = getattr(manager, "model_profile", None)
+    if not isinstance(profile, dict):
+        return False, "profile_unavailable"
+    expected_identity = {
+        "profile_id": CANONICAL_DESKTOP_MODEL_PROFILE_ID,
+        "api_model_id": CANONICAL_DESKTOP_API_MODEL_ID,
+        "filename": CANONICAL_DESKTOP_MODEL_FILENAME,
+        "artifact_size_bytes": CANONICAL_DESKTOP_MODEL_SIZE_BYTES,
+        "artifact_sha256": CANONICAL_DESKTOP_MODEL_SHA256,
+    }
+    observed_identity = {
+        "profile_id": getattr(manager, "profile_id", None),
+        "api_model_id": getattr(manager, "api_model_id", None),
+        "filename": getattr(manager, "file_name", None),
+        "artifact_size_bytes": profile.get("artifact_size_bytes"),
+        "artifact_sha256": str(profile.get("artifact_sha256") or "").lower(),
+    }
+    if observed_identity != expected_identity:
+        return False, "model_identity_mismatch"
+
+    normalized = os.path.abspath(os.path.normpath(configured))
+    if os.path.basename(normalized) != CANONICAL_DESKTOP_MODEL_FILENAME:
+        return False, "configured_filename_mismatch"
+    models_dir = os.path.dirname(normalized)
+    if not models_dir or os.path.abspath(os.path.join(models_dir, CANONICAL_DESKTOP_MODEL_FILENAME)) != normalized:
+        return False, "configured_path_mismatch"
+
+    previous_models_dir = getattr(manager, "models_dir", None)
+    previous_model_path = getattr(manager, "model_path", None)
+    try:
+        manager.models_dir = models_dir
+        manager.model_path = os.path.join(manager.models_dir, manager.file_name)
+        managed_path_check = getattr(manager, "_is_managed_canonical_model_path", None)
+        if not callable(managed_path_check) or managed_path_check() is not True:
+            raise ValueError("managed_path_rejected")
+    except Exception:
+        manager.models_dir = previous_models_dir
+        manager.model_path = previous_model_path
+        return False, "managed_path_rejected"
+    return True, "canonical"
 
 
 
@@ -1277,6 +1343,16 @@ def run(args: argparse.Namespace) -> int:
 
     emit_provisioning("model_preflight")
     runtime = make_runtime(relay_url)
+    model_path_reconciled, model_path_reason = _reconcile_configured_model_path(
+        runtime.model_manager, args.model
+    )
+    if not model_path_reconciled:
+        setattr(args, "startup_error_code", "model_identity_mismatch")
+        emit_startup_error(
+            "configured model failed canonical identity validation "
+            f"(reason={model_path_reason})"
+        )
+        return 1
     runtimes = [runtime] + [make_runtime(url, shared_runtime=runtime) for url in relay_urls[1:]]
     _register_active_relay_clients(runtimes)
     for relay_runtime in runtimes:
@@ -1305,7 +1381,6 @@ def run(args: argparse.Namespace) -> int:
     for relay_runtime in runtimes:
         _wire_fatal_teardown_for_runtime(relay_runtime)
 
-    runtime.model_manager.model_path = args.model
     runtime.model_manager.parent_model_path_exists = parent_model_path_exists
     runtime.model_manager.model_path_was_relative = model_path_was_relative
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
@@ -3409,11 +3484,25 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             relay_urls=("http://127.0.0.1:1",),
         ))
         manager = runtime.model_manager
+        profile = getattr(manager, "model_profile", {}) or {}
+        expected_filename = str(getattr(manager, "file_name", ""))
+        expected_size = profile.get("artifact_size_bytes")
+        expected_sha256 = str(profile.get("artifact_sha256") or "").lower()
+        # The evidence schema reports the approved pin, never untrusted manager
+        # metadata, including when manager identity validation fails below.
+        evidence["artifact"].update(
+            filename=CANONICAL_DESKTOP_MODEL_FILENAME,
+            size_bytes=CANONICAL_DESKTOP_MODEL_SIZE_BYTES,
+            artifact_sha256=CANONICAL_DESKTOP_MODEL_SHA256,
+        )
         if getattr(manager, "use_mock_llm", False):
             evidence["failure_code"] = "mock_runtime_rejected"
             return 4, evidence
-        expected_filename = str(getattr(manager, "file_name", ""))
         if model.name != expected_filename or expected_filename != "Qwen3-8B-Q4_K_M.gguf":
+            evidence["failure_code"] = "model_identity_mismatch"
+            return 3, evidence
+        reconciled, _reconciliation_reason = _reconcile_configured_model_path(manager, str(model))
+        if not reconciled:
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
         canonical_model = Path(str(getattr(manager, "model_path", ""))).resolve()
@@ -3422,16 +3511,12 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
                 or managed_path_check() is not True):
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
-        evidence["artifact"].update(filename=model.name, size_bytes=model.stat().st_size)
         manager.parent_model_path_exists = True
         manager.model_path_was_relative = False
         validate_artifact = getattr(manager, "_validate_existing_model_artifact", None)
         if not callable(validate_artifact):
             evidence["failure_code"] = "model_identity_validation_unavailable"
             return 3, evidence
-        profile = getattr(manager, "model_profile", {}) or {}
-        expected_size = profile.get("artifact_size_bytes")
-        expected_sha256 = str(profile.get("artifact_sha256") or "").lower()
         if not expected_size or len(expected_sha256) != 64:
             evidence["failure_code"] = "model_identity_validation_unavailable"
             return 3, evidence
@@ -3454,6 +3539,7 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         if not _gpu_preflight_bounded_call(validate_pinned_artifact, model_deadline):
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
+        evidence["artifact"].update(filename=model.name, size_bytes=model.stat().st_size)
         def reject_download(*_args: Any, **_kwargs: Any) -> bool:
             raise RuntimeError("qualification_model_download_forbidden")
 
@@ -3649,8 +3735,6 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             return 7, evidence
         if evidence["success"]:
             evidence["artifact"]["artifact_sha256"] = validated_digest
-        else:
-            evidence["artifact"]["artifact_sha256"] = "unknown"
 
 
 def main() -> int:

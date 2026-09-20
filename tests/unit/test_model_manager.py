@@ -14705,3 +14705,85 @@ def test_qwen_64k_estimates_are_monotonic_for_context_and_quantization(tmp_path)
 
     assert q8_8k < q8_32k
     assert q4_32k < q8_32k < f16_32k
+
+
+def _canonical_reconciliation_manager(tmp_path, monkeypatch, artifact=b'GGUFdesktop-fixture'):
+    from utils.llm import model_manager as model_manager_module
+    from utils.llm.model_profiles import MODEL_PROFILES, QWEN3_8B_PROFILE_ID
+
+    profile = dict(MODEL_PROFILES[QWEN3_8B_PROFILE_ID])
+    profile['artifact_size_bytes'] = len(artifact)
+    profile['artifact_sha256'] = hashlib.sha256(artifact).hexdigest()
+    monkeypatch.setattr(
+        model_manager_module,
+        'get_model_profile',
+        lambda profile_id: dict(profile) if profile_id == QWEN3_8B_PROFILE_ID else None,
+    )
+
+    class Config:
+        is_production = False
+
+        def get(self, key, default=None):
+            return {
+                'model.profile_id': QWEN3_8B_PROFILE_ID,
+                'model.api_model_id': profile['api_model_id'],
+                'paths.models_dir': str(tmp_path / 'original-models'),
+            }.get(key, default)
+
+    return ModelManager(Config()), profile
+
+
+def test_reconcile_configured_model_path_adopts_flat_absolute_canonical_path(tmp_path, monkeypatch):
+    artifact = b'GGUFdesktop-fixture'
+    manager, profile = _canonical_reconciliation_manager(tmp_path, monkeypatch, artifact)
+    configured = tmp_path / 'flat' / profile['filename']
+    configured.parent.mkdir()
+    configured.write_bytes(artifact)
+
+    manager.reconcile_configured_model_path(str(configured))
+
+    assert manager.models_dir == str(configured.parent.resolve())
+    assert manager.model_path == str(configured.resolve())
+    assert manager._is_managed_canonical_model_path() is True
+
+
+@pytest.mark.parametrize('mismatch', ['profile', 'api_model', 'filename', 'size', 'sha', 'path'])
+def test_reconcile_configured_model_path_rejects_identity_mismatch_and_rolls_back(
+        tmp_path, monkeypatch, mismatch):
+    artifact = b'GGUFdesktop-fixture'
+    manager, profile = _canonical_reconciliation_manager(tmp_path, monkeypatch, artifact)
+    configured = tmp_path / 'flat' / profile['filename']
+    configured.parent.mkdir()
+    configured.write_bytes(artifact)
+    original = (manager.models_dir, manager.model_path)
+
+    if mismatch == 'profile':
+        manager.profile_id = 'unsafe-profile'
+    elif mismatch == 'api_model':
+        manager.api_model_id = 'unsafe-api-model'
+    elif mismatch == 'filename':
+        manager.file_name = 'unsafe.gguf'
+    elif mismatch == 'size':
+        manager.model_profile['artifact_size_bytes'] += 1
+    elif mismatch == 'sha':
+        manager.model_profile['artifact_sha256'] = '0' * 64
+    else:
+        configured = Path('relative') / profile['filename']
+
+    with pytest.raises(ValueError):
+        manager.reconcile_configured_model_path(str(configured))
+
+    assert (manager.models_dir, manager.model_path) == original
+
+
+def test_reconcile_configured_model_path_rejects_bad_artifact_and_rolls_back(tmp_path, monkeypatch):
+    manager, profile = _canonical_reconciliation_manager(tmp_path, monkeypatch)
+    configured = tmp_path / 'flat' / profile['filename']
+    configured.parent.mkdir()
+    configured.write_bytes(b'GGUFwrong-artifact')
+    original = (manager.models_dir, manager.model_path)
+
+    with pytest.raises(ValueError, match='pinned identity'):
+        manager.reconcile_configured_model_path(str(configured))
+
+    assert (manager.models_dir, manager.model_path) == original

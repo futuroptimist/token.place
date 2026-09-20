@@ -103,6 +103,10 @@ class _CompletionPreflightManager:
     def _is_managed_canonical_model_path(self):
         return Path(self.model_path).resolve() == Path(self.models_dir, self.file_name).resolve()
 
+    def reconcile_configured_model_path(self, configured_path):
+        self.models_dir = str(Path(configured_path).parent.resolve())
+        self.model_path = str(Path(self.models_dir, self.file_name))
+
     def _close_llm_proxy(self, _loaded):
         return True
 
@@ -366,7 +370,20 @@ def test_installed_gpu_completion_preflight_fail_closed(monkeypatch, tmp_path, m
     assert code != 0 or evidence["success"] is False
     assert evidence["success"] is False
     assert evidence["failure_code"] == expected
-    assert evidence["artifact"]["artifact_sha256"] == "unknown"
+    if mutation in {"identity", "blank_identity", "missing_model", "cpu_mode", "fallback"}:
+        assert evidence["artifact"]["artifact_sha256"] == "unknown"
+    elif mutation == "profile_missing":
+        assert evidence["artifact"]["artifact_sha256"] == "unknown"
+    elif mutation == "artifact_hash":
+        assert evidence["artifact"]["artifact_sha256"] == "0" * 64
+    else:
+        assert evidence["artifact"]["artifact_sha256"] == hashlib.sha256(b"fixture").hexdigest()
+    if mutation not in {"identity", "blank_identity", "missing_model", "cpu_mode", "fallback"}:
+        assert evidence["artifact"]["filename"] == "Qwen3-8B-Q4_K_M.gguf"
+        assert evidence["artifact"]["size_bytes"] == len(b"fixture")
+        assert evidence["backend"]["declared"] == "cuda"
+        assert set(evidence["backend"]) == {"declared", "observed", "gpu_verified"}
+        assert isinstance(evidence["backend"]["gpu_verified"], bool)
     serialized = json.dumps(evidence)
     assert "secret child log" not in serialized
     assert "fixture" not in serialized
@@ -839,6 +856,7 @@ def test_api_v1_recovery_backoff_seconds_parses_valid_values_and_defaults(
 
 class FakeModelManager:
     def __init__(self):
+        self.desktop_test_fixture_model_override = True
         self.model_path = ''
         self.default_n_gpu_layers = -1
         self.requested_compute_mode = 'auto'
@@ -3522,6 +3540,7 @@ class _RelayClient:
 
 class _ModelManager:
     model_path = ""
+    desktop_test_fixture_model_override = True
 
 
 class ComputeNodeRuntime:

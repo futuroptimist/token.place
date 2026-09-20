@@ -6540,6 +6540,66 @@ class ModelManager:
             and os.path.abspath(str(self.model_path)) == os.path.abspath(os.path.join(self.models_dir, self.file_name))
         )
 
+    def reconcile_configured_model_path(self, configured_path: str) -> None:
+        """Adopt a desktop-selected flat model path without bypassing identity.
+
+        Desktop launchers persist an absolute path to the managed GGUF.  The
+        containing directory is therefore the configured models directory; the
+        filename and every artifact identity field continue to come from the
+        selected profile.  State is restored if any check fails so callers
+        cannot accidentally retain a partially reconciled, unmanaged path.
+        """
+        original_models_dir = self.models_dir
+        original_model_path = self.model_path
+        try:
+            if not isinstance(configured_path, str) or not configured_path or not os.path.isabs(configured_path):
+                raise ValueError('configured model path must be absolute')
+
+            configured = Path(configured_path)
+            if configured.name != self.file_name:
+                raise ValueError('configured model filename does not match the active profile')
+            if configured.is_symlink():
+                raise ValueError('configured model path must not be a symlink')
+
+            pinned_profile = get_model_profile(self.profile_id)
+            required_identity = (
+                'api_model_id', 'filename', 'artifact_size_bytes', 'artifact_sha256'
+            )
+            if not pinned_profile or any(
+                self.model_profile.get(field) != pinned_profile.get(field)
+                for field in required_identity
+            ):
+                raise ValueError('configured model identity does not match the pinned profile')
+            if self.api_model_id != pinned_profile.get('api_model_id'):
+                raise ValueError('configured API model does not match the pinned profile')
+            expected_size = pinned_profile.get('artifact_size_bytes')
+            expected_sha256 = str(pinned_profile.get('artifact_sha256') or '').lower()
+            if (
+                not isinstance(expected_size, int)
+                or isinstance(expected_size, bool)
+                or expected_size <= 0
+                or not re.fullmatch(r'[0-9a-f]{64}', expected_sha256)
+            ):
+                raise ValueError('active profile does not define a safe pinned artifact')
+
+            canonical_parent = configured.parent.resolve(strict=False)
+            canonical_path = canonical_parent / self.file_name
+            if configured.resolve(strict=False) != canonical_path:
+                raise ValueError('configured model path is not a flat canonical path')
+
+            self.models_dir = str(canonical_parent)
+            self.model_path = str(canonical_path)
+            if not self._is_managed_canonical_model_path():
+                raise ValueError('configured model path is outside the managed identity contract')
+            if canonical_path.exists():
+                valid, _reason = self._validate_existing_model_artifact(hash_if_suspect=True)
+                if not valid:
+                    raise ValueError('configured model artifact does not match pinned identity')
+        except Exception:
+            self.models_dir = original_models_dir
+            self.model_path = original_model_path
+            raise
+
     def _artifact_verification_receipt_path(self) -> str:
         return f"{self.model_path}.sha256.verified.json"
 

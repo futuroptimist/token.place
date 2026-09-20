@@ -148,6 +148,16 @@ def test_macos_release_script_signs_inside_out_and_staples_app_and_dmg() -> None
     assert 'rm -rf "${private_dir}"' in text
 
 
+def test_macos_release_script_requires_apple_notarization_log() -> None:
+    text = Path('desktop-tauri/scripts/sign_and_notarize_macos_release.sh').read_text(encoding='utf-8')
+    log_command = 'xcrun notarytool log "${submission_id}" --output-format json'
+    assert f'if ! {log_command}' in text
+    assert f'{log_command}' in text
+    assert '> "${notary_log_dir}/${label}-log.json"; then' in text
+    assert 'Failed to retain the Apple notarization log' in text
+    assert 'log.json" || true' not in text
+
+
 def test_validator_enforces_gatekeeper_release_evidence() -> None:
     text = Path('scripts/validate_desktop_tauri_release_artifacts.py').read_text(encoding='utf-8')
     assert '--require-gatekeeper-ready' in text

@@ -97,9 +97,12 @@ submit_and_record() {
   status="$(jq -r '.status // empty' "${result_path}")"
   printf '%s\n' "${submission_id}" > "${notary_log_dir}/${label}-submission-id.txt"
   if [[ -n "${submission_id}" ]]; then
-    xcrun notarytool log "${submission_id}" --output-format json \
+    if ! xcrun notarytool log "${submission_id}" --output-format json \
       --key "${notary_key_path}" --key-id "${APPLE_NOTARY_KEY_ID}" --issuer "${APPLE_NOTARY_ISSUER_ID}" \
-      > "${notary_log_dir}/${label}-log.json" || true
+      > "${notary_log_dir}/${label}-log.json"; then
+      echo "::error::Failed to retain the Apple notarization log for ${label}; submission=${submission_id}." >&2
+      exit 1
+    fi
   fi
   if [[ ${submit_exit} -ne 0 || "${status}" != "Accepted" ]]; then
     echo "::error::Apple notarization failed for ${label}; status=${status:-unavailable}, submission=${submission_id:-unavailable}." >&2

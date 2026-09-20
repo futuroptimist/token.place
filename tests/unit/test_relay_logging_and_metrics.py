@@ -1105,3 +1105,25 @@ def test_structured_logs_keep_compat_http_path_normalized(relay_client, monkeypa
     serialized_logs = "\n".join(json.dumps(payload, default=str) for payload in http_logs)
     for value in raw_values:
         assert value not in serialized_logs
+
+
+def test_availability_metrics_use_only_fixed_bounded_labels(relay_client) -> None:
+    response = relay_client.get("/api/v1/relay/availability")
+    assert response.status_code == 503
+    body = _metric_body(relay_client)
+    for name in (
+        "tokenplace_relay_chat_available",
+        "tokenplace_relay_schedulable_compute_nodes",
+        "tokenplace_relay_chat_availability_state",
+        "tokenplace_relay_state_store_up",
+        "tokenplace_relay_state_store_operation_duration_seconds",
+        "tokenplace_relay_state_store_errors_total",
+    ):
+        assert name in body
+    states = set(relay_module.AVAILABILITY_STATE_ENUM)
+    observed = {
+        line.split('state="', 1)[1].split('"', 1)[0]
+        for line in body.splitlines()
+        if line.startswith("tokenplace_relay_chat_availability_state{")
+    }
+    assert observed == states

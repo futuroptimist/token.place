@@ -14214,3 +14214,31 @@ def test_node_work_contract_rejects_active_writer_membership_corruption(
         writer._foundation._client.delete(work)
         observer.close()
         writer.close()
+
+
+def test_availability_is_shared_authoritative_and_side_effect_free(valkey_server):
+    namespace = uuid.uuid4().hex
+    first = _registration_store(valkey_server, namespace)
+    second = _registration_store(valkey_server, namespace)
+    cfg = first._foundation.config
+    node = "availability-shared-node"
+    digest = first._node_digest(node)
+    keys = [
+        cfg.key("schema"), cfg.key("nodes:lease"), cfg.key("node", digest),
+        cfg.key("node_work", digest), cfg.key("cursor"),
+        cfg.key("requests:deadline"), cfg.key("reservations:expiry"),
+    ]
+    try:
+        assert first.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == "no_registered_compute_nodes"
+        first.register(node, _capabilities(concurrency=1), _digest("availability-owner"))
+        client = first._foundation._client
+        before = _read_exact_keys(client, keys)
+        left = first.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        right = second.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+        assert left == right
+        assert (left.reason, left.schedulable_compute_nodes) == ("available", 1)
+        assert _read_exact_keys(client, keys) == before
+    finally:
+        first._foundation._client.delete(*keys)
+        first.close()
+        second.close()

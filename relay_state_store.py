@@ -52,6 +52,40 @@ class RelayStateInvalidReservation(RelayStateStoreError):
     """A reservation token is invalid, expired, consumed, or wrongly bound."""
 
 
+AVAILABILITY_REASONS = frozenset(
+    {
+        "available",
+        "no_registered_compute_nodes",
+        "no_healthy_compute_nodes",
+        "no_matching_compute_node",
+        "no_available_capacity",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class EligibilitySnapshot:
+    """Bounded, identity-free view of scheduler eligibility."""
+
+    reason: str
+    registered_compute_nodes: int
+    healthy_compute_nodes: int
+    matching_compute_nodes: int
+    schedulable_compute_nodes: int
+
+    def __post_init__(self) -> None:
+        if self.reason not in AVAILABILITY_REASONS:
+            raise RelayStateStoreError("availability reason is invalid")
+        counts = (
+            self.registered_compute_nodes,
+            self.healthy_compute_nodes,
+            self.matching_compute_nodes,
+            self.schedulable_compute_nodes,
+        )
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise RelayStateStoreError("availability counts are invalid")
+
+
 @dataclass(frozen=True, slots=True)
 class RelayStateStoreConfig:
     """Explicit key-space, expiry, and size policy shared by all backends."""
@@ -866,6 +900,9 @@ class RelayStateStore(Protocol):
     def set_scheduler_state(
         self, node_id: str, control_credential_digest: str, state: SchedulerNodeState
     ) -> bool: ...
+    def inspect_eligibility(
+        self, requested_model_id: str, requested_context_tier: str
+    ) -> EligibilitySnapshot: ...
     def select_and_reserve(
         self,
         client_public_key: str,
@@ -1223,6 +1260,84 @@ class InMemoryRelayStateStore:
             self._require_digest(record, control_credential_digest)
             self._scheduler_states[node_id] = state
             return True
+
+    def inspect_eligibility(
+        self, requested_model_id: str, requested_context_tier: str
+    ) -> EligibilitySnapshot:
+        """Inspect live capacity without reaping records or advancing fairness."""
+
+        model_id = self._model_id(requested_model_id)
+        tier = self._context_tier(requested_context_tier)
+        requested_tokens = CONTEXT_TIER_TOKEN_BOUNDS[tier]
+        with self._lock:
+            now = self._now()
+            records = tuple(
+                record
+                for record in self._records.values()
+                if record.lease_expires_at_epoch > now
+            )
+            healthy = tuple(
+                record
+                for record in records
+                if (state := self._scheduler_states.get(record.node_id)) is not None
+                and state.healthy
+                and not state.draining
+            )
+            matching = tuple(
+                record
+                for record in healthy
+                if model_id in record.capabilities.supported_model_ids
+                and CONTEXT_TIER_TOKEN_BOUNDS[
+                    record.capabilities.active_context_tier
+                ]
+                >= requested_tokens
+                and record.capabilities.maximum_total_context_tokens
+                >= requested_tokens
+            )
+            live_reservations = tuple(
+                item
+                for item in self._reservations.values()
+                if item.request_deadline_epoch > now
+                and item.reservation_expires_at_epoch > now
+            )
+            live_queued = tuple(
+                item for item in self._queued.values() if item.request_deadline_epoch > now
+            )
+            global_capacity = (
+                len(live_reservations) < self.config.max_reservations
+                and len(live_reservations) + len(live_queued)
+                < self.config.max_request_lifecycles
+            )
+            schedulable = 0
+            if global_capacity:
+                for record in matching:
+                    node_id = record.node_id
+                    reservations = sum(
+                        item.selected_node_id == node_id for item in live_reservations
+                    )
+                    queued = sum(item.selected_node_id == node_id for item in live_queued)
+                    state = self._scheduler_states[node_id]
+                    load = reservations + queued + state.claimed_work
+                    if (
+                        load < record.capabilities.max_concurrency
+                        and reservations < self.config.max_reservations_per_node
+                        and reservations + queued
+                        < self.config.max_queue_depth_per_node
+                    ):
+                        schedulable += 1
+            counts = (len(records), len(healthy), len(matching), schedulable)
+            reason = (
+                "available"
+                if schedulable
+                else "no_registered_compute_nodes"
+                if not records
+                else "no_healthy_compute_nodes"
+                if not healthy
+                else "no_matching_compute_node"
+                if not matching
+                else "no_available_capacity"
+            )
+            return EligibilitySnapshot(reason, *counts)
 
     def select_and_reserve(
         self,

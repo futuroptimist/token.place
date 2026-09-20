@@ -890,3 +890,49 @@ def test_operational_endpoints_bound_store_snapshot_failures(
         }
     }
     assert secret.encode() not in response.data
+
+
+def test_availability_route_reports_canonical_capacity_without_reservation():
+    relay._reset_api_v1_relay_state_store()
+    client = relay.app.test_client()
+    empty = client.get("/api/v1/relay/availability")
+    assert empty.status_code == 503
+    assert empty.get_json()["reason"] == "no_registered_compute_nodes"
+    assert empty.headers["Cache-Control"] == "no-store"
+
+    registration = client.post("/api/v1/relay/servers/register", json={
+        "server_public_key": "availability-node",
+        "capabilities": {"supported_model_ids": ["qwen3-8b-instruct"],
+                         "active_context_tier": "8k-fast",
+                         "maximum_total_context_tokens": 8192,
+                         "default_output_token_reservation": 1024,
+                         "maximum_output_tokens": 1024, "max_concurrency": 1},
+    })
+    assert registration.status_code == 200
+    store = relay._api_v1_store()
+    before = (store.list_reservations(), dict(store._fairness_cursors))
+    response = client.get("/api/v1/relay/availability")
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "available": True,
+        "reason": "available",
+        "registered_compute_nodes": 1,
+        "healthy_compute_nodes": 1,
+        "matching_compute_nodes": 1,
+        "schedulable_compute_nodes": 1,
+    }
+    assert before == (store.list_reservations(), store._fairness_cursors)
+
+
+def test_availability_route_bounds_backend_failures(monkeypatch):
+    store = Mock()
+    store.inspect_eligibility.side_effect = RelayStateStoreError("secret backend URL")
+    monkeypatch.setattr(relay, "_api_v1_health_store", lambda: (store, False))
+    response = relay.app.test_client().get("/api/v1/relay/availability")
+    assert response.status_code == 503
+    assert response.get_json() == {
+        "available": False, "reason": "state_backend_unavailable",
+        "registered_compute_nodes": 0, "healthy_compute_nodes": 0,
+        "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
+    }
+    assert b"secret" not in response.data

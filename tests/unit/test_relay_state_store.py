@@ -238,6 +238,7 @@ RELAY_STATE_STORE_OPERATIONS = frozenset(
         "unregister",
         "unregister_node_and_transition_work",
         "set_scheduler_state",
+        "inspect_eligibility",
         "select_and_reserve",
         "enqueue_encrypted_request",
         "list_reservations",
@@ -5324,3 +5325,37 @@ def test_observable_control_tombstone_always_has_terminal_outcome(
     clock.value += 1
     assert store.control_tombstones() == ()
     assert store.terminal_records() == ()
+
+
+def test_inspect_eligibility_is_side_effect_free_and_classifies_fixed_states(
+    store_factory, capabilities
+):
+    clock = EpochClock()
+    store = store_factory(clock=clock)
+    empty = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+    assert (empty.reason, empty.registered_compute_nodes) == (
+        "no_registered_compute_nodes", 0
+    )
+
+    store.register("node-a", capabilities, digest("owner-a"))
+    before = (
+        dict(store._reservations), dict(store._queued), dict(store._claims),
+        dict(store._fairness_cursors), dict(store._node_tombstones),
+    )
+    available = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+    assert available.reason == "available"
+    assert available.schedulable_compute_nodes == 1
+    assert before == (
+        store._reservations, store._queued, store._claims,
+        store._fairness_cursors, store._node_tombstones,
+    )
+
+    store.set_scheduler_state(
+        "node-a", digest("owner-a"), SchedulerNodeState(healthy=False)
+    )
+    assert store.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == "no_healthy_compute_nodes"
+    store.set_scheduler_state("node-a", digest("owner-a"), SchedulerNodeState())
+    assert store.inspect_eligibility("other-model", "8k-fast").reason == "no_matching_compute_node"
+    clock.value = store._records["node-a"].lease_expires_at_epoch
+    assert store.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == "no_registered_compute_nodes"
+    assert "node-a" in store._records

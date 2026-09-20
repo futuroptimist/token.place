@@ -61,6 +61,10 @@ INTERNAL_RELAY_LIFECYCLE_ROUTES = {
     ("POST", "/relay/api/v1/source"),
 }
 
+FUNCTIONAL_AVAILABILITY_ROUTES = {
+    ("GET", "/api/v1/relay/availability"),
+}
+
 DOCUMENTED_INTERNAL_ROUTES = (
     COMPUTE_NODE_CONTROL_PLANE_ROUTES | INTERNAL_RELAY_LIFECYCLE_ROUTES
 )
@@ -127,7 +131,12 @@ def test_no_unclassified_api_v1_routes_leak_into_launch_contract():
         or path.startswith("/v1/")
         or path.startswith("/relay/api/v1/")
     }
-    expected = PUBLIC_CLIENT_ROUTES | OPENAI_V1_ALIASES | DOCUMENTED_INTERNAL_ROUTES
+    expected = (
+        PUBLIC_CLIENT_ROUTES
+        | OPENAI_V1_ALIASES
+        | DOCUMENTED_INTERNAL_ROUTES
+        | FUNCTIONAL_AVAILABILITY_ROUTES
+    )
 
     assert registered_api_v1 == expected
 

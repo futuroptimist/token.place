@@ -178,6 +178,56 @@ class TestModelManager:
         assert model_manager.llm is None
         assert model_manager.use_mock_llm is False
 
+    def test_reconcile_configured_model_path_preserves_canonical_manager_path(self):
+        manager = self._build_manager_with_model_config({})
+        canonical_path = manager.model_path
+
+        assert manager.reconcile_configured_model_path(canonical_path) == canonical_path
+        assert manager.model_path == canonical_path
+
+    @pytest.mark.parametrize(
+        ('attribute', 'unsafe_value'),
+        [
+            ('profile_id', 'llama-3.1-8b-q4-k-m'),
+            ('api_model_id', 'llama-3.1-8b-instruct'),
+            ('file_name', 'unapproved.gguf'),
+        ],
+    )
+    def test_reconcile_configured_model_path_rejects_identity_mismatch_without_mutation(
+        self, attribute, unsafe_value
+    ):
+        manager = self._build_manager_with_model_config({})
+        canonical_path = manager.model_path
+        setattr(manager, attribute, unsafe_value)
+
+        with pytest.raises(ValueError, match='pinned canonical identity'):
+            manager.reconcile_configured_model_path(canonical_path)
+
+        assert manager.model_path == canonical_path
+
+    @pytest.mark.parametrize('profile_field', ['artifact_size_bytes', 'artifact_sha256'])
+    def test_reconcile_configured_model_path_rejects_pinned_artifact_mismatch(
+        self, profile_field
+    ):
+        manager = self._build_manager_with_model_config({})
+        canonical_path = manager.model_path
+        manager.model_profile[profile_field] = 0 if profile_field == 'artifact_size_bytes' else '0' * 64
+
+        with pytest.raises(ValueError, match='pinned canonical identity'):
+            manager.reconcile_configured_model_path(canonical_path)
+
+        assert manager.model_path == canonical_path
+
+    def test_reconcile_configured_model_path_rejects_noncanonical_paths(self, tmp_path):
+        manager = self._build_manager_with_model_config({})
+        canonical_path = manager.model_path
+
+        for configured_path in ('Qwen3-8B-Q4_K_M.gguf', str(tmp_path / manager.file_name)):
+            with pytest.raises(ValueError):
+                manager.reconcile_configured_model_path(configured_path)
+
+        assert manager.model_path == canonical_path
+
     def test_mock_llm_exposes_chat_template_and_tokenizer(self, model_manager):
         """USE_MOCK_LLM runtime supports API v1 authoritative admission helpers."""
         model_manager.use_mock_llm = True

@@ -6540,6 +6540,49 @@ class ModelManager:
             and os.path.abspath(str(self.model_path)) == os.path.abspath(os.path.join(self.models_dir, self.file_name))
         )
 
+    def reconcile_configured_model_path(self, configured_path: Any) -> str:
+        """Validate a desktop-selected path without replacing canonical identity.
+
+        The desktop persists an absolute, flat path selected from the model
+        bridge.  Treat that value as an assertion about the active pinned
+        profile, not as permission to point the manager at an arbitrary file.
+        """
+        if not isinstance(configured_path, (str, os.PathLike)):
+            raise ValueError('configured model path must be path-like')
+        configured_text = os.fspath(configured_path)
+        if not configured_text or not os.path.isabs(configured_text):
+            raise ValueError('configured model path must be absolute')
+
+        expected_profile = get_model_profile(self.profile_id)
+        expected_filename = expected_profile.get('filename') if expected_profile else None
+        expected_size = expected_profile.get('artifact_size_bytes') if expected_profile else None
+        expected_sha256 = str(
+            expected_profile.get('artifact_sha256') if expected_profile else ''
+        ).lower()
+        active_sha256 = str(self.model_profile.get('artifact_sha256') or '').lower()
+        identity_matches = (
+            expected_profile is not None
+            and self.profile_id == 'qwen3-8b-q4-k-m'
+            and self.api_model_id == expected_profile.get('api_model_id')
+            and self.file_name == expected_filename
+            and self.model_profile.get('artifact_size_bytes') == expected_size
+            and active_sha256 == expected_sha256
+            and len(expected_sha256) == 64
+        )
+        canonical_path = os.path.abspath(os.path.join(self.models_dir, self.file_name))
+        configured_absolute = os.path.abspath(configured_text)
+        if (
+            not identity_matches
+            or not self._is_managed_canonical_model_path()
+            or configured_absolute != canonical_path
+        ):
+            raise ValueError('configured model path does not match pinned canonical identity')
+
+        # Deliberately return the already-derived manager path.  In particular,
+        # do not assign ``configured_path`` to ``self.model_path``: spelling,
+        # traversal, symlink, or future config differences must fail closed.
+        return self.model_path
+
     def _artifact_verification_receipt_path(self) -> str:
         return f"{self.model_path}.sha256.verified.json"
 

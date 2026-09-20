@@ -1277,6 +1277,21 @@ def run(args: argparse.Namespace) -> int:
 
     emit_provisioning("model_preflight")
     runtime = make_runtime(relay_url)
+    reconcile_model_path = getattr(runtime.model_manager, "reconcile_configured_model_path", None)
+    try:
+        if not callable(reconcile_model_path):
+            raise ValueError("canonical model path reconciliation unavailable")
+        canonical_model_path = reconcile_model_path(args.model)
+        if canonical_model_path != runtime.model_manager.model_path:
+            raise ValueError("canonical model path reconciliation changed manager identity")
+    except (OSError, TypeError, ValueError):
+        setattr(args, "startup_error_code", "model_identity_mismatch")
+        emit_startup_error("configured model does not match the pinned canonical model identity")
+        try:
+            runtime.stop()
+        except Exception:
+            pass
+        return 1
     runtimes = [runtime] + [make_runtime(url, shared_runtime=runtime) for url in relay_urls[1:]]
     _register_active_relay_clients(runtimes)
     for relay_runtime in runtimes:
@@ -1305,7 +1320,6 @@ def run(args: argparse.Namespace) -> int:
     for relay_runtime in runtimes:
         _wire_fatal_teardown_for_runtime(relay_runtime)
 
-    runtime.model_manager.model_path = args.model
     runtime.model_manager.parent_model_path_exists = parent_model_path_exists
     runtime.model_manager.model_path_was_relative = model_path_was_relative
     context_profile = apply_context_profile(runtime.model_manager, args.context_tier)
@@ -3412,8 +3426,25 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
         if getattr(manager, "use_mock_llm", False):
             evidence["failure_code"] = "mock_runtime_rejected"
             return 4, evidence
+        profile = getattr(manager, "model_profile", {}) or {}
         expected_filename = str(getattr(manager, "file_name", ""))
-        if model.name != expected_filename or expected_filename != "Qwen3-8B-Q4_K_M.gguf":
+        expected_size = profile.get("artifact_size_bytes")
+        expected_sha256 = str(profile.get("artifact_sha256") or "").lower()
+        evidence["artifact"].update(
+            filename=expected_filename or model.name or "unknown",
+            size_bytes=expected_size if isinstance(expected_size, int) else 0,
+            artifact_sha256=expected_sha256 if len(expected_sha256) == 64 else "unknown",
+        )
+        reconcile_model_path = getattr(manager, "reconcile_configured_model_path", None)
+        try:
+            canonical_model_path = reconcile_model_path(str(model)) if callable(reconcile_model_path) else None
+        except (OSError, TypeError, ValueError):
+            canonical_model_path = None
+        if (
+            canonical_model_path != getattr(manager, "model_path", None)
+            or model.name != expected_filename
+            or expected_filename != "Qwen3-8B-Q4_K_M.gguf"
+        ):
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
         canonical_model = Path(str(getattr(manager, "model_path", ""))).resolve()
@@ -3422,16 +3453,12 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
                 or managed_path_check() is not True):
             evidence["failure_code"] = "model_identity_mismatch"
             return 3, evidence
-        evidence["artifact"].update(filename=model.name, size_bytes=model.stat().st_size)
         manager.parent_model_path_exists = True
         manager.model_path_was_relative = False
         validate_artifact = getattr(manager, "_validate_existing_model_artifact", None)
         if not callable(validate_artifact):
             evidence["failure_code"] = "model_identity_validation_unavailable"
             return 3, evidence
-        profile = getattr(manager, "model_profile", {}) or {}
-        expected_size = profile.get("artifact_size_bytes")
-        expected_sha256 = str(profile.get("artifact_sha256") or "").lower()
         if not expected_size or len(expected_sha256) != 64:
             evidence["failure_code"] = "model_identity_validation_unavailable"
             return 3, evidence
@@ -3649,8 +3676,6 @@ def installed_gpu_completion_preflight(args: Any, runtime_factory: Any = None) -
             return 7, evidence
         if evidence["success"]:
             evidence["artifact"]["artifact_sha256"] = validated_digest
-        else:
-            evidence["artifact"]["artifact_sha256"] = "unknown"
 
 
 def main() -> int:

@@ -5359,3 +5359,25 @@ def test_inspect_eligibility_is_side_effect_free_and_classifies_fixed_states(
     clock.value = store._records["node-a"].lease_expires_at_epoch
     assert store.inspect_eligibility("qwen3-8b-instruct", "8k-fast").reason == "no_registered_compute_nodes"
     assert "node-a" in store._records
+
+
+def test_inspect_eligibility_counts_retained_expired_lifecycles(
+    store_factory, capabilities
+):
+    """A probe must not advertise capacity still occupied before bounded cleanup."""
+
+    clock = EpochClock()
+    store = store_factory(
+        clock=clock,
+        max_reservations=1,
+        max_reservations_per_node=1,
+    )
+    store.register("node-a", capabilities, digest("owner"))
+    selection = reserve(store, request_deadline_epoch=clock.value + 60)
+    clock.value = selection.reservation_expires_at_epoch
+
+    snapshot = store.inspect_eligibility("qwen3-8b-instruct", "8k-fast")
+
+    assert snapshot.reason == "no_available_capacity"
+    assert snapshot.schedulable_compute_nodes == 0
+    assert len(store._reservations) == 1

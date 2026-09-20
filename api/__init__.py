@@ -174,6 +174,7 @@ RATE_LIMIT_EXEMPT_PATHS = frozenset(
     {
         "/livez",
         "/healthz",
+        "/api/v1/relay/availability",
         "/metrics",
         "/relay/diagnostics",
     }

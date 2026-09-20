@@ -936,3 +936,22 @@ def test_availability_route_bounds_backend_failures(monkeypatch):
         "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
     }
     assert b"secret" not in response.data
+
+
+def test_availability_route_drain_short_circuits_state_backend(monkeypatch):
+    backend = Mock(side_effect=AssertionError("draining probe touched backend"))
+    monkeypatch.setattr(relay, "_api_v1_health_store", backend)
+    relay.DRAINING.set()
+    try:
+        response = relay.app.test_client().get("/api/v1/relay/availability")
+    finally:
+        relay.DRAINING.clear()
+
+    assert response.status_code == 503
+    assert response.get_json() == {
+        "available": False, "reason": "no_available_capacity",
+        "registered_compute_nodes": 0, "healthy_compute_nodes": 0,
+        "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
+    }
+    assert response.headers["Cache-Control"] == "no-store"
+    backend.assert_not_called()

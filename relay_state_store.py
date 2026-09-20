@@ -1294,28 +1294,31 @@ class InMemoryRelayStateStore:
                 and record.capabilities.maximum_total_context_tokens
                 >= requested_tokens
             )
-            live_reservations = tuple(
-                item
-                for item in self._reservations.values()
-                if item.request_deadline_epoch > now
-                and item.reservation_expires_at_epoch > now
-            )
-            live_queued = tuple(
-                item for item in self._queued.values() if item.request_deadline_epoch > now
-            )
+            # Match the scheduler's retained lifecycle population. Bounded cleanup can
+            # intentionally leave expired entries in these mappings, and those entries
+            # continue to consume admission capacity until a mutating operation reaps
+            # them. A read-only probe must not advertise capacity the scheduler rejects.
+            retained_reservations = tuple(self._reservations.values())
+            retained_queued = tuple(self._queued.values())
             global_capacity = (
-                len(live_reservations) < self.config.max_reservations
-                and len(live_reservations) + len(live_queued)
+                len(retained_reservations) < self.config.max_reservations
+                and len(retained_reservations) + len(retained_queued)
                 < self.config.max_request_lifecycles
             )
+            reservation_counts: dict[str, int] = {}
+            queued_counts: dict[str, int] = {}
+            for item in retained_reservations:
+                node_id = item.selected_node_id
+                reservation_counts[node_id] = reservation_counts.get(node_id, 0) + 1
+            for item in retained_queued:
+                node_id = item.selected_node_id
+                queued_counts[node_id] = queued_counts.get(node_id, 0) + 1
             schedulable = 0
             if global_capacity:
                 for record in matching:
                     node_id = record.node_id
-                    reservations = sum(
-                        item.selected_node_id == node_id for item in live_reservations
-                    )
-                    queued = sum(item.selected_node_id == node_id for item in live_queued)
+                    reservations = reservation_counts.get(node_id, 0)
+                    queued = queued_counts.get(node_id, 0)
                     state = self._scheduler_states[node_id]
                     load = reservations + queued + state.claimed_work
                     if (

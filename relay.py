@@ -785,6 +785,7 @@ def _normalise_http_route() -> str:
         "api_v1_relay_servers_poll": "/api/v1/relay/servers/poll",
         "api_v1_relay_servers_control": "/api/v1/relay/servers/control",
         "api_v1_relay_servers_next": "/api/v1/relay/servers/next",
+        "api_v1_relay_availability": "/api/v1/relay/availability",
         "healthz": "/healthz",
         "livez": "/livez",
         "metrics": "/metrics",
@@ -2283,14 +2284,6 @@ def healthz():
             started = time.monotonic()
             try:
                 store.readiness()
-            except ValkeySchemaIncompatibleError:
-                RELAY_STATE_STORE_UP.set(0)
-                RELAY_STATE_STORE_ERRORS_TOTAL.labels("readiness", "schema_incompatible").inc()
-                raise
-            except RelayStateStoreError:
-                RELAY_STATE_STORE_UP.set(0)
-                RELAY_STATE_STORE_ERRORS_TOTAL.labels("readiness", "unavailable").inc()
-                raise
             finally:
                 RELAY_STATE_STORE_OPERATION_DURATION_SECONDS.labels("readiness").observe(
                     max(time.monotonic() - started, 0.0)
@@ -2303,8 +2296,12 @@ def healthz():
             known_server_items=eligible_known_servers,
         )
     except ValkeySchemaIncompatibleError:
+        RELAY_STATE_STORE_UP.set(0)
+        RELAY_STATE_STORE_ERRORS_TOTAL.labels("readiness", "schema_incompatible").inc()
         return _schema_failure_response()
     except RelayStateStoreError:
+        RELAY_STATE_STORE_UP.set(0)
+        RELAY_STATE_STORE_ERRORS_TOTAL.labels("readiness", "unavailable").inc()
         return _store_failure_response()
     finally:
         if close_store and store is not None:
@@ -2372,6 +2369,17 @@ def _publish_availability_metrics(reason: str, schedulable: int, *, store_up: bo
 @app.route("/api/v1/relay/availability", methods=["GET"])
 def api_v1_relay_availability():
     """Report canonical scheduler capacity without mutating shared state."""
+
+    if DRAINING.is_set():
+        _publish_availability_metrics("no_available_capacity", 0, store_up=True)
+        response = jsonify({
+            "available": False, "reason": "no_available_capacity",
+            "registered_compute_nodes": 0, "healthy_compute_nodes": 0,
+            "matching_compute_nodes": 0, "schedulable_compute_nodes": 0,
+        })
+        response.status_code = 503
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     store = None
     close_store = False

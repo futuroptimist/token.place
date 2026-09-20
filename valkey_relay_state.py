@@ -641,7 +641,10 @@ local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 local nodes = redis.call('ZRANGEBYSCORE', leases, '(' .. now, '+inf', 'LIMIT', 0, max_nodes + 1)
 if #nodes > max_nodes then return {'schema'} end
-local lifecycle = redis.call('ZRANGEBYSCORE', deadlines, '(' .. now, '+inf', 'LIMIT', 0, max_lifecycles + 1)
+-- Inspect the retained scheduler population rather than only unexpired entries.
+-- Bounded cleanup may leave expired lifecycles consuming capacity until the next
+-- mutating scheduler operation; availability must remain conservative meanwhile.
+local lifecycle = redis.call('ZRANGE', deadlines, 0, max_lifecycles)
 if #lifecycle > max_lifecycles then return {'schema'} end
 local node_reservations, node_queued, live_reservations = {}, {}, 0
 for _, member in ipairs(lifecycle) do
@@ -652,15 +655,13 @@ for _, member in ipairs(lifecycle) do
   local values = redis.call('HMGET', prefix .. 'request:' .. c .. ':' .. q,
     'state', 'client', 'request', 'node_digest', 'deadline', 'reservation_expires', 'token_digest')
   if not values[1] or values[2] ~= c or values[3] ~= q or not values[4] or
-     tonumber(values[5]) == nil or tonumber(values[5]) <= now then return {'schema'} end
+     tonumber(values[5]) == nil then return {'schema'} end
   if values[1] == 'reserved' then
     if not values[6] or not values[7] or tonumber(values[6]) == nil then return {'schema'} end
-    if tonumber(values[6]) > now then
-      local indexed = redis.call('ZSCORE', expiries, values[7])
-      if not indexed or tonumber(indexed) ~= tonumber(values[6]) then return {'schema'} end
-      live_reservations = live_reservations + 1
-      node_reservations[values[4]] = (node_reservations[values[4]] or 0) + 1
-    end
+    local indexed = redis.call('ZSCORE', expiries, values[7])
+    if not indexed or tonumber(indexed) ~= tonumber(values[6]) then return {'schema'} end
+    live_reservations = live_reservations + 1
+    node_reservations[values[4]] = (node_reservations[values[4]] or 0) + 1
   elseif values[1] == 'queued' or values[1] == 'claimed' then
     node_queued[values[4]] = (node_queued[values[4]] or 0) + 1
   else return {'schema'} end
@@ -704,7 +705,7 @@ return {reason, registered, healthy, matching, schedulable}
 INSPECT_ELIGIBILITY_SCRIPT = ReviewedScript(
     "inspect_eligibility_v1",
     INSPECT_ELIGIBILITY_SOURCE,
-    "520224fe4877166caf60b64be960df9f6f16ff936aa72f14b3392598ac48f122",  # pragma: allowlist secret
+    "078a15d0b6b41c7e8cbf9eed1a82a4fd6ab5813112bfb32b396a00b4fcdf76eb",  # pragma: allowlist secret
     False,
 )
 

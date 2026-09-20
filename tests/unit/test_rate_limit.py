@@ -432,8 +432,15 @@ def test_operational_routes_are_exempt_from_public_rate_limit():
     def relay_diagnostics():
         return {"status": "ok"}
 
+    @app.get("/api/v1/relay/availability")
+    def relay_availability():
+        return {"available": True}
+
     with app.test_client() as client:
-        for path in ("/livez", "/healthz", "/metrics", "/relay/diagnostics"):
+        for path in (
+            "/livez", "/healthz", "/metrics", "/relay/diagnostics",
+            "/api/v1/relay/availability",
+        ):
             statuses = [client.get(path).status_code for _ in range(3)]
             assert statuses == [200, 200, 200]
 
